@@ -305,8 +305,14 @@ fn serialize_json_shadow_detection_is_scope_aware() {
         "JSON ||= shadows bare JSON"
     );
 
-    // Nested class JSON / module JSON leave a shadow marker.
-    for nested in ["class JSON; end", "module JSON; end"] {
+    // A nested class JSON / module JSON, or a JSON value class, shadows
+    // bare JSON.
+    for nested in [
+        "class JSON; end",
+        "module JSON; end",
+        "JSON = Struct.new(:tag) do\n    def label = tag\n  end",
+        "JSON = Data.define(:tag) do\n    def label = tag\n  end",
+    ] {
         let app = ingest_app_from_tree(article_app(
             &format!("  {nested}\n  serialize :payload, coder: JSON\n"),
             "    t.text :payload\n",

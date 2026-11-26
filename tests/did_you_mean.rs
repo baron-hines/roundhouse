@@ -1,4 +1,6 @@
 //! action_policy's default-gem guard must keep the suggestion CRuby produces.
+#[path = "support/prerequisite.rs"]
+mod prerequisite;
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
@@ -109,7 +111,7 @@ fn rails_output_with_flags(extra: &str, consumer: &str, flags: &[&str]) -> Optio
     );
     let out = Command::new("ruby").args(flags).args(["-e", &script]).output().expect("Rails control");
     if out.status.code() == Some(77) {
-        eprintln!("skipping Rails comparison: RailsOracle railties is unavailable; native checks use the verified literal");
+        prerequisite::missing("Rails comparison: RailsOracle railties is unavailable; native checks use the verified literal");
         return None;
     }
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));

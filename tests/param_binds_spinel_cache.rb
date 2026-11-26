@@ -171,7 +171,7 @@ end
 
 module Db
   def self.shutdown_pools
-    @pools
+    @slots.nil? ? nil : slot.pools
   end
 end
 

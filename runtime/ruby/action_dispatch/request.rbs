@@ -37,9 +37,12 @@ module ActionDispatch
     @path_parameters: RequestPathParameters
     @user_agent: String
     @session_options: Hash[Symbol, bool]
-    @params: Hash[String, untyped]
+    @session: Session?
+    @flash: ActionDispatch::Flash?
+    @params: Hash[String, Roundhouse::ParamValue]
     @csp_ready: bool
     @content_security_policy: ContentSecurityPolicy?
+    @csp_nonce: String?
 
     def remote_ip: () -> String
     def remote_ip=: (String) -> String
@@ -59,12 +62,18 @@ module ActionDispatch
     def forwarded_authority: () -> String
     def trusted_forwarded_peer?: () -> bool
     def host_authority?: (String value) -> bool
-    def format: () -> String
+    def format: () -> Mime::Type
+    def domain: () -> String?
+    def subdomains: () -> Array[String]
+    def subdomain: () -> String
+    def named_host_parts: () -> Array[String]
     def format=: (untyped value) -> untyped
     def body: () -> RequestBody
     def body=: (String) -> String
     def raw_post: () -> String
     def env: () -> Hash[String, untyped]
+    def flash: () -> ActionDispatch::Flash?
+    def flash=: (ActionDispatch::Flash?) -> ActionDispatch::Flash?
     def env=: (Hash[String, untyped]) -> Hash[String, untyped]
     def headers: () -> ActionDispatch::Http::Headers
     def request_id: () -> String?
@@ -78,14 +87,18 @@ module ActionDispatch
     def query_parameters: () -> Hash[String, Roundhouse::ParamValue]
     def query_parameters=: (Hash[String, Roundhouse::ParamValue]) -> Hash[String, Roundhouse::ParamValue]
     def initialize: () -> void
+    def self.for_env: (Hash[String, untyped] env) -> ActionDispatch::Request
+    def request_method_symbol: () -> Symbol
     def get?: () -> bool
     def post?: () -> bool
     def put?: () -> bool
+    def patch?: () -> bool
     def head?: () -> bool
     def xhr?: () -> bool
     def inertia?: () -> bool
     def fullpath: () -> String
     def original_fullpath: () -> String
+    def path_info: () -> String
     def ssl?: () -> bool
     def protocol: () -> String
     def optional_port: () -> Integer?
@@ -93,16 +106,21 @@ module ActionDispatch
     def base_url: () -> String
     def host_with_port: () -> String
     def content_security_policy: () -> ContentSecurityPolicy?
+    def content_security_policy=: (ContentSecurityPolicy? policy) -> ContentSecurityPolicy?
+    def content_security_policy_nonce: () -> String?
     def original_url: () -> String
     def url: () -> String
     def referrer: () -> String
     def user_agent: () -> String
     def session_options: () -> Hash[Symbol, bool]
+    def session: () -> Session
+    def session=: (Session) -> Session
+    def reset_session: () -> ActionDispatch::Session
     def session_skip?: () -> bool
     def user_agent=: (String) -> String
-    def params: () -> Hash[String, untyped]
+    def params: () -> Hash[String, Roundhouse::ParamValue]
     def filtered_parameters: () -> Hash[String, untyped]
-    def params=: (Hash[String, untyped]) -> Hash[String, untyped]
+    def params=: (Hash[String, Roundhouse::ParamValue]) -> Hash[String, Roundhouse::ParamValue]
     def self.for: (Hash[String, untyped] env, ?Hash[String, untyped] params) -> Request
   end
 end

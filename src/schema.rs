@@ -18,6 +18,30 @@ use crate::ident::{Symbol, TableRef};
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Schema {
     pub tables: IndexMap<Symbol, Table>,
+    /// The grammar application ingest read this schema's CHECKs under,
+    /// which records whose SQL their text is. `Portable` when nothing
+    /// says: every schema built or ingested outside an application.
+    #[serde(default, skip_serializing_if = "generated::GeneratedExpressionDialect::is_portable")]
+    pub expression_dialect: generated::GeneratedExpressionDialect,
+    /// `create_schema "name"`, in order: the PostgreSQL schemas Rails'
+    /// `db:schema:load` creates before anything goes into them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub schemas: Vec<Symbol>,
+    /// `enable_extension "name"` (or `"schema.name"`), in order, less any
+    /// a later `disable_extension` removed: what Rails' PostgreSQL adapter
+    /// creates ahead of the tables. Column typing never reads them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<Extension>,
+}
+
+/// One `enable_extension`: the extension, and the schema it goes into
+/// when the name is qualified (`"extensions.pgcrypto"`). Unqualified, it
+/// goes into the first schema on the search path, as PostgreSQL puts it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Extension {
+    pub name: Symbol,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<Symbol>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -26,6 +50,8 @@ pub struct Table {
     pub columns: Vec<Column>,
     pub indexes: Vec<Index>,
     pub foreign_keys: Vec<ForeignKey>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub check_constraints: Vec<CheckConstraint>,
     /// A plain `create_table id: false` declaration with no later key or
     /// id-column changes. False also means unknown: retain the default.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -64,6 +90,12 @@ pub struct Column {
     pub col_type: ColumnType,
     pub nullable: bool,
     pub default: Option<String>,
+    /// A database expression is distinct from the model's literal default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_expression: Option<String>,
+    /// Target lowering may leave computed defaults on the legacy persistence path.
+    #[serde(skip)]
+    pub legacy_default_persistence: bool,
     pub primary_key: bool,
     /// The SQL expression and storage mode of a generated column. The
     /// declared `col_type` remains the column's result type; generated
@@ -103,9 +135,34 @@ pub struct Column {
     /// other target reads the element, as before.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub array_stored: bool,
+    /// A NOT NULL number column a strict target's lowering holds nilable
+    /// (`nullable` set on its copy of the schema), because Rails reads it
+    /// as nil until it is assigned and a presence validation rejects that
+    /// (`lower::validations::hold_unset_presence_columns`). Its public
+    /// reader still answers the column's own type. Lowering-only.
+    #[serde(skip)]
+    pub unset_until_assigned: bool,
+    /// Ingest-only evidence: the column declares `collation:`. Its
+    /// database compares the column's text under that collation, which
+    /// may ignore case, so no CHECK comparing it is rewritten for SQLite
+    /// (`carry_postgres_check`).
+    #[serde(skip)]
+    pub collated: bool,
 }
 
 impl Column {
+    pub fn persisted_computed_default(&self) -> Option<&str> {
+        if self.legacy_default_persistence { None } else { self.computed_default() }
+    }
+
+    /// A database-evaluated default, distinct from a quoted SQL literal.
+    pub fn computed_default(&self) -> Option<&str> {
+        self.default_expression.as_deref().filter(|sql| {
+            !(sql.len() >= 2 && sql.starts_with('\'') && sql.ends_with('\'')
+                && !sql[1..sql.len() - 1].replace("''", "").contains('\''))
+        })
+    }
+
     /// The schema default a target reads. An array column's `[]` counts
     /// only where the target stores the Array.
     pub fn stored_default(&self) -> Option<&str> {
@@ -121,6 +178,11 @@ pub struct GeneratedColumn {
     /// Source SQL retained from `as:` or `GENERATED ALWAYS AS (...)`.
     pub expression: String,
     pub storage: GeneratedColumnStorage,
+    /// The expression is the app's own database's SQL, outside the grammar
+    /// SQLite and PostgreSQL read alike (`config/database.yml` names another
+    /// database than SQLite): only a tree that runs on that database carries it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub native: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,10 +225,19 @@ pub enum ColumnType {
     Reference { table: TableRef },
 }
 
+impl ColumnType {
+    pub(crate) fn stores_sql_literal_default_as_text(&self) -> bool {
+        matches!(self, Self::String { .. } | Self::Text | Self::Json | Self::Jsonb | Self::Uuid)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Index {
     pub name: Symbol,
     pub columns: Vec<Symbol>,
+    /// SQL index keys are expressions, never a list of physical columns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expression: Option<String>,
     pub unique: bool,
     /// PostgreSQL's `USING <access_method>`, when present in the source.
     /// `None` is the database default (btree). The method is retained
@@ -183,11 +254,40 @@ pub struct Index {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ForeignKey {
-    pub from_column: Symbol,
+    #[serde(alias = "from_column", deserialize_with = "deserialize_key_columns")]
+    pub from_columns: Vec<Symbol>,
     pub to_table: TableRef,
-    pub to_column: Symbol,
+    #[serde(alias = "to_column", deserialize_with = "deserialize_key_columns")]
+    pub to_columns: Vec<Symbol>,
     pub on_delete: ReferentialAction,
     pub on_update: ReferentialAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferrable: Option<Deferrable>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Deferrable {
+    Immediate,
+    Deferred,
+}
+
+fn deserialize_key_columns<'de, D: serde::Deserializer<'de>>(input: D) -> Result<Vec<Symbol>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Columns { One(Symbol), Many(Vec<Symbol>) }
+    Ok(match Columns::deserialize(input)? { Columns::One(c) => vec![c], Columns::Many(cs) => cs })
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CheckConstraint {
+    pub name: Option<String>,
+    pub expression: String,
+    /// Ingest-only: the PostgreSQL text `expression` was rewritten from
+    /// for SQLite (`carry_postgres_check`). PostgreSQL rereads that text
+    /// when a column it names changes, so ingest carries it again then.
+    #[serde(skip)]
+    pub carried_from: Option<String>,
 }
 
 /// Column a `pluck` or `pick` argument selects.

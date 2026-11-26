@@ -36,7 +36,7 @@ fn native_control() {
 fn a_class_side_or_assign_runs_where_it_stands_on_ruby() {
     let run = overlay().run_ruby(SCRIPT);
     assert!(run.errors.is_empty(), "{:#?}", run.errors);
-    assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+    run.assert_passes();
     assert_eq!(run.stdout, EXPECTED, "{}", run.stderr);
 }
 
@@ -76,7 +76,7 @@ fn a_target_without_class_body_code_refuses_an_inherited_class_side_write_by_nam
             .write("vendor/gems/paygate-1.0.0/lib/paygate.rb", gem)
     };
     let run = overlay().run_ruby(script);
-    assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+    run.assert_passes();
     assert_eq!(run.stdout, "test\nlive\n", "{}", run.stderr);
     let (_tree, errors) = overlay().emit(BuildTarget::Typescript);
     for written in ["self.mode = :test", "self.mode ||"] {

@@ -1,3 +1,5 @@
+#[path = "../support/prerequisite.rs"]
+mod prerequisite;
 #[path = "../support/scratch.rs"]
 mod scratch;
 use super::emit_and_run;
@@ -223,7 +225,7 @@ fn acceptance_on_an_undeclared_attribute_matches_rails() {
 fn rails_answers_the_undeclared_acceptance_table() {
     let probe = r#"gem "activerecord", "8.1.4"; require "active_record"; require "sqlite3""#;
     if !std::process::Command::new("ruby").args(["-e", probe]).status().is_ok_and(|s| s.success()) {
-        eprintln!("skipping: ruby with activerecord 8.1.4 and sqlite3 not available");
+        prerequisite::missing("ruby with activerecord 8.1.4 and sqlite3 not available");
         return;
     }
     let script = format!(

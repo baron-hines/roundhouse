@@ -27,11 +27,15 @@ use crate::ty::Ty;
 
 /// A condition on the including class, read from a concern's
 /// `included do`: `self == A` / `self != A` / `in?([A, B])`, under `if`
-/// or `unless`. `classes` are the constants as written.
+/// or `unless`. `classes` are the constants as written. `asked` is instead
+/// a module's predicate of the includer, `Devise::Orm.active_record?(self)`:
+/// the module and the method, which a gem hook answers per includer.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct IncluderGuard {
     pub classes: Vec<String>,
     pub negate: bool,
+    #[serde(default)]
+    pub asked: Option<(String, String)>,
 }
 
 impl IncluderGuard {
@@ -60,6 +64,12 @@ pub struct ConcernGuardedItem {
     pub item: ModelBodyItem,
     pub at: usize,
 }
+
+/// The generated module whose `run(server)` performs the app's
+/// `after_initialize` callbacks (`ingest::after_initialize`); each entry
+/// calls it once the database and the job drain are set up, saying whether
+/// it serves (`project::apply_app_initializers`).
+pub const AFTER_INITIALIZE_RUNNER: &str = "AppInitializers";
 
 /// The top-level IR: a Rails application as data. This is the serializable
 /// deliverable — the thing ingesters produce and emitters consume.
@@ -131,6 +141,14 @@ pub struct App {
     /// (`ingest::boot_program`): run at boot on the ruby family and spinel.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub boot_program: Vec<Expr>,
+    /// The statements of [`App::boot_program`] that a gem file runs as it
+    /// loads (`ingest::gem_load_program`): the ruby family leaves them to
+    /// the file's program, which runs them where the file is required.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gem_load_statements: Vec<crate::span::Span>,
+    /// The gem files the boot loads, as `ingest::gem_load_program` walks them (normalized source paths).
+    #[serde(default, skip_serializing_if = "crate::det::HashSet::is_empty")]
+    pub gem_loaded_files: crate::det::HashSet<String>,
     /// The constants an initializer statement held by a gem not compiled
     /// from source calls (`Rack::Attack` of `Rack::Attack.throttle`):
     /// `ingest::auto_source_gems` brings that gem in, and the statement
@@ -142,12 +160,32 @@ pub struct App {
     /// them in front of the routes, where Rails puts them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gem_middlewares: Vec<String>,
+    /// The block a `use` passes its middleware (`use Warden::Manager do |config| … end`), by class,
+    /// as brace-block Ruby the stack hands the constructor.
+    #[serde(default, skip_serializing_if = "crate::det::HashMap::is_empty")]
+    pub gem_middleware_blocks: crate::det::HashMap<String, String>,
+    /// The arguments a `use` passes its middleware after the app it wraps, by class, as Ruby source
+    /// (`*Devise.omniauth_configs[:github].args` for a provider Devise's loop unrolled to).
+    #[serde(default, skip_serializing_if = "crate::det::HashMap::is_empty")]
+    pub gem_middleware_args: crate::det::HashMap<String, String>,
+    /// The Rack env keys a stacked middleware writes, and the class there (`"warden"` → `Warden::Proxy`).
+    #[serde(default, skip_serializing_if = "crate::det::HashMap::is_empty")]
+    pub rack_env_writes: crate::det::HashMap<String, String>,
     /// The insertions it could not read, reported by analyze.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gem_middleware_refusals: Vec<crate::diagnostic::Diagnostic>,
     /// A def hoisted out of a concern's `included do` that a module the same block includes also defines.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub included_hoist_conflicts: Vec<crate::diagnostic::Diagnostic>,
+    /// A superclass expression read off a configured object that did not fold to a constant.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub superclass_refusals: Vec<crate::diagnostic::Diagnostic>,
+    /// Routes a gem's routing method draws that are left out (`ingest::gem_hooks::omits_on_failure`), at the call.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gem_route_gaps: Vec<crate::diagnostic::Diagnostic>,
+    /// `RouteHelpers` methods a gem's load generates from its route tables (Devise's `new_session_path(resource_or_scope)`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub generated_route_helpers: Vec<crate::dialect::MethodDef>,
     /// Pins from `config/importmap.rb`, expanded (each
     /// `pin_all_from` has been resolved into explicit per-file
     /// pins via `app/javascript/**` walking). Consumed by the
@@ -181,6 +219,13 @@ pub struct App {
     /// Empty when the app ships no `sig/` directory.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub rbs_signatures: HashMap<ClassId, HashMap<Symbol, Ty>>,
+    /// How the `sig/` sidecars and inline signatures behind
+    /// `rbs_signatures` spelled each class name (`crate::rbs::Spellings`).
+    /// Provenance only: the Ruby RBS writer reads it to keep a declared
+    /// name as written when its lexical nesting is preserved; identity
+    /// and every other reader use the ids.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub rbs_spellings: crate::rbs::MethodSpellings,
     /// What a `sig/**/*.rbs` sidecar says a class INCLUDES, keyed by
     /// the declaring class and holding the module names as written.
     ///
@@ -252,6 +297,9 @@ pub struct App {
     /// param types, `Ty::Var` where no call site contributed.
     #[serde(skip)]
     pub inferred_method_params: HashMap<(ClassId, Symbol), Vec<Ty>>,
+    /// Parameters an app method reads as a relation (`analyze::relation_params`), set by analysis for the lowering.
+    #[serde(skip)]
+    pub relation_params: crate::analyze::relation_params::RelationParams,
     /// Source files the text pipeline cannot represent — every emitted
     /// file's content is a `String`, so an app's images, fonts and
     /// binary test fixtures were silently dropped on the floor. Carried
@@ -352,11 +400,12 @@ pub struct App {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_adapter: Option<String>,
     /// The Redis the app's `Sidekiq.configure_client` block names
-    /// (`config.redis = { url: …, password: … }`), read at ingest from
-    /// `config/initializers`. It is the only source of where jobs are
-    /// pushed: a tree on `:sidekiq` without a `url:` here is an ingest
-    /// error, with no fallback to `REDIS_PROVIDER`, `REDIS_URL` or
-    /// localhost. Other keys are not read.
+    /// (`config.redis = { url: …, password: …, db: …, timeout: … }`),
+    /// read at ingest from `config/initializers`. It is the only source
+    /// of where jobs are pushed: a tree on `:sidekiq` without a `url:`
+    /// here is an ingest error, with no fallback to `REDIS_PROVIDER`,
+    /// `REDIS_URL` or localhost. A key it can't honor is an error on
+    /// `:sidekiq` (see `ingest::app::sidekiq_redis_key`).
     #[serde(default, skip_serializing_if = "SidekiqRedisConfig::is_empty")]
     pub sidekiq_redis: SidekiqRedisConfig,
     /// The worker's defaults from `config/sidekiq.yml` (concurrency,
@@ -394,10 +443,23 @@ pub struct App {
     /// (not a seeded `include` set on every model).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub load_hook_class_macros: Vec<ClassId>,
+    /// The modules a model macro's body includes into the model (devise's
+    /// `devise :database_authenticatable`), written in the call's place
+    /// (`configured_superclass::expand_model_mixin_macros`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub macro_includes: Vec<(ClassId, ClassId)>,
+    /// The model macro calls those includes took the place of, as written.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expanded_macro_calls: Vec<(ClassId, crate::expr::Expr)>,
     /// Modules `extend`ed inside `ActiveSupport.on_load(:active_record)`:
     /// their instance methods are class-method macros on every model.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub load_hook_extended_macros: Vec<ClassId>,
+    /// Constants written on ActiveRecord::Base inside `ActiveSupport.on_load(:active_record)` (`self::X = Const`,
+    /// orm_adapter's `self::OrmAdapter = ::OrmAdapter::ActiveRecord`): the name, the constant path it holds as written
+    /// (a leading empty segment when rooted), and the hook's lexical nesting outermost first, one full name per header.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub load_hook_constants: Vec<(Symbol, Vec<Symbol>, Vec<Symbol>)>,
     /// Class methods a model took from a module only it extends
     /// (`ingest::extend_splice`), by name.
     #[serde(default, skip_serializing_if = "std::collections::HashSet::is_empty")]
@@ -533,6 +595,11 @@ pub struct App {
     /// seams as `initializer_filters`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub initializer_response_headers: Vec<InitializerResponseHeader>,
+    /// Whether ingest generated the after_initialize runner module
+    /// ([`AFTER_INITIALIZE_RUNNER`], `ingest::after_initialize`), so the
+    /// emitted entries call its `run`. Recorded, not inferred from the name.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub runs_after_initialize: bool,
     /// `ActionView::PartialRenderer.collection_cache = Store.reader` from
     /// a `config/initializers/` file (bare or inside `to_prepare`): the
     /// store cached collection renders read and write. campfire points
@@ -580,6 +647,10 @@ pub struct App {
     /// `analyze::database_identity`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub database_refusals: Vec<crate::database::DatabaseRefusal>,
+    /// The shard and role pools of an app whose one connection class
+    /// routes every model; none for any other app.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_routes: Option<crate::database::DatabaseRoutes>,
     /// Support files (`lib/`, a gem's source, …) whose class ingest
     /// failed, each at the construct that failed it: the walk goes on
     /// without the file, and `analyze` reports it there
@@ -611,6 +682,31 @@ pub struct App {
     /// the app walk; empty for apps without concerns.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub concern_filters: HashMap<ClassId, Vec<Filter>>,
+    /// Callback declarations in a concern's `included do` block that ingest
+    /// could not read, keyed by the module, as `(file, message)`. They
+    /// refuse the compile only once a controller registers the concern
+    /// (`ingest::app::refuse_unread_concern_filters`): the block has no
+    /// effect on an app that never includes it in a controller.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub concern_filter_refusals: HashMap<ClassId, Vec<(String, String)>>,
+    /// Modules known not to be Concerns. Ruby does not run the `included`
+    /// hooks of what such a module includes on the module's own includers,
+    /// so filter registration stops there; its methods still arrive.
+    #[serde(default, skip_serializing_if = "crate::det::HashSet::is_empty")]
+    pub plain_mixins: crate::det::HashSet<ClassId>,
+    /// Modules whose `def self.included` hook registers controller filters,
+    /// read or refused. Such a filter says nothing about Concern identity.
+    #[serde(default, skip_serializing_if = "crate::det::HashSet::is_empty")]
+    pub concern_hook_modules: crate::det::HashSet<ClassId>,
+    /// Name spans of the hooks fully read into `concern_filters`, left out
+    /// of the emitted module: nothing is left for them to do at load.
+    #[serde(default, skip_serializing_if = "crate::det::HashSet::is_empty")]
+    pub modelled_included_hooks: crate::det::HashSet<crate::span::Span>,
+    /// The hooks among those with a filter no guard stands in front of:
+    /// on a class that is not a controller it raises or calls that
+    /// class's own macro, even where `respond_to?` would say no.
+    #[serde(default, skip_serializing_if = "crate::det::HashSet::is_empty")]
+    pub unguarded_included_hooks: crate::det::HashSet<crate::span::Span>,
     /// graphql-ruby object types (`ingest::graphql_ruby`), for the
     /// analyzer only; their synthesized methods leave at lowering.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -646,6 +742,18 @@ pub struct App {
     /// are reported as warnings, since Rails never runs them.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub unreachable_views: BTreeSet<Symbol>,
+    /// A pagy before 43's extras and `Pagy::DEFAULT[...] =` settings, as
+    /// the initializers write them (`ingest::pagy::read_settings`).
+    #[serde(default)]
+    pub pagy: PagyConfig,
+    /// The block renders `ingest::yield_partials` turned into a render of a
+    /// partial copy, by the call's span: off the ruby family still refused.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub yield_specialized: Vec<crate::span::Span>,
+    /// The partials `ingest::yield_partials` copied for a block render: named only by a render of their own name,
+    /// since each such call now renders the copy (`ingest::unreachable_views`).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub yield_originals: BTreeSet<Symbol>,
     /// The `app/helpers` modules' diagnostics, taken before the
     /// post-analyze lowerings rewrite their bodies; `None` until then,
     /// and on a path that never lowers (`check`), where they are
@@ -703,6 +811,19 @@ pub struct App {
     /// so the splice keeps source order.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub concern_guarded_items: HashMap<ClassId, Vec<ConcernGuardedItem>>,
+    /// The class-variable seeds a concern's `included do` block sets on
+    /// each includer, keyed by module. `included do cattr_accessor :cap,
+    /// default: 3 end` runs in the includer's class body there, so the
+    /// block's expansion is the includer's accessors AND its `@@cap =
+    /// 3`; the splice hands both to the model that includes the module.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub concern_class_attr_defaults: HashMap<ClassId, indexmap::IndexMap<Symbol, Expr>>,
+    /// Model DSL declared inside a concern module's `prepended do`, keyed
+    /// by the module, exactly as [`App::concern_model_items`] holds an
+    /// `included do` block's. Rails runs the block in the class that
+    /// `prepend`s the module, so the splice gives these to that class.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub concern_prepended_items: HashMap<ClassId, Vec<ModelBodyItem>>,
     /// Instance-method names a concern's `included do` block (re)defines
     /// (`def x`, `alias_method :x, ...`, `define_method`, `attr_*`), keyed by
     /// module. Those statements are not carried as `concern_model_items`, so
@@ -760,6 +881,10 @@ pub struct App {
     /// Read by `lower::controller_to_library::params_wrapper`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub wrap_parameters_by_default: bool,
+    /// Rails writes `autocomplete="off"` on every hidden input: the app's `config.load_defaults` is before 8.1 (or it
+    /// sets `config.action_view.remove_hidden_field_autocomplete = false`). Off, the runtime's default, is 8.1's.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hidden_field_autocomplete: bool,
     /// `ActiveJob::Base.retry_jitter`, app-wide: 0.15 when
     /// `config.load_defaults` is 6.1 or later, else 0.0, unless
     /// `config.active_job.retry_jitter = <number>` sets it (application,
@@ -831,12 +956,11 @@ pub struct ControllerResolution {
     /// pick the subset they care about.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub filter_chain: Vec<ResolvedFilter>,
-    /// Effective layout view name (`layouts/application`), resolved by
-    /// walking the inheritance chain; `None` records an explicit
-    /// `layout false`. Convention default applies, so this may name a
-    /// layout view the app doesn't ship — Rails would render bare.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub layout: Option<Symbol>,
+    /// The layout templates this controller's actions render in
+    /// (`layouts/application`), as `controller_layout` resolves them;
+    /// empty when none does.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layouts: Vec<Symbol>,
 }
 
 /// One hop of a resolved filter chain: the declaration plus the
@@ -990,6 +1114,21 @@ impl MixinKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+pub struct PagyConfig {
+    /// `require "pagy/extras/overflow"`'s mode: `empty_page` (the extra's
+    /// own default) unless a `Pagy::DEFAULT[:overflow] =` names another.
+    /// `None` without the extra, where the gem raises past the end.
+    pub overflow: Option<String>,
+    /// `require "pagy/extras/array"`: `pagy_array` exists.
+    pub array: bool,
+    /// `Pagy::DEFAULT[:limit] =`, an Integer literal of at least 1.
+    pub limit: Option<i64>,
+    /// What the initializers set that this model does not read: another
+    /// extra, another `Pagy::DEFAULT` key, a value that is not a literal.
+    pub unmodeled: Vec<(crate::span::Span, String)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 pub struct InertiaConfig {
     pub version: String,
     pub encrypt_history: bool,
@@ -1031,6 +1170,21 @@ pub struct ImportmapPin {
 }
 
 impl App {
+    /// Each of the app's classes and its superclass, a leading `::`
+    /// dropped. A subclass of a model with no table of its own is a
+    /// library class (chatwoot's `SuperAdmin < User`, campfire's
+    /// `Rooms::Open < Room`), so both lists are walked.
+    pub fn class_parents(&self) -> HashMap<&str, Option<&str>> {
+        fn parent(p: &Option<ClassId>) -> Option<&str> {
+            p.as_ref().map(|p| p.0.as_str().trim_start_matches("::"))
+        }
+        self.models
+            .iter()
+            .map(|m| (m.name.0.as_str(), parent(&m.parent)))
+            .chain(self.library_classes.iter().map(|c| (c.name.0.as_str(), parent(&c.parent))))
+            .collect()
+    }
+
     /// Drop the spare capacity ingest leaves in the unit collections.
     ///
     /// Building a tree by pushing leaves every `Vec` and `String` in it
@@ -1073,6 +1227,18 @@ impl App {
     pub fn sole_includer_of_modules(
         &self,
     ) -> crate::det::HashMap<crate::ident::ClassId, crate::ident::ClassId> {
+        self.includers_of_modules()
+            .into_iter()
+            .filter_map(|(m, set)| (set.len() == 1).then(|| (m, set.into_iter().next().unwrap())))
+            .collect()
+    }
+
+    /// Module → every non-module class that includes it, directly or
+    /// through another module (see `sole_includer_of_modules`, which is
+    /// the one-includer case of this).
+    pub fn includers_of_modules(
+        &self,
+    ) -> crate::det::HashMap<crate::ident::ClassId, std::collections::BTreeSet<crate::ident::ClassId>> {
         use std::collections::{BTreeMap, BTreeSet};
         use crate::det::HashMap;
         let modules: BTreeSet<&crate::ident::ClassId> = self
@@ -1125,9 +1291,6 @@ impl App {
             }
         }
         includers
-            .into_iter()
-            .filter_map(|(m, set)| (set.len() == 1).then(|| (m, set.into_iter().next().unwrap())))
-            .collect()
     }
 
     /// A module that no class includes and exactly one class `extend`s
@@ -1252,16 +1415,25 @@ impl App {
             fixtures: Vec::new(),
             seeds: None,
             boot_program: Vec::new(),
+            gem_load_statements: Vec::new(),
+            gem_loaded_files: Default::default(),
             boot_gem_constants: Vec::new(),
             gem_middlewares: Vec::new(),
+            gem_middleware_blocks: Default::default(),
+            gem_middleware_args: Default::default(),
+            rack_env_writes: Default::default(),
             gem_middleware_refusals: Vec::new(),
             included_hoist_conflicts: Vec::new(),
+            superclass_refusals: Vec::new(),
+            gem_route_gaps: Vec::new(),
+            generated_route_helpers: Vec::new(),
             importmap: None,
             engine_importmaps: Vec::new(),
             inertia: None,
             vite_manifest: None,
             stylesheets: Vec::new(),
             rbs_signatures: HashMap::default(),
+            rbs_spellings: HashMap::default(),
             rbs_includes: HashMap::default(),
             gem_lock: None,
             loaded_frameworks: None,
@@ -1272,6 +1444,7 @@ impl App {
             content_helper_allowed_attributes: Vec::new(),
             content_helper_allowed_tags: Vec::new(),
             inferred_method_params: HashMap::default(),
+            relation_params: Default::default(),
             helper_method_index: HashMap::default(),
             view_visible_controller_methods: BTreeSet::new(),
             generated_helper_methods: BTreeMap::new(),
@@ -1286,6 +1459,9 @@ impl App {
             pending_attachment_on_load: Vec::new(),
             load_hook_class_macros: Vec::new(),
             load_hook_extended_macros: Vec::new(),
+            load_hook_constants: Vec::new(),
+            macro_includes: Vec::new(),
+            expanded_macro_calls: Vec::new(),
             spliced_class_methods: Default::default(),
             time_tag_calls: Vec::new(),
             partial_local_types: HashMap::default(),
@@ -1302,6 +1478,7 @@ impl App {
             gem_package_settings: Vec::new(),
             auto_source_gems: Vec::new(),
             initializer_response_headers: Vec::new(),
+            runs_after_initialize: false,
             collection_cache_store: None,
             app_requires: Vec::new(),
             sql_functions: Vec::new(),
@@ -1309,14 +1486,23 @@ impl App {
             databases: Vec::new(),
             model_databases: indexmap::IndexMap::new(),
             database_refusals: Vec::new(),
+            database_routes: None,
             ingest_drops: Vec::new(),
             library_class_files: Vec::new(),
             rails_application: None,
             concern_filters: HashMap::default(),
+            concern_filter_refusals: HashMap::default(),
+            plain_mixins: Default::default(),
+            concern_hook_modules: Default::default(),
+            modelled_included_hooks: Default::default(),
+            unguarded_included_hooks: Default::default(),
             graphql_types: Vec::new(),
             graphql_signatures: Vec::new(),
             concern_spliced_actions: HashMap::default(),
             unreachable_views: BTreeSet::new(),
+            pagy: PagyConfig::default(),
+            yield_specialized: Vec::new(),
+            yield_originals: BTreeSet::new(),
             helper_diagnostics: None,
             unknown_association_targets: Vec::new(),
             helper_modules: BTreeSet::new(),
@@ -1324,6 +1510,8 @@ impl App {
             concern_class_side_spans: crate::det::HashSet::default(),
             concern_model_items: HashMap::default(),
             concern_guarded_items: HashMap::default(),
+            concern_class_attr_defaults: HashMap::default(),
+            concern_prepended_items: HashMap::default(),
             concern_included_redefs: HashMap::default(),
             validates_with_guards: Vec::new(),
             current_attribute_classes: Vec::new(),
@@ -1332,6 +1520,7 @@ impl App {
             controller_resolutions: HashMap::default(),
             sources: Vec::new(),
             wrap_parameters_by_default: false,
+            hidden_field_autocomplete: false,
             active_job_retry_jitter: 0.0,
             ports_active_model_validator: false,
             each_validator_calls: Vec::new(),
@@ -1355,7 +1544,7 @@ mod includer_guard_tests {
     use super::IncluderGuard;
 
     fn guard(classes: &[&str], negate: bool) -> IncluderGuard {
-        IncluderGuard { classes: classes.iter().map(|c| c.to_string()).collect(), negate }
+        IncluderGuard { classes: classes.iter().map(|c| c.to_string()).collect(), negate, asked: None }
     }
 
     #[test]
@@ -1380,18 +1569,58 @@ mod includer_guard_tests {
     }
 }
 
-/// `App::sidekiq_redis`: the `url:` and `password:` of the app's
-/// `Sidekiq.configure_client` Redis settings, each `None` when the block
-/// doesn't give it in a form ingest reads.
+/// `App::sidekiq_redis`: the app's `Sidekiq.configure_client` Redis
+/// settings that the push and the worker honor, each `None` when the
+/// block doesn't give it.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SidekiqRedisConfig {
     pub url: Option<RedisSetting>,
     pub password: Option<RedisSetting>,
+    /// `username:`, the Redis 6 ACL user. It overrides the URL's, as
+    /// `password:` does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<RedisSetting>,
+    /// `db:`, which overrides the URL's database. An Integer literal is
+    /// held as its digits; a variable is read, and checked to be an
+    /// Integer, when the push first connects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub db: Option<RedisSetting>,
+    /// `timeout:` (or Sidekiq's `network_timeout:`), the default for the
+    /// two below. Sidekiq passes 3 seconds when the app gives none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_timeout: Option<f64>,
+    /// `reconnect_attempts:` as redis-client reads it: one delay, in
+    /// seconds, per retry after a connection error. An Integer `n` is `n`
+    /// zero delays and `false` is none. Sidekiq passes 1 when the app
+    /// gives none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconnect_attempts: Option<Vec<f64>>,
 }
 
 impl SidekiqRedisConfig {
     pub fn is_empty(&self) -> bool {
-        self.url.is_none() && self.password.is_none()
+        *self == Self::default()
+    }
+
+    /// Sidekiq 8.1.7's `RedisConnection.create` sets `timeout ||= 3`
+    /// before redis-client reads it, and `network_timeout:` replaces it.
+    pub const SIDEKIQ_TIMEOUT: f64 = 3.0;
+
+    pub fn effective_connect_timeout(&self) -> f64 {
+        self.connect_timeout.or(self.timeout).unwrap_or(Self::SIDEKIQ_TIMEOUT)
+    }
+
+    pub fn effective_read_timeout(&self) -> f64 {
+        self.read_timeout.or(self.timeout).unwrap_or(Self::SIDEKIQ_TIMEOUT)
+    }
+
+    /// Sidekiq's `reconnect_attempts ||= 1`: one retry, without a wait.
+    pub fn effective_reconnect_delays(&self) -> Vec<f64> {
+        self.reconnect_attempts.clone().unwrap_or_else(|| vec![0.0])
     }
 }
 
@@ -1512,18 +1741,160 @@ pub struct IngestDrop {
 /// The modules a model's body includes, as `include X` sends it keeps
 /// until the concerns are spliced.
 pub(crate) fn model_includes(model: &Model) -> Vec<crate::ident::ClassId> {
-    let mut ids = Vec::new();
+    model_include_groups(model).into_iter().flatten().collect()
+}
+
+/// [`model_includes`], one group per `include` call: `include A, B` is
+/// one group of two.
+pub(crate) fn model_include_groups(model: &Model) -> Vec<Vec<crate::ident::ClassId>> {
+    let mut groups = Vec::new();
     for item in &model.body {
         if let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item
             && let crate::expr::ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node
             && method.as_str() == "include"
         {
-            for arg in args {
-                if let crate::expr::ExprNode::Const { path } = &*arg.node {
-                    ids.push(crate::analyze::mixin_path_id(path));
+            let ids: Vec<_> = args
+                .iter()
+                .filter_map(|arg| match &*arg.node {
+                    crate::expr::ExprNode::Const { path } => Some(crate::analyze::mixin_path_id(path)),
+                    _ => None,
+                })
+                .collect();
+            if !ids.is_empty() {
+                groups.push(ids);
+            }
+        }
+    }
+    groups
+}
+
+/// The modules a model includes, directly or through other modules, in
+/// Ruby's method-lookup order: the one whose method a call finds first
+/// comes first.
+///
+/// Built as `Module#include` builds it: the included module's ancestors
+/// are walked in order with an insertion point that starts right above
+/// the class. One not in the chain goes in at the point, which then moves
+/// below it. One already there below the point moves the point below
+/// itself, once a module has gone in (`include_modules_at`'s `c_seen`).
+/// One call's arguments go in last to first, so `include A, B` looks in
+/// `A`, then `B`. A module's own includes are taken one call each.
+///
+/// An `ActiveSupport::Concern` defers the concerns it includes: its
+/// includer includes them first, in the order it named them, then the
+/// concern itself, which it skips when it is already there. So with a
+/// model including `Shared` and then `Wrapper`, a concern including
+/// `Tail` and then `Shared`, Rails gives `[Wrapper, Tail, Shared]`, where
+/// plain modules give `[Wrapper, Shared, Tail]`.
+pub(crate) fn model_include_ancestors(
+    model: &Model,
+    library_classes: &[crate::dialect::LibraryClass],
+) -> Vec<crate::ident::ClassId> {
+    use crate::ident::ClassId;
+    struct Modules<'a> {
+        includes: crate::det::HashMap<&'a ClassId, &'a Vec<ClassId>>,
+        concerns: crate::det::HashSet<&'a ClassId>,
+    }
+    impl Modules<'_> {
+        /// A module's ancestors below it, and, for a concern, the concerns
+        /// it defers to its includer.
+        fn own(&self, id: &ClassId, depth: usize) -> (Vec<ClassId>, Vec<ClassId>) {
+            let (mut chain, mut deferred) = (Vec::new(), Vec::new());
+            if depth > 32 {
+                return (chain, deferred);
+            }
+            let concern = self.concerns.contains(id);
+            for n in self.includes.get(id).into_iter().flat_map(|v| v.iter()) {
+                if n == id {
+                    continue;
+                }
+                if concern && self.concerns.contains(n) {
+                    deferred.push(n.clone());
+                } else {
+                    self.include(&mut chain, n, depth + 1);
+                }
+            }
+            (chain, deferred)
+        }
+
+        /// `Module#include` of `m` into a chain whose own entry (the class,
+        /// or the including module) sits just above index 0.
+        fn include(&self, chain: &mut Vec<ClassId>, m: &ClassId, depth: usize) {
+            if depth > 32 {
+                return;
+            }
+            let (below, deferred) = self.own(m, depth);
+            if self.concerns.contains(m) {
+                if chain.contains(m) {
+                    return;
+                }
+                for dep in &deferred {
+                    self.include(chain, dep, depth + 1);
+                }
+            }
+            let mut point = 0;
+            for a in std::iter::once(m.clone()).chain(below) {
+                match chain.iter().position(|present| *present == a) {
+                    Some(at) => {
+                        if point > 0 && at >= point {
+                            point = at + 1;
+                        }
+                    }
+                    None => {
+                        chain.insert(point, a);
+                        point += 1;
+                    }
                 }
             }
         }
     }
-    ids
+    let modules = Modules {
+        includes: library_classes
+            .iter()
+            .filter(|lc| lc.is_module && !lc.includes.is_empty())
+            .map(|lc| (&lc.name, &lc.includes))
+            .collect(),
+        concerns: library_classes
+            .iter()
+            .filter(|lc| lc.is_module && extends_active_support_concern(lc))
+            .map(|lc| &lc.name)
+            .collect(),
+    };
+    let mut chain: Vec<ClassId> = Vec::new();
+    for group in model_include_groups(model) {
+        for id in group.iter().rev() {
+            modules.include(&mut chain, id, 0);
+        }
+    }
+    chain
+}
+
+/// Whether a module runs `extend ActiveSupport::Concern` (or
+/// `self.extend`), which the ingest keeps as one of its unmodelled calls.
+fn extends_active_support_concern(lc: &crate::dialect::LibraryClass) -> bool {
+    lc.unknown_calls.iter().any(|call| {
+        let crate::expr::ExprNode::Send { recv, method, args, block: None, .. } = &*call.node else { return false };
+        if !recv.as_ref().is_none_or(|r| matches!(&*r.node, crate::expr::ExprNode::SelfRef)) {
+            return false;
+        }
+        method.as_str() == "extend"
+            && args.iter().any(|arg| {
+                matches!(&*arg.node, crate::expr::ExprNode::Const { path }
+                    if path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>() == ["ActiveSupport", "Concern"])
+            })
+    })
+}
+
+/// A class's superclasses in [`App::class_parents`], nearest first. The
+/// first parent that is no app class (`ApplicationRecord`'s
+/// `ActiveRecord::Base`) is the last one yielded, and a cycle ends the
+/// walk instead of looping.
+pub fn class_ancestors<'a>(parents: &'a HashMap<&'a str, Option<&'a str>>, class: &str) -> impl Iterator<Item = &'a str> {
+    let mut seen: crate::det::HashSet<&str> = crate::det::HashSet::default();
+    let mut current = parents.get(class).copied().flatten();
+    std::iter::from_fn(move || {
+        let name = current.filter(|name| seen.insert(name))?;
+        current = parents.get(name).copied().flatten();
+        Some(name)
+    })
 }

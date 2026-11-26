@@ -25,6 +25,7 @@ pub use ir::{
     Order, Predicate, PreloadDirective, Select, Update, Value, ValueType,
 };
 pub use visitor::{ArelVisitor, SqliteVisitor};
+pub(crate) use ruby_values::StringEnums;
 
 use crate::det::HashMap;
 
@@ -65,10 +66,12 @@ pub fn rewrite_arel_in_expr_with_assocs(
     assocs: &[crate::lower::model_associations::AssociationEdge],
 ) -> bool {
     let no_scopes = crate::det::HashSet::default();
-    rewrite_arel_in_expr_with_ruby_values(expr, schema, registry, assocs, false, &no_scopes, SqliteVisitor::default())
+    rewrite_arel_in_expr_with_ruby_values(expr, schema, registry, assocs, None, &no_scopes, SqliteVisitor::default())
 }
 
 /// Ruby-family values preserve SQL NULL without changing strict-target emit.
+/// `ruby_read_values` is `Some` on those targets only, with the String
+/// enum mappings a folded literal is cast through.
 /// `scopes` is the app's relation-returning class methods (`scope`
 /// declarations plus class methods whose body tail is a query chain) —
 /// see `relation_refined_method_names` for why these license the same
@@ -78,7 +81,7 @@ pub(crate) fn rewrite_arel_in_expr_with_ruby_values(
     schema: &Schema,
     registry: &HashMap<ClassId, ClassInfo>,
     assocs: &[crate::lower::model_associations::AssociationEdge],
-    ruby_read_values: bool,
+    ruby_read_values: Option<&StringEnums>,
     scopes: &crate::det::HashSet<crate::ident::Symbol>,
     visitor: SqliteVisitor,
 ) -> bool {
@@ -663,7 +666,7 @@ fn model_declares_scope(registry: &HashMap<ClassId, ClassInfo>, model: &ClassId,
 pub(crate) fn returns_relation(ty: &Ty) -> bool {
     match ty {
         Ty::Relation { .. } => true,
-        Ty::Fn { ret, .. } => returns_relation(ret),
+        Ty::Fn(fn_ty) => returns_relation(&fn_ty.ret),
         _ => false,
     }
 }
@@ -674,7 +677,7 @@ fn rewrite_arel_inner(
     registry: &HashMap<ClassId, ClassInfo>,
     assocs: &[crate::lower::model_associations::AssociationEdge],
     refined: &RefinedNames,
-    ruby_read_values: bool,
+    ruby_read_values: Option<&StringEnums>,
     scopes: &crate::det::HashSet<crate::ident::Symbol>,
     visitor: SqliteVisitor,
 ) -> bool {
@@ -697,8 +700,8 @@ fn rewrite_arel_inner(
         if let Some((mut op, owner)) =
             build::try_build_arel_with_assocs(expr, schema, registry, assocs)
         {
-            if ruby_read_values {
-                ruby_values::normalize(&mut op, schema);
+            if let Some(enums) = ruby_read_values {
+                ruby_values::normalize(&mut op, schema, enums.of(&owner));
             }
             let mut replacement = visitor.visit(&op, schema, &owner);
             // The expansion replaces the recognized chain wholesale;
@@ -776,7 +779,7 @@ fn rewrite_arel_spine_args(
     registry: &HashMap<ClassId, ClassInfo>,
     assocs: &[crate::lower::model_associations::AssociationEdge],
     refined: &RefinedNames,
-    ruby_read_values: bool,
+    ruby_read_values: Option<&StringEnums>,
     scopes: &crate::det::HashSet<crate::ident::Symbol>,
     visitor: SqliteVisitor,
 ) -> bool {
@@ -878,6 +881,12 @@ fn is_inert(e: &Expr) -> bool {
 
 thread_local! {
     static HOIST_TEMPORARIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Temporaries this thread has hoisted. Work handed to a worker thread
+/// must hoist none: the names follow the order bodies are lowered in.
+pub(crate) fn hoisted_temporaries() -> usize {
+    HOIST_TEMPORARIES.with(std::cell::Cell::get)
 }
 
 /// `__hoisted_N = <slot>`, leaving a read of `__hoisted_N` in its place.

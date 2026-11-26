@@ -30,6 +30,18 @@ pub(super) fn with_anonymous_rest<T>(name: Option<Symbol>, f: impl FnOnce() -> T
     out
 }
 
+thread_local! {
+    static BLOCK_PARAM: std::cell::RefCell<Option<Symbol>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Ingests a `def` body whose `&name` parameter is `name`: a block handed on from it is the block the method was given.
+pub(super) fn with_block_param<T>(name: Option<Symbol>, f: impl FnOnce() -> T) -> T {
+    let saved = BLOCK_PARAM.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), name));
+    let out = f();
+    BLOCK_PARAM.with(|slot| *slot.borrow_mut() = saved);
+    out
+}
+
 use crate::ingest::prism_api::PrismLocation;
 pub fn ingest_expr(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
     // Survey-mode gate: when active, intercept Err returns and
@@ -1197,10 +1209,19 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
                 return Ok(source_file_path_lit(span, dir));
             }
             if let Some(body) = writing_connection_block(&c) {
-                return match body {
-                    Some(body) => ingest_expr(&body, file),
-                    None => Ok(Expr::new(span, ExprNode::Lit { value: Literal::Nil })),
+                let mut body = match body {
+                    WritingBlock::Body(Some(body)) => ingest_expr(&body, file)?,
+                    WritingBlock::Body(None) => Expr::new(span, ExprNode::Lit { value: Literal::Nil }),
+                    WritingBlock::Forwarded(name) => Expr::new(span, ExprNode::Send {
+                        recv: Some(Expr::new(span, ExprNode::Var { id: crate::ident::VarId(0), name })),
+                        method: Symbol::from("call"),
+                        args: Vec::new(),
+                        block: None,
+                        parenthesized: false,
+                    }),
                 };
+                body.decisions |= crate::expr::ERASED_WRITING_SCOPE;
+                return Ok(body);
             }
             let args: Vec<Expr> = if let Some(a) = c.arguments() {
                 ingest_forwardable_arguments(&a, file)?
@@ -1810,16 +1831,21 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         }
         n if n.as_lambda_node().is_some() => {
             let l = n.as_lambda_node().unwrap();
-            refuse_block_capture(l.parameters(), file)?;
+            // A stabby lambda's `&block` is its own parameter (view_component's slot lambdas take one), kept as a
+            // `define_method` block's is; an anonymous `&` has no name to keep.
+            let block_param = named_block_param(l.parameters());
+            if block_param.is_none() {
+                refuse_block_capture(l.parameters(), file)?;
+            }
             let extra_params = block_extra_params(l.parameters(), file)?;
             let params = block_param_names(l.parameters());
             let mut rest_param = lambda_rest_param(l.parameters());
-            let body = ingest_block_body(|| l.parameters(), l.body(), &mut rest_param, file)?;
+            let body = unless_shadowed(l.parameters(), || ingest_block_body(|| l.parameters(), l.body(), &mut rest_param, file))?;
             // `->(x) { body }` literals always use brace form (Prism's
             // opening_loc is `{`); `->(x) do body end` exists but isn't
             // idiomatic and doesn't appear in any fixture yet.
             let block_style = block_style_from_opening(l.opening_loc().as_slice());
-            ExprNode::Lambda { extra_params, rest_param, params, block_param: None, body, block_style }
+            ExprNode::Lambda { extra_params, rest_param, params, block_param, body, block_style }
         }
         n if n.as_yield_node().is_some() => {
             let y = n.as_yield_node().unwrap();
@@ -2430,14 +2456,14 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             }
             let else_branch = match b.else_clause() {
                 Some(e) => match e.statements() {
-                    Some(s) => Some(ingest_expr(&s.as_node(), file)?),
+                    Some(s) => Some(Box::new(ingest_expr(&s.as_node(), file)?)),
                     None => None,
                 },
                 None => None,
             };
             let ensure = match b.ensure_clause() {
                 Some(e) => match e.statements() {
-                    Some(s) => Some(ingest_expr(&s.as_node(), file)?),
+                    Some(s) => Some(Box::new(ingest_expr(&s.as_node(), file)?)),
                     None => None,
                 },
                 None => None,
@@ -3104,6 +3130,42 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         // own expressions, so a constant or call in the block is not lost.
         n if n.as_singleton_class_node().is_some() => {
             let sc = n.as_singleton_class_node().unwrap();
+            // Not another object's as `self`'s: its body defines on that object. Attribute macros alone are that object's singleton class's (`class << mod; attr_accessor :x; end`), a public call since Ruby 2.5.
+            if sc.expression().as_self_node().is_none() {
+                let stmts: Vec<_> = sc.body().and_then(|b| b.as_statements_node()).map(|s| s.body().iter().collect()).unwrap_or_default();
+                let attrs = !stmts.is_empty()
+                    && stmts.iter().all(|stmt| {
+                        stmt.as_call_node().is_some_and(|c| {
+                            c.receiver().is_none()
+                                && c.block().is_none()
+                                && matches!(constant_id_str(&c.name()).as_ref(), "attr_accessor" | "attr_reader" | "attr_writer")
+                                && c.arguments().is_some_and(|a| a.arguments().iter().all(|x| x.as_symbol_node().is_some()))
+                        })
+                    });
+                // `(class << hash; self; end)`: the body answers the singleton class and defines nothing, which is
+                // `hash.singleton_class` (Hashie's `IndifferentAccess.inject!`).
+                if let [only] = stmts.as_slice()
+                    && only.as_self_node().is_some()
+                {
+                    let owner = ingest_expr(&sc.expression(), file)?;
+                    return Ok(Expr::new(span, ExprNode::Send { recv: Some(owner), method: Symbol::from("singleton_class"), args: Vec::new(), block: None, parenthesized: false }));
+                }
+                if attrs {
+                    let owner = ingest_expr(&sc.expression(), file)?;
+                    let singleton = Expr::new(span, ExprNode::Send { recv: Some(owner), method: Symbol::from("singleton_class"), args: Vec::new(), block: None, parenthesized: false });
+                    let mut calls = Vec::new();
+                    for stmt in &stmts {
+                        let call = stmt.as_call_node().expect("checked above");
+                        let args = call.arguments().map(|a| a.arguments().iter().map(|x| ingest_expr(&x, file)).collect::<IngestResult<Vec<_>>>()).transpose()?.unwrap_or_default();
+                        calls.push(Expr::new(span, ExprNode::Send { recv: Some(singleton.clone()), method: Symbol::from(constant_id_str(&call.name()).as_ref()), args, block: None, parenthesized: true }));
+                    }
+                    return Ok(if calls.len() == 1 { calls.pop().expect("one") } else { Expr::new(span, ExprNode::Seq { exprs: calls }) });
+                }
+                return Err(IngestError::Unsupported {
+                    file: file.into(),
+                    message: "`class << obj` on an object other than self inside a method or block (its body defines on that object)".into(),
+                });
+            }
             match sc.body() {
                 Some(body) => return ingest_expr(&body, file),
                 None => ExprNode::Lit { value: Literal::Nil },
@@ -3116,7 +3178,17 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             });
         }
     };
-    Ok(Expr::new(span, expr_node))
+    let mut out = Expr::new(span, expr_node);
+    if let Some(c) = node.as_call_node()
+        && c.receiver().is_none()
+        && c.arguments().is_none()
+        && c.block().is_none()
+        && c.opening_loc().is_some()
+        && matches!(&*out.node, ExprNode::Send { recv: None, args, .. } if args.is_empty())
+    {
+        out.decisions |= crate::expr::WRITTEN_EMPTY_PARENS;
+    }
+    Ok(out)
 }
 
 /// Ingest a `case/in` arm's pattern, unwrapping a guard first when the
@@ -3765,7 +3837,7 @@ fn ingest_call_block(
                 {
                     if let Some(blk) = call.block() {
                         if let Some(b) = blk.as_block_node() {
-                            return Ok(Some(ingest_block_node_as_lambda(&b, file)?));
+                            return Ok(Some(ingest_block_node_as_lambda(&b, file, false)?));
                         }
                     }
                 }
@@ -3780,7 +3852,7 @@ fn ingest_call_block(
                 let extra_params = block_extra_params(lam.parameters(), file)?;
                 let params = block_param_names(lam.parameters());
                 let mut rest_param = lambda_rest_param(lam.parameters());
-                let body = ingest_block_body(|| lam.parameters(), lam.body(), &mut rest_param, file)?;
+                let body = unless_shadowed(lam.parameters(), || ingest_block_body(|| lam.parameters(), lam.body(), &mut rest_param, file))?;
                 let block_style = block_style_from_opening(lam.opening_loc().as_slice());
                 return Ok(Some(Expr::new(
                     Span::synthetic(),
@@ -3831,7 +3903,9 @@ fn ingest_call_block(
             message: "scoped find-or-create cannot be lowered safely: block locals and optional, post, keyword, block or anonymous-rest parameters are not represented in initialization-block IR".into(),
         });
     }
-    Ok(Some(ingest_block_node_as_lambda(&b, file)?))
+    // `define_method(name) { |*args, &block| … }`: the block becomes a method's own block parameter, which a `def` carries.
+    let keeps_block = matches!(enclosing_method, "define_method" | "define_singleton_method");
+    Ok(Some(ingest_block_node_as_lambda(&b, file, keeps_block)?))
 }
 
 /// Ingest a literal block's params/body into a `Lambda` `Expr`. Shared
@@ -3839,17 +3913,66 @@ fn ingest_call_block(
 /// `&proc { ... }`/`&lambda { ... }` block-argument desugar, which
 /// hands this the same `BlockNode` shape one level deeper (inside the
 /// `proc`/`lambda` call's own block).
-fn ingest_block_node_as_lambda(b: &ruby_prism::BlockNode<'_>, file: &str) -> IngestResult<Expr> {
-    refuse_block_capture(b.parameters(), file)?;
+fn ingest_block_node_as_lambda(b: &ruby_prism::BlockNode<'_>, file: &str, keeps_block: bool) -> IngestResult<Expr> {
+    let block_param = if keeps_block { named_block_param(b.parameters()) } else { None };
+    if block_param.is_none() {
+        refuse_block_capture(b.parameters(), file)?;
+    }
     let extra_params = block_extra_params(b.parameters(), file)?;
     let params = block_param_names(b.parameters());
     let mut rest_param = block_rest_param(b.parameters());
-    let body = ingest_block_body(|| b.parameters(), b.body(), &mut rest_param, file)?;
+    let body = unless_shadowed(b.parameters(), || ingest_block_body(|| b.parameters(), b.body(), &mut rest_param, file))?;
     let block_style = block_style_from_opening(b.opening_loc().as_slice());
     Ok(Expr::new(
         Span::synthetic(),
-        ExprNode::Lambda { extra_params, rest_param, params, block_param: None, body, block_style },
+        ExprNode::Lambda { extra_params, rest_param, params, block_param, body, block_style },
     ))
+}
+
+/// Ingests a block or lambda body, outside the method's block when its parameters bind that name.
+// Not by the parsed parameter lists: a block-local (`|a; block|`) and a destructured one are in neither, and the written list names them all.
+fn unless_shadowed<T>(params_node: Option<Node<'_>>, f: impl FnOnce() -> T) -> T {
+    let text = params_node.map(|node| String::from_utf8_lossy(node.location().as_slice()).into_owned()).unwrap_or_default();
+    let shadows = BLOCK_PARAM.with(|slot| {
+        slot.borrow().as_ref().is_some_and(|name| text.split(|c: char| !(c.is_alphanumeric() || c == '_')).any(|word| word == name.as_str()))
+    });
+    if shadows { with_block_param(None, f) } else { f() }
+}
+
+/// The `&name` parameter a `def` is given, unless its body assigns the name: then `&name` may hand on another value.
+pub(super) fn def_block_param(name: Option<Symbol>, body: Option<&Node<'_>>) -> Option<Symbol> {
+    struct Writes<'n>(&'n str, bool);
+    impl<'pr> ruby_prism::Visit<'pr> for Writes<'_> {
+        fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
+            self.1 |= constant_id_str(&node.name()) == self.0;
+            ruby_prism::visit_local_variable_write_node(self, node);
+        }
+        fn visit_local_variable_or_write_node(&mut self, node: &ruby_prism::LocalVariableOrWriteNode<'pr>) {
+            self.1 |= constant_id_str(&node.name()) == self.0;
+            ruby_prism::visit_local_variable_or_write_node(self, node);
+        }
+        fn visit_local_variable_and_write_node(&mut self, node: &ruby_prism::LocalVariableAndWriteNode<'pr>) {
+            self.1 |= constant_id_str(&node.name()) == self.0;
+            ruby_prism::visit_local_variable_and_write_node(self, node);
+        }
+        fn visit_local_variable_operator_write_node(&mut self, node: &ruby_prism::LocalVariableOperatorWriteNode<'pr>) {
+            self.1 |= constant_id_str(&node.name()) == self.0;
+            ruby_prism::visit_local_variable_operator_write_node(self, node);
+        }
+        fn visit_local_variable_target_node(&mut self, node: &ruby_prism::LocalVariableTargetNode<'pr>) {
+            self.1 |= constant_id_str(&node.name()) == self.0;
+        }
+    }
+    let name = name?;
+    let Some(body) = body else { return Some(name) };
+    let mut writes = Writes(name.as_str(), false);
+    ruby_prism::Visit::visit(&mut writes, body);
+    (!writes.1).then_some(name)
+}
+
+fn named_block_param(params_node: Option<Node<'_>>) -> Option<Symbol> {
+    let block = params_node?.as_block_parameters_node()?.parameters()?.block()?;
+    block.as_block_parameter_node()?.name().map(|n| Symbol::from(constant_id_str(&n).as_ref()))
 }
 
 /// `method(:name)` / `recv.method(:name)` → `ExprNode::MethodRef`.
@@ -4275,8 +4398,12 @@ fn destructure_block_params(params_node: Option<Node<'_>>, body: Expr, file: &st
     // otherwise become the value: a rest binding answers the tail, and
     // `map { |(month, *row)| }` would return those tails.
     let body_empty = matches!(&*body.node, ExprNode::Seq { exprs } if exprs.is_empty());
+    // A writing block read as its body stays one statement, with its mark
+    // (`ERASED_WRITING_SCOPE`): spliced in, a routed app could not put the
+    // call back around it.
+    let erased = body.decisions & crate::expr::ERASED_WRITING_SCOPE != 0;
     match *body.node {
-        ExprNode::Seq { exprs } => prelude.extend(exprs),
+        ExprNode::Seq { exprs } if !erased => prelude.extend(exprs),
         other => prelude.push(Expr { node: Box::new(other), ..body }),
     }
     if body_empty {
@@ -4374,9 +4501,15 @@ fn desugar_post_params(rest_param: &mut Option<Symbol>, posts: Vec<Symbol>, body
             )
         })
         .collect();
+    // As in `destructure_block_params`: a marked body stays one statement.
+    let erased = body.decisions & crate::expr::ERASED_WRITING_SCOPE != 0;
     match *body.node {
-        ExprNode::Seq { exprs: inner } => exprs.extend(inner),
-        other => exprs.push(Expr::new(body.span, other)),
+        ExprNode::Seq { exprs: inner } if !erased => exprs.extend(inner),
+        other => {
+            let mut only = Expr::new(body.span, other);
+            only.decisions = body.decisions;
+            exprs.push(only);
+        }
     }
     Expr::new(Span::synthetic(), ExprNode::Seq { exprs })
 }
@@ -4407,8 +4540,10 @@ fn scope_block_locals(params_node: Option<Node<'_>>, mut body: Expr) -> Expr {
                 },
             );
             let mut exprs = vec![init];
+            // As in `destructure_block_params`: a marked body stays one statement.
+            let erased = body.decisions & crate::expr::ERASED_WRITING_SCOPE != 0;
             match *body.node {
-                ExprNode::Seq { exprs: inner } => exprs.extend(inner),
+                ExprNode::Seq { exprs: inner } if !erased => exprs.extend(inner),
                 other => exprs.push(Expr { node: Box::new(other), ..body }),
             }
             body = Expr::new(Span::synthetic(), ExprNode::Seq { exprs });
@@ -4834,7 +4969,14 @@ fn binary_string(s: &ruby_prism::StringNode<'_>, span: Span, file: &str) -> Inge
 /// unsupported `connected_to`.
 /// ponytail: a local first assigned in the block outlives it once inlined;
 /// a later bare call of that name would read it.
-fn writing_connection_block<'pr>(c: &ruby_prism::CallNode<'pr>) -> Option<Option<Node<'pr>>> {
+/// A block handed on from a local (`connected_to(role: :writing, &block)`, doorkeeper's
+/// `with_primary_role`) is that block, called.
+enum WritingBlock<'pr> {
+    Body(Option<Node<'pr>>),
+    Forwarded(Symbol),
+}
+
+fn writing_connection_block<'pr>(c: &ruby_prism::CallNode<'pr>) -> Option<WritingBlock<'pr>> {
     if constant_id_str(&c.name()) != "connected_to"
         || c.receiver().and_then(|r| super::util::constant_path_of(&r)).as_deref() != Some(&["ActiveRecord".to_string(), "Base".to_string()])
     {
@@ -4847,6 +4989,15 @@ fn writing_connection_block<'pr>(c: &ruby_prism::CallNode<'pr>) -> Option<Option
     let assoc = element.as_assoc_node()?;
     if symbol_value(&assoc.key()).as_deref() != Some("role") || symbol_value(&assoc.value()).as_deref() != Some("writing") {
         return None;
+    }
+    if let Some(forwarded) = c.block()?.as_block_argument_node() {
+        let local = forwarded.expression()?.as_local_variable_read_node()?;
+        let name = Symbol::from(constant_id_str(&local.name()).as_ref());
+        // Not any local: `&callback` converts through `to_proc`, which only the method's own block needs no call for.
+        if BLOCK_PARAM.with(|slot| slot.borrow().as_ref() != Some(&name)) {
+            return None;
+        }
+        return Some(WritingBlock::Forwarded(name));
     }
     let block = c.block()?.as_block_node()?;
     if block.parameters().is_some() {
@@ -4878,7 +5029,7 @@ fn writing_connection_block<'pr>(c: &ruby_prism::CallNode<'pr>) -> Option<Option
             return None;
         }
     }
-    Some(body)
+    Some(WritingBlock::Body(body))
 }
 
 fn wide_integer(value: &ruby_prism::Integer<'_>, span: Span) -> Expr {

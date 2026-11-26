@@ -5,6 +5,8 @@
 //! Skips when `ruby` with the sqlite3 gem is not on the machine; the CI
 //! core job has it.
 
+#[path = "support/prerequisite.rs"]
+mod prerequisite;
 #[path = "support/scratch.rs"]
 mod scratch;
 use std::path::PathBuf;
@@ -40,7 +42,7 @@ fn tree() -> PathBuf {
 #[test]
 fn relation_surface_answers_like_rails() {
     if !Command::new("ruby").args(["-rsqlite3", "-e", "1"]).status().is_ok_and(|s| s.success()) {
-        eprintln!("skipping: ruby with the sqlite3 gem not available");
+        prerequisite::missing("ruby with the sqlite3 gem not available");
         return;
     }
     let out = tree();
@@ -91,7 +93,7 @@ p (only_a & [Note.find(a.id)]).length
 #[test]
 fn relation_enumeration_chains_answer_loaded_rows() {
     if !Command::new("ruby").args(["-rsqlite3", "-e", "1"]).status().is_ok_and(|s| s.success()) {
-        eprintln!("skipping: ruby with the sqlite3 gem not available");
+        prerequisite::missing("ruby with the sqlite3 gem not available");
         return;
     }
     let out = tree();
@@ -128,7 +130,7 @@ p relation.sort_by.with_index { |record, index| 0 }.map { |record| record.body }
 #[test]
 fn relation_create_returns_records_and_create_bang_raises_on_invalid_records() {
     if !Command::new("ruby").args(["-rsqlite3", "-e", "1"]).status().is_ok_and(|s| s.success()) {
-        eprintln!("skipping: ruby with the sqlite3 gem not available");
+        prerequisite::missing("ruby with the sqlite3 gem not available");
         return;
     }
     let out = tree();

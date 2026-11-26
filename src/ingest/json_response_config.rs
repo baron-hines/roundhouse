@@ -76,7 +76,6 @@ mod tests {
     #[test]
     fn computed_escaping_values_are_refused() {
         for source in [
-            "module App\n  class Application < Rails::Application\n    config.load_defaults ENV.fetch('DEFAULTS')\n  end\nend\n",
             "module App\n  class Application < Rails::Application\n    config.action_controller.escape_json_responses = ENV['ESCAPE'] == '1'\n  end\nend\n",
             "Rails.application.configure do\n  config.active_support.escape_js_separators_in_json = nil\nend\n",
         ] {

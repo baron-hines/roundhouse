@@ -1,10 +1,12 @@
 //! Callback registration order, compared with the same declarations on Rails.
+#[path = "support/prerequisite.rs"]
+mod prerequisite;
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
 const BASE: &str =
     "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n";
-const SCHEMA: &str = r#"ActiveRecord::Schema.define do
+const SCHEMA: &str = r#"ActiveRecord::Schema[8.1].define(version: 1) do
   create_table :items, force: true do |t|
     t.string :name
     t.string :code
@@ -55,7 +57,7 @@ ActiveRecord::Schema.verbose = false
         .output()
         .expect("Rails oracle");
     if output.status.code() == Some(77) {
-        eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+        prerequisite::missing(String::from_utf8_lossy(&output.stderr).trim());
     } else {
         assert!(
             output.status.success(),
@@ -442,12 +444,16 @@ fn constant_prepend_on_validates_with_keeps_its_original_value() {
     );
 }
 
+/// One build for every case: each gets its own numbered `Item` and table, and a
+/// local of its own, so that no case widens another's. Not a build each: ten
+/// whole-runtime compiles in one test outran its CI shard. The tests above
+/// still compare each case alone with Rails.
 #[test]
 #[ignore = "requires the Spinel toolchain"]
 fn registration_order_identity_ownership_and_truthiness_run_natively() {
-    app(&[("app/models/item.rb", OWNED_MULTI_VALIDATE)])
-        .run_spinel_with_db(OWNED_MULTI_SCRIPT)
-        .assert_passes();
+    // Two validators of this name differ in their superclass, so one is renamed.
+    let flag_with_validator = FLAG_WITH_VALIDATOR.replace("FlagValidator", "FlagWithValidator");
+    let flag_with_item = FLAG_WITH_ITEM.replace("FlagValidator", "FlagWithValidator");
     let cases: &[(&[(&str, &str)], &str, bool, &str)] = &[
         (
             &[
@@ -504,23 +510,43 @@ fn registration_order_identity_ownership_and_truthiness_run_natively() {
         ),
         (
             &[
-                ("app/validators/flag_validator.rb", FLAG_WITH_VALIDATOR),
-                ("app/models/item.rb", FLAG_WITH_ITEM),
+                ("app/validators/flag_with_validator.rb", &flag_with_validator),
+                ("app/models/item.rb", &flag_with_item),
             ],
             "Item",
             false,
             "false option",
         ),
     ];
-    for (files, class, valid, errors) in cases {
-        let script = format!(
-            r#"record = {class}.new(name: "", code: "", enabled: true)
-raise "validity" unless record.valid? == {valid}
-raise record.errors.to_a.inspect unless record.errors.to_a.join("|") == {errors:?}
-"#
-        );
-        app(files).run_spinel_with_db(&script).assert_passes();
+    let own = |source: &str, n: usize| source.replace("Item", &format!("Item{n}"));
+    // The app-owned batch `validate`'s own check is case 0; the table's cases follow it.
+    let mut tables = String::from("ActiveRecord::Schema[8.1].define(version: 1) do\n");
+    for n in 0..=cases.len() {
+        tables.push_str(&format!(
+            "  create_table :item{n}s, force: true do |t|\n    t.string :name\n    t.string :code\n    t.string :type\n    t.boolean :enabled\n  end\n"
+        ));
     }
+    tables.push_str("end\n");
+    let mut overlay = emit_and_run::empty_app()
+        .write("app/models/application_record.rb", BASE)
+        .write("db/schema.rb", tables.as_str())
+        .write("app/models/item0.rb", own(OWNED_MULTI_VALIDATE, 0).as_str());
+    let mut script = own(OWNED_MULTI_SCRIPT, 0);
+    for (i, (files, class, valid, errors)) in cases.iter().enumerate() {
+        let n = i + 1;
+        for (path, source) in *files {
+            let path = path.replace("item.rb", &format!("item{n}.rb"));
+            overlay = overlay.write(&path, own(source, n).as_str());
+        }
+        let class = own(class, n);
+        script.push_str(&format!(
+            r#"record{n} = {class}.new(name: "", code: "", enabled: true)
+raise "case {n} validity" unless record{n}.valid? == {valid}
+raise "case {n}: " + record{n}.errors.to_a.inspect unless record{n}.errors.to_a.join("|") == {errors:?}
+"#
+        ));
+    }
+    overlay.run_spinel_with_db(&script).assert_passes();
 }
 
 const METHODS: &str = r#"class Item < ApplicationRecord
@@ -964,7 +990,7 @@ raise record.errors.inspect unless record.errors[:name] == ["first", "length", "
         .output()
         .expect("Sequel control");
     if output.status.code() == Some(77) {
-        eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+        prerequisite::missing(String::from_utf8_lossy(&output.stderr).trim());
     } else {
         assert!(
             output.status.success(),
@@ -1016,6 +1042,9 @@ RailsOracle.activate('railties', 'activerecord', sqlite3: '>= 2.9')
 require 'rails'
 require 'active_record/railtie'
 require 'tmpdir'
+require 'fileutils'
+ORACLE_ROOT = Dir.mktmpdir('validation-oracle')
+at_exit {{ FileUtils.remove_entry(ORACLE_ROOT) unless ENV['ROUNDHOUSE_KEEP_EMITTED'] }}
 ENV['RAILS_ENV'] = 'test'
 ENV['DATABASE_URL'] = 'sqlite3::memory:'
 class ValidationOracle < Rails::Application
@@ -1023,7 +1052,7 @@ class ValidationOracle < Rails::Application
   config.eager_load = false
   config.secret_key_base = 'validation-oracle-key'
   config.logger = Logger.new(File::NULL)
-  config.root = Dir.mktmpdir('validation-oracle')
+  config.root = ORACLE_ROOT
 end
 ValidationOracle.initialize!
 ActiveRecord::Base.establish_connection(adapter: 'sqlite3', database: ':memory:')
@@ -1034,7 +1063,7 @@ ActiveRecord::Schema.verbose = false
 {script}
 "#)]).output().expect("Rails 8.1 control");
     if output.status.code() == Some(77) {
-        eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+        prerequisite::missing(String::from_utf8_lossy(&output.stderr).trim());
         return None;
     }
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));

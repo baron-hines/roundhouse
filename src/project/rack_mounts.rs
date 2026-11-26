@@ -159,7 +159,7 @@ end
     } else {
         replace(
             main,
-            "    matched = ActionDispatch::Router.match(verb, request_path, Main.route_table)\n",
+            "    matched = RouteTable.match_asking(verb, request_path, Main.route_table, request_obj)\n",
             NATIVE_DISPATCH,
         )?;
     }
@@ -193,7 +193,7 @@ const NATIVE_DISPATCH: &str = r#"    rack_index = RouteTable.rack_index(verb, re
         return
       end
     end
-    matched = ActionDispatch::Router.match(verb, request_path, Main.route_table)
+    matched = RouteTable.match_asking(verb, request_path, Main.route_table, request_obj)
 "#;
 
 fn ruby_string(value: &str) -> String {

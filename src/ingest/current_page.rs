@@ -29,41 +29,67 @@ use crate::ident::Symbol;
 /// for (a layout, a shared partial), and a `helper_method` only a concern
 /// declares, count as answered.
 pub(crate) fn app_defines_current_page(app: &App, view: Option<&str>) -> bool {
+    current_page_answers(app)(view)
+}
+
+/// [`app_defines_current_page`] with its view-independent
+/// part (helper scan, declaring controllers, controllers by name) computed
+/// once, for callers that ask it per view.
+pub(crate) fn current_page_answers(app: &App) -> impl Fn(Option<&str>) -> bool + '_ {
     let name = Symbol::from("current_page?");
-    if app.helper_method_index.get(&name).is_some_and(|owner| app.helper_modules.contains(owner)) || helpers_define(app, &name) {
-        return true;
-    }
-    let declaring: Vec<&crate::ident::ClassId> = app
-        .controllers
-        .iter()
-        .filter(|c| crate::lower::controller_to_library::helper_method_marked_names(c).contains(&name))
-        .map(|c| &c.name)
-        .collect();
-    if declaring.is_empty() {
-        return app.view_visible_controller_methods.contains(&name);
-    }
-    let reaches = |controller: Option<&crate::dialect::Controller>| {
-        let mut current = controller;
-        let mut seen = 0;
-        while let Some(c) = current {
-            if declaring.contains(&&c.name) {
-                return true;
-            }
-            seen += 1;
-            if seen > app.controllers.len() {
-                break;
-            }
-            current = c.parent.as_ref().and_then(|p| app.controllers.iter().find(|o| &o.name == p));
-        }
-        false
+    let always = app.helper_method_index.get(&name).is_some_and(|owner| app.helper_modules.contains(owner)) || helpers_define(app, &name);
+    let declaring: std::collections::HashSet<&crate::ident::ClassId> = if always {
+        Default::default()
+    } else {
+        app.controllers
+            .iter()
+            .filter(|c| crate::lower::controller_to_library::helper_method_marked_names(c).contains(&name))
+            .map(|c| &c.name)
+            .collect()
     };
-    // A helper module's body runs in any controller's views: only an
-    // override every controller inherits answers it.
-    let Some(view) = view else { return app.controllers.iter().all(|c| reaches(Some(c))) };
-    let dir = view.rsplit_once('/').map_or("", |(d, _)| d);
-    let controller = format!("{}Controller", crate::naming::camelize_path(dir));
-    let current = app.controllers.iter().find(|c| c.name.0.as_str() == controller);
-    current.is_none() || reaches(current)
+    let visible = app.view_visible_controller_methods.contains(&name);
+    let no_declaring = !always && declaring.is_empty();
+    let mut by_name: std::collections::HashMap<&str, &crate::dialect::Controller> = std::collections::HashMap::new();
+    for c in app.controllers.iter().rev() {
+        by_name.insert(c.name.0.as_str(), c);
+    }
+    let helper_body = !always && !no_declaring && app.controllers.iter().all(|c| reaches(app.controllers.len(), &declaring, &by_name, Some(c)));
+    move |view: Option<&str>| {
+        if always {
+            return true;
+        }
+        if no_declaring {
+            return visible;
+        }
+        // A helper module's body runs in any controller's views: only an
+        // override every controller inherits answers it.
+        let Some(view) = view else { return helper_body };
+        let dir = view.rsplit_once('/').map_or("", |(d, _)| d);
+        let controller = format!("{}Controller", crate::naming::camelize_path(dir));
+        let current = by_name.get(controller.as_str()).copied();
+        current.is_none() || reaches(app.controllers.len(), &declaring, &by_name, current)
+    }
+}
+
+fn reaches<'a>(
+    limit: usize,
+    declaring: &std::collections::HashSet<&crate::ident::ClassId>,
+    by_name: &std::collections::HashMap<&str, &'a crate::dialect::Controller>,
+    controller: Option<&'a crate::dialect::Controller>,
+) -> bool {
+    let mut current = controller;
+    let mut seen = 0;
+    while let Some(c) = current {
+        if declaring.contains(&c.name) {
+            return true;
+        }
+        seen += 1;
+        if seen > limit {
+            break;
+        }
+        current = c.parent.as_ref().and_then(|p| by_name.get(p.0.as_str()).copied());
+    }
+    false
 }
 
 /// Whether an `app/helpers` module, or an app module one includes
@@ -93,12 +119,13 @@ fn helpers_define(app: &App, name: &Symbol) -> bool {
 /// (`app_defines_current_page`). Other library classes are left alone:
 /// their own `current_page?` is theirs.
 pub(crate) fn for_each_view_context_body(app: &App, f: &mut impl FnMut(&Expr)) {
+    let answers = current_page_answers(app);
     for view in &app.views {
-        if !app_defines_current_page(app, Some(view.name.as_str())) {
+        if !answers(Some(view.name.as_str())) {
             f(&view.body);
         }
     }
-    if app_defines_current_page(app, None) {
+    if answers(None) {
         return;
     }
     for lc in app.library_classes.iter().filter(|lc| app.helper_modules.contains(&lc.name)) {
@@ -112,7 +139,10 @@ pub fn lower_current_page(app: &mut App) {
     // Views only: in an `app/helpers` module the runtime's
     // `ActionView::ViewHelpers` is not a constant analysis resolves, so a
     // helper's `current_page?` is left as written and refused.
-    let answered: Vec<bool> = app.views.iter().map(|v| app_defines_current_page(app, Some(v.name.as_str()))).collect();
+    let answered: Vec<bool> = {
+        let answers = current_page_answers(app);
+        app.views.iter().map(|v| answers(Some(v.name.as_str()))).collect()
+    };
     for (view, answered) in app.views.iter_mut().zip(answered) {
         if !answered {
             rewrite(&mut view.body);

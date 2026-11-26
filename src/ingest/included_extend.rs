@@ -61,7 +61,15 @@ pub(super) fn splice_included_extends(app: &mut App) {
             Extend::Itself => None,
         }))
         .collect();
-    let snapshot = app.library_classes.clone();
+    // Only the modules the splice reads back: the hooks and the modules they extend with, in declaration order so
+    // `find` takes the same first match. A copy of every class was a deep clone of the whole library.
+    let hook_names: HashSet<&ClassId> = hooks.iter().map(|(id, _)| id).collect();
+    let snapshot: Vec<LibraryClass> = app
+        .library_classes
+        .iter()
+        .filter(|c| hook_extended.contains(&c.name) || hook_names.contains(&c.name))
+        .cloned()
+        .collect();
     let mut spliced = Vec::new();
     let mut expanded_hooks: HashSet<ClassId> = HashSet::default();
     let mut extended: HashSet<ClassId> = HashSet::default();
@@ -124,26 +132,35 @@ pub(super) fn splice_included_extends(app: &mut App) {
 
 /// A module every extender took in that nothing else includes, extends or names: its methods run only as the copies, and left in the tree its body is checked and compiled for nothing.
 fn drop_unreferenced(app: &mut App, extended: &HashSet<ClassId>) {
-    let names: HashSet<String> = app.library_classes.iter().map(|c| c.name.0.as_str().to_string()).collect();
+    // Not every constant the app reads resolved against every class: only a
+    // module the splice extended can be dropped, so only those names are
+    // looked for, and the walk stops looking once each one is named.
+    let present: HashSet<&str> = app.library_classes.iter().map(|c| c.name.0.as_str()).collect();
+    let wanted: HashSet<String> =
+        extended.iter().map(|c| c.0.as_str()).filter(|n| present.contains(n)).map(str::to_string).collect();
+    if wanted.is_empty() {
+        return;
+    }
+    let last: HashSet<&str> = wanted.iter().map(|n| n.rsplit("::").next().unwrap_or(n)).collect();
     let mut named: HashSet<ClassId> = HashSet::default();
-    fn visit(e: &Expr, names: &HashSet<String>, named: &mut HashSet<ClassId>) {
+    for lc in &app.library_classes {
+        named.extend(lc.includes.iter().filter(|i| wanted.contains(i.0.as_str())).cloned());
+    }
+    fn visit(e: &Expr, wanted: &HashSet<String>, last: &HashSet<&str>, named: &mut HashSet<ClassId>) {
+        if named.len() == wanted.len() {
+            return;
+        }
+        // Not the segment whole: a generated receiver (a `module_function` retarget's) holds `Outer::Helpers` in one segment.
         if let ExprNode::Const { path } = &*e.node
-            && let Some(id) = resolve(path, names)
+            && path.last().is_some_and(|s| last.contains(s.as_str().rsplit("::").next().unwrap_or(s.as_str())))
+            && let Some(id) = resolve(path, wanted)
         {
             named.insert(id);
         }
-        e.node.for_each_child(&mut |c| visit(c, names, named));
+        e.node.for_each_child(&mut |c| visit(c, wanted, last, named));
     }
-    for lc in &app.library_classes {
-        for i in &lc.includes {
-            named.insert(i.clone());
-        }
-        let bodies = lc.methods.iter().map(|m| &m.body).chain(lc.unknown_calls.iter()).chain(lc.class_ivar_initializers.iter()).chain(lc.constants.iter().map(|(_, e)| e));
-        for e in bodies {
-            visit(e, &names, &mut named);
-        }
-    }
-    crate::lower::for_each_hook_body_ref(app, &mut |e| visit(e, &names, &mut named));
+    // Library classes' bodies are among the hook bodies.
+    crate::lower::for_each_hook_body_ref(app, &mut |e| visit(e, &wanted, &last, &mut named));
     app.library_classes.retain(|c| !extended.contains(&c.name) || named.contains(&c.name));
 }
 
@@ -555,4 +572,46 @@ fn ground_prefixed_sends(body: &mut Expr, methods: &[MethodDef], owner: &str) {
     });
     let scrutinee = send(Some(suffix.clone()), "to_s", vec![]);
     *body.node = ExprNode::Case { scrutinee, arms };
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    const HOOKED: &str = "module Outer\n  module Helpers\n    def shout(s)\n      s.upcase\n    end\n  end\nend\n\nmodule Hook\n  def self.included(base)\n    base.instance_eval { extend Outer::Helpers }\n  end\nend\n\nmodule Parser\n  include Hook\n\n  def self.parse(s)\n    shout(s)\n  end\nend\n";
+
+    fn class_names_of(source: &str) -> Vec<String> {
+        let tree = [(PathBuf::from("app/lib/parser.rb"), source.as_bytes().to_vec())].into_iter().collect();
+        let app = crate::ingest::ingest_app_from_tree(tree).expect("ingest");
+        app.library_classes.iter().map(|lc| lc.name.0.as_str().to_string()).collect()
+    }
+
+    fn library_class_names(extra: &str) -> Vec<String> {
+        class_names_of(&format!("{HOOKED}{extra}"))
+    }
+
+    #[test]
+    fn an_extended_module_nothing_names_is_dropped() {
+        let names = library_class_names("");
+        assert!(names.iter().any(|n| n == "Parser"), "{names:?}");
+        assert!(!names.iter().any(|n| n == "Outer::Helpers"), "{names:?}");
+    }
+
+    #[test]
+    fn an_extended_module_named_elsewhere_is_kept() {
+        let names = library_class_names("\nclass Tool\n  def run\n    Outer::Helpers\n  end\nend\n");
+        assert!(names.iter().any(|n| n == "Outer::Helpers"), "{names:?}");
+    }
+
+    /// `module_function :up` retargets `shout`'s bare `up(s)` to a receiver holding `Outer::Helpers` in one path segment, and `shout` is copied into `Parser`, which then calls the module.
+    #[test]
+    fn an_extended_module_a_retargeted_copy_calls_is_kept() {
+        let source = HOOKED.replace(
+            "      s.upcase\n    end\n",
+            "      up(s)\n    end\n\n    def up(s)\n      s.upcase\n    end\n    module_function :up\n",
+        );
+        assert_ne!(source, HOOKED);
+        let names = class_names_of(&source);
+        assert!(names.iter().any(|n| n == "Outer::Helpers"), "{names:?}");
+    }
 }

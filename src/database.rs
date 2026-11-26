@@ -6,13 +6,15 @@
 //! Rails' `ActiveRecord::DatabaseConfigurations` reads it: the
 //! environments, each one's configurations, which is the primary, which
 //! are replicas, and the adapter each names. Only the keys that decide
-//! identity are read; connection values (host, credentials, pool sizes)
-//! are not, so none of them reaches the IR.
+//! identity are read, a SQLite configuration's file among them;
+//! connection values (host, credentials, pool sizes) are not, so none of
+//! them reaches the IR.
 //!
 //! The second is read from source, never from configuration: a
 //! `connects_to` in an abstract class, inherited by its subclasses
-//! (`ingest::database_ownership`). Every routing shape the emitted
-//! runtime does not carry is a named refusal (`DatabaseRefusal`),
+//! (`ingest::database_ownership`). One shape is carried, on the Spinel
+//! target's SQLite runtime ([`DatabaseRoutes`]). Every other routing
+//! shape is a named refusal (`DatabaseRefusal`),
 //! reported by `analyze::database_identity`, so an app that needs a
 //! database the runtime does not open is reported unsupported instead of
 //! silently running on the primary.
@@ -56,6 +58,10 @@ impl DatabaseAdapter {
     /// The adapter a `url:` names by its scheme, as Rails'
     /// `ConnectionUrlResolver` maps it (`postgres` is `postgresql`).
     pub fn from_url(url: &str) -> Option<Self> {
+        let query_adapter = Self::query_pairs(url).filter(|(key, _)| *key == "adapter").last();
+        if let Some((_, adapter)) = query_adapter {
+            return Some(Self::parse(adapter));
+        }
         let (scheme, _) = url.split_once(':')?;
         if scheme.is_empty() || !scheme.chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c)) {
             return None;
@@ -64,6 +70,13 @@ impl DatabaseAdapter {
             "postgres" => Self::Postgresql,
             scheme => Self::parse(&scheme.replace('-', "_")),
         })
+    }
+
+    /// The `key=value` pairs of a hierarchical URL's query, where Rails' `ConnectionUrlResolver`
+    /// lets them win over the URL's own parts. An opaque URL (`sqlite3:db/x`) keeps its scheme.
+    pub fn query_pairs(url: &str) -> impl Iterator<Item = (&str, &str)> {
+        let query = url.split_once(':').map(|(_, rest)| rest).filter(|rest| rest.starts_with('/')).and_then(|rest| rest.split('#').next()).and_then(|rest| rest.split_once('?')).map(|(_, query)| query);
+        query.into_iter().flat_map(|query| query.split('&')).map(|pair| pair.split_once('=').unwrap_or((pair, "")))
     }
 
     pub fn name(&self) -> &str {
@@ -95,6 +108,45 @@ pub struct Database {
     pub migrations_paths: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_search_path: Option<String>,
+    /// A SQLite configuration's literal `database:`, the file it opens,
+    /// relative to the app's root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database: Option<String>,
+    /// A literal `schema_dump:` file name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_dump: Option<String>,
+}
+
+impl Database {
+    /// Whether the Spinel SQLite runtime can open this configuration as
+    /// the pool of a role: a SQLite file named literally, and for the
+    /// writing role the primary or one that names the app's own schema
+    /// file (Rails' default for another database is a file of its own).
+    pub fn routable(&self, writing: bool, schema: &str) -> bool {
+        let file = self.database.as_deref().is_some_and(|f| !f.is_empty() && f != ":memory:" && !f.starts_with("file:"));
+        let shared_schema = self.schema_dump.as_ref().is_some_and(|name| {
+            std::path::Path::new("db").join(name) == std::path::Path::new(schema)
+        });
+        let own_tables = !self.replica && self.database_tasks && (self.primary || shared_schema);
+        // Not a replica primary: its pool is the one `Db.configure` opened, which carries no replica flag.
+        self.adapter == DatabaseAdapter::Sqlite3 && file && (!writing || own_tables) && !(self.primary && self.replica)
+    }
+}
+
+/// The pools of an app whose one connection class routes every model,
+/// which the Spinel SQLite runtime opens (`ingest::database_ownership`,
+/// `project::apply_database_routes`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DatabaseRoutes {
+    /// The abstract class that declares them.
+    pub owner: ClassId,
+    /// Its default shard: the first `shards:` names, `default` for
+    /// `database:`.
+    pub default_shard: String,
+    /// The loaded Ruby schema, relative to the app root.
+    pub schema_file: String,
+    /// `(shard, role, configuration name)`, in declaration order.
+    pub routes: Vec<(String, String, String)>,
 }
 
 /// The database a model runs on, read from source.

@@ -70,7 +70,7 @@ fn a_gem_source_loads_its_data_modules_and_requires_like_the_gem() {
 
     let run = app_with(FILES, "require \"tessera\"\n").run_ruby(OBSERVE);
     assert!(
-        run.success,
+        run.passed(),
         "the emitted program failed in {}\n=== stdout ===\n{}\n=== stderr ===\n{}\nerrors: {:#?}",
         run.emitted.display(),
         run.stdout,
@@ -103,7 +103,7 @@ fn requiring_a_gem_file_whose_classes_were_all_dropped_loads_nothing() {
     ];
     let run = app_with(files, "require \"tessera\"\n").run_ruby("puts Tessera.describe\n");
     assert!(
-        run.success,
+        run.passed(),
         "the emitted program failed in {}\n=== stdout ===\n{}\n=== stderr ===\n{}\nerrors: {:#?}",
         run.emitted.display(),
         run.stdout,
@@ -143,7 +143,7 @@ fn a_require_written_below_a_gem_class_runs_after_the_class_is_defined() {
     let require = program.find("lib/tessera/leaf\")").unwrap_or_else(|| panic!("the trailing require is carried:\n{program}"));
     assert!(class < require, "the require written below the class moved above it:\n{program}");
     assert!(
-        run.success,
+        run.passed(),
         "the emitted program failed in {}\n=== stdout ===\n{}\n=== stderr ===\n{}\nerrors: {:#?}",
         run.emitted.display(),
         run.stdout,
@@ -182,7 +182,7 @@ fn a_nested_namespace_a_later_file_opens_does_not_shadow_the_top_level_before_it
 
     let run = app_with(NESTED, "require \"tessera\"\n").run_ruby(SEE);
     assert!(
-        run.success,
+        run.passed(),
         "the emitted program failed in {}\n=== stdout ===\n{}\n=== stderr ===\n{}\nerrors: {:#?}",
         run.emitted.display(),
         run.stdout,
@@ -215,7 +215,7 @@ fn a_require_written_below_a_gem_class_does_not_re_enter_the_loading_file() {
     let run = app_with(files, "require \"tessera\"\n")
         .run_ruby_env("puts \"#{Tessera::Leaf.new.kind} #{Tessera::Twig.new.kind}\"\n", &[("RUBYOPT", "-w")]);
     assert!(
-        run.success,
+        run.passed(),
         "the emitted program failed in {}\n=== stdout ===\n{}\n=== stderr ===\n{}\nerrors: {:#?}",
         run.emitted.display(),
         run.stdout,
@@ -242,7 +242,7 @@ fn a_class_beside_a_gem_model_in_its_file_is_still_declared() {
     ];
     let run = app_with(files, "require \"tessera\"\n").run_ruby("puts \"#{Tessera::Node.new.kind} #{Tessera::Helpers.label}\"\n");
     assert!(
-        run.success,
+        run.passed(),
         "the emitted program failed in {}\n=== stdout ===\n{}\n=== stderr ===\n{}\nerrors: {:#?}",
         run.emitted.display(),
         run.stdout,
@@ -271,7 +271,7 @@ fn openings_whose_order_a_conditional_require_decides_keep_their_order() {
     ];
     let run = app_with(files, "require \"tessera\"\n").run_ruby("p Tessera::Thing.who\n");
     assert!(
-        run.success,
+        run.passed(),
         "the emitted program failed in {}\n=== stdout ===\n{}\n=== stderr ===\n{}\nerrors: {:#?}",
         run.emitted.display(),
         run.stdout,
@@ -298,7 +298,7 @@ fn a_class_beside_a_gem_model_aliasing_an_ancestor_method_is_declared() {
     ];
     let run = app_with(files, "require \"tessera\"\n").run_ruby("puts \"#{Tessera::Helpers.new.tag} #{Tessera::Node.new.valid?}\"\n");
     assert!(
-        run.success,
+        run.passed(),
         "the emitted program failed in {}\n=== stdout ===\n{}\n=== stderr ===\n{}\nerrors: {:#?}",
         run.emitted.display(),
         run.stdout,
@@ -323,7 +323,7 @@ fn a_concern_beside_a_gem_model_runs_its_included_block_in_the_model() {
     let run = app_with(files, "require \"tessera\"\n")
         .run_ruby("puts \"#{Tessera::Node.new.valid?} #{Tessera::Node.new(name: 'x').valid?}\"\n");
     assert!(
-        run.success,
+        run.passed(),
         "the emitted program failed in {}\n=== stdout ===\n{}\n=== stderr ===\n{}\nerrors: {:#?}",
         run.emitted.display(),
         run.stdout,

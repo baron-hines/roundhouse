@@ -9,8 +9,8 @@ use super::emit_and_run;
 /// lambda-condition follow-up) a zero-arity lambda `if:` now guards the
 /// same way — `:note` below, with dedicated coverage in
 /// `validates_lambda_conditions.rs`. `equal_to`, `other_than`,
-/// `uniqueness: { conditions: }` and comparison stay
-/// diagnostics and are not enforced (plain `uniqueness:` is covered by
+/// `uniqueness: { conditions: }` stay diagnostics and are not
+/// enforced; comparison is (`validates_comparison.rs`) (plain `uniqueness:` is covered by
 /// `validates_uniqueness.rs`).
 const MODEL: &str = r#"class Article < ApplicationRecord
   has_many :comments, dependent: :destroy
@@ -64,7 +64,7 @@ base = {
   title: "Ok", body: "0123456789", price: 5, rating: 2, color: "red", stock: 2, score: 1.5,
   inventory_count: 0, ceiling: 1, parity: 9,
   code: "ABC", max_stock: 10, kind: "one", sku: "12", status: "draft",
-  label: "", extra: "", note: "", tag: "ab", level: 9, cap: 1
+  label: "", extra: "", note: "", tag: "ab", level: 1, cap: 1
 }
 
 def messages(attrs)
@@ -146,11 +146,11 @@ raise "lambda condition not enforced: #{lambda_blank.inspect}" unless lambda_bla
 valid, msgs = messages(base.merge(title: "LambdaOk", status: "live", label: "x", extra: "y", note: "z"))
 raise "lambda condition filled rejected: #{msgs.inspect}" unless valid
 
-# uniqueness: { conditions: } and comparison: are not enforced; length: is: is.
+# uniqueness: { conditions: } is not enforced; comparison: and length: is: are.
 Article.create!(base.merge(title: "Taken", label: "x", extra: "y"))
 Article.create!(base.merge(title: "Taken"))
-valid, msgs = messages(base.merge(title: "Compared"))
-raise "comparison ran: #{msgs.inspect}" unless valid
+valid, msgs = messages(base.merge(title: "Compared", level: 9))
+raise "comparison not enforced: #{msgs.to_a.inspect}" unless !valid && msgs.to_a == ["Level must be less than or equal to 1"]
 valid, msgs = messages(base.merge(title: "WrongTag", tag: "abc"))
 raise "length is: not enforced: #{msgs.to_a.inspect}" unless !valid && msgs.to_a == ["Tag is the wrong length (should be 2 characters)"]
 
@@ -170,7 +170,6 @@ puts "validates options passed"
         "equal_to",
         "other_than",
         "uniqueness",
-        "comparison",
     ] {
         assert!(
             warnings.iter().any(|message| message.contains(needle)),

@@ -741,6 +741,8 @@ fn try_rewrite_compact_blank(
                 key: (**key).clone(),
                 value: (**value).clone(),
             },
+            // The String-keyed Hash an indifferent one runs as (`params.permit(…).to_h.compact_blank`).
+            Some(ty) if let Some(value) = crate::analyze::indifferent::value_of(ty) => Shape::Hash { key: Ty::Str, value: value.clone() },
             _ => {
                 diags.push(unlowered(
                     expr,

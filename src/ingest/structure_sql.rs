@@ -294,6 +294,7 @@ fn handle_create_table(
         columns,
         indexes: Vec::new(),
         foreign_keys: Vec::new(),
+        check_constraints: Vec::new(),
         virtual_module: None,
         known_keyless: false,
         primary_key_columns,
@@ -402,6 +403,8 @@ fn parse_column_def(
         col_type,
         nullable,
         default,
+        default_expression: None,
+        legacy_default_persistence: false,
         primary_key: top_level_words(modifiers).windows(2)
             .any(|words| words[0].1 == "PRIMARY" && words[1].1 == "KEY"),
         generated,
@@ -409,6 +412,8 @@ fn parse_column_def(
         generated_int4_compatible,
         array: false,
         array_stored: false,
+        unset_until_assigned: false,
+        collated: top_level_words(modifiers).iter().any(|(_, word)| word == "COLLATE"),
     }))
 }
 
@@ -692,6 +697,7 @@ fn handle_create_index(stmt: &str, file: &str, schema: &mut Schema, gaps: &mut V
             table.indexes.push(Index {
                 name: Symbol::from(index_name),
                 columns: cols,
+                expression: None,
                 unique,
                 using,
                 predicate,
@@ -842,13 +848,26 @@ fn handle_add_foreign_key(
     if from_cols.len() == 1 && to_cols.len() == 1 {
         let on_delete = action_after(words, close2, "DELETE");
         let on_update = action_after(words, close2, "UPDATE");
+        // PostgreSQL: `NOT DEFERRABLE` is the default, `DEFERRABLE` starts
+        // immediate, and `INITIALLY DEFERRED` implies `DEFERRABLE`.
+        let after_refs = |seq: &[&str]| word_seq_pos_after(words, close2, seq).is_some();
+        let deferrable = if after_refs(&["NOT", "DEFERRABLE"]) {
+            None
+        } else if after_refs(&["INITIALLY", "DEFERRED"]) {
+            Some(crate::schema::Deferrable::Deferred)
+        } else if after_refs(&["DEFERRABLE"]) {
+            Some(crate::schema::Deferrable::Immediate)
+        } else {
+            None
+        };
         if let Some(table) = schema.tables.get_mut(&table_sym) {
             table.foreign_keys.push(ForeignKey {
-                from_column: Symbol::from(from_cols[0].clone()),
+                from_columns: vec![Symbol::from(from_cols[0].clone())],
                 to_table: TableRef(Symbol::from(ref_table_raw)),
-                to_column: Symbol::from(to_cols[0].clone()),
+                to_columns: vec![Symbol::from(to_cols[0].clone())],
                 on_delete,
                 on_update,
+                deferrable,
             });
         }
     } else {
@@ -1464,7 +1483,7 @@ fn parse_generated_modifier(modifiers: &str) -> Result<Option<GeneratedColumn>, 
         return Err("only NULL or NOT NULL may follow the generated storage mode".into());
     }
 
-    Ok(Some(GeneratedColumn { expression, storage }))
+    Ok(Some(GeneratedColumn { expression, storage, native: false }))
 }
 
 /// Consume only an optional `NULL` or `NOT NULL` clause plus SQL trivia.

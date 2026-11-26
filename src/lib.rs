@@ -7,6 +7,7 @@
 pub mod adapter;
 pub mod analyze;
 pub mod app;
+mod app_answers;
 #[cfg(feature = "memory-census")]
 pub mod memory_census;
 pub mod builder;
@@ -14,6 +15,7 @@ pub mod bytecode;
 pub mod catalog;
 /// Machine-readable `roundhouse check` inventory + ranked hotspot report.
 pub mod check_report;
+pub mod controller_layout;
 pub mod diagnostic;
 pub mod database;
 pub mod dialect;
@@ -63,6 +65,7 @@ pub mod lsp;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod mcp;
 pub mod naming;
+pub mod observed_shapes;
 pub mod par;
 pub mod profile;
 /// Target identity and the policies lowering reads (`param_binds_enabled`,
@@ -87,7 +90,7 @@ pub mod runtime_src;
 pub mod session;
 pub mod timings;
 pub mod treeshake;
-pub(crate) mod source_gem_shake;
+pub mod source_gem_shake;
 pub mod version;
 pub mod schema;
 pub mod span;
@@ -99,7 +102,7 @@ pub use app::{App, ControllerResolution, ResolvedFilter};
 pub use profile::{Database, DeploymentProfile, HttpShim, ProfileError, Target};
 pub use dialect::{
     Action, Association, Callback, CallbackHook, Comment, Controller, ControllerBodyItem,
-    Dependent, Filter, FilterKind, HttpMethod, LayoutDecl, MethodDef, MethodReceiver, Model,
+    Dependent, Filter, FilterKind, HttpMethod, LayoutCall, LayoutDecl, LayoutValue, MethodDef, MethodReceiver, Model,
     ModelBodyItem,
     InclusionRange, RenderTarget, ResourceScope, Route, RouteSpec, RouteTable, Scope, Validation,
     ValidationRule,

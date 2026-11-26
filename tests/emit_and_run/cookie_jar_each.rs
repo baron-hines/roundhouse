@@ -51,7 +51,7 @@ fn unknown_cookies_are_deleted_from_the_jar_s_each() {
 fn the_cookie_test_fails_when_nothing_is_deleted() {
     let run = app(&FILTER.replace("      cookies.delete(key)\n", "")).run_test("test/controllers/cookie_filter_controller_test.rb");
     assert!(run.errors.is_empty(), "{:?}", run.errors);
-    assert!(!run.success, "a kept junk cookie passed:\n{}\n{}", run.stdout, run.stderr);
+    assert!(!run.program_succeeded(), "a kept junk cookie passed:\n{}\n{}", run.stdout, run.stderr);
     assert!(run.stdout.contains("FAIL CookieFilterControllerTest"), "the test did not run:\n{}\n{}", run.stdout, run.stderr);
 }
 

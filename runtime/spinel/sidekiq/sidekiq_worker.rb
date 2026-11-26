@@ -32,9 +32,8 @@
 # `count**4 + 15` seconds plus jitter from now, until its `retry` limit
 # (`max_retries`, 25 by default) or `retry_for` runs out. Then it goes
 # to the dead set, unless it says `dead: false`. Malformed JSON goes to
-# the dead set as it is. The dead write is a pipeline of ZADD and the
-# two trims Sidekiq sends (Sidekiq wraps them in MULTI; spinel-redis has
-# no MULTI yet).
+# the dead set as it is. The dead write is ZADD and the two trims
+# Sidekiq sends, in one MULTI as Sidekiq sends them.
 #
 # THE SCHEDULER. One more thread with its own connection
 # (`SidekiqScheduler`, below) moves due jobs from the `retry` and

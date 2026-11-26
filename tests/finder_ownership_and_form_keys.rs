@@ -1,4 +1,6 @@
 //! Paired regressions for finder ownership, STI hydration and form parameter keys.
+#[path = "support/prerequisite.rs"]
+mod prerequisite;
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
@@ -18,7 +20,7 @@ fn native(components: &[&str], program: &str) {
     assert!(probe.status.success() && matches!(available.as_str(), "true" | "false"),
         "oracle availability: {available}\n{}", String::from_utf8_lossy(&probe.stderr));
     if available == "false" {
-        eprintln!("skipping native Rails 8.1.4 oracle: missing {components:?}");
+        prerequisite::missing(&format!("native Rails 8.1.4 oracle: missing {components:?}"));
         return;
     }
     let program = format!("require {oracle:?}\nRailsOracle.activate({gems}, sqlite3: \">= 2.9\")\nrequire 'tmpdir'\nDir.mktmpdir('roundhouse-finder-oracle') do |root|\nDir.mkdir(File.join(root, 'lib'))\nDir.chdir(root) do\n{program}\nend\nend\n");
@@ -263,7 +265,7 @@ fn native_optional_extension(gem: &str, version: &str, program: &str) {
     )]).output().expect("optional extension availability");
     assert!(probe.status.success(), "optional extension probe");
     if String::from_utf8_lossy(&probe.stdout).trim() == "false" {
-        eprintln!("skipping native extension oracle: missing {gem} {version}");
+        prerequisite::missing(&format!("native extension oracle: missing {gem} {version}"));
         return;
     }
     native(&["activerecord"], &format!("gem {gem:?}, {version:?}\nrequire {gem:?}\n{program}"));

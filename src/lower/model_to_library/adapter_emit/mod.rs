@@ -51,6 +51,7 @@ use super::{fn_sig, ty_of_column};
 
 mod exists;
 use exists::{synth_adapter_any, synth_adapter_exists_by_id};
+pub(super) mod uniqueness;
 
 pub(super) fn push_adapter_methods(
     methods: &mut Vec<MethodDef>,
@@ -65,7 +66,7 @@ pub(super) fn push_adapter_methods(
     methods.push(synth_adapter_all(owner, table, schema));
     methods.push(synth_adapter_last(owner, table, schema));
     methods.push(synth_adapter_insert(owner, table, schema, writes_supplied_keys));
-    methods.push(synth_adapter_update(owner, table, schema));
+    methods.push(synth_adapter_update(owner, table, schema, writes_supplied_keys));
     methods.push(synth_adapter_touch(owner, table, schema));
     methods.push(synth_adapter_delete(owner, table, schema));
     methods.push(synth_adapter_count(owner, table, schema));
@@ -126,6 +127,15 @@ pub(super) fn synth_exists_primary_key_input(owner: &ClassId, table: &Table) -> 
     )
 }
 
+/// A PostgreSQL uuid key, which Rails casts through OID::Uuid before
+/// the lookup. SQLite stores the column as text and Rails leaves the
+/// value as given there.
+fn uuid_key_casts(table: &Table) -> bool {
+    use crate::emit::shared::schema_sql::Dialect;
+    Dialect::current() == Dialect::Postgres
+        && key_column(table).is_some_and(|c| c.col_type == crate::schema::ColumnType::Uuid && !c.array)
+}
+
 fn synth_primary_key_input(
     owner: &ClassId,
     table: &Table,
@@ -145,7 +155,28 @@ fn synth_primary_key_input(
         recv: Some(super::class_const(&caster)), method: Symbol::from(method),
         args: vec![var_ref(&id)], block: None, parenthesized: true,
     });
-    let body = if key == Ty::Str {
+    let body = if uuid_key_casts(table) {
+        // Rails' OID::Uuid cast (ActiveRecord::UuidCast): the canonical
+        // uuid, or "" for a value that is none, which finds no row
+        // rather than reaching PostgreSQL as a literal it rejects.
+        let key_text = Symbol::from("key");
+        let uuid_cast = ClassId(Symbol::from("ActiveRecord::UuidCast"));
+        let cast = Expr::new(Span::synthetic(), ExprNode::Send {
+            recv: Some(super::class_const(&uuid_cast)), method: Symbol::from("cast_text"),
+            args: vec![var_ref(&id)], block: None, parenthesized: true,
+        });
+        let blank = Expr::new(Span::synthetic(), ExprNode::Send {
+            recv: Some(var_ref(&key_text)), method: Symbol::from("empty?"),
+            args: vec![], block: None, parenthesized: true,
+        });
+        super::seq(vec![
+            arel_assign(&key_text, cast),
+            Expr::new(Span::synthetic(), ExprNode::If {
+                cond: blank, then_branch: invalid,
+                else_branch: adapter_call(var_ref(&key_text)),
+            }),
+        ])
+    } else if key == Ty::Str {
         adapter_call(caster_call("input_text"))
     } else if key != Ty::Int {
         // Other schema keys retain their existing adapter conversion. For
@@ -336,19 +367,32 @@ fn synth_adapter_insert(owner: &ClassId, table: &Table, schema: &Schema, writes_
         .filter(|c| c.generated.is_none() && (!c.primary_key || supplied_key.is_some()))
         .map(|c| Assignment {
             column: c.name.clone(),
-            value: Value::Runtime { expr: storage_value(c), ty: value_type_for_column(c) },
+            value: match c.persisted_computed_default() {
+                Some(sql) => Value::SqlDefault { expr: storage_value(c), ty: value_type_for_column(c), sql: sql.into() },
+                None => Value::Runtime { expr: storage_value(c), ty: value_type_for_column(c) },
+            },
         })
         .collect();
 
+    // A table with no primary key (`id: false`, a join table) has no key
+    // to read back, and Rails reads none: `save_after_validation` assigns
+    // no id without a primary key. SQLite answers with the rowid, which
+    // that leaves unused. PostgreSQL has neither a sequence nor a rowid to
+    // read it from, so the insert reads nothing and answers 0 for the same
+    // unused slot; one that returns generated or default columns returns
+    // 0 in the key's place (below).
+    let keyless_on_postgres = key.is_none()
+        && table.primary_key_columns.is_empty()
+        && crate::emit::shared::schema_sql::Dialect::current() == crate::emit::shared::schema_sql::Dialect::Postgres;
     let insert = Insert {
         table: TableRef(table.name.clone()),
         assignments,
-        returns_rowid: supplied_key.is_none(),
+        returns_rowid: supplied_key.is_none() && !keyless_on_postgres,
     };
     let insert_with_key = insert.clone();
     let op = ArelOp::Insert(insert.clone());
     let generated: Vec<&crate::schema::Column> =
-        table.columns.iter().filter(|c| c.generated.is_some()).collect();
+        table.columns.iter().filter(|c| c.generated.is_some() || c.persisted_computed_default().is_some()).collect();
     let ret_ty = supplied_key.map(|c| ty_of_column(&c.col_type)).unwrap_or(Ty::Int);
     let uuid_mint = supplied_key
         .filter(|c| matches!(c.col_type, ColumnType::Uuid))
@@ -360,6 +404,9 @@ fn synth_adapter_insert(owner: &ClassId, table: &Table, schema: &Schema, writes_
             exprs.push(mint);
         }
         exprs.push(SqliteVisitor::default().visit(&op, schema, owner));
+        if keyless_on_postgres {
+            exprs.push(arel_lit_int(0));
+        }
         if let Some(k) = supplied_key {
             exprs.push(ivar_ref(&k.name));
         }
@@ -378,10 +425,12 @@ fn synth_adapter_insert(owner: &ClassId, table: &Table, schema: &Schema, writes_
             .unwrap_or_else(|| Symbol::from("rowid"));
         let returning_columns: Vec<Symbol> =
             generated.iter().map(|c| c.name.clone()).collect();
+        // A keyless table on PostgreSQL returns no key (it has no rowid);
+        // its slot reads 0, as the ordinary insert above answers.
         let insert = SqliteVisitor::default().visit_insert_returning(
             &insert,
             schema,
-            &returning_key,
+            (!keyless_on_postgres).then_some(&returning_key),
             key_is_integer(table),
             &returning_columns,
         );
@@ -398,7 +447,7 @@ fn synth_adapter_insert(owner: &ClassId, table: &Table, schema: &Schema, writes_
                 let written = SqliteVisitor::default().visit_insert_returning(
                     &keyed,
                     schema,
-                    &returning_key,
+                    Some(&returning_key),
                     key_is_integer(table),
                     &returning_columns,
                 );
@@ -543,6 +592,9 @@ fn hydrate_generated_after_insert(
             },
         );
         is_nil.ty = Some(Ty::Bool);
+        if col.persisted_computed_default().is_some() {
+            is_nil = Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Bool { value: true } });
+        }
         let value = crate::lower::typing::with_ty(
             arel_db_call(
                 &db,
@@ -601,7 +653,7 @@ fn hydrate_generated_after_insert(
             body: read_row,
             rescues: vec![],
             else_branch: None,
-            ensure: Some(arel_db_call(&db, "finalize", vec![var_ref(&stmt)])),
+            ensure: Some(Box::new(arel_db_call(&db, "finalize", vec![var_ref(&stmt)]))),
             implicit: false,
         },
     );
@@ -646,7 +698,14 @@ fn hydrate_generated_after_insert(
 
 /// `def _adapter_update` — instance method; reads ivars + @id.
 /// See `synth_adapter_insert` for the receiver-rationale.
-fn synth_adapter_update(owner: &ClassId, table: &Table, schema: &Schema) -> MethodDef {
+///
+/// `partial` (the ruby-family targets, whose runtime tracks pending
+/// changes in connection.rb) writes only the columns the runtime's
+/// `_columns_to_write` names, as Rails' partial updates do: a column
+/// another process changed since the record loaded keeps that write
+/// unless this record changed it too. The strict targets' runtime
+/// tracks no changes, so they keep the full-row write.
+fn synth_adapter_update(owner: &ClassId, table: &Table, schema: &Schema, partial: bool) -> MethodDef {
     // Same storage-ivar convention as `synth_adapter_insert`.
     let assignments: Vec<Assignment> = table
         .columns
@@ -676,10 +735,26 @@ fn synth_adapter_update(owner: &ClassId, table: &Table, schema: &Schema) -> Meth
         // A model whose only non-key attributes are generated columns has
         // nothing to write on update. Do not render `UPDATE ... SET WHERE`;
         // generated values are database-owned and a no-op save stays a no-op.
-        body: if has_assignments {
-            SqliteVisitor::default().visit(&op, schema, owner)
-        } else {
+        body: if !has_assignments {
             super::nil_lit()
+        } else if partial {
+            let ArelOp::Update(update) = &op else { unreachable!() };
+            let cols = Symbol::from("cols");
+            let mut columns = Expr::new(
+                Span::synthetic(),
+                ExprNode::Send {
+                    recv: None,
+                    method: Symbol::from("_columns_to_write"),
+                    args: vec![],
+                    block: None,
+                    parenthesized: false,
+                },
+            );
+            columns.ty = Some(Ty::Array { elem: std::sync::Arc::new(Ty::Str) });
+            let write = crate::lower::arel::visitor::visit_partial_update(update, schema, &cols, &Symbol::from("sets"));
+            Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![arel_assign(&cols, columns), write] })
+        } else {
+            SqliteVisitor::default().visit(&op, schema, owner)
         },
         signature: Some(fn_sig(vec![], Ty::Nil)),
         effects: EffectSet::default(),
@@ -922,8 +997,10 @@ fn synth_adapter_reload(model: &Model, table: &Table, param: bool) -> MethodDef 
     let owner_ty = Ty::Class { id: owner.clone(), args: vec![].into() };
 
     // Rails' `reload` clears the association cache — owned by
-    // associations (same kinds as `assoc_cache_ivar_bindings`).
-    let clear_assoc = super::associations::clear_loaded_flag_assigns(model);
+    // associations (same kinds as `assoc_cache_ivar_bindings`) — and
+    // the attachment proxies and unsaved attachment assignments.
+    let mut clear_assoc = super::associations::clear_loaded_flag_assigns(model);
+    clear_assoc.extend(crate::lower::attached::reload_resets(model));
 
     // SQL: "SELECT <cols> FROM <table> WHERE id = " + Db.escape_int(@id) + " LIMIT 1"
     let cols_csv: String = table
@@ -1405,7 +1482,10 @@ fn value_type_for_column(col: &crate::schema::Column) -> ValueType {
     if col.array_stored {
         return ValueType::StrOpt;
     }
-    let nullable = col.nullable && !col.primary_key;
+    let nullable = (col.nullable || col.persisted_computed_default().is_some()) && !col.primary_key;
+    if col.col_type == crate::schema::ColumnType::Binary {
+        return if nullable { ValueType::BinaryOpt } else { ValueType::Binary };
+    }
     match ty_of_column(&col.col_type) {
         Ty::Int => {
             if nullable {

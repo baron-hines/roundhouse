@@ -20,6 +20,23 @@ fn expr_is_option(expr: &Expr) -> bool {
     column_ty(expr).as_ref().is_some_and(is_option_ty)
 }
 
+/// A zero-argument reader on a record (`article.title`) whose value is
+/// `String | nil`: the reader returns `Option<String>`.
+fn record_reader_is_option_str(expr: &Expr) -> bool {
+    use crate::ty::Ty;
+    let ExprNode::Send { recv: Some(inner), args, block: None, .. } = &*expr.node else {
+        return false;
+    };
+    args.is_empty()
+        && matches!(inner.ty.as_ref().map(peel_nil), Some(Ty::Class { .. }))
+        && matches!(
+            expr.ty.as_ref(),
+            Some(Ty::Union { variants }) if variants.len() == 2
+                && variants.iter().any(|v| matches!(v, Ty::Nil))
+                && variants.iter().any(|v| matches!(v, Ty::Str))
+        )
+}
+
 fn option_column_is_text(expr: &Expr) -> bool {
     column_ty(expr)
         .as_ref()
@@ -57,9 +74,11 @@ pub(super) fn external_class_method_param_tys(
         ("Db", "column_int") => Some(vec![Ty::Int, Ty::Int]),
         ("Db", "column_float") => Some(vec![Ty::Int, Ty::Int]),
         ("Db", "column_text") => Some(vec![Ty::Int, Ty::Int]),
+        ("Db", "column_binary") => Some(vec![Ty::Int, Ty::Int]),
         ("Db", "column_bool") => Some(vec![Ty::Int, Ty::Int]),
         ("Db", "finalize") => Some(vec![Ty::Int]),
         ("Db", "escape_string") => Some(vec![Ty::Str]),
+        ("Db", "escape_binary") => Some(vec![Ty::Str]),
         ("Db", "escape_int") => Some(vec![Ty::Int]),
         ("Db", "escape_bool") => Some(vec![Ty::Bool]),
         // Nullable-column seam: nil renders the SQL keyword NULL. The
@@ -68,8 +87,9 @@ pub(super) fn external_class_method_param_tys(
         ("Db", "column_int_opt") => Some(vec![Ty::Int, Ty::Int]),
         ("Db", "column_float_opt") => Some(vec![Ty::Int, Ty::Int]),
         ("Db", "column_text_opt") => Some(vec![Ty::Int, Ty::Int]),
+        ("Db", "column_binary_opt") => Some(vec![Ty::Int, Ty::Int]),
         ("Db", "column_bool_opt") => Some(vec![Ty::Int, Ty::Int]),
-        ("Db", "escape_string_opt") => {
+        ("Db", "escape_string_opt" | "escape_binary_opt") => {
             Some(vec![Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() }])
         }
         ("Db", "escape_int_opt") => Some(vec![Ty::Union { variants: vec![Ty::Int, Ty::Nil].into() }]),
@@ -319,7 +339,14 @@ pub(super) fn dispatch_method_by_recv_ty(
         .filter(|t| super::super::super::ty::rust_ty(t) == "serde_json::Value")
         .filter(|_| recv_ty.is_some_and(|t| super::super::super::ty::rust_ty(t) != "serde_json::Value"));
     let recv_ty = if bound_value_ty.is_some() { bound_value_ty.as_ref() } else { recv_ty };
-    let recv_s = if binding_is_option {
+    // A record's reader typed `String | nil` (a nullable string column,
+    // `article.title`) returns `Option<String>`. The String methods nil
+    // has no answer for read the value, and a nil column panics, where
+    // Ruby raises `NoMethodError` on nil.
+    let nilable_reader = matches!(method, "empty?" | "length" | "size")
+        && args.is_empty()
+        && record_reader_is_option_str(recv);
+    let recv_s = if binding_is_option || nilable_reader {
         // `.clone().unwrap()` is a method chain — already a primary
         // form. The outer wrap was historically defensive against
         // downstream `.method` chaining; the `NEEDS_PARENS` decide-

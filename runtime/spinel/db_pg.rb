@@ -12,12 +12,13 @@
 # the pg gem, whose API spinel-pg mirrors; pg_driver.rb holds the few
 # places the two differ (pg_driver_cruby.rb is the gem's).
 #
-# The Ruby target ships it as runtime/db.rb, with pg_driver_cruby.rb, for
-# an app whose `config/database.yml` names postgresql for the test
-# environment's primary (src/project.rs::apply_postgresql_tree), and
-# lowers that app's SQL for PostgreSQL. Spinel's wiring (`pg` as a spin
-# dependency) follows. The Db contract runs it directly on both runtimes
-# (tests/spinel_pg_db.rs, tests/db_contract.rs).
+# Both targets ship it as runtime/db.rb for an app whose
+# `config/database.yml` names postgresql for the test environment's
+# primary (src/project.rs::apply_postgresql_tree), and lower that app's
+# SQL for PostgreSQL: the Ruby target with pg_driver_cruby.rb, the Spinel
+# target with spinel-pg's pg_driver.rb and `pg` as a spin dependency. The
+# Db contract runs it directly on both runtimes (tests/spinel_pg_db.rs,
+# tests/db_contract.rs).
 #
 # What maps onto what:
 #
@@ -25,6 +26,8 @@
 #                          libpq PG* environment variables as fallbacks.
 #                          No TLS, unix sockets or query parameters; a
 #                          URL that asks for them is refused.
+#                          `schema_search_path:` sets search_path on
+#                          every connection, as Rails' key of that name.
 #   Db.prepare(sql)      — a statement handle (an Integer) on the current
 #                          connection. SQL spells its placeholders $1, $2…
 #   Db.bind_*(h, i, v)   — one-based, as with SQLite; values travel as
@@ -84,14 +87,22 @@ require_relative "pg_driver"
 # variables, then libpq's defaults (localhost:5432, database named after
 # the user).
 class PgConfig
-  def initialize(url)
+  def initialize(url, search_path = "")
     @host = PgUrl.env("PGHOST", "localhost")
     @port = PgUrl.env("PGPORT", "5432").to_i
     @user = PgUrl.env("PGUSER", PgUrl.env("USER", "postgres"))
     @password = PgUrl.env("PGPASSWORD", "")
     @database = PgUrl.env("PGDATABASE", "")
+    @search_path = search_path
     parse(url) if url != ""
     @database = @user if @database == ""
+  end
+
+  # Rails' `schema_search_path`: what its PostgreSQL adapter sets with
+  # `SET search_path TO <value>` on each connection it opens. "" leaves
+  # the server's own.
+  def search_path
+    @search_path
   end
 
   def host
@@ -414,6 +425,17 @@ class PgConn
     if c.nil?
       cfg = @config
       c = PgDriver.open(cfg.host, cfg.port, cfg.database, cfg.user, cfg.password)
+      # The configured schema_search_path, on every connection before its
+      # first use, as Rails' adapter sets it; a session that cannot take
+      # it is closed rather than kept.
+      if cfg.search_path != ""
+        begin
+          c.exec("SET search_path TO " + cfg.search_path)
+        rescue PG::Error => e
+          c.close
+          raise e
+        end
+      end
       @client = c
     end
     c
@@ -785,8 +807,10 @@ module Db
 
   # Pool size: kwarg, overridden by DATABASE_POOL_SIZE as in db.rb. The
   # first connection opens here, so a wrong URL or password fails at
-  # boot rather than on the first request.
-  def self.configure(url, pool_size: 8)
+  # boot rather than on the first request. `schema_search_path:` is
+  # Rails' database.yml key of that name: set on every connection the
+  # pool opens (PgConn#client).
+  def self.configure(url, pool_size: 8, schema_search_path: "")
     @sql_trace = ENV.fetch("RH_SQL_TRACE", "") != ""
     n = pool_size
     ev = ENV["DATABASE_POOL_SIZE"]
@@ -802,7 +826,7 @@ module Db
     stripes = 8 if stripes > 8
     per = n / stripes
     per = 1 if per < 1
-    config = PgConfig.new(url.to_s)
+    config = PgConfig.new(url.to_s, schema_search_path)
     @database = config.database
     pools = []
     i = 0
@@ -870,6 +894,23 @@ module Db
 
   def self.adapter_name
     "postgresql"
+  end
+
+  # One database: a connection handle is the shared one (db.rbs).
+  def self.connection_slot(_base)
+    -1
+  end
+
+  def self.enter_slot(_slot, _base)
+    nil
+  end
+
+  def self.hold_slot(_slot, _base)
+    nil
+  end
+
+  def self.leave_slot
+    nil
   end
 
   def self.transaction_open?
@@ -949,6 +990,25 @@ module Db
       Thread.current[:ar_unscoped_tables] = tables
     end
     tables
+  end
+
+  # The relations whose `scoping { }` block runs on this thread,
+  # innermost last (relation.rb's `Relation.current_scope_for`). Nil
+  # until the first push, which seeds the list with its element, so the
+  # element type is the relation's without a placeholder relation.
+  def self._current_scopes
+    Thread.current[:ar_current_scopes]
+  end
+
+  def self._push_current_scope(scope)
+    scopes = Thread.current[:ar_current_scopes]
+    if scopes.nil?
+      scopes = [scope]
+      Thread.current[:ar_current_scopes] = scopes
+    else
+      scopes << scope
+    end
+    scopes
   end
 
   # Not PostgreSQL's DISABLE TRIGGER: its DDL here carries no foreign keys yet (emit::shared::schema_sql), so a fixture load has nothing to defer.
@@ -1465,6 +1525,69 @@ module Db
 
   def self.escape_string_opt(s)
     s.nil? ? "NULL" : escape_string(s)
+  end
+
+  # `t.binary` columns (the lowerer's `ValueType::Binary`), which are
+  # `bytea` here. A value is written in bytea's hex input format,
+  # `'\x…'` (standard_conforming_strings, on since PostgreSQL 9.1, keeps
+  # the backslash literal), so a NUL or a byte that is not UTF-8 reaches
+  # the column intact. The text result format renders bytea the same
+  # way, so a read decodes the `\x` hex back to the bytes.
+  def self.escape_binary(s)
+    "'\\x" + s.to_s.unpack1("H*") + "'"
+  end
+
+  def self.escape_binary_opt(s)
+    s.nil? ? "NULL" : escape_binary(s)
+  end
+
+  def self.column_binary(stmt, i)
+    v = column_binary_opt(stmt, i)
+    return "" if v.nil?
+    v
+  end
+
+  def self.column_binary_opt(stmt, i)
+    v = Db.cell(stmt, i)
+    return nil if v.nil?
+    Db.bytea_decode(v)
+  end
+
+  # A bytea cell in the text result format, to the bytes it spells, as
+  # an ASCII-8BIT string (what Rails reads a bytea as). The server writes
+  # `\x` + hex pairs by default, and bytea's older escape format (`\\`
+  # for a backslash, `\ooo` octal for a non-printable byte, everything
+  # else as itself) when `bytea_output` is set to `escape`.
+  def self.bytea_decode(s)
+    out = "".dup
+    n = s.bytesize
+    if s.start_with?("\\x")
+      i = 2
+      while i + 1 < n
+        out = out + (PgUrl.hex(s.getbyte(i)) * 16 + PgUrl.hex(s.getbyte(i + 1))).chr
+        i += 2
+      end
+      return out.force_encoding("ASCII-8BIT")
+    end
+    i = 0
+    while i < n
+      b = s.getbyte(i)
+      if b == 92 && i + 1 < n && s.getbyte(i + 1) == 92
+        out = out + 92.chr
+        i += 2
+      elsif b == 92 && i + 3 < n && Db.octal_digit?(s.getbyte(i + 1)) && Db.octal_digit?(s.getbyte(i + 2)) && Db.octal_digit?(s.getbyte(i + 3))
+        out = out + (((s.getbyte(i + 1) - 48) * 64) + ((s.getbyte(i + 2) - 48) * 8) + (s.getbyte(i + 3) - 48)).chr
+        i += 4
+      else
+        out = out + b.chr
+        i += 1
+      end
+    end
+    out.force_encoding("ASCII-8BIT")
+  end
+
+  def self.octal_digit?(b)
+    b >= 48 && b <= 55
   end
 
   def self.escape_int_opt(n)

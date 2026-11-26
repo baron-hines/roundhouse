@@ -256,6 +256,27 @@ class IgnoredSuiteSelectionTests(unittest.TestCase):
             "binary_id(roundhouse::all_tests) & ((test(/^framework_tests_ruby::/)) | "
             "(test(/^tiny_api::/) & test(cruby_gate_)))")
 
+    def test_an_exact_selector_names_one_case_as_cargo_test_exact_did(self):
+        self.assertEqual(unit.parse_selector("tiny_api::cruby_gate_models"),
+                         ("tiny_api", "tiny_api::cruby_gate_models"))
+        self.assertEqual(unit.parse_selector("framework_tests_ruby::nested::case_x"),
+                         ("framework_tests_ruby", "framework_tests_ruby::nested::case_x"))
+        chosen = unit.ignored_selection(self.cases, [("framework_tests_ruby", "framework_tests_ruby::router")])
+        self.assertEqual(chosen, {("roundhouse::all_tests", "framework_tests_ruby::router")})
+        # A prefix of a longer name is not that name.
+        with self.assertRaises(unit.ContractError):
+            unit.ignored_selection(self.cases, [("tiny_api", "tiny_api::cruby_gate")])
+        # Not ignored: the archive's ignored-only run would not execute it.
+        with self.assertRaises(unit.ContractError):
+            unit.ignored_selection(self.cases, [("tiny_api", "tiny_api::active_listing")])
+        self.assertEqual(
+            unit.selection_filter([("tiny_api", "tiny_api::cruby_gate_models"), ("framework_tests_ruby", None)]),
+            "binary_id(roundhouse::all_tests) & ((test(=tiny_api::cruby_gate_models)) | "
+            "(test(/^framework_tests_ruby::/)))")
+        for invalid in ("tiny_api::", "::x", "tiny_api:::x", "tiny_api::a b"):
+            with self.assertRaises(unit.ContractError):
+                unit.parse_selector(invalid)
+
     def test_listed_matches_reads_only_selected_cases(self):
         listed = inventory()
         listed["rust-suites"]["roundhouse::all_tests"]["testcases"]["spinel_toolchain::native"][

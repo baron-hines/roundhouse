@@ -29,23 +29,20 @@ fn speculative_fanout_retains_selection_and_real_prerequisites() {
     ] {
         assert_eq!(jobs[name]["needs"].as_str(), Some("plan"), "{name}");
     }
-    for name in [
-        "store-check",
-        "browser-smoke-typescript",
-        "compare",
-        "compare-extra",
-        "compare-jruby",
-    ] {
+    for name in ["store-check", "browser-smoke-typescript"] {
         assert_eq!(
             jobs[name]["needs"],
             serde_yaml_ng::from_str::<serde_yaml_ng::Value>("[generate-fixture, plan]").unwrap(),
             "{name} must not wait for tests, or lose its fixture/selection"
         );
     }
-    // The CRuby compare jobs wait for the builds they reuse, never for tests.
+    // The CRuby and JRuby compare jobs wait for the builds they reuse, never for tests.
     for (name, needs) in [
         ("compare-ruby", "[generate-fixture, plan, unit-build, build-roundhouse]"),
+        ("compare-jruby", "[generate-fixture, plan, unit-build, build-roundhouse]"),
         ("compare-ruby-next", "[generate-fixture, plan, unit-build]"),
+        ("compare", "[generate-fixture, plan, unit-build]"),
+        ("compare-extra", "[generate-fixture, plan, unit-build]"),
     ] {
         assert_eq!(
             jobs[name]["needs"],
@@ -499,21 +496,23 @@ fn compact_and_extra_compare_share_commands_but_not_results() {
         controller_identity["if"].as_str(),
         Some("${{ !cancelled() && matrix.target == 'rust' }}")
     );
+    // The archive selection fails unless the inventory names exactly this ignored case and
+    // Nextest runs it (`--no-tests fail`), which is what the old success-line grep proved.
     let identity_run = controller_identity["run"].as_str().unwrap();
-    let cargo_command = concat!(
-        "cargo test --locked --test rust_toolchain ",
-        "real_blog_controller_identity_values_match_rails -- --ignored --nocapture --exact"
-    );
     assert!(
-        identity_run.contains(&format!("if output=$({cargo_command} 2>&1); then")),
-        "the required Rust toolchain command and exact filter must be preserved:\n{identity_run}"
+        identity_run.contains("python3 scripts/ci-unit-tests.py select")
+            && identity_run.contains(
+                "--select rust_toolchain::real_blog_controller_identity_values_match_rails"
+            ),
+        "the required Rust toolchain case must be selected exactly:\n{identity_run}"
     );
-    let success_check =
-        "grep -Fxq 'test real_blog_controller_identity_values_match_rails ... ok' <<< \"$output\"";
-    assert!(
-        identity_run.contains(success_check),
-        "the selected outer test must produce its exact success line:\n{identity_run}"
-    );
+    for step in compare_steps {
+        let run = step["run"].as_str().unwrap_or("");
+        assert!(
+            !run.contains("cargo test") && !run.contains("cargo build"),
+            "compare legs run their suites from unit-build's archive:\n{run}"
+        );
+    }
     assert!(
         controller_identity["continue-on-error"].is_null()
             || controller_identity["continue-on-error"].as_bool() == Some(false),
@@ -688,76 +687,6 @@ fn compact_and_extra_compare_share_commands_but_not_results() {
     assert_eq!(ci["permissions"]["contents"].as_str(), Some("read"));
     assert!(ci["permissions"].get("pages").is_none());
     assert!(ci["permissions"].get("id-token").is_none());
-}
-
-/// Verifies the required Rust identity step needs execution and preserves Cargo failures.
-#[cfg(unix)]
-#[test]
-fn rust_identity_ci_guard_requires_execution_and_propagates_failure() {
-    use std::os::unix::fs::PermissionsExt;
-    use std::process::Command;
-
-    let ci: serde_yaml_ng::Value =
-        serde_yaml_ng::from_str(&fs::read_to_string(".github/workflows/ci.yml").unwrap()).unwrap();
-    let step = ci["jobs"]["compare"]["steps"]
-        .as_sequence()
-        .unwrap()
-        .iter()
-        .find(|step| {
-            step["name"].as_str()
-                == Some("cargo test --test rust_toolchain controller identity values")
-        })
-        .unwrap();
-
-    let unique = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let root = scratch::dir(&format!("rust-identity-ci-{unique}"));
-    let cargo = root.join("cargo");
-    fs::write(
-        &cargo,
-        r#"#!/bin/sh
-printf '<%s>\n' "$@" >> "$CARGO_LOG"
-case "$CARGO_MODE" in
-  success) printf '%s\n' 'test real_blog_controller_identity_values_match_rails ... ok'; exit 0 ;;
-  zero_match) printf '%s\n' 'running 0 tests'; exit 0 ;;
-  forged_success_on_failure) printf '%s\n' 'test real_blog_controller_identity_values_match_rails ... ok'; exit 37 ;;
-  *) exit 64 ;;
-esac
-"#,
-    )
-    .unwrap();
-    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
-
-    let cargo_args = "<test>\n<--locked>\n<--test>\n<rust_toolchain>\n<real_blog_controller_identity_values_match_rails>\n<-->\n<--ignored>\n<--nocapture>\n<--exact>\n";
-    for (mode, expected_status) in [
-        ("success", 0),
-        ("zero_match", 1),
-        ("forged_success_on_failure", 37),
-    ] {
-        let log = root.join("cargo.log");
-        fs::write(&log, "").unwrap();
-        let result = Command::new("bash")
-            .args(["-e", "-o", "pipefail", "-c", step["run"].as_str().unwrap()])
-            .env("CARGO_LOG", &log)
-            .env("CARGO_MODE", mode)
-            .env("CARGO_TERM_COLOR", "always")
-            .env(
-                "PATH",
-                format!("{}:{}", root.display(), std::env::var("PATH").unwrap()),
-            )
-            .output()
-            .unwrap();
-        assert_eq!(
-            result.status.code(),
-            Some(expected_status),
-            "{mode}: {result:?}"
-        );
-        assert_eq!(fs::read_to_string(log).unwrap(), cargo_args);
-    }
-
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -978,10 +907,164 @@ fn focused_framework_loop_runs_every_selection_and_preserves_failure() {
         // The suites run side by side, so in any order.
         let mut ran: Vec<String> = fs::read_to_string(log).unwrap().lines().map(String::from).collect();
         ran.sort();
-        let mut expected: Vec<&str> = expected_log.lines().collect();
+        // Not one run per suite: each first runs to record its shareable Spinel cases (`RH_SPINEL_BUNDLE_COLLECT`).
+        let collected: Vec<String> = expected_log.lines().map(|l| l.replace(" --nocapture", "")).collect();
+        let mut expected: Vec<&str> = expected_log.lines().chain(collected.iter().map(String::as_str)).collect();
         expected.sort();
         assert_eq!(ran, expected, "{result:?}");
     }
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// A slow suite is stopped and named inside the job's limit, with the shard's
+/// other suites reported and timed; `spinel` runs at the lane's `-O` level.
+#[cfg(unix)]
+#[test]
+fn framework_loop_stops_a_slow_suite_and_compiles_at_its_opt_level() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = scratch::dir(&format!("framework-budget-{unique}"));
+    let executable = |path: &std::path::Path, body: String| {
+        fs::write(path, body).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    executable(
+        &root.join("cargo"),
+        concat!(
+            "#!/bin/sh\n",
+            "prev=\n",
+            "for a in \"$@\"; do\n",
+            "  if [ \"$prev\" = --test ]; then\n",
+            "    printf '{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"%s\",\"kind\":[\"test\"]},\"executable\":\"%s/%s\"}\\n' \"$a\" \"$STUBS\" \"$a\"\n",
+            "  fi\n",
+            "  prev=$a\n",
+            "done\n",
+        )
+        .to_string(),
+    );
+    executable(&root.join("spinel"), "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$RUN_LOG\"\n".to_string());
+    let stubs = root.join("stubs");
+    fs::create_dir(&stubs).unwrap();
+    executable(&stubs.join("slow"), "#!/bin/sh\nsleep 60\n".to_string());
+    executable(&stubs.join("quick"), "#!/bin/sh\necho quick-output\nspinel app.rb -o app\n".to_string());
+
+    for (opt, expected) in [(Some("0"), "-O0 app.rb -o app\n"), (Some("2"), "-O2 app.rb -o app\n"), (None, "app.rb -o app\n")] {
+        let log = root.join("run.log");
+        fs::write(&log, "").unwrap();
+        let timings = root.join("timings.jsonl");
+        fs::write(&timings, "").unwrap();
+        let mut command = Command::new("bash");
+        command
+            .args(["-e", "-o", "pipefail", "-c", "scripts/ci-spinel-framework.sh"])
+            .env("TESTS", "slow quick")
+            .env("RUN_LOG", &log)
+            .env("STUBS", &stubs)
+            .env("RUNNER_TEMP", &root)
+            .env("CI_SPINEL_TIMINGS_OUT", &timings)
+            .env("CI_SPINEL_FRAMEWORK_BUDGET", "3")
+            .env("CI_SPINEL_OPT", opt.unwrap_or(""))
+            .env("PATH", format!("{}:{}", root.display(), std::env::var("PATH").unwrap()));
+        let start = std::time::Instant::now();
+        let result = command.output().unwrap();
+        assert!(start.elapsed().as_secs() < 30, "the budget did not stop the suite: {result:?}");
+        assert!(!result.status.success(), "a stopped suite fails the shard: {result:?}");
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        assert!(stdout.contains("::error::slow stopped at this shard's 3s budget"), "{stdout}");
+        assert!(stdout.contains("::group::quick") && stdout.contains("quick-output"), "{stdout}");
+        assert_eq!(fs::read_to_string(&log).unwrap(), expected, "{stdout}");
+        let recorded = fs::read_to_string(&timings).unwrap();
+        assert!(
+            recorded.lines().any(|l| l.contains("\"name\": \"slow\"") && l.contains("\"timed_out\": true")),
+            "{recorded}"
+        );
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn framework_loop_runs_a_suite_beside_the_build_of_its_shared_cases() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = scratch::dir(&format!("framework-bundle-{unique}"));
+    let executable = |path: &std::path::Path, body: &str| {
+        fs::write(path, body).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    executable(
+        &root.join("cargo"),
+        concat!(
+            "#!/bin/sh\n",
+            "prev=\n",
+            "for a in \"$@\"; do\n",
+            "  if [ \"$prev\" = --test ]; then\n",
+            "    printf '{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"%s\",\"kind\":[\"test\"]},\"executable\":\"%s/%s\"}\\n' \"$a\" \"$STUBS\" \"$a\"\n",
+            "  fi\n",
+            "  prev=$a\n",
+            "done\n",
+        ),
+    );
+    let stubs = root.join("stubs");
+    fs::create_dir(&stubs).unwrap();
+    executable(
+        &stubs.join("shared"),
+        concat!(
+            "#!/bin/sh\n",
+            "if [ -n \"$RH_SPINEL_BUNDLE_COLLECT\" ]; then echo '{\"test\":\"shared::case\"}' > \"$RH_SPINEL_BUNDLE_COLLECT/k.json\"; exit 101; fi\n",
+            "echo shared-started >> \"$RUN_LOG\"\n",
+            "until [ -e \"$RH_SPINEL_BUNDLE/finished\" ]; do sleep 0.1; done\n",
+            "printf 'shared %s bundle=%s\\n' \"$*\" \"$RH_SPINEL_BUNDLE\" >> \"$RUN_LOG\"\n",
+        ),
+    );
+    executable(&stubs.join("alone"), "#!/bin/sh\n[ -n \"$RH_SPINEL_BUNDLE_COLLECT\" ] || printf 'alone %s\\n' \"$*\" >> \"$RUN_LOG\"\n");
+    executable(
+        &stubs.join("spinel_bundle"),
+        concat!(
+            "#!/bin/sh\n",
+            "echo '[\"k\"]' > \"$RH_SPINEL_BUNDLE_OUT/pending.json\"\n",
+            "i=0; until grep -q shared-started \"$RUN_LOG\" 2> /dev/null || [ $i -gt 100 ]; do i=$((i+1)); sleep 0.1; done\n",
+            "printf 'spinel_bundle %s cases=%s\\n' \"$*\" \"$(ls \"$RH_SPINEL_BUNDLE_COLLECT\")\" >> \"$RUN_LOG\"\n",
+            "echo '{\"shared::case\": 40}' > \"$RH_SPINEL_BUNDLE_OUT/seconds.json\"\n",
+        ),
+    );
+    let log = root.join("run.log");
+    let timings = root.join("timings.jsonl");
+    let result = Command::new("bash")
+        .args(["-e", "-o", "pipefail", "-c", "scripts/ci-spinel-framework.sh"])
+        .env("TESTS", "shared alone")
+        .env("RUN_LOG", &log)
+        .env("STUBS", &stubs)
+        .env("RUNNER_TEMP", &root)
+        .env("CI_SPINEL_TIMINGS_OUT", &timings)
+        .env("PATH", format!("{}:{}", root.display(), std::env::var("PATH").unwrap()))
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "{result:?}");
+    let ran = fs::read_to_string(&log).unwrap();
+    let bundle = ran.lines().position(|l| l == "spinel_bundle --ignored --exact spinel_bundle_build --nocapture cases=k.json");
+    let shared = ran.lines().position(|l| {
+        l == format!("shared --ignored --nocapture bundle={}/spinel-framework/bundles", root.display())
+    });
+    let started = ran.lines().position(|l| l == "shared-started");
+    assert!(started.is_some() && bundle.is_some() && shared.is_some() && started < bundle && bundle < shared, "{ran}");
+    assert!(ran.lines().any(|l| l == "alone --ignored --nocapture"), "{ran}");
+    let recorded = fs::read_to_string(&timings).unwrap();
+    let seconds = recorded
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .find(|r| r["name"] == "shared")
+        .map(|r| r["seconds"].as_u64().unwrap());
+    assert!(seconds.is_some_and(|s| s >= 40), "the shared build is charged to its suite: {recorded}");
     fs::remove_dir_all(root).unwrap();
 }
 

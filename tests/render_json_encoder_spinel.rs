@@ -4,6 +4,8 @@
 //! sibling suites; CI's `spinel-framework` job runs it with `--ignored`
 //! (`scripts/ci-plan.py`'s `SPINEL_TESTS`).
 
+#[path = "support/prerequisite.rs"]
+mod prerequisite;
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 #[path = "support/json_response_escaping.rs"]
@@ -36,7 +38,7 @@ fn configuration_spellings_and_older_defaults_keep_rails_response_bytes() {
         ("rooted", "::Rails.application.config.load_defaults"),
     ] {
         let oracle = emit_and_run::ruby().arg(&script).args(["8.1", "unset", variant]).output().unwrap();
-        if oracle.status.code() == Some(77) { return; }
+        if oracle.status.code() == Some(77) { prerequisite::missing(&format!("the Rails oracle is unavailable (exit 77): {}", String::from_utf8_lossy(&oracle.stderr).trim())); return; }
         assert!(oracle.status.success(), "{}", String::from_utf8_lossy(&oracle.stderr));
         let actual: Vec<serde_json::Value> = String::from_utf8(oracle.stdout).unwrap().lines()
             .map(|line| serde_json::from_str(line).unwrap()).collect();
@@ -48,7 +50,7 @@ fn configuration_spellings_and_older_defaults_keep_rails_response_bytes() {
             .run_ruby(&json_response_escaping::program("8.1")).assert_passes();
     }
     let oracle = emit_and_run::ruby().arg(script).args(["8.0", "unset", "false_then_older"]).output().unwrap();
-    if oracle.status.code() == Some(77) { return; }
+    if oracle.status.code() == Some(77) { prerequisite::missing(&format!("the Rails oracle is unavailable (exit 77): {}", String::from_utf8_lossy(&oracle.stderr).trim())); return; }
     assert!(oracle.status.success(), "{}", String::from_utf8_lossy(&oracle.stderr));
     for line in String::from_utf8(oracle.stdout).unwrap().lines() {
         let actual: serde_json::Value = serde_json::from_str(line).unwrap();
@@ -69,6 +71,16 @@ fn json_response_defaults_run_on_spinel() {
     }
     json_response_escaping::app("8.1").remove("config/application.rb")
         .run_spinel(&json_response_escaping::program("8.1")).assert_passes();
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn installed_rails_defaults_run_on_spinel() {
+    for defaults in [r##""#{Rails::VERSION::MAJOR}.#{Rails::VERSION::MINOR}""##, "Rails::VERSION::STRING.to_f"] {
+        json_response_escaping::app(defaults)
+            .write("Gemfile.lock", "GEM\n  remote: https://rubygems.org/\n  specs:\n    railties (8.1.4)\n\nPLATFORMS\n  ruby\n")
+            .run_spinel(&json_response_escaping::program("8.1")).assert_passes();
+    }
 }
 
 #[test]
@@ -94,7 +106,7 @@ puts "dispatcher encoding passed"
 fn app() -> emit_and_run::Overlay {
     emit_and_run::empty_app()
         .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n")
-        .write("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"widgets\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n")
+        .write("db/schema.rb", "ActiveRecord::Schema[8.1].define(version: 1) do\n  create_table \"widgets\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n")
         .write("config/routes.rb", "Rails.application.routes.draw do\n  get \"/settings\", to: \"payloads#settings\"\n  get \"/count\", to: \"payloads#count\"\n  get \"/stamp\", to: \"payloads#stamp\"\nend\n")
         .write("app/models/badge.rb", r#"class Badge
   def initialize(label)
@@ -204,7 +216,7 @@ fn controller_owned_policy_and_configuration_execution_match_rails() {
     let oracle = root.parent().unwrap().join("case_oracle.rb");
     for name in ["jsonp_charset", "jsonp_uppercase", "benign_string", "unrelated_setter", "parent_getter_false_child_true", "reopened_application"] {
         let output = emit_and_run::ruby().arg(&oracle).arg(root.join(name)).arg("index").output().unwrap();
-        if output.status.code() == Some(77) { continue; }
+        if output.status.code() == Some(77) { prerequisite::missing(&format!("the Rails oracle is unavailable (exit 77): {}", String::from_utf8_lossy(&output.stderr).trim())); continue; }
         assert!(output.status.success(), "{name}: {}", String::from_utf8_lossy(&output.stderr));
         let expected: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         if matches!(name, "parent_getter_false_child_true" | "reopened_application" | "unrelated_setter") {
@@ -234,7 +246,7 @@ fn jsonp_parameter_spacing_matches_initialized_rails() {
     let fixture = root.join("cases/jsonp_parameters");
     let actions = ["bare", "no_space", "one_space", "extra_spaces", "uppercase", "other_parameter", "other_then_charset", "charset_then_other"];
     let output = emit_and_run::ruby().arg(root.join("case_oracle.rb")).arg(&fixture).args(actions).output().unwrap();
-    if output.status.code() == Some(77) { return; }
+    if output.status.code() == Some(77) { prerequisite::missing(&format!("the Rails oracle is unavailable (exit 77): {}", String::from_utf8_lossy(&output.stderr).trim())); return; }
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     let expected: Vec<serde_json::Value> = String::from_utf8(output.stdout).unwrap().lines()
         .map(|line| serde_json::from_str(line).unwrap()).collect();

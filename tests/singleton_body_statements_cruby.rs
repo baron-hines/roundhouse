@@ -106,6 +106,6 @@ fn a_gem_source_singleton_body_loop_runs_on_the_singleton_class_as_in_cruby() {
         app = app.write(&format!("vendor/gems/writers_gem-1.0.0/{path}"), text);
     }
     let run = app.run_ruby(GEM_SCRIPT);
-    assert!(run.success, "{}\n{}\n{}\n{:?}", run.emitted.display(), run.stdout, run.stderr, run.errors);
+    run.assert_passes();
     assert_eq!(run.stdout, expected, "{}", run.stderr);
 }

@@ -50,7 +50,7 @@ fn refused_run(why: &str) -> emit_and_run::Run {
 
 fn assert_refused(run: &emit_and_run::Run) {
     assert!(run.errors.iter().any(|error| error.contains("widget-engine") && error.contains("requires the Rails framework")), "{:#?}", run.errors);
-    assert!(!run.success, "a refused target has no program to run:\n{}", run.stdout);
+    assert!(!run.program_succeeded(), "a refused target has no program to run:\n{}", run.stdout);
     assert!(std::fs::read_dir(&run.emitted).unwrap().next().is_none(), "a refused target writes no tree");
 }
 
@@ -63,4 +63,64 @@ fn a_refused_target_reports_its_errors_instead_of_panicking() {
 fn a_refusal_whose_reason_ends_in_a_newline_is_still_reported() {
     // A block scalar keeps its trailing newline, and so does the diagnostic.
     assert_refused(&refused_run("|\n      requires the Rails framework\n"));
+}
+
+// A script reports a failed check by raising, so exit status 0 alone would
+// also pass a script that stopped before its checks. The harness appends a
+// completion line and requires it.
+
+#[test]
+#[should_panic(expected = "without reaching the end of its script")]
+fn a_script_that_exits_before_its_checks_does_not_pass() {
+    app().run_ruby("exit 0\nraise \"the check that never ran\"").assert_passes();
+}
+
+#[test]
+#[should_panic(expected = "without reaching the end of its script")]
+fn a_script_that_returns_before_its_checks_does_not_pass() {
+    app().run_ruby("return\nraise \"the check that never ran\"").assert_passes();
+}
+
+#[test]
+fn a_script_that_stops_early_is_not_a_success_either() {
+    let run = app().run_ruby("exit 0");
+    assert!(!run.program_succeeded(), "a caller reading `program_succeeded` gets the same verdict as `assert_passes`");
+}
+
+#[test]
+fn output_after_the_script_ends_is_kept_and_the_completion_line_is_not() {
+    let run = app().run_ruby("at_exit { print \"after\" }\nputs \"during\"");
+    run.assert_passes();
+    assert_eq!(run.stdout, "during\nafter");
+}
+
+// A program that runs is half the claim: a run whose analysis reports an
+// error has not passed, however its program ran. `passed` and
+// `assert_passes` read both halves; `program_succeeded` reads one.
+
+const PUNDIT_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    pundit (2.5.2)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  pundit\n";
+
+/// An action no script calls refers to an unshipped gem's helper: `check`
+/// refuses it, and the emitted program, which never reaches it, runs.
+fn refused_but_running() -> emit_and_run::Run {
+    app()
+        .write("Gemfile.lock", PUNDIT_LOCK)
+        .write("app/models/widget.rb", "class Widget < ApplicationRecord\nend\n")
+        .write("app/controllers/widgets_controller.rb", "class WidgetsController < ApplicationController\n  def index\n    @widgets = policy_scope(Widget)\n  end\nend\n")
+        .run_ruby("print :ran")
+}
+
+#[test]
+fn a_run_that_reports_an_error_has_not_passed_although_its_program_ran() {
+    let run = refused_but_running();
+    assert!(run.errors.iter().any(|error| error.contains("`policy_scope` is a helper of the `pundit` gem")), "{:#?}", run.errors);
+    assert!(run.program_succeeded(), "{}\n{}", run.stdout, run.stderr);
+    assert_eq!(run.stdout, "ran");
+    assert!(!run.passed(), "a run with an error passed");
+}
+
+#[test]
+#[should_panic(expected = "analysis or emit reports errors")]
+fn assert_passes_fails_a_run_that_reports_an_error() {
+    refused_but_running().assert_passes();
 }

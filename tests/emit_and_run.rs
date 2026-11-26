@@ -5,18 +5,54 @@
 //! disagree: `check` is clean and the emitted program fails. Each is a
 //! complete statement of the fix: make it pass and drop the `#[ignore]`.
 
+#[path = "support/data_record_siblings.rs"]
+mod data_record_siblings_contract;
+#[path = "emit_and_run/data_record_siblings.rs"]
+mod data_record_siblings;
+
 #[path = "support/scratch.rs"]
 mod scratch;
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
+#[path = "support/native_http.rs"]
+#[allow(dead_code)]
+mod native_http;
+#[path = "emit_and_run/namespaced_form_partial.rs"]
+mod namespaced_form_partial;
+#[path = "emit_and_run/url_helper_protocol.rs"]
+mod url_helper_protocol;
+#[path = "emit_and_run/guessed_private_method.rs"]
+mod guessed_private_method;
+#[path = "emit_and_run/literal_send_untyped.rs"]
+mod literal_send_untyped;
+#[path = "emit_and_run/duration_defined_units.rs"]
+mod duration_defined_units;
+#[path = "emit_and_run/find_or_create_block_before_hook.rs"]
+mod find_or_create_block_before_hook;
+#[path = "emit_and_run/eager_load_conditions.rs"]
+mod eager_load_conditions;
+#[path = "emit_and_run/zeitwerk_eager_gem.rs"]
+mod zeitwerk_eager_gem;
+#[path = "emit_and_run/lobsters_boot_calls.rs"]
+mod lobsters_boot_calls;
+#[path = "emit_and_run/multi_json.rs"]
+mod multi_json;
+#[path = "emit_and_run/active_model_serializer_08.rs"]
+mod active_model_serializer_08;
+#[path = "emit_and_run/respond_to_core_class.rs"]
+mod respond_to_core_class;
 #[path = "emit_and_run/deep_stringify_keys.rs"]
 mod deep_stringify_keys;
+#[path = "emit_and_run/fixture_explicit_id.rs"]
+mod fixture_explicit_id;
 #[path = "emit_and_run/controller_content_type_writer.rs"]
 mod controller_content_type_writer;
 #[path = "support/time_change_usec.rs"]
 mod time_change_usec_contract;
 #[path = "emit_and_run/time_change_usec.rs"]
 mod time_change_usec;
+#[path = "emit_and_run/controller_constant_rooting.rs"]
+mod controller_constant_rooting;
 #[path = "emit_and_run/rate_limits.rs"]
 mod rate_limits;
 #[path = "emit_and_run/config_for.rs"]
@@ -105,12 +141,18 @@ mod branch_local_join;
 mod utc_zone_time;
 #[path = "emit_and_run/rspec_specs.rs"]
 mod rspec_specs;
+#[path = "support/after_initialize_boot.rs"]
+mod after_initialize_boot_contract;
+#[path = "emit_and_run/after_initialize.rs"]
+mod after_initialize;
 #[path = "emit_and_run/discard.rs"]
 mod discard;
 #[path = "emit_and_run/callback_abort.rs"]
 mod callback_abort;
 #[path = "emit_and_run/dirty_clear_restore.rs"]
 mod dirty_clear_restore;
+#[path = "emit_and_run/partial_writes.rs"]
+mod partial_writes;
 #[path = "emit_and_run/will_save_change_to_attribute.rs"]
 mod will_save_change_to_attribute;
 #[path = "emit_and_run/pundit_source.rs"]
@@ -131,6 +173,34 @@ mod gem_class_macros;
 mod source_gem_autoload;
 #[path = "emit_and_run/source_gem_load_order.rs"]
 mod source_gem_load_order;
+#[path = "emit_and_run/gem_file_statements.rs"]
+mod gem_file_statements;
+#[path = "emit_and_run/uncalled_config_writers.rs"]
+mod uncalled_config_writers;
+#[path = "emit_and_run/gem_mailer_reach.rs"]
+mod gem_mailer_reach;
+#[path = "emit_and_run/helper_method_splat.rs"]
+mod helper_method_splat;
+#[path = "emit_and_run/constant_branches.rs"]
+mod constant_branches;
+#[path = "emit_and_run/defined_method_query.rs"]
+mod defined_method_query;
+#[path = "emit_and_run/metal_subclass.rs"]
+mod metal_subclass;
+#[path = "emit_and_run/association_reflection.rs"]
+mod association_reflection;
+#[path = "emit_and_run/human_attribute_name_dynamic.rs"]
+mod human_attribute_name_dynamic;
+#[path = "emit_and_run/boot_with_options.rs"]
+mod boot_with_options;
+#[path = "support/class_param_or_assign.rs"]
+mod class_param_or_assign_app;
+#[path = "emit_and_run/class_param_or_assign.rs"]
+mod class_param_or_assign;
+#[path = "emit_and_run/forwarded_block_reach.rs"]
+mod forwarded_block_reach;
+#[path = "emit_and_run/superclass_respond_to.rs"]
+mod superclass_respond_to;
 #[path = "emit_and_run/unresolved_param_rbs.rs"]
 mod unresolved_param_rbs;
 #[path = "emit_and_run/declared_sig_rbs.rs"]
@@ -157,6 +227,22 @@ mod stdlib_scan_zlib;
 mod stdlib_rexml_include_contract;
 #[path = "emit_and_run/stdlib_rexml_include.rs"]
 mod stdlib_rexml_include;
+#[path = "support/gem_reopen_source.rs"]
+mod gem_reopen_source_contract;
+#[path = "emit_and_run/gem_reopen_source.rs"]
+mod gem_reopen_source;
+#[path = "support/gem_nested_once.rs"]
+mod gem_nested_once_contract;
+#[path = "emit_and_run/gem_nested_once.rs"]
+mod gem_nested_once;
+#[path = "support/gem_array_first.rs"]
+mod gem_array_first_contract;
+#[path = "emit_and_run/gem_array_first.rs"]
+mod gem_array_first;
+#[path = "support/stdlib_singleton.rs"]
+mod stdlib_singleton_contract;
+#[path = "emit_and_run/stdlib_singleton.rs"]
+mod stdlib_singleton;
 #[path = "support/mutable_literals.rs"]
 mod mutable_literals_contract;
 #[path = "emit_and_run/mutable_literals.rs"]
@@ -165,6 +251,18 @@ mod mutable_literals;
 mod auto_source_gem_contract;
 #[path = "emit_and_run/auto_source_gem.rs"]
 mod auto_source_gem;
+#[path = "support/gem_autoload_helper.rs"]
+mod gem_autoload_helper_contract;
+#[path = "emit_and_run/gem_autoload_helper.rs"]
+mod gem_autoload_helper;
+#[path = "support/gem_method_require.rs"]
+mod gem_method_require_contract;
+#[path = "emit_and_run/gem_method_require.rs"]
+mod gem_method_require;
+#[path = "support/block_arg_conditional.rs"]
+mod block_arg_conditional_contract;
+#[path = "emit_and_run/block_arg_conditional.rs"]
+mod block_arg_conditional;
 #[path = "emit_and_run/pay_exceptions.rs"]
 mod pay_exceptions;
 #[path = "emit_and_run/net_http_patch.rs"]
@@ -177,6 +275,16 @@ mod temporal_index_assign;
 mod file_mtime_time;
 #[path = "support/class_attribute.rs"]
 mod class_attribute;
+#[path = "support/service_params_class.rs"]
+mod service_params_class;
+#[path = "emit_and_run/gem_routes.rs"]
+mod gem_routes;
+#[path = "emit_and_run/route_request_guards.rs"]
+mod route_request_guards;
+#[path = "support/option_dsl.rs"]
+mod option_dsl;
+#[path = "emit_and_run/option_dsl.rs"]
+mod option_dsl_runs;
 #[path = "support/string_truncate.rs"]
 mod string_truncate;
 #[path = "emit_and_run/string_truncate.rs"]
@@ -291,6 +399,10 @@ mod representable;
 mod active_model_serializer_app;
 #[path = "emit_and_run/active_model_serializer.rs"]
 mod active_model_serializer;
+#[path = "emit_and_run/render_rooted_serializer.rs"]
+mod render_rooted_serializer;
+#[path = "emit_and_run/serializer_scope.rs"]
+mod serializer_scope;
 #[path = "emit_and_run/instance_extend.rs"]
 mod instance_extend;
 
@@ -368,10 +480,24 @@ mod backticks;
 mod json_params_contract;
 #[path = "emit_and_run/json_params.rs"]
 mod json_params;
+#[path = "emit_and_run/raw_post_body.rs"]
+mod raw_post_body;
+#[path = "emit_and_run/scoped_new_form.rs"]
+mod scoped_new_form;
+#[path = "emit_and_run/sti_form_route.rs"]
+mod sti_form_route;
 #[path = "support/class_side_default.rs"]
 mod class_side_default_contract;
 #[path = "emit_and_run/class_side_default.rs"]
 mod class_side_default;
+#[path = "support/hash_write_through_reader.rs"]
+mod hash_write_through_reader_contract;
+#[path = "emit_and_run/hash_write_through_reader.rs"]
+mod hash_write_through_reader;
+#[path = "support/app_class_registry.rs"]
+mod app_class_registry_contract;
+#[path = "emit_and_run/app_class_registry.rs"]
+mod app_class_registry;
 #[path = "emit_and_run/helper_anonymous_rest.rs"]
 mod helper_anonymous_rest;
 #[path = "emit_and_run/controller_response_body.rs"]
@@ -454,6 +580,12 @@ mod campfire_caches_contract;
 mod campfire_caches;
 #[path = "emit_and_run/action_text_markdown.rs"]
 mod action_text_markdown;
+#[path = "emit_and_run/nested_class_requires_its_namespace.rs"]
+mod nested_class_requires_its_namespace;
+#[path = "emit_and_run/nested_include_require_top.rs"]
+mod nested_include_require_top;
+#[path = "emit_and_run/nested_include_after_constants.rs"]
+mod nested_include_after_constants;
 #[path = "emit_and_run/ordinalize.rs"]
 mod ordinalize;
 #[path = "emit_and_run/float_round_digits.rs"]
@@ -462,10 +594,14 @@ mod float_round_digits;
 mod autoload_once_paths;
 #[path = "emit_and_run/config_require_relative.rs"]
 mod config_require_relative;
+#[path = "emit_and_run/active_storage_current.rs"]
+mod active_storage_current;
 #[path = "emit_and_run/defined_const_fold.rs"]
 mod defined_const_fold;
 #[path = "emit_and_run/job_payload.rs"]
 mod job_payload;
+#[path = "emit_and_run/job_keywords.rs"]
+mod job_keywords;
 #[path = "emit_and_run/sidekiq_push.rs"]
 mod sidekiq_adapter;
 #[path = "emit_and_run/sidekiq_retry_on.rs"]
@@ -522,6 +658,10 @@ mod format_allow_nil_blank;
 mod format_value_to_s;
 #[path = "emit_and_run/validates_acceptance.rs"]
 mod validates_acceptance;
+#[path = "emit_and_run/validates_of_confirmation.rs"]
+mod validates_of_confirmation;
+#[path = "emit_and_run/respond_to_fold.rs"]
+mod respond_to_fold;
 #[path = "emit_and_run/attribute_api_boolean_cast.rs"]
 mod attribute_api_boolean_cast;
 #[path = "emit_and_run/hash_fetch_one_arg.rs"]
@@ -530,6 +670,8 @@ mod hash_fetch_one_arg;
 mod numericality_unknown_option;
 #[path = "emit_and_run/belongs_to_nil_writer.rs"]
 mod belongs_to_nil_writer;
+#[path = "emit_and_run/model_defined_guard.rs"]
+mod model_defined_guard;
 #[path = "emit_and_run/inclusion_duration_literals.rs"]
 mod inclusion_duration_literals;
 #[path = "emit_and_run/validates_constant_splat.rs"]
@@ -790,6 +932,75 @@ puts "registry module passed"
         );
     run.assert_passes();
     assert!(run.stdout.contains("registry module passed"));
+}
+
+/// doorkeeper's `Client::Credentials = Struct.new(:uid, :secret) do … end`: the block is the class's
+/// body, with `class << self`, a private class method and a `delegate`, not one the file is dropped for.
+#[test]
+fn a_struct_block_body_keeps_its_class_methods_visibility_and_delegates() {
+    let run = emit_and_run::real_blog()
+        .write(
+            "app/models/cred.rb",
+            "class Cred\n  Pair = Struct.new(:uid, :secret) do\n    class << self\n      def from(text)\n        build(text)\n      end\n\n      private\n\n      def build(text)\n        new(*text.split(\":\", 2))\n      end\n    end\n\n    delegate :blank?, to: :uid\n  end\nend\n",
+        )
+        .run_ruby(
+            r##"pair = Cred::Pair.from("a:b")
+raise "from: #{pair.uid.inspect}" unless pair.uid == "a" && pair.secret == "b"
+raise "blank" unless Cred::Pair.new("", "x").blank?
+raise "present" if Cred::Pair.new("u", "x").blank?
+begin
+  Cred::Pair.build("x:y")
+  raise "build is public"
+rescue NoMethodError
+end
+puts "struct block passed"
+"##,
+        );
+    run.assert_passes();
+    assert!(run.stdout.contains("struct block passed"), "{}", run.stdout);
+}
+
+/// A `Struct.new` block's `include` is the class's own, as in a class body. An `alias_method` there
+/// keeps the constant: the struct class is written without its class-body calls.
+#[test]
+fn a_struct_block_body_keeps_its_includes() {
+    let run = emit_and_run::real_blog()
+        .write("app/models/greeting.rb", "module Greeting\n  def hi\n    \"hi #{name}\"\n  end\nend\n")
+        .write(
+            "app/models/greeter.rb",
+            "class Greeter\n  Person = Struct.new(:name) do\n    include Greeting\n  end\nend\n",
+        )
+        .run_ruby(
+            r##"person = Greeter::Person.new("Ann")
+raise "include: #{person.hi.inspect}" unless person.hi == "hi Ann"
+raise "ancestry" unless Greeter::Person.include?(Greeting)
+puts "struct include passed"
+"##,
+        );
+    run.assert_passes();
+    assert!(run.stdout.contains("struct include passed"), "{}", run.stdout);
+}
+
+/// A module body as devise's: an `autoload` beside `mattr_*` initializers, a
+/// class variable appended to after its seed, and a writer the body defines
+/// called in it. Each runs where the source has it, the autoloaded constant
+/// read as the body loads.
+#[test]
+fn a_module_body_runs_its_class_variable_steps_in_order() {
+    let run = emit_and_run::real_blog()
+        .write("app/models/registry/item.rb", "module Registry\n  module Item\n    def self.tag\n      :item\n    end\n  end\nend\n")
+        .write(
+            "app/models/registry.rb",
+            "module Registry\n  autoload :Item, \"registry/item\"\n\n  mattr_reader :items\n  @@items = []\n  @@items << Registry::Item\n  @@items << :b\n\n  def self.ref(name)\n    \"ref:#{name}\"\n  end\n\n  def self.mailer\n    @@mailer_ref\n  end\n\n  def self.mailer=(name)\n    @@mailer_ref = ref(name)\n  end\n  self.mailer = \"Registry::Mailer\"\nend\n",
+        )
+        .run_ruby(
+            r##"raise "items: #{Registry.items.inspect}" unless Registry.items == [Registry::Item, :b]
+raise "mailer: #{Registry.mailer.inspect}" unless Registry.mailer == "ref:Registry::Mailer"
+puts "module body passed"
+"##,
+        );
+    run.assert_passes();
+    assert!(run.stdout.contains("module body passed"), "{}", run.stdout);
 }
 
 /// `String#strip_heredoc` as Rails takes it: the least indentation of a
@@ -5666,9 +5877,10 @@ fn concern_class_attribute_macros_are_fully_typed() {
     // The signature declares the parameter's own type, not the slot's.
     let probe = app.controllers.iter().find(|c| c.name.0.as_str() == "ProbeController").unwrap();
     let preload = probe.class_methods().find(|m| m.name.as_str() == "preload_site_configs").unwrap();
-    let Some(roundhouse::ty::Ty::Fn { params, .. }) = &preload.signature else {
+    let Some(roundhouse::ty::Ty::Fn(fn_ty)) = &preload.signature else {
         panic!("unsigned: {:?}", preload.signature)
     };
+    let roundhouse::ty::FnTy { params, .. } = &**fn_ty;
     assert_eq!(
         params[0].ty,
         roundhouse::ty::Ty::Array { elem: std::sync::Arc::new(roundhouse::ty::Ty::Str) }.into(),
@@ -5676,9 +5888,10 @@ fn concern_class_attribute_macros_are_fully_typed() {
     );
     // `only: nil` is nil when absent, which the signature has to say.
     let add = probe.class_methods().find(|m| m.name.as_str() == "add_preload_definition").unwrap();
-    let Some(roundhouse::ty::Ty::Fn { params, .. }) = &add.signature else {
+    let Some(roundhouse::ty::Ty::Fn(fn_ty)) = &add.signature else {
         panic!("unsigned: {:?}", add.signature)
     };
+    let roundhouse::ty::FnTy { params, .. } = &**fn_ty;
     let only = params.iter().find(|p| p.name.as_str() == "only").expect("only");
     assert!(
         matches!(&*only.ty, roundhouse::ty::Ty::Union { variants } if variants.contains(&roundhouse::ty::Ty::Nil)),
@@ -7859,7 +8072,7 @@ fn a_fixture_naming_a_missing_parent_fails_setup() {
             "require \"test_helper\"\n\nclass FkCheckTest < ActiveSupport::TestCase\n  test \"loads\" do\n    assert Article.count > 0\n  end\nend\n",
         )
         .run_test("test/models/fk_check_test.rb");
-    assert!(!run.success, "{}", run.stdout);
+    assert!(!run.program_succeeded(), "{}", run.stdout);
     assert!(run.stdout.contains("Foreign key violations found: comments") || run.stderr.contains("Foreign key violations found: comments"), "{}\n{}", run.stdout, run.stderr);
 }
 
@@ -10229,6 +10442,53 @@ fn connected_to_the_writing_role_runs_its_block() {
         .assert_passes();
 }
 
+/// doorkeeper's `get_error_response_from_exception`: `exception.response` behind `respond_to?(:response)`,
+/// on an error class that has none, is a branch no value the inference sees takes, not a missing method.
+#[test]
+fn a_respond_to_guard_none_of_the_receivers_answers_is_no_dispatch_error() {
+    emit_and_run::real_blog()
+        .write(
+            "app/models/error_view.rb",
+            "class ErrorView\n  class Failure < StandardError\n  end\n\n  def self.describe(error)\n    if error.respond_to?(:response)\n      error.response\n    else\n      error.message\n    end\n  end\n\n  def self.sample\n    describe(Failure.new(\"broken\"))\n  end\nend\n",
+        )
+        .run_ruby("raise ErrorView.sample.inspect unless ErrorView.sample == \"broken\"")
+        .assert_passes();
+}
+
+/// doorkeeper's `SecretStoring::BCrypt.secret_matches?`: a stored value that is not a bcrypt hash raises the
+/// gem's `BCrypt::Errors::InvalidHash`, which the caller rescues.
+#[test]
+fn a_bcrypt_invalid_hash_is_the_gems_error() {
+    emit_and_run::real_blog()
+        .write(
+            "app/models/secret_check.rb",
+            "class SecretCheck\n  def self.matches?(stored, input)\n    BCrypt::Password.new(stored) == input\n  rescue BCrypt::Errors::InvalidHash\n    false\n  end\nend\n",
+        )
+        .run_ruby(
+            "raise \"invalid\" if SecretCheck.matches?(\"not a hash\", \"pw\")\n\
+             raise \"valid\" unless SecretCheck.matches?(BCrypt::Password.create(\"pw\", cost: 4).to_s, \"pw\")\n\
+             raise \"hierarchy\" unless BCrypt::Errors::InvalidHash.ancestors.include?(BCrypt::Error)",
+        )
+        .assert_passes();
+}
+
+/// doorkeeper's `with_primary_role(&block)`: the block handed on to `connected_to(role: :writing, &block)` is the one called.
+#[test]
+fn connected_to_the_writing_role_calls_a_block_handed_on() {
+    emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n",
+            "class Article < ApplicationRecord\n  def self.with_primary(&block)\n    ::ActiveRecord::Base.connected_to(role: :writing, &block)\n  end\n",
+        )
+        .run_ruby(
+            "a = Article.create!(title: \"Hi\", body: \"Body text here\")\n\
+             raise \"value\" unless Article.with_primary { Article.find(a.id).update!(title: \"New\"); 7 } == 7\n\
+             raise \"write\" unless Article.find(a.id).title == \"New\"",
+        )
+        .assert_passes();
+}
+
 /// A reading role refuses writes in Rails, and a shard is another
 /// database; neither, nor a block whose `next` the call gives meaning,
 /// is the plain block.
@@ -10238,6 +10498,8 @@ fn connected_to_other_than_the_writing_role_stays_unsupported() {
         "ActiveRecord::Base.connected_to(role: :reading) do\n      count\n    end",
         "ActiveRecord::Base.connected_to(role: :writing, shard: :other) do\n      count\n    end",
         "ActiveRecord::Base.connected_to(role: :writing) do\n      next 0 if none?\n      count\n    end",
+        // Not the method's own block: `&callback` converts a local through `to_proc`.
+        "callback = method(:count)\n    ActiveRecord::Base.connected_to(role: :writing, &callback)",
     ] {
         let errors = emit_and_run::real_blog()
             .edit(
@@ -10247,6 +10509,29 @@ fn connected_to_other_than_the_writing_role_stays_unsupported() {
             )
             .check_errors();
         assert!(errors.iter().any(|e| e.contains("connected_to")), "{call}: {errors:?}");
+    }
+}
+
+/// An inner block that binds the method's block name hands on its own value, which `&` converts through `to_proc`.
+#[test]
+fn connected_to_with_a_shadowed_block_name_stays_unsupported() {
+    let errors = emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n",
+            "class Article < ApplicationRecord\n  def self.tally(&block)\n    [method(:count)].map { |block| ActiveRecord::Base.connected_to(role: :writing, &block) }\n  end\n",
+        )
+        .check_errors();
+    assert!(errors.iter().any(|e| e.contains("connected_to")), "{errors:?}");
+    // An arrow lambda binds it the same way, and a method that assigns it hands on what it assigned.
+    for body in [
+        "->(block) { ActiveRecord::Base.connected_to(role: :writing, &block) }.call(method(:count))",
+        "block = method(:count)\n    ActiveRecord::Base.connected_to(role: :writing, &block)",
+    ] {
+        let errors = emit_and_run::real_blog()
+            .edit("app/models/article.rb", "class Article < ApplicationRecord\n", &format!("class Article < ApplicationRecord\n  def self.tally(&block)\n    {body}\n  end\n"))
+            .check_errors();
+        assert!(errors.iter().any(|e| e.contains("connected_to")), "{body}: {errors:?}");
     }
 }
 
@@ -10896,6 +11181,134 @@ end
         .run_ruby(
             r#"raise "helper override lost" unless ApplicationHelper.heading == "custom 1:person"
 raise "view override lost" unless Views::Articles.custom_count(nil) == "custom 1:person|nested custom 2:person"
+puts "ok"
+"#,
+        )
+        .assert_passes();
+}
+
+/// `row.pluralize` on a receiver of no settled type, in a controller. An
+/// app class outside the controllers that defines `pluralize` owns the
+/// call (Rails 8.1.4 dispatches to it).
+fn an_untyped_pluralize_receiver_app() -> emit_and_run::Overlay {
+    emit_and_run::real_blog().write(
+        "app/controllers/probes_controller.rb",
+        r#"class ProbesController < ApplicationController
+  def tag_of(row)
+    row.pluralize
+  end
+end
+"#,
+    )
+}
+
+#[test]
+fn a_library_class_pluralize_owns_an_untyped_controller_call() {
+    an_untyped_pluralize_receiver_app()
+        .write("app/models/label.rb", "class Label\n  def pluralize\n    \"custom\"\n  end\nend\n")
+        .run_ruby(
+            r#"require_relative "app/controllers/probes_controller"
+raise "library class override lost" unless ProbesController.allocate.tag_of(Label.new) == "custom"
+puts "ok"
+"#,
+        )
+        .assert_passes();
+}
+
+#[test]
+fn a_model_pluralize_owns_an_untyped_controller_call() {
+    an_untyped_pluralize_receiver_app()
+        .write(
+            "app/models/comment.rb",
+            r#"class Comment < ApplicationRecord
+  belongs_to :article
+  validates :body, presence: true
+
+  def pluralize
+    "custom"
+  end
+end
+"#,
+        )
+        .run_ruby(
+            r#"require_relative "app/controllers/probes_controller"
+raise "model override lost" unless ProbesController.allocate.tag_of(Comment.new) == "custom"
+puts "ok"
+"#,
+        )
+        .assert_passes();
+}
+
+/// Only a String has `pluralize` (Rails 8.1.4 raises NoMethodError on a number).
+#[test]
+fn a_number_raises_in_an_untyped_controller_call() {
+    an_untyped_pluralize_receiver_app()
+        .run_ruby(
+            r#"require_relative "app/controllers/probes_controller"
+begin
+  out = ProbesController.allocate.tag_of(5)
+  raise "answered: #{out}"
+rescue NoMethodError => e
+  raise e.message unless e.message == "undefined method 'pluralize' for an instance of Integer"
+end
+puts "ok"
+"#,
+        )
+        .assert_passes();
+}
+
+/// Two helpers define it, and each name indexes only one of them.
+#[test]
+fn two_helpers_pluralize_leave_an_untyped_controller_call_lowered() {
+    an_untyped_pluralize_receiver_app()
+        .write(
+            "app/helpers/application_helper.rb",
+            "module ApplicationHelper\n  def pluralize(count, word)\n    \"custom\"\n  end\nend\n",
+        )
+        .write(
+            "app/helpers/other_helper.rb",
+            "module OtherHelper\n  def pluralize(count, word)\n    \"other\"\n  end\nend\n",
+        )
+        .run_ruby(
+            r#"require_relative "app/controllers/probes_controller"
+out = ProbesController.allocate.tag_of("status")
+raise "helper took the call: #{out}" unless out == "statuses"
+puts "ok"
+"#,
+        )
+        .assert_passes();
+}
+
+/// The same inside the helper module that defines it (Rails 8.1.4 answers
+/// `statuses` from `word.pluralize` there).
+#[test]
+fn a_helper_pluralize_leaves_its_own_untyped_call_lowered() {
+    emit_and_run::real_blog()
+        .write(
+            "app/helpers/application_helper.rb",
+            "module ApplicationHelper\n  def pluralize(count, word)\n    \"custom\"\n  end\n\n  def plural_of(word)\n    word.pluralize\n  end\nend\n",
+        )
+        .run_ruby(
+            r#"out = ApplicationHelper.plural_of("status")
+raise "helper took the call: #{out}" unless out == "statuses"
+puts "ok"
+"#,
+        )
+        .assert_passes();
+}
+
+/// A helper's `pluralize(count, word)` is not what `row.pluralize` reaches.
+#[test]
+fn a_helper_pluralize_leaves_an_untyped_controller_call_lowered() {
+    an_untyped_pluralize_receiver_app()
+        .write(
+            "app/helpers/application_helper.rb",
+            "module ApplicationHelper\n  def pluralize(count, word)\n    \"custom\"\n  end\nend\n",
+        )
+        .run_ruby(
+            r#"require_relative "app/controllers/probes_controller"
+out = ProbesController.allocate.tag_of("status")
+raise "helper took the call: #{out}" unless out == "statuses"
 puts "ok"
 "#,
         )
@@ -13072,10 +13485,8 @@ puts "string inflections passed"
     assert!(run.stdout.contains("string inflections passed"), "{}", run.stdout);
 }
 
-/// #293: `tableize` needs Rails' plural rules, which the runtime does not
-/// carry (its `pluralize_word` keeps a word that ends in "s", where Rails
-/// answers "statuses"). It is refused at check time, not emitted onto a
-/// String no runtime reopens.
+/// #293: `tableize` has no runtime body. It is refused at check time, not
+/// emitted onto a String no runtime reopens.
 #[test]
 fn string_extensions_without_a_runtime_body_are_refused() {
     for (call, method) in [(r#""Status".tableize"#, "tableize")] {
@@ -14974,7 +15385,7 @@ end
 #[test]
 fn literal_data_factories_and_aliases_check_cleanly_and_execute() {
     use roundhouse::ident::{ClassId, Symbol};
-    use roundhouse::ty::Ty;
+    use roundhouse::ty::{FnTy, Ty};
 
     let run = emit_and_run::real_blog()
         .write("app/lib/factory_examples.rb", data_factory::DECLARATIONS)
@@ -15022,13 +15433,14 @@ puts "Data factory identity, aliases, constructors, values and immutability pass
         assert!(factory.contains_key(&Symbol::from("new")), "{sidecar}");
         for reader in readers {
             let signature = &factory[&Symbol::from(reader)];
-            assert!(matches!(signature, Ty::Fn { ret, .. } if **ret == Ty::Untyped), "{sidecar}");
+            assert!(matches!(signature, Ty::Fn(fn_ty) if *fn_ty.ret == Ty::Untyped), "{sidecar}");
             assert!(!factory.contains_key(&Symbol::from(format!("{reader}="))), "{sidecar}");
         }
         let owner_methods = &signatures[&ClassId(Symbol::from(owner))];
-        let Ty::Fn { ret, .. } = &owner_methods[&Symbol::from("build")] else {
+        let Ty::Fn(fn_ty) = &owner_methods[&Symbol::from("build")] else {
             panic!("build has no function signature: {sidecar}");
         };
+        let FnTy { ret, .. } = &**fn_ty;
         assert_eq!(ret.as_ref(), &Ty::Class { id, args: vec![].into() }, "{sidecar}");
     }
 }
@@ -15883,6 +16295,8 @@ end
 mod relation_finders;
 #[path = "emit_and_run/attach_hash.rs"]
 mod attach_hash;
+#[path = "emit_and_run/attached_record.rs"]
+mod attached_record;
 #[path = "emit_and_run/many_attached.rs"]
 mod many_attached;
 
@@ -15950,8 +16364,18 @@ end
 
 #[path = "emit_and_run/pagy.rs"]
 mod pagy;
+#[path = "emit_and_run/pagy9.rs"]
+mod pagy9;
+#[path = "emit_and_run/yield_partial_render.rs"]
+mod yield_partial_render;
 #[path = "emit_and_run/string_bytes.rs"]
 mod string_bytes;
+#[path = "emit_and_run/class_body_unknown_call.rs"]
+mod class_body_unknown_call;
+#[path = "emit_and_run/string_to_d.rs"]
+mod string_to_d;
+#[path = "emit_and_run/current_delegate_method.rs"]
+mod current_delegate_method;
 
 /// A Slim view is ingested rather than skipped, so `check` going quiet on
 /// it is a claim the emitted page renders. Swap the blog's index for a
@@ -18691,7 +19115,7 @@ fn a_failing_assertion_inside_a_destructured_block_stops_what_follows() {
     for (name, hits, members) in cases {
         let run = destructured_block_app(name, members).run_test("test/models/widget_test.rb");
         assert!(run.errors.is_empty(), "{name}: {:?}", run.errors);
-        assert!(!run.success, "{name}: the failing assertion passed\n{}", run.stdout);
+        assert!(!run.program_succeeded(), "{name}: the failing assertion passed\n{}", run.stdout);
         assert!(run.stdout.contains(&format!("CASE {name} HITS={hits}\n")), "{name}: {}", run.stdout);
     }
 }
@@ -20489,6 +20913,28 @@ mod module_protocol_receivers;
 mod module_protocol_block_self;
 #[path = "emit_and_run/ipaddr_include.rs"]
 mod ipaddr_include;
+#[path = "emit_and_run/pp_require.rs"]
+mod pp_require;
+#[path = "emit_and_run/weakref_observable.rs"]
+mod weakref_observable;
+#[path = "emit_and_run/core_exceptions.rs"]
+mod core_exceptions;
+#[path = "emit_and_run/rbconfig_config.rs"]
+mod rbconfig_config;
+#[path = "emit_and_run/process_modules.rs"]
+mod process_modules;
+#[path = "emit_and_run/network_constants.rs"]
+mod network_constants;
+#[path = "emit_and_run/logger_severity.rs"]
+mod logger_severity;
+#[path = "emit_and_run/gem_nested_core_constant.rs"]
+mod gem_nested_core_constant;
+#[path = "emit_and_run/bigdecimal_bn_classes.rs"]
+mod bigdecimal_bn_classes;
+#[path = "emit_and_run/module_reflection.rs"]
+mod module_reflection;
+#[path = "emit_and_run/gem_class_eval_mixins.rs"]
+mod gem_class_eval_mixins;
 #[path = "emit_and_run/hash_subclass_include.rs"]
 mod hash_subclass_include;
 #[path = "emit_and_run/module_query_class_unions.rs"]
@@ -20513,6 +20959,16 @@ mod reset_counters;
 mod console_only_definitions;
 #[path = "emit_and_run/open_classes.rs"]
 mod open_classes;
+#[path = "emit_and_run/class_arg_specialize.rs"]
+mod class_arg_specialize;
+#[path = "emit_and_run/scope_hash_tail.rs"]
+mod scope_hash_tail;
+#[path = "emit_and_run/core_subclass_dispatch.rs"]
+mod core_subclass_dispatch;
+#[path = "emit_and_run/paren_call_beside_local.rs"]
+mod paren_call_beside_local;
+#[path = "emit_and_run/string_prepend.rs"]
+mod string_prepend;
 #[path = "emit_and_run/parameterized_mailer.rs"]
 mod parameterized_mailer;
 #[path = "emit_and_run/change_table_migrations.rs"]
@@ -20531,6 +20987,10 @@ mod dynamic_where_forms;
 mod enum_cross_class_mapping;
 #[path = "emit_and_run/jbuilder_record_values.rs"]
 mod jbuilder_record_values;
+#[path = "support/jbuilder_dynamic_partial.rs"]
+mod jbuilder_dynamic_partial;
+#[path = "emit_and_run/jbuilder_dynamic_partial.rs"]
+mod jbuilder_dynamic_partial_test;
 #[path = "emit_and_run/nil_operand.rs"]
 mod nil_operand;
 #[path = "emit_and_run/descendant_ivar.rs"]
@@ -20771,6 +21231,10 @@ mod resource_dynamic_path;
 mod enumerable_mixin_contract;
 #[path = "emit_and_run/enumerable_mixin.rs"]
 mod enumerable_mixin;
+#[path = "support/enum_where_runtime_cast.rs"]
+mod enum_where_runtime_cast_contract;
+#[path = "emit_and_run/enum_where_runtime_cast.rs"]
+mod enum_where_runtime_cast;
 #[path = "support/file_level_struct.rs"]
 mod file_level_struct_contract;
 #[path = "emit_and_run/file_level_struct.rs"]
@@ -20779,6 +21243,8 @@ mod file_level_struct;
 mod concern_class_side_contract;
 #[path = "emit_and_run/concern_class_side.rs"]
 mod concern_class_side;
+#[path = "emit_and_run/controller_concern_class_methods.rs"]
+mod controller_concern_class_methods;
 #[path = "support/concern_define_loop.rs"]
 mod concern_define_loop_contract;
 #[path = "emit_and_run/concern_define_loop.rs"]
@@ -20789,10 +21255,24 @@ mod mutated_loop_constant;
 mod solid_queue_worker_contract;
 #[path = "emit_and_run/solid_queue_surface.rs"]
 mod solid_queue_surface;
+#[path = "emit_and_run/included_block_attribute_writes.rs"]
+mod included_block_attribute_writes;
 #[path = "emit_and_run/controller_surface.rs"]
 mod controller_surface;
 #[path = "emit_and_run/rack_attack.rs"]
 mod rack_attack;
+#[path = "emit_and_run/devise.rs"]
+mod devise;
+#[path = "emit_and_run/warden.rs"]
+mod warden;
+#[path = "emit_and_run/class_eval_string_macro.rs"]
+mod class_eval_string_macro;
+#[path = "emit_and_run/primary_key_send.rs"]
+mod primary_key_send;
+#[path = "emit_and_run/send_built_name.rs"]
+mod send_built_name;
+#[path = "emit_and_run/app_middleware.rs"]
+mod app_middleware;
 #[path = "support/addressable_gem.rs"]
 mod addressable_gem;
 #[path = "emit_and_run/addressable.rs"]
@@ -20840,6 +21320,8 @@ mod python_route_format;
 mod partial_local_shadows_helper;
 #[path = "emit_and_run/partial_reads_caller_ivar.rs"]
 mod partial_reads_caller_ivar;
+#[path = "emit_and_run/partial_ivar_and_local.rs"]
+mod partial_ivar_and_local;
 
 #[path = "emit_and_run/python_nested_modifier_if.rs"]
 mod python_nested_modifier_if;
@@ -21219,6 +21701,36 @@ fn link_to_if_shadowing_a_nested_local_is_refused() {
 mod simple_format;
 #[path = "support/link_to_computed_url.rs"]
 mod link_to_computed_url;
+#[path = "support/nested_route_helper_record.rs"]
+#[allow(dead_code)]
+mod nested_route_helper_record;
+#[path = "support/concern_to_param.rs"]
+#[allow(dead_code)]
+mod concern_to_param;
+#[path = "support/ivar_named_local.rs"]
+#[allow(dead_code)]
+mod ivar_named_local;
+#[path = "support/record_if_condition.rs"]
+#[allow(dead_code)]
+mod record_if_condition;
+#[path = "support/link_to_template_local.rs"]
+#[allow(dead_code)]
+mod link_to_template_local;
+#[path = "support/each_no_param.rs"]
+#[allow(dead_code)]
+mod each_no_param;
+#[path = "support/view_unless_no_else.rs"]
+#[allow(dead_code)]
+mod view_unless_no_else;
+#[path = "support/nilable_string_view.rs"]
+#[allow(dead_code)]
+mod nilable_string_view;
+#[path = "support/each_receiver_once.rs"]
+#[allow(dead_code)]
+mod each_receiver_once;
+#[path = "support/join_nil.rs"]
+#[allow(dead_code)]
+mod join_nil;
 
 /// `simple_format` with `sanitize: false`: paragraphs, line breaks, html
 /// options and `wrapper_tag:`, as Rails 8.1.4 renders them.
@@ -21240,17 +21752,23 @@ fn simple_format_renders_as_rails_on_spinel() {
         .assert_passes();
 }
 
-/// The default `sanitize: true` runs Rails' HTML sanitizer, which isn't
-/// modeled: refused with the reason, as is a `sanitize:` that isn't a
-/// literal `false` or `nil`.
+/// The default `sanitize: true` runs the app's `sanitize` first (`ingest::simple_format_sanitize`), so each literal
+/// form checks clean; a `sanitize:` that isn't a literal is refused with the reason.
 #[test]
-fn simple_format_that_sanitizes_is_refused() {
+fn simple_format_sanitizes_a_literal_form_and_refuses_a_computed_one() {
     for markup in [
         "<%= simple_format(\"a\") %>\n",
         "<%= simple_format(\"a\", class: \"k\") %>\n",
         "<%= simple_format(\"a\", {}, sanitize: true) %>\n",
         "<%= simple_format(\"a\", {}, wrapper_tag: :div) %>\n",
+    ] {
+        let errors = html_safe_method_owner::app().write("app/views/probes/show.html.erb", markup).check_errors();
+        assert!(!errors.iter().any(|e| e.contains("simple_format")), "{markup}: {errors:?}");
+    }
+    // A computed `sanitize:`, and html options Rails evaluates before it sanitizes, which could change the text first.
+    for markup in [
         "<%= simple_format(\"a\", {}, sanitize: @article.nil?) %>\n",
+        "<%= simple_format(\"a\", { class: @article.title }) %>\n",
     ] {
         let errors = html_safe_method_owner::app().write("app/views/probes/show.html.erb", markup).check_errors();
         let refused: Vec<_> = errors.iter().filter(|e| e.contains("simple_format")).collect();
@@ -21407,7 +21925,7 @@ fn a_base_controllers_pure_helper_method_with_an_override_is_refused() {
 /// does, so its `simple_format` doesn't fail another target's build.
 #[test]
 fn simple_format_in_an_unreachable_template_is_a_warning() {
-    let overlay = || emit_and_run::real_blog().write("app/views/articles/orphan.html.erb", "<%= simple_format(\"a\") %>\n");
+    let overlay = || emit_and_run::real_blog().write("app/views/articles/orphan.html.erb", "<%= simple_format(\"a\", {}, sanitize: @article.nil?) %>\n");
     let (_, errors) = overlay().emit(roundhouse::project::BuildTarget::Typescript);
     assert!(!errors.iter().any(|e| e.contains("simple_format")), "{errors:?}");
     let (_, errors) = overlay()
@@ -21436,4 +21954,1184 @@ fn link_to_computed_url_renders_as_rails_on_spinel() {
         .write("app/views/probes/show.html.erb", link_to_computed_url::VIEW)
         .run_spinel(&helper_escape_at_output::render_script(link_to_computed_url::RENDERS))
         .assert_passes();
+}
+
+/// #1890: a record handed to a route helper inside an output
+/// expression renders as Rails 8.1.4 does
+/// (`nested_route_helper_record::VIEW`).
+#[test]
+fn nested_route_helper_record_renders_as_rails() {
+    let (view, renders) = nested_route_helper_record::view(true, true);
+    nested_route_helper_record::app(content_tag_options::app_rendering(&view, &[]), true)
+        .write("test/controllers/probes_controller_test.rb", &helper_escape_at_output::integration_test(&renders))
+        .run_test("test/controllers/probes_controller_test.rb")
+        .assert_passes();
+}
+
+/// #1890: a record handed to a route helper inside an output
+/// expression renders as Rails 8.1.4 does
+/// (`nested_route_helper_record::VIEW`).
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn nested_route_helper_record_renders_as_rails_on_spinel() {
+    let (view, renders) = nested_route_helper_record::view(true, false);
+    nested_route_helper_record::app(content_tag_options::app_rendering(&view, &[]), true)
+        .run_spinel(&helper_escape_at_output::render_script(&renders))
+        .assert_passes();
+}
+
+/// #1897: a model whose `to_param` is a method of the module renders as Rails
+/// 8.1.4 does (`concern_to_param::VIEW`).
+#[test]
+fn concern_to_param_module_renders_as_rails() {
+    concern_to_param::app(content_tag_options::app_rendering(concern_to_param::VIEW, &[]), concern_to_param::MODULE)
+        .write("test/controllers/probes_controller_test.rb", &helper_escape_at_output::integration_test(concern_to_param::RENDERS))
+        .run_test("test/controllers/probes_controller_test.rb")
+        .assert_passes();
+}
+
+/// #1897: a model whose `to_param` is a method of the module renders as Rails
+/// 8.1.4 does (`concern_to_param::VIEW`).
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn concern_to_param_module_renders_as_rails_on_spinel() {
+    concern_to_param::app(content_tag_options::app_rendering(concern_to_param::VIEW, &[]), concern_to_param::MODULE)
+        .run_spinel(&helper_escape_at_output::render_script(concern_to_param::RENDERS))
+        .assert_passes();
+}
+
+/// #1897: a model whose `to_param` is a def in the concern's
+/// `included do` renders as Rails 8.1.4 does (`concern_to_param::VIEW`).
+#[test]
+fn concern_to_param_included_renders_as_rails() {
+    concern_to_param::app(content_tag_options::app_rendering(concern_to_param::VIEW, &[]), concern_to_param::INCLUDED)
+        .write("test/controllers/probes_controller_test.rb", &helper_escape_at_output::integration_test(concern_to_param::RENDERS))
+        .run_test("test/controllers/probes_controller_test.rb")
+        .assert_passes();
+}
+
+/// #1897: a model whose `to_param` is a def in the concern's
+/// `included do` renders as Rails 8.1.4 does (`concern_to_param::VIEW`).
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn concern_to_param_included_renders_as_rails_on_spinel() {
+    concern_to_param::app(content_tag_options::app_rendering(concern_to_param::VIEW, &[]), concern_to_param::INCLUDED)
+        .run_spinel(&helper_escape_at_output::render_script(concern_to_param::RENDERS))
+        .assert_passes();
+}
+
+/// A template local assigned from the ivar of its own name renders as
+/// Rails 8.1.4 does (`ivar_named_local::VIEW`).
+#[test]
+fn ivar_named_local_renders_as_rails() {
+    ivar_named_local::app(content_tag_options::app_rendering(ivar_named_local::VIEW, &[]))
+        .write("test/controllers/probes_controller_test.rb", &helper_escape_at_output::integration_test(ivar_named_local::RENDERS))
+        .run_test("test/controllers/probes_controller_test.rb")
+        .assert_passes();
+}
+
+/// #1909: a record as an `if` condition renders as Rails 8.1.4 does
+/// (`record_if_condition::VIEW`).
+#[test]
+fn record_if_condition_renders_as_rails() {
+    record_if_condition::app(content_tag_options::app_rendering(record_if_condition::VIEW, &[]))
+        .write("test/controllers/probes_controller_test.rb", &helper_escape_at_output::integration_test(record_if_condition::RENDERS))
+        .run_test("test/controllers/probes_controller_test.rb")
+        .assert_passes();
+}
+
+/// #1909: an assignment as the `if` condition, the record read in the
+/// branch, renders as Rails 8.1.4 does (`record_if_condition::ASSIGN_VIEW`).
+#[test]
+fn record_if_assignment_renders_as_rails() {
+    record_if_condition::app(content_tag_options::app_rendering(record_if_condition::ASSIGN_VIEW, &[]))
+        .write("test/controllers/probes_controller_test.rb", &helper_escape_at_output::integration_test(record_if_condition::ASSIGN_RENDERS))
+        .run_test("test/controllers/probes_controller_test.rb")
+        .assert_passes();
+}
+
+/// A template local assigned from the ivar of its own name renders as
+/// Rails 8.1.4 does (`ivar_named_local::VIEW`).
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn ivar_named_local_renders_as_rails_on_spinel() {
+    ivar_named_local::app(content_tag_options::app_rendering(ivar_named_local::VIEW, &[]))
+        .run_spinel(&helper_escape_at_output::render_script(ivar_named_local::RENDERS))
+        .assert_passes();
+}
+
+/// #1909: a record as an `if` condition renders as Rails 8.1.4 does
+/// (`record_if_condition::VIEW`).
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn record_if_condition_renders_as_rails_on_spinel() {
+    record_if_condition::app(content_tag_options::app_rendering(record_if_condition::VIEW, &[]))
+        .run_spinel(&helper_escape_at_output::render_script(record_if_condition::RENDERS))
+        .assert_passes();
+}
+
+/// #1909: an assignment as the `if` condition, the record read in the
+/// branch, renders as Rails 8.1.4 does (`record_if_condition::ASSIGN_VIEW`).
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn record_if_assignment_renders_as_rails_on_spinel() {
+    record_if_condition::app(content_tag_options::app_rendering(record_if_condition::ASSIGN_VIEW, &[]))
+        .run_spinel(&helper_escape_at_output::render_script(record_if_condition::ASSIGN_RENDERS))
+        .assert_passes();
+}
+
+/// #1898: a record in a local the template assigns, handed to
+/// `link_to`'s url helper, renders as Rails 8.1.4 does
+/// (`link_to_template_local::VIEW`).
+#[test]
+fn link_to_template_local_renders_as_rails() {
+    link_to_template_local::app(content_tag_options::app_rendering(link_to_template_local::VIEW, &[]))
+        .write("test/controllers/probes_controller_test.rb", &helper_escape_at_output::integration_test(link_to_template_local::RENDERS))
+        .run_test("test/controllers/probes_controller_test.rb")
+        .assert_passes();
+}
+
+/// #1910: a block with no parameter renders as Rails 8.1.4 does
+/// (`each_no_param::VIEW`).
+#[test]
+fn each_no_param_renders_as_rails() {
+    each_no_param::app(content_tag_options::app_rendering(each_no_param::VIEW, &[]))
+        .write("test/controllers/probes_controller_test.rb", &helper_escape_at_output::integration_test(each_no_param::RENDERS))
+        .run_test("test/controllers/probes_controller_test.rb")
+        .assert_passes();
+}
+
+/// An empty `map` block maps each element to nil, as Rails 8.1.4
+/// does (`each_no_param::EMPTY_MAP_VIEW`).
+#[test]
+fn each_no_param_empty_map_renders_as_rails() {
+    each_no_param::app(content_tag_options::app_rendering(each_no_param::EMPTY_MAP_VIEW, &[]))
+        .write("test/controllers/probes_controller_test.rb", &helper_escape_at_output::integration_test(each_no_param::EMPTY_MAP_RENDERS))
+        .run_test("test/controllers/probes_controller_test.rb")
+        .assert_passes();
+}
+
+/// #1921: an `unless` with no `else` in a view renders as Rails 8.1.4
+/// does (`view_unless_no_else::VIEW`).
+#[test]
+fn view_unless_no_else_renders_as_rails() {
+    view_unless_no_else::app(content_tag_options::app_rendering(view_unless_no_else::VIEW, &[]))
+        .write("test/controllers/probes_controller_test.rb", &helper_escape_at_output::integration_test(view_unless_no_else::RENDERS))
+        .run_test("test/controllers/probes_controller_test.rb")
+        .assert_passes();
+}
+
+/// #1937: a view reading a nullable string column renders as Rails
+/// 8.1.4 does (`nilable_string_view::VIEW`).
+#[test]
+fn nilable_string_view_renders_as_rails() {
+    nilable_string_view::app(content_tag_options::app_rendering(nilable_string_view::VIEW, &[]))
+        .write("test/controllers/probes_controller_test.rb", &helper_escape_at_output::integration_test(nilable_string_view::RENDERS))
+        .run_test("test/controllers/probes_controller_test.rb")
+        .assert_passes();
+}
+
+/// #1937: `==` and `!=` on a nullable string column evaluate each
+/// operand once, left then right, as Rails 8.1.4 does
+/// (`nilable_string_view::EFFECT_VIEW`, title present).
+#[test]
+fn nilable_string_view_effect_renders_as_rails() {
+    nilable_string_view::effect_app(content_tag_options::app_rendering(nilable_string_view::EFFECT_VIEW, &[]))
+        .write("test/controllers/probes_controller_test.rb", &helper_escape_at_output::integration_test(nilable_string_view::EFFECT_RENDERS))
+        .run_test("test/controllers/probes_controller_test.rb")
+        .assert_passes();
+}
+
+/// #1937: with the column nil, `==` and `!=` render as Rails 8.1.4
+/// does (`nilable_string_view::NIL_VIEW`).
+#[test]
+fn nilable_string_view_nil_renders_as_rails() {
+    nilable_string_view::nil_app(content_tag_options::app_rendering(nilable_string_view::NIL_VIEW, &[]))
+        .write("test/controllers/probes_controller_test.rb", &helper_escape_at_output::integration_test(nilable_string_view::NIL_RENDERS))
+        .run_test("test/controllers/probes_controller_test.rb")
+        .assert_passes();
+}
+
+/// #1937: the same operands with a nil title: the right operand still
+/// runs, as in Rails 8.1.4 (`nilable_string_view::EFFECT_VIEW`).
+#[test]
+fn nilable_string_view_nil_effect_renders_as_rails() {
+    nilable_string_view::nil_effect_app(content_tag_options::app_rendering(nilable_string_view::EFFECT_VIEW, &[]))
+        .write("test/controllers/probes_controller_test.rb", &helper_escape_at_output::integration_test(nilable_string_view::NIL_EFFECT_RENDERS))
+        .run_test("test/controllers/probes_controller_test.rb")
+        .assert_passes();
+}
+
+/// #1898: a record in a local the template assigns, handed to
+/// `link_to`'s url helper, renders as Rails 8.1.4 does
+/// (`link_to_template_local::VIEW`).
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn link_to_template_local_renders_as_rails_on_spinel() {
+    link_to_template_local::app(content_tag_options::app_rendering(link_to_template_local::VIEW, &[]))
+        .run_spinel(&helper_escape_at_output::render_script(link_to_template_local::RENDERS))
+        .assert_passes();
+}
+
+/// #1910: a block with no parameter renders as Rails 8.1.4 does
+/// (`each_no_param::VIEW`).
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn each_no_param_renders_as_rails_on_spinel() {
+    each_no_param::app(content_tag_options::app_rendering(each_no_param::VIEW, &[]))
+        .run_spinel(&helper_escape_at_output::render_script(each_no_param::RENDERS))
+        .assert_passes();
+}
+
+/// #1921: an `unless` with no `else` in a view renders as Rails 8.1.4
+/// does (`view_unless_no_else::VIEW`).
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn view_unless_no_else_renders_as_rails_on_spinel() {
+    view_unless_no_else::app(content_tag_options::app_rendering(view_unless_no_else::VIEW, &[]))
+        .run_spinel(&helper_escape_at_output::render_script(view_unless_no_else::RENDERS))
+        .assert_passes();
+}
+
+/// #1937: a view reading a nullable string column renders as Rails
+/// 8.1.4 does (`nilable_string_view::VIEW`).
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn nilable_string_view_renders_as_rails_on_spinel() {
+    nilable_string_view::app(content_tag_options::app_rendering(nilable_string_view::VIEW, &[]))
+        .run_spinel(&helper_escape_at_output::render_script(nilable_string_view::RENDERS))
+        .assert_passes();
+}
+
+/// #1937: `==` and `!=` on a nullable string column evaluate each
+/// operand once, left then right, as Rails 8.1.4 does
+/// (`nilable_string_view::EFFECT_VIEW`, title present).
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn nilable_string_view_effect_renders_as_rails_on_spinel() {
+    nilable_string_view::effect_app(content_tag_options::app_rendering(nilable_string_view::EFFECT_VIEW, &[]))
+        .run_spinel(&helper_escape_at_output::render_script(nilable_string_view::EFFECT_RENDERS))
+        .assert_passes();
+}
+
+/// #1937: with the column nil, `==` and `!=` render as Rails 8.1.4
+/// does (`nilable_string_view::NIL_VIEW`).
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn nilable_string_view_nil_renders_as_rails_on_spinel() {
+    nilable_string_view::nil_app(content_tag_options::app_rendering(nilable_string_view::NIL_VIEW, &[]))
+        .run_spinel(&helper_escape_at_output::render_script(nilable_string_view::NIL_RENDERS))
+        .assert_passes();
+}
+
+/// #1937: the same operands with a nil title: the right operand still
+/// runs, as in Rails 8.1.4 (`nilable_string_view::EFFECT_VIEW`).
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn nilable_string_view_nil_effect_renders_as_rails_on_spinel() {
+    nilable_string_view::nil_effect_app(content_tag_options::app_rendering(nilable_string_view::EFFECT_VIEW, &[]))
+        .run_spinel(&helper_escape_at_output::render_script(nilable_string_view::NIL_EFFECT_RENDERS))
+        .assert_passes();
+}
+
+/// #1946: `each` runs a receiver with an effect once, as Rails 8.1.4
+/// does (`each_receiver_once::VIEW`).
+#[test]
+fn each_receiver_once_renders_as_rails() {
+    each_receiver_once::app(content_tag_options::app_rendering(each_receiver_once::VIEW, &[]))
+        .write("test/controllers/probes_controller_test.rb", &helper_escape_at_output::integration_test(each_receiver_once::RENDERS))
+        .run_test("test/controllers/probes_controller_test.rb")
+        .assert_passes();
+}
+
+/// #1946: `each` runs a receiver with an effect once, as Rails 8.1.4
+/// does (`each_receiver_once::VIEW`).
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn each_receiver_once_renders_as_rails_on_spinel() {
+    each_receiver_once::app(content_tag_options::app_rendering(each_receiver_once::VIEW, &[]))
+        .run_spinel(&helper_escape_at_output::render_script(each_receiver_once::RENDERS))
+        .assert_passes();
+}
+
+/// #1949: `join` reads a nil element as an empty string, as Rails 8.1.4
+/// does (`join_nil::VIEW`).
+#[test]
+fn join_nil_renders_as_rails() {
+    join_nil::app(content_tag_options::app_rendering(join_nil::VIEW, &[]))
+        .write("test/controllers/probes_controller_test.rb", &helper_escape_at_output::integration_test(join_nil::RENDERS))
+        .run_test("test/controllers/probes_controller_test.rb")
+        .assert_passes();
+}
+#[path = "emit_and_run/cable_connection_request.rs"]
+mod cable_connection_request;
+#[path = "emit_and_run/respond_with.rs"]
+mod respond_with;
+#[path = "emit_and_run/respond_with_json.rs"]
+mod respond_with_json;
+#[path = "emit_and_run/respond_with_resource_location.rs"]
+mod respond_with_resource_location;
+#[path = "emit_and_run/route_loop_index.rs"]
+mod route_loop_index;
+#[path = "emit_and_run/deprecation.rs"]
+mod deprecation;
+#[path = "emit_and_run/loaded_begin.rs"]
+mod loaded_begin;
+#[path = "emit_and_run/class_eval_definer_call.rs"]
+mod class_eval_definer_call;
+#[path = "emit_and_run/custom_form_builder.rs"]
+mod custom_form_builder;
+#[path = "emit_and_run/controller_name_constantize.rs"]
+mod controller_name_constantize;
+#[path = "emit_and_run/class_macro_keyword_rest.rs"]
+mod class_macro_keyword_rest;
+#[path = "emit_and_run/nested_form_child.rs"]
+mod nested_form_child;
+#[path = "emit_and_run/implicit_namespace_include.rs"]
+mod implicit_namespace_include;
+#[path = "emit_and_run/maybe_ruby_boot.rs"]
+mod maybe_ruby_boot;
+#[path = "emit_and_run/rails_settings_cached.rs"]
+mod rails_settings_cached;
+#[path = "emit_and_run/simple_form.rs"]
+mod simple_form;
+#[path = "emit_and_run/classvar_block_initializers.rs"]
+mod classvar_block_initializers;
+#[path = "emit_and_run/concern_class_settings.rs"]
+mod concern_class_settings;
+#[path = "emit_and_run/load_time_constants.rs"]
+mod load_time_constants;
+#[path = "emit_and_run/doorkeeper.rs"]
+mod doorkeeper;
+#[path = "emit_and_run/message_bus.rs"]
+mod message_bus;
+#[path = "emit_and_run/content_security_policy.rs"]
+mod content_security_policy;
+#[path = "emit_and_run/find_or_create_variable_block.rs"]
+mod find_or_create_variable_block;
+#[path = "emit_and_run/lowered_sends.rs"]
+mod lowered_sends;
+#[path = "emit_and_run/included_alias.rs"]
+mod included_alias;
+#[path = "emit_and_run/simple_format_sanitize.rs"]
+mod simple_format_sanitize;
+#[path = "emit_and_run/cookie_rotation.rs"]
+mod cookie_rotation;
+#[path = "emit_and_run/render_layout_choice.rs"]
+mod render_layout_choice;
+#[path = "emit_and_run/route_protocol.rs"]
+mod route_protocol;
+#[path = "emit_and_run/render_object.rs"]
+mod render_object;
+#[path = "support/ordered_options_app.rs"]
+mod ordered_options_app;
+#[path = "emit_and_run/ordered_options.rs"]
+mod ordered_options;
+#[path = "support/class_ext_app.rs"]
+mod class_ext_app;
+#[path = "emit_and_run/class_ext.rs"]
+mod class_ext;
+#[path = "support/view_component_gem.rs"]
+mod view_component_gem;
+#[path = "emit_and_run/view_component.rs"]
+mod view_component;
+#[path = "emit_and_run/model_mixin_macro.rs"]
+mod model_mixin_macro;
+#[path = "emit_and_run/controller_append_callbacks.rs"]
+mod controller_append_callbacks;
+#[path = "emit_and_run/routing_method_boot_state.rs"]
+mod routing_method_boot_state;
+#[path = "emit_and_run/boot_base_mixins.rs"]
+mod boot_base_mixins;
+#[path = "emit_and_run/array_grep_extract_options.rs"]
+mod array_grep_extract_options;
+#[path = "emit_and_run/load_time_string_definer.rs"]
+mod load_time_string_definer;
+#[path = "emit_and_run/mime_extension_lookup.rs"]
+mod mime_extension_lookup;
+#[path = "emit_and_run/self_class_argument.rs"]
+mod self_class_argument;
+#[path = "emit_and_run/form_for_record.rs"]
+mod form_for_record;
+#[path = "support/library_concern_included_include.rs"]
+mod library_concern_included_include_contract;
+#[path = "emit_and_run/library_concern_included_include.rs"]
+mod library_concern_included_include;
+#[path = "emit_and_run/param_default_constant_rooting.rs"]
+mod param_default_constant_rooting;
+#[path = "emit_and_run/compiled_rooted_constants.rs"]
+mod compiled_rooted_constants;
+#[path = "emit_and_run/serializable_resource_as_json.rs"]
+mod serializable_resource_as_json;
+#[path = "emit_and_run/belongs_to_target.rs"]
+mod belongs_to_target;
+#[path = "emit_and_run/has_one_writer.rs"]
+mod has_one_writer;
+#[path = "emit_and_run/has_one_validate.rs"]
+mod has_one_validate;
+#[path = "emit_and_run/has_many_target.rs"]
+mod has_many_target;
+#[path = "emit_and_run/has_many_writer.rs"]
+mod has_many_writer;
+#[path = "emit_and_run/association_scopes.rs"]
+mod association_scopes;
+#[path = "emit_and_run/association_relation_calls.rs"]
+mod association_relation_calls;
+#[path = "emit_and_run/concern_association_includers.rs"]
+mod concern_association_includers;
+#[path = "emit_and_run/concern_super_includers.rs"]
+mod concern_super_includers;
+#[path = "emit_and_run/concern_includer_definitions.rs"]
+mod concern_includer_definitions;
+#[path = "emit_and_run/polymorphic_belongs_to_scope.rs"]
+mod polymorphic_belongs_to_scope;
+#[path = "emit_and_run/belongs_to_scope_join.rs"]
+mod belongs_to_scope_join;
+#[path = "emit_and_run/has_many_scoped_join.rs"]
+mod has_many_scoped_join;
+#[path = "emit_and_run/polymorphic_belongs_to_any_model.rs"]
+mod polymorphic_belongs_to_any_model;
+#[path = "emit_and_run/polymorphic_belongs_to_must_exist.rs"]
+mod polymorphic_belongs_to_must_exist;
+#[path = "emit_and_run/belongs_to_scope_over_default_scope.rs"]
+mod belongs_to_scope_over_default_scope;
+#[path = "emit_and_run/helper_content_for.rs"]
+mod helper_content_for;
+#[path = "emit_and_run/view_statement_helper_call.rs"]
+mod view_statement_helper_call;
+#[path = "emit_and_run/helper_view_context.rs"]
+mod helper_view_context;
+#[path = "emit_and_run/view_keyword_splat.rs"]
+mod view_keyword_splat;
+#[path = "emit_and_run/link_to_app_helper_path.rs"]
+mod link_to_app_helper_path;
+#[path = "emit_and_run/partial_object_as.rs"]
+mod partial_object_as;
+#[path = "emit_and_run/helper_asset_url.rs"]
+mod helper_asset_url;
+#[path = "emit_and_run/safe_join_safe.rs"]
+mod safe_join_safe;
+
+// Fork specs: association targets.
+#[path = "emit_and_run/association_build_joins_target.rs"]
+mod association_build_joins_target;
+#[path = "emit_and_run/association_relation_build.rs"]
+mod association_relation_build;
+#[path = "emit_and_run/association_scope_load_inverse.rs"]
+mod association_scope_load_inverse;
+#[path = "emit_and_run/belongs_to_load_seats_inverse.rs"]
+mod belongs_to_load_seats_inverse;
+#[path = "emit_and_run/belongs_to_writer_joins_owner_target.rs"]
+mod belongs_to_writer_joins_owner_target;
+#[path = "emit_and_run/has_many_add_remove_callbacks.rs"]
+mod has_many_add_remove_callbacks;
+#[path = "emit_and_run/has_many_as_inverse_of_belongs_to.rs"]
+mod has_many_as_inverse_of_belongs_to;
+#[path = "emit_and_run/has_many_create_then_update.rs"]
+mod has_many_create_then_update;
+#[path = "emit_and_run/has_many_load_merges_held_records.rs"]
+mod has_many_load_merges_held_records;
+#[path = "emit_and_run/has_many_through_before_add.rs"]
+mod has_many_through_before_add;
+#[path = "emit_and_run/has_many_writer_under_overridden_reader.rs"]
+mod has_many_writer_under_overridden_reader;
+#[path = "emit_and_run/has_one_create_bang_holds_record.rs"]
+mod has_one_create_bang_holds_record;
+#[path = "emit_and_run/where_polymorphic_record.rs"]
+mod where_polymorphic_record;
+
+// Fork specs: preloads.
+#[path = "emit_and_run/includes_singular_where_eager_loads.rs"]
+mod includes_singular_where_eager_loads;
+#[path = "emit_and_run/preload_belongs_to_raw_foreign_key.rs"]
+mod preload_belongs_to_raw_foreign_key;
+#[path = "emit_and_run/preload_composite_key_owner.rs"]
+mod preload_composite_key_owner;
+#[path = "emit_and_run/preload_instance_dependent_belongs_to.rs"]
+mod preload_instance_dependent_belongs_to;
+#[path = "emit_and_run/preload_inverse_before_after_initialize.rs"]
+mod preload_inverse_before_after_initialize;
+#[path = "emit_and_run/preload_onto_subclass.rs"]
+mod preload_onto_subclass;
+
+#[path = "emit_and_run/relation_merge_order.rs"]
+mod relation_merge_order;
+#[path = "emit_and_run/relation_except_only.rs"]
+mod relation_except_only;
+#[path = "emit_and_run/model_delete_by_id.rs"]
+mod model_delete_by_id;
+#[path = "emit_and_run/querying_delegation.rs"]
+mod querying_delegation;
+#[path = "emit_and_run/bulk_write_window.rs"]
+mod bulk_write_window;
+#[path = "emit_and_run/relation_async_count.rs"]
+mod relation_async_count;
+#[path = "emit_and_run/order_values.rs"]
+mod order_values;
+#[path = "emit_and_run/scoping_all_is_scope.rs"]
+mod scoping_all_is_scope;
+#[path = "emit_and_run/create_array.rs"]
+mod create_array;
+#[path = "emit_and_run/partial_select_missing_attribute.rs"]
+mod partial_select_missing_attribute;
+
+#[path = "emit_and_run/response_header_alias.rs"]
+mod response_header_alias;
+#[path = "emit_and_run/assert_select_equality.rs"]
+mod assert_select_equality;
+#[path = "emit_and_run/request_headers_merge.rs"]
+mod request_headers_merge;
+#[path = "emit_and_run/prepend_around_action.rs"]
+mod prepend_around_action;
+#[path = "emit_and_run/url_for_controller_index.rs"]
+mod url_for_controller_index;
+#[path = "emit_and_run/redirect_content_type.rs"]
+mod redirect_content_type;
+
+#[path = "emit_and_run/errors_objects_to_a.rs"]
+mod errors_objects_to_a;
+
+#[path = "emit_and_run/errors_group_by_attribute.rs"]
+mod errors_group_by_attribute;
+
+#[path = "emit_and_run/errors_delete_type.rs"]
+mod errors_delete_type;
+
+#[path = "emit_and_run/errors_copy.rs"]
+mod errors_copy;
+
+#[path = "emit_and_run/errors_computed_field.rs"]
+mod errors_computed_field;
+#[path = "support/aasm_gem.rs"]
+mod aasm_gem;
+#[path = "emit_and_run/aasm_source.rs"]
+mod aasm_source;
+#[path = "emit_and_run/aasm_generated_methods.rs"]
+mod aasm_generated_methods;
+#[path = "emit_and_run/runtime_registered_callbacks.rs"]
+mod runtime_registered_callbacks;
+#[path = "emit_and_run/reopened_alias.rs"]
+mod reopened_alias;
+
+// Fork specs: ruby semantics.
+#[path = "emit_and_run/array_as_json_elements.rs"]
+mod array_as_json_elements;
+#[path = "emit_and_run/association_named_ivars.rs"]
+mod association_named_ivars;
+#[path = "emit_and_run/attr_reader_splat_list.rs"]
+mod attr_reader_splat_list;
+#[path = "emit_and_run/class_body_macro_loop.rs"]
+mod class_body_macro_loop;
+#[path = "emit_and_run/class_body_singleton_loop.rs"]
+mod class_body_singleton_loop;
+#[path = "emit_and_run/class_new_self_subclass.rs"]
+mod class_new_self_subclass;
+#[path = "emit_and_run/computed_include_before_extend.rs"]
+mod computed_include_before_extend;
+#[path = "emit_and_run/computed_include_beside_reopen.rs"]
+mod computed_include_beside_reopen;
+#[path = "emit_and_run/model_constant_reads_arel_table.rs"]
+mod model_constant_reads_arel_table;
+#[path = "emit_and_run/model_thread_mattr_accessor.rs"]
+mod model_thread_mattr_accessor;
+#[path = "emit_and_run/module_body_registry_block.rs"]
+mod module_body_registry_block;
+#[path = "emit_and_run/module_body_statements.rs"]
+mod module_body_statements;
+#[path = "emit_and_run/on_load_hook_body.rs"]
+mod on_load_hook_body;
+#[path = "emit_and_run/refinement_scope.rs"]
+mod refinement_scope;
+#[path = "emit_and_run/safe_buffer_plus_nil.rs"]
+mod safe_buffer_plus_nil;
+#[path = "emit_and_run/safe_navigation_on_false.rs"]
+mod safe_navigation_on_false;
+#[path = "emit_and_run/singleton_include_only_module.rs"]
+mod singleton_include_only_module;
+#[path = "emit_and_run/superseded_macro_association.rs"]
+mod superseded_macro_association;
+#[path = "emit_and_run/symbol_key_reads.rs"]
+mod symbol_key_reads;
+#[path = "emit_and_run/unsaved_id_present.rs"]
+mod unsaved_id_present;
+
+// Fork specs: record queries.
+#[path = "emit_and_run/integer_sum.rs"]
+mod integer_sum;
+#[path = "emit_and_run/pluck_joined_columns.rs"]
+mod pluck_joined_columns;
+#[path = "emit_and_run/query_constraints_update.rs"]
+mod query_constraints_update;
+#[path = "emit_and_run/quoted_booleans.rs"]
+mod quoted_booleans;
+#[path = "emit_and_run/record_bracket_read.rs"]
+mod record_bracket_read;
+#[path = "emit_and_run/select_without_text_key.rs"]
+mod select_without_text_key;
+#[path = "emit_and_run/self_join_nested_hop.rs"]
+mod self_join_nested_hop;
+#[path = "emit_and_run/sti_custom_inheritance_column.rs"]
+mod sti_custom_inheritance_column;
+#[path = "emit_and_run/where_bound_sql_literal.rs"]
+mod where_bound_sql_literal;
+
+#[path = "emit_and_run/through_scope_merge.rs"]
+mod through_scope_merge;
+#[path = "emit_and_run/through_singular_hop_readers.rs"]
+mod through_singular_hop_readers;
+#[path = "emit_and_run/through_preload_hop_first.rs"]
+mod through_preload_hop_first;
+#[path = "emit_and_run/through_preload_distinct.rs"]
+mod through_preload_distinct;
+#[path = "emit_and_run/through_preload_readonly.rs"]
+mod through_preload_readonly;
+
+#[path = "emit_and_run/held_has_many_default_scope_key.rs"]
+mod held_has_many_default_scope_key;
+#[path = "emit_and_run/emitted_model_methods.rs"]
+mod emitted_model_methods;
+
+#[path = "emit_and_run/association_load_seats_inverse.rs"]
+mod association_load_seats_inverse;
+#[path = "emit_and_run/relation_predicate_blocks.rs"]
+mod relation_predicate_blocks;
+
+// Fork specs: routes.
+#[path = "emit_and_run/route_default_url_options_app.rs"]
+mod route_default_url_options_app;
+#[path = "emit_and_run/route_default_url_options_test_body.rs"]
+mod route_default_url_options_test_body;
+#[path = "emit_and_run/route_fewer_positionals_url_options.rs"]
+mod route_fewer_positionals_url_options;
+#[path = "emit_and_run/route_helper_options_hash.rs"]
+mod route_helper_options_hash;
+#[path = "emit_and_run/route_keyword_params_in_tests.rs"]
+mod route_keyword_params_in_tests;
+#[path = "emit_and_run/route_positional_path_order.rs"]
+mod route_positional_path_order;
+#[path = "emit_and_run/route_scope_requirement_constant.rs"]
+mod route_scope_requirement_constant;
+#[path = "emit_and_run/route_scope_requirement_runtime_constant.rs"]
+mod route_scope_requirement_runtime_constant;
+#[path = "emit_and_run/routing_assertion_recognized_request.rs"]
+mod routing_assertion_recognized_request;
+
+// Fork specs: test framework.
+#[path = "emit_and_run/assert_difference_value.rs"]
+mod assert_difference_value;
+#[path = "emit_and_run/assertion_counts.rs"]
+mod assertion_counts;
+#[path = "emit_and_run/concern_defined_tests.rs"]
+mod concern_defined_tests;
+#[path = "emit_and_run/deprecation_assertions.rs"]
+mod deprecation_assertions;
+#[path = "emit_and_run/enqueued_jobs_with.rs"]
+mod enqueued_jobs_with;
+#[path = "emit_and_run/execution_context_per_test.rs"]
+mod execution_context_per_test;
+#[path = "emit_and_run/included_setup_block_self.rs"]
+mod included_setup_block_self;
+#[path = "emit_and_run/private_lifecycle_hooks.rs"]
+mod private_lifecycle_hooks;
+#[path = "emit_and_run/test_case_load_hooks.rs"]
+mod test_case_load_hooks;
+#[path = "emit_and_run/test_class_statement_between_constants.rs"]
+mod test_class_statement_between_constants;
+#[path = "emit_and_run/test_file_shared_class_once.rs"]
+mod test_file_shared_class_once;
+#[path = "emit_and_run/test_file_struct_constant.rs"]
+mod test_file_struct_constant;
+
+// Fork specs: relation queries.
+#[path = "emit_and_run/connection_to_sql_node.rs"]
+mod connection_to_sql_node;
+#[path = "emit_and_run/eager_load_joined_self_reference.rs"]
+mod eager_load_joined_self_reference;
+#[path = "emit_and_run/eager_load_over_nested_joins.rs"]
+mod eager_load_over_nested_joins;
+#[path = "emit_and_run/eager_load_string_join_order.rs"]
+mod eager_load_string_join_order;
+#[path = "emit_and_run/enumerate_columns_select.rs"]
+mod enumerate_columns_select;
+#[path = "emit_and_run/integer_bind_key_object.rs"]
+mod integer_bind_key_object;
+#[path = "emit_and_run/pluck_enum_labels.rs"]
+mod pluck_enum_labels;
+#[path = "emit_and_run/pluck_sql_string.rs"]
+mod pluck_sql_string;
+#[path = "emit_and_run/relation_rewhere.rs"]
+mod relation_rewhere;
+#[path = "emit_and_run/result_any_block.rs"]
+mod result_any_block;
+#[path = "emit_and_run/select_arel_attribute_array.rs"]
+mod select_arel_attribute_array;
+#[path = "emit_and_run/select_hash_value_no_alias.rs"]
+mod select_hash_value_no_alias;
+#[path = "emit_and_run/select_string_column.rs"]
+mod select_string_column;
+#[path = "emit_and_run/where_association_alias.rs"]
+mod where_association_alias;
+
+// Fork specs: persistence.
+#[path = "emit_and_run/clone_shares_belongs_to_has_many.rs"]
+mod clone_shares_belongs_to_has_many;
+#[path = "emit_and_run/clone_shares_has_one.rs"]
+mod clone_shares_has_one;
+#[path = "emit_and_run/declared_primary_key_reads.rs"]
+mod declared_primary_key_reads;
+#[path = "emit_and_run/dup_after_initialize.rs"]
+mod dup_after_initialize;
+#[path = "emit_and_run/model_update_override.rs"]
+mod model_update_override;
+#[path = "emit_and_run/new_nil_assigns_nothing.rs"]
+mod new_nil_assigns_nothing;
+#[path = "emit_and_run/partial_select_write.rs"]
+mod partial_select_write;
+#[path = "emit_and_run/record_toggle.rs"]
+mod record_toggle;
+#[path = "emit_and_run/reload_leaves_clone_cache.rs"]
+mod reload_leaves_clone_cache;
+#[path = "emit_and_run/save_touch_false.rs"]
+mod save_touch_false;
+#[path = "emit_and_run/delegated_type_methods.rs"]
+mod delegated_type_methods;
+#[path = "emit_and_run/direct_route_records.rs"]
+mod direct_route_records;
+#[path = "emit_and_run/direct_route_model_calls.rs"]
+mod direct_route_model_calls;
+
+#[path = "emit_and_run/after_initialize_require_class.rs"]
+mod after_initialize_require_class;
+#[path = "emit_and_run/model_value_class_blocks.rs"]
+mod model_value_class_blocks;
+
+// Fork specs: controller tests.
+#[path = "emit_and_run/app_headers_hash_keys.rs"]
+mod app_headers_hash_keys;
+#[path = "emit_and_run/app_json_renderer.rs"]
+mod app_json_renderer;
+#[path = "emit_and_run/controller_action_methods.rs"]
+mod controller_action_methods;
+#[path = "emit_and_run/controller_upload_param_io.rs"]
+mod controller_upload_param_io;
+#[path = "emit_and_run/deep_munge_nil_members.rs"]
+mod deep_munge_nil_members;
+#[path = "emit_and_run/fixture_file_upload_multipart.rs"]
+mod fixture_file_upload_multipart;
+#[path = "emit_and_run/functional_test_request_at_setup.rs"]
+mod functional_test_request_at_setup;
+#[path = "emit_and_run/integration_options_request.rs"]
+mod integration_options_request;
+#[path = "emit_and_run/render_json_as_json_options.rs"]
+mod render_json_as_json_options;
+#[path = "emit_and_run/request_media_type_case.rs"]
+mod request_media_type_case;
+#[path = "emit_and_run/request_variant.rs"]
+mod request_variant;
+#[path = "emit_and_run/response_body_writer.rs"]
+mod response_body_writer;
+#[path = "emit_and_run/test_local_controller.rs"]
+mod test_local_controller;
+
+// Fork specs: views helpers.
+#[path = "emit_and_run/declared_helper_includes.rs"]
+mod declared_helper_includes;
+#[path = "emit_and_run/declared_helper_order.rs"]
+mod declared_helper_order;
+#[path = "emit_and_run/declared_helpers_only.rs"]
+mod declared_helpers_only;
+#[path = "emit_and_run/helper_capture_arguments.rs"]
+mod helper_capture_arguments;
+#[path = "emit_and_run/helper_module_singleton_beside_instance.rs"]
+mod helper_module_singleton_beside_instance;
+#[path = "emit_and_run/helper_render_partial_format.rs"]
+mod helper_render_partial_format;
+#[path = "emit_and_run/number_helper_include_called_outside.rs"]
+mod number_helper_include_called_outside;
+#[path = "emit_and_run/tag_helper_singleton_include.rs"]
+mod tag_helper_singleton_include;
+#[path = "emit_and_run/translation_helper_test_include.rs"]
+mod translation_helper_test_include;
+#[path = "emit_and_run/view_url_for_hash.rs"]
+mod view_url_for_hash;
+#[path = "emit_and_run/class_side_multi_column_pluck.rs"]
+mod class_side_multi_column_pluck;
+#[path = "emit_and_run/has_many_inverse_of_foreign_key.rs"]
+mod has_many_inverse_of_foreign_key;
+#[path = "emit_and_run/errors_messages_unlowered.rs"]
+mod errors_messages_unlowered;
+#[path = "emit_and_run/belongs_to_unsaved_target_valid.rs"]
+mod belongs_to_unsaved_target_valid;
+#[path = "emit_and_run/string_starts_with_alias.rs"]
+mod string_starts_with_alias;
+#[path = "emit_and_run/duration_name_on_object.rs"]
+mod duration_name_on_object;
+#[path = "emit_and_run/update_in_argument_position.rs"]
+mod update_in_argument_position;
+#[path = "emit_and_run/indifferent_hash_in_plain_class.rs"]
+mod indifferent_hash_in_plain_class;
+#[path = "emit_and_run/test_file_class_body.rs"]
+mod test_file_class_body;
+#[path = "emit_and_run/test_class_dropped_statement.rs"]
+mod test_class_dropped_statement;
+#[path = "emit_and_run/route_helper_scalar_call.rs"]
+mod route_helper_scalar_call;
+
+// Fork specs: validations.
+#[path = "emit_and_run/key_named_validator_listed.rs"]
+mod key_named_validator_listed;
+#[path = "emit_and_run/presence_reads_delegated_column.rs"]
+mod presence_reads_delegated_column;
+#[path = "emit_and_run/sti_subclass_validators_listed.rs"]
+mod sti_subclass_validators_listed;
+#[path = "emit_and_run/validates_on_context_constant.rs"]
+mod validates_on_context_constant;
+#[path = "emit_and_run/validates_with_built_once_listed.rs"]
+mod validates_with_built_once_listed;
+#[path = "emit_and_run/validates_with_class_option.rs"]
+mod validates_with_class_option;
+#[path = "emit_and_run/validation_custom_context.rs"]
+mod validation_custom_context;
+#[path = "emit_and_run/validation_message_number_helper.rs"]
+mod validation_message_number_helper;
+#[path = "emit_and_run/validation_reads_singleton_reader.rs"]
+mod validation_reads_singleton_reader;
+
+// Fork specs: nested attributes.
+#[path = "emit_and_run/has_one_autosave_validates.rs"]
+mod has_one_autosave_validates;
+#[path = "emit_and_run/nested_built_child_errors.rs"]
+mod nested_built_child_errors;
+#[path = "emit_and_run/nested_validate_new_children.rs"]
+mod nested_validate_new_children;
+
+// Fork specs: attribute types.
+#[path = "emit_and_run/decimal_before_type_cast.rs"]
+mod decimal_before_type_cast;
+#[path = "emit_and_run/declared_type_read_after_save.rs"]
+mod declared_type_read_after_save;
+#[path = "emit_and_run/json_changed_in_place.rs"]
+mod json_changed_in_place;
+#[path = "emit_and_run/json_update_columns.rs"]
+mod json_update_columns;
+
+// Concern shapes: an `included do` block's class/instance attributes.
+#[path = "emit_and_run/concern_included_cattr.rs"]
+mod concern_included_cattr;
+#[path = "emit_and_run/struct_block_definers.rs"]
+mod struct_block_definers;
+#[path = "emit_and_run/concern_class_methods_body_calls.rs"]
+mod concern_class_methods_body_calls;
+#[path = "emit_and_run/base_with_connection.rs"]
+mod base_with_connection;
+#[path = "emit_and_run/concern_class_attribute_subclass_calls.rs"]
+mod concern_class_attribute_subclass_calls;
+#[path = "emit_and_run/concern_class_attribute_private.rs"]
+mod concern_class_attribute_private;
+
+// Concern shapes: model callbacks declared in a concern's included block.
+#[path = "emit_and_run/concern_model_callbacks.rs"]
+mod concern_model_callbacks;
+
+// Concern shapes: a prepended concern.
+#[path = "emit_and_run/concern_prepended.rs"]
+mod concern_prepended;
+
+// Concern shapes: a plain module's included hook class_eval'ing an include.
+#[path = "emit_and_run/concern_class_eval_include.rs"]
+mod concern_class_eval_include;
+
+// Concern shapes: `concerning :Topic do … end` in a model body.
+#[path = "emit_and_run/concerning_block.rs"]
+mod concerning_block;
+
+// Concern shapes: a concern's accessors and validations on a plain
+// Active Model class.
+#[path = "emit_and_run/concern_plain_includer.rs"]
+mod concern_plain_includer;
+
+// Concern shapes: a namespaced prepend by its relative name.
+#[path = "emit_and_run/concern_prepended_namespaced.rs"]
+mod concern_prepended_namespaced;
+
+// A module defining `method_missing`: its receiverless reads are the includer's.
+#[path = "emit_and_run/module_method_missing_includer.rs"]
+mod module_method_missing_includer;
+// Declarations: a rooted class or module name inside a module.
+#[path = "emit_and_run/rooted_class_declarations.rs"]
+mod rooted_class_declarations;
+// A model whose include defines `method_missing`: ActiveRecord's own methods still answer.
+#[path = "emit_and_run/model_method_missing_active_record.rs"]
+mod model_method_missing_active_record;
+#[path = "emit_and_run/token_for_string_key.rs"]
+mod token_for_string_key;
+#[path = "emit_and_run/integer_times_enumerator.rs"]
+mod integer_times_enumerator;
+#[path = "emit_and_run/own_namespace_association.rs"]
+mod own_namespace_association;
+#[path = "emit_and_run/rooted_class_name.rs"]
+mod rooted_class_name;
+#[path = "emit_and_run/unreachable_partials.rs"]
+mod unreachable_partials;
+#[path = "emit_and_run/mixed_in_constants.rs"]
+mod mixed_in_constants;
+#[path = "emit_and_run/struct_predicate_members.rs"]
+mod struct_predicate_members;
+#[path = "emit_and_run/params_compact_blank.rs"]
+mod params_compact_blank;
+#[path = "emit_and_run/computed_partial_render.rs"]
+mod computed_partial_render;
+#[path = "emit_and_run/view_raise_statement.rs"]
+mod view_raise_statement;
+#[path = "emit_and_run/params_string_filter_scalars.rs"]
+mod params_string_filter_scalars;
+#[path = "emit_and_run/hidden_field_autocomplete.rs"]
+mod hidden_field_autocomplete;
+#[path = "emit_and_run/record_as_json_in_literal.rs"]
+mod record_as_json_in_literal;
+#[path = "emit_and_run/empty_base_list_override.rs"]
+mod empty_base_list_override;
+#[path = "emit_and_run/relation_argument.rs"]
+mod relation_argument;
+#[path = "emit_and_run/params_permit_key_args.rs"]
+mod params_permit_key_args;
+#[path = "emit_and_run/params_permit_splat_keys.rs"]
+mod params_permit_splat_keys;
+#[path = "emit_and_run/current_set.rs"]
+mod current_set;
+
+/// A class macro's `Class.new(base).tap { it.class_eval(&block) }` named by
+/// `const_set` is the class a `class Name < Base` with the call's block as
+/// its body makes: on main a `def` in the block was a nested def, refused
+/// and replaced by a raise.
+#[test]
+fn a_class_a_macro_makes_from_its_block_runs() {
+    let errors = service_params_class::overlay().check_errors();
+    assert!(errors.is_empty(), "{errors:#?}");
+    let run = service_params_class::overlay().run_ruby(service_params_class::ASSERTIONS);
+    run.assert_passes();
+    assert!(run.stdout.contains("service params contract passed"));
+}
+
+/// A class the macro makes and never names, or a local it rebinds before
+/// `const_set`, leaves the call reported: the block is not dropped
+/// unread, and the constant is not taken for a class the local no longer
+/// holds.
+#[test]
+fn a_class_a_macro_does_not_name_is_reported() {
+    let base = "class Maker\n  def self.make(&block)\n    k = Class.new(Maker, &block)\n  end\n\n  def self.rebind(&block)\n    k = Class.new(Maker, &block)\n    k = Maker\n    const_set(\"Made\", k)\n  end\nend\n";
+    for call in ["  make { raise \"expected\" }\n", "  rebind do\n    def x = 1\n  end\n"] {
+        let errors = emit_and_run::empty_app()
+            .write("app/models/maker.rb", base)
+            .write("app/models/user_of_maker.rb", &format!("class UserOfMaker < Maker\n{call}end\n"))
+            .check_errors();
+        assert!(errors.iter().any(|e| e.contains("this call does not expand")), "{call}: {errors:#?}");
+    }
+}
+
+/// A name the macro computes from a value known only when it runs leaves
+/// the call reported, not expanded under a guessed name.
+#[test]
+fn a_class_a_macro_names_at_run_time_is_reported() {
+    let errors = service_params_class::overlay()
+        .edit("app/models/list_service.rb", "  params :filter\n", "  params ENV.fetch(\"X\", \"y\").to_sym\n")
+        .check_errors();
+    assert!(errors.iter().any(|e| e.contains("`params` defines methods this call does not expand")), "{errors:#?}");
+}
+
+/// discourse's `UserActionManager`: `%i[post topic].each { |type|
+/// class_eval(<<~RUBY) }` defines class methods whose bodies name a model.
+/// The string's `def`s are parsed apart from the file, so their offsets
+/// are no source position; a constant in them is read as written rather
+/// than looked up at a position it does not stand at, which reported
+/// `UserAction` as unsupported.
+#[test]
+fn a_class_eval_string_loop_s_methods_read_their_constants() {
+    let errors = class_eval_loop_overlay().check_errors();
+    assert!(errors.is_empty(), "{errors:#?}");
+    let run = class_eval_loop_overlay().run_ruby(CLASS_EVAL_LOOP_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("class_eval loop passed"));
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn a_class_eval_string_loop_s_methods_read_their_constants_on_spinel() {
+    let run = class_eval_loop_overlay().run_spinel_with_db(CLASS_EVAL_LOOP_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("class_eval loop passed"));
+}
+
+const CLASS_EVAL_LOOP_SCRIPT: &str = "got = [UserActionManager.post_created(1), UserActionManager.topic_created(2)]\nraise got.inspect unless got == [[\"logged post 1\"], [\"logged topic 2\"]]\nputs \"class_eval loop passed\"\n";
+
+fn class_eval_loop_overlay() -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n")
+        .write("app/models/user_action.rb", "class UserAction < ApplicationRecord\n  def self.log_action!(row)\n    \"logged #{row}\"\n  end\nend\n")
+        .write("app/models/user_action_manager.rb", "class UserActionManager\n  %i[post topic].each { |type| class_eval(<<~RUBY) }\n      def self.#{type}_created(*args)\n        #{type}_rows(*args).map { |row| UserAction.log_action!(row) }\n      end\n    RUBY\n\n  def self.post_rows(x)\n    [\"post #{x}\"]\n  end\n\n  def self.topic_rows(x)\n    [\"topic #{x}\"]\n  end\nend\n")
+        .write("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"user_actions\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n")
+}
+
+/// discourse's `JsonApiKit::Name`: `Data.define(:value) { include Name }`.
+/// Ruby runs the block on the new class, so the module is the Data class's
+/// include, its methods (`with` among the reads, `super` through a nested
+/// mixin) the record's. Before, an include beside a `def` refused the
+/// whole file, and a block holding only the include stayed an opaque
+/// constant another class could not name.
+#[test]
+fn a_data_define_block_s_include_is_the_data_class_s() {
+    let errors = data_include_overlay().check_errors();
+    assert!(errors.is_empty(), "{errors:#?}");
+    let run = data_include_overlay().run_ruby(DATA_INCLUDE_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("data include passed"));
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn a_data_define_block_s_include_is_the_data_class_s_on_spinel() {
+    let run = data_include_overlay().run_spinel(DATA_INCLUDE_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("data include passed"));
+}
+
+const DATA_INCLUDE_SCRIPT: &str = "m = Kit::Name::Member.new(value: \"a\")\nraise m.to_s unless m.to_s == \"a\"\nc = m.convert { |v| v.upcase }\nraise c.inspect unless c.value == \"A\" && c.is_a?(Kit::Name::Member)\nf = Kit::Name::Field.new(value: \"x\", type: \"t\")\ng = f.convert { |v| v + \"!\" }\nraise g.inspect unless g.value == \"x!\" && g.type == \"t!\"\nnames = Kit::Names.all\nraise names.inspect unless names == [\"tt\", \"Y\"]\npair = Kit::Pair.new(value: 1)\nraise pair.tag unless pair.tag == \"a\" && pair.label == \"l\"\nputs \"data include passed\"\n";
+
+fn data_include_overlay() -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("app/models/kit/name.rb", "module Kit\n  module Name\n    def convert = with(value: yield(value))\n\n    def convert_type = self\n\n    def to_s = value\n  end\nend\n")
+        .write("app/models/kit/name/resource_scope.rb", "module Kit\n  module Name\n    module ResourceScope\n      include Name\n\n      def convert(&) = super.convert_type(&)\n\n      def convert_type = with(type: yield(type))\n    end\n  end\nend\n")
+        .write("app/models/kit/name/member.rb", "module Kit\n  module Name\n    Member = Data.define(:value) { include Name }\n  end\nend\n")
+        .write("app/models/kit/name/field.rb", "module Kit\n  module Name\n    Field = Data.define(:value, :type) { include Name::ResourceScope }\n  end\nend\n")
+        .write("app/models/kit/name/type.rb", "module Kit\n  module Name\n    Type =\n      Data.define(:value) do\n        include Name\n\n        def convert_type(&) = convert(&)\n      end\n  end\nend\n")
+        .write("app/models/kit/tags.rb", "module Kit\n  module TagA\n    def tag = \"a\"\n  end\n\n  module TagB\n    def tag = \"b\"\n  end\n\n  Pair = Data.define(:value) do\n    def label = \"l\"\n\n    include TagA, TagB\n  end\nend\n")
+        .write("app/models/kit/names.rb", "module Kit\n  class Names\n    def self.all\n      [Kit::Name::Field.new(value: \"f\", type: \"t\").convert { |v| v * 2 }.type, Kit::Name::Type.new(value: \"y\").convert_type { |v| v.upcase }.value]\n    end\n  end\nend\n")
+}
+
+
+/// An app file's top-level `Foo.prepend(Bar)` beside `module Bar`: Ruby runs
+/// Module#prepend as the file loads. It was dropped from the emitted tree
+/// with no diagnostic; it is now the class's own `prepend Bar`. A target the
+/// program does not declare is reported.
+#[test]
+fn an_app_file_s_top_level_prepend_runs() {
+    let errors = top_level_prepend_app().check_errors();
+    assert!(errors.is_empty(), "{errors:#?}");
+    let run = top_level_prepend_app().run_ruby(TOP_LEVEL_PREPEND_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("app prepend passed"));
+    let errors = emit_and_run::empty_app()
+        .write("app/models/bar.rb", "module Bar\n  def hi = \"bar\"\nend\n\nNowhere.prepend(Bar)\n")
+        .check_errors();
+    assert!(errors.iter().any(|e| e.contains("`Nowhere` is no class or module the program declares")), "{errors:#?}");
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn an_app_file_s_top_level_prepend_runs_on_spinel() {
+    let run = top_level_prepend_app().run_spinel(TOP_LEVEL_PREPEND_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("app prepend passed"));
+}
+
+const TOP_LEVEL_PREPEND_SCRIPT: &str = "got = [Greeter.new.hi, Greeter.new.respond_to?(:wave)]\nraise got.inspect unless got == [[\"greeter\", \"loud\"], true]\nputs \"app prepend passed\"\n";
+
+fn top_level_prepend_app() -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("app/models/greeter.rb", "class Greeter\n  def hi = [\"greeter\"]\nend\n")
+        .write("app/models/loud.rb", "module Loud\n  def hi = super + [\"loud\"]\nend\n\nGreeter.prepend(Loud)\n")
+        .write("app/models/waving.rb", "module Waving\n  def wave = true\nend\n\nGreeter.include(Waving)\n")
+}
+
+/// responders' `ActionController::Responder` reads Rails' own renderer constants: the formats Rails renders itself
+/// and the LoadError it raises for another.
+#[test]
+fn rails_renderer_constants_answer_as_rails_does() {
+    let run = renderer_constants_app().run_ruby(RENDERER_CONSTANTS_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("renderer constants passed"));
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn rails_renderer_constants_answer_as_rails_does_on_spinel() {
+    let run = renderer_constants_app().run_spinel(RENDERER_CONSTANTS_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("renderer constants passed"));
+}
+
+const RENDERER_CONSTANTS_SCRIPT: &str = "got = RendererProbe.report\nraise got.inspect unless got == [true, true, true, false, \"No renderer defined for format: csv\"]\nputs \"renderer constants passed\"\n";
+
+fn renderer_constants_app() -> emit_and_run::Overlay {
+    emit_and_run::empty_app().write(
+        "app/models/renderer_probe.rb",
+        "class RendererProbe\n  def self.report\n    raise ActionController::MissingRenderer.new(:csv)\n  rescue LoadError => e\n    renderers = ActionController::Renderers::RENDERERS\n    [renderers.include?(:json), renderers.include?(:js), renderers.include?(:xml), renderers.include?(:csv), e.message]\n  end\nend\n",
+    )
+}
+
+/// What a gem's Rack middleware asks of Rack and Rails at a request's end (message_bus's): rack's env key constants,
+/// the connection handler's `clear_active_connections!`, and `defined?` of the `ActiveRecord::Base` method Rails 7.2
+/// moved to the handler, which Rails 8.1 answers nil.
+#[test]
+fn a_middleware_s_rack_and_connection_calls_answer_as_rails_does() {
+    let run = middleware_calls_app().run_ruby(MIDDLEWARE_CALLS_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("middleware calls passed"));
+}
+
+/// The replay cache a fiber turned on goes off at `clear_active_connections!`, with no lease held, as Rails'
+/// `disable_query_cache!` turns each pool's off.
+#[test]
+fn clearing_active_connections_turns_the_query_cache_off() {
+    let script = "Db.query_cache_begin\nraise \"cache off\" unless Db.query_cache_enabled?\nActiveRecord::Base.connection_handler.clear_active_connections!(:all)\nraise \"cache still on\" if Db.query_cache_enabled?\nputs \"query cache cleared\"\n";
+    let run = middleware_calls_app().run_ruby(script);
+    run.assert_passes();
+    assert!(run.stdout.contains("query cache cleared"));
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn a_middleware_s_rack_and_connection_calls_answer_as_rails_does_on_spinel() {
+    let run = middleware_calls_app().run_spinel(MIDDLEWARE_CALLS_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("middleware calls passed"));
+}
+
+const MIDDLEWARE_CALLS_SCRIPT: &str = "got = ConnectionProbe.report\nraise got.inspect unless got == [\"rack.session.options\", \"rack.input\", nil, :handler]\nputs \"middleware calls passed\"\n";
+
+fn middleware_calls_app() -> emit_and_run::Overlay {
+    emit_and_run::real_blog().write(
+        "app/models/connection_probe.rb",
+        "class ConnectionProbe\n  def self.report\n    [Rack::RACK_SESSION_OPTIONS, Rack::RACK_INPUT, ActiveRecord::Base.connection_handler.clear_active_connections!(:all), released]\n  end\n\n  def self.released\n    if defined? ActiveRecord::Base.connection_handler\n      ActiveRecord::Base.connection_handler.clear_active_connections!(:all)\n      :handler\n    elsif defined? ActiveRecord::Base.clear_active_connections!\n      ActiveRecord::Base.clear_active_connections!\n      :base\n    end\n  end\nend\n",
+    )
+}
+
+/// `defined?(ActiveRecord::Base.clear_active_connections!)` folds to nil only for Rails' own `ActiveRecord`: in a
+/// namespace with an `ActiveRecord` of its own that defines the method, Ruby answers "method".
+#[test]
+fn a_removed_rails_method_s_defined_keeps_a_lexically_shadowed_head() {
+    let run = emit_and_run::real_blog()
+        .write(
+            "app/models/wrapper.rb",
+            "module Wrapper\n  module ActiveRecord\n    class Base\n      def self.clear_active_connections!\n        :own\n      end\n    end\n  end\n\n  class Probe\n    def self.check\n      [defined?(ActiveRecord::Base.clear_active_connections!), defined?(::ActiveRecord::Base.clear_active_connections!)]\n    end\n  end\nend\n",
+        )
+        .run_ruby("got = Wrapper::Probe.check\nraise got.inspect unless got == [\"method\", nil]\nputs \"shadowed head passed\"\n");
+    run.assert_passes();
+    assert!(run.stdout.contains("shadowed head passed"));
+}
+
+/// A `require` of a name built at run time loads nothing in the Spinel tree and is reported there; a call of the app's
+/// own `load(name)` is that method, and is not.
+#[test]
+fn only_kernel_s_require_of_a_built_name_is_reported_on_spinel() {
+    let errors = |body: &str| {
+        emit_and_run::real_blog()
+            .write("app/models/loader.rb", &format!("class Loader\n{body}end\n"))
+            .emit(roundhouse::project::BuildTarget::Spinel)
+            .1
+    };
+    let built = errors("  def self.backend(name)\n    require \"loader/#{name}\"\n  end\n");
+    assert!(built.iter().any(|e| e.contains("require of a name built at run time")), "{built:#?}");
+    let own = errors("  def self.load(name)\n    name.to_s\n  end\n\n  def self.fetch(name)\n    load(name)\n  end\n");
+    assert!(!own.iter().any(|e| e.contains("require of a name built at run time")), "{own:#?}");
 }

@@ -123,16 +123,38 @@ module ActiveJob
     # An Array argument, or the whole argument list: the element JSON
     # each helper above wrote, joined.
     def self.list(parts)
-      "[" + parts.join(",") + "]"
+      "[" + parts.reject { |part| part == "" }.join(",") + "]"
     end
 
-    def self.keywords(names, parts)
-      body = []
-      names.each_with_index { |name, i| body << str(name) + ":" + parts[i] }
-      body << "\"" + RUBY2_KEYWORDS_KEY + "\":" + list(names.map { |name| str(name) })
-      "{" + body.join(",") + "}"
+    # A job's keyword arguments, as the one Hash ActiveJob writes for
+    # them after the positional ones: each name and its value's JSON,
+    # then `"_aj_ruby2_keywords"` listing the names, which is what tells
+    # Rails' reader to pass them back as keywords. A name of "" is a
+    # keyword the caller left at its default: Rails doesn't write a
+    # keyword the caller omits, so it is left out here. With none left,
+    # the answer is "", which `list` drops: Rails writes no Hash at all
+    # for a call that passes no keywords.
+    def self.keywords(names, values)
+      out = +"{"
+      written = [""]
+      written.clear
+      i = 0
+      while i < names.length
+        name = names[i]
+        if name != ""
+          out << str(name) + ":" + values[i] + ","
+          written << str(name)
+        end
+        i += 1
+      end
+      return "" if written.empty?
+      out << "\"" + RUBY2_KEYWORDS_KEY + "\":[" + written.join(",") + "]}"
+      out
     end
 
+    # Whether the trailing keyword Hash names `name`. A payload with no
+    # keyword Hash (every optional keyword left at its default) answers
+    # false, so the reader binds the default.
     def self.keyword_given?(args, name)
       names = key_of(args[args.length - 1], RUBY2_KEYWORDS_KEY)
       !names.nil? && names.include?(name)

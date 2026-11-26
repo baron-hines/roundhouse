@@ -20,7 +20,8 @@
 //! * one `@__instance` singleton plus `self.instance` / `self.reset`;
 //! * a reader and writer per declared attribute, storing in an ivar;
 //! * `delegate … to: :x, prefix: true, allow_nil: true` expanded to real
-//!   methods (`request_host` → `@request.nil? ? nil : @request.host`);
+//!   methods (`request_host` → `@request.host` unless `@request` is nil; a
+//!   target that is a method, not an attribute, is called, as Rails does);
 //! * a `self.<name>` forwarder for every instance method, which is what
 //!   makes the class-level call sites app code actually writes resolve.
 //!
@@ -142,7 +143,7 @@ fn take_attribute_decls(lc: &mut LibraryClass) -> (Vec<Symbol>, Vec<(Symbol, cra
 /// the presence test would fold to true (see current_attributes_typing).
 /// Returns each accessor's signature.
 fn declare_attribute_types(methods: &mut [MethodDef], declared: &[(Symbol, crate::ty::Ty)]) -> Vec<(Symbol, crate::ty::Ty)> {
-    use crate::ty::{Param, ParamKind, Ty};
+    use crate::ty::{FnTy, Param, ParamKind, Ty};
     let mut out = Vec::new();
     for (name, written) in declared {
         let ty = &match written {
@@ -159,13 +160,21 @@ fn declare_attribute_types(methods: &mut [MethodDef], declared: &[(Symbol, crate
             } else {
                 continue;
             };
-            let signature = Ty::Fn { params: params.into(), block: None, ret: std::sync::Arc::new(ty.clone()), effects: method.effects.clone() };
+            let signature = Ty::Fn(Box::new(FnTy { params: params.into(), block: None, ret: std::sync::Arc::new(ty.clone()), effects: method.effects.clone() }));
             method.signature = Some(signature.clone());
             out.push((method.name.clone(), signature));
         }
     }
     out
 }
+
+/// A delegate target Ruby would parse as a keyword (`to: :class`), which Rails' delegate qualifies with `self.`.
+const RUBY_KEYWORDS: [&str; 41] = [
+    "__ENCODING__", "__LINE__", "__FILE__", "BEGIN", "END", "alias", "and", "begin", "break", "case", "class", "def",
+    "defined?", "do", "else", "elsif", "end", "ensure", "false", "for", "if", "in", "module", "next", "nil", "not", "or",
+    "redo", "rescue", "retry", "return", "self", "super", "then", "true", "undef", "unless", "until", "when", "while",
+    "yield",
+];
 
 /// `delegate :host, :protocol, to: :request, prefix: true, allow_nil: true`.
 /// Returns `(method, target, generated_name, allow_nil)`.
@@ -316,13 +325,26 @@ fn synthesized_source(
             continue;
         }
         let (t, m) = (d.target.as_str(), d.method.as_str());
+        // `to: :user` calls the method: the ivar only for a declared attribute whose reader the app left as storage.
+        let target = if t.starts_with('@') {
+            t.to_string()
+        } else if attrs.iter().any(|a| a.as_str() == t) && !defines(t) {
+            format!("@{t}")
+        } else if RUBY_KEYWORDS.contains(&t) {
+            format!("self.{t}")
+        } else if t.trim_start_matches("::").starts_with(|c: char| c.is_ascii_uppercase()) {
+            t.to_string()
+        } else {
+            // Not bare: `__target = __target` would read the local being assigned, not the method.
+            format!("{t}()")
+        };
         if d.allow_nil {
             body.push_str(&format!(
-                "  def {}\n    @{t}.nil? ? nil : @{t}.{m}\n  end\n\n",
+                "  def {}\n    __target = {target}\n    __target.nil? ? nil : __target.{m}\n  end\n\n",
                 d.name
             ));
         } else {
-            body.push_str(&format!("  def {}\n    @{t}.{m}\n  end\n\n", d.name));
+            body.push_str(&format!("  def {}\n    {target}.{m}\n  end\n\n", d.name));
         }
     }
 

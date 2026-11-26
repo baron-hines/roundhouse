@@ -130,6 +130,7 @@ class ActionResponse
   # lowercase-keyed the way Rack 3 normalizes — the values are the
   # response's own Strings, not the caller's Hash.
   def headers: () -> Hash[String, String]
+  def header: () -> Hash[String, String]
 
   def initialize: (
     status: Integer,
@@ -356,7 +357,8 @@ module RequestDispatch
     String query,
     untyped params,
     Hash[untyped, untyped] headers,
-    Symbol? as
+    Symbol? as,
+    ?Integer defaults
   ) -> ActionResponse
 
   # Recursive Hash-keys-to-strings. Strictly `(Hash) -> Hash`; non-
@@ -381,17 +383,19 @@ module RequestDispatch
   # this file cannot name it.
   #
   # Second arg is either the selector (root form), the content string
-  # to match against the rendered tag, or an options Hash, or nil.
+  # to match against the rendered tag, an equality (`false` or `0`: no
+  # match; `true`: one), or an options Hash, or nil. In the root form
+  # the third arg takes the second's place, so it takes the same.
   # Returns void (raises on mismatch).
   def assert_select: (
     untyped selector_or_root,
-    ?(String | Hash[Symbol, untyped])? content_or_opts,
-    ?Hash[Symbol, untyped]? opts
+    ?(String | bool | Integer | Hash[Symbol, untyped])? content_or_opts,
+    ?(String | bool | Integer | Hash[Symbol, untyped])? opts
   ) { () -> void } -> void
        | (
     untyped selector_or_root,
-    ?(String | Hash[Symbol, untyped])? content_or_opts,
-    ?Hash[Symbol, untyped]? opts
+    ?(String | bool | Integer | Hash[Symbol, untyped])? content_or_opts,
+    ?(String | bool | Integer | Hash[Symbol, untyped])? opts
   ) -> void
 end
 

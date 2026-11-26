@@ -39,7 +39,7 @@ use super::util::{map_expr, map_expr_mut};
 /// `partial: "users/sidebars/rooms/shared", locals: { room: room }` →
 /// `Views::Users::Sidebars::Rooms.shared(room)`, bound against the
 /// partial's DEF-SITE contract: the record by the partial's record-arg
-/// convention, closure ivars as `@<name>` (a same-named local wins),
+/// convention, closure ivars as `@<name>` (never a same-named local),
 /// extras from `locals:` (nil-filled, trailing-trimmed).
 ///
 /// Shared by the render rewrite and the broadcast rewrite — a broadcast
@@ -103,7 +103,7 @@ pub(super) fn partial_view_call_with_record(
         .or_else(|| record_override.cloned())
         .unwrap_or_else(|| nil_expr(span))];
     for n in &contract.closure {
-        view_args.push(lookup(n).unwrap_or_else(|| ivar(n.as_str(), span)));
+        view_args.push(ivar(n.as_str(), span));
     }
     // An action's render passes its own action, controller and path parameters, as a view's call passes them to a partial.
     let request_value = |name: &str| -> Option<Expr> {
@@ -222,8 +222,8 @@ pub(super) fn rewrite_render_to_views(
             // "commentbox", layout: false, content_type: …, locals:
             // {comment: c}` (lobsters' reply). Bind against the
             // partial's def-site contract: record by the partial's
-            // record-arg convention, closure ivars as `@<name>` (a
-            // same-named local wins), extras from locals (nil-filled,
+            // record-arg convention, closure ivars as `@<name>` (never
+            // a same-named local), extras from locals (nil-filled,
             // trailing-trimmed). `layout:` drops (Rails renders
             // partials without one); other kwargs (content_type:,
             // status:) ride the render.
@@ -2923,7 +2923,7 @@ fn strip_url_helpers_receiver(expr: &Expr) -> Expr {
         if !is_rails_url_helpers_chain(r) {
             return None;
         }
-        Some(Expr::new(
+        let mut bare = Expr::new(
             e.span,
             ExprNode::Send {
                 recv: None,
@@ -2932,7 +2932,16 @@ fn strip_url_helpers_receiver(expr: &Expr) -> Expr {
                 block: block.as_ref().map(strip_url_helpers_receiver),
                 parenthesized: *parenthesized,
             },
-        ))
+        );
+        // Not left to `route_url_options`: it ran while the receiver was on, and its chained form is the library emit's.
+        // Only with a `host:`: without one it would drop a `protocol:` that `url_from_path` cannot take.
+        let names_host = args.last().is_some_and(|a| matches!(&*a.node, ExprNode::Hash { entries, .. }
+            if entries.iter().any(|(k, _)| matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "host"))));
+        if names_host {
+            let helper: crate::det::HashSet<String> = std::iter::once(method.as_str().to_string()).collect();
+            crate::lower::route_url_options::rewrite_node(&mut bare, &helper);
+        }
+        Some(bare)
     })
 }
 
@@ -3035,7 +3044,10 @@ fn rewrite_route_helpers_with(
                 .map(|(i, arg)| {
                     let id_segment =
                         shape.map_or(true, |s| s.get(i).copied().unwrap_or(true));
-                    let needs_id = id_segment && match &*arg.node {
+                    // Not a value typed as a scalar: a call answering a
+                    // String or an Integer is its own `to_param`
+                    // (`shelf_path(Links.locale_for(user), 4)`).
+                    let needs_id = id_segment && !types_to_a_scalar(arg) && match &*arg.node {
                         ExprNode::Ivar { .. } => true,
                         ExprNode::Send { recv: Some(r), method, .. }
                             if method.as_str() != "id" =>
@@ -3265,6 +3277,21 @@ fn project_route_helper_ids_node(e: &Expr, direct_helpers: &crate::det::HashSet<
     ))
 }
 
+/// Is `arg` typed as a String, Symbol, number or boolean (or a union of
+/// them, nil included)? Rails renders such a value with its own
+/// `to_param`; it has no `id`.
+fn types_to_a_scalar(arg: &Expr) -> bool {
+    use crate::ty::Ty;
+    fn scalar(t: &Ty) -> bool {
+        match t {
+            Ty::Str | Ty::Sym | Ty::Int | Ty::Float | Ty::Bool | Ty::Nil => true,
+            Ty::Union { variants } => variants.iter().all(scalar),
+            _ => false,
+        }
+    }
+    arg.ty.as_ref().is_some_and(scalar)
+}
+
 /// A route-helper argument with every model instance in it projected
 /// to its id — the argument itself, or the VALUES of a trailing kwargs
 /// hash.
@@ -3307,7 +3334,9 @@ fn project_arg(a: &Expr, direct: bool) -> Expr {
         }
         return a.clone();
     }
-    if records_a_model(a) {
+    // A `direct` helper's block is given the record itself; its own
+    // `route_for` takes the id where a segment wants one.
+    if records_a_model(a) && !direct {
         return id_of(a);
     }
     a.clone()

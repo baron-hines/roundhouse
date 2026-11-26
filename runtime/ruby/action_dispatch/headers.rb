@@ -32,6 +32,20 @@ module ActionDispatch
         @env[Headers.env_name(key)]
       end
 
+      # Rails' `[]=` and `merge!` write into the request's own env, under
+      # each key's env name (`X-Route` is `HTTP_X_ROUTE`), so a later
+      # read through the request sees them. `merge!` answers its
+      # argument, as Rails' `each` over it does.
+      def []=(key, value)
+        @env[Headers.env_name(key)] = value
+        value
+      end
+
+      def merge!(headers)
+        headers.each { |key, value| @env[Headers.env_name(key)] = value }
+        headers
+      end
+
       def key?(key)
         @env.key?(Headers.env_name(key))
       end

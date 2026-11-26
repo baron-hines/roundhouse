@@ -3,6 +3,8 @@
 //! scope does not. Needs `ruby` on the path; without it every test that
 //! boots Ruby returns early.
 
+#[path = "support/prerequisite.rs"]
+mod prerequisite;
 #[path = "support/scratch.rs"]
 mod scratch;
 use std::fs;
@@ -24,7 +26,7 @@ const WRITTEN: &str = "class Order\n  def name = ::Kernel.format('%s', shop)\n\n
 fn ruby_available() -> bool {
     let available = Command::new("ruby").args(["-e", "exit 0"]).output().is_ok_and(|output| output.status.success());
     if !available {
-        eprintln!("ruby is not available; skipping");
+        prerequisite::missing("ruby is not available");
     }
     available
 }

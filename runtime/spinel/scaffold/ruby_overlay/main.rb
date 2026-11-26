@@ -33,6 +33,8 @@
 require_relative "boot"
 
 module Main
+  GEM_STACK_LOCK = Mutex.new
+
   # The framework class used by the nominal ParseError fallback.
   FrameworkParseError = ActionDispatch::Http::Parameters::ParseError
 
@@ -81,7 +83,9 @@ module Main
     [404, "<h1>404 Not Found</h1>", "text/html; charset=utf-8", nil, {}, {}, {}, {}, {}]
   end
 
-  def self.dispatch_core(env, stdin)
+  # `endpoint` is a controller and the action an endpoint runs (`Controller.action(name)`, `Main.run_endpoint`), in
+  # place of the route the path matches.
+  def self.dispatch_core(env, stdin, endpoint = nil)
     # Not replaced when run_rack made it: the id a gem's middleware already saw is the one the response carries.
     env["action_dispatch.request_id"] ||= ActionDispatch::RequestId.make(env["HTTP_X_REQUEST_ID"].to_s)
     # Rails wraps every request in the AR query cache: identical
@@ -95,7 +99,7 @@ module Main
     snapshot = method == "GET" || method == "HEAD"
     Db.read_snapshot_begin if snapshot
     begin
-      dispatch_core_inner(env, stdin)
+      dispatch_core_inner(env, stdin, endpoint)
     ensure
       Db.read_snapshot_end if snapshot
       Db.query_cache_end
@@ -104,7 +108,7 @@ module Main
 
   # Decode a Rack request and dispatch its complete path through Router,
   # preserving literal suffix routes while negotiating the response format.
-  def self.dispatch_core_inner(env, stdin)
+  def self.dispatch_core_inner(env, stdin, endpoint = nil)
     ActionView::ViewHelpers.reset_slots!
     Broadcasts.reset_log!
     # config.assume_ssl, same as the spinel dispatcher: the Rack env is
@@ -115,7 +119,10 @@ module Main
       env["rack.url_scheme"] = "https"
     end
 
-    request = CgiIo.parse_request(env, stdin)
+    # Not parsed again for an endpoint the request reaches: the body has been read, and the endpoint's params are its.
+    request = env["roundhouse.parsed_request"] ||= CgiIo.parse_request(env, stdin)
+    # Not beside the controller below: a request constraint reads the session before its route is chosen.
+    Main.restore_session(env, request[:cookies] || {})
     # Browser forms can only GET/POST; a hidden `_method` field carries
     # the real verb (PATCH/DELETE) — the same override Rails' middleware
     # stack performs. Done here, after the body parse, so every serving
@@ -147,8 +154,18 @@ module Main
     # to TABLE. ROOT is kept as a separate constant in routes.rb for
     # legibility (it's the only literal-pattern entry); the dispatch
     # composes them here so Router.match stays a flat-table walk.
-    matched = ActionDispatch::Router.match(request[:method], request_path,
-                           route_table)
+    # What a request constraint asks before its route is chosen (`RouteTable.match_asking`).
+    asked = ActionDispatch::Request.new(env.to_h, request[:params])
+    last_segment = request_path.split("/").last.to_s
+    asked.format = ActionDispatch::MimeNegotiation.format_name(
+      last_segment.include?(".") ? last_segment.split(".").last.to_s : "",
+      env["HTTP_ACCEPT"].to_s, env["HTTP_X_REQUESTED_WITH"].to_s, env["CONTENT_TYPE"].to_s
+    )
+    matched = if endpoint.nil?
+      RouteTable.match_asking(request[:method], request_path, route_table, asked)
+    else
+      ActionDispatch::Router::MatchResult.new(nil, endpoint[1], (env["roundhouse.path_params"] || {}).dup)
+    end
     if matched.nil?
       # No route: the format is the `?format=` param, a trusted Accept,
       # or the path's extension (Main.not_found_response).
@@ -201,9 +218,12 @@ module Main
       return [400, "<h1>400 Bad Request</h1>", "text/html; charset=utf-8", nil, {}, {}, {}, {}, {}]
     end
 
-    controller = Main.instantiate_controller(matched.controller)
+    env["roundhouse.path_params"] ||= matched.path_params
+    controller = endpoint.nil? ? Main.instantiate_controller(matched.controller) : endpoint[0]
     merged = matched.path_params.dup
-    request[:params].each { |k, v| merged[k] = v }
+    # Rails' `params.merge!(path_parameters)`: a captured segment wins over the query and body.
+    request[:params].each { |k, v| merged[k] = v unless matched.path_params.key?(k) }
+    RouteTable.route_defaults(matched.defaults, merged, matched.path_params)
     controller.params  = merged
     controller.path_parameters = matched.path_params
 
@@ -229,21 +249,9 @@ module Main
     # header, and `controller.cookies.pending` already contributes String
     # keys to the same hash.
     session_cookie = Rails.application.session_cookie_key
-    # SIGNED — see the spinel main.rb twin: `session_in` is the restored
-    # session's plain encoding, and only a changed session is re-signed.
-    #
-    # Under the futamura bridge the host Rails app owns the session: it
-    # arrives already decoded as `roundhouse.session` and leaves as
-    # `roundhouse.session.out`, with no cookie signed or verified on
-    # this side.
+    restored = Main.restore_session(env, cookies)
     host_session = env["roundhouse.session"]
-    restored = if host_session.nil?
-      ActionDispatch::Session.from_signed_cookie(
-        cookies[session_cookie.to_sym].to_s, session_cookie)
-    else
-      ActionDispatch::Session.new(host_session)
-    end
-    session_in = restored.to_cookie
+    session_in = env["roundhouse.session.in"].to_s
     controller.assign_http_session(restored)
     # Expose the inbound cookies to the controller as a CookieJar so
     # `cookies[:k]` reads (and `cookies[:k] = v` records writes, surfaced
@@ -268,7 +276,10 @@ module Main
     else
       host_flash.each { |k, v| inbound_flash[k.to_s] = v }
     end
-    controller.flash = ActionDispatch::Flash.new(inbound_flash)
+    # Not a new Flash when the request already holds one: Rails' flash is the request's, so the routes' controller and an endpoint it reaches (Devise's recall after `flash.now[:alert] =`) share it.
+    flash = env["roundhouse.request.flash"] || ActionDispatch::Flash.new(inbound_flash)
+    env["roundhouse.request.flash"] = flash
+    controller.flash = flash
 
     controller.request_method = request[:method]
     controller.request_path   = request[:path]
@@ -293,7 +304,14 @@ module Main
     # detaches a plain mutable Hash (callers write scratch keys the real
     # ENV would reject); params delegation gets the same merged hash the
     # controller sees.
+    env["RAW_POST_DATA"] = request.fetch(:raw_body, "")
     controller.request = ActionDispatch::Request.new(env.to_h, merged)
+    # Not read back from the controller: Devise's FailureApp delegates `flash` to the request.
+    controller.request.flash = flash
+    # The env's own request, which a gem's `ActionDispatch::Request.new(env)` is (`Request.for_env`).
+    env["roundhouse.request"] = controller.request
+    # Rails' `request.cookie_jar` is the controller's `cookies`: Warden's `cookies` (Devise's remember-me) reads and writes it.
+    controller.cookies = controller.request.adopt_cookie_jar(controller.cookies)
     controller.request.path_parameters = Main.route_parameters(controller, matched)
     # The body's params alone, for ParamsWrapper (`Params.wrap`).
     controller.request.request_parameters = request[:body_params]
@@ -330,6 +348,9 @@ module Main
     rescue ActiveRecord::RecordInvalid, ActiveRecord::RecordNotSaved, ActionController::InvalidAuthenticityToken
       # Not a 500: Rails' rescue_responses answer these with 422.
       return [422, "<h1>422 Unprocessable Content</h1>", "text/html; charset=utf-8", nil, {}, {}, {}, {}, {}]
+    rescue ActionController::UnknownFormat
+      # Rails' rescue_responses answer it with 406; the default app ships no public/406.html, so the body is empty.
+      return [406, "", "text/html; charset=utf-8", nil, {}, {}, {}, {}, {}]
     end
 
     # Dispatch on status, not on @location nil-ness: redirect_to
@@ -366,7 +387,7 @@ module Main
     httponly_cookies = {}
     expires_cookies = {}
     jar.pending.each do |k, v|
-      out_cookies[k] = v
+      out_cookies[k] = jar.deleted?(k) ? nil : v
       secure_cookies[k] = true if jar.flag_secure?(k)
       httponly_cookies[k] = jar.flag_httponly?(k)
       ss = jar.flag_samesite(k).to_s
@@ -383,7 +404,8 @@ module Main
     session_out = controller.session.to_cookie
     if !host_session.nil?
       env["roundhouse.session.out"] = controller.session.to_hash if session_out != session_in && !controller.request.session_skip?
-    elsif session_out != session_in && !controller.request.session_skip?
+    # Not here under `run_rack`: Rails commits above the gems' middleware (`Main.commit_session`).
+    elsif session_out != session_in && !controller.request.session_skip? && !env["roundhouse.session.above"]
       out_cookies[session_cookie] =
         session_out.empty? ? nil : ActionDispatch::Session.signed_cookie(session_out, session_cookie)
     end
@@ -409,10 +431,13 @@ module Main
       extra_headers[controller.headers.key_at(hi)] = controller.headers.val_at(hi)
       hi += 1
     end
+    # Rails' `redirect_to` sets no type: a redirect keeps the one a
+    # filter assigned, and only an unset type is text/html, the
+    # controller's default. The spinel dispatcher does the same.
     if is_redirect
       [controller.status,
        %(<a href="#{ActionView::ViewHelpers.html_escape(controller.location.to_s)}">Redirecting</a>),
-       "text/html; charset=utf-8", controller.location, out_cookies, extra_headers, secure_cookies, samesite_cookies, httponly_cookies, expires_cookies]
+       controller.content_type, controller.location, out_cookies, extra_headers, secure_cookies, samesite_cookies, httponly_cookies, expires_cookies]
     else
       # The controller body IS the full page: the Ruby emit path's
       # `apply_layout_lowering` wraps each html action render in
@@ -429,12 +454,13 @@ module Main
       # (`send_data … type: "image/png"` — a served avatar or logo)
       # keeps that type: the default is only the default. Same rule
       # the spinel dispatcher applies.
-      if controller.request_format == :json ||
-         controller.request_format == :turbo_stream ||
+      # Not read back from the controller: a controller may answer `request_format` itself (Devise's FailureApp), as the spinel twin takes the dispatch's.
+      if request_format == :json ||
+         request_format == :turbo_stream ||
          controller.content_type != "text/html; charset=utf-8"
         [controller.status, controller.body,
          controller.content_type, controller.location, out_cookies, extra_headers, secure_cookies, samesite_cookies, httponly_cookies, expires_cookies]
-      elsif controller.request_format == :rss
+      elsif request_format == :rss
         [controller.status, controller.body,
          "application/rss+xml; charset=utf-8", controller.location, out_cookies, extra_headers, secure_cookies, samesite_cookies, httponly_cookies, expires_cookies]
       else
@@ -474,16 +500,78 @@ module Main
   def self.run_rack(env)
     started = ActionDispatch::Runtime.clock_time
     env["action_dispatch.request_id"] = ActionDispatch::RequestId.make(env["HTTP_X_REQUEST_ID"].to_s)
-    @gem_stack ||= GemMiddleware.wrap(->(inner_env) { Main.run_app(inner_env) })
+    # Not restored in dispatch_core alone: Rails' session middleware sits above Warden's, which reads `rack.session`.
+    Main.restore_session(env, CgiIo.parse_cookies(env["HTTP_COOKIE"].to_s))
+    # Not a bare `||=`: two first requests at once would each build the stack and finalize the routes, one before the other is done.
+    @gem_stack || GEM_STACK_LOCK.synchronize { @gem_stack ||= GemMiddleware.wrap(->(inner_env) { Main.run_app(inner_env) }) }
+    env["roundhouse.session.above"] = true unless env.key?("roundhouse.session")
     status, headers, body = @gem_stack.call(env)
+    Main.commit_session(env, headers) unless env.key?("roundhouse.session")
     headers["x-request-id"] = env["action_dispatch.request_id"].to_s
     headers["x-runtime"] = ActionDispatch::Runtime.header_value(started) unless headers.key?("x-runtime")
     [status, headers, body]
   end
 
+  # SIGNED — see the spinel main.rb twin: `roundhouse.session.in` is the
+  # restored session's plain encoding, and only a changed session is
+  # re-signed.
+  #
+  # Under the futamura bridge the host Rails app owns the session: it
+  # arrives already decoded as `roundhouse.session` and leaves as
+  # `roundhouse.session.out`, with no cookie signed or verified on
+  # this side.
+  #
+  # `.to_sym` on the read: CgiIo.parse_cookies keys the inbound hash by
+  # Symbol (`out[name.to_sym] = val`).
+  def self.restore_session(env, cookies)
+    existing = env["rack.session"]
+    return existing if existing.is_a?(ActionDispatch::Session)
+    session_cookie = Rails.application.session_cookie_key
+    host_session = env["roundhouse.session"]
+    restored = if host_session.nil?
+      ActionDispatch::Session.from_signed_cookie(
+        cookies[session_cookie.to_sym].to_s, session_cookie)
+    else
+      ActionDispatch::Session.new(host_session)
+    end
+    env["roundhouse.session.in"] = restored.to_cookie
+    # Not left to the controller's request: it holds a copy of the env, and the commit above the stack reads this Hash.
+    env["rack.session.options"] ||= {}
+    env["rack.session"] = restored
+  end
+
+  def self.commit_session(env, headers)
+    session = env["rack.session"]
+    return unless session.is_a?(ActionDispatch::Session)
+    out = session.to_cookie
+    return if out == env["roundhouse.session.in"].to_s || env["rack.session.options"].to_h[:skip] == true
+    name = Rails.application.session_cookie_key
+    https = env["HTTPS"].to_s == "on" || env.fetch("HTTP_X_FORWARDED_PROTO", "").to_s.split(",").first.to_s.strip.downcase == "https"
+    line = if out.empty?
+      "#{name}=; Path=/; Max-Age=0"
+    else
+      "#{name}=#{CgiIo.url_encode(ActionDispatch::Session.signed_cookie(out, name))}; Path=/; HttpOnly; SameSite=Lax#{"; Secure" if https}"
+    end
+    key = headers.keys.find { |k| k.to_s.downcase == "set-cookie" } || "set-cookie"
+    existing = headers[key]
+    lines = existing.is_a?(Array) ? existing : existing.to_s.split("\n")
+    headers[key] = lines + [line]
+  end
+
   def self.run_app(env)
-    status, body, content_type, location, set_cookies, extra_headers, secure_cookies, samesite_cookies, httponly_cookies, expires_cookies =
-      dispatch_core(env, env["rack.input"] || StringIO.new(""))
+    Main.rack_response(env, dispatch_core(env, env["rack.input"] || StringIO.new("")))
+  end
+
+  # `Controller.action(name).call(env)`: the action of that controller over the request the env holds, as a Rack
+  # response; one the controller was handed (Metal's `response=`, Devise's recall) is its answer.
+  def self.run_endpoint(controller, action, env)
+    answer = dispatch_core(env, env["rack.input"] || StringIO.new(""), [controller, action])
+    held = controller.rack_response
+    held.nil? ? Main.rack_response(env, answer) : held
+  end
+
+  def self.rack_response(env, answer)
+    status, body, content_type, location, set_cookies, extra_headers, secure_cookies, samesite_cookies, httponly_cookies, expires_cookies = answer
     headers = {}
     headers["content-type"] = content_type unless content_type.empty?
     headers["location"] = location unless location.nil?

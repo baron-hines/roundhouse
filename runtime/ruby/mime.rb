@@ -193,8 +193,168 @@ module Mime
       @symbol
     end
 
+    # Rails' `ref`: the symbol, or the string of a type registered without one.
+    def ref
+      @symbol.nil? ? @string : @symbol
+    end
+
+    # Rails compares the string or the symbol, so `request.format == :json`
+    # and `== "application/json"` both hold (synonyms are not registered here).
     def ==(other)
+      return !@symbol.nil? && @symbol == other if other.is_a?(Symbol)
+      return @string == other || (!@symbol.nil? && @symbol.to_s == other) if other.is_a?(String)
       other.is_a?(Mime::Type) && to_s == other.to_s
+    end
+
+    # Rails answers `html?`, `json?`, … through `method_missing` for each registered symbol; spelled out
+    # here, which the runtime's typing requires.
+    def atom?
+      @symbol == :atom
+    end
+
+    def bmp?
+      @symbol == :bmp
+    end
+
+    def css?
+      @symbol == :css
+    end
+
+    def csv?
+      @symbol == :csv
+    end
+
+    def gif?
+      @symbol == :gif
+    end
+
+    def gzip?
+      @symbol == :gzip
+    end
+
+    # Rails' one exception: any HTML type, Turbo Stream's `text/vnd.turbo-stream.html` among them.
+    def html?
+      @symbol == :html || @string.include?("html")
+    end
+
+    def ics?
+      @symbol == :ics
+    end
+
+    def jpeg?
+      @symbol == :jpeg
+    end
+
+    def js?
+      @symbol == :js
+    end
+
+    def json?
+      @symbol == :json
+    end
+
+    def m4a?
+      @symbol == :m4a
+    end
+
+    def md?
+      @symbol == :md
+    end
+
+    def mp3?
+      @symbol == :mp3
+    end
+
+    def mp4?
+      @symbol == :mp4
+    end
+
+    def mpeg?
+      @symbol == :mpeg
+    end
+
+    def multipart_form?
+      @symbol == :multipart_form
+    end
+
+    def ogg?
+      @symbol == :ogg
+    end
+
+    def otf?
+      @symbol == :otf
+    end
+
+    def pdf?
+      @symbol == :pdf
+    end
+
+    def png?
+      @symbol == :png
+    end
+
+    def rss?
+      @symbol == :rss
+    end
+
+    def svg?
+      @symbol == :svg
+    end
+
+    def text?
+      @symbol == :text
+    end
+
+    def tiff?
+      @symbol == :tiff
+    end
+
+    def ttf?
+      @symbol == :ttf
+    end
+
+    def turbo_stream?
+      @symbol == :turbo_stream
+    end
+
+    def url_encoded_form?
+      @symbol == :url_encoded_form
+    end
+
+    def vcf?
+      @symbol == :vcf
+    end
+
+    def vtt?
+      @symbol == :vtt
+    end
+
+    def webm?
+      @symbol == :webm
+    end
+
+    def webp?
+      @symbol == :webp
+    end
+
+    def woff?
+      @symbol == :woff
+    end
+
+    def woff2?
+      @symbol == :woff2
+    end
+
+    def xml?
+      @symbol == :xml
+    end
+
+    def yaml?
+      @symbol == :yaml
+    end
+
+    def zip?
+      @symbol == :zip
     end
 
     def eql?(other)
@@ -226,6 +386,12 @@ module Mime
         return new(base, nil)
       end
       new(canonical, SYMBOLS[canonical])
+    end
+
+    # The registered symbol of a media type or its alias (`text/x-json` is `:json`).
+    def self.symbol_for(media_type)
+      canonical = CANONICAL[media_type]
+      canonical.nil? ? nil : SYMBOLS[canonical]
     end
 
     def self.lookup_by_extension(extension)

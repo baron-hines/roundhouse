@@ -116,11 +116,11 @@ fn an_options_object_the_app_builds_reads_and_writes_keys() {
     overlay()
         .run_ruby("raise Built.value.inspect unless Built.value == 3\nputs \"built options passed\"\n")
         .assert_passes();
-    // Spinel leaves the YAML file, and with it the class, out of its boot.
+    // Spinel leaves the YAML file out of its boot, but ships its own OrderedOptions (runtime/ordered_options_spinel.rb).
     let (_, errors) = overlay().emit(roundhouse::project::BuildTarget::Spinel);
     assert!(
-        errors.iter().any(|e| e.contains("ActiveSupport::OrderedOptions is not available")),
-        "spinel must refuse the class:\n{}",
+        !errors.iter().any(|e| e.contains("ActiveSupport::OrderedOptions is not available")),
+        "spinel ships the class:\n{}",
         errors.join("\n")
     );
 }
@@ -259,7 +259,7 @@ fn a_file_that_closes_its_method_is_an_error_and_leaves_the_other_files() {
         .write("app/models/extra_reader.rb", "class ExtraReader\n  def self.e\n    Rails.configuration.extra.e\n  end\nend\n")
         .run_ruby("raise ExtraReader.e.inspect unless ExtraReader.e == 2\nputs \"extra passed\"\n");
     assert_errors_name(&run.errors, "config/broken.yml, which does not compile: its ERB closes the method that holds it");
-    assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+    assert!(run.program_succeeded(), "the expected errors aside, the emitted program failed in {}\n=== stdout ===\n{}\n=== stderr ===\n{}", run.emitted.display(), run.stdout, run.stderr);
 }
 
 #[test]
@@ -268,7 +268,7 @@ fn erb_in_the_yaml_does_not_see_the_generated_method() {
         .write("config/who.yml", "shared:\n  who: <%= name %>\n")
         .write("app/models/who.rb", "class Who\n  def self.settings\n    Rails.application.config_for(:who)\n  end\nend\n")
         .run_ruby("begin\n  Who.settings\n  raise \"no NameError\"\nrescue NameError => e\n  raise e.message unless e.name == :name\nend\nputs \"who passed\"\n");
-    assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+    run.assert_passes();
 }
 
 #[test]

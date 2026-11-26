@@ -3,6 +3,8 @@
 //! returns what the original does, in several zones and either side of DST
 //! changes.
 
+#[path = "support/prerequisite.rs"]
+mod prerequisite;
 #[path = "support/scratch.rs"]
 mod scratch;
 use std::fs;
@@ -272,7 +274,7 @@ fn every_rewritten_expression_returns_what_the_original_does() {
     // neither.
     let available = Command::new("ruby").args(["-e", "require 'active_support'; require 'active_support/time'; require 'active_support/testing/time_helpers'"]).output();
     if !available.is_ok_and(|output| output.status.success()) {
-        eprintln!("ruby with active_support/time is not available; skipping the runtime comparison");
+        prerequisite::missing("ruby with active_support/time is not available; the runtime comparison does not run");
         return;
     }
     let units = [
@@ -308,7 +310,7 @@ fn the_comparison_catches_a_lowering_that_counts_days_in_seconds() {
     // wrong lowering: 5 days as 432,000 seconds differs across a DST change.
     let available = Command::new("ruby").args(["-e", "require 'active_support'; require 'active_support/time'; require 'active_support/testing/time_helpers'"]).output();
     if !available.is_ok_and(|output| output.status.success()) {
-        eprintln!("ruby with active_support/time is not available; skipping the runtime comparison");
+        prerequisite::missing("ruby with active_support/time is not available; the runtime comparison does not run");
         return;
     }
     let app = app_directory("seconds", &[]);

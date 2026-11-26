@@ -1,3 +1,5 @@
+#[path = "../support/prerequisite.rs"]
+mod prerequisite;
 use super::emit_and_run;
 
 /// A `validates` call with a rule this build does not lower keeps its
@@ -130,7 +132,7 @@ fn a_call_keeps_its_rules_beside_a_gap_on_ruby() {
 fn rails_answers_the_rule_gaps_script() {
     let probe = r#"gem "activerecord", "8.1.4"; require "active_record"; require "sqlite3""#;
     if !std::process::Command::new("ruby").args(["-e", probe]).status().is_ok_and(|s| s.success()) {
-        eprintln!("skipping: ruby with activerecord 8.1.4 and sqlite3 not available");
+        prerequisite::missing("ruby with activerecord 8.1.4 and sqlite3 not available");
         return;
     }
     let script = format!(

@@ -190,6 +190,9 @@ article.enqueue_keywords
 payload = JSON.parse(JobRegistry.payload_keyword_job(article, "second", 3))
 want = { "label" => "second", "count" => 3, "_aj_ruby2_keywords" => ["label", "count"] }
 raise "keywords #{payload["arguments"][1].inspect}" unless payload["arguments"][1] == want
+# A keyword left at its default is left out, as Rails leaves out one the caller omits.
+first = JSON.parse(JobRegistry.payload_keyword_job(article, "first", 1))
+raise "default written #{first["arguments"][1].inspect}" unless first["arguments"][1] == { "label" => "first", "_aj_ruby2_keywords" => ["label"] }
 raise "drain ran #{ActiveJob.pending_count}" unless ActiveJob.drain == 2
 # Rails leaves a defaulted keyword out of the Hash; perform binds its default.
 JobRegistry.perform("KeywordJob", [payload["arguments"][0], { "label" => "railsish", "_aj_ruby2_keywords" => ["label"] }])
@@ -203,10 +206,10 @@ puts "keyword payload passed"
 "#;
 
 /// A job's keyword parameters ride the payload as the trailing Hash Rails
-/// flags with `_aj_ruby2_keywords`, and come back by name. A keyword a call
-/// leaves to its default is written with that default, where Rails leaves
-/// the key out; a payload without the key binds the literal default, so
-/// `perform` sees the same value either way.
+/// flags with `_aj_ruby2_keywords`, and come back by name. A keyword whose
+/// value is its default is left out of the Hash, as Rails leaves out a
+/// keyword the caller omits; a payload without the key binds the literal
+/// default, so `perform` sees the same value either way.
 #[test]
 fn keyword_arguments_round_trip_as_rails_flags_them() {
     let run = emit_and_run::real_blog()

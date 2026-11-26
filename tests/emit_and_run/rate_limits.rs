@@ -2,6 +2,8 @@
 //! The adapters expose the same status/body pair; Rails' default exception
 //! is the 429 that ActionDispatch's exception middleware would return.
 
+#[path = "../support/prerequisite.rs"]
+mod prerequisite;
 #[path = "../support/scratch.rs"]
 mod scratch;
 use std::process::Command;
@@ -78,7 +80,7 @@ fn controller_oracle_skips_when_the_controller_gems_are_missing() {
 fn compare(controllers: &[(&str, &str)], program: &str, expected: serde_json::Value) {
     let helper = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/rails_oracle.rb");
     if !controller_oracle_available(oracle_command(), &helper) {
-        eprintln!("skipping: rate-limit request oracle requires the selected Rails actionpack and actionview components");
+        prerequisite::missing("rate-limit request oracle requires the selected Rails actionpack and actionview components");
         return;
     }
     let mut native = format!(r#"

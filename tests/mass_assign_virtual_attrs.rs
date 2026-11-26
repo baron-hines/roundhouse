@@ -7,6 +7,8 @@
 //! virtuals; the constructor now routes the same ones. Answers are
 //! activerecord 8.1.4's (`rails_answers_the_table`).
 
+#[path = "support/prerequisite.rs"]
+mod prerequisite;
 #[path = "support/scratch.rs"]
 mod scratch;
 #[path = "support/emit_and_run.rs"]
@@ -80,7 +82,7 @@ fn strict_targets_emit_the_constructor() {
 fn rails_answers_the_table() {
     let probe = r#"gem "activerecord", "8.1.4"; require "active_record"; require "sqlite3""#;
     if !Command::new("ruby").args(["-e", probe]).status().is_ok_and(|s| s.success()) {
-        eprintln!("skipping: ruby with activerecord 8.1.4 and sqlite3 not available");
+        prerequisite::missing("ruby with activerecord 8.1.4 and sqlite3 not available");
         return;
     }
     let script = format!(
@@ -174,7 +176,7 @@ fn rails_refuses_a_private_writer_key() {
 fn rails_refuses_keys(model: &str, keys: &[&str]) {
     let probe = r#"gem "activerecord", "8.1.4"; require "active_record"; require "sqlite3""#;
     if !Command::new("ruby").args(["-e", probe]).status().is_ok_and(|s| s.success()) {
-        eprintln!("skipping: ruby with activerecord 8.1.4 and sqlite3 not available");
+        prerequisite::missing("ruby with activerecord 8.1.4 and sqlite3 not available");
         return;
     }
     let keys = keys.iter().map(|k| format!(":{k}")).collect::<Vec<_>>().join(", ");
@@ -303,7 +305,7 @@ fn an_operator_method_is_not_a_writer() {
 fn rails_answers_the_operator_script() {
     let probe = r#"gem "activerecord", "8.1.4"; require "active_record"; require "sqlite3""#;
     if !Command::new("ruby").args(["-e", probe]).status().is_ok_and(|s| s.success()) {
-        eprintln!("skipping: ruby with activerecord 8.1.4 and sqlite3 not available");
+        prerequisite::missing("ruby with activerecord 8.1.4 and sqlite3 not available");
         return;
     }
     let script = format!(

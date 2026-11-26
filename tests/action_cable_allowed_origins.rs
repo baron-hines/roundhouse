@@ -7,6 +7,8 @@
 //! development default, initializers).
 
 #[allow(dead_code)]
+#[path = "support/prerequisite.rs"]
+mod prerequisite;
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 #[allow(dead_code)]
@@ -18,7 +20,7 @@ use std::process::Command;
 #[test]
 fn rails_answers_the_contract_table() {
     if !Command::new("ruby").args(["-raction_cable", "-e", "1"]).status().is_ok_and(|s| s.success()) {
-        eprintln!("skipping: ruby with the actioncable gem not available");
+        prerequisite::missing("ruby with the actioncable gem not available");
         return;
     }
     let origins: Vec<String> = cable_allowed_origins::ORIGINS

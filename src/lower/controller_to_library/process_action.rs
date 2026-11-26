@@ -1,7 +1,7 @@
 //! Synthesize the `process_action(action_name)` dispatcher: conditionally
 //! invoke before-action filters and case-dispatch to per-action methods.
 
-use crate::dialect::{AccessorKind, Action, Filter, MethodDef, MethodReceiver, Param};
+use crate::dialect::{AccessorKind, Action, Filter, FilterKind, MethodDef, MethodReceiver, Param};
 use crate::effect::EffectSet;
 use crate::expr::{Arm, ArrayStyle, Expr, ExprNode, Literal, Pattern, RescueClause};
 use crate::ident::{Symbol, VarId};
@@ -18,6 +18,8 @@ use super::util::method_name_for_action;
 /// inlines a block-form filter's body (`before_action { @page = page }`).
 /// `Lead` is not a filter: an always-on head of `process_action`
 /// (ParamsWrapper) that Rails runs outside the callback chain.
+/// A `Call` of an `Around` filter is a `prepend_around_action` at its
+/// place in the chain's head: everything after it runs in its block.
 /// `halt_check` appends `return if performed?` after the statement —
 /// Rails' halting semantics: a filter that renders or redirects skips
 /// the action. It's set only when the filter body can respond, so
@@ -161,6 +163,7 @@ pub(super) fn synthesize_process_action(
     wraps: &WrapFilters,
     reads_action_name: bool,
     missing: &[Symbol],
+    csp_header: bool,
 ) -> MethodDef {
     let mut stmts: Vec<Expr> = Vec::new();
 
@@ -222,8 +225,15 @@ pub(super) fn synthesize_process_action(
         })
     });
 
+    // Each `prepend_around_action`, with the index in `stmts` where its
+    // block begins; folded once the statements after it are built.
+    let mut prepended_arounds: Vec<(usize, &Filter)> = Vec::new();
     for p in preamble {
         let (stmt, halt_check) = match p {
+            PreambleStmt::Call { filter, .. } if matches!(filter.kind, FilterKind::Around) => {
+                prepended_arounds.push((stmts.len(), filter));
+                continue;
+            }
             PreambleStmt::Call { filter, halt_check } => {
                 (filter_dispatch_stmt(filter, param), *halt_check)
             }
@@ -272,19 +282,7 @@ pub(super) fn synthesize_process_action(
         // story page renders, then bumps the ribbon after it.
         let mut dispatch = case_dispatch(publics, inherited, deferred_tails, param);
         for f in wraps.around.iter().rev() {
-            let wrapped = syn(ExprNode::Send {
-                recv: None,
-                method: f.target.clone(),
-                args: vec![],
-                block: Some(syn(ExprNode::Lambda { extra_params: Vec::new(),
-                    params: vec![],
-                    rest_param: None,
-                    block_param: None,
-                    body: dispatch.clone(),
-                    block_style: crate::expr::BlockStyle::Do,
-                })),
-                parenthesized: false,
-            });
+            let wrapped = around_call(f, dispatch.clone());
             dispatch = match filter_cond(f, param) {
                 Some(cond) => syn(ExprNode::If { cond, then_branch: wrapped, else_branch: dispatch }),
                 None => wrapped,
@@ -325,14 +323,28 @@ pub(super) fn synthesize_process_action(
                 PreambleStmt::Lead { body } => body.clone(),
             });
         }
-        // Rails writes the CSP header in middleware, after the
-        // controller — including an around_action that served a cached
-        // page and did not yield. Only a chain that narrowed (or
-        // consulted) `content_security_policy` pays for the call;
-        // `write_header` no-ops when the request has no policy.
-        if chain_mentions_csp(preamble, wraps) {
-            stmts.push(csp_header_stmt());
-        }
+    }
+    // A `prepend_around_action` runs everything registered after it,
+    // the action and its after filters too, by yielding: those
+    // statements become its block, innermost first. A halted chain
+    // inside it ends the block, not the dispatcher, so the around's
+    // code after `yield` still runs, as Rails' halted chain returns to
+    // it.
+    for (at, f) in prepended_arounds.into_iter().rev() {
+        let inner = halts_as_branches(stmts.split_off(at));
+        let wrapped = around_call(f, inner.clone());
+        stmts.push(match filter_cond(f, param) {
+            Some(cond) => syn(ExprNode::If { cond, then_branch: wrapped, else_branch: inner }),
+            None => wrapped,
+        });
+    }
+    // Rails writes the CSP header in middleware, after the controller —
+    // including an around_action that served a cached page and did not
+    // yield. Only a chain that narrowed (or consulted)
+    // `content_security_policy` pays for the call; `write_header`
+    // no-ops when the request has no policy.
+    if (!publics.is_empty() || !inherited.is_empty()) && (csp_header || chain_mentions_csp(preamble, wraps)) {
+        stmts.push(csp_header_stmt());
     }
 
     let mut body = match stmts.len() {
@@ -515,6 +527,60 @@ fn cause_fallback_clause(rescues: &[RescueHandler], exc: &Symbol) -> Option<Resc
             exprs: vec![assign_rescued(cause_of(var_ref(unhandled))), walk, dispatch],
         }),
     })
+}
+
+/// `target do … end`: an around filter's call, `body` the block it
+/// yields to.
+fn around_call(f: &Filter, body: Expr) -> Expr {
+    syn(ExprNode::Send {
+        recv: None,
+        method: f.target.clone(),
+        args: vec![],
+        block: Some(syn(ExprNode::Lambda {
+            extra_params: Vec::new(),
+            params: vec![],
+            rest_param: None,
+            block_param: None,
+            body,
+            block_style: crate::expr::BlockStyle::Do,
+        })),
+        parenthesized: false,
+    })
+}
+
+/// `stmts` as one body with each [`halt_if_performed`] turned into
+/// `if performed? then (nothing) else <the statements after it>`: a
+/// halted chain skips the rest of a block without a `return`, which
+/// would leave the dispatcher from inside it.
+fn halts_as_branches(stmts: Vec<Expr>) -> Expr {
+    let mut out: Vec<Expr> = Vec::new();
+    let mut rest = stmts.into_iter();
+    while let Some(stmt) = rest.next() {
+        if is_halt_if_performed(&stmt) {
+            let ExprNode::If { cond, .. } = *stmt.node else { unreachable!() };
+            out.push(syn(ExprNode::If {
+                cond,
+                then_branch: empty_seq(),
+                else_branch: halts_as_branches(rest.collect()),
+            }));
+            break;
+        }
+        out.push(stmt);
+    }
+    match out.len() {
+        1 => out.pop().unwrap(),
+        _ => syn(ExprNode::Seq { exprs: out }),
+    }
+}
+
+fn is_halt_if_performed(stmt: &Expr) -> bool {
+    matches!(
+        &*stmt.node,
+        ExprNode::If { cond, then_branch, .. }
+            if matches!(&*then_branch.node, ExprNode::Return { .. })
+                && matches!(&*cond.node, ExprNode::Send { recv: None, method, args, .. }
+                    if method.as_str() == "performed?" && args.is_empty())
+    )
 }
 
 /// `return if performed?` — the halting check after a filter that can

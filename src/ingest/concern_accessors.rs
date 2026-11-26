@@ -117,11 +117,24 @@ fn uncertain_visibility(expr: &Expr, name: &Symbol, writer: &Symbol, nested: boo
 /// class-method carriers have no hook left here. Only literal included
 /// callbacks/defaults after block registration are inert; overriding the
 /// rest of the framework protocol can prevent that registration/execution.
-fn unconsumed_included_hook(model: &crate::dialect::Model, app: &App) -> Option<crate::ClassId> {
-    unconsumed_class_side_hook(&crate::analyze::model_includes(model), app)
+fn unconsumed_included_hook(model: &crate::dialect::Model, app: &App, by_name: &LibraryClassesByName) -> Option<crate::ClassId> {
+    unconsumed_class_side_hook(&crate::analyze::model_includes(model), app, by_name)
 }
 
-pub(crate) fn unconsumed_class_side_hook(includes: &[ClassId], app: &App) -> Option<ClassId> {
+/// The library classes of an app by name, each name's declarations in
+/// `library_classes` order: the lookup the hook walks make per include,
+/// which a scan of every library class made quadratic.
+pub(crate) type LibraryClassesByName<'a> = HashMap<&'a ClassId, Vec<&'a crate::dialect::LibraryClass>>;
+
+pub(crate) fn library_classes_by_name(app: &App) -> LibraryClassesByName<'_> {
+    let mut by_name = LibraryClassesByName::default();
+    for class in &app.library_classes {
+        by_name.entry(&class.name).or_default().push(class);
+    }
+    by_name
+}
+
+pub(crate) fn unconsumed_class_side_hook(includes: &[ClassId], app: &App, by_name: &LibraryClassesByName) -> Option<ClassId> {
     fn inert(expr: &Expr) -> bool {
         match &*expr.node {
             ExprNode::Lit { .. } => true,
@@ -137,7 +150,7 @@ pub(crate) fn unconsumed_class_side_hook(includes: &[ClassId], app: &App) -> Opt
         if !seen.insert(id.clone()) {
             continue;
         }
-        for class in app.library_classes.iter().filter(|class| class.name == id) {
+        for class in by_name.get(&id).into_iter().flatten().copied() {
             for method in &class.methods {
                 let intercepts_registration = app.concern_model_items.get(&id)
                     .into_iter().flatten().any(|item| {
@@ -183,6 +196,9 @@ fn validate_activation(
     if spans.is_empty() {
         return Ok(());
     }
+    // Taken before the model borrow below: a refusal names the file it
+    // was written in.
+    let sources: &[crate::span::SourceFile] = &app.sources;
     let resolver = app.const_resolver.for_sources(&app.sources);
     let mut includes = BTreeMap::<crate::ClassId, Vec<crate::ClassId>>::new();
     let mut modules = HashSet::default();
@@ -244,6 +260,10 @@ fn validate_activation(
             }
         }
     }
+    // Not only the source's own: a model macro's body that includes (devise's `devise`) wrote these in the call's place.
+    for (owner, module) in &app.macro_includes {
+        includes.entry(owner.clone()).or_default().push(module.clone());
+    }
     // Spelling alone does not prove deferral: use the same source identity,
     // binding barriers and extension ordering as finite configuration.
     let deferred = super::class_configuration::verified_framework_concerns(
@@ -290,7 +310,7 @@ fn validate_activation(
                     let supplied = supplied || (model.is_none() && direct.contains(&id) && library_classes.contains(owner) && is_supported(item));
                     if !supplied && reported.insert(expr.span) {
                         unwrap_or_record::<()>(Err(IngestError::Unsupported {
-                            file: app.sources[(expr.span.file.0 - 1) as usize].path.clone(),
+                            file: span_file(sources, expr.span),
                             message: format!("concern attr_accessor on {}: only a direct include by a model or class is supported", owner.0),
                         }))?;
                     }
@@ -390,9 +410,8 @@ pub(super) fn validate(
     for (model_index, refused) in refused {
         let mut rejected = HashSet::default();
         for (span, message) in refused {
-            let file = &app.sources[span.file.0 as usize - 1].path;
             unwrap_or_record::<()>(Err(IngestError::Unsupported {
-                file: file.clone(),
+                file: span_file(&app.sources, span),
                 message,
             }))?;
             rejected.insert(span);
@@ -404,6 +423,17 @@ pub(super) fn validate(
         app.models[index].body.retain(|item| !matches!(item, ModelBodyItem::Unknown { expr, .. } if rejected.contains(&expr.span)));
     }
     Ok(())
+}
+
+/// The file a span was written in, or a marker for a declaration a
+/// desugar synthesized — `concerning :X do … end`'s block has no file of
+/// its own.
+fn span_file(sources: &[crate::span::SourceFile], span: Span) -> String {
+    span.file
+        .0
+        .checked_sub(1)
+        .and_then(|index| sources.get(index as usize))
+        .map_or_else(|| "<generated>".to_string(), |source| source.path.clone())
 }
 
 fn occupied(
@@ -425,6 +455,14 @@ enum Deferral {
 
 thread_local! {
     static DEFERRAL: std::cell::RefCell<Deferral> = const { std::cell::RefCell::new(Deferral::Off) };
+}
+
+/// Run `f` with no deferral armed, putting back the caller's after: a pass whose app is thrown away defers nothing.
+pub(super) fn not_deferring<T>(f: impl FnOnce() -> T) -> T {
+    let previous = DEFERRAL.with(|state| std::mem::replace(&mut *state.borrow_mut(), Deferral::Off));
+    let result = f();
+    DEFERRAL.with(|state| *state.borrow_mut() = previous);
+    result
 }
 
 /// Run a survey-mode `ingest` without the surface probe's whole-app clone
@@ -499,12 +537,13 @@ fn refusals(
     occupied: &mut dyn FnMut(&ClassId, &Symbol, &Symbol) -> bool,
 ) -> Vec<(usize, Vec<(Span, String)>)> {
     let mut out = Vec::new();
+    let by_name = library_classes_by_name(app);
     for (model_index, model) in app.models.iter().enumerate() {
         let carried = |item: &ModelBodyItem| matches!(item, ModelBodyItem::Unknown { expr, .. } if spans.contains(&expr.span));
         if !model.body.iter().any(carried) {
             continue;
         };
-        let hook = unconsumed_included_hook(model, app);
+        let hook = unconsumed_included_hook(model, app, &by_name);
         let mut nonpublic_methods = HashSet::default();
         for item in &model.body {
             match item {

@@ -101,12 +101,6 @@ fn a_load_time_reference_into_a_program_autoloaded_namespace_loads_the_program_f
         app = app.write(&format!("vendor/gems/trackopts-1.0.0/lib/{path}"), text);
     }
     let run = app.run_ruby(SCRIPT);
-    assert!(
-        run.success,
-        "emitted tree failed in {}\n=== stdout ===\n{}\n=== stderr ===\n{}",
-        run.emitted.display(),
-        run.stdout,
-        run.stderr
-    );
+    run.assert_passes();
     assert_eq!(lines(run.stdout.as_bytes()), EXPECTED, "emitted boot diverges from CRuby\n{}", run.stderr);
 }
