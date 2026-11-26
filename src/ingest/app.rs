@@ -6167,21 +6167,9 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
     let settler = super::settled_conditionals::Settler::of(app, resolver);
     for lc in openings_gem_first(&app.library_classes, &app.sources) {
         let conditional = |m: &crate::dialect::MethodDef| settler.defines(lc, m).is_none();
-        let hooks: Vec<crate::span::Span> = lc
-            .unknown_calls
-            .iter()
-            .filter(|call| {
-                // `self.included do` is the same hook (#2278).
-                matches!(&*call.node, crate::expr::ExprNode::Send { recv, method, block: Some(_), .. }
-                    if method.as_str() == "included" && recv.as_ref().is_none_or(|r| matches!(&*r.node, crate::expr::ExprNode::SelfRef)))
-            })
-            .map(|call| call.span)
-            .collect();
-        // `def self.x` in the hook is the includer's class-side method: not an instance one.
-        let in_hook = |m: &crate::dialect::MethodDef| {
-            let at = m.name_span;
-            hooks.iter().any(|h| !at.is_synthetic() && h.file == at.file && h.start <= at.start && at.end <= h.end)
-        };
+        // `self.included do` is the same hook (#2278). `def self.x` in the
+        // hook is the includer's class-side method: not an instance one.
+        let in_hook = |m: &crate::dialect::MethodDef| super::library_concern_items::in_included_hook(lc, m);
         let instance: Vec<&crate::dialect::MethodDef> = lc
             .methods
             .iter()
@@ -6504,6 +6492,9 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
                 Pick::Hooked if hooked.contains(module) => by_hook.collect(),
                 Pick::Hooked => Vec::new(),
                 Pick::Carried => by_hook.collect(),
+                // A hook that ran on a lib/ superclass made its defs there,
+                // ahead of the module's own (#2278).
+                Pick::Own if from_library.contains(module) && !hooked.contains(module) && !is_carried(module) => by_hook.chain(own).collect(),
                 // A hook that ran nowhere the chain shows: its defs are read
                 // as the module's, below its own of the same name.
                 Pick::Own if !hooked.contains(module) && !is_carried(module) => {

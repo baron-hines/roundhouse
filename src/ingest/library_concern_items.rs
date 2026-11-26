@@ -8,7 +8,7 @@
 //! module and their own `included` block to it.
 
 use crate::app::App;
-use crate::dialect::{MethodReceiver, ModelBodyItem};
+use crate::dialect::{LibraryClass, MethodDef, MethodReceiver, ModelBodyItem};
 use crate::expr::{Expr, ExprNode, Literal};
 use crate::ident::{ClassId, Symbol};
 use crate::span::Span;
@@ -66,7 +66,33 @@ pub(super) fn splice(app: &mut App) {
                 }
             }
         }
+        // A def the block makes is the includer's own, ahead of the module.
+        // The concern hoist carries it on the module, which the same lookup
+        // finds, unless the module's own def of the name (a later opening's)
+        // shadows it there: then this class takes the block's def as its own
+        // (#2278). One the class writes itself stays; Ruby keeps it when it is
+        // written below the `include`.
+        let mut hook_defs: Vec<MethodDef> = Vec::new();
+        for module in &includes {
+            let openings = || app.library_classes.iter().filter(|o| o.is_module && o.name == *module);
+            let own: Vec<&Symbol> = openings()
+                .flat_map(|o| o.methods.iter().filter(move |m| m.receiver == MethodReceiver::Instance && !in_included_hook(o, m)))
+                .map(|m| &m.name)
+                .collect();
+            // The last opening's def of a name is the one Ruby keeps.
+            let hooked: Vec<&MethodDef> = openings()
+                .flat_map(|o| o.methods.iter().filter(move |m| m.receiver == MethodReceiver::Instance && in_included_hook(o, m)))
+                .collect();
+            for (at, def) in hooked.iter().enumerate() {
+                let replaced = hooked[at + 1..].iter().any(|later| later.name == def.name);
+                let written = app.library_classes[i].methods.iter().any(|m| m.receiver == MethodReceiver::Instance && m.name == def.name);
+                if !replaced && !written && own.contains(&&def.name) && !hook_defs.iter().any(|d| d.name == def.name) {
+                    hook_defs.push((*def).clone());
+                }
+            }
+        }
         let lc = &mut app.library_classes[i];
+        lc.methods.extend(hook_defs);
         for (id, span) in added {
             lc.includes.push(id);
             lc.include_spans.push(span);
@@ -107,4 +133,17 @@ pub(super) fn splice(app: &mut App) {
             }
         }
     }
+}
+
+/// Whether `m` is written in one of `lc`'s `included do` blocks (or `self.included do`): a def the hook makes on the includer.
+pub(super) fn in_included_hook(lc: &LibraryClass, m: &MethodDef) -> bool {
+    let at = m.name_span;
+    !at.is_synthetic()
+        && lc.unknown_calls.iter().any(|call| {
+            matches!(&*call.node, ExprNode::Send { recv, method, block: Some(_), .. }
+                if method.as_str() == "included" && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)))
+                && call.span.file == at.file
+                && call.span.start <= at.start
+                && at.end <= call.span.end
+        })
 }

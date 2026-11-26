@@ -471,3 +471,60 @@ fn a_deferred_hook_runs_on_the_plain_wrapper() {
     assert_eq!(spliced_label(&files, lines, BuildTarget::Spinel), "\"hook\"");
     single_case(&files, lines, "label", "hook");
 }
+
+/// HookReopen's hook defines `label` on the includer, and a later opening's
+/// ordinary `label` is the module's own, below it.
+const HOOK_REOPEN: (&str, &str) = (
+    "hook_reopen",
+    "module HookReopen\n  extend ActiveSupport::Concern\n\n  included do\n    def label\n      \"hook\"\n    end\n  end\nend\n\nmodule HookReopen\n  def label\n    \"ordinary\"\n  end\nend\n",
+);
+
+/// `single_app`'s controller, under `HookLibParent`: a class in lib/ that
+/// includes HookReopen.
+fn lib_parent_app(child_lines: &str) -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::API\nend\n")
+        .write(&format!("app/controllers/concerns/{}.rb", HOOK_REOPEN.0), HOOK_REOPEN.1)
+        .write("lib/hook_lib_parent.rb", "class HookLibParent < ApplicationController\n  include HookReopen\nend\n")
+        .write(
+            "app/controllers/single_controller.rb",
+            &format!("class SingleController < HookLibParent\n{child_lines}\n  def show\n    render json: {{ label: label }}\n  end\nend\n"),
+        )
+        .write("config/routes.rb", "Rails.application.routes.draw do\n  get \"/single\" => \"single#show\"\nend\n")
+}
+
+/// The hook ran on the lib/ superclass, so `label` is HookLibParent's own:
+/// `[SingleController, HookLibParent, HookReopen]`. The child's repeated
+/// include runs no hook and adds nothing (#2278).
+#[test]
+fn a_hook_def_that_ran_on_a_lib_superclass_stands_over_the_modules_own() {
+    for child_lines in ["  include HookReopen\n", ""] {
+        let (emitted, errors) = lib_parent_app(child_lines).emit(BuildTarget::Spinel);
+        assert!(errors.is_empty(), "{errors:#?}");
+        // The lib/ class holds the hook's `label` once, as its own.
+        let parent = std::fs::read_to_string(emitted.join("app/models/hook_lib_parent.rb")).unwrap();
+        let lines: Vec<&str> = parent.lines().filter(|l| !l.starts_with("#<SPINEL_SOURCE>")).map(str::trim).collect();
+        let defs: Vec<usize> = (0..lines.len()).filter(|&i| lines[i] == "def label").collect();
+        assert!(matches!(defs.as_slice(), [at] if lines[at + 1] == "\"hook\""), "{parent}");
+        let controller = std::fs::read_to_string(emitted.join("app/controllers/single_controller.rb")).unwrap();
+        if let Some(at) = controller.find("  def label\n") {
+            assert_eq!(controller[at..].lines().nth(1).map(str::trim), Some("\"hook\""), "{child_lines:?}:\n{controller}");
+        }
+        let run = lib_parent_app(child_lines).run_ruby(
+            r##"status, _headers, body = begin
+  Main.run_rack("REQUEST_METHOD" => "GET", "PATH_INFO" => "/single", "QUERY_STRING" => "", "rack.input" => StringIO.new(""))
+rescue StandardError => e
+  [e.class.name, {}, [e.message[0, 100]]]
+end
+text = +""
+body.each { |part| text << part }
+got = [status, text]
+want = [200, %({"label":"hook"})]
+raise "got #{got.inspect}, want #{want.inspect}" unless got == want
+puts "lib parent case passed"
+"##,
+        );
+        run.assert_passes();
+        assert!(run.stdout.contains("lib parent case passed"), "{child_lines:?}: {}", run.stdout);
+    }
+}
