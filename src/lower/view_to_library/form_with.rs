@@ -1190,7 +1190,7 @@ fn classify_form_with_components(
         send(Some(model.clone()), "id", Vec::new(), None, false)
     };
     let member_path =
-        super::member_path_call(ctx, &format!("{singular}_path"), member_arg);
+        super::member_path_call(ctx, &format!("{singular}_path"), member_arg.clone());
     let collection_helper = format!("{}_path", crate::lower::routes::collection_name(&singular, plural));
     let collection_path = send(
         Some(route_helpers()),
@@ -1221,6 +1221,7 @@ fn classify_form_with_components(
             },
         ),
     };
+    let action = sti_action(ctx, &model, &singular, &persisted, &member_arg, action);
     // An explicit `method:` wins (Rails honors it verbatim); otherwise
     // the resource convention — PATCH for a persisted record, POST for a
     // new one. Feeds both the `<form>`'s `_method` override and
@@ -1244,6 +1245,41 @@ fn classify_form_with_components(
         opts_entries,
         id_prefix: namespace.unwrap_or_default(),
     })
+}
+
+/// Rails routes `form_with model: record` through the record's CLASS
+/// (`polymorphic_path`): a new `Rooms::Open` posts to `rooms_opens_path`,
+/// a persisted one to `rooms_open_path(id)`. A record typed as the
+/// subclass takes its routes directly; one typed as an STI base asks
+/// `dom_prefix` at run time, one arm per subclass the routes declare,
+/// the base action last (as `tag_builder` does for `link_to [:edit, @room]`).
+fn sti_action(ctx: &ViewCtx, record: &Expr, singular: &str, persisted: &Expr, member_arg: &Expr, base: Expr) -> Expr {
+    let has = |n: &str| ctx.route_helper_names.contains(n);
+    let arm = |stem: &str| {
+        let member_name = format!("{stem}_path");
+        let collection_name = format!("{}_path", crate::naming::pluralize_snake(stem));
+        let member = has(&member_name).then(|| super::member_path_call(ctx, &member_name, member_arg.clone()));
+        let collection = has(&collection_name).then(|| super::route_helpers_call(&collection_name, Vec::new()));
+        match (member, collection) {
+            (Some(m), Some(c)) => Some(Expr::new(Span::synthetic(), ExprNode::If { cond: persisted.clone(), then_branch: m, else_branch: c })),
+            (m, c) => m.or(c),
+        }
+    };
+    if let Some(crate::ty::Ty::Class { id, .. }) = record.ty.as_ref().map(crate::ty::Ty::peel_nilable) {
+        let stem = crate::lower::tag_builder::class_route_stem(id.0.as_str());
+        if stem != singular && ctx.sti_route_stems.values().any(|stems| stems.contains(&stem)) {
+            return arm(&stem).unwrap_or(base);
+        }
+    }
+    let Some(stems) = ctx.sti_route_stems.get(singular) else { return base };
+    let mut dispatch = base;
+    for stem in stems.iter().rev() {
+        let Some(arm) = arm(stem) else { continue };
+        let prefix = send(Some(record.clone()), "dom_prefix", Vec::new(), None, true);
+        let cond = send(Some(prefix), "==", vec![lit_str(stem.clone())], None, false);
+        dispatch = Expr::new(Span::synthetic(), ExprNode::If { cond, then_branch: arm, else_branch: dispatch });
+    }
+    dispatch
 }
 
 /// The typed record class used for metadata, independent of its field prefix.
@@ -1804,6 +1840,7 @@ mod tests {
                 model_singulars.iter().map(|s| s.to_string()).collect::<HashSet<_>>(),
             ),
             slug_models: Default::default(),
+            sti_route_stems: Default::default(),
             bool_readers: Default::default(),
             time_columns: Default::default(),
             store_readers: Default::default(),

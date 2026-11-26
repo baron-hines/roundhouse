@@ -478,6 +478,10 @@ mod json_params_contract;
 mod json_params;
 #[path = "emit_and_run/raw_post_body.rs"]
 mod raw_post_body;
+#[path = "emit_and_run/scoped_new_form.rs"]
+mod scoped_new_form;
+#[path = "emit_and_run/sti_form_route.rs"]
+mod sti_form_route;
 #[path = "support/class_side_default.rs"]
 mod class_side_default_contract;
 #[path = "emit_and_run/class_side_default.rs"]

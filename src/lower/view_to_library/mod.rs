@@ -254,6 +254,7 @@ pub struct ViewLowerCtx<'a> {
     html_safe_methods: std::rc::Rc<HtmlSafeMarks>,
     model_singulars: std::rc::Rc<crate::det::HashSet<String>>,
     slug_models: std::rc::Rc<crate::det::HashSet<String>>,
+    sti_route_stems: std::rc::Rc<crate::det::HashMap<String, Vec<String>>>,
     bool_readers: std::rc::Rc<crate::det::HashMap<String, crate::det::HashSet<String>>>,
     time_columns: std::rc::Rc<crate::det::HashMap<String, crate::det::HashSet<String>>>,
     store_readers:
@@ -346,6 +347,7 @@ impl<'a> ViewLowerCtx<'a> {
                     .map(|m| app.model_param_key(m.name.0.as_str()))
                     .collect(),
             ),
+            sti_route_stems: std::rc::Rc::new(crate::lower::tag_builder::sti_route_stems(app)),
             slug_models: std::rc::Rc::new(
                 app.models
                     .iter()
@@ -899,6 +901,7 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
         html_safe_methods: lx.html_safe_methods.clone(),
         model_singulars: lx.model_singulars.clone(),
         slug_models: lx.slug_models.clone(),
+        sti_route_stems: lx.sti_route_stems.clone(),
         bool_readers: lx.bool_readers.clone(),
         time_columns: lx.time_columns.clone(),
         store_readers: lx.store_readers.clone(),
@@ -2580,8 +2583,8 @@ fn partial_form_bindings_and_conflicts(
                     if let (Some(p), Some(form_local), Some(record_local)) =
                         (partial, form_local, record_local)
                     {
-                        // `ingest::form_partial_record`'s local is no model's name: the form's record names it.
-                        let model_name = if record_local.starts_with("__") { form.model_name.clone() } else { Some(record_local.clone()) };
+                        // Not the record local's name when the form knows its model: `bot: @bot` holding a User is `user[name]` in Rails.
+                        let model_name = if record_local.starts_with("__") { form.model_name.clone() } else { form.model_name.clone().or_else(|| Some(record_local.clone())) };
                         if let Some(key) = partial_name_to_key_from(&p, own_dir, stems)
                             && let Some(model_name) = model_name
                         {
@@ -5486,6 +5489,8 @@ pub(super) struct ViewCtx {
     /// param is String-typed. Non-slug models pass `record.id`
     /// (Integer param) so strict targets keep a typed scalar.
     pub(super) slug_models: std::rc::Rc<crate::det::HashSet<String>>,
+    /// STI base → subclass route stems (`tag_builder::sti_route_stems`).
+    pub(super) sti_route_stems: std::rc::Rc<crate::det::HashMap<String, Vec<String>>>,
     /// Per-model bool-reader names (`bool_reader_names`): Boolean
     /// columns + bool typed_store attrs. `f.check_box` grounds its
     /// checked state through these (typed ternary instead of the
