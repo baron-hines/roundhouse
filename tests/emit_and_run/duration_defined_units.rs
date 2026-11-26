@@ -1,7 +1,8 @@
 //! A duration unit a class also defines as its own reader (et-orbi's `EoTime#seconds`, which fugit's
 //! `TimeCursor` reads as `@t.seconds = @t.seconds.to_i`): on a receiver not known to be a number, Ruby answers the
 //! class's reader for an instance of it and ActiveSupport's Duration for a number. The unit used to become
-//! `ActiveSupport::Duration.seconds(@t)` whatever `@t` held.
+//! `ActiveSupport::Duration.seconds(@t)` whatever `@t` held. A receiver that runs something (`current.seconds`) is
+//! bound once and read by both arms.
 
 use super::emit_and_run;
 
@@ -24,6 +25,14 @@ const TIMER: &str = r#"class Timer
   def total
     @t.seconds.to_i
   end
+
+  def through_a_call
+    current.seconds.to_i
+  end
+
+  def current
+    @t
+  end
 end
 "#;
 
@@ -34,11 +43,11 @@ fn app() -> emit_and_run::Overlay {
         .write("lib/timer.rb", TIMER)
         .write(
             "app/controllers/timers_controller.rb",
-            "class TimersController < ApplicationController\n  def index\n    render plain: \"#{Timer.new(Lap.new(5)).total} #{Timer.new(3).total}\"\n  end\nend\n",
+            "class TimersController < ApplicationController\n  def index\n    render plain: \"#{Timer.new(Lap.new(5)).total} #{Timer.new(3).total} #{Timer.new(Lap.new(7)).through_a_call} #{Timer.new(4).through_a_call}\"\n  end\nend\n",
         )
 }
 
-const EXPECTED: &str = "5 3";
+const EXPECTED: &str = "5 3 7 4";
 
 #[test]
 fn a_unit_a_class_defines_answers_by_the_receiver_s_class() {

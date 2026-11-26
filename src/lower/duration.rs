@@ -75,7 +75,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::app::App;
 use crate::build_target::BuildTarget;
 use crate::expr::{Expr, ExprNode, LValue, Literal};
-use crate::ident::{ClassId, Symbol};
+use crate::ident::{ClassId, Symbol, VarId};
 use crate::ty::Ty;
 
 /// Ground duration-unit sends across every app body the post-analyze
@@ -649,8 +649,20 @@ pub(crate) fn rewrite_durations(expr: &mut Expr, defined: &BTreeSet<String>) {
     // Not a Duration outright where a class's own reader shares the unit's name: Ruby picks by the receiver's class.
     let guarded = rewrite
         && matches!(&*expr.node, ExprNode::Send { recv: Some(r), method, .. }
-            if !is_numeric_expr(r) && defined.contains(method.as_str())
-                && matches!(&*r.node, ExprNode::Var { .. } | ExprNode::Ivar { .. } | ExprNode::Const { .. }));
+            if !is_numeric_expr(r) && defined.contains(method.as_str()));
+    // Not read twice: a receiver that runs something (`fetch.seconds`) is bound once and both arms read the binding.
+    let bound = guarded.then(|| match &*expr.node {
+        ExprNode::Send { recv: Some(r), .. } if !matches!(&*r.node, ExprNode::Var { .. } | ExprNode::Ivar { .. } | ExprNode::Const { .. }) => {
+            let name = Symbol::from(format!("_duration_receiver_{}", expr.span.start));
+            let value = r.clone();
+            let mut read = Expr::new(r.span, ExprNode::Var { id: VarId(0), name: name.clone() });
+            read.ty = r.ty.clone();
+            let ExprNode::Send { recv, .. } = &mut *expr.node else { unreachable!() };
+            *recv = Some(read);
+            Some((name, value))
+        }
+        _ => None,
+    }).flatten();
     let reader = guarded.then(|| expr.clone());
     if rewrite {
         let span = expr.span;
@@ -688,5 +700,10 @@ pub(crate) fn rewrite_durations(expr: &mut Expr, defined: &BTreeSet<String>) {
         let duration = std::mem::replace(expr, Expr::new(span, ExprNode::Lit { value: Literal::Nil }));
         *expr = Expr::new(span, ExprNode::If { cond, then_branch: duration, else_branch: reader });
         expr.ty = Some(Ty::Untyped);
+        if let Some((name, value)) = bound {
+            let body = std::mem::replace(expr, Expr::new(span, ExprNode::Lit { value: Literal::Nil }));
+            *expr = Expr::new(span, ExprNode::Let { id: VarId(0), name, value, body });
+            expr.ty = Some(Ty::Untyped);
+        }
     }
 }
