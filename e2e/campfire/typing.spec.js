@@ -42,8 +42,10 @@ function typingSubscribed(page) {
 }
 
 test("a user typing in a room shows their name to the room's other members", async ({ browser }) => {
-  const contextA = await browser.newContext()
-  const contextB = await browser.newContext()
+  // Not the config's shared signed-in state: each context is its own person and signs in (or joins) itself.
+  const signedOut = { storageState: { cookies: [], origins: [] } }
+  const contextA = await browser.newContext(signedOut)
+  const contextB = await browser.newContext(signedOut)
   const pageA = await contextA.newPage()
   const pageB = await contextB.newPage()
 
