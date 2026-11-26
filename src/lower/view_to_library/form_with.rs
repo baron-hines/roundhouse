@@ -1337,7 +1337,8 @@ fn is_known_model_record(model: &Expr, ctx: &ViewCtx) -> bool {
         }
         _ => return false,
     };
-    ctx.ivar_models.contains_key(name)
+    // Not every typed ivar: a form object (`SearchForm`) has no `persisted?`, and keeps POST as in Rails.
+    ctx.ivar_models.get(name).is_some_and(|key| ctx.model_singulars.contains(key))
 }
 
 fn record_model_name(model: &Expr, ctx: &ViewCtx, fallback: &str) -> String {

@@ -19,7 +19,8 @@ import { join } from 'node:path'
 // the runner and in every worker, and specs that open their own browser
 // context read these two straight from the environment.
 process.env.CAMPFIRE_BASE_URL ||= 'http://localhost:3000'
-process.env.CAMPFIRE_AUTH_STATE ||= join(process.cwd(), '.auth', 'state.json')
+// Beside this file, not under the cwd: `.auth/` is ignored only here, and the state holds an administrator's cookies.
+process.env.CAMPFIRE_AUTH_STATE ||= join(__dirname, '.auth', 'state.json')
 
 export default defineConfig({
   testDir: '.',

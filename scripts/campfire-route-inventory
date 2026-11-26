@@ -22,6 +22,11 @@ SOURCE_SHA="${CAMPFIRE_SHA:-}"
 if [[ -z "$SOURCE_SHA" && -e "$APP/.git" ]]; then
     SOURCE_SHA="$(git -C "$APP" rev-parse HEAD)"
 fi
+# Not only when CAMPFIRE_SHA is unset: a checkout at another commit would export its routes under the pin's name.
+if [[ -n "$SOURCE_SHA" && -e "$APP/.git" ]] && [[ "$(git -C "$APP" rev-parse HEAD)" != "$SOURCE_SHA" ]]; then
+    echo "campfire-route-inventory: $APP is not at CAMPFIRE_SHA $SOURCE_SHA" >&2
+    exit 2
+fi
 if [[ -z "$SOURCE_SHA" ]]; then
     echo "campfire-route-inventory: set CAMPFIRE_SHA for a source archive without .git" >&2
     exit 2

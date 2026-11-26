@@ -58,11 +58,11 @@ module CgiIo
     bad_request = false
     parse_form_into(query, params) unless query.empty?
 
-    raw_body = ""
+    # Read for any method: a DELETE can carry a body its action reads, though only these three parse params from it.
+    length = (env["CONTENT_LENGTH"] || "0").to_i
+    raw_body = length > 0 ? stdin.read(length).to_s : ""
     if method == "POST" || method == "PATCH" || method == "PUT"
-      length = (env["CONTENT_LENGTH"] || "0").to_i
       ctype  = env["CONTENT_TYPE"] || ""
-      raw_body = stdin.read(length).to_s if length > 0
       if length > 0 && ctype.start_with?("application/x-www-form-urlencoded")
         parse_form_into(raw_body, body_params)
       elsif length > 0 && ctype.start_with?("multipart/form-data")

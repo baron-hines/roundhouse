@@ -5,7 +5,8 @@ import { test, expect } from '@playwright/test'
 // remain absent from the normal authenticated user's room.
 test('a signed-out message POST is rejected without persisting a message', async ({ browser, page }) => {
   const body = `anonymous route probe ${Date.now()}`
-  const anonymous = await browser.newContext()
+  // Not the config's shared signed-in state: this probe must be signed out, or a CSRF refusal would pass for it.
+  const anonymous = await browser.newContext({ storageState: { cookies: [], origins: [] } })
   const anonymousPage = await anonymous.newPage()
 
   try {

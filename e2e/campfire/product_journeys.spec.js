@@ -94,10 +94,12 @@ test('a member updates their profile', async ({ page }) => {
   const updatedName = `E2E Profile ${Date.now()}`
   await page.locator('#user_name').fill(updatedName)
   await page.locator('#user_bio').fill('Profile changes are visible after saving.')
-  // This UI also submits its optional password field. Keep the account's
-  // known E2E credential intact so later tests remain independent.
-  await page.locator('#user_password').fill(process.env.CAMPFIRE_PASSWORD || 'secret123456')
+  // The password field stays empty: a value there asks for the current password (`password_challenge`), and the save is refused without it.
+  const saved = page.waitForResponse(response => response.request().method() === 'POST' && response.url().includes('/users/'))
   await page.getByRole('button', { name: 'Save changes' }).click()
+  expect((await saved).status(), 'the profile update is accepted').toBeLessThan(400)
+  // A fresh read, not the form just typed into: a refused save would leave these values in place.
+  await page.goto('/users/me/profile')
   await expect(page.locator('#user_name')).toHaveValue(updatedName)
   await expect(page.locator('#user_bio')).toHaveValue('Profile changes are visible after saving.')
 })

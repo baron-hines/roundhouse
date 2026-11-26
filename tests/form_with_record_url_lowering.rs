@@ -111,4 +111,20 @@ fn model_with_explicit_url_patches_a_persisted_record() {
         ("app/views/comments/_search.html.erb", "<%= form_with url: \"/c\" do |f| %>\n<% end %>\n"),
     ]);
     assert!(!plain.contains("\"patch\""), "a url-only form stays POST:\n{plain}");
+
+    // A form object (no `persisted?`) beside an explicit `url:` keeps POST, as Rails does.
+    let form_object = lower_analyzed(vec![
+        schema,
+        model,
+        ("app/models/search_form.rb", "class SearchForm\n  def query\n    \"\"\n  end\nend\n"),
+        (
+            "app/controllers/searches_controller.rb",
+            "class SearchesController < ApplicationController\n  def new\n    @search = SearchForm.new\n  end\nend\n",
+        ),
+        (
+            "app/views/searches/new.html.erb",
+            "<%= form_with model: @search, scope: :search, url: \"/search\" do |f| %>\n<% end %>\n",
+        ),
+    ]);
+    assert!(!form_object.contains("persisted?"), "a form object has no persisted? to ask:\n{form_object}");
 }

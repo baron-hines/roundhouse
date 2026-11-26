@@ -976,7 +976,8 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
         })).flatten();
         ctx.form_records.push(FormBuilderBinding {
             form_param: binding.form_local.clone(),
-            model_name: binding.model_name.clone(),
+            model_name: binding.model_class.as_ref().and_then(|class| ctx.model_param_keys.get(class)).cloned()
+                .unwrap_or_else(|| binding.model_name.clone()),
             model_class: ctx.record_classes.get(&binding.record_local).cloned()
                 .or_else(|| ctx.i18n.model_class(&binding.model_name).map(str::to_owned)),
             record_var: record_var.clone(),
@@ -2418,6 +2419,10 @@ pub(crate) struct PartialFormBinding {
     pub(crate) form_local: String,
     pub(crate) record_local: String,
     pub(crate) model_name: String,
+    /// The defining form's typed model, whose param_key names the fields
+    /// over the record local's name (`bot: @bot` holding a User is
+    /// `user[name]` in Rails).
+    pub(crate) model_class: Option<String>,
     /// The defining `form_with`'s `namespace:` — a partial's fields
     /// belong to that form, so they carry its id prefix too.
     pub(crate) id_prefix: String,
@@ -2583,8 +2588,8 @@ fn partial_form_bindings_and_conflicts(
                     if let (Some(p), Some(form_local), Some(record_local)) =
                         (partial, form_local, record_local)
                     {
-                        // Not the record local's name when the form knows its model: `bot: @bot` holding a User is `user[name]` in Rails.
-                        let model_name = if record_local.starts_with("__") { form.model_name.clone() } else { form.model_name.clone().or_else(|| Some(record_local.clone())) };
+                        // `ingest::form_partial_record`'s local is no model's name: the form's record names it.
+                        let model_name = if record_local.starts_with("__") { form.model_name.clone() } else { Some(record_local.clone()) };
                         if let Some(key) = partial_name_to_key_from(&p, own_dir, stems)
                             && let Some(model_name) = model_name
                         {
@@ -2594,6 +2599,7 @@ fn partial_form_bindings_and_conflicts(
                                     form_local,
                                     record_local,
                                     model_name,
+                                    model_class: form.model_class.clone(),
                                     id_prefix: id_prefix.to_string(),
                                     builder: form.builder.clone(),
                                     // Not a stock builder's options: only an overriding builder is rebuilt from them, and they would split equal bindings.
@@ -2613,6 +2619,9 @@ fn partial_form_bindings_and_conflicts(
     /// What a form scope hands the partials it renders beside its builder.
     struct FormScope {
         model_name: Option<String>,
+        /// The typed model's class, unless an explicit `scope:` names the fields.
+        model_class: Option<String>,
+        scoped: bool,
         builder: Option<String>,
         options: Vec<(Symbol, Literal)>,
     }
@@ -2634,7 +2643,7 @@ fn partial_form_bindings_and_conflicts(
                     if let Some(form_param) = params.first().filter(|_| extra_params.is_empty()) {
                         let mut record_refs: HashSet<String> = HashSet::default();
                         let mut id_prefix = String::new();
-                        let mut scope = FormScope { model_name: None, builder: None, options: Vec::new() };
+                        let mut scope = FormScope { model_name: None, model_class: None, scoped: false, builder: None, options: Vec::new() };
                         for arg in args {
                             if let ExprNode::Hash { entries, .. } = &*arg.node {
                                 for (k, v) in entries {
@@ -2661,6 +2670,11 @@ fn partial_form_bindings_and_conflicts(
                                             {
                                                 scope.model_name = Some(crate::naming::snake_case(&id.0.as_str().replace("::", "")));
                                             }
+                                            if !scope.scoped
+                                                && let Some(crate::ty::Ty::Class { id, .. }) = named.ty.as_ref().map(|t| t.peel_nilable())
+                                            {
+                                                scope.model_class = Some(id.0.as_str().to_owned());
+                                            }
                                             if let Some(r) = simple_ref(named) {
                                                 record_refs.insert(r);
                                             }
@@ -2668,6 +2682,8 @@ fn partial_form_bindings_and_conflicts(
                                         "scope" => {
                                             if let Some(s) = self::form_with::str_or_sym_literal(v) {
                                                 scope.model_name = Some(s);
+                                                scope.model_class = None;
+                                                scope.scoped = true;
                                             }
                                         }
                                         "builder" => {
@@ -2753,7 +2769,7 @@ fn partial_form_bindings_and_conflicts(
                     &binding.form_local,
                     &refs,
                     &binding.id_prefix,
-                    &FormScope { model_name: Some(binding.model_name.clone()), builder: binding.builder.clone(), options: binding.builder_options.clone() },
+                    &FormScope { model_name: Some(binding.model_name.clone()), model_class: binding.model_class.clone(), scoped: false, builder: binding.builder.clone(), options: binding.builder_options.clone() },
                     &stems,
                     &mut next,
                 );
