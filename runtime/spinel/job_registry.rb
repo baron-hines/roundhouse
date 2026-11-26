@@ -42,6 +42,18 @@ module JobRegistry
     false
   end
 
+  def self.perform_native(worker, args, jid)
+    false
+  end
+
+  def self.native_retry_in(worker, count, exception, msg)
+    0
+  end
+
+  def self.native_retries_exhausted(worker, msg, exception)
+    false
+  end
+
   def self.instantiate(job_class)
     nil
   end

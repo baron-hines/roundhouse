@@ -624,3 +624,323 @@ fn a_hook_def_stays_below_a_later_reader_of_its_block() {
         "null",
     );
 }
+
+/// HookReopen with `hook2` and `ordinary2`: a second concern whose hook
+/// `label` a later opening's ordinary `label` shadows.
+const HOOK_REOPEN2: (&str, &str) = (
+    "hook_reopen2",
+    "module HookReopen2\n  extend ActiveSupport::Concern\n\n  included do\n    def label\n      \"hook2\"\n    end\n  end\nend\n\nmodule HookReopen2\n  def label\n    \"ordinary2\"\n  end\nend\n",
+);
+
+/// The body line of each `def label` the Spinel emit gives the lib/ class
+/// in `file`.
+fn lib_label_bodies(concerns: &[(&str, &str)], libs: &[(&str, &str)], file: &str) -> Vec<String> {
+    let mut app = emit_and_run::empty_app()
+        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::API\nend\n");
+    for (name, source) in concerns {
+        app = app.write(&format!("app/controllers/concerns/{name}.rb"), source);
+    }
+    for (name, source) in libs {
+        app = app.write(&format!("lib/{name}.rb"), source);
+    }
+    let (emitted, errors) = app.emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let class = std::fs::read_to_string(emitted.join(format!("app/models/{file}.rb"))).unwrap();
+    let lines: Vec<&str> = class.lines().filter(|l| !l.starts_with("#<SPINEL_SOURCE>")).map(str::trim).collect();
+    (0..lines.len()).filter(|&i| lines[i] == "def label").map(|i| lines[i + 1].to_string()).collect()
+}
+
+/// Both hooks define `label` on the class, in the order the includes run,
+/// so the last one's stands over both modules' own (#2278). Within one
+/// `include A, B`, B is included first, so A's hook runs last.
+#[test]
+fn a_lib_class_takes_the_last_hooks_def_of_two() {
+    for (includes, want) in [
+        ("  include HookReopen\n  include HookReopen2\n", "\"hook2\""),
+        ("  include HookReopen2\n  include HookReopen\n", "\"hook\""),
+        ("  include HookReopen, HookReopen2\n", "\"hook\""),
+    ] {
+        let libs = [("two_hook_parent", format!("class TwoHookParent < ApplicationController\n{includes}end\n"))];
+        let libs: Vec<(&str, &str)> = libs.iter().map(|(f, s)| (*f, s.as_str())).collect();
+        assert_eq!(lib_label_bodies(&[HOOK_REOPEN, HOOK_REOPEN2], &libs, "two_hook_parent"), [want], "{includes:?}");
+        lib_case(&[HOOK_REOPEN, HOOK_REOPEN2], &libs, "TwoHookParent", want);
+    }
+}
+
+/// The block's `def label` comes after its `attr_reader :label` and replaces
+/// the reader on the includer, whether or not a later opening's ordinary
+/// `label` shadows it on the module (#2278).
+#[test]
+fn a_hook_def_below_its_reader_stands() {
+    let hook = "module HookReaderFirst\n  extend ActiveSupport::Concern\n\n  included do\n    attr_reader :label\n    def label\n      \"hook\"\n    end\n  end\nend\n";
+    let reopened = format!("{hook}\nmodule HookReaderFirst\n  def label\n    \"ordinary\"\n  end\nend\n");
+    for source in [reopened.as_str(), hook] {
+        let concern = ("hook_reader_first", source);
+        let libs = [("reader_first_parent", "class ReaderFirstParent < ApplicationController\n  include HookReaderFirst\nend\n")];
+        assert_eq!(lib_label_bodies(&[concern], &libs, "reader_first_parent"), ["\"hook\""], "{source}");
+        lib_case(&[concern], &libs, "ReaderFirstParent", "\"hook\"");
+    }
+}
+
+
+/// LastHookOnly's hook defines `label` on the class, and no reopening
+/// shadows it on the module.
+const LAST_HOOK_ONLY: (&str, &str) = (
+    "last_hook_only",
+    "module LastHookOnly\n  extend ActiveSupport::Concern\n\n  included do\n    def label\n      \"last\"\n    end\n  end\nend\n",
+);
+
+/// A repeated `include` of a module the class has adds nothing and runs no
+/// hook again, so LastHookOnly's hook ran last (#2278).
+#[test]
+fn a_repeated_include_runs_its_hook_once() {
+    let libs = [("repeat_parent", "class RepeatParent < ApplicationController\n  include HookReopen2\n  include LastHookOnly\n  include HookReopen2\nend\n")];
+    assert!(!lib_label_bodies(&[HOOK_REOPEN2, LAST_HOOK_ONLY], &libs, "repeat_parent").contains(&"\"hook2\"".to_string()));
+    lib_case(&[HOOK_REOPEN2, LAST_HOOK_ONLY], &libs, "RepeatParent", "\"last\"");
+}
+
+/// The block's second `attr_reader :label` comes after its `def label` and
+/// replaces it on the includer, whether or not a reopening shadows the def
+/// on the module (#2278).
+#[test]
+fn a_reader_below_the_hook_def_stands_over_it() {
+    let hook = "module ReaderTwice\n  extend ActiveSupport::Concern\n\n  included do\n    attr_reader :label\n    def label\n      \"hook\"\n    end\n    attr_reader :label\n  end\nend\n";
+    let reopened = format!("{hook}\nmodule ReaderTwice\n  def label\n    \"ordinary\"\n  end\nend\n");
+    for source in [hook, reopened.as_str()] {
+        let concern = ("reader_twice", source);
+        let libs = [("reader_twice_parent", "class ReaderTwiceParent < ApplicationController\n  include ReaderTwice\nend\n")];
+        assert_eq!(lib_label_bodies(&[concern], &libs, "reader_twice_parent"), ["@label"], "{source}");
+        lib_case(&[concern], &libs, "ReaderTwiceParent", "null");
+    }
+}
+
+/// A hook def below its reader that calls `super`, with no reopening: the
+/// module keeps the hoisted copy of the same def, which a copy on the class
+/// would reach through `super` and run twice. It isn't copied, and the
+/// reader stands, as before. Ruby's `"hook:base"` waits on #2278. With a
+/// reopening, `super` reaches the module's ordinary def, as in Ruby.
+#[test]
+fn a_hook_def_calling_super_is_copied_only_over_a_reopening() {
+    let hook = "module HookSuper\n  extend ActiveSupport::Concern\n\n  included do\n    attr_reader :label\n    def label\n      \"hook:#{super}\"\n    end\n  end\nend\n";
+    let libs = [
+        ("super_base", "class SuperBase < ApplicationController\n  def label\n    \"base\"\n  end\nend\n"),
+        ("super_hook_parent", "class SuperHookParent < SuperBase\n  include HookSuper\nend\n"),
+    ];
+    assert_eq!(lib_label_bodies(&[("hook_super", hook)], &libs, "super_hook_parent"), ["@label"]);
+    let reopened = format!("{hook}\nmodule HookSuper\n  def label\n    \"ordinary\"\n  end\nend\n");
+    lib_case(&[("hook_super", reopened.as_str())], &libs, "SuperHookParent", "\"hook:ordinary\"");
+}
+
+const READER_DEF_A: (&str, &str) = (
+    "reader_def_a",
+    "module ReaderDefA\n  extend ActiveSupport::Concern\n\n  included do\n    attr_reader :label\n    def label\n      \"hook\"\n    end\n  end\nend\n",
+);
+const READER_ONLY_B: (&str, &str) = ("reader_only_b", "module ReaderOnlyB\n  extend ActiveSupport::Concern\n\n  included do\n    attr_reader :label\n  end\nend\n");
+
+/// A later hook's reader replaces an earlier hook's def on the includer, as
+/// the def replaced its own block's reader (#2278).
+#[test]
+fn a_later_hooks_reader_stands_over_an_earlier_hooks_def() {
+    for (includes, body, want) in [
+        ("  include ReaderDefA\n  include ReaderOnlyB\n", "@label", "null"),
+        ("  include ReaderOnlyB\n  include ReaderDefA\n", "\"hook\"", "\"hook\""),
+    ] {
+        let libs = [("reader_pair_parent", format!("class ReaderPairParent < ApplicationController\n{includes}end\n"))];
+        let libs: Vec<(&str, &str)> = libs.iter().map(|(f, s)| (*f, s.as_str())).collect();
+        assert_eq!(lib_label_bodies(&[READER_DEF_A, READER_ONLY_B], &libs, "reader_pair_parent"), [body], "{includes:?}");
+        lib_case(&[READER_DEF_A, READER_ONLY_B], &libs, "ReaderPairParent", want);
+    }
+}
+
+/// ShadowX: a hook `label` ("x hook") that a reopening's ordinary `label`
+/// shadows on the module.
+fn shadow(x: &str) -> (String, String) {
+    let name = format!("Shadow{x}");
+    (
+        format!("shadow_{}", x.to_lowercase()),
+        format!("module {name}\n  extend ActiveSupport::Concern\n\n  included do\n    def label\n      \"{l} hook\"\n    end\n  end\nend\n\nmodule {name}\n  def label\n    \"{l} ordinary\"\n  end\nend\n", l = x.to_lowercase()),
+    )
+}
+
+/// The later opening's ShadowC runs its hook last, so its def stands, the
+/// only one on the class: an earlier opening's copy is not the class's own
+/// (#2278).
+#[test]
+fn a_later_openings_hook_replaces_an_earlier_openings_copy() {
+    let shadows: Vec<(String, String)> = ["A", "B", "C"].iter().map(|x| shadow(x)).collect();
+    let concerns: Vec<(&str, &str)> = shadows.iter().map(|(f, s)| (f.as_str(), s.as_str())).collect();
+    let libs = [
+        ("shadow_parent", "class ShadowParent < ApplicationController\n  include ShadowA\n  include ShadowB\nend\n"),
+        ("shadow_parent_again", "class ShadowParent < ApplicationController\n  include ShadowC\nend\n"),
+    ];
+    let mut app = emit_and_run::empty_app()
+        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::API\nend\n");
+    for (name, source) in &concerns {
+        app = app.write(&format!("app/controllers/concerns/{name}.rb"), source);
+    }
+    for (name, source) in &libs {
+        app = app.write(&format!("lib/{name}.rb"), source);
+    }
+    let (emitted, errors) = app.emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let mut bodies = Vec::new();
+    for file in ["shadow_parent", "shadow_parent_again"] {
+        let Ok(class) = std::fs::read_to_string(emitted.join(format!("app/models/{file}.rb"))) else { continue };
+        let lines: Vec<&str> = class.lines().filter(|l| !l.starts_with("#<SPINEL_SOURCE>")).map(str::trim).collect();
+        bodies.extend((0..lines.len()).filter(|&i| lines[i] == "def label").map(|i| lines[i + 1].to_string()));
+    }
+    assert_eq!(bodies, ["\"c hook\""]);
+    lib_case(&concerns, &libs, "ShadowParent", "\"c hook\"");
+}
+
+const PREP_M: (&str, &str) = ("prep_m", "module PrepM\n  extend ActiveSupport::Concern\n\n  def label\n    \"m\"\n  end\nend\n");
+const PREP_N: (&str, &str) = ("prep_n", "module PrepN\n  extend ActiveSupport::Concern\n\n  def label\n    \"n\"\n  end\nend\n");
+const PLAIN_M: (&str, &str) = ("plain_m", "module PlainM\n  def label\n    \"plain m\"\n  end\nend\n");
+
+/// SingleController under PrepParentController (`parent`), with `child_lines`
+/// and `concerns`: Ruby's `label` through the Ruby emit, and the body of the
+/// `label` the Spinel emit splices into SingleController.
+fn parent_case(concerns: &[(&str, &str)], parent: &str, child_lines: &str, want: &str) -> String {
+    let app = || {
+        let mut app = emit_and_run::empty_app()
+            .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::API\nend\n")
+            .write("app/controllers/prep_parent_controller.rb", &format!("class PrepParentController < ApplicationController\n{parent}end\n"));
+        for (file, source) in concerns {
+            app = app.write(&format!("app/controllers/concerns/{file}.rb"), source);
+        }
+        app.write(
+            "app/controllers/single_controller.rb",
+            &format!("class SingleController < PrepParentController\n{child_lines}\n  def show\n    render json: {{ label: label }}\n  end\nend\n"),
+        )
+        .write("config/routes.rb", "Rails.application.routes.draw do\n  get \"/single\" => \"single#show\"\nend\n")
+    };
+    let run = app().run_ruby(&format!(
+        r##"status, _headers, body = begin
+  Main.run_rack("REQUEST_METHOD" => "GET", "PATH_INFO" => "/single", "QUERY_STRING" => "", "rack.input" => StringIO.new(""))
+rescue StandardError => e
+  [e.class.name, {{}}, [e.message[0, 100]]]
+end
+text = +""
+body.each {{ |part| text << part }}
+got = [status, text]
+want = [200, %({{"label":{want:?}}})]
+raise "got #{{got.inspect}}, want #{{want.inspect}}" unless got == want
+puts "parent case passed"
+"##
+    ));
+    run.assert_passes();
+    assert!(run.stdout.contains("parent case passed"), "{}", run.stdout);
+    let (emitted, errors) = app().emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let controller = std::fs::read_to_string(emitted.join("app/controllers/single_controller.rb")).unwrap();
+    let at = controller.find("  def label\n").unwrap_or_else(|| panic!("no spliced label:\n{controller}"));
+    let body = &controller[at + "  def label\n".len()..];
+    body[..body.find("\n  end\n").unwrap()].trim().to_string()
+}
+
+/// The superclass's `prepend PrepM` puts PrepM ahead of it, its `include
+/// PrepN` below: `[Single, PrepM, PrepParent, PrepN]`. The child's includes
+/// of both add nothing (#2278).
+#[test]
+fn a_superclass_prepend_stays_ahead_of_its_includes() {
+    let label = parent_case(&[PREP_M, PREP_N], "  prepend PrepM\n  include PrepN\n", "  include PrepN\n  include PrepM\n", "m");
+    assert_eq!(label, "\"m\"");
+}
+
+/// ActiveSupport::Concern's `prepend_features` does nothing when the class
+/// has the concern through its superclass: `[Single, PrepN, PrepParent,
+/// PrepM]`. A plain module is prepended again: `[PlainM, Single, PrepN,
+/// PrepParent, PlainM]` (#2278).
+#[test]
+fn a_concern_the_superclass_has_is_not_prepended_again() {
+    let label = parent_case(&[PREP_M, PREP_N], "  include PrepM\n", "  prepend PrepM\n  include PrepN\n", "n");
+    assert_eq!(label, "\"n\"");
+    let label = parent_case(&[PLAIN_M, PREP_N], "  include PlainM\n", "  prepend PlainM\n  include PrepN\n", "plain m");
+    assert_eq!(label, "\"plain m\"");
+    // HookM's hook ran on the superclass and defined `label` there, below
+    // the child's PrepN: `[Single, PrepN, PrepParent, HookM]`.
+    let hook_m = ("hook_m", "module HookM\n  extend ActiveSupport::Concern\n\n  included do\n    def label\n      \"hook\"\n    end\n  end\nend\n");
+    let label = parent_case(&[hook_m, PREP_N], "  include HookM\n", "  prepend HookM\n  include PrepN\n", "n");
+    assert_eq!(label, "\"n\"");
+}
+
+/// A prepend runs the concern's `prepended do`, not its `included do`, so
+/// HookDef defines no `label`, and DelegateOne delegates none:
+/// `[HookDef, Single, PlainDef]` (#2278).
+#[test]
+fn a_prepend_runs_no_included_hook() {
+    let lines = "  prepend HookDef\n  include PlainDef\n";
+    assert_eq!(spliced_label(&[HOOK_DEF, PLAIN_DEF], lines, BuildTarget::Spinel), "\"plain\"");
+    single_case(&[HOOK_DEF, PLAIN_DEF], lines, "label", "plain");
+    let delegate_one = ("delegate_one", "module DelegateOne\n  extend ActiveSupport::Concern\n\n  included do\n    delegate :label, to: :source_one\n  end\nend\n");
+    let lines = "  prepend DelegateOne\n  include PlainDef\n";
+    single_case(&[delegate_one, PLAIN_DEF], lines, "label", "plain");
+}
+
+/// ShadowR's hook def is shadowed by its module's own `label`, but a hook
+/// that runs later declares `attr_reader :label`: that reader replaces the
+/// def on the includer, so Ruby gives nil. Run the other way round, the def
+/// replaces the reader (#2278).
+#[test]
+fn a_later_hooks_reader_stands_over_a_shadowed_hook_def() {
+    let shadow_r = ("shadow_r", "module ShadowR\n  extend ActiveSupport::Concern\n\n  included do\n    attr_reader :label\n    def label\n      \"hook\"\n    end\n  end\nend\n\nmodule ShadowR\n  def label\n    \"ordinary\"\n  end\nend\n");
+    for (includes, body, want) in [
+        ("  include ShadowR\n  include ReaderOnlyB\n", "@label", "null"),
+        ("  include ReaderOnlyB\n  include ShadowR\n", "\"hook\"", "\"hook\""),
+    ] {
+        let libs = [("shadow_reader_parent", format!("class ShadowReaderParent < ApplicationController\n{includes}end\n"))];
+        let libs: Vec<(&str, &str)> = libs.iter().map(|(f, s)| (*f, s.as_str())).collect();
+        assert_eq!(lib_label_bodies(&[shadow_r, READER_ONLY_B], &libs, "shadow_reader_parent"), [body], "{includes:?}");
+        lib_case(&[shadow_r, READER_ONLY_B], &libs, "ShadowReaderParent", want);
+    }
+}
+
+/// The later opening's LastHookOnly runs its hook after the earlier
+/// opening's ShadowB, so it wins although it needs no copy: ShadowB's copy
+/// on the earlier opening goes (#2278).
+#[test]
+fn a_later_openings_unshadowed_hook_retires_an_earlier_copy() {
+    let shadows: Vec<(String, String)> = ["A", "B"].iter().map(|x| shadow(x)).collect();
+    let mut concerns: Vec<(&str, &str)> = shadows.iter().map(|(f, s)| (f.as_str(), s.as_str())).collect();
+    concerns.push(LAST_HOOK_ONLY);
+    let libs = [
+        ("retire_parent", "class RetireParent < ApplicationController\n  include ShadowA\n  include ShadowB\nend\n"),
+        ("retire_parent_again", "class RetireParent < ApplicationController\n  include LastHookOnly\nend\n"),
+    ];
+    let mut app = emit_and_run::empty_app()
+        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::API\nend\n");
+    for (name, source) in &concerns {
+        app = app.write(&format!("app/controllers/concerns/{name}.rb"), source);
+    }
+    for (name, source) in &libs {
+        app = app.write(&format!("lib/{name}.rb"), source);
+    }
+    let (emitted, errors) = app.emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let mut bodies = Vec::new();
+    for (file, _) in &libs {
+        let Ok(class) = std::fs::read_to_string(emitted.join(format!("app/models/{file}.rb"))) else { continue };
+        let lines: Vec<&str> = class.lines().filter(|l| !l.starts_with("#<SPINEL_SOURCE>")).map(str::trim).collect();
+        bodies.extend((0..lines.len()).filter(|&i| lines[i] == "def label").map(|i| lines[i + 1].to_string()));
+    }
+    assert!(!bodies.contains(&"\"b hook\"".to_string()), "{bodies:?}");
+    lib_case(&concerns, &libs, "RetireParent", "\"last\"");
+}
+
+/// A prepend runs the concern's `prepended do`, not its `included do`, so
+/// no filter its `included do` declares is registered: `@ran` stays unset
+/// (#2278).
+#[test]
+fn a_prepend_registers_no_included_filter() {
+    let filter = ("hook_filter", "module HookFilter\n  extend ActiveSupport::Concern\n\n  included do\n    before_action :from_hook\n  end\n\n  def from_hook\n    @ran = \"ran\"\n  end\nend\n");
+    single_case(&[filter], "  prepend HookFilter\n", "(@ran || \"none\")", "none");
+    let around = ("hook_around", "module HookAround\n  extend ActiveSupport::Concern\n\n  included do\n    around_action :wrap\n  end\n\n  def wrap\n    @ran = \"around\"\n    yield\n  end\nend\n");
+    single_case(&[around], "  prepend HookAround\n", "(@ran || \"none\")", "none");
+    // Nothing observes an `after_action` in the response: the emitted
+    // controller registers none.
+    let after = ("hook_after", "module HookAfter\n  extend ActiveSupport::Concern\n\n  included do\n    after_action :after_hook\n  end\n\n  def after_hook\n    nil\n  end\nend\n");
+    let (emitted, errors) = single_app(&[after], "  prepend HookAfter\n", "(@ran || \"none\")").emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let controller = std::fs::read_to_string(emitted.join("app/controllers/single_controller.rb")).unwrap();
+    assert!(!controller.contains("self.after_hook"), "{controller}");
+}
