@@ -682,3 +682,51 @@ fn a_hook_def_below_its_reader_stands() {
     }
 }
 
+
+/// LastHookOnly's hook defines `label` on the class, and no reopening
+/// shadows it on the module.
+const LAST_HOOK_ONLY: (&str, &str) = (
+    "last_hook_only",
+    "module LastHookOnly\n  extend ActiveSupport::Concern\n\n  included do\n    def label\n      \"last\"\n    end\n  end\nend\n",
+);
+
+/// A repeated `include` of a module the class has adds nothing and runs no
+/// hook again, so LastHookOnly's hook ran last (#2278).
+#[test]
+fn a_repeated_include_runs_its_hook_once() {
+    let libs = [("repeat_parent", "class RepeatParent < ApplicationController\n  include HookReopen2\n  include LastHookOnly\n  include HookReopen2\nend\n")];
+    assert!(!lib_label_bodies(&[HOOK_REOPEN2, LAST_HOOK_ONLY], &libs, "repeat_parent").contains(&"\"hook2\"".to_string()));
+    lib_case(&[HOOK_REOPEN2, LAST_HOOK_ONLY], &libs, "RepeatParent", "\"last\"");
+}
+
+/// The block's second `attr_reader :label` comes after its `def label` and
+/// replaces it on the includer, whether or not a reopening shadows the def
+/// on the module (#2278).
+#[test]
+fn a_reader_below_the_hook_def_stands_over_it() {
+    let hook = "module ReaderTwice\n  extend ActiveSupport::Concern\n\n  included do\n    attr_reader :label\n    def label\n      \"hook\"\n    end\n    attr_reader :label\n  end\nend\n";
+    let reopened = format!("{hook}\nmodule ReaderTwice\n  def label\n    \"ordinary\"\n  end\nend\n");
+    for source in [hook, reopened.as_str()] {
+        let concern = ("reader_twice", source);
+        let libs = [("reader_twice_parent", "class ReaderTwiceParent < ApplicationController\n  include ReaderTwice\nend\n")];
+        assert_eq!(lib_label_bodies(&[concern], &libs, "reader_twice_parent"), ["@label"], "{source}");
+        lib_case(&[concern], &libs, "ReaderTwiceParent", "null");
+    }
+}
+
+/// A hook def below its reader that calls `super`, with no reopening: the
+/// module keeps the hoisted copy of the same def, which a copy on the class
+/// would reach through `super` and run twice. It isn't copied, and the
+/// reader stands, as before. Ruby's `"hook:base"` waits on #2278. With a
+/// reopening, `super` reaches the module's ordinary def, as in Ruby.
+#[test]
+fn a_hook_def_calling_super_is_copied_only_over_a_reopening() {
+    let hook = "module HookSuper\n  extend ActiveSupport::Concern\n\n  included do\n    attr_reader :label\n    def label\n      \"hook:#{super}\"\n    end\n  end\nend\n";
+    let libs = [
+        ("super_base", "class SuperBase < ApplicationController\n  def label\n    \"base\"\n  end\nend\n"),
+        ("super_hook_parent", "class SuperHookParent < SuperBase\n  include HookSuper\nend\n"),
+    ];
+    assert_eq!(lib_label_bodies(&[("hook_super", hook)], &libs, "super_hook_parent"), ["@label"]);
+    let reopened = format!("{hook}\nmodule HookSuper\n  def label\n    \"ordinary\"\n  end\nend\n");
+    lib_case(&[("hook_super", reopened.as_str())], &libs, "SuperHookParent", "\"hook:ordinary\"");
+}

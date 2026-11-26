@@ -83,14 +83,15 @@ pub(super) fn splice(app: &mut App) {
         let earlier: Vec<&ClassId> =
             app.library_classes[..i].iter().filter(|c| !c.is_module && c.name == *class).flat_map(|c| c.includes.iter()).collect();
         // Where a direct include runs its hook: statement order, and within
-        // one `include A, B` the last argument first. A module a hook includes
-        // runs at a point not read here.
+        // one `include A, B` the last argument first. A repeated include runs
+        // no hook again, so a module's first include is where it ran. A
+        // module a hook includes runs at a point not read here.
         let direct = &app.library_classes[i];
         let run_at = |module: &ClassId| {
             if direct.include_spans.len() != direct.includes.len() {
                 return None;
             }
-            direct.includes.iter().enumerate().filter(|(_, m)| *m == module).map(|(k, _)| (direct.include_spans[k].start, std::cmp::Reverse(k))).max()
+            direct.includes.iter().enumerate().filter(|(_, m)| *m == module).map(|(k, _)| (direct.include_spans[k].start, std::cmp::Reverse(k))).min()
         };
         // The last hook def of each name per module, whether the module's own
         // def of the name shadows it, and whether the block declares a reader
@@ -129,8 +130,11 @@ pub(super) fn splice(app: &mut App) {
             };
             let written = openings_of_class().flat_map(|c| &c.methods).any(|m| m.receiver == MethodReceiver::Instance && m.name == def.name);
             // A def below the block's own reader replaces it on the includer,
-            // where the module's def would stand behind the reader.
-            if (*shadowed || *reader) && last && !written {
+            // where the module's def would stand behind the reader. Not one
+            // that calls `super` with no reopening: the module keeps the
+            // hoisted copy of the same def, which `super` would run again.
+            let below_reader = *reader && !super::app::calls_super(&def.body);
+            if (*shadowed || below_reader) && last && !written {
                 hook_defs.push(((*def).clone(), *reader));
             }
         }
@@ -202,7 +206,8 @@ pub(super) fn in_included_hook(lc: &LibraryClass, m: &MethodDef) -> bool {
 }
 
 /// Whether the `included` block that writes `def` declares a reader of its
-/// name (`attr_reader` or `attr_accessor`) above it.
+/// name (`attr_reader` or `attr_accessor`) above it, and none below it: a
+/// reader below replaces the def again.
 fn reader_above(app: &App, module: &ClassId, def: &MethodDef) -> bool {
     let at = def.name_span;
     let Some(block) = app.library_classes.iter().filter(|o| o.is_module && o.name == *module).flat_map(|o| &o.unknown_calls).find_map(|call| {
@@ -212,16 +217,23 @@ fn reader_above(app: &App, module: &ClassId, def: &MethodDef) -> bool {
     }) else {
         return false;
     };
-    let items = app.concern_model_items.get(module).into_iter().flatten();
-    items.into_iter().any(|item| {
-        let ModelBodyItem::Unknown { expr, .. } = item else { return false };
-        let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node else { return false };
-        matches!(method.as_str(), "attr_reader" | "attr_accessor")
-            && args.iter().any(|a| matches!(&*a.node, ExprNode::Lit { value: Literal::Sym { value } } if *value == def.name))
-            && expr.span.file == block.file
-            && block.start <= expr.span.start
-            && expr.span.end <= at.start
-    })
+    let readers: Vec<Span> = app
+        .concern_model_items
+        .get(module)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let ModelBodyItem::Unknown { expr, .. } = item else { return None };
+            let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node else { return None };
+            (matches!(method.as_str(), "attr_reader" | "attr_accessor")
+                && args.iter().any(|a| matches!(&*a.node, ExprNode::Lit { value: Literal::Sym { value } } if *value == def.name))
+                && expr.span.file == block.file
+                && block.start <= expr.span.start
+                && expr.span.end <= block.end)
+                .then_some(expr.span)
+        })
+        .collect();
+    readers.iter().any(|r| r.end <= at.start) && !readers.iter().any(|r| r.start >= at.end)
 }
 
 /// The modules the classes above `parent` and `parent` itself include, with
