@@ -34,3 +34,13 @@ pub fn app(base: Overlay) -> Overlay {
 pub fn strict_app() -> Overlay {
     app(super::content_tag_options::app_rendering(VIEW, RENDERS))
 }
+
+/// `join` on the same receiver. Rails 8.1.4 renders `JOIN_RENDERS`.
+pub const JOIN_VIEW: &str = "L0:<%= @article.two_ids.join(\",\") %>|<%= @article.body %>|\n";
+
+pub const JOIN_RENDERS: &[&str] = &["L0:1,2|a body long enougha|"];
+
+/// The strict targets' probe app for `JOIN_VIEW`.
+pub fn strict_join_app() -> Overlay {
+    app(super::content_tag_options::app_rendering(JOIN_VIEW, JOIN_RENDERS))
+}

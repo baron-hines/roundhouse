@@ -1,0 +1,11 @@
+module ActionDispatch
+  module Routing
+    class RouteSet
+      def url_helpers: () -> singleton(RouteHelpers)
+    end
+  end
+end
+
+module RouteHelpers
+  def self.routes: () -> ActionDispatch::Routing::RouteSet
+end

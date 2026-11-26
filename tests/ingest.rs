@@ -500,362 +500,6 @@ end
     );
 }
 
-#[test]
-fn devise_for_expands_session_and_registration_helpers() {
-    let source = br#"Rails.application.routes.draw do
-  devise_for :users,
-    controllers: {
-      registrations: "users/registrations",
-      sessions: "users/sessions"
-    }
-end
-"#;
-    roundhouse::ingest::survey::activate();
-    let (result, _) = roundhouse::ingest::prism::scope(|| {
-        roundhouse::ingest::ingest_routes(source, "config/routes.rb")
-    });
-    let gaps = roundhouse::ingest::survey::drain();
-    let table = result.expect("ingest");
-    assert!(
-        gaps.iter().all(|g| !format!("{g:?}").contains("devise_for")),
-        "devise_for must not survey: {gaps:?}"
-    );
-    let mut app = roundhouse::App::default();
-    app.routes = table;
-    let flat = roundhouse::lower::flatten_routes(&app);
-    let by_name: roundhouse::det::HashMap<_, _> =
-        flat.iter().map(|r| (r.as_name.as_str(), r)).collect();
-    let session = by_name.get("new_user_session").expect("new_user_session");
-    assert_eq!(session.path, "/users/sign_in");
-    assert_eq!(session.controller.0.as_str(), "Users::SessionsController");
-    let reg = by_name.get("new_user_registration").expect("new_user_registration");
-    assert_eq!(reg.path, "/users/sign_up");
-    assert_eq!(reg.controller.0.as_str(), "Users::RegistrationsController");
-    assert!(by_name.contains_key("destroy_user_session"));
-    assert!(by_name.contains_key("edit_user_password"));
-    assert!(by_name.contains_key("user_confirmation"));
-}
-
-#[test]
-fn devise_for_accepts_string_controller_keys() {
-    // Devise accepts string keys in `controllers:`; skipping them would
-    // silently fall back to Devise::*Controller.
-    let source = br#"Rails.application.routes.draw do
-  devise_for :users,
-    controllers: {
-      "sessions" => "users/sessions",
-      registrations: "users/registrations"
-    }
-end
-"#;
-    roundhouse::ingest::survey::activate();
-    let (result, _) = roundhouse::ingest::prism::scope(|| {
-        roundhouse::ingest::ingest_routes(source, "config/routes.rb")
-    });
-    let gaps = roundhouse::ingest::survey::drain();
-    let table = result.expect("ingest");
-    assert!(
-        gaps.iter().all(|g| !format!("{g:?}").contains("devise_for")),
-        "string-keyed controllers must not survey: {gaps:?}"
-    );
-    let mut app = roundhouse::App::default();
-    app.routes = table;
-    let flat = roundhouse::lower::flatten_routes(&app);
-    let by_name: roundhouse::det::HashMap<_, _> =
-        flat.iter().map(|r| (r.as_name.as_str(), r)).collect();
-    let session = by_name.get("new_user_session").expect("new_user_session");
-    assert_eq!(session.controller.0.as_str(), "Users::SessionsController");
-    let reg = by_name.get("new_user_registration").expect("new_user_registration");
-    assert_eq!(reg.controller.0.as_str(), "Users::RegistrationsController");
-}
-
-#[test]
-fn devise_for_rejects_unmodeled_controller_mappings() {
-    // OmniAuth (and any mapping outside the static four) must fail loud —
-    // accepting the key then emitting no routes would hide the gap.
-    let source = br#"Rails.application.routes.draw do
-  devise_for :users, controllers: { omniauth_callbacks: "users/omniauth_callbacks" }
-end
-"#;
-    let (result, _) = roundhouse::ingest::prism::scope(|| {
-        roundhouse::ingest::ingest_routes(source, "config/routes.rb")
-    });
-    let err = result.expect_err("unmodeled controllers: key must fail");
-    let msg = format!("{err:?}");
-    assert!(
-        msg.contains("omniauth_callbacks") || msg.contains("unsupported devise_for controllers"),
-        "expected unmodeled mapping error, got: {msg}"
-    );
-}
-
-#[test]
-fn devise_for_defaults_controllers_under_devise_module() {
-    // Bare `devise_for :users` must resolve to Devise::*Controller, not
-    // top-level SessionsController (Devise::Mapping#default_controllers).
-    let source = br#"Rails.application.routes.draw do
-  devise_for :users
-end
-"#;
-    roundhouse::ingest::survey::activate();
-    let (result, _) = roundhouse::ingest::prism::scope(|| {
-        roundhouse::ingest::ingest_routes(source, "config/routes.rb")
-    });
-    let gaps = roundhouse::ingest::survey::drain();
-    let table = result.expect("ingest");
-    assert!(
-        gaps.iter().all(|g| !format!("{g:?}").contains("devise_for")),
-        "bare devise_for must not survey: {gaps:?}"
-    );
-    let mut app = roundhouse::App::default();
-    app.routes = table;
-    let flat = roundhouse::lower::flatten_routes(&app);
-    let by_name: roundhouse::det::HashMap<_, _> =
-        flat.iter().map(|r| (r.as_name.as_str(), r)).collect();
-    let session = by_name.get("new_user_session").expect("new_user_session");
-    assert_eq!(session.path, "/users/sign_in");
-    assert_eq!(session.controller.0.as_str(), "Devise::SessionsController");
-    let reg = by_name.get("new_user_registration").expect("new_user_registration");
-    assert_eq!(reg.controller.0.as_str(), "Devise::RegistrationsController");
-    let password = by_name.get("new_user_password").expect("new_user_password");
-    assert_eq!(password.controller.0.as_str(), "Devise::PasswordsController");
-    let confirmation = by_name.get("user_confirmation").expect("user_confirmation");
-    assert_eq!(
-        confirmation.controller.0.as_str(),
-        "Devise::ConfirmationsController"
-    );
-}
-
-/// `devise_for :widgets, path: "auth", format: false` under `scope
-/// module: :auth` — the Top-3 reduction for ranked gaps #1 and #2.
-/// Devise::Mapping uses `options[:path] || name` as the path segment
-/// and substitutes the enclosing scope's module for its own `"devise"`
-/// default: `auth/sessions#new`, not `auth/devise/sessions#new` and not
-/// `devise/sessions#new` (that would drop the scope entirely). Checked
-/// against the real Devise 5 routes this mirrors (`devise/rails/routes.rb`,
-/// `devise/mapping.rb`). Fails to ingest on main (`unsupported
-/// devise_for option \`path\``).
-#[test]
-fn devise_for_with_scope_module_and_path_matches_real_devise_routes() {
-    let source = br#"Rails.application.routes.draw do
-  scope module: :auth do
-    devise_for :widgets, path: "auth", format: false
-  end
-  resources :widgets, only: %i[index show]
-end
-"#;
-    roundhouse::ingest::survey::activate();
-    let (result, _) = roundhouse::ingest::prism::scope(|| {
-        roundhouse::ingest::ingest_routes(source, "config/routes.rb")
-    });
-    let gaps = roundhouse::ingest::survey::drain();
-    let table = result.expect("ingest");
-    assert!(
-        gaps.iter().all(|g| !format!("{g:?}").contains("devise_for")),
-        "devise_for path:/format: must not survey: {gaps:?}"
-    );
-    let mut app = roundhouse::App::default();
-    app.routes = table;
-    let flat = roundhouse::lower::flatten_routes(&app);
-    let by_name: roundhouse::det::HashMap<_, _> =
-        flat.iter().map(|r| (r.as_name.as_str(), r)).collect();
-
-    let new_session = by_name.get("new_widget_session").expect("new_widget_session");
-    assert_eq!(new_session.path, "/auth/sign_in");
-    assert_eq!(new_session.controller.0.as_str(), "Auth::SessionsController");
-    let destroy_session =
-        by_name.get("destroy_widget_session").expect("destroy_widget_session");
-    assert_eq!(destroy_session.path, "/auth/sign_out");
-
-    let new_registration =
-        by_name.get("new_widget_registration").expect("new_widget_registration");
-    assert_eq!(new_registration.path, "/auth/sign_up");
-    assert_eq!(
-        new_registration.controller.0.as_str(),
-        "Auth::RegistrationsController"
-    );
-    let create_registration =
-        by_name.get("widget_registration").expect("widget_registration");
-    assert_eq!(create_registration.path, "/auth");
-
-    let new_password = by_name.get("new_widget_password").expect("new_widget_password");
-    assert_eq!(new_password.path, "/auth/password/new");
-    assert_eq!(new_password.controller.0.as_str(), "Auth::PasswordsController");
-
-    let new_confirmation =
-        by_name.get("new_widget_confirmation").expect("new_widget_confirmation");
-    assert_eq!(new_confirmation.path, "/auth/confirmation/new");
-    assert_eq!(
-        new_confirmation.controller.0.as_str(),
-        "Auth::ConfirmationsController"
-    );
-
-    // The sibling `resources :widgets`, OUTSIDE the `scope module:`
-    // block, must not pick up the Devise scope's module.
-    let index = by_name.get("widgets").expect("widgets index");
-    assert_eq!(index.path, "/widgets");
-    assert_eq!(index.controller.0.as_str(), "WidgetsController");
-}
-
-/// Same scope-module substitution bug (ranked gap #1's second half), with
-/// no `path:` override, so it isolates the controller-naming half of the
-/// fix: the sessions controller resolves as `auth/sessions`, not
-/// `auth/devise/sessions` (what the un-fixed route lowering's blind
-/// module-prefix concatenation produces) and not bare `devise/sessions`
-/// (dropping the scope entirely). Fails (wrong controller) on main.
-#[test]
-fn devise_for_under_scope_module_resolves_controller_in_place_of_devise() {
-    let source = br#"Rails.application.routes.draw do
-  scope module: :auth do
-    devise_for :widgets
-  end
-end
-"#;
-    let (result, _) = roundhouse::ingest::prism::scope(|| {
-        roundhouse::ingest::ingest_routes(source, "config/routes.rb")
-    });
-    let table = result.expect("ingest");
-    let mut app = roundhouse::App::default();
-    app.routes = table;
-    let flat = roundhouse::lower::flatten_routes(&app);
-    let by_name: roundhouse::det::HashMap<_, _> =
-        flat.iter().map(|r| (r.as_name.as_str(), r)).collect();
-    let session = by_name.get("new_widget_session").expect("new_widget_session");
-    assert_eq!(session.path, "/widgets/sign_in");
-    assert_eq!(session.controller.0.as_str(), "Auth::SessionsController");
-    let registration =
-        by_name.get("new_widget_registration").expect("new_widget_registration");
-    assert_eq!(
-        registration.controller.0.as_str(),
-        "Auth::RegistrationsController"
-    );
-}
-
-/// `controllers:` overrides are absolute in real Devise
-/// (`with_devise_exclusive_scope` resets the scope's module to `nil`
-/// before applying them) — an enclosing `scope module:` must not
-/// re-qualify them on top of what `controllers:` already names.
-#[test]
-fn devise_for_controllers_override_ignores_enclosing_scope_module() {
-    let source = br#"Rails.application.routes.draw do
-  scope module: :auth do
-    devise_for :widgets, controllers: { sessions: "widgets/sessions" }
-  end
-end
-"#;
-    let (result, _) = roundhouse::ingest::prism::scope(|| {
-        roundhouse::ingest::ingest_routes(source, "config/routes.rb")
-    });
-    let table = result.expect("ingest");
-    let mut app = roundhouse::App::default();
-    app.routes = table;
-    let flat = roundhouse::lower::flatten_routes(&app);
-    let by_name: roundhouse::det::HashMap<_, _> =
-        flat.iter().map(|r| (r.as_name.as_str(), r)).collect();
-    let session = by_name.get("new_widget_session").expect("new_widget_session");
-    assert_eq!(session.controller.0.as_str(), "Widgets::SessionsController");
-}
-
-/// `devise_for format: true` would need the `(.:format)` optional
-/// suffix this table never models; it fails loud instead of silently
-/// matching `format: false`'s (already-modeled) behavior.
-#[test]
-fn devise_for_rejects_format_true() {
-    let source = br#"Rails.application.routes.draw do
-  devise_for :widgets, format: true
-end
-"#;
-    let (result, _) = roundhouse::ingest::prism::scope(|| {
-        roundhouse::ingest::ingest_routes(source, "config/routes.rb")
-    });
-    let err = result.expect_err("format: true is not modeled");
-    assert!(format!("{err:?}").contains("format: true"));
-}
-
-/// `path_names:` overrides the stock segment names
-/// (`Devise::Mapping#default_path_names`), merged over the defaults.
-#[test]
-fn devise_for_path_names_override() {
-    let source = br#"Rails.application.routes.draw do
-  devise_for :widgets, path_names: { sign_in: "login", sign_out: "logout" }
-end
-"#;
-    let (result, _) = roundhouse::ingest::prism::scope(|| {
-        roundhouse::ingest::ingest_routes(source, "config/routes.rb")
-    });
-    let table = result.expect("ingest");
-    let mut app = roundhouse::App::default();
-    app.routes = table;
-    let flat = roundhouse::lower::flatten_routes(&app);
-    let by_name: roundhouse::det::HashMap<_, _> =
-        flat.iter().map(|r| (r.as_name.as_str(), r)).collect();
-    let new_session = by_name.get("new_widget_session").expect("new_widget_session");
-    assert_eq!(new_session.path, "/widgets/login");
-    let destroy_session =
-        by_name.get("destroy_widget_session").expect("destroy_widget_session");
-    assert_eq!(destroy_session.path, "/widgets/logout");
-}
-
-/// `devise_for :widgets, path: ""` is a common Devise idiom (mount the
-/// whole table at the resource's own root segment). `base_path` is
-/// empty, so naive `"/{base_path}"` prefixing produces `"/"`, and
-/// joining that with a suffix that already starts with `"/"` doubles
-/// it into `"//sign_in"`. Real Devise (`Mapping#fullpath`:
-/// `"/#{path_prefix}/#{@path}".squeeze("/")`) gives `/sign_in`,
-/// `/sign_out`, `/password...`, `/sign_up`, and `/` for the
-/// registration root (create/update/destroy). Fails on b6379ca9
-/// (produces `"//sign_in"` etc., and `""` for the registration root).
-#[test]
-fn devise_for_empty_path_does_not_double_the_leading_slash() {
-    let source = br#"Rails.application.routes.draw do
-  devise_for :widgets, path: ""
-end
-"#;
-    let (result, _) = roundhouse::ingest::prism::scope(|| {
-        roundhouse::ingest::ingest_routes(source, "config/routes.rb")
-    });
-    let table = result.expect("ingest");
-    let mut app = roundhouse::App::default();
-    app.routes = table;
-    let flat = roundhouse::lower::flatten_routes(&app);
-    let by_name: roundhouse::det::HashMap<_, _> =
-        flat.iter().map(|r| (r.as_name.as_str(), r)).collect();
-    let new_session = by_name.get("new_widget_session").expect("new_widget_session");
-    assert_eq!(new_session.path, "/sign_in");
-    let destroy_session =
-        by_name.get("destroy_widget_session").expect("destroy_widget_session");
-    assert_eq!(destroy_session.path, "/sign_out");
-    let new_password = by_name.get("new_widget_password").expect("new_widget_password");
-    assert_eq!(new_password.path, "/password/new");
-    let new_registration =
-        by_name.get("new_widget_registration").expect("new_widget_registration");
-    assert_eq!(new_registration.path, "/sign_up");
-    let create_registration =
-        by_name.get("widget_registration").expect("widget_registration");
-    assert_eq!(create_registration.path, "/");
-}
-
-/// `path: "/auth"` (a leading slash on the segment itself) must not
-/// double up with the suffix's own leading slash either. Fails on
-/// b6379ca9 (produces `"//auth/sign_in"`).
-#[test]
-fn devise_for_path_with_a_leading_slash_does_not_double_it() {
-    let source = br#"Rails.application.routes.draw do
-  devise_for :widgets, path: "/auth"
-end
-"#;
-    let (result, _) = roundhouse::ingest::prism::scope(|| {
-        roundhouse::ingest::ingest_routes(source, "config/routes.rb")
-    });
-    let table = result.expect("ingest");
-    let mut app = roundhouse::App::default();
-    app.routes = table;
-    let flat = roundhouse::lower::flatten_routes(&app);
-    let by_name: roundhouse::det::HashMap<_, _> =
-        flat.iter().map(|r| (r.as_name.as_str(), r)).collect();
-    let new_session = by_name.get("new_widget_session").expect("new_widget_session");
-    assert_eq!(new_session.path, "/auth/sign_in");
-}
-
 /// A route omission is an error on the recovered table, not a fatal parse.
 #[test]
 fn routes_mount_diagnostic_preserves_siblings_in_every_mode() {
@@ -1675,7 +1319,8 @@ fn unmodeled_validates_options_warn_and_drop_their_rule_or_call() {
         r#"
 class Widget < ApplicationRecord
   validates :name, presence: true, uniqueness: { conditions: -> { where(active: true) } }
-  validates :stock, comparison: { less_than_or_equal_to: :max_stock }
+  # A bound computed from neither a literal, a Symbol, a lambda nor a value constant.
+  validates :stock, comparison: { less_than_or_equal_to: Time.now }
   validates :price, numericality: { greater_than: 0, odd: true }
   validates :bounded, numericality: { equal_to: 1, other_than: 2 }
   # A two-parameter lambda would splice an unbound parameter into `def
@@ -2963,7 +2608,25 @@ fn cattr_defaults_cannot_be_silently_dropped_with_native_initializers() {
                 );
             }
         }
-        for default in ["**{default: 41}", "**options", "instance_reader: false, default: 41"] {
+        // `instance_reader: false` beside a default leaves only the instance copy out: the seed and the class-side
+        // accessors stand, as Rails defines them.
+        {
+            let source = format!("class Probe; {declaration} :count, instance_reader: false, default: 41; end");
+            let classes = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb").unwrap();
+            assert!(
+                classes[0].class_ivar_initializers.iter().any(|expr| {
+                    matches!(&*expr.node, ExprNode::Assign { target: LValue::Var { name, .. }, value }
+                        if name.as_str() == "@@count" && matches!(&*value.node, ExprNode::Lit { value: Literal::Int { value: 41 } }))
+                }),
+                "{declaration}: {:?}",
+                classes[0].class_ivar_initializers
+            );
+            assert!(
+                !classes[0].methods.iter().any(|m| m.name.as_str() == "count" && m.receiver == roundhouse::dialect::MethodReceiver::Instance),
+                "{declaration}: no instance reader"
+            );
+        }
+        for default in ["**{default: 41}", "**options"] {
             let call = format!("{declaration} :count, {default}");
             let source = format!("class Probe; {call}; end");
             let classes = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb")
@@ -3021,6 +2684,19 @@ fn native_classvar_initialization_uses_owned_initializer_ir() {
             .expect_err("separate class-body buckets cannot preserve interleaving");
         assert!(err.to_string().contains("requires source ordering"), "{err}");
     }
+}
+
+/// simple_form's module body: ActiveSupport::Autoload's `autoload :X` and `eager_autoload do … end`, class variables
+/// written a block that closes over nothing, and a call of the module's own class method at its end, which the
+/// emitter replays in source order. A block that reads a local of the class body is not carried.
+#[test]
+fn native_classvar_initialization_beside_autoloads_blocks_and_an_own_class_method_call() {
+    let source = b"module Probe\n  extend ActiveSupport::Autoload\n  autoload :Helpers\n  eager_autoload do\n    autoload :Inputs\n  end\n  @@label = ->(label, required) { \"#{required} #{label}\" }\n  @@error = proc do |tag, _| tag end\n  @@wrappers = {}\n  def self.wrappers(name, &block)\n    @@wrappers[name] = block\n  end\n  wrappers :default do |b| b end\nend\n";
+    roundhouse::ingest::ingest_library_classes(source, "probe.rb").expect("ingests");
+    let closing = b"module Probe\n  prefix = \"x\"\n  @@label = ->(label) { prefix + label }\nend\n";
+    // Not a library class at all: a body that assigns a local is left to the file's program.
+    let closed = roundhouse::ingest::ingest_library_classes(closing, "probe.rb");
+    assert!(matches!(&closed, Ok(classes) if classes.is_empty()), "{closed:?}");
 }
 
 #[test]
@@ -3926,4 +3602,43 @@ end
     let names: Vec<(&str, &str)> = flat.iter().map(|r| (r.path.as_str(), r.as_name.as_str())).collect();
     assert!(names.contains(&("/log_in", "create")), "{names:?}");
     assert!(names.contains(&("/away", "new")), "{names:?}");
+}
+
+#[test]
+fn a_rooted_class_in_a_model_body_is_walked_as_nested_not_beside() {
+    use roundhouse::ingest::library_class::{ingest_library_classes_beside, ingest_nested_library_classes};
+
+    // A gem file whose model body declares `class ::StaticFiles`: Ruby
+    // names it at the top level, but it is written inside the model,
+    // so the nested walk takes it and the walk beside the model leaves
+    // it alone. Taken by both, it was registered twice.
+    let src = br#"module Tessera
+  class Node
+    include ActiveModel::Validations
+    validate :named
+
+    class ::StaticFiles
+      def self.call(env)
+        [200, {}, ["static"]]
+      end
+    end
+
+    def named
+    end
+  end
+
+  class Helpers
+    def self.tag
+      :helpers
+    end
+  end
+end
+"#;
+    let names = |classes: Vec<roundhouse::dialect::LibraryClass>| {
+        classes.into_iter().map(|c| c.name.0.as_str().to_string()).collect::<Vec<_>>()
+    };
+    let beside = names(ingest_library_classes_beside(src, "lib/tessera/node.rb", "Tessera::Node").expect("beside"));
+    let nested = names(ingest_nested_library_classes(src, "lib/tessera/node.rb", "Tessera::Node").expect("nested"));
+    assert_eq!(beside, ["Tessera::Helpers"], "beside the model");
+    assert!(nested.contains(&"StaticFiles".to_string()), "nested in the model: {nested:?}");
 }

@@ -153,6 +153,20 @@ pub fn ingest_controller(source: &[u8], file: &str) -> IngestResult<Option<Contr
             // `controller_layout` resolves each action's layout from. A
             // non-literal `only:`/`except:` is a located gap (survey) or a
             // strict error, as a filter's is, and leaves `layout` as it was.
+            // `alias :new :old` is the keyword spelling of `alias_method :new, :old`, which the lowering copies the method for.
+            if let Some(alias) = stmt.as_alias_method_node()
+                && let (Some(to), Some(from)) = (alias.new_name().as_symbol_node(), alias.old_name().as_symbol_node())
+            {
+                let span = crate::span::Span { file: super::sources::file_id(file), start: stmt_start as u32, end: stmt.location().end_offset() as u32 };
+                let sym = |s: &ruby_prism::SymbolNode<'_>| crate::expr::Expr::new(span, crate::expr::ExprNode::Lit { value: crate::expr::Literal::Sym { value: Symbol::from(String::from_utf8_lossy(s.unescaped()).as_ref()) } });
+                body_items.push(ControllerBodyItem::Unknown {
+                    expr: crate::expr::Expr::new(span, crate::expr::ExprNode::Send { recv: None, method: Symbol::from("alias_method"), args: vec![sym(&to), sym(&from)], block: None, parenthesized: false }),
+                    leading_comments: std::mem::take(&mut leading),
+                    leading_blank_line: leading_blank,
+                });
+                prev_end = Some(stmt.location().end_offset());
+                continue;
+            }
             match parse_layout_call(&stmt, file) {
                 Ok(Some(decl)) => layout = decl,
                 Ok(None) => {}
@@ -347,7 +361,7 @@ pub fn ingest_controller(source: &[u8], file: &str) -> IngestResult<Option<Contr
                 Some(
                     super::singleton_class::ingest_singleton_body(&sc, &owner, file, &|def| {
                         super::library_class::ingest_library_method(def, &owner, file)
-                    })
+                    }, false)
                     .map(|b| (b.methods, b.class_body)),
                 )
             } else {
@@ -430,6 +444,7 @@ pub fn ingest_controller(source: &[u8], file: &str) -> IngestResult<Option<Contr
         body: body_items,
         layout,
         sibling_classes,
+        csp_header: false,
     }))
 }
 
@@ -754,10 +769,23 @@ pub(super) fn parse_filter_call(
     stmt: &Node<'_>,
     file: &str,
 ) -> IngestResult<Option<Vec<crate::dialect::Filter>>> {
+    parse_filter_call_on(stmt, file, None)
+}
+
+/// [`parse_filter_call`], also reading a call on the local `receiver`: the
+/// `base` of a `def self.included(base)` hook.
+pub(super) fn parse_filter_call_on(
+    stmt: &Node<'_>,
+    file: &str,
+    receiver: Option<&str>,
+) -> IngestResult<Option<Vec<crate::dialect::Filter>>> {
     use crate::dialect::{Filter, FilterKind};
 
     let Some(call) = stmt.as_call_node() else { return Ok(None) };
-    if call.receiver().is_some() {
+    let on_receiver = call.receiver().is_some_and(|r| {
+        r.as_local_variable_read_node().is_some_and(|read| Some(constant_id_str(&read.name())) == receiver)
+    });
+    if call.receiver().is_some() && !on_receiver {
         return Ok(None);
     }
     let macro_name = constant_id_str(&call.name());
@@ -765,20 +793,21 @@ pub(super) fn parse_filter_call(
         return parse_forgery_macro(&call, macro_name == "protect_from_forgery", file);
     }
     let kind = match macro_name {
-        "before_action" | "prepend_before_action" => FilterKind::Before,
-        "around_action" => FilterKind::Around,
-        "after_action" => FilterKind::After,
+        // `append_*` is Rails' alias of the plain macro (AbstractController::Callbacks).
+        "before_action" | "prepend_before_action" | "append_before_action" => FilterKind::Before,
+        "around_action" | "append_around_action" | "prepend_around_action" => FilterKind::Around,
+        "after_action" | "append_after_action" => FilterKind::After,
         "skip_before_action" => FilterKind::Skip,
         "skip_around_action" => FilterKind::SkipAround,
         "skip_after_action" => FilterKind::SkipAfter,
         _ => return Ok(None),
     };
-    // Rails moves a `prepend_before_action` callback to the head of the
-    // WHOLE chain, ahead of inherited filters too — see `Filter::prepend`.
-    // `prepend_around_action` / `prepend_after_action` are not modeled:
-    // no controller in this codebase's fixtures uses either, so they
-    // stay unrecognized rather than risk a wrong-order claim.
-    let mut prepend = macro_name == "prepend_before_action";
+    // Rails moves a `prepend_before_action` or `prepend_around_action`
+    // callback to the head of the WHOLE chain, ahead of inherited filters
+    // too — see `Filter::prepend`. `prepend_after_action` is not modeled:
+    // no controller in this codebase's fixtures uses it, so it stays
+    // unrecognized rather than risk a wrong-order claim.
+    let mut prepend = matches!(macro_name, "prepend_before_action" | "prepend_around_action");
 
     let Some(args) = call.arguments() else { return Ok(None) };
 

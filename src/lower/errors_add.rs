@@ -487,20 +487,27 @@ fn import_attribute(args: &[Expr]) -> Option<Option<&Expr>> {
 /// The record whose errors `errors.merge!` imports: an `errors` read, or a record.
 fn merged_owner(args: &[Expr], is_model: &dyn Fn(&crate::ident::ClassId) -> bool) -> Option<Option<Expr>> {
     let [other] = args else { return None };
+    copied_owner(args).or_else(|| matches!(&other.ty, Some(crate::ty::Ty::Class { id, .. }) if is_model(id)).then(|| Some(other.clone())))
+}
+
+/// The record whose errors `errors.copy!` copies: an `errors` read only. Rails' `copy!` takes another
+/// `Errors` (`@errors = other.errors.deep_dup`); given a record, it keeps an `Errors` where its Array goes.
+fn copied_owner(args: &[Expr]) -> Option<Option<Expr>> {
+    let [other] = args else { return None };
     match &*other.node {
         ExprNode::Send { recv, method, args, block: None, .. } if method.as_str() == "errors" && args.is_empty() && is_errors_ty(other) => {
             Some(recv.clone())
         }
-        _ if matches!(&other.ty, Some(crate::ty::Ty::Class { id, .. }) if is_model(id)) => Some(Some(other.clone())),
         _ => None,
     }
 }
 
-/// Shared with analyze, which types `import` and `merge!` only when this holds.
+/// Shared with analyze, which types `import`, `merge!` and `copy!` only when this holds.
 pub(crate) fn import_grounds(method: &str, args: &[Expr], is_model: &dyn Fn(&crate::ident::ClassId) -> bool) -> bool {
     match method {
         "import" => import_attribute(args).is_some(),
         "merge!" => merged_owner(args, is_model).is_some(),
+        "copy!" => copied_owner(args).is_some(),
         _ => false,
     }
 }
@@ -664,7 +671,7 @@ fn table_call(span: crate::span::Span, table: &str, owner: Option<Expr>) -> Expr
 fn rewrite_import(expr: &mut Expr, labels: &Labels, diags: &mut Vec<Diagnostic>) -> bool {
     let ExprNode::Send { recv: Some(reader), method, args, block: None, .. } = &*expr.node else { return false };
     let method = method.as_str();
-    if !matches!(method, "import" | "merge!") || !is_errors_ty(reader) {
+    if !matches!(method, "import" | "merge!" | "copy!") || !is_errors_ty(reader) {
         return false;
     }
     let ExprNode::Send { recv: owner, method: em, args: ea, .. } = &*reader.node else { return false };
@@ -677,6 +684,7 @@ fn rewrite_import(expr: &mut Expr, labels: &Labels, diags: &mut Vec<Diagnostic>)
     let reason = if !import_grounds(method, args, &is_model) {
         Some(match method {
             "import" => "an error and an `attribute:` Symbol are grounded, no other option",
+            "copy!" => "only another record's `errors` is grounded",
             _ => "only another record or its `errors` is grounded",
         })
     } else if !owner_reads_once(owner.as_ref()) {
@@ -689,7 +697,7 @@ fn rewrite_import(expr: &mut Expr, labels: &Labels, diags: &mut Vec<Diagnostic>)
     if let Some(reason) = reason {
         let mut d = crate::lower::residue_diagnostic(
             "errors_add",
-            if method == "import" { "errors.import" } else { "errors.merge!" },
+            &format!("errors.{method}"),
             expr.span,
             reason,
             format!("`errors.{method}` is not grounded: {reason}"),
@@ -724,8 +732,9 @@ fn rewrite_import(expr: &mut Expr, labels: &Labels, diags: &mut Vec<Diagnostic>)
         }));
         "errors_import"
     } else {
-        call_args.push(error_details(merged_owner(args, &is_model).expect("checked above"), span));
-        "errors_merge"
+        let other = if method == "copy!" { copied_owner(args) } else { merged_owner(args, &is_model) };
+        call_args.push(error_details(other.expect("checked above"), span));
+        if method == "copy!" { "errors_copy" } else { "errors_merge" }
     };
     call_args.extend([names, str_lit(span, &before), str_lit(span, &between), str_lit(span, &after)]);
     let mut support = Expr::new(span, ExprNode::Const { path: vec![Symbol::from("ActiveSupport")] });

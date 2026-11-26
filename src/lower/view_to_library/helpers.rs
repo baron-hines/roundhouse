@@ -416,7 +416,13 @@ pub(super) fn emit_view_helper_call(kind: &ViewHelperKind<'_>, ctx: &ViewCtx) ->
                 Some(inline) => inline,
                 None => {
                     let label = pre_escaped.clone().unwrap_or_else(|| lit_str_coerce(lowered.clone()));
-                    let mut args = vec![label, rewrite_helpers_in_expr(url, ctx)];
+                    // `:back` is Rails' `url_for(:back)`, the referrer, not a String to escape.
+                    let href = if matches!(&*url.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "back") {
+                        view_helpers_call("back_url", Vec::new())
+                    } else {
+                        rewrite_helpers_in_expr(url, ctx)
+                    };
+                    let mut args = vec![label, href];
                     if let Some(o) = opts {
                         args.push((*o).clone());
                     }
@@ -1108,10 +1114,23 @@ fn emit_url_arg(url: &Expr, ctx: &ViewCtx, string_ok: bool) -> Option<Expr> {
             }
         }
     }
+    // An app helper of the name is what the bare call reaches first:
+    // Rails mixes the app's helpers in above the url helpers, so
+    // `link_to name, device_path(id)` links to what the helper answers.
+    // A bare read of a template local of that name is the local.
+    if let ExprNode::Send { recv: None, method, block: None, .. } = &*url.node
+        && ctx.app_helper_names.contains(method.as_str())
+        && !ctx.reads_local(url)
+    {
+        return Some(rewrite_helpers_in_expr(url, ctx));
+    }
     // Bare `<x>_url` absolute helpers (`button_to "Verify",
     // twofa_verify_url`) — RouteHelpers has no `_url` functions;
-    // ground to the shared absolute interp.
-    if let ExprNode::Send { recv: None, method, args, block: None, .. } = &*url.node {
+    // ground to the shared absolute interp. A bare read of a template
+    // local of that name is the local.
+    if let ExprNode::Send { recv: None, method, args, block: None, .. } = &*url.node
+        && !ctx.reads_local(url)
+    {
         if let Some(stem) = method.as_str().strip_suffix("_url") {
             return Some(super::absolute_url_interp(stem, args.clone()));
         }
@@ -1218,6 +1237,11 @@ fn emit_url_options_hash(url: &Expr, ctx: &ViewCtx) -> Option<Expr> {
     // `**splat` into a route helper goes through.
     if let ExprNode::Send { recv: Some(base), method, args, block: None, .. } = &*url.node {
         if method.as_str() == "merge" && args.len() == 1 {
+            // The merged keys could name the action, so a base without
+            // one is not the index here.
+            if !crate::lower::routes_to_library::url_hash_names_action(base) {
+                return None;
+            }
             let path = emit_url_options_hash(base, ctx)?;
             let extra = rewrite_helpers_in_expr(&args[0], ctx);
             return Some(send(
@@ -1243,7 +1267,14 @@ fn emit_url_options_hash(url: &Expr, ctx: &ViewCtx) -> Option<Expr> {
         by_key.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone())
     };
     let controller = take("controller")?;
-    let action = take("action")?;
+    // Rails' route set normalizes a Hash that names a controller:
+    // `action ||= "index"`, so no action, or a nil one, is the index.
+    let index = || Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Str { value: "index".to_string() } });
+    let action = match take("action") {
+        None => index(),
+        Some(a) if matches!(&*a.node, ExprNode::Lit { value: Literal::Nil }) => index(),
+        Some(a) => a,
+    };
     let mut extras: Vec<(String, Expr)> = by_key
         .iter()
         .filter(|(k, _)| k != "controller" && k != "action")
@@ -1320,6 +1351,9 @@ fn nested_element_parts(kind: &NestedUrlElement<'_>) -> (String, Expr) {
 /// helper whose body the app wrote, an app helper of the name or a
 /// `direct` route, which reads the record.
 pub(super) fn rewrite_path_args(helper: &str, args: &[Expr], ctx: &ViewCtx) -> Vec<Expr> {
+    if ctx.direct_route_helpers.contains(helper) {
+        return args.to_vec();
+    }
     let resource = helper.trim_end_matches("_path").trim_end_matches("_url");
     let resource = resource.strip_prefix("edit_").unwrap_or(resource);
     let param = if args.len() == 1 && ctx.slug_models.iter().any(|m| m == resource) { "to_param" } else { "id" };

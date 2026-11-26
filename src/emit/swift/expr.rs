@@ -1181,8 +1181,8 @@ fn children(e: &Expr) -> Vec<&Expr> {
         ExprNode::BeginRescue { body, rescues, else_branch, ensure, .. } => {
             v.push(body);
             v.extend(rescues.iter().map(|r| &r.body));
-            v.extend(else_branch.iter());
-            v.extend(ensure.iter());
+            v.extend(else_branch.as_deref());
+            v.extend(ensure.as_deref());
         }
         _ => {}
     }
@@ -1502,7 +1502,7 @@ fn emit_node(n: &ExprNode, e: &Expr) -> String {
         ExprNode::BeginRescue { body, rescues, else_branch: None, ensure, .. }
             if !rescues.is_empty() && rescues.iter().all(rescue_catches_throw) =>
         {
-            emit_do_catch(&emit_expr(body), rescues, ensure.as_ref(), false)
+            emit_do_catch(&emit_expr(body), rescues, ensure.as_deref(), false)
         }
         other => {
             let stub = crate::emit::diagnostics::report_unsupported(e.span, "swift", other.kind_str(), "no Swift form for this construct here");
@@ -2393,7 +2393,7 @@ pub(super) fn wrap_return(e: &Expr) -> String {
         ExprNode::BeginRescue { body, rescues, else_branch: None, ensure, .. }
             if !rescues.is_empty() && rescues.iter().all(rescue_catches_throw) =>
         {
-            emit_do_catch(&wrap_return(body), rescues, ensure.as_ref(), true)
+            emit_do_catch(&wrap_return(body), rescues, ensure.as_deref(), true)
         }
         ExprNode::Let { name, value, body, .. } => format!("{}\n{}", bind_let(name.as_str(), value), wrap_return(body)),
         ExprNode::Seq { exprs } if !exprs.is_empty() => emit_stmts(exprs, true),
@@ -2408,6 +2408,21 @@ pub(super) fn wrap_return(e: &Expr) -> String {
                 "if {c} {{\n{}\n}} else {{\n{}\n}}",
                 indent(&with_nonnull_scope(&then_nn, || wrap_return(then_branch))),
                 indent(&with_nonnull_scope(&else_nn, || wrap_return(else_branch)))
+            )
+        }
+        // A value method's tail `c ? x : nil` (or `x if c`): Swift's `if`
+        // expression needs both arms, so the taken arm returns and Ruby's
+        // missing arm is the `return nil` after it.
+        ExprNode::If { cond, then_branch, else_branch }
+            if is_empty_branch(else_branch)
+                && !is_empty_branch(then_branch)
+                && RETURNS_VALUE.with(|r| *r.borrow()) =>
+        {
+            let then_nn = props_proven_nonnull(cond);
+            let c = emit_expr(cond);
+            format!(
+                "if {c} {{\n{}\n}}\nreturn nil",
+                indent(&with_nonnull_scope(&then_nn, || wrap_return(then_branch)))
             )
         }
         // Not the assignment alone: Ruby's assignment answers the value, and a value method must return it

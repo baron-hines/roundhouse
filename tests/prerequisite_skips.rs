@@ -56,8 +56,13 @@ fn a_run_that_requires_prerequisites_fails_instead_of_skipping() {
         return;
     }
     let test = test_subprocess::name!("a_run_that_requires_prerequisites_fails_instead_of_skipping");
-    let output = child(test, &[(prerequisite::REQUIRE_VAR, "1")]);
+    let log = std::env::temp_dir().join(format!("roundhouse-required-log-{}", std::process::id()));
+    std::fs::remove_file(&log).ok();
+    let output = child(test, &[(prerequisite::REQUIRE_VAR, "1"), (prerequisite::LOG_VAR, log.to_str().unwrap())]);
+    let logged = std::fs::read_to_string(&log).unwrap_or_default();
+    std::fs::remove_file(&log).ok();
     assert_eq!(output.status.code(), Some(101), "{}", String::from_utf8_lossy(&output.stdout));
+    assert_eq!(logged, format!("{test}\t{WHAT}\n"), "a required prerequisite is still named in the log");
     assert!(!String::from_utf8_lossy(&output.stdout).contains("returned after the skip"));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains(&format!("{WHAT}; {} is set", prerequisite::REQUIRE_VAR)), "{stderr}");

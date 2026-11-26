@@ -224,9 +224,24 @@ module ActionMailer
       nil
     end
 
+    # ActionMailer's own defaults (`ActionMailer::Base.default_params`); a mailer with `default` entries answers them
+    # merged over these (`lower::mailer_templates`).
+    def self.base_default_params
+      { mime_version: "1.0", charset: "UTF-8", content_type: "text/plain", parts_order: ["text/plain", "text/enriched", "text/html"] }
+    end
+
+    def default_params
+      ActionMailer::Base.base_default_params
+    end
+
     # The :test-style delivery log. Lazy-init on first read (top-level
     # assignment at require time is a load-order trap under AOT).
     def self.deliveries
+      ActionMailer::Base.__deliveries
+    end
+
+    # Not each mailer's own: Rails' test delivery log is one, which every mailer's `deliveries` answers.
+    def self.__deliveries
       @deliveries ||= []
     end
 
@@ -263,7 +278,15 @@ module ActionMailer
     # The action this mailer runs, which the generated callback chain sets
     # (`ingest::mailer_callbacks`).
     def action_name
-      @_action_name.to_s
+      (@_action_name || @_called_action).to_s
+    end
+
+    # The action a mailer whose `mail` looks its template up runs, the
+    # outermost: what `action_name` answers without a callback chain
+    # (`lower::mailer_templates`).
+    def __called(name)
+      @_called_action = name if @_called_action.nil?
+      nil
     end
 
     # Starts the action's chain, or answers false while another action

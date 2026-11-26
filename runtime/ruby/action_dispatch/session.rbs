@@ -16,6 +16,7 @@ module ActionDispatch
     def has_key?: (String | Symbol key) -> bool
     def include?: (String | Symbol key) -> bool
     def delete: (String | Symbol key) -> untyped
+    def clear: () -> Session
     def length: () -> Integer
     def size: () -> Integer
     def empty?: () -> bool

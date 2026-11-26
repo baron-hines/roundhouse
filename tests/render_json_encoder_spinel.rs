@@ -75,6 +75,16 @@ fn json_response_defaults_run_on_spinel() {
 
 #[test]
 #[ignore = "requires the Spinel toolchain"]
+fn installed_rails_defaults_run_on_spinel() {
+    for defaults in [r##""#{Rails::VERSION::MAJOR}.#{Rails::VERSION::MINOR}""##, "Rails::VERSION::STRING.to_f"] {
+        json_response_escaping::app(defaults)
+            .write("Gemfile.lock", "GEM\n  remote: https://rubygems.org/\n  specs:\n    railties (8.1.4)\n\nPLATFORMS\n  ruby\n")
+            .run_spinel(&json_response_escaping::program("8.1")).assert_passes();
+    }
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
 fn dispatcher_rescue_uses_its_application_defaults_on_spinel() {
     use std::{fs, path::Path};
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/dispatcher_cases/render-classes");
@@ -96,7 +106,7 @@ puts "dispatcher encoding passed"
 fn app() -> emit_and_run::Overlay {
     emit_and_run::empty_app()
         .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n")
-        .write("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"widgets\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n")
+        .write("db/schema.rb", "ActiveRecord::Schema[8.1].define(version: 1) do\n  create_table \"widgets\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n")
         .write("config/routes.rb", "Rails.application.routes.draw do\n  get \"/settings\", to: \"payloads#settings\"\n  get \"/count\", to: \"payloads#count\"\n  get \"/stamp\", to: \"payloads#stamp\"\nend\n")
         .write("app/models/badge.rb", r#"class Badge
   def initialize(label)

@@ -7,8 +7,8 @@
 //! Ruby family the app's own code defines the method when it runs, and
 //! the send answers untyped, the gradual escape. Only where that code
 //! runs in the emitted class: the class `extend`s the defining module
-//! and every class-body call that reaches the definition is one the
-//! Ruby family replays (`ingest::app_extension_calls`). The class is
+//! and every class-body call that reaches the definition is in a statement
+//! the Ruby family replays (`ingest::app_extension_calls`). The class is
 //! reported once, as a warning. A literal-named definition is not
 //! this: the class macro expansion turns it into a `def`.
 
@@ -92,17 +92,17 @@ impl OpenClasses {
                     }
                     continue;
                 }
+                if replayed {
+                    continue;
+                }
                 let reach: Vec<&HashSet<Symbol>> = extended.iter().map(|m| &reaching[m].0).collect();
-                let mut root = true;
                 visit(expr, &mut |e| {
                     if let ExprNode::Send { recv, method, .. } = &*e.node
                         && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
                         && reach.iter().any(|set| set.contains(method))
-                        && !(root && replayed)
                     {
                         covered = false;
                     }
-                    root = false;
                 });
             }
             if covered && let Some(m) = extended.first() {

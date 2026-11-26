@@ -64,6 +64,10 @@ const CURRENT_REOPENED: &str = r#"class Current
   def room
     @room
   end
+
+  def room=(value)
+    @room = value
+  end
 end
 "#;
 
@@ -327,7 +331,7 @@ fn knowledge_reports_types_and_effects() {
     assert!(label.no_recorded_effects && !label.writes_state, "{label:?}");
     // `Account.first` reads the database.
     assert!(!method(&plan, "Current#account").knowledge.no_recorded_effects);
-    // An ivar read the analyzer cannot type.
+    // An ivar read the analyzer cannot type: a writer nothing calls sets it (an ivar nothing writes reads as nil).
     let room = &method(&plan, "Current#room").knowledge;
     assert!(room.typed < room.expressions, "{room:?}");
 }

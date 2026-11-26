@@ -51,9 +51,18 @@ mod view_unless_no_else;
 #[path = "support/nilable_string_view.rs"]
 #[allow(dead_code)]
 mod nilable_string_view;
+#[path = "support/go_nil_narrowed.rs"]
+#[allow(dead_code)]
+mod go_nil_narrowed;
+#[path = "support/go_nil_literal_left.rs"]
+#[allow(dead_code)]
+mod go_nil_literal_left;
 #[path = "support/each_receiver_once.rs"]
 #[allow(dead_code)]
 mod each_receiver_once;
+#[path = "support/join_nil.rs"]
+#[allow(dead_code)]
+mod join_nil;
 #[path = "support/go_view_predicate.rs"]
 mod go_view_predicate;
 #[path = "support/go_test_literal_receiver.rs"]
@@ -268,6 +277,180 @@ func TestRecordSliceProbe(t *testing.T) {
     go_mod_tidy(&emitted);
     let output = Command::new("go")
         .args(["test", "-count=1", "-run", "TestRecordSliceProbe", "./app/v2/"])
+        .current_dir(&*emitted)
+        .output()
+        .expect("run go test");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore]
+fn constructor_optionals_of_mixed_types_build_and_keep_their_defaults() {
+    // The router's constructors have String optionals, then Integer ones;
+    // an omitted `guard` is -1, no guard, not Go's zero.
+    let (emitted, errors) = emit_and_run::real_blog().emit(roundhouse::project::BuildTarget::Go);
+    assert!(errors.is_empty(), "{errors:?}");
+    std::fs::write(emitted.join("app/v2/ctor_optionals_test.go"), r#"package v2
+
+import "testing"
+
+func TestCtorOptionals(t *testing.T) {
+	r := NewActionDispatchRouterRoute("GET", "/x", "XController", "show")
+	if r.Guard != -1 || r.ReqFormat != "" {
+		t.Fatalf("omitted: guard %d format %q", r.Guard, r.ReqFormat)
+	}
+	g := NewActionDispatchRouterRoute("GET", "/x", "XController", "show", "json", "", "", 3)
+	if g.Guard != 3 || g.ReqFormat != "json" {
+		t.Fatalf("passed: guard %d format %q", g.Guard, g.ReqFormat)
+	}
+	m := NewActionDispatchRouterMatchResult("C", "a", map[string]string{})
+	if m.Index != 0 || m.Guard != -1 {
+		t.Fatalf("result omitted: index %d guard %d", m.Index, m.Guard)
+	}
+	f := NewActionDispatchRouterMatchResult("C", "a", map[string]string{}, "json", int64(2), int64(5))
+	if f.Index != 2 || f.Guard != 5 || f.ReqFormat != "json" {
+		t.Fatalf("result passed: index %d guard %d format %q", f.Index, f.Guard, f.ReqFormat)
+	}
+	hit := ActionDispatchRouter_match("GET", "/x", []*ActionDispatchRouterRoute{r})
+	if hit == nil || hit.Guard != -1 {
+		t.Fatalf("a matched route with no guard: %#v", hit)
+	}
+	n := NewActionDispatchRouterMatchResult("C", "a", map[string]string{}, nil, 2, 5)
+	if n.ReqFormat != "" || n.Index != 2 || n.Guard != 5 {
+		t.Fatalf("an explicit nil and bare integers: format %q index %d guard %d", n.ReqFormat, n.Index, n.Guard)
+	}
+}
+"#).expect("write probe");
+    go_mod_tidy(&emitted);
+    for args in [vec!["build", "./..."], vec!["test", "-count=1", "-run", "TestCtorOptionals", "./app/v2/"]] {
+        let output = Command::new("go").args(&args).current_dir(&*emitted).output().expect("run go");
+        assert!(
+            output.status.success(),
+            "go {args:?}\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+#[ignore]
+fn a_float_optional_of_mixed_types_takes_a_bare_integer() {
+    // A bare integer literal boxes as Go's `int`.
+    let (emitted, errors) = emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n",
+            "class Article < ApplicationRecord\n  def scored(label = \"a\", ratio = 1.5, count = 7)\n    ratio\n  end\n\n  def scored_from_ruby\n    scored(\"x\", 2, 3)\n  end\n\n  def counted(label = \"a\", count = 7)\n    count\n  end\n\n  def counted_from_ruby\n    counted(\"x\", 3)\n  end\n\n  def counted_nil_label\n    counted(nil, 4)\n  end\n\n",
+        )
+        .write("sig/article_scored.rbs", "class Article\n  def scored: (?String label, ?Float ratio, ?Integer count) -> Float\n  def scored_from_ruby: () -> Float\n  def counted: (?String? label, ?Integer count) -> Integer\n  def counted_from_ruby: () -> Integer\n  def counted_nil_label: () -> Integer\nend\n")
+        .emit(roundhouse::project::BuildTarget::Go);
+    assert!(errors.is_empty(), "{errors:?}");
+    std::fs::write(emitted.join("app/v2/float_optional_test.go"), r#"package v2
+
+import "testing"
+
+func TestFloatOptional(t *testing.T) {
+	a := &Article{}
+	if got := a.Scored(); got != 1.5 {
+		t.Fatalf("omitted: %v", got)
+	}
+	if got := a.Scored("x", 2.5); got != 2.5 {
+		t.Fatalf("a float: %v", got)
+	}
+	if got := a.Scored("x", 2); got != 2.0 {
+		t.Fatalf("a bare integer: %v", got)
+	}
+	if got := a.Scored("x", int64(3)); got != 3.0 {
+		t.Fatalf("an int64: %v", got)
+	}
+	if got := a.ScoredFromRuby(); got != 2.0 {
+		t.Fatalf("a float from a Ruby call: %v", got)
+	}
+	if got := a.CountedFromRuby(); got != 3 {
+		t.Fatalf("an integer from a Ruby call: %v", got)
+	}
+	if got := a.CountedNilLabel(); got != 4 {
+		t.Fatalf("a nil from a Ruby call: %v", got)
+	}
+}
+"#).expect("write probe");
+    go_mod_tidy(&emitted);
+    let output = Command::new("go")
+        .args(["test", "-count=1", "-run", "TestFloatOptional", "./app/v2/"])
+        .current_dir(&*emitted)
+        .output()
+        .expect("run go test");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore]
+fn nilable_numeric_optionals_narrow_after_a_nil_guard() {
+    // `return … if x.nil?` narrows with a plain assertion, so the boxed value must be the type it asserts.
+    let (emitted, errors) = emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n",
+            "class Article < ApplicationRecord\n  def nil_ratio(label = \"a\", ratio = 1)\n    return 0.5 if ratio.nil?\n    ratio + 1.5\n  end\n\n  def nil_count(label = \"a\", count = 2)\n    return 0 if count.nil?\n    count + 1\n  end\n\n  def ratio_from_ruby\n    nil_ratio(\"x\", 2)\n  end\n\n  def count_from_ruby\n    nil_count(\"x\", 3)\n  end\n\n",
+        )
+        .write("sig/article_nilable.rbs", "class Article\n  def nil_ratio: (?String label, ?Float? ratio) -> Float\n  def nil_count: (?String label, ?Integer? count) -> Integer\n  def ratio_from_ruby: () -> Float\n  def count_from_ruby: () -> Integer\nend\n")
+        .emit(roundhouse::project::BuildTarget::Go);
+    assert!(errors.is_empty(), "{errors:?}");
+    std::fs::write(emitted.join("app/v2/nilable_optional_test.go"), r#"package v2
+
+import "testing"
+
+func checkFloat(t *testing.T, name string, want float64, f func() float64) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("%s: panic: %v", name, r)
+		}
+	}()
+	if got := f(); got != want {
+		t.Errorf("%s: %v (want %v)", name, got, want)
+	}
+}
+
+func checkInt(t *testing.T, name string, want int64, f func() int64) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("%s: panic: %v", name, r)
+		}
+	}()
+	if got := f(); got != want {
+		t.Errorf("%s: %v (want %v)", name, got, want)
+	}
+}
+
+func TestNilableOptionals(t *testing.T) {
+	a := &Article{}
+	checkFloat(t, "float omitted", 2.5, func() float64 { return a.NilRatio() })
+	checkFloat(t, "float nil", 0.5, func() float64 { return a.NilRatio("x", nil) })
+	checkFloat(t, "float bare int", 3.5, func() float64 { return a.NilRatio("x", 2) })
+	checkFloat(t, "float int64", 3.5, func() float64 { return a.NilRatio("x", int64(2)) })
+	checkFloat(t, "float float", 4.0, func() float64 { return a.NilRatio("x", 2.5) })
+	checkFloat(t, "float from ruby", 3.5, func() float64 { return a.RatioFromRuby() })
+	checkInt(t, "int omitted", 3, func() int64 { return a.NilCount() })
+	checkInt(t, "int nil", 0, func() int64 { return a.NilCount("x", nil) })
+	checkInt(t, "int bare int", 4, func() int64 { return a.NilCount("x", 3) })
+	checkInt(t, "int int64", 4, func() int64 { return a.NilCount("x", int64(3)) })
+	checkInt(t, "int from ruby", 4, func() int64 { return a.CountFromRuby() })
+}
+"#).expect("write probe");
+    go_mod_tidy(&emitted);
+    let output = Command::new("go")
+        .args(["test", "-count=1", "-run", "TestNilableOptionals", "./app/v2/"])
         .current_dir(&*emitted)
         .output()
         .expect("run go test");
@@ -729,4 +912,77 @@ fn nilable_string_view_nil_effect_renders() {
 #[ignore]
 fn each_receiver_once_renders() {
     assert_content_tag_test_passes(each_receiver_once::strict_app());
+}
+
+/// #1949: `join` reads a nil element as an empty string, as Rails 8.1.4
+/// does (`join_nil::GO_VIEW`).
+#[test]
+#[ignore]
+fn join_nil_renders() {
+    assert_content_tag_test_passes(join_nil::strict_go_app());
+}
+
+/// #1949: a nil column beside an Integer joins as an empty string, as
+/// Rails 8.1.4 does (`join_nil::MIXED_VIEW`).
+#[test]
+#[ignore]
+fn join_nil_mixed_nil_renders() {
+    assert_content_tag_test_passes(join_nil::strict_mixed_nil_app());
+}
+
+/// #1949: a present column beside an Integer joins as its text, as
+/// Rails 8.1.4 does (`join_nil::MIXED_VIEW`).
+#[test]
+#[ignore]
+fn join_nil_mixed_renders() {
+    assert_content_tag_test_passes(join_nil::strict_mixed_app());
+}
+
+/// #1977: a String on the left of a nil column renders as Rails 8.1.4
+/// does (`go_nil_literal_left::VIEW`).
+#[test]
+#[ignore]
+fn go_nil_literal_left_nil_renders() {
+    assert_content_tag_test_passes(go_nil_literal_left::strict_nil_app());
+}
+
+/// #1977: a String on the left of a present column renders as Rails
+/// 8.1.4 does (`go_nil_literal_left::VIEW`).
+#[test]
+#[ignore]
+fn go_nil_literal_left_renders() {
+    assert_content_tag_test_passes(go_nil_literal_left::strict_app());
+}
+
+/// A nullable column compared after a nil check, on either side, renders as
+/// Rails 8.1.4 does (`go_nil_narrowed::VIEW`).
+#[test]
+#[ignore]
+fn go_nil_narrowed_renders() {
+    assert_content_tag_test_passes(go_nil_narrowed::strict_app());
+}
+
+/// The nil check and the comparison in a controller and a model method,
+/// where a local's reader narrows, render as Rails 8.1.4 does.
+#[test]
+#[ignore]
+fn go_nil_narrowed_code_renders() {
+    assert_content_tag_test_passes(go_nil_narrowed::strict_code_app());
+}
+
+/// Two nullable columns compare as Rails 8.1.4 does: nil equals only nil.
+#[test]
+#[ignore]
+fn go_nil_column_pairs_render() {
+    for app in go_nil_narrowed::strict_pair_apps() {
+        assert_content_tag_test_passes(app);
+    }
+}
+
+/// `join` runs a receiver with an effect once, as Rails 8.1.4 does
+/// (`each_receiver_once::JOIN_VIEW`).
+#[test]
+#[ignore]
+fn join_receiver_once_renders() {
+    assert_content_tag_test_passes(each_receiver_once::strict_join_app());
 }

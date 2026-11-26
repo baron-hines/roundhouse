@@ -64,6 +64,6 @@ fn global_variable_writes_in_a_method_run_as_natively() {
         .write("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"widgets\" do |t|\n    t.string \"name\"\n  end\nend\n")
         .write("lib/stdio_restore.rb", LIB)
         .run_ruby(SCRIPT);
-    assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+    run.assert_passes();
     assert_eq!(run.stdout, native);
 }

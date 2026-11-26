@@ -271,7 +271,29 @@ pub(crate) fn rewrite_fused_node(expr: &mut Expr) -> bool {
     rewrite_node(expr, Site::Fused)
 }
 
+/// ActiveSupport's underscore-style aliases of a String's own predicates.
+/// Analysis types them as the predicates they alias, and no runtime
+/// defines them, so they become the core method on the same receiver.
+const STRING_ALIASES: &[(&str, &str)] = &[("starts_with?", "start_with?"), ("ends_with?", "end_with?")];
+
+fn rewrite_alias(expr: &mut Expr) -> bool {
+    let ExprNode::Send { recv: Some(receiver), method, block: None, .. } = &mut *expr.node else {
+        return false;
+    };
+    let Some((_, core)) = STRING_ALIASES.iter().find(|(alias, _)| *alias == method.as_str()) else {
+        return false;
+    };
+    if !ReceiverShape::StringOrNil.matches(receiver.ty.as_ref()) {
+        return false;
+    }
+    *method = Symbol::from(*core);
+    true
+}
+
 fn rewrite_node(expr: &mut Expr, site: Site) -> bool {
+    if site == Site::Fused && rewrite_alias(expr) {
+        return true;
+    }
     let Some(matched) = match_rule(expr, site) else {
         return false;
     };

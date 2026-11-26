@@ -14,7 +14,10 @@
 //! * a constant assignment lands in the singleton class's lexical
 //!   scope, which the block's own methods read by bare name;
 //! * `sig`, `abstract!`, `private_constant`, and the visibility markers
-//!   carry no behavior the flattened method list can hold.
+//!   carry no behavior the flattened method list can hold;
+//! * in a model, a loop of `define_method` over literal names defines a
+//!   class method per name, as the class body's own loop defines
+//!   instance methods.
 //!
 //! Models and controllers both walk their class body one statement at a
 //! time, and a `class << self` is one statement that stands for many, so
@@ -62,12 +65,15 @@ const VISIBILITY: &[&str] =
 
 /// Expand one `class << self` block. `ingest_def` reads a `def` the way
 /// the enclosing walk reads its own methods, so a controller's class
-/// methods and a model's carry the parameter model of their side.
+/// methods and a model's carry the parameter model of their side. With
+/// `unroll_loops` (a model's), a `define_method` loop over literal names
+/// defines its class methods.
 pub(super) fn ingest_singleton_body(
     sc: &ruby_prism::SingletonClassNode<'_>,
     owner: &ClassId,
     file: &str,
     ingest_def: &dyn Fn(&ruby_prism::DefNode<'_>) -> IngestResult<MethodDef>,
+    unroll_loops: bool,
 ) -> IngestResult<SingletonBody> {
     let mut out = SingletonBody::default();
     // Only `class << self` is the enclosing class's own singleton. The
@@ -77,8 +83,35 @@ pub(super) fn ingest_singleton_body(
             .map(|()| out);
     }
     let Some(body) = sc.body() else { return Ok(out) };
-    for stmt in flatten_statements(body) {
-        walk_statement(&stmt, owner, file, ingest_def, &mut out)?;
+    let statements = flatten_statements(body);
+    let named = super::define_method_loop::named_visibility(&statements);
+    // The block's own constants shadow the class's, and the loop table
+    // holds only the class's: a loop over one of them is not unrolled.
+    let assigned: Vec<&[u8]> = statements.iter().filter_map(|s| s.as_constant_write_node()).map(|w| w.name().as_slice()).collect();
+    let shadowed = |stmt: &Node<'_>| {
+        stmt.as_call_node()
+            .and_then(|c| c.receiver())
+            .and_then(|r| r.as_constant_read_node())
+            .is_some_and(|r| assigned.contains(&r.name().as_slice()))
+    };
+    // A loop after a bare marker is not unrolled: its reach into the loop's
+    // `define_method`s is not modelled, so the loop stays the error it was.
+    let mut bare_marker = false;
+    for stmt in &statements {
+        if let Some(call) = stmt.as_call_node().filter(|c| c.receiver().is_none() && VISIBILITY.contains(&constant_id_str(&c.name()))) {
+            bare_marker |= call.arguments().is_none();
+        }
+        // `%w[a b].each { |n| define_method("first_#{n}") { … } }`: class
+        // methods, one per literal name (`define_method_loop`).
+        if unroll_loops
+            && !bare_marker
+            && !shadowed(stmt)
+            && let Some(methods) = super::define_method_loop::unroll(stmt, owner, file, MethodReceiver::Class, &named, false)
+        {
+            out.methods.extend(methods);
+            continue;
+        }
+        walk_statement(stmt, owner, file, ingest_def, &mut out)?;
     }
     for method in &mut out.methods {
         mark_singleton_constants(&mut method.body);
@@ -211,6 +244,27 @@ fn walk_statement(
                 out.methods.push(copy);
                 Ok(())
             }
+            None if let Some((to, from)) = framework_class_alias(&call) => {
+                // Not Rails' method under the new name: no emitted tree carries ActiveRecord's own `scope` as a method
+                // (each `scope :x` is lowered where it is written), so a call that reaches the copy raises, reported.
+                let src = format!(
+                    "class RoundhouseAliasStub\n  def self.{to}(*args, &block)\n    raise \"`{to}` is ActiveRecord's `{from}`, which this tree lowers where it is written\"\n  end\nend\n"
+                );
+                let (parsed, _) = super::prism::scope(|| super::library_class::ingest_library_classes(src.as_bytes(), file));
+                let Some(mut stub) = parsed.ok().and_then(|classes| classes.into_iter().flat_map(|c| c.methods).next()) else {
+                    return unsupported(file, "unsupported statement inside `class << self`: `alias_method` of a method the block does not define");
+                };
+                stub.enclosing_class = Some(owner.0.clone());
+                super::prism::push(crate::lower::residue_diagnostic(
+                    "framework_alias",
+                    "alias_method",
+                    super::util::node_span(stmt, file),
+                    "framework_method",
+                    format!("`alias_method :{to}, :{from}` copies ActiveRecord's own `{from}`, which no emitted tree carries as a method: `{to}` raises if it is called"),
+                ));
+                out.methods.push(stub);
+                Ok(())
+            }
             None => unsupported(
                 file,
                 "unsupported statement inside `class << self`: `alias_method` of a method the block does not define",
@@ -258,6 +312,16 @@ fn recover(err: IngestError) -> IngestResult<()> {
     } else {
         Err(err)
     }
+}
+
+/// `alias_method :to, :from` where `from` is an ActiveRecord class method the catalog knows (`scope`).
+fn framework_class_alias(call: &ruby_prism::CallNode<'_>) -> Option<(String, String)> {
+    let args: Vec<String> = call.arguments()?.arguments().iter().filter_map(|a| symbol_value(&a)).collect();
+    let [to, from] = args.as_slice() else { return None };
+    // Not in the catalog: the class-body macros ingest lowers where they are written.
+    const MACROS: &[&str] = &["scope", "default_scope", "has_many", "has_one", "belongs_to", "validates", "validate"];
+    (crate::catalog::lookup(from, crate::catalog::ReceiverContext::Class).is_some() || MACROS.contains(&from.as_str()))
+        .then(|| (to.clone(), from.clone()))
 }
 
 fn unsupported(file: &str, message: &str) -> IngestResult<()> {

@@ -259,7 +259,14 @@ A `require` of a Rails framework feature is left to the runtime, as are
 statement that cannot be carried is an error (`file_statement_unsupported`),
 as is a `require_relative` of a file the tree does not carry
 (`file_require_not_carried`). The `spinel` tree compiles the gem's
-declarations only.
+declarations and loads no file, so its boot runs the statements instead,
+ahead of the app's initializer code, in the order Ruby loads their files:
+the boot's requires as above, then the files declaring a constant the
+app's own code names and the files an `autoload` of such a constant
+names. Only a call on a class the tree carries is run there
+(`Warden::Strategies.add(:database_authenticatable, …)`); any other
+statement of those files, and one inside a file-level `if`, is a warning
+(`gem file statement`): the `spinel` tree does not run it.
 
 Extension gem facts also select the locked gems' Tapioca RBIs under
 `sorbet/rbi/gems/`. This includes gems classified as infrastructure or

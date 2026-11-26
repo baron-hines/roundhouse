@@ -107,15 +107,29 @@ pub(super) fn conditional_definition<'pr>(node: &Node<'pr>) -> Option<(bool, Vec
     }
     let defines = arms.iter().any(|(_, stmts)| !stmts.is_empty());
     let only_defs = arms.iter().all(|(_, stmts)| {
-        stmts.iter().all(|stmt| {
+        stmts.iter().enumerate().all(|(at, stmt)| {
             definition(stmt).is_some()
                 || conditional_accessor(stmt).is_some()
+                || self_write(stmt).is_some()
+                || (branch_load(stmt).is_some() && marks_an_earlier_def(stmt, &stmts[..at]))
                 || conditional_definition(stmt).is_some()
                 || stmt.as_class_node().is_some()
                 || stmt.as_module_node().is_some()
         })
     });
     (defines && only_defs).then_some((negated, arms))
+}
+
+/// A [`conditional_definition`] whose branches only load: each statement an
+/// `include` of a constant, a `require` of a string, or a nested conditional
+/// of the same kind (#2282). It defines nothing itself.
+pub(super) fn load_only_conditional<'pr>(node: &Node<'pr>) -> Option<(bool, Vec<(Option<Node<'pr>>, Vec<Node<'pr>>)>)> {
+    let (negated, arms) = conditional_definition(node)?;
+    let loads = |stmt: &Node<'_>| {
+        branch_load(stmt).is_some_and(|call| matches!(constant_id_str(&call.name()), "include" | "require"))
+            || load_only_conditional(stmt).is_some()
+    };
+    arms.iter().all(|(_, stmts)| stmts.iter().all(loads)).then_some((negated, arms))
 }
 
 /// A class-body `if` / `unless` whose branches define a method but hold
@@ -158,6 +172,7 @@ fn refused_conditional_definition<'pr>(node: &Node<'pr>) -> Option<(Node<'pr>, &
     let admitted = |stmt: &Node<'_>| {
         definition(stmt).is_some()
             || conditional_accessor(stmt).is_some()
+            || self_write(stmt).is_some()
             || conditional_definition(stmt).is_some()
             || stmt.as_class_node().is_some()
             || stmt.as_module_node().is_some()
@@ -182,6 +197,48 @@ fn refused_conditional_definition<'pr>(node: &Node<'pr>) -> Option<(Node<'pr>, &
         "a load-time conditional definition whose branch holds a statement other than a `def` is not modeled"
     };
     Some((stmt, why))
+}
+
+/// `self.error_status = :ok`: a write through the class's own writer, as a branch runs it.
+/// `include Mod` (of a constant) or `require "lib"` in a load-time conditional's branch (method_source's
+/// `include ReeSourceLocation` / `require 'java'`): it runs only when the branch does, as a `def` there does.
+pub(super) fn branch_load<'pr>(stmt: &Node<'pr>) -> Option<CallNode<'pr>> {
+    let call = stmt.as_call_node()?;
+    if call.receiver().is_some() || call.block().is_some() {
+        return None;
+    }
+    let args: Vec<_> = call.arguments()?.arguments().iter().collect();
+    let [arg] = args.as_slice() else { return None };
+    match constant_id_str(&call.name()).as_ref() {
+        "include" => (arg.as_constant_read_node().is_some() || arg.as_constant_path_node().is_some()).then_some(call),
+        "require" => arg.as_string_node().is_some().then_some(call),
+        // `private :trace_func` after the branch's `def`: the visibility it gives, where the branch runs.
+        "private" | "public" | "protected" => arg.as_symbol_node().is_some().then_some(call),
+        _ => None,
+    }
+}
+
+/// A branch's `private :name` names a method the branch defined before it: Ruby raises NameError for one not yet
+/// defined, which the output, writing the class's own methods first, would not.
+fn marks_an_earlier_def(stmt: &Node<'_>, before: &[Node<'_>]) -> bool {
+    let Some(call) = stmt.as_call_node() else { return true };
+    if !matches!(constant_id_str(&call.name()).as_ref(), "private" | "public" | "protected") {
+        return true;
+    }
+    let Some(sym) = call.arguments().and_then(|a| a.arguments().iter().next()).and_then(|a| a.as_symbol_node()) else { return false };
+    let name = sym.unescaped();
+    before.iter().any(|b| definition(b).is_some_and(|d| d.receiver().is_none() && d.name().as_slice() == name))
+}
+
+pub(super) fn self_write<'pr>(stmt: &Node<'pr>) -> Option<CallNode<'pr>> {
+    let call = stmt.as_call_node()?;
+    let name = constant_id_str(&call.name());
+    (call.receiver().is_some_and(|r| r.as_self_node().is_some())
+        && call.block().is_none()
+        && name.ends_with('=')
+        && !matches!(name, "==" | "!=" | "<=" | ">=" | "===")
+        && call.arguments().is_some_and(|a| a.arguments().iter().count() == 1))
+    .then_some(call)
 }
 
 /// A bare `attr_reader` / `attr_writer` / `attr_accessor` of literal
@@ -209,6 +266,39 @@ pub(super) fn marker(call: &CallNode<'_>) -> bool {
         constant_id_str(&call.name()),
         "public" | "protected" | "private" | "public_class_method" | "private_class_method"
     )
+}
+
+pub(super) fn validate_data(body: Option<Node<'_>>, file: &str, methods: &[MethodDef], owner: &ClassId) -> IngestResult<()> {
+    let inherited = Visibility::resolve_library_carrying(body.as_ref(), file, None, Some(owner)).ok();
+    fn collect<'pr>(body: Option<Node<'pr>>, singleton: bool, names: &mut HashSet<String>, calls: &mut Vec<CallNode<'pr>>, mixin: &mut bool) {
+        for stmt in body.map(flatten_statements).unwrap_or_default() {
+            if let Some(class) = stmt.as_singleton_class_node() {
+                collect(class.body(), true, names, calls, mixin);
+            }
+            if let Some(def) = definition(&stmt) {
+                if singleton || def.receiver().is_some() { names.insert(constant_id_str(&def.name()).to_string()); }
+            }
+            if let Some(call) = stmt.as_call_node() {
+                let name = constant_id_str(&call.name()).to_string();
+                *mixin |= matches!(name.as_str(), "include" | "extend" | "prepend");
+                if marker(&call) || matches!(name.as_str(), "private_constant" | "public_constant" | "module_function") { calls.push(call); }
+            }
+        }
+    }
+    let mut names = methods.iter().filter(|method| method.receiver == crate::dialect::MethodReceiver::Class)
+        .map(|method| method.name.to_string()).collect();
+    let (mut calls, mut mixin) = (Vec::new(), false);
+    collect(body, false, &mut names, &mut calls, &mut mixin);
+    for call in calls {
+        let name = constant_id_str(&call.name()).to_string();
+        if !names.contains(&name) && inherited.as_ref().is_some_and(|visibility| !visibility.inherited.iter().any(|(side, name, at)| *side && matches!(name.as_str(), "new" | "[]" | "allocate") && *at == call.location().start_offset())) { continue; }
+        if mixin || names.contains(&name) || call.receiver().is_some() || call.block().is_some()
+            || !matches!(name.as_str(), "private" | "public" | "protected" | "private_class_method")
+            || call.arguments().is_some_and(|args| args.arguments().iter().any(|arg| arg.as_symbol_node().is_none())) {
+            return Err(super::error_site::at(IngestError::Unsupported { file: file.into(), message: format!("Data visibility macro `{name}` requires a built-in static declaration with literal symbols") }, &call.as_node()));
+        }
+    }
+    Ok(())
 }
 
 /// `private def helper … end` defines a method, not a default for later
@@ -327,9 +417,36 @@ fn statement_has_unmodeled_call(stmt: &Node<'_>) -> bool {
         if !targets_includer {
             return false;
         }
-        return !TRACKED_DECLARATIONS.contains(&constant_id_str(&call.name()));
+        return !TRACKED_DECLARATIONS.contains(&constant_id_str(&call.name())) && class_side_attribute_names(&call).is_none();
     }
     branch_has_unmodeled_call(stmt)
+}
+
+/// `class_attribute :a, :b, instance_accessor: false, instance_predicate: false`: the names, whose only methods are
+/// the class side's public `a`, `a=` and `a?`. Not one with an instance accessor or predicate, whose visibility a
+/// bare marker before it may or may not reach.
+fn class_side_attribute_names(call: &ruby_prism::CallNode<'_>) -> Option<Vec<String>> {
+    if constant_id_str(&call.name()) != "class_attribute" || call.block().is_some() {
+        return None;
+    }
+    let mut names = Vec::new();
+    let (mut accessor_off, mut predicate_off) = (false, false);
+    for arg in call.arguments()?.arguments().iter() {
+        if let Some(options) = arg.as_keyword_hash_node() {
+            for element in options.elements().iter() {
+                let pair = element.as_assoc_node()?;
+                match symbol_or_string_value(&pair.key())?.as_str() {
+                    "instance_accessor" => accessor_off = pair.value().as_false_node().is_some(),
+                    "instance_predicate" => predicate_off = pair.value().as_false_node().is_some(),
+                    "default" => {}
+                    _ => return None,
+                }
+            }
+            continue;
+        }
+        names.push(symbol_or_string_value(&arg)?);
+    }
+    (accessor_off && predicate_off && !names.is_empty()).then_some(names)
 }
 
 /// Descend into an `if`/`unless` node's branches (both arms, and an
@@ -382,13 +499,18 @@ impl Visibility {
         for body in bodies {
             // Not `resolve`: forem's `private :has_role?` names a method rolify defines, which
             // refuses the class body there but leaves the default at every later line known.
-            if let Ok(visibility) = Self::resolve_carrying_inherited(Some(&body), file, None) {
+            // Nor a body whose load-time conditional definitions only a library class admits (view_component's
+            // `Base`): the defaults at its other lines are known all the same.
+            if let Ok(visibility) = Self::resolve_carrying_inherited(Some(&body), file, None)
+                .or_else(|_| Self::resolve_carrying_inherited_with(Some(&body), file, None, None, true))
+            {
                 defaults.extend(visibility.defaults);
             }
             for statement in flatten_statements(body) {
                 // `X = Struct.new(…) do … end`: the block is that class's body, with defaults of its own.
                 if let Some(cw) = statement.as_constant_write_node()
-                    && super::library_class::struct_constant_block(&cw.value())
+                    && (super::library_class::struct_constant_block(&cw.value())
+                        || super::data_factory::declaration(&statement).is_some())
                 {
                     let block_body = cw.value().as_call_node().and_then(|c| c.block()).and_then(|b| b.as_block_node()).and_then(|b| b.body());
                     if let Ok(visibility) = Self::resolve_carrying_inherited(block_body.as_ref(), file, None) {
@@ -431,9 +553,56 @@ impl Visibility {
     ) -> IngestResult<Self> {
         let out = Self::resolve_carrying_inherited_with(body, file, module_owner, owner, true)?;
         match out.inherited.first() {
-            Some((_, name, _)) => Err(Self::undefined(file, name)),
+            Some((_, name, at)) => {
+                let err = Self::undefined(file, name);
+                super::error_site::note(&err, *at, *at + 1);
+                Err(err)
+            }
             None => Ok(out),
         }
+    }
+
+    /// Data supplies these class methods before evaluating its block. Keep
+    /// their visibility calls for native replay instead of inventing defs.
+    pub(super) fn resolve_data(body: Option<&Node<'_>>, file: &str, owner: &ClassId) -> IngestResult<Self> {
+        let out = Self::resolve_library_carrying(body, file, None, Some(owner))?;
+        fn private_constructors(body: Option<&Node<'_>>, at: usize) -> bool {
+            body.and_then(|body| body.as_statements_node()).is_some_and(|body| body.body().iter().any(|stmt| {
+                if let Some(singleton) = stmt.as_singleton_class_node() {
+                    return private_constructors(singleton.body().as_ref(), at);
+                }
+                let Some(call) = stmt.as_call_node().filter(|_| stmt.location().start_offset() == at) else { return false };
+                if !matches!(constant_id_str(&call.name()), "private_class_method" | "private") { return false; }
+                let names = call.arguments().map(|args| args.arguments().iter()
+                    .filter_map(|arg| symbol_or_string_value(&arg)).collect::<Vec<_>>()).unwrap_or_default();
+                ["new", "[]", "allocate"].iter().all(|name| names.iter().any(|n| n == name))
+                    && names.iter().all(|name| matches!(name.as_str(), "new" | "[]" | "allocate"))
+            }))
+        }
+        if let Some((_, name, at)) = out.inherited.iter().find(|(side, name, at)| {
+            !*side || !matches!(name.as_str(), "new" | "[]" | "allocate")
+                || !private_constructors(body, *at)
+        }) {
+            let err = Self::undefined(file, name);
+            super::error_site::note(&err, *at, *at + 1);
+            return Err(err);
+        }
+        Ok(out)
+    }
+
+    /// [`Self::resolve_library`] for a class body whose walk carries a marker naming an inherited method as a body
+    /// statement (Hashie's `private :_regular_reader` after `alias _regular_reader []`), which the Ruby family writes
+    /// back and Ruby resolves along the ancestors.
+    /// [`Self::resolve_library`] for a class body whose walk carries a marker naming an inherited method as a body
+    /// statement (Hashie's `private :_regular_reader` after `alias _regular_reader []`), which the Ruby family writes
+    /// back and Ruby resolves along the ancestors.
+    pub(super) fn resolve_library_carrying(
+        body: Option<&Node<'_>>,
+        file: &str,
+        module_owner: Option<&ClassId>,
+        owner: Option<&ClassId>,
+    ) -> IngestResult<Self> {
+        Self::resolve_carrying_inherited_with(body, file, module_owner, owner, true)
     }
 
     /// Whether this body's load-time conditional definitions are admitted.
@@ -489,10 +658,12 @@ impl Visibility {
             out.walk(Some(statements.as_node()), false, file, module_owner)?;
         }
         // Ruby raises NameError at the marker for a later `def` or one only on the other side, so those are no inherited method.
-        if let Some((_, name, _)) = out.inherited.iter().find(|(class_side, name, _)| {
+        if let Some((_, name, at)) = out.inherited.iter().find(|(class_side, name, _)| {
             out.known.contains_key(&(*class_side, name.clone())) || out.known.contains_key(&(!*class_side, name.clone()))
         }) {
-            return Err(Self::undefined(file, name));
+            let err = Self::undefined(file, name);
+            super::error_site::note(&err, *at, *at + 1);
+            return Err(err);
         }
         Ok(out)
     }
@@ -837,6 +1008,7 @@ impl Visibility {
         struct Declarations {
             invalid: bool,
             reject_defs: bool,
+            in_block: usize,
         }
         impl<'pr> ruby_prism::Visit<'pr> for Declarations {
             fn visit_branch_node_enter(&mut self, node: Node<'pr>) {
@@ -866,13 +1038,19 @@ impl Visibility {
                             .and_then(|clause| clause.statements())
                             .is_some_and(|s| body_has_marker(Some(s.as_node())))
                 } else {
-                    node.as_call_node().is_some_and(|c| c.receiver().is_none() && marker(&c))
+                    node.as_call_node().is_some_and(|c| c.receiver().is_none() && marker(&c) && (self.in_block == 0 || c.arguments().is_some()))
                 };
             }
             fn visit_def_node(&mut self, _node: &ruby_prism::DefNode<'pr>) {
                 // DSL blocks (e.g. has_many extensions) own their defs, not
                 // the enclosing class. Never inspect ordinary def bodies.
                 self.invalid |= self.reject_defs;
+            }
+            // Not a named marker (`with_options do protected :x= end` sets the class's `x=`): a bare one in a call's block sets the visibility of the block's own `def`s only, which whoever reads that block models or refuses.
+            fn visit_block_node(&mut self, node: &ruby_prism::BlockNode<'pr>) {
+                self.in_block += !self.reject_defs as usize;
+                ruby_prism::visit_block_node(self, node);
+                self.in_block -= !self.reject_defs as usize;
             }
         }
         // A def inside a call's block belongs to that block's owner, not
@@ -887,6 +1065,7 @@ impl Visibility {
         let mut declarations = Declarations {
             invalid: false,
             reject_defs: !owns_defs,
+            in_block: 0,
         };
         ruby_prism::Visit::visit(&mut declarations, node);
         if declarations.invalid {
@@ -1190,6 +1369,13 @@ impl Visibility {
                     self.walk_included(block.body(), file)?;
                 } else {
                     Self::reject_dynamic_declarations(node, file)?;
+                }
+            } else if let Some(attributes) = class_side_attribute_names(&call) {
+                // Rails defines them on the singleton class, public whatever marker stands before.
+                for attr in attributes {
+                    for method in [attr.clone(), format!("{attr}="), format!("{attr}?")] {
+                        self.define(offset, method, true, MethodVisibility::Public, file)?;
+                    }
                 }
             } else if matches!(name, "attr_reader" | "attr_writer" | "attr_accessor") {
                 if let Some(args) = call.arguments() {

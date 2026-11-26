@@ -44,13 +44,7 @@ puts Comp::Schema::Klass.frozen?\n";
 #[test]
 fn a_module_whose_body_is_only_calls_is_declared_and_runs_them() {
     let run = emit_and_run::empty_app().write("app/models/comp/schema.rb", SCHEMA).run_ruby(MODELS_SCRIPT);
-    assert!(
-        run.success,
-        "emitted tree failed in {}\n=== stdout ===\n{}\n=== stderr ===\n{}",
-        run.emitted.display(),
-        run.stdout,
-        run.stderr
-    );
+    run.assert_passes();
     // CRuby 4.0 on SCHEMA, as written.
     assert_eq!(run.stdout.lines().collect::<Vec<_>>(), ["bool", "self_frozen", "true", "true", "klass", "true"], "{}", run.stderr);
 }
@@ -97,13 +91,7 @@ fn a_constant_whose_program_raised_while_loading_autoloads_it_again() {
         app = app.write(&format!("vendor/gems/broken-1.0.0/lib/{path}"), text);
     }
     let run = app.run_ruby(AUTOLOAD_SCRIPT);
-    assert!(
-        run.success,
-        "emitted tree failed in {}\n=== stdout ===\n{}\n=== stderr ===\n{}",
-        run.emitted.display(),
-        run.stdout,
-        run.stderr
-    );
+    run.assert_passes();
     let program = "models/roundhouse_files/vendor/gems/broken-1.0.0/lib/broken/track";
     let track = std::fs::read_to_string(run.emitted.join(format!("app/{program}.rb"))).unwrap();
     assert!(track.contains(&format!("RoundhouseAutoload.entering({program:?}, [\"Broken::Track\"]) do")), "{track}");

@@ -359,14 +359,43 @@ fn run_transpile(
     // keeps the probe.
     let defer = !matches!(target, BuildTarget::Roda | BuildTarget::Futamura)
         && std::env::var_os("ROUNDHOUSE_DEFER_ACCESSOR_SURFACE").is_none_or(|value| value != "0");
-    if transpile(target, input, out, allow_unsupported, survey, defer)? == Transpiled::Overturned {
+    // Not by ingesting first: a cached observation is checked against the app's files.
+    if target == BuildTarget::Spinel
+        && std::env::var_os("ROUNDHOUSE_OBSERVE_SHAPES").is_none_or(|v| v != "0")
+        && let Some(cached) = input.canonicalize().ok().and_then(|dir| roundhouse::observed_shapes::cached(&dir))
+    {
+        match cached {
+            Ok(patches) => roundhouse::observed_shapes::install(patches),
+            Err(why) => eprintln!("roundhouse: note: observing the boot did not answer what a gem does to a held class: {why}"),
+        }
+        OBSERVED.with(|c| c.set(true));
+    }
+    let mut first = transpile(target, input, out, allow_unsupported, survey, defer)?;
+    if let Transpiled::Observe { gems, key } = first {
+        let emit_ruby = |tmp: &std::path::Path| transpile(BuildTarget::Ruby, input, tmp, true, false, false).map(|_| ());
+        match roundhouse::timings::phase("observe shapes", || roundhouse::observed_shapes::observe(input, &gems, &key, roundhouse::observed_shapes::Boot::Tree(&emit_ruby))) {
+            Ok(patches) => roundhouse::observed_shapes::install(patches),
+            Err(why) => eprintln!("roundhouse: note: {} change a class held in a variable, and observing the boot did not answer it: {why}", gems.join(", ")),
+        }
+        OBSERVED.with(|c| c.set(true));
+        first = transpile(target, input, out, allow_unsupported, survey, defer)?;
+    }
+    if first == Transpiled::Overturned {
         transpile(target, input, out, allow_unsupported, survey, false)?;
     }
+    roundhouse::observed_shapes::uninstall();
     Ok(())
 }
 
+thread_local! {
+    static OBSERVED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Boot the app's CRuby tree once with the shape observer, or reuse the observation cached under the same key.
 #[derive(PartialEq)]
 enum Transpiled {
+    /// The Spinel tree needs what these gems do to the app's classes as it boots (`observed_shapes`): nothing was written.
+    Observe { gems: Vec<String>, key: String },
     Written,
     /// The analyzed app does not occupy a name ingest refused: nothing
     /// was written.
@@ -415,6 +444,13 @@ fn transpile(
         Ok(app) => {
             #[cfg(feature = "memory-census")]
             roundhouse::memory_census::census("after ingest", &app);
+            if target == BuildTarget::Spinel && !OBSERVED.with(|c| c.get()) && std::env::var_os("ROUNDHOUSE_OBSERVE_SHAPES").is_none_or(|v| v != "0") {
+                let gems = roundhouse::observed_shapes::needed(&app);
+                if !gems.is_empty() {
+                    let key = input.canonicalize().map(|dir| roundhouse::observed_shapes::key(&dir)).unwrap_or_default();
+                    return Ok(Transpiled::Observe { gems, key });
+                }
+            }
             app
         }
         Err(e) => {
@@ -437,7 +473,7 @@ fn transpile(
                      constructs as a punch list and keep going"
                 );
             }
-            return Err(format!("ingest {}: {e}", input.display()));
+            return Err(format!("ingest {}: {}", input.display(), roundhouse::ingest::render_error(&e)));
         }
     };
     // An ActiveRecord class outside app/models (a migration helper's own
@@ -517,27 +553,7 @@ fn transpile(
     };
     analyze_diags.extend(lower_diags);
 
-    // CRuby can carry an external include only when the lockfile uniquely
-    // identifies its gem and the defining source has a matching literal
-    // top-level require. Keep check's source diagnostic and all strict-target
-    // refusals unchanged.
-    if matches!(target, BuildTarget::Ruby | BuildTarget::Jruby) {
-        let (external_namespaces, supported_includes) = if target == BuildTarget::Ruby {
-            (roundhouse::gems::locked_external_gem_namespaces(&app), roundhouse::gems::statically_resolved_external_includes(&app))
-        } else {
-            (roundhouse::gems::native_extension_gem_namespaces(&app), Default::default())
-        };
-        let mut external_roots = roundhouse::gems::ExternalRootIndex::new(&external_namespaces);
-        analyze_diags.retain(|diagnostic| match &diagnostic.kind {
-            roundhouse::diagnostic::DiagnosticKind::Unsupported {
-                construct, detail, ..
-            } if construct.as_str() == "include" => !supported_includes.contains_key(detail),
-            roundhouse::diagnostic::DiagnosticKind::Unsupported {
-                construct, detail, ..
-            } if construct.as_str() == "constant" => !external_roots.names_any(detail),
-            _ => true,
-        });
-    }
+    roundhouse::session::drop_answered_by_target(&app, target, &mut analyze_diags);
 
     // A residue whose own text says the construct is "unsupported at
     // strict-target emit" has to fail the emit it predicts that for.
@@ -580,25 +596,41 @@ fn transpile(
     // Each gap still degrades to a stub in the emitted output, so a
     // single run surfaces the whole inventory instead of dying on the
     // first one.
-    let emit = || {
+    // The emit below lowers `constantize` in the app itself, and on a target that refuses the call
+    // the name it resolved goes with it: what the app reaches is read before, as it was read
+    // when the emit lowered a copy.
+    let unreached_gem_code = (whole_route.is_none() && roundhouse::lower::constantize::applies(&app, target))
+        .then(|| roundhouse::source_gem_shake::UnreachedGemCode::of(&app));
+    let mut emit = || {
         roundhouse::emit::diagnostics::scope(|| match &whole_route {
             Some(wr) => project::futamura_target_files(&app, input, Some(wr)),
-            None => project::target_files(&app, input, target),
+            // What follows reads the app's sources, lockfile and assets, never its bodies.
+            None => project::target_files_lowering_in_place(&mut app, input, target),
         })
     };
-    let audit = std::env::var_os("ROUNDHOUSE_AUDIT").is_some();
-    // Not recorded on every run: the record clones each rendered class's IR, which only the audit reads.
+    // The Ruby family and Spinel write Ruby, which the audit reads back: a
+    // send on an app model the written Ruby defines nothing for is an
+    // error. `ROUNDHOUSE_AUDIT` also lists the warnings, on other classes.
+    let list_audit = std::env::var_os("ROUNDHOUSE_AUDIT").is_some();
+    let gates = roundhouse::emit::audit::gates(target);
+    let audit = list_audit || gates;
     let ((files_result, mut diags), rendered) =
         if audit { roundhouse::emit::ruby::record_rendered(emit) } else { (emit(), Vec::new()) };
     if audit
         && let Ok(files) = &files_result
     {
         let started = std::time::Instant::now();
-        let findings = roundhouse::emit::audit::audit(&rendered, files);
-        for d in &findings {
-            eprintln!("{}", d.render(&app.sources));
+        let models = app.models.iter().map(|m| m.name.0.as_str()).collect();
+        let findings = roundhouse::emit::audit::audit(&rendered, files, &models, &app.sources);
+        if list_audit {
+            for d in &findings {
+                eprintln!("{}", d.render(&app.sources));
+            }
+            eprintln!("roundhouse: audit: {} send(s) resolve to no emitted method ({:?})", findings.len(), started.elapsed());
         }
-        eprintln!("roundhouse: audit: {} send(s) resolve to no emitted method ({:?})", findings.len(), started.elapsed());
+        if gates {
+            diags.extend(findings.into_iter().filter(|d| d.severity == Severity::Error));
+        }
     }
 
     // Same attribution pass as `analyze_diags` above, run again here:
@@ -628,6 +660,18 @@ fn transpile(
     // materialized `files` are deferred to after the gate (below) so a
     // gate failure reports every diagnostic before the run aborts.
     diags.splice(0..0, parse_diags);
+    // A gem's code the app does not reach is no error of the emitted program (`source_gem_shake`).
+    match &unreached_gem_code {
+        Some(unreached) => {
+            for d in [&mut diags, &mut analyze_diags] {
+                unreached.iter().for_each(|u| u.demote(d));
+            }
+        }
+        None => {
+            roundhouse::source_gem_shake::demote_unreached_gem_errors(&app, &mut diags);
+            roundhouse::source_gem_shake::demote_unreached_gem_errors(&app, &mut analyze_diags);
+        }
+    }
 
     // Policy: errors (unsupported constructs and type errors alike) fail
     // the transpile cleanly by default. With --allow-unsupported they

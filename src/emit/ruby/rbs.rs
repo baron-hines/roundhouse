@@ -6,7 +6,7 @@
 //! layout, but Steep / TypeProf auto-discover `sig/` by convention —
 //! so this layout costs zero extra config for either consumer.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
@@ -15,12 +15,15 @@ use crate::dialect::{
     AccessorKind, LibraryClass, MethodDef, MethodReceiver, MethodVisibility,
 };
 use crate::expr::{Expr, ExprNode, Literal, RESOLVED_DATA_FACTORY};
-use crate::ty::{Param, ParamKind, Ty};
+use crate::ty::{FnTy, Param, ParamKind, Ty};
 
 thread_local! {
     /// True while rendering a class-side `def self.x` signature. See the
     /// `Ty::SelfInstance` arm of `ty_to_rbs_in`.
     static CLASS_SIDE_SIG: Cell<bool> = const { Cell::new(false) };
+    /// How the declaration of the method being rendered spelled its
+    /// class names. `type_name` keeps an author's spelling.
+    static WRITTEN: RefCell<Option<crate::rbs::Spellings>> = const { RefCell::new(None) };
 }
 
 /// Sets [`CLASS_SIDE_SIG`] for its scope and restores the previous value
@@ -135,7 +138,7 @@ fn render_class(
         let last = segments[depth - 1];
         let pad = "  ".repeat(depth - 1);
         match lc.parent.as_ref() {
-            Some(p) => writeln!(s, "{pad}class {last} < {}", p.0.as_str()).unwrap(),
+            Some(p) => writeln!(s, "{pad}class {last} < {}", type_name(p.0.as_str(), &segments[..depth - 1])).unwrap(),
             None if lc.data_define().is_some() => writeln!(s, "{pad}class {last} < ::Data").unwrap(),
             None => writeln!(s, "{pad}class {last}").unwrap(),
         }
@@ -158,7 +161,7 @@ fn render_class(
     }
 
     for inc in &lc.includes {
-        writeln!(s, "{body_pad}include {}", inc.0.as_str()).unwrap();
+        writeln!(s, "{body_pad}include {}", type_name(inc.0.as_str(), &segments)).unwrap();
     }
     if !lc.includes.is_empty() && !lc.methods.is_empty() {
         writeln!(s).unwrap();
@@ -169,7 +172,8 @@ fn render_class(
         render_data_factory(&mut s, lc, name.as_str(), value, &body_pad, factory);
     }
 
-    for m in &lc.methods {
+    for (index, m) in lc.methods.iter().enumerate() {
+        if lc.data_define().is_some() && lc.methods[index + 1..].iter().any(|later| later.name == m.name && later.receiver == m.receiver) { continue; }
         let line = render_method(m, &segments);
         let visibility = if lc.data_define().is_some() && m.visibility != MethodVisibility::Public { "private " } else { "" };
         writeln!(s, "{body_pad}{visibility}{line}").unwrap();
@@ -231,6 +235,14 @@ fn render_data_factory(s: &mut String, owner: &LibraryClass, name: &str, value: 
 }
 
 fn render_method(m: &MethodDef, enclosing: &[&str]) -> String {
+    let written = super::library::written_names(&enclosing.join("::"), m.name.as_str());
+    let previous = WRITTEN.with(|w| w.replace(written));
+    let line = render_method_in(m, enclosing);
+    WRITTEN.with(|w| w.replace(previous));
+    line
+}
+
+fn render_method_in(m: &MethodDef, enclosing: &[&str]) -> String {
     // Class-receiver methods can't be attr_reader / attr_writer at the
     // RBS surface — the `attr_*` shorthand only describes instance
     // attributes, and an `attr_reader name?: bool` form lacks any way
@@ -271,7 +283,7 @@ fn plain_writer(m: &MethodDef) -> bool {
 
 fn render_attr_reader(m: &MethodDef, enclosing: &[&str]) -> String {
     let ty = match &m.signature {
-        Some(Ty::Fn { ret, .. }) => ty_to_rbs_in(ret, enclosing),
+        Some(Ty::Fn(fn_ty)) => ty_to_rbs_in(&fn_ty.ret, enclosing),
         _ => "untyped".to_string(),
     };
     format!("attr_reader {}: {}", m.name.as_str(), ty)
@@ -279,7 +291,8 @@ fn render_attr_reader(m: &MethodDef, enclosing: &[&str]) -> String {
 
 fn render_attr_writer(m: &MethodDef, enclosing: &[&str]) -> String {
     let ty = match &m.signature {
-        Some(Ty::Fn { params, .. }) if !params.is_empty() => {
+        Some(Ty::Fn(fn_ty)) if !fn_ty.params.is_empty() => {
+            let FnTy { params, .. } = &**fn_ty;
             ty_to_rbs_in(&params[0].ty, enclosing)
         }
         _ => "untyped".to_string(),
@@ -298,7 +311,8 @@ fn render_def(m: &MethodDef, enclosing: &[&str]) -> String {
     // A full forwarder has no named rest binding. Neither its keywords
     // nor its block can be inferred from the synthetic signature slot.
     let sig = match &m.signature {
-        Some(Ty::Fn { params, block, ret, .. }) if !m.params.iter().any(|p| p.forwarding) => {
+        Some(Ty::Fn(fn_ty)) if !m.params.iter().any(|p| p.forwarding) => {
+            let FnTy { params, block, ret, .. } = &**fn_ty;
             let params_str = render_typed_params(params, enclosing);
             let block_str = match block.as_deref() {
                 Some(b) => format!(" {{ {} }}", render_block_ty(b, enclosing)),
@@ -378,7 +392,8 @@ fn render_typed_params(params: &[Param], enclosing: &[&str]) -> String {
 
 fn render_block_ty(b: &Ty, enclosing: &[&str]) -> String {
     match b {
-        Ty::Fn { params, ret, .. } => {
+        Ty::Fn(fn_ty) => {
+            let FnTy { params, ret, .. } = &**fn_ty;
             let p = render_typed_params(params, enclosing);
             format!("({p}) -> {}", ty_to_rbs_in(ret, enclosing))
         }
@@ -398,9 +413,9 @@ pub fn ty_to_rbs(ty: &Ty) -> String {
 ///
 /// A type name in RBS resolves LEXICALLY, as a constant does in Ruby:
 /// inside `module Views; module Search`, `Search` is `Views::Search`.
-/// Every `Ty::Class` id here is the top-level name, so one whose first
-/// segment is also a NESTED enclosing segment is written rooted
-/// (`::Search`), which names the same class from anywhere. lobsters'
+/// A `Ty::Class` id that analysis gives is the top-level name, so one a
+/// nearer declaration would capture is written rooted (`type_name`:
+/// `::Search`), which names the same class from anywhere. lobsters'
 /// search view is exactly that shape — `Views::Search.index_into(io,
 /// Search search, …)` — and spinel, once it read the name lexically,
 /// typed `search` as the view module and refused
@@ -476,13 +491,7 @@ fn ty_to_rbs_in(ty: &Ty, enclosing: &[&str]) -> String {
             "Hash[String, String]".into()
         }
         Ty::Class { id, args } => {
-            let raw = id.0.as_str();
-            let first = raw.split("::").next().unwrap_or(raw);
-            let name = if enclosing.iter().skip(1).any(|seg| *seg == first) {
-                format!("::{raw}")
-            } else {
-                raw.to_string()
-            };
+            let name = type_name(id.0.as_str(), enclosing);
             if args.is_empty() {
                 name
             } else {
@@ -490,7 +499,8 @@ fn ty_to_rbs_in(ty: &Ty, enclosing: &[&str]) -> String {
                 format!("{name}[{}]", a.join(", "))
             }
         }
-        Ty::Fn { params, ret, .. } => {
+        Ty::Fn(fn_ty) => {
+            let FnTy { params, ret, .. } = &**fn_ty;
             // Procs in value position render as `^(Params) -> Ret`.
             let p = render_typed_params(params, enclosing);
             format!("^({p}) -> {}", rbs(ret))
@@ -499,6 +509,29 @@ fn ty_to_rbs_in(ty: &Ty, enclosing: &[&str]) -> String {
         Ty::Untyped => "untyped".into(),
         Ty::Bottom => "bot".into(),
     }
+}
+
+/// `raw` as the sidecar spells it inside `enclosing`. A name the method's
+/// declaration wrote rooted (`::X`), or that its reader kept as written
+/// with matching lexical nesting, stays as written. Another name
+/// in a declared method (one a `sig/` reader qualified, or with no recorded
+/// spelling) keeps main's rule: rooted when its first segment is a nested
+/// enclosing segment. A name analysis generated is also rooted when a
+/// class analysis knows would capture it. Then `raw` is a full name, since
+/// analysis would have resolved a written one to that nearer class; a
+/// name analysis left as written is not one of its classes and stays.
+fn type_name(raw: &str, enclosing: &[&str]) -> String {
+    let declared = WRITTEN.with(|w| w.borrow().as_ref().map(|names| names.get(raw).cloned()));
+    if let Some(Some((written, same_nesting))) = &declared
+        && (written.starts_with("::") || (*same_nesting && written == raw)) {
+        return written.clone();
+    }
+    let first = raw.split("::").next().unwrap_or(raw);
+    let registers = super::library::registers;
+    let captured = declared.is_none()
+        && (registers(raw) || crate::gem_boundary::RUBY_CORE.contains(&raw))
+        && (1..=enclosing.len()).any(|depth| registers(&format!("{}::{first}", enclosing[..depth].join("::"))));
+    if captured || enclosing.iter().skip(1).any(|seg| *seg == first) { format!("::{raw}") } else { raw.to_string() }
 }
 
 fn render_union(variants: &[Ty], enclosing: &[&str]) -> String {
@@ -555,8 +588,7 @@ pub(super) fn emit_library_class_rbs_decls(app: &crate::App) -> Vec<EmittedFile>
     app.library_classes
         .iter()
         .map(|lc| {
-            let file_stem = crate::naming::underscore(lc.name.0.as_str());
-            let rb_path = PathBuf::from(format!("app/models/{file_stem}.rb"));
+            let rb_path = super::class_paths::class_rb(lc.name.0.as_str());
             emit_library_class_rbs(lc, &rb_path)
         })
         .collect()

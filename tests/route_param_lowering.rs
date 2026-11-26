@@ -115,8 +115,16 @@ fn a_plain_models_record_converts_with_id() {
 #[test]
 fn a_slug_models_record_still_converts_with_to_param() {
     let c = shown();
-    assert!(
-        c.contains("RouteHelpers.user_path(@room.user.to_param)"),
+    let projection = concat!(
+        "RouteHelpers.user_path((route_segment_0 = @room.user\n",
+        "    if route_segment_0.nil?\n",
+        "      nil\n",
+        "    else\n",
+        "      route_segment_0.to_param\n",
+        "    end))",
+    );
+    assert_eq!(
+        c.matches(projection).count(), 1,
         "a to_param-overriding model uses to_param:\n{c}"
     );
 }

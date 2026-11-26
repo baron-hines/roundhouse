@@ -30,6 +30,7 @@ require_relative "runtime/db"
 # the stdlib equivalents with semantically-identical implementations
 # for the surface framework Ruby actually uses.
 require_relative "runtime/base64"
+require_relative "runtime/securerandom_active_support"
 # Module-only Shellwords — packages/shellwords reopens String/Array and
 # poisons String#split (PolyArray → C compile fail). See
 # runtime/spinel/shellwords_spinel.rb; defining the module drops
@@ -57,6 +58,8 @@ require_relative "runtime/params"
 require_relative "runtime/action_dispatch_journey"
 # Before any gem: a gem's middleware subclasses it (rack-attack's Rack::Attack::Request).
 require_relative "runtime/rack_request"
+# Before any gem: Warden's manager names it as it answers (runtime/rack_response.rb).
+require_relative "runtime/rack_response"
 # Before any gem: a gem subclasses it (rack-attack's BaseProxy).
 require_relative "runtime/delegate_spinel"
 # ActionText::Content — the coder behind a `has_rich_text` attribute.
@@ -78,6 +81,7 @@ require_relative "runtime/active_support_duration"
 require_relative "runtime/active_support_ext"
 require_relative "runtime/active_support_calendar"
 require_relative "runtime/active_model_validator"
+require_relative "runtime/active_model_name"
 require_relative "runtime/rails"
 # Not part of runtime/rails: the instrumented Notifications paths keep per-thread state the strict targets' typing gate does not follow.
 require_relative "runtime/active_support_instrumentation"
@@ -309,6 +313,10 @@ require_relative "runtime/integration_session"
 # Rails 8.1.4's full ActionController::Head options hash is a Ruby-family
 # feature; strict non-Ruby targets keep the bounded shared implementation.
 require_relative "runtime/action_controller_head"
+# `Controller.action(name)`, which a gem's middleware calls (Warden's failure app).
+require_relative "runtime/action_controller_endpoint"
+require_relative "runtime/active_record_attribute_keys"
+require_relative "runtime/route_helpers_routes"
 require_relative "runtime/action_controller_render"
 # Rails' FlashHash keeps any key; the shared Flash keeps notice/alert, which every target can type.
 require_relative "runtime/flash_any_key"

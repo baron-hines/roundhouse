@@ -70,7 +70,8 @@ fn defined_of_a_constant_path_while_loading_is_still_refused() {
 
 #[test]
 fn defined_of_anything_else_is_still_refused() {
-    let c = controller("    @error = defined?(String.new) ? \"set\" : nil");
+    // Not `defined?(recv.m)`: Spinel answers that one as CRuby does (tests/emit_and_run/defined_method_query.rs).
+    let c = controller("    @error = defined?(super) ? \"set\" : nil");
     let (ok, err) = spinel_build("defined-call", &[("app/controllers/probe_controller.rb", &c)]);
     assert!(!ok && err.contains("runtime defined? query"), "{err}");
 }

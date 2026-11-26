@@ -6,7 +6,7 @@ mod emit_and_run;
 
 const BASE: &str =
     "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n";
-const SCHEMA: &str = r#"ActiveRecord::Schema.define do
+const SCHEMA: &str = r#"ActiveRecord::Schema[8.1].define(version: 1) do
   create_table :items, force: true do |t|
     t.string :name
     t.string :code
@@ -520,7 +520,7 @@ fn registration_order_identity_ownership_and_truthiness_run_natively() {
     ];
     let own = |source: &str, n: usize| source.replace("Item", &format!("Item{n}"));
     // The app-owned batch `validate`'s own check is case 0; the table's cases follow it.
-    let mut tables = String::from("ActiveRecord::Schema.define do\n");
+    let mut tables = String::from("ActiveRecord::Schema[8.1].define(version: 1) do\n");
     for n in 0..=cases.len() {
         tables.push_str(&format!(
             "  create_table :item{n}s, force: true do |t|\n    t.string :name\n    t.string :code\n    t.string :type\n    t.boolean :enabled\n  end\n"
@@ -1042,6 +1042,9 @@ RailsOracle.activate('railties', 'activerecord', sqlite3: '>= 2.9')
 require 'rails'
 require 'active_record/railtie'
 require 'tmpdir'
+require 'fileutils'
+ORACLE_ROOT = Dir.mktmpdir('validation-oracle')
+at_exit {{ FileUtils.remove_entry(ORACLE_ROOT) unless ENV['ROUNDHOUSE_KEEP_EMITTED'] }}
 ENV['RAILS_ENV'] = 'test'
 ENV['DATABASE_URL'] = 'sqlite3::memory:'
 class ValidationOracle < Rails::Application
@@ -1049,7 +1052,7 @@ class ValidationOracle < Rails::Application
   config.eager_load = false
   config.secret_key_base = 'validation-oracle-key'
   config.logger = Logger.new(File::NULL)
-  config.root = Dir.mktmpdir('validation-oracle')
+  config.root = ORACLE_ROOT
 end
 ValidationOracle.initialize!
 ActiveRecord::Base.establish_connection(adapter: 'sqlite3', database: ':memory:')

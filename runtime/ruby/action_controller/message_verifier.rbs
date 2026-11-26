@@ -27,9 +27,13 @@ module ActionController
     def self.iso8601_ms: (::Time t) -> String
     def self.verified: (String secret, String salt, String signed, String purpose, bool sha1) -> String
     def self.verified_json: (String secret, String salt, String signed, String purpose, bool sha1) -> String
+    def self.verified_json_by_key: (String key, String signed, String purpose, bool sha1) -> String
+    def self.verified_unpurposed_json_by_key: (String key, String signed, bool sha1) -> String
+    def self.unpurposed_json: (String plain) -> String
     def self.envelope_message: (String env, String purpose) -> String
     def self.secure_compare: (String a, String b) -> bool
     def self.digest_for: (String secret, String salt, String payload, bool sha1) -> String
+    def self.digest_by_key: (String key, String payload, bool sha1) -> String
     def self.extract: (String envelope, String prefix) -> String
     def self.json_string: (String value) -> String
     def self.json_value: (String json) -> String

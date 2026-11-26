@@ -149,9 +149,9 @@ pub fn apply_fused_context_rewrites(app: &mut App) {
 /// `controller_class_render` is hooks plus per-test attachment locals;
 /// `sum_symbol` is model methods/unknown last so its new `to_a`/`sum`
 /// children are not fed to the other fused rewrites.
-pub fn apply_fused_pre_tag_rewrites(app: &mut App) {
+pub fn apply_fused_pre_tag_rewrites(app: &mut App, target: crate::build_target::BuildTarget) {
     super::attribute_aliases::receiver::prove(app);
-    let models = super::attribute_aliases::Models::of(app);
+    let models = super::attribute_aliases::Models::of(app, target);
     let sti_names = super::sti_is_a::subclass_type_names(app);
     let contracts = super::controller_class_render::call_contracts(app);
     let none = HashSet::default();
@@ -324,7 +324,7 @@ fn rewrite_narrow_controller_node(e: &mut Expr) {
 /// `.target`. Collect tables once; one owned-hook walk, one view walk,
 /// one test walk. Tests skip `position_path_params`, matching the
 /// original `route_url_options` surface.
-pub fn apply_fused_mid_rewrites(app: &mut App) {
+pub fn apply_fused_mid_rewrites(app: &mut App, target: crate::build_target::BuildTarget) {
     let helpers = super::route_format_suffix::route_helper_names(app);
     let path_params = if helpers.is_empty() {
         Default::default()
@@ -332,7 +332,7 @@ pub fn apply_fused_mid_rewrites(app: &mut App) {
         super::route_url_options::bare_url_helper_receivers(app, &helpers);
         super::route_url_options::helper_path_params(app)
     };
-    let enum_map = super::enum_symbols::enum_columns(app);
+    let enum_map = super::enum_symbols::enum_columns(app, target.has_runtime_relation());
     let json_map = super::has_json::has_json_columns(&app.models);
     let by_model = super::assoc_loaded::has_many_by_model(app);
     let readers = super::assoc_loaded::association_readers_by_model(app);

@@ -63,6 +63,9 @@ mod nilable_string_view;
 #[path = "support/each_receiver_once.rs"]
 #[allow(dead_code)]
 mod each_receiver_once;
+#[path = "support/join_nil.rs"]
+#[allow(dead_code)]
+mod join_nil;
 #[path = "support/link_to_if_escape.rs"]
 #[allow(dead_code)]
 mod link_to_if_escape;
@@ -672,6 +675,19 @@ fn nilable_string_view_nil_effect_renders() {
 #[ignore]
 fn each_receiver_once_renders() {
     let (app, renders) = (each_receiver_once::strict_app(), each_receiver_once::RENDERS.to_vec());
+    let (ok, stdout, stderr) = render_probe(app);
+    assert!(ok, "{stdout}\n{stderr}");
+    for want in &renders {
+        assert!(stdout.contains(want), "expected {want:?} in\n{stdout}");
+    }
+}
+
+/// #1949: `join` reads a nil element as an empty string, as Rails 8.1.4
+/// does (`join_nil::VIEW`).
+#[test]
+#[ignore]
+fn join_nil_renders() {
+    let (app, renders) = (join_nil::strict_app(), join_nil::RENDERS.to_vec());
     let (ok, stdout, stderr) = render_probe(app);
     assert!(ok, "{stdout}\n{stderr}");
     for want in &renders {

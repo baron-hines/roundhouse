@@ -32,6 +32,7 @@ mod params_values;
 mod params_sources;
 mod permit_splat;
 mod typed_update;
+mod respond_with;
 pub mod params_wrapper;
 pub mod rewrites;
 pub mod util;
@@ -45,7 +46,7 @@ use crate::ingest::controller::VERIFY_AUTHENTICITY_TOKEN;
 use crate::expr::{Expr, ExprNode, Literal};
 use crate::ident::{ClassId, Symbol};
 use crate::span::Span;
-use crate::ty::Ty;
+use crate::ty::{FnTy, Ty};
 use crate::lower::controller::body::{
     has_toplevel_terminal, synthesize_deferred_implicit_render,
     unwrap_respond_to_with_format_dispatch, FormatBreadth,
@@ -294,6 +295,10 @@ pub struct LowerControllerOptions<'a> {
     /// for every controller. Read only when the tree
     /// `FormatBreadth::wraps_json_params`.
     pub wrap_parameters_by_default: bool,
+    /// The app bundles jbuilder (its `Gemfile.lock`, and not `require: false` in its Gemfile), so
+    /// `ActionController::API` renders views: jbuilder's railtie includes `ActionView::Rendering` there.
+    /// `None` without a lockfile: any `.jbuilder` view answers.
+    pub jbuilder_loaded: Option<bool>,
     /// `App::concern_spliced_actions`: per controller, the methods the
     /// ingest copied in from included modules. They count as defined
     /// for the missing-action check (`missing_action_check`). `None`
@@ -331,6 +336,7 @@ pub fn lower_controllers_with_arel_views_assocs_and_routes(
         models,
         wrap_parameters_by_default,
         concern_spliced_actions,
+        jbuilder_loaded,
     } = opts;
     // `None` (every wrapper's default) means the projection stays
     // purely shape-directed — what it was before this table existed.
@@ -339,6 +345,10 @@ pub fn lower_controllers_with_arel_views_assocs_and_routes(
     // `permit(*helper)` with a helper answering a literal Symbol list is
     // the same permit written inline; inline it before anything reads
     // the permit lists (`permit_splat`).
+    let responders_with_behavior = respond_with::Responders {
+        with_behavior: respond_with::responders_with_behavior(library_classes),
+        jbuilder_loaded: jbuilder_loaded.unwrap_or_else(|| views.iter().any(|v| v.jbuilder)),
+    };
     let inlined = self::permit_splat::inline_permit_splats(controllers);
     let controllers: &[Controller] = inlined.as_deref().unwrap_or(controllers);
     // Scan source-shape action bodies for `permit(...)` declarations.
@@ -394,7 +404,7 @@ pub fn lower_controllers_with_arel_views_assocs_and_routes(
                 library_classes,
                 concern_spliced_actions,
             );
-            let methods = build_methods(controller, controllers, &params_specs, &assoc_registry, &json_actions, &text_format_actions, routed.as_ref(), &view_ivars, &partials, format_breadth, route_id_segments, inferred_params, wrapper.as_ref(), action_check.as_ref());
+            let methods = build_methods(controller, controllers, &params_specs, &assoc_registry, &json_actions, &text_format_actions, routed.as_ref(), &view_ivars, &partials, format_breadth, route_id_segments, inferred_params, wrapper.as_ref(), action_check.as_ref(), &responders_with_behavior);
             all_methods.push((methods, controller));
         }
         subclass_template_hooks(&mut all_methods, controllers, &view_ivars, &partials);
@@ -555,6 +565,10 @@ pub fn lower_controllers_with_arel_views_assocs_and_routes(
 
     let permitted_fields = self::params::permitted_field_tys(&params_specs);
 
+    let string_enums = match schema {
+        Some(schema) if ruby_read_values => crate::lower::arel::StringEnums::of_models(models, schema),
+        _ => Default::default(),
+    };
     let mut out = Vec::new();
     // Params classes a kept `update(<params object>)` reads `to_attrs`
     // of (`typed_update::hand_update_the_attrs`).
@@ -601,7 +615,7 @@ pub fn lower_controllers_with_arel_views_assocs_and_routes(
             if let Some(schema) = schema {
                 if !refined_across_methods {
                     rewritten |= crate::lower::arel::rewrite_arel_in_expr_with_ruby_values(
-                        &mut method.body, schema, &classes, assocs, ruby_read_values,
+                        &mut method.body, schema, &classes, assocs, ruby_read_values.then_some(&string_enums),
                         &relation_scope_names,
                         crate::lower::arel::SqliteVisitor { param_binds },
                     );
@@ -707,6 +721,7 @@ pub fn lower_controller_to_library_class(controller: &Controller) -> LibraryClas
         None,
         None,
         None,
+        &respond_with::Responders { with_behavior: crate::det::HashSet::default(), jbuilder_loaded: false },
     );
     methods.extend(collect_attr_accessor_methods(controller));
     apply_alias_methods(controller, &mut methods);
@@ -1159,6 +1174,7 @@ fn build_methods(
     // Rails' ParamsWrapper for this controller, when its requests get one.
     wrapper: Option<&self::params_wrapper::WrapperSpec>,
     action_check: Option<&crate::det::HashSet<Symbol>>,
+    responders_with_behavior: &respond_with::Responders,
 ) -> Vec<MethodDef> {
     let mut methods: Vec<MethodDef> = controller.class_methods().cloned().collect();
 
@@ -1438,7 +1454,7 @@ fn build_methods(
             params_specs, assocs, json_actions,
             text_format_actions, view_ivars,
             partials, format_breadth, &shadows, route_id_segments, inferred_params,
-            &deferred_renders, &mut deferred_tails,
+            &deferred_renders, &mut deferred_tails, responders_with_behavior,
         ));
     }
     if let Some((mut preamble, mut wraps)) = pending_dispatcher {
@@ -1449,6 +1465,7 @@ fn build_methods(
                 /*is_public=*/ false, params_specs, assocs, &[], view_ivars, partials,
                 format_breadth, &shadows, route_id_segments, false, false, None, None, &[],
                 /*preserve_named_layout=*/ true, overlaid(controller, all_controllers),
+                &descendant_method_names(controller, all_controllers),
             ).0
         });
         // Template lowering can introduce a read of self.action_name.
@@ -1469,6 +1486,7 @@ fn build_methods(
             &wraps,
             reads,
             &missing,
+            controller.csp_header,
         );
         // Assembly adds expressions after action lowering. Route-helper
         // rewriting is idempotent and must still cover the final dispatcher;
@@ -1487,7 +1505,7 @@ fn build_methods(
             params_specs, assocs, json_actions,
             text_format_actions, view_ivars,
             partials, format_breadth, &shadows, route_id_segments, inferred_params,
-            &no_deferred, &mut crate::det::HashMap::default(),
+            &no_deferred, &mut crate::det::HashMap::default(), responders_with_behavior,
         ));
     }
     // Public methods no route reaches are helpers/filters, not actions:
@@ -1500,7 +1518,7 @@ fn build_methods(
             params_specs, assocs, json_actions,
             text_format_actions, view_ivars,
             partials, format_breadth, &shadows, route_id_segments, inferred_params,
-            &no_deferred, &mut crate::det::HashMap::default(),
+            &no_deferred, &mut crate::det::HashMap::default(), responders_with_behavior,
         ));
     }
 
@@ -1895,7 +1913,7 @@ fn class_side_safe_methods(controller: &Controller) -> crate::det::HashMap<Symbo
 
 /// Does `f` apply to the action named `action_name`?
 fn filter_applies(f: &Filter, action_name: &Symbol) -> bool {
-    if !f.only.is_empty() {
+    if f.only_present || !f.only.is_empty() {
         f.only.contains(action_name)
     } else if !f.except.is_empty() {
         !f.except.contains(action_name)
@@ -2169,16 +2187,32 @@ fn build_filter_preamble(
     // dispatcher already enforces per action (`filter_cond` emits the
     // only/except guard).
     let narrow = |f: &Filter| -> Option<Filter> {
+        // `only: []` matches no action in Rails (`ActionFilter` over an
+        // empty list), so the filter never runs.
+        if f.only_present && f.only.is_empty() {
+            return None;
+        }
         let mut f = f.clone();
         for skip in skips
             .iter()
             .filter(|s| s.target == f.target && s.kind.skipped_kind().as_ref() == Some(&f.kind))
+            // A skip with `only: []` skips no action.
+            .filter(|s| !(s.only_present && s.only.is_empty()))
         {
             if skip.only.is_empty() && skip.except.is_empty() {
                 return None;
             }
+            // A filter that names its actions loses the skipped ones
+            // from that list: the guard reads `only:` alone when it has
+            // one, so an `except:` beside it would not be checked.
+            if !f.only.is_empty() && !skip.only.is_empty() {
+                f.only.retain(|a| !skip.only.contains(a));
+                if f.only.is_empty() {
+                    return None;
+                }
+            }
             for a in &skip.only {
-                if !f.except.contains(a) {
+                if f.only.is_empty() && !f.except.contains(a) {
                     f.except.push(a.clone());
                 }
             }
@@ -2275,7 +2309,9 @@ fn build_filter_preamble(
     // them. Multiple prepends within one walk end up front-to-back in
     // REVERSE declaration order: each `prepend_before_action` Rails
     // sees unshifts onto the same head, so the last one declared is the
-    // first one that runs.
+    // first one that runs. A `prepend_around_action` joins them as an
+    // around `Call` at its place in that head: the dispatcher runs
+    // everything after it inside its block.
     let mut prepends: Vec<PreambleStmt> = Vec::new();
     let bodies = chain.iter().map(|c| (*c, false)).chain(std::iter::once((controller, true)));
     for (c, is_own) in bodies {
@@ -2301,11 +2337,25 @@ fn build_filter_preamble(
                 ControllerBodyItem::Filter { filter, .. }
                     if matches!(filter.kind, FilterKind::Around | FilterKind::After) =>
                 {
+                    // Registering an around again, a parent's in a
+                    // child, moves it: Rails' callback chain removes the
+                    // earlier one of the same name before it appends or
+                    // prepends the new one, whatever the new one's
+                    // scope, so this comes before the narrowing drops an
+                    // `only: []` registration.
+                    if matches!(filter.kind, FilterKind::Around) {
+                        let target = &filter.target;
+                        wraps.around.retain(|a| &a.target != target);
+                        prepends.retain(|p| !matches!(p, PreambleStmt::Call { filter, .. }
+                            if matches!(filter.kind, FilterKind::Around) && &filter.target == target));
+                    }
                     let Some(f) = narrow(filter) else { continue };
                     if find_target(&f.target).is_none() {
                         continue;
                     }
-                    if matches!(f.kind, FilterKind::Around) {
+                    if matches!(f.kind, FilterKind::Around) && f.prepend {
+                        prepends.push(PreambleStmt::Call { filter: f, halt_check: false });
+                    } else if matches!(f.kind, FilterKind::Around) {
                         wraps.around.push(f);
                     } else {
                         wraps.after.push(PreambleStmt::Call { filter: f, halt_check: false });
@@ -2347,8 +2397,8 @@ fn build_filter_preamble(
             }
         }
     }
-    // Hoist every `prepend_before_action` to the head of the chain, in
-    // reverse declaration order — see the comment where `prepends` is
+    // Hoist every `prepend_before_action` and `prepend_around_action` to
+    // the head of the chain, in reverse declaration order — see the comment where `prepends` is
     // declared above.
     if !prepends.is_empty() {
         prepends.reverse();
@@ -2651,6 +2701,15 @@ fn inheritor_view_modules(controller: &Controller, all: &[Controller]) -> Vec<St
         .collect()
 }
 
+/// Every method name a controller below this one defines (its own or a concern's): an inherited action
+/// calling one of these by name runs that subclass's definition on the subclass's routes.
+fn descendant_method_names(controller: &Controller, all: &[Controller]) -> crate::det::HashSet<Symbol> {
+    all.iter()
+        .filter(|c| ancestor_chain(c, all).iter().any(|p| p.name == controller.name))
+        .flat_map(|c| c.actions().map(|a| a.name.clone()))
+        .collect()
+}
+
 /// Whether the controller has `route_param_recall::OVERLAY`, its own or inherited.
 fn overlaid(controller: &Controller, all: &[Controller]) -> bool {
     let name = crate::lower::route_param_recall::OVERLAY;
@@ -2889,7 +2948,7 @@ fn insert_baseline_controller_methods(info: &mut crate::analyze::ClassInfo) {
     // doesn't matter for typing — we don't check per-key types of
     // controller render options today.
     let kw_rest_opts = || -> Ty {
-        Ty::Fn {
+        Ty::Fn(Box::new(FnTy {
             params: vec![crate::ty::Param {
                 name: Symbol::from("opts"),
                 ty: any_hash.clone().into(),
@@ -2898,10 +2957,10 @@ fn insert_baseline_controller_methods(info: &mut crate::analyze::ClassInfo) {
             block: None,
             ret: std::sync::Arc::new(Ty::Nil),
             effects: crate::effect::EffectSet::pure(),
-        }
+        }))
     };
     let positional_with_kwargs = |first_name: &str, first_ty: Ty| -> Ty {
-        Ty::Fn {
+        Ty::Fn(Box::new(FnTy {
             params: vec![
                 crate::ty::Param {
                     name: Symbol::from(first_name),
@@ -2917,7 +2976,7 @@ fn insert_baseline_controller_methods(info: &mut crate::analyze::ClassInfo) {
             block: None,
             ret: std::sync::Arc::new(Ty::Nil),
             effects: crate::effect::EffectSet::pure(),
-        }
+        }))
     };
     info.instance_methods
         .entry(Symbol::from("render"))
@@ -3202,6 +3261,7 @@ fn action_to_method(
     inferred_params: Option<&crate::det::HashMap<(ClassId, Symbol), Vec<Ty>>>,
     deferred_renders: &crate::det::HashSet<Symbol>,
     deferred_out: &mut crate::det::HashMap<Symbol, Expr>,
+    responders_with_behavior: &respond_with::Responders,
 ) -> MethodDef {
     let method_name = method_name_for_action(a.name.as_str());
     // Required positionals, optionals (so `def get_from_cache(opts = {})`
@@ -3261,8 +3321,44 @@ fn action_to_method(
         can_respond_within(&a.body, &resolve, &mut std::collections::BTreeSet::new())
     };
     let inheritor_modules = inheritor_view_modules(controller, all_controllers_for_params);
+    let chain: Vec<&Controller> = std::iter::once(controller).chain(ancestor_chain(controller, all_controllers_for_params).into_iter().rev()).collect();
+    let responder_expr = chain.iter().find_map(|c| {
+        c.body.iter().find_map(|item| {
+            let crate::dialect::ControllerBodyItem::Unknown { expr, .. } = item else { return None };
+            match &*expr.node {
+                ExprNode::Assign { target: crate::expr::LValue::Attr { recv, name }, value } if matches!(&*recv.node, ExprNode::SelfRef) && name.as_str() == "responder" => Some(value),
+                // The setter call a class body writes as `self.responder = v`.
+                ExprNode::Send { recv: Some(recv), method, args, .. } if method.as_str() == "responder=" && matches!(&*recv.node, ExprNode::SelfRef) && args.len() == 1 => args.first(),
+                _ => None,
+            }
+        })
+    });
+    // Past `ancestor_chain`'s depth a further ancestor may declare other formats.
+    let chain_complete = !chain.last().and_then(|c| c.parent.as_ref()).is_some_and(|p| all_controllers_for_params.iter().any(|c| &c.name == p));
+    let responder_keeps_defaults = !responder_expr.is_some_and(|r| respond_with::names_responder_with_behavior(r, &responders_with_behavior.with_behavior));
+    let html_only = respond_with::html_only_declared(&chain) == Some(true);
+    let json_only = respond_with::json_only_declared(&chain) == Some(true);
+    // Native renders an action's template from the controller's own view directory. A json-only action whose
+    // template could come from an ancestor's directory instead keeps its call: Rails would render that template.
+    let json_template_inherited = json_only
+        && !json_actions.contains(&a.name)
+        && chain.iter().skip(1).any(|c| views_module_name(c).is_some_and(|m| view_ivars.contains_key(&(m, format!("{}_json", a.name.as_str())))));
+    let respond_with_body = (chain_complete && responder_keeps_defaults && (html_only || json_only) && !json_template_inherited).then(|| {
+        let has_template = if json_only {
+            json_actions.contains(&a.name)
+        } else {
+            chain.iter().any(|c| views_module_name(c).is_some_and(|m| view_ivars.contains_key(&(m, a.name.as_str().to_string()))))
+        };
+        // The chain's root: an app controller's parent the app does not define.
+        let on_api = chain.last().and_then(|c| c.parent.as_ref()).is_some_and(|p| p.0.as_str().trim_start_matches("::") == "ActionController::API");
+        let view_rendering = !on_api || responders_with_behavior.jbuilder_loaded;
+        respond_with::lower(
+            &a.body,
+            &respond_with::Facts { action: is_public.then_some(a.name.as_str()), has_template, responder: responder_expr, json: json_only, view_rendering },
+        )
+    });
     let (body, deferred_tail) = lower_action_body(
-        &a.body,
+        respond_with_body.as_ref().unwrap_or(&a.body),
         controller,
         a.name.as_str(),
         privs,
@@ -3283,6 +3379,7 @@ fn action_to_method(
         &inheritor_modules,
         /*preserve_named_layout=*/ false,
         overlaid(controller, all_controllers_for_params),
+        &descendant_method_names(controller, all_controllers_for_params),
     );
     if let Some(tail) = deferred_tail {
         deferred_out.insert(a.name.clone(), tail);
@@ -3458,11 +3555,11 @@ fn union_with(a: Ty, b: Ty) -> Ty {
 /// beside it and spinel binds the call's kwargs Hash to the first slot.
 fn mark_param_kinds(sig: Ty, params: &[Param]) -> Ty {
     match sig {
-        Ty::Fn { params: mut tps, block, ret, effects } => {
-            for (tp, p) in tps.iter_mut().zip(params) {
+        Ty::Fn(mut fn_ty) => {
+            for (tp, p) in fn_ty.params.iter_mut().zip(params) {
                 tp.kind = p.ty_kind();
             }
-            Ty::Fn { params: tps, block, ret, effects }
+            Ty::Fn(fn_ty)
         }
         other => other,
     }
@@ -3528,6 +3625,8 @@ fn lower_action_body(
     inheritor_modules: &[String],
     preserve_named_layout: bool,
     overlaid: bool,
+    // Method names a subclass redefines (`descendant_method_names`).
+    overridden_below: &crate::det::HashSet<Symbol>,
 ) -> (Expr, Option<Expr>) {
     // BEFORE everything else: this turns a helper the permit recognizer
     // could not read into one that yields the params class, so every
@@ -3691,6 +3790,16 @@ fn lower_action_body(
     let mut filtered = crate::lower::params_permit::filtered_permit_helpers(privs);
     filtered.extend(crate::lower::params_permit::filtered_permit_helpers(params_privs));
     crate::lower::params_permit::stringify_filtered_helper_reads(&mut lowered, &filtered);
+    // A helper the class defines itself is judged by its own body: an override answering a plain Hash shadows an
+    // ancestor's permit, so only the inherited helpers this class does not define come from `params_privs`.
+    let mut permitted = crate::lower::params_permit::permitted_helpers(privs);
+    let inherited: Vec<Action> =
+        params_privs.iter().filter(|a| !privs.iter().any(|p| p.name == a.name)).cloned().collect();
+    permitted.extend(crate::lower::params_permit::permitted_helpers(&inherited));
+    // And a subclass that redefines one runs this body with its own: `allowed_attrs.fetch("title")` in an inherited
+    // action reads the subclass's Hash, so only a helper no subclass redefines counts.
+    permitted.retain(|name| !overridden_below.contains(name));
+    crate::lower::params_permit::symbolize_permitted_helper_reads(&mut lowered, &permitted);
     if !defer_implicit_render {
         return (lowered, None);
     }

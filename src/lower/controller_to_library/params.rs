@@ -56,7 +56,7 @@ use crate::ident::{ClassId, Symbol, VarId};
 use crate::lower::typing::with_ty;
 use crate::naming::camelize;
 use crate::span::Span;
-use crate::ty::Ty;
+use crate::ty::{FnTy, Ty};
 
 use super::util::map_expr;
 
@@ -813,6 +813,21 @@ fn scan_lookup_demand(controllers: &[Controller], specs: &mut ParamsSpecs) {
                         blocked.push(class);
                     }
                 }
+                // `<permit-chain>.tap { |p| p.require(:key) }`: the block
+                // parameter is the params object itself.
+                if let ExprNode::Send { recv: Some(recv), method, block: Some(block), .. } = &*expr.node
+                    && method.as_str() == "tap"
+                    && let ExprNode::Lambda { params, body, .. } = &*block.node
+                    && let [param] = params.as_slice()
+                    && block_requires_key(body, param)
+                    && let Some(class) = sources.class(recv, specs).or_else(|| {
+                        match_permit_call_full(recv).and_then(|(resource, fields, _)| {
+                            specs.find(&resource, &fields, &nested_signature(recv)).map(|spec| spec.class_id.clone())
+                        })
+                    })
+                {
+                    calls.push((class, Symbol::from("require")));
+                }
                 let ExprNode::Send { recv: Some(recv), method, args, block, .. } = &*expr.node else {
                     return;
                 };
@@ -870,6 +885,22 @@ fn scan_lookup_demand(controllers: &[Controller], specs: &mut ParamsSpecs) {
             }
         }
     }
+}
+
+/// Whether `body` calls `<param>.require(:key)` with a literal Symbol.
+fn block_requires_key(body: &Expr, param: &Symbol) -> bool {
+    let mut found = false;
+    walk_all(body, &mut |e| {
+        if let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*e.node
+            && method.as_str() == "require"
+            && matches!(&*recv.node, ExprNode::Var { name, .. } if name == param)
+            && let [key] = args.as_slice()
+            && sym_of(key).is_some()
+        {
+            found = true;
+        }
+    });
+    found
 }
 
 /// Second phase: which specs a `<Model>.create(<helper>)` call site
@@ -1340,7 +1371,8 @@ pub fn first_permit_in(body: &Expr) -> Option<(Symbol, Vec<Symbol>, Vec<String>)
 
 /// Push the permit list of each value `expr` can evaluate to, or answer
 /// false when one of them is not a permit. A local read resolves to the
-/// values `body` writes to that local.
+/// values `body` writes to that local; `except` and a `tap` block are
+/// seen through to their receiver.
 fn collect_returned_permits<'a>(
     expr: &'a Expr,
     body: &'a Expr,
@@ -1377,15 +1409,31 @@ fn collect_returned_permits<'a>(
             arms.iter().map(|arm| &arm.body).collect()
         }
         ExprNode::CaseMatch { arms, else_body, .. } => arms.iter().map(|arm| &arm.body).chain(else_body).collect(),
-        ExprNode::BeginRescue { body: begun, rescues, else_branch, .. } => std::iter::once(else_branch.as_ref().unwrap_or(begun))
+        ExprNode::BeginRescue { body: begun, rescues, else_branch, .. } => std::iter::once(else_branch.as_deref().unwrap_or(begun))
             .chain(rescues.iter().map(|rescue| &rescue.body))
             .collect(),
         ExprNode::Assign { value, .. } | ExprNode::OpAssign { value, .. } | ExprNode::Return { value } => vec![value],
         ExprNode::BoolOp { left, right, .. } | ExprNode::RescueModifier { expr: left, fallback: right } => vec![left, right],
         ExprNode::Send { recv: Some(recv), method, .. } if method.as_str() == "except" => vec![recv],
+        ExprNode::Send { recv: Some(recv), method, args, block: Some(block), .. }
+            if method.as_str() == "tap" && args.is_empty() && !block_can_leave(block) => vec![recv],
         _ => Vec::new(),
     };
     !sources.is_empty() && sources.into_iter().all(|source| collect_returned_permits(source, body, resolving, permits))
+}
+
+/// Whether `block` can leave with a value other than its call's result:
+/// `tap { |p| ... }` returns its receiver unless the block ends it with
+/// `break value`, or ends the whole method with `return value`. A `break`
+/// in a nested block ends that block's call and is skipped; one in a loop
+/// is counted, and so is a `return` at any depth, which can only leave a
+/// helper untyped. A forwarded block (`tap(&check)`) isn't read: it counts.
+fn block_can_leave(block: &Expr) -> bool {
+    let ExprNode::Lambda { body, .. } = &*block.node else { return true };
+    let mut leaves = false;
+    for_each_outside_lambdas(body, &mut |e| leaves |= matches!(&*e.node, ExprNode::Break { .. }));
+    walk_all(body, &mut |e| leaves |= matches!(&*e.node, ExprNode::Return { .. }));
+    leaves
 }
 
 fn for_each_outside_lambdas<'a>(expr: &'a Expr, f: &mut dyn FnMut(&'a Expr)) {
@@ -1456,6 +1504,19 @@ fn rewrite_tail(e: &Expr, spec: &ParamsSpec) -> Expr {
                 cond: cond.clone(),
                 then_branch: rewrite_tail(then_branch, spec),
                 else_branch: rewrite_tail(else_branch, spec),
+            }),
+            ..e.clone()
+        },
+        // `<value>.tap { … }` answers `<value>` (see `block_can_leave`),
+        // so the rewrite belongs on the receiver.
+        ExprNode::Send { recv: Some(recv), method, args, block: Some(b), parenthesized }
+            if method.as_str() == "tap" && args.is_empty() && !block_can_leave(b) => Expr {
+            node: Box::new(ExprNode::Send {
+                recv: Some(rewrite_tail(recv, spec)),
+                method: method.clone(),
+                args: args.clone(),
+                block: Some(b.clone()),
+                parenthesized: *parenthesized,
             }),
             ..e.clone()
         },
@@ -2046,6 +2107,9 @@ fn build_params_class(spec: &ParamsSpec) -> LibraryClass {
             });
         }
         methods.push(synth_to_h(spec));
+        if spec.lookup_methods.contains(&Symbol::from("require")) {
+            methods.push(super::params_values::require_method(spec));
+        }
         if spec.wants_as_json {
             methods.push(synth_as_json(&spec.class_id));
         }
@@ -2313,14 +2377,14 @@ fn synth_except(spec: &ParamsSpec) -> MethodDef {
         receiver: MethodReceiver::Instance,
         params: vec![Param::rest(keys.clone())],
         body,
-        signature: Some(Ty::Fn {
+        signature: Some(Ty::Fn(Box::new(FnTy {
             params: vec![crate::ty::Param {
                 name: keys, ty: keys_ty.into(), kind: crate::ty::ParamKind::Rest,
             }].into(),
             block: None,
             ret: owner_ty.into(),
             effects: EffectSet::pure(),
-        }),
+        }))),
         effects: EffectSet::default(),
         enclosing_class: Some(owner.0.clone()),
         kind: AccessorKind::Method,
@@ -2981,7 +3045,7 @@ fn synth_as_json(owner: &ClassId) -> MethodDef {
 }
 
 fn fn_sig(params: Vec<(Symbol, Ty)>, ret: Ty) -> Ty {
-    Ty::Fn {
+    Ty::Fn(Box::new(FnTy {
         params: params
             .into_iter()
             .map(|(name, ty)| crate::ty::Param {
@@ -2993,7 +3057,7 @@ fn fn_sig(params: Vec<(Symbol, Ty)>, ret: Ty) -> Ty {
         block: None,
         ret: std::sync::Arc::new(ret),
         effects: crate::effect::EffectSet::pure(),
-    }
+    }))
 }
 
 /// Build the `ClassInfo` registry entry for a synthesized Params class

@@ -78,7 +78,7 @@ end
 "#,
         )
         .run_ruby("p Sampling.diagnostic_sampling\np CacheStore.new.report\n");
-    assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+    run.assert_passes();
     assert_eq!(run.stdout, "\"other\"\n[\"development\", \"lenient\", \"other\", true, true, true]\n");
 }
 
@@ -123,7 +123,7 @@ end
 "#,
         )
         .run_ruby("p Connection.new.report\n");
-    assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+    run.assert_passes();
     assert_eq!(run.stdout, "[:TLS1_2, nil, false, false, false, \"s\"]\n");
 }
 
@@ -251,7 +251,7 @@ end
              p [Shop.sharded_table?, Shop.sharded_hook, Shop.tracked_hook]\n\
              p Sharded::ClassMethods.singleton_methods\n",
         );
-    assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+    run.assert_passes();
     assert_eq!(
         run.stdout,
         "[true, \"extended Widget\", \"tracked Widget\"]\n[true, \"extended Shop\", \"tracked Shop\"]\n[:extended]\n"
@@ -340,6 +340,21 @@ end
         .write("vendor/gems/vc-1.0.0/lib/vc.rb", GEM)
         .write("lib/widget.rb", WIDGET)
         .run_ruby(SCRIPT);
-    assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+    run.assert_passes();
     assert_eq!(run.stdout, EXPECTED, "{}", run.stderr);
+}
+
+/// Spinel compiles a load-time `if` around `def`s, but not one whose name a builtin or another def also answers
+/// (`to_s`, or a method the parent defines): only that one is reported on its tree. Two separate conditionals of one
+/// name (`tone`) compile, the later branch that ran answering, as Ruby does.
+#[test]
+fn spinel_reports_only_a_conditional_def_another_method_answers() {
+    let (_emitted, errors) = emit_and_run::empty_app()
+        .write(
+            "lib/greeter.rb",
+            "class GreeterBase\n  def shout = \"base\"\nend\n\nclass Greeter < GreeterBase\n  if Rails.env.production?\n    def mode = \"production\"\n  else\n    def mode = \"other\"\n  end\n\n  if Rails.env.test?\n    def to_s = \"test\"\n  end\n\n  unless Rails.env.development?\n    def shout = \"loud\"\n  end\n\n  if Rails.env.production?\n    def tone = \"a\"\n  end\n\n  if Rails.env.test?\n    def tone = \"b\"\n  end\nend\n",
+        )
+        .emit(roundhouse::project::BuildTarget::Spinel);
+    let refused: Vec<_> = errors.iter().filter(|e| e.contains("conditional_definition")).collect();
+    assert_eq!(refused.len(), 2, "{errors:#?}");
 }

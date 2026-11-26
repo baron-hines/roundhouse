@@ -9,8 +9,9 @@
 //!
 //! - `ROUNDHOUSE_SKIP_LOG=<file>` appends `<test>\t<what>` to that file,
 //!   which CI publishes in the job summary.
-//! - `ROUNDHOUSE_REQUIRE_PREREQUISITES=1` fails the test instead, for a
-//!   run that provides everything and so must not skip anything.
+//! - `ROUNDHOUSE_REQUIRE_PREREQUISITES=1` fails the test as well, for a
+//!   run that provides everything and so must not skip anything; the log
+//!   still names it.
 //!
 //! The caller returns after it, as it did after its `eprintln!`.
 //! PostgreSQL has its own pair (`pg_test_url.rs`), which predates this.
@@ -21,17 +22,12 @@ use std::io::Write;
 pub const LOG_VAR: &str = "ROUNDHOUSE_SKIP_LOG";
 pub const REQUIRE_VAR: &str = "ROUNDHOUSE_REQUIRE_PREREQUISITES";
 
-/// Report that this test's prerequisite `what` is absent: a failure when
-/// the run requires prerequisites, otherwise a skip on stderr and in the
-/// skip log.
+/// Report that this test's prerequisite `what` is absent, in the skip log,
+/// then as a failure when the run requires prerequisites, otherwise as a
+/// skip on stderr.
 pub fn missing(what: &str) {
     let current = std::thread::current();
     let test = current.name().unwrap_or("<unnamed test>");
-    assert!(
-        !std::env::var(REQUIRE_VAR).is_ok_and(|v| !v.is_empty()),
-        "{test}: {what}; {REQUIRE_VAR} is set, so a missing prerequisite fails instead of skipping"
-    );
-    eprintln!("skipping {test}: {what}");
     if let Some(log) = std::env::var_os(LOG_VAR) {
         // One write of one line: concurrent test processes append whole lines.
         let line = format!("{test}\t{}\n", what.replace(['\t', '\n'], " "));
@@ -42,4 +38,9 @@ pub fn missing(what: &str) {
             .unwrap_or_else(|e| panic!("{LOG_VAR}={}: {e}", log.to_string_lossy()));
         file.write_all(line.as_bytes()).expect("append to the skip log");
     }
+    assert!(
+        !std::env::var(REQUIRE_VAR).is_ok_and(|v| !v.is_empty()),
+        "{test}: {what}; {REQUIRE_VAR} is set, so a missing prerequisite fails instead of skipping"
+    );
+    eprintln!("skipping {test}: {what}");
 }

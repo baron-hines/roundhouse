@@ -211,8 +211,8 @@ pub(super) fn body_contains_yield(body: &Expr) -> bool {
         ExprNode::BeginRescue { body: inner, rescues, else_branch, ensure, .. } => {
             body_contains_yield(inner)
                 || rescues.iter().any(|r| body_contains_yield(&r.body))
-                || else_branch.as_ref().is_some_and(body_contains_yield)
-                || ensure.as_ref().is_some_and(body_contains_yield)
+                || else_branch.as_deref().is_some_and(body_contains_yield)
+                || ensure.as_deref().is_some_and(body_contains_yield)
         }
         _ => false,
     }
@@ -1520,6 +1520,12 @@ pub(super) fn emit_send(recv: Option<&Expr>, method: &str, args: &[Expr], parent
             }
             // Every other `?`/`!` (and `[]`/`[]=`) name is legalized the
             // same way at the definition site, so calls and defs align.
+            // A writer the analyzer resolved to a `Method`-kind `x=` (a
+            // column's own-typed writer over its `_raw` slot) is the
+            // `x_set` def, not a field: `recv.x=(v)` would only shadow it.
+            if parenthesized && args_s.len() == 1 && method.ends_with('=') && !matches!(method, "==" | "!=" | "<=" | ">=" | "===" | "[]=") {
+                return format!("{recv_s}.{}({})", super::shared::py_def_name(method), args_s[0]);
+            }
             let m = super::shared::py_method_name(method);
             if args_s.is_empty() {
                 // A zero-arg send is either an attribute read (`parent.id`,
@@ -1661,10 +1667,15 @@ fn map_builtin_method(recv: &str, method: &str, ty: Option<&Ty>, args_s: &[Strin
         "join" if is_array => {
             let str_elems =
                 matches!(ty, Some(Ty::Array { elem }) if matches!(**elem, Ty::Str));
+            // Ruby's `join` reads a nil element as "", and `str(None)` is
+            // "None". Elements of these types are never nil.
+            let never_nil = matches!(ty, Some(Ty::Array { elem }) if matches!(**elem, Ty::Int | Ty::Float | Ty::Sym));
             let items = if str_elems {
                 recv.to_string()
-            } else {
+            } else if never_nil {
                 format!("map(str, {recv})")
+            } else {
+                format!("\"\" if _x is None else str(_x) for _x in {recv}")
             };
             match args_s.first() {
                 Some(sep) => format!("{sep}.join({items})"),

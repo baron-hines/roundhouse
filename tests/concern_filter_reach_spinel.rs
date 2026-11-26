@@ -10,7 +10,7 @@ mod concern_filter_reach_app;
 #[test]
 #[ignore = "requires the Spinel toolchain"]
 fn concern_filters_reach_controllers_as_rails_registers_them_on_spinel() {
-    let run = concern_filter_reach_app::app().run_spinel(concern_filter_reach_app::ASSERTIONS);
+    let run = concern_filter_reach_app::app_with_plain_includer().run_spinel(concern_filter_reach_app::ASSERTIONS);
     run.assert_passes();
     assert!(run.stdout.contains("concern filters reached"), "{}", run.stdout);
 }

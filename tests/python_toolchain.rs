@@ -55,6 +55,9 @@ mod nilable_string_view;
 #[path = "support/each_receiver_once.rs"]
 #[allow(dead_code)]
 mod each_receiver_once;
+#[path = "support/join_nil.rs"]
+#[allow(dead_code)]
+mod join_nil;
 #[path = "support/i18n_locales_app.rs"]
 #[allow(dead_code)]
 mod i18n_locales_app;
@@ -539,6 +542,25 @@ fn nilable_string_view_nil_effect_renders() {
 #[ignore]
 fn each_receiver_once_renders() {
     let (emitted, errors) = each_receiver_once::strict_app().emit(roundhouse::project::BuildTarget::Python);
+    assert!(errors.is_empty(), "{errors:?}");
+    let test = emitted.join("tests/test_probes_controller.py");
+    let source = std::fs::read_to_string(&test).expect("test_probes_controller.py");
+    std::fs::write(&test, source.replace(".include_p(", ".__contains__(")).expect("write probe");
+    let output = Command::new("python3")
+        .args(["-m", "unittest", "tests.test_probes_controller"])
+        .current_dir(&*emitted)
+        .output()
+        .expect("run python unittest");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success() && stderr.contains("Ran 1 test"), "{}\n{stderr}", String::from_utf8_lossy(&output.stdout));
+}
+
+/// #1949: `join` reads a nil element as an empty string, as Rails 8.1.4
+/// does (`join_nil::VIEW`).
+#[test]
+#[ignore]
+fn join_nil_renders() {
+    let (emitted, errors) = join_nil::strict_app().emit(roundhouse::project::BuildTarget::Python);
     assert!(errors.is_empty(), "{errors:?}");
     let test = emitted.join("tests/test_probes_controller.py");
     let source = std::fs::read_to_string(&test).expect("test_probes_controller.py");

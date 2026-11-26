@@ -1043,6 +1043,7 @@ fn parse_validator(key: &str, value: &Node<'_>, file: &str, class_consts: &super
     let mut parsed = match key {
         "presence" => parse_bool_or_hash(value, ValidationRule::Presence, "presence", file),
         "absence" => parse_bool_or_hash(value, ValidationRule::Absence, "absence", file),
+        "confirmation" => parse_confirmation(value, file),
         "acceptance" => parse_acceptance(value, file),
         "length" => parse_length_rule(value, file, class_consts),
         "numericality" => parse_numericality(value, file, class_consts),
@@ -1050,6 +1051,7 @@ fn parse_validator(key: &str, value: &Node<'_>, file: &str, class_consts: &super
         "exclusion" => parse_set(value, file, true, class_consts),
         "uniqueness" => parse_uniqueness(value, file, class_consts),
         "format" => parse_format(value, file, class_consts),
+        "comparison" => parse_comparison(value, file),
         other => RuleParse::Gap(vec![other.to_string()]),
     };
     // Scheduling is shared by every validator, independently of its own options.
@@ -1143,6 +1145,20 @@ fn acceptance_values(node: &Node<'_>) -> Option<Vec<Literal>> {
 }
 
 /// `presence: true`, `presence: false`, or `presence: { if: :live? }`.
+fn parse_confirmation(value: &Node<'_>, file: &str) -> RuleParse {
+    let mut case_sensitive = None;
+    for el in hash_elements(value).iter().flat_map(|e| e.iter()) {
+        let Some(assoc) = el.as_assoc_node() else { continue };
+        if symbol_value(&assoc.key()).as_deref() == Some("case_sensitive") {
+            match super::super::util::bool_value(&assoc.value()) {
+                Some(b) => case_sensitive = Some(b),
+                None => return RuleParse::Gap(vec!["confirmation: case_sensitive".to_string()]),
+            }
+        }
+    }
+    parse_bool_or_hash(value, crate::dialect::ValidationRule::Confirmation { case_sensitive }, "confirmation", file)
+}
+
 fn parse_bool_or_hash(
     value: &Node<'_>,
     rule: crate::dialect::ValidationRule,
@@ -1440,6 +1456,130 @@ fn parse_set(value: &Node<'_>, file: &str, exclusion: bool, class_consts: &super
         }
         None => built.gap(vec![format!("{label}: in")]),
     }
+}
+
+/// `comparison:` — Rails' `ComparisonValidator` options, each bound a literal, a Symbol (the record's method) or a
+/// lambda (`-> { min_supported_date }`, its body run on the record), with the guards and flags `inclusion:` takes.
+fn parse_comparison(value: &Node<'_>, file: &str) -> RuleParse {
+    use crate::dialect::ValidationRule;
+    let Some(elements) = hash_elements(value) else {
+        return RuleParse::Gap(vec!["comparison".to_string()]);
+    };
+    let mut checks: Vec<(Symbol, crate::expr::Expr)> = Vec::new();
+    let mut built = BuiltRule::bare(ValidationRule::Comparison { checks: Vec::new() });
+    let mut gaps = Vec::new();
+    for el in elements.iter() {
+        let Some(assoc) = el.as_assoc_node() else {
+            gaps.push("comparison".to_string());
+            continue;
+        };
+        let Some(key) = symbol_value(&assoc.key()) else {
+            gaps.push("comparison".to_string());
+            continue;
+        };
+        let child = assoc.value();
+        match key.as_str() {
+            "greater_than" | "greater_than_or_equal_to" | "equal_to" | "less_than" | "less_than_or_equal_to" | "other_than" => {
+                let bound = match class_side_lambda_body(&child, file) {
+                    Some(body) => Some(body),
+                    None => match inclusion_call(&child, file) {
+                        Some(InclusionSpec::Call(bound)) => Some(bound),
+                        _ => super::super::expr::ingest_expr(&child, file)
+                            .ok()
+                            .filter(|e| matches!(&*e.node, crate::expr::ExprNode::Lit { .. })),
+                    },
+                };
+                // A repeated option is the last one written, as a Ruby Hash keeps it.
+                match bound {
+                    Some(bound) => {
+                        checks.retain(|(option, _)| option.as_str() != key.as_str());
+                        checks.push((Symbol::from(key.as_str()), bound));
+                    }
+                    None => gaps.push(format!("comparison: {key}")),
+                }
+            }
+            "prepend" => {}
+            "on" => match context_guard(&child) {
+                Some(guard) => built.on_guard = Some(guard),
+                None => gaps.push("on".to_string()),
+            },
+            "if" => push_condition(&child, file, &mut built.if_cond, "if", &mut gaps),
+            "unless" => push_condition(&child, file, &mut built.unless_cond, "unless", &mut gaps),
+            "allow_nil" => match super::super::util::bool_value(&child) {
+                Some(flag) => {
+                    built.nil_skip = flag;
+                    built.own_allow_nil = true;
+                }
+                None => gaps.push("allow_nil".to_string()),
+            },
+            "allow_blank" => match super::super::util::bool_value(&child) {
+                Some(flag) => {
+                    built.blank_skip = flag;
+                    built.own_allow_blank = true;
+                }
+                None => gaps.push("allow_blank".to_string()),
+            },
+            other => gaps.push(format!("comparison: {other}")),
+        }
+    }
+    if checks.is_empty() {
+        gaps.push("comparison".to_string());
+    }
+    if !gaps.is_empty() {
+        return built.gap(gaps);
+    }
+    // Rails checks in its own order (`options.slice(*COMPARE_CHECKS.keys)`), not the order written.
+    const ORDER: [&str; 6] = ["greater_than", "greater_than_or_equal_to", "equal_to", "less_than", "less_than_or_equal_to", "other_than"];
+    checks.sort_by_key(|(option, _)| ORDER.iter().position(|o| *o == option.as_str()));
+    built.rule = ValidationRule::Comparison { checks };
+    RuleParse::Rule(built)
+}
+
+/// Rails' `resolve_value`: a lambda of no parameters is called as it is, so its body runs on the class it was written
+/// in (maybe's `-> { min_supported_date }`, a class method). Read from the record that validates: what the body calls
+/// without a receiver, and `self`, are `self.class`.
+fn class_side_lambda_body(node: &Node<'_>, file: &str) -> Option<crate::expr::Expr> {
+    use crate::expr::{Expr, ExprNode};
+    fn to_class(e: &mut Expr) {
+        e.node.for_each_child_mut(&mut |c| to_class(c));
+        let class_of_self = |span| {
+            Expr::new(span, ExprNode::Send { recv: Some(Expr::new(span, ExprNode::SelfRef)), method: Symbol::from("class"), args: vec![], block: None, parenthesized: false })
+        };
+        match &mut *e.node {
+            ExprNode::SelfRef => *e = class_of_self(e.span),
+            ExprNode::Send { recv: recv @ None, .. } => *recv = Some(class_of_self(e.span)),
+            _ => {}
+        }
+    }
+    let expr = super::super::expr::ingest_expr(node, file).ok()?;
+    let lambda = match &*expr.node {
+        ExprNode::Lambda { .. } => expr,
+        ExprNode::Send { recv: None, method, args, block: Some(block), .. }
+            if args.is_empty() && matches!(method.as_str(), "lambda" | "proc") && matches!(&*block.node, ExprNode::Lambda { .. }) =>
+        {
+            block.clone()
+        }
+        _ => return None,
+    };
+    let ExprNode::Lambda { params, rest_param: None, extra_params, block_param: None, body, .. } = &*lambda.node else { return None };
+    if !params.is_empty() || !extra_params.is_empty() || numbered_parameters(node).is_some_and(|n| n > 0) {
+        return None;
+    }
+    // Not a body that reads an ivar (the class's, there) or leaves the lambda (`return`), which no assignment can hold.
+    fn unmovable(e: &Expr) -> bool {
+        if matches!(&*e.node, ExprNode::Ivar { .. } | ExprNode::Return { .. } | ExprNode::Next { .. } | ExprNode::Break { .. }) {
+            return true;
+        }
+        let mut found = false;
+        e.node.for_each_child(&mut |c| found = found || unmovable(c));
+        found
+    }
+    if unmovable(body) {
+        return None;
+    }
+    let mut body = body.clone();
+    to_class(&mut body);
+    Some(body)
 }
 
 fn parse_format(value: &Node<'_>, file: &str, class_consts: &super::ClassConsts) -> RuleParse {
@@ -1877,6 +2017,13 @@ fn inclusion_call(node: &Node<'_>, file: &str) -> Option<InclusionSpec> {
         {
             block.clone()
         }
+        // A set computed from constants (`in: DATE_FORMATS.map(&:last)`, `I18n.available_locales.map(&:to_s)`): Rails
+        // evaluates it once as the class loads; with no read of self it is the same set at validation time. Not one
+        // rooted at a class (`PtySession.drivers.keys`): an enum recipient's stored values may not be the labels Rails
+        // validates, which the enum fold decides.
+        ExprNode::Send { recv: Some(_), .. } if !reads_implicit_self(&expr) && rooted_at_a_value_constant(&expr) => {
+            return Some(InclusionSpec::Call(expr));
+        }
         _ => return None,
     };
     let ExprNode::Lambda { params, rest_param: None, extra_params, block_param: None, body, .. } = &*lambda.node else {
@@ -1901,6 +2048,26 @@ fn inclusion_call(node: &Node<'_>, file: &str) -> Option<InclusionSpec> {
         replace_var_with_self(&mut body, param);
     }
     Some(InclusionSpec::Call(body))
+}
+
+/// The receiver chain under `e` starts at a constant holding a value (`DATE_FORMATS`, `Period::PERIODS`) or at
+/// `I18n.available_locales`, not at a class.
+fn rooted_at_a_value_constant(e: &crate::expr::Expr) -> bool {
+    use crate::expr::ExprNode;
+    match &*e.node {
+        // Not `I18n.t(…)`, whose value is the request's locale's: only the locale list is the same set however late.
+        ExprNode::Send { recv: Some(r), method, .. }
+            if method.as_str() == "available_locales" && matches!(&*r.node, ExprNode::Const { path } if path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).eq(["I18n"])) =>
+        {
+            true
+        }
+        ExprNode::Send { recv: Some(r), .. } => rooted_at_a_value_constant(r),
+        ExprNode::Const { path } => {
+            let names: Vec<&str> = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect();
+            names.last().is_some_and(|n| n.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
+        }
+        _ => false,
+    }
 }
 
 /// The highest numbered parameter (`_1`, `_2`, …) a lambda literal or a
@@ -1971,3 +2138,56 @@ fn literal_atom(node: &Node<'_>) -> Option<Literal> {
     node.as_nil_node().is_some().then_some(Literal::Nil)
 }
 
+
+/// `validates_length_of :password, within: 6..128, allow_blank: true` as the `validates` call Rails makes of it
+/// (`validates_with LengthValidator, _merge_attributes(attr_names)`): the validator's own options in its hash, the
+/// ones `validates` hands every validator beside it. Padded to the call's offset in its file, so the spans read back
+/// land where it is written.
+pub(super) fn validates_of_as_validates(call: &ruby_prism::CallNode<'_>, file: &str) -> Option<String> {
+    const SHARED: &[&str] = &["if", "unless", "on", "allow_blank", "allow_nil", "strict"];
+    let name = String::from_utf8_lossy(call.name().as_slice()).into_owned();
+    let kind = name.strip_prefix("validates_")?.strip_suffix("_of")?;
+    let kind = match kind {
+        "size" => "length",
+        "presence" | "absence" | "uniqueness" | "length" | "acceptance" | "confirmation" | "comparison" => kind,
+        _ => return None,
+    };
+    let text = |n: &Node<'_>| String::from_utf8_lossy(n.location().as_slice()).into_owned();
+    let mut attrs = Vec::new();
+    let mut own = Vec::new();
+    let mut shared = Vec::new();
+    let args: Vec<Node<'_>> = call.arguments()?.arguments().iter().collect();
+    for (i, arg) in args.iter().enumerate() {
+        if super::super::util::symbol_or_string_value(arg).is_some() {
+            attrs.push(text(arg));
+            continue;
+        }
+        let elements: Vec<Node<'_>> = if let Some(h) = arg.as_keyword_hash_node() {
+            h.elements().iter().collect()
+        } else if let Some(h) = arg.as_hash_node() {
+            h.elements().iter().collect()
+        } else {
+            return None;
+        };
+        if i + 1 != args.len() {
+            return None;
+        }
+        for element in elements {
+            let assoc = element.as_assoc_node()?;
+            let key = symbol_value(&assoc.key())?;
+            if SHARED.contains(&key.as_str()) { shared.push(text(&element)) } else { own.push(text(&element)) }
+        }
+    }
+    if attrs.is_empty() {
+        return None;
+    }
+    let rule = if own.is_empty() { format!("{kind}: true") } else { format!("{kind}: {{ {} }}", own.join(", ")) };
+    let written = std::iter::once(attrs.join(", ")).chain(std::iter::once(rule)).chain(shared).collect::<Vec<_>>().join(", ");
+    let start = call.location().start_offset();
+    let padding = super::super::sources::with_text(file, |t| {
+        t.as_bytes().get(..start).map(|b| b.iter().map(|&c| if c == b'\n' { '\n' } else { ' ' }).collect::<String>())
+    })
+    .flatten()
+    .unwrap_or_default();
+    Some(format!("{padding}validates {written}\n"))
+}

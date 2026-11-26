@@ -35,3 +35,16 @@ pub(super) fn map_ref<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync)
         |_, item| f(item),
     )
 }
+
+/// `a` here and `b` on a worker, as [`crate::par::join`], with the app's
+/// inflections and the i18n plan cache installed on the worker as [`map`]
+/// installs them.
+pub(super) fn join<A: Send, B: Send>(a: impl FnOnce() -> A + Send, b: impl FnOnce() -> B + Send) -> (A, B) {
+    let inflections = crate::naming::app_inflections();
+    let plans = crate::lower::i18n_translate::plan_cache_snapshot();
+    crate::par::join(a, move || {
+        crate::naming::install_app_inflections(inflections);
+        let _plans = crate::lower::i18n_translate::install_plan_cache(plans);
+        b()
+    })
+}

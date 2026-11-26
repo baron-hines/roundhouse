@@ -103,13 +103,7 @@ fn a_require_relative_loop_over_a_literal_list_loads_each_file_it_names() {
         app = app.write(&format!("vendor/gems/adaptkit-1.0.0/lib/{path}"), text);
     }
     let run = app.run_ruby(SCRIPT);
-    assert!(
-        run.success,
-        "emitted tree failed in {}\n=== stdout ===\n{}\n=== stderr ===\n{}",
-        run.emitted.display(),
-        run.stdout,
-        run.stderr
-    );
+    run.assert_passes();
     assert_eq!(lines(run.stdout.as_bytes()), EXPECTED, "emitted boot diverges from CRuby\n{}", run.stderr);
 
     // Each loop became one require per element in the file's program
@@ -155,7 +149,7 @@ end
         app = app.write(&format!("vendor/gems/adaptkit-1.0.0/lib/{path}"), text);
     }
     let run = app.run_ruby("require \"adaptkit\" unless defined?(Adaptkit)\nputs Adaptkit::LOADED.inspect\n");
-    assert!(run.success, "emitted tree failed in {}\n{}\n{}", run.emitted.display(), run.stdout, run.stderr);
+    assert!(run.program_succeeded(), "the expected errors aside, the emitted program failed in {}\n=== stdout ===\n{}\n=== stderr ===\n{}", run.emitted.display(), run.stdout, run.stderr);
     assert_eq!(lines(run.stdout.as_bytes()), ["[:alpha]"], "{}", run.stderr);
     assert!(
         run.stderr.contains("error[file_require_not_carried]") && run.stderr.contains("adapters/gone_adapter"),

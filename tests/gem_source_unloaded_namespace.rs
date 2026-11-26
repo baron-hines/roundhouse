@@ -59,12 +59,6 @@ fn unloaded_namespace(eager: bool) {
         .write("vendor/gems/coinkit-1.0.0/lib/rubocop/cop/coinkit.rb", COPS)
         .write("vendor/gems/coinkit-1.0.0/lib/rubocop/cop/coinkit/missing_currency.rb", COP)
         .run_ruby(SCRIPT);
-    assert!(
-        run.success,
-        "emitted tree failed in {}\n=== stdout ===\n{}\n=== stderr ===\n{}",
-        run.emitted.display(),
-        run.stdout,
-        run.stderr
-    );
+    run.assert_passes();
     assert_eq!(lines(run.stdout.as_bytes()), expected, "emitted boot diverges from CRuby");
 }

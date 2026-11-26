@@ -340,6 +340,7 @@ fn controller(
         body: items,
         layout: Default::default(),
         sibling_classes: Vec::new(),
+        csp_header: false,
     }
 }
 

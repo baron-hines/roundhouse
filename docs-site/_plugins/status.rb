@@ -617,12 +617,14 @@ module RoundhouseStatus
       return if @logged
       @logged = true
       @status.each do |key, feed|
-        next unless feed.is_a?(Hash) && feed["fetch"] && feed["fetch"] != "ok"
+        next unless feed.is_a?(Hash) && feed["fetch"] && !%w[ok reused offline].include?(feed["fetch"])
         Jekyll.logger.warn "Status:", "#{key}: #{feed["fetch"]}#{" (showing the saved result)" if feed["cached"]}: #{feed["error"]}"
       end
       Jekyll.logger.warn "Status:", "history #{@status["history_error"]}" if @status["history_error"]
       Jekyll.logger.warn "Status:", "home page numbers withheld: #{@status["highlights_error"]}" if @status["highlights_error"]
-      Jekyll.logger.info "Status:", "#{@status.count { |_, f| f.is_a?(Hash) && f["fetch"] == "ok" }} feeds collected; history has #{@history["points"].size} point(s)"
+      reused = @status.select { |_, f| f.is_a?(Hash) && f["fetch"] == "reused" }.keys
+      offline = @status.count { |_, f| f.is_a?(Hash) && f["fetch"] == "offline" }
+      Jekyll.logger.info "Status:", "#{@status.count { |_, f| f.is_a?(Hash) && f["fetch"] == "ok" }} feeds collected#{"; #{reused.join(", ")} reused from the last publication" unless reused.empty?}#{"; #{offline} not collected (ROUNDHOUSE_STATUS=off)" if offline.positive?}; history has #{@history["points"].size} point(s)"
     end
   end
 end

@@ -58,7 +58,7 @@ fn an_interpolated_regex_constant_with_the_u_flag_works_as_in_ruby() {
         .write("app/models/handle.rb", HANDLE)
         .run_ruby(SCRIPT);
     assert!(run.errors.is_empty(), "{:#?}", run.errors);
-    assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+    run.assert_passes();
     assert_eq!(run.stdout, native_out, "emitted\n{}", run.stderr);
 }
 
@@ -83,6 +83,6 @@ fn a_constant_holding_symbol_to_proc_is_readable() {
         .write("app/models/registry.rb", REGISTRY)
         .run_ruby("p Registry.pack(\"ab\")\n");
     assert!(run.errors.is_empty(), "{:#?}", run.errors);
-    assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+    run.assert_passes();
     assert_eq!(run.stdout, "\"ABx\"\n", "emitted\n{}", run.stderr);
 }
