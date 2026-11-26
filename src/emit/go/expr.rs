@@ -520,6 +520,13 @@ pub(super) fn emit_expr(ctx: &EmitCtx, e: &Expr) -> String {
                         emit_expr_as_value(ctx, right)
                     );
                 }
+                if let Some(ptr) = nullable_or_go_ty(left, right) {
+                    return format!(
+                        "func() {ptr} {{ if p := {}; p != nil {{ return p }}; return {} }}()",
+                        emit_expr_as_value(ctx, left),
+                        emit_expr_as_value(ctx, right)
+                    );
+                }
                 if primitive_kind(&left.ty) || primitive_kind(&right.ty) {
                     return format!(
                         "cmp.Or({}, {})",
@@ -2193,6 +2200,7 @@ pub(super) fn emit_send(
             // another record (`article.title` in a view).
             let nilable_col = match &*r.node {
                 ExprNode::Ivar { name } => nullable_column_go_ty(name.as_str()),
+                ExprNode::BoolOp { op: crate::expr::BoolOpKind::Or, left, right, .. } => nullable_or_go_ty(left, right),
                 ExprNode::Send { recv: Some(inner), method: m, args, .. }
                     if args.is_empty() && !recv_model_defines(inner, m.as_str()) =>
                 {
@@ -4737,6 +4745,12 @@ fn unbox_nullable_column(v: &Expr, v_s: &str, slot_go: &str) -> Option<String> {
 
 /// The Go pointer type of `column` on the model this receiver resolves
 /// to, when the schema declares it nullable.
+/// `a || b` over two nullable reads of one pointer type: nil only when both are, so the pointer itself.
+fn nullable_or_go_ty(left: &Expr, right: &Expr) -> Option<String> {
+    let ptr = nullable_read_go_ty(left)?;
+    (ptr.starts_with('*') && nullable_read_go_ty(right).as_deref() == Some(ptr.as_str())).then_some(ptr)
+}
+
 /// The model a receiver reads: its class, or the one class of a nilable read (`belongs_to`'s `Article | nil`).
 fn recv_model_id(recv: &Expr) -> Option<&crate::ClassId> {
     match recv.ty.as_ref().and_then(union_non_nil_core)? {
