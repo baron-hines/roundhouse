@@ -58,6 +58,24 @@
 require "stringio"
 
 class Logger
+  # Ruby's severities, which a gem reads as `Logger::INFO` or `Logger::Severity::WARN` to set or compare a
+  # level. Not through `include Severity` as Ruby has it: the strict targets resolve a constant on its own class.
+  module Severity
+    DEBUG = 0
+    INFO = 1
+    WARN = 2
+    ERROR = 3
+    FATAL = 4
+    UNKNOWN = 5
+  end
+
+  DEBUG = 0
+  INFO = 1
+  WARN = 2
+  ERROR = 3
+  FATAL = 4
+  UNKNOWN = 5
+
   # Ruby's default formatter. An app subclasses THIS — that is the
   # whole reason it is a class with a body rather than a function.
   class Formatter

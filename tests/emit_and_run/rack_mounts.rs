@@ -1,5 +1,7 @@
 //! A mounted Rack app sees Rails' shifted environment and owns its response.
 
+#[path = "../support/prerequisite.rs"]
+mod prerequisite;
 #[path = "../support/scratch.rs"]
 mod scratch;
 use super::emit_and_run::{self, Overlay};
@@ -63,7 +65,7 @@ end
 "#);
     let output = Command::new("ruby").args(["-e", &native]).output().expect("Rails oracle");
     if output.status.code() == Some(77) {
-        eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+        prerequisite::missing(String::from_utf8_lossy(&output.stderr).trim());
         return None;
     }
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
@@ -427,7 +429,7 @@ fn rack_mount_native_conversion_serializes_headers_and_closes_consumed_bodies() 
     assert!(errors.is_empty(), "{errors:?}");
     let main = std::fs::read_to_string(native.join("main.rb")).unwrap();
     let start = main.find("    rack_index = RouteTable.rack_index(").unwrap();
-    let end = start + main[start..].find("    matched = ActionDispatch::Router.match(verb, request_path, Main.route_table)").unwrap();
+    let end = start + main[start..].find("    matched = RouteTable.match_asking(verb, request_path, Main.route_table, request_obj)").unwrap();
     let fragment = &main[start..end];
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let harness = root.join("tests/tep_server_harness.rb");
@@ -495,7 +497,7 @@ fn rack_mount_native_cache_reads_every_policy_and_variant_field() {
     assert!(errors.is_empty(), "{errors:?}");
     let main = std::fs::read_to_string(native.join("main.rb")).unwrap();
     let start = main.find("    rack_index = RouteTable.rack_index(").unwrap();
-    let end = start + main[start..].find("    matched = ActionDispatch::Router.match(verb, request_path, Main.route_table)").unwrap();
+    let end = start + main[start..].find("    matched = RouteTable.match_asking(verb, request_path, Main.route_table, request_obj)").unwrap();
     let fragment = &main[start..end];
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let harness = root.join("tests/tep_server_harness.rb");

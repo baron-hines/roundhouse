@@ -10,7 +10,8 @@
 //! no local it hands a partial (`post: other`, `author: name`) stands in
 //! for the partial's same-named ivar, not even `notice: name`, whose name
 //! the partial's flash param also goes by. One the partial also reads as
-//! `local_assigns[:notice]`, in a `case` or a `while` too, still fills it.
+//! `local_assigns[:notice]`, in a `case` or a `while` too, reaches that
+//! read, and the ivar stays the template's.
 
 use super::emit_and_run;
 
@@ -195,7 +196,7 @@ missing = []
   nested: ["<section>#{summary}"],
   prefixed: ["<p class=\"prefixed\">New: Rails tips</p>"],
   helped: [summary],
-  helped_local: ["<section>ivar=Rails tips local=Go tips#{summary}", "<i>by Ann</i>", "<b>by Cat</b>", ">flagged</em>", ">looped</s>"],
+  helped_local: ["<section>ivar=Rails tips local=Go tips#{summary}", "<i>by Ann</i>", "<b>by Cat</b>", "<em title=\"Cat\">flagged</em>", "<s title=\"Cat\">looped</s>"],
   pooled: ["<section>ivar=Rails tips local=Go tips#{summary}"],
   pooled_nil: ["<section>ivar=Rails tips local=none</section>"],
 }.each do |action, wants|

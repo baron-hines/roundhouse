@@ -11,6 +11,8 @@
 //! the CRuby tree installs them through the sqlite3 gem on every pooled
 //! connection (`runtime/sql_functions.rb`, called from `Db.open_pool`).
 
+#[path = "support/prerequisite.rs"]
+mod prerequisite;
 #[path = "support/scratch.rs"]
 mod scratch;
 use std::path::PathBuf;
@@ -137,7 +139,7 @@ fn the_blocks_become_methods_and_an_installer() {
 #[test]
 fn the_installed_functions_answer_what_the_apps_blocks_would() {
     if !Command::new("ruby").args(["-rsqlite3", "-e", "1"]).status().is_ok_and(|s| s.success()) {
-        eprintln!("skipping: ruby with the sqlite3 gem not available");
+        prerequisite::missing("ruby with the sqlite3 gem not available");
         return;
     }
     let dir = scratch::dir("roundhouse-sql-functions-run");

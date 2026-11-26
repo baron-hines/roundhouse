@@ -84,7 +84,8 @@ pub struct FlatRoute {
     /// this rides the flat route rather than staying a request-shaping
     /// detail: campfire calls `user_profile_url` with no argument at
     /// all, and the helper's own signature is what has to allow it.
-    pub param_defaults: Vec<(String, String)>,
+    pub param_defaults: Vec<(String, (String, crate::span::Span))>, // every enclosing default, with its source
+    pub request_defaults: Vec<(String, crate::expr::Literal, crate::span::Span)>,
     pub int_params: Vec<String>,
     /// Non-digit `constraints:` regexes, as `(param, regex_source)` for
     /// the params this route captures. The regex-free runtime router
@@ -121,6 +122,8 @@ pub struct FlatRoute {
     /// The root of an isolated engine at its mount: Rails generates its
     /// helper as the mount's script name joined with `/` (`/catalog/`).
     pub mount_root: bool,
+    /// The request constraints of every enclosing `RouteSpec::Guarded`, outermost first; the route matches only when all hold.
+    pub guards: Vec<crate::expr::Expr>,
 }
 
 /// The `defaults` key that carries `scope format: true` through a
@@ -130,6 +133,10 @@ pub const FORMAT_REQUIRED_KEY: &str = "format!";
 /// The `refused` parameter name of a route whose endpoint is Ruby code
 /// (`UNMODELED_ENDPOINT_CONTROLLER`); the value is the endpoint kind.
 pub const ENDPOINT_REFUSAL: &str = "endpoint";
+
+/// The `refused` parameter name of a route a request constraint guards (`RouteSpec::Guarded`): the
+/// router matches by verb and path alone, so serving it would answer every request the constraint refuses.
+pub const GUARD_REFUSAL: &str = "request constraint";
 
 /// Compile every non-digit-class requirement on one concrete route
 /// into the router's segment-pattern form, or refuse the WHOLE route
@@ -314,6 +321,17 @@ pub fn helper_id_segments(app: &App) -> crate::det::HashMap<String, Vec<bool>> {
             .collect();
         out.entry(format!("{}_path", r.as_name)).or_insert(shape);
     }
+    // A generated helper's arguments are the record or scope it resolves and its query: neither is an id segment.
+    for m in &app.generated_route_helpers {
+        out.entry(m.name.as_str().to_string()).or_insert_with(|| vec![false, false]);
+    }
+    // A `direct` helper's block is given its arguments as written, the
+    // record itself (`direct :x do |article, options|`): none is an id
+    // segment. Its body's `route_for` projects each to the target's
+    // segment (`routes_to_library::direct`).
+    for h in &app.routes.direct_helpers {
+        out.entry(format!("{}_path", h.name.as_str())).or_insert_with(|| vec![false; h.params.len()]);
+    }
     out
 }
 
@@ -335,6 +353,29 @@ pub fn flatten_routes(app: &App) -> Vec<FlatRoute> {
     let mut out = flatten_route_entries(&app.routes.entries);
     out.retain(|r| r.refused.is_none());
     out
+}
+
+/// `flatten_routes` for a router that asks request constraints (the Ruby family): a route refused only
+/// for constraints `route_guards` can write stays, with the `guard_<n>` indices of each, outermost first.
+pub fn flatten_routes_asking_guards(app: &App) -> Vec<(FlatRoute, Vec<usize>)> {
+    flatten_route_entries(&app.routes.entries)
+        .into_iter()
+        .filter_map(|r| {
+            let refused_for_guards = r.refused.as_ref().is_some_and(|(param, _)| param == GUARD_REFUSAL);
+            if r.refused.is_some() && !refused_for_guards {
+                return None;
+            }
+            let indices: Option<Vec<usize>> =
+                r.guards.iter().map(|g| crate::lower::route_guards::guard_index(&app.routes.entries, g)).collect();
+            indices.map(|indices| (FlatRoute { refused: None, ..r }, indices))
+        })
+        .collect()
+}
+
+/// The routes some target dispatches: `flatten_routes` with those only the Ruby family's router asks,
+/// for what a route makes reachable (an action, its controller's require).
+pub fn flatten_routes_reachable(app: &App) -> Vec<FlatRoute> {
+    flatten_routes_asking_guards(app).into_iter().map(|(route, _)| route).collect()
 }
 
 /// Every flattened route, refused ones included — for URL-helper
@@ -368,7 +409,7 @@ struct Ctx {
     helpers_enabled: bool,
     /// Segment defaults from enclosing `scope defaults: { … }` entries,
     /// innermost last so a nested scope can override an outer one.
-    param_defaults: Vec<(String, String)>,
+    param_defaults: Vec<(String, (String, crate::span::Span))>,
     /// Enclosing `resources`/`resource` blocks, OUTERMOST FIRST.
     ///
     /// A stack rather than one pair because Rails accumulates every
@@ -391,6 +432,8 @@ struct Ctx {
     inner_path: String,
     /// The path an isolated engine is mounted at, inside its scope.
     mount_path: Option<String>,
+    /// Enclosing request constraints, outermost first.
+    guards: Vec<crate::expr::Expr>,
 }
 
 /// One enclosing resource.
@@ -420,6 +463,10 @@ struct Nesting {
 }
 
 impl Ctx {
+    fn guard_refusal(&self) -> Option<(String, String)> {
+        (!self.guards.is_empty()).then(|| (GUARD_REFUSAL.to_string(), String::new()))
+    }
+
     /// A resource declared inside `member`/`collection` nests under that
     /// level's segment (`/customers/:id`) but is not named after it:
     /// fold the segment and the scope paths since into the URL prefix and
@@ -455,7 +502,7 @@ impl Ctx {
             .iter()
             .rev()
             .find(|(n, _)| n == "format")
-            .map(|(_, v)| Symbol::from(v.as_str()))
+            .map(|(_, (v, _))| Symbol::from(v.as_str()))
     }
 
     /// `account_bot_` — every enclosing level's singular, in order.
@@ -580,7 +627,24 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
         // Rack mounts use the ordered prefix dispatcher, not controller rows
         // or `(.:format)` URL helpers.
         RouteSpec::RackMount { .. } => {}
+        // Not drawn: ingest replaces every one with the routes its call draws.
+        RouteSpec::Deferred { .. } => {}
+        RouteSpec::Guarded { guard, entries } => {
+            let mut inner = ctx.clone();
+            inner.guards.push(guard.clone());
+            for entry in entries {
+                collect_flat_routes(entry, out, &inner);
+            }
+        }
+        // Not under the enclosing scopes: the method set its own path, module and name, as Rails' `@scope` swap does.
+        RouteSpec::Exclusive { entries } => {
+            let root = Ctx { helpers_enabled: ctx.helpers_enabled, mount_path: ctx.mount_path.clone(), guards: ctx.guards.clone(), ..Ctx::default() };
+            for entry in entries {
+                collect_flat_routes(entry, out, &root);
+            }
+        }
         RouteSpec::Explicit {
+            defaults,
             method,
             path,
             controller,
@@ -660,7 +724,8 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
             // route keeps the legacy action-name fallback in `as_name`
             // for consumers that key on it, but the helper generator
             // skips it.
-            let action_part = written_action(path);
+            // A canonical action's symbol is named by the action where `path:` moved its segment (`post :create, path: "sign_in"`), adding nothing on a member or collection; ingest roots only that path, a bare symbol's stays the symbol.
+            let action_part = if *action_symbol && path.starts_with('/') { Some(action.as_str()) } else { written_action(path) };
             let derived = match as_name.as_ref() {
                 // `as: nil`: no helper at all.
                 Some(s) if s.as_str().is_empty() => None,
@@ -700,6 +765,21 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
                     ),
                 }
             };
+            let required = path_ordered_params(variants.last().unwrap(), &base_params);
+            let mut param_defaults = ctx.param_defaults.clone();
+            let mut request_defaults = Vec::new();
+            for (key, (value, span)) in defaults {
+                if required.iter().any(|name| name == key.as_str()) {
+                    param_defaults.retain(|(name, _)| name != key.as_str());
+                    if matches!(value, crate::expr::Literal::Nil | crate::expr::Literal::Bool { value: false }) { continue; }
+                    let text = match value {
+                        crate::expr::Literal::Str { value } => value.clone(), crate::expr::Literal::Sym { value } => value.as_str().to_string(),
+                        crate::expr::Literal::Int { value } => value.to_string(), crate::expr::Literal::Bool { value } => value.to_string(),
+                        _ => String::new(),
+                    };
+                    param_defaults.push((key.as_str().to_string(), (text, *span)));
+                } else { request_defaults.push((key.as_str().to_string(), value.clone(), *span)); }
+            }
             // Only the canonical variant carries the helper name; the
             // shorter alternates would otherwise register a duplicate
             // helper for the same controller#action.
@@ -756,7 +836,7 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
                 {
                     Some((ENDPOINT_REFUSAL.to_string(), action.as_str().to_string()))
                 } else {
-                    refused
+                    refused.or_else(|| ctx.guard_refusal())
                 };
                 out.push(FlatRoute {
                     method: method.clone(),
@@ -770,7 +850,8 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
                     format: forced_format.clone().or_else(|| ctx.default_format()),
                     required_params,
                     required_path: if i == 0 { required_path.clone() } else { None },
-                    param_defaults: defaults_for(ctx, &params),
+                    param_defaults: param_defaults.clone(),
+                    request_defaults: request_defaults.clone(),
                     path_params: params,
                     int_params,
                     constraints,
@@ -778,6 +859,7 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
                     refused,
                     format_required: ctx.format_required(),
                     mount_root: false,
+                    guards: ctx.guards.clone(),
                 });
             }
         }
@@ -816,29 +898,43 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
                 .map(|s| format!("{}{}", ctx.name_prefix, s.as_str()))
                 .unwrap_or_else(|| format!("{}root", ctx.name_prefix));
             // A root inside `scope "admin/api/:version_handle"` still
-            // carries the scope's dynamic segments.
-            let path_params = path_ordered_params(&path, &[]);
-            out.push(FlatRoute {
-                method: HttpMethod::Get,
-                source_path: path.clone(),
-                path,
-                controller: ClassId(Symbol::from(controller_class)),
-                action: Symbol::from(action_name),
-                as_name: if ctx.helpers_enabled { helper } else { String::new() },
-                required_params: path_params.len(),
-                param_defaults: defaults_for(ctx, &path_params),
-                path_params,
-                named: ctx.helpers_enabled,
-                helpers_enabled: ctx.helpers_enabled,
-                format: None,
-                required_path: None,
-                int_params: vec![],
-                constraints: vec![],
-                seg_patterns: vec![],
-                refused: None,
-                format_required: false,
-                mount_root: ctx.mount_path.as_deref() == Some(ctx.ns_path.as_str()),
-            });
+            // carries the scope's dynamic segments, and one inside
+            // `scope "(/locale/:locale)"` answers each of its expansions,
+            // named once, on the longest, as an explicit route is.
+            let variants = expand_optional_paths(&path);
+            let shortest = variants.last().cloned().unwrap_or_else(|| path.clone());
+            let optional = variants.len() > 1;
+            for (i, vpath) in variants.into_iter().enumerate() {
+                let mut path_params = path_ordered_params(&vpath, &[]);
+                if i == 0 && optional {
+                    path_params = required_first(path_params, &shortest, &[]);
+                }
+                let required_params = if i == 0 && optional { path_ordered_params(&shortest, &[]).len() } else { path_params.len() };
+                let named = ctx.helpers_enabled && i == 0;
+                out.push(FlatRoute {
+                    method: HttpMethod::Get,
+                    source_path: vpath.clone(),
+                    mount_root: ctx.mount_path.as_deref() == Some(ctx.ns_path.as_str()),
+                    path: vpath,
+                    controller: ClassId(Symbol::from(controller_class.clone())),
+                    action: Symbol::from(action_name.clone()),
+                    as_name: if ctx.helpers_enabled { helper.clone() } else { String::new() },
+                    required_params,
+                    request_defaults: Vec::new(),
+                    param_defaults: ctx.param_defaults.clone(),
+                    path_params,
+                    named,
+                    helpers_enabled: ctx.helpers_enabled,
+                    format: None,
+                    required_path: (i == 0 && optional).then(|| shortest.clone()),
+                    int_params: vec![],
+                    constraints: vec![],
+                    seg_patterns: vec![],
+                    refused: ctx.guard_refusal(),
+                    format_required: false,
+                    guards: ctx.guards.clone(),
+                });
+            }
         }
         RouteSpec::Resources {
             name,
@@ -848,9 +944,11 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
             singular,
             as_name,
             controller,
+            action: to_action,
             param,
             path: path_segment,
             constraints: resource_constraints,
+            path_names,
         } => {
             let materialized;
             let ctx = if ctx.within.is_nested() {
@@ -965,6 +1063,13 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
                     continue;
                 }
                 let member = suffix.replace(":id", &format!(":{id_param}"));
+                let member = match path_names.get(&Symbol::from(action_name)) {
+                    Some(named) if matches!(action_name, "new" | "edit") => {
+                        let base = member.strip_suffix(&format!("/{action_name}")).unwrap_or(&member).to_string();
+                        if named.is_empty() { base } else { format!("{base}/{named}") }
+                    }
+                    _ => member,
+                };
                 // Empty for an index or show mounted with `path: "/"`; it
                 // stays empty through the nesting (`/account`, not
                 // `/account/`) and is the root `/` only at the very top.
@@ -1069,11 +1174,12 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
                             source_path: full_path.clone(),
                             path: vpath.clone(),
                             controller: controller_class.clone(),
-                            action: Symbol::from(action_name),
+                            action: to_action.clone().unwrap_or_else(|| Symbol::from(action_name)),
                             as_name: if ctx.helpers_enabled { as_name.clone() } else { String::new() },
                             required_params,
                             required_path: if i == 0 { required_path.clone() } else { None },
-                            param_defaults: defaults_for(ctx, &vparams),
+                            request_defaults: Vec::new(),
+                            param_defaults: ctx.param_defaults.clone(),
                             path_params: vparams.clone(),
                             named: named && *primary && i == 0,
                             helpers_enabled: ctx.helpers_enabled,
@@ -1081,9 +1187,10 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
                             int_params: int_params.iter().filter(|n| vparams.contains(n)).cloned().collect(),
                             constraints: vconstraints.clone(),
                             seg_patterns: seg_patterns.clone(),
-                            refused: refused.clone(),
+                            refused: refused.clone().or_else(|| ctx.guard_refusal()),
                             format_required: ctx.format_required(),
                             mount_root: false,
+                            guards: ctx.guards.clone(),
                         });
                     }
                 }
@@ -1170,17 +1277,6 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
     }
 }
 
-/// The scope defaults that apply to THIS route's params. A default for
-/// a segment the route does not carry is irrelevant here (Rails would
-/// put it in the query string; the helper signature is unaffected).
-fn defaults_for(ctx: &Ctx, params: &[String]) -> Vec<(String, String)> {
-    ctx.param_defaults
-        .iter()
-        .filter(|(n, _)| params.iter().any(|p| p == n))
-        .cloned()
-        .collect()
-}
-
 /// Prepend the accumulated namespace path. Both sides are `/`-rooted
 /// segments; guard the bare-`/` and missing-slash edges (`root` inside
 /// a namespace, `get "health"` with no leading slash).
@@ -1211,16 +1307,6 @@ fn qualify_controller(module_prefix: &str, controller: &ClassId) -> ClassId {
     // otherwise be qualified into a class nobody defines.
     if controller.0.as_str() == crate::ingest::routes::REDIRECT_CONTROLLER {
         return controller.clone();
-    }
-    // `devise_for`'s default (no `controllers:` override) is a
-    // placeholder, not a qualified class: Devise substitutes the
-    // enclosing scope's module for its own `"devise"` default
-    // (`Devise::Mapping#default_controllers`) rather than nesting under
-    // it, which the generic concatenation below would do.
-    if let Some(resolved) =
-        crate::ingest::devise_routes::resolve_default_controller(module_prefix, controller.0.as_str())
-    {
-        return ClassId(Symbol::from(resolved));
     }
     // `get "token"` in `namespace :reportify` has no controller of its own;
     // Rails takes the scope's module (`Admin::Reportify::` →

@@ -1,3 +1,5 @@
+#[path = "../support/prerequisite.rs"]
+mod prerequisite;
 use super::emit_and_run;
 
 /// Build the same lookup through each receiver-preservation path: inline,
@@ -906,7 +908,7 @@ fn subclass_forms_keep_routes_parameter_keys_and_errors() {
     assert!(probe.status.success() && matches!(available.as_str(), "true" | "false"),
         "Rails oracle availability probe failed: {available}\n{}", String::from_utf8_lossy(&probe.stderr));
     if available == "false" {
-        eprintln!("skipping native oracle: Rails 8.1.4 form oracle requires activerecord, actionview, actionpack and sqlite3 >= 2.9");
+        prerequisite::missing("native oracle: Rails 8.1.4 form oracle requires activerecord, actionview, actionpack and sqlite3 >= 2.9");
     }
     const SCHEMA: &str = "ActiveRecord::Schema.define do\ncreate_table(:rooms) { |t| t.string :name; t.string :type }\nend\n";
     const ROOM: &str = "class Room < ActiveRecord::Base\nattr_accessor :user_ids_input\nend\n";

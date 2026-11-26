@@ -57,6 +57,12 @@ module ActionDispatch
       @data.delete(key.to_s)
     end
 
+    # Not `@data.clear`: the strict targets' emitters have no zero-argument Hash#clear, and the Session object is what is kept.
+    def clear
+      @data = {}
+      self
+    end
+
     def length
       @data.length
     end

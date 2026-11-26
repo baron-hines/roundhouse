@@ -200,11 +200,16 @@ pub fn verify(options: &Options) -> Result<Outcome, String> {
     }
     let app = options.app.canonicalize().map_err(|error| format!("app {}: {error}", options.app.display()))?;
 
-    static VERIFICATIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let number = VERIFICATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let temporary = std::env::temp_dir().join(format!("fractal-verify-{}-{number}", std::process::id()));
-    let directory = options.keep.clone().unwrap_or_else(|| temporary.clone());
-    fs::create_dir_all(&directory).map_err(|error| format!("create {}: {error}", directory.display()))?;
+    let (directory, mut temporary) = match &options.keep {
+        Some(keep) => {
+            fs::create_dir_all(keep).map_err(|error| format!("create {}: {error}", keep.display()))?;
+            (keep.clone(), Temporary(None))
+        }
+        None => {
+            let created = create_temporary()?;
+            (created.clone(), Temporary(Some(created)))
+        }
+    };
     // Ruby runs from the app's root, so every path handed to it is absolute.
     let directory = directory.canonicalize().map_err(|error| format!("resolve {}: {error}", directory.display()))?;
     let script = directory.join("fingerprint.rb");
@@ -221,17 +226,46 @@ pub fn verify(options: &Options) -> Result<Outcome, String> {
         // a process killed outright.
         let _interrupts = HoldInterrupts::new();
         let restore = Restore::save(&app, &report.rewritten, &directory.join("originals"))?;
-        super::apply(&options.overlay, &app)?;
-        let booted = boot(&rewritten_path);
+        // Until the app is restored, the copies of its originals stay.
+        let removable = temporary.0.take();
+        let booted = super::apply(&options.overlay, &app).and_then(|_| boot(&rewritten_path));
         restore.finish()?;
+        temporary.0 = removable;
         booted?;
     }
     let original: Fingerprint = read_json(&original_path)?;
     let rewritten: Fingerprint = read_json(&rewritten_path)?;
-    if options.keep.is_none() {
-        let _ = fs::remove_dir_all(&temporary);
-    }
     Ok(compare(&original, &rewritten, &report.rewrites))
+}
+
+/// A fresh working directory under the system temp directory. One that is
+/// already there, such as an earlier process's under a reused PID holding
+/// the originals of a failed restore, is never adopted.
+fn create_temporary() -> Result<PathBuf, String> {
+    static VERIFICATIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let base = std::env::temp_dir();
+    for _ in 0..10_000 {
+        let number = VERIFICATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = base.join(format!("fractal-verify-{}-{number}", std::process::id()));
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("create {}: {error}", path.display())),
+        }
+    }
+    Err(format!("no free fractal-verify directory name under {}", base.display()))
+}
+
+/// The working directory `verify` made itself, removed on every return,
+/// failed or not.
+struct Temporary(Option<PathBuf>);
+
+impl Drop for Temporary {
+    fn drop(&mut self) {
+        if let Some(directory) = &self.0 {
+            let _ = fs::remove_dir_all(directory);
+        }
+    }
 }
 
 fn read_json<Value: for<'json> Deserialize<'json>>(path: &Path) -> Result<Value, String> {

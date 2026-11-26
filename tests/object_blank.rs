@@ -1,6 +1,8 @@
 //! Untyped blank?/present? calls must use Object's emptiness protocol,
 //! never an arbitrary object's string representation.
 
+#[path = "support/prerequisite.rs"]
+mod prerequisite;
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
@@ -139,7 +141,7 @@ fn assert_rails(cases: &str, expected: &str) {
         .output()
         .expect("Rails oracle");
     if output.status.code() == Some(77) {
-        eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+        prerequisite::missing(String::from_utf8_lossy(&output.stderr).trim());
         return;
     }
     assert!(

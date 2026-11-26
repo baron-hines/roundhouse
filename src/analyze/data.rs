@@ -5,7 +5,7 @@ use crate::det::{HashMap, HashSet};
 
 use crate::App;
 use crate::diagnostic::Diagnostic;
-use crate::dialect::{LibraryClassOrigin, ModelBodyItem};
+use crate::dialect::{LibraryClassOrigin, MethodReceiver, ModelBodyItem};
 use crate::expr::{Expr, ExprNode, Literal, LValue, RESOLVED_DATA_FACTORY};
 use crate::ident::{ClassId, Symbol};
 use crate::span::Span;
@@ -82,7 +82,7 @@ pub(super) fn register(
             return;
         }
         let mut info = classes.remove(&id).unwrap_or_default();
-        let instance = add_data_methods(&mut info, &id, members);
+        let instance = add_data_methods(app, &mut info, &id, members);
         classes.insert(id, info);
         factories.insert(value.span, instance);
     };
@@ -111,7 +111,7 @@ pub(super) fn register(
             continue;
         }
         let Some(info) = classes.get_mut(&class.name) else { continue };
-        let instance = add_data_methods(info, &class.name, members.iter().cloned());
+        let instance = add_data_methods(app, info, &class.name, members.iter().cloned());
         factories.insert(span, instance);
     }
     factories
@@ -121,12 +121,64 @@ pub(super) fn register(
 /// or whose generated class is subclassed. Lifting methods alone does not establish
 /// that the original factory belongs to the supported subset.
 pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
-    if !app.library_classes.iter().any(|class| matches!(class.origin, Some(LibraryClassOrigin::DataFactory { .. }))) {
+    if !app.library_classes.iter().any(|class| matches!(class.origin,
+        Some(LibraryClassOrigin::DataFactory { .. } | LibraryClassOrigin::DataDefine { .. }))) {
         return Vec::new();
     }
     let resolver = app.const_resolver.for_sources(&app.sources);
     let mut diagnostics = Vec::new();
     for factory in &app.library_classes {
+        if let Some(span) = factory.data_constructor_visibility()
+            && app.library_classes.iter().any(|owner| matches!(owner.name.0.as_str(), "Module" | "Class")
+                && owner.methods.iter().any(|method| matches!(method.name.as_str(), "private" | "public" | "protected" | "private_class_method"))) {
+            diagnostics.push(Diagnostic::unsupported(span, None, "Data.define", "Data visibility macro has an app-defined owner")); continue;
+        }
+        if let Some(span) = factory.data_constructor_visibility()
+            && (app.library_classes.iter().any(|class| !class.parent_span.is_synthetic()
+                && class.parent.as_ref().is_none_or(|parent| {
+                    let path = parent.0.as_str().split("::").map(Symbol::from).collect::<Vec<_>>();
+                    resolver.namespace(class.parent_span, &path).is_none()
+                        || resolver.declaration_name(class.parent_span, &path) == Some(factory.name.0.as_str())
+                })) || app.library_classes.iter().flat_map(|class| &class.constants).any(|(_, value)| {
+                    matches!(&*value.node, ExprNode::Const { path } if resolver.declaration_name(value.span, path) == Some(factory.name.0.as_str()))
+                })) {
+            diagnostics.push(Diagnostic::unsupported(span, None, "Data.define",
+                "constructor visibility with Data subclasses requires a direct superclass namespace, not an alias or expression; subclasses are not modeled"));
+            continue;
+        }
+        if factory.data_define().is_some() {
+            for (_, value) in &factory.constants {
+                if let ExprNode::Send { recv: Some(recv), method, .. } = &*value.node
+                    && let ExprNode::Const { path } = &*recv.node
+                    && method.as_str() == "define" && resolver.is_runtime_class(recv.span, path, "Data")
+                {
+                    // Ingest can strip a lifted block; check the original call before admitting it.
+                    let source = value.span.file.0.checked_sub(1).and_then(|i| app.sources.get(i as usize))
+                        .and_then(|s| s.text.get(value.span.start as usize..value.span.end as usize));
+                    if source.is_some_and(|source| {
+                        let parsed = ruby_prism::parse(source.as_bytes());
+                        parsed.errors().next().is_none() && parsed.node().as_program_node().is_some_and(|root| root.statements().body().iter().next().and_then(|n| n.as_call_node()).is_some_and(|call| call.block().is_none()))
+                    }) { continue; }
+                    diagnostics.push(Diagnostic::unsupported(value.span, None, "Data.define", "nested Data.define factories cannot retain their bodies and lexical identity"));
+                }
+            }
+        }
+        if let Some((_, span)) = factory.data_define()
+            && app.library_classes.iter().any(|other| other.name == factory.name && !std::ptr::eq(other, factory)
+                && (other.data_define().is_some() || !other.methods.is_empty() || !other.constants.is_empty()
+                    || !other.includes.is_empty() || !other.unknown_calls.is_empty()
+                    || !other.class_ivar_initializers.is_empty() || !other.conditional_definitions.is_empty()))
+        {
+            diagnostics.push(Diagnostic::unsupported(span, None, "Data.define", "cross-file reopening of a Data record cannot preserve definition order"));
+            continue;
+        }
+        if let Some((_, span)) = factory.data_define()
+            && resolver.has_source_namespace("Data")
+        {
+            diagnostics.push(Diagnostic::unsupported(span, None, "Data.define",
+                "file-level Data factories require the built-in Data"));
+            continue;
+        }
         let Some(LibraryClassOrigin::DataFactory { declaration_span }) = factory.origin else {
             continue;
         };
@@ -148,13 +200,24 @@ pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
 
 /// `new`, `with` and one reader per member, on the class that a
 /// factory creates. The result is the instance type.
-fn add_data_methods(info: &mut ClassInfo, id: &ClassId, members: impl IntoIterator<Item = Symbol>) -> Ty {
+fn add_data_methods(app: &App, info: &mut ClassInfo, id: &ClassId, members: impl IntoIterator<Item = Symbol>) -> Ty {
     let instance = Ty::Class {
         id: id.clone(),
         args: vec![].into(),
     };
+    // A source definition replaces the generated method, so its return
+    // starts unknown and harvest reads the last definition's body. One
+    // that calls `super` keeps the generated return.
+    let generated = |name: &str, receiver: MethodReceiver| {
+        let replaced = app.library_classes.iter().filter(|class| class.name == *id)
+            .flat_map(|class| &class.methods)
+            .filter(|method| method.name.as_str() == name && method.receiver == receiver)
+            .last()
+            .is_some_and(|method| method.signature.is_none() && !super::expr_calls_super(&method.body));
+        if replaced { Ty::Untyped } else { instance.clone() }
+    };
     info.class_methods
-        .insert(Symbol::from("new"), instance.clone());
+        .insert(Symbol::from("new"), generated("new", MethodReceiver::Class));
     info.declares_constructor = true;
     // A member declaration establishes a reader, not its value type.
     // Data has no generated writers. A block method of the same name
@@ -162,7 +225,7 @@ fn add_data_methods(info: &mut ClassInfo, id: &ClassId, members: impl IntoIterat
     for member in members {
         info.instance_methods.entry(member).or_insert(Ty::Untyped);
     }
-    info.instance_methods.entry(Symbol::from("with")).or_insert(instance.clone());
+    info.instance_methods.entry(Symbol::from("with")).or_insert_with(|| generated("with", MethodReceiver::Instance));
     instance
 }
 

@@ -58,14 +58,14 @@ fn a_library_the_tree_defines_itself_is_not_required() {
 /// A library Spinel has no package for (`delegate`, ...) stays out of the
 /// spinel tree, whose `--strict-require` build would refuse it, and is
 /// carried on the ruby family. `date`, `yaml` and `weakref` have one
-/// (packages/date, packages/yaml, packages/weakref), `io/wait` is native,
-/// and all four are carried on both.
+/// (packages/date, packages/yaml, packages/weakref, packages/pp), `io/wait`
+/// is native, and all five are carried on both.
 #[test]
 fn a_library_spinel_lacks_is_required_on_the_ruby_family_only() {
     let overlay = || {
         emit_and_run::real_blog().write(
             "app/models/dated_probe.rb",
-            "require \"date\"\nrequire \"delegate\"\nrequire \"yaml\"\nrequire \"weakref\"\nrequire \"io/wait\"\nrequire \"open3\"\n\nclass DatedProbe\n  def self.size = 1\nend\n",
+            "require \"date\"\nrequire \"delegate\"\nrequire \"yaml\"\nrequire \"weakref\"\nrequire \"io/wait\"\nrequire \"pp\"\nrequire \"open3\"\n\nclass DatedProbe\n  def self.size = 1\nend\n",
         )
     };
     for (target, carried) in [(BuildTarget::Spinel, false), (BuildTarget::Ruby, true)] {
@@ -73,7 +73,7 @@ fn a_library_spinel_lacks_is_required_on_the_ruby_family_only() {
         assert!(errors.is_empty(), "{target:?} errors: {errors:?}");
         let boot = std::fs::read_to_string(emitted.join("boot.rb")).expect("read boot.rb");
         assert!(boot.lines().any(|l| l.trim() == "require \"open3\""), "{target:?}:\n{boot}");
-        for (lib, on_spinel) in [("delegate", false), ("date", true), ("yaml", true), ("weakref", true), ("io/wait", true)] {
+        for (lib, on_spinel) in [("delegate", false), ("date", true), ("yaml", true), ("weakref", true), ("io/wait", true), ("pp", true)] {
             let line = format!("require {lib:?}");
             let expected = carried || on_spinel;
             assert_eq!(boot.lines().take(12).any(|l| l.trim() == line), expected, "{target:?} {lib}:\n{boot}");
@@ -109,19 +109,37 @@ fn a_package_s_requires_open_boot_too() {
 
 #[test]
 fn rails_version_is_the_locked_one() {
-    // fixtures/real-blog locks rails 8.1.4.
+    // The version fixtures/real-blog's Gemfile.lock pins: whatever
+    // `gem install rails` resolved when the fixture was generated
+    // (8.1.4, or a patch release such as 8.1.4.1, whose fourth part is PRE).
+    let version = locked_rails();
+    let parts: Vec<&str> = version.split('.').collect();
+    let pre = if parts.len() > 3 { format!("{:?}", parts[3..].join(".")) } else { "nil".to_string() };
+    let string = format!("STRING = \"{version}\"");
     for target in [BuildTarget::Spinel, BuildTarget::Ruby] {
         let boot = boot(target);
-        assert!(boot.contains("STRING = \"8.1.4\""), "{target:?}:\n{boot}");
-        assert!(boot.contains("MAJOR = 8") && boot.contains("MINOR = 1") && boot.contains("TINY = 4"));
+        assert!(boot.contains(&string), "{target:?}:\n{boot}");
+        for (name, value) in [("MAJOR", parts[0]), ("MINOR", parts[1]), ("TINY", parts[2]), ("PRE", pre.as_str())] {
+            assert!(boot.contains(&format!("{name} = {value}\n")), "{target:?}: {name}:\n{boot}");
+        }
         // defined before the app's files load, as `require "rails"` does
-        let version = boot.find("STRING = \"8.1.4\"").expect("version block");
+        let at = boot.find(&string).expect("version block");
         let app = boot.find("require_relative \"config/application\"").expect("config/application");
-        assert!(version < app, "{target:?}: Rails::VERSION after the app loads:\n{boot}");
+        assert!(at < app, "{target:?}: Rails::VERSION after the app loads:\n{boot}");
     }
     let run = app_with_requires().run_ruby("puts Rails::VERSION::STRING\nputs Rails::VERSION::PRE.inspect\n");
     run.assert_passes();
-    assert!(run.stdout.contains("8.1.4\nnil"), "{}", run.stdout);
+    assert!(run.stdout.contains(&format!("{version}\n{pre}")), "{}", run.stdout);
+}
+
+/// The `rails` spec fixtures/real-blog's Gemfile.lock resolves.
+fn locked_rails() -> String {
+    let lock = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/real-blog/Gemfile.lock"))
+        .expect("fixtures/real-blog/Gemfile.lock (bin/rh fixture)");
+    lock.lines()
+        .find_map(|l| l.strip_prefix("    rails (").and_then(|v| v.strip_suffix(')')))
+        .expect("a `rails (x.y.z)` spec in fixtures/real-blog/Gemfile.lock")
+        .to_string()
 }
 
 #[test]

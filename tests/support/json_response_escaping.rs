@@ -1,4 +1,6 @@
 use super::emit_and_run;
+#[path = "prerequisite.rs"]
+mod prerequisite;
 use serde_json::Value;
 
 pub fn expected() -> Vec<Value> {
@@ -140,9 +142,7 @@ pub fn oracle_matches_snapshot() {
                 .output()
                 .unwrap();
             if output.status.code() == Some(77) {
-                eprintln!(
-                    "skipping JSON response oracle: RailsOracle railties/actionpack unavailable"
-                );
+                prerequisite::missing("JSON response oracle: RailsOracle railties/actionpack unavailable");
                 return;
             }
             assert!(

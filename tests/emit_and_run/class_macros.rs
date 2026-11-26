@@ -167,3 +167,130 @@ fn a_definition_with_an_argument_splat_is_still_refused() {
         .emit(roundhouse::project::BuildTarget::Ruby);
     assert!(errors.iter().any(|e| e.contains("`guarded` defines methods this call does not expand")), "{errors:#?}");
 }
+
+/// A macro reads a list its class inherits (`NAMES` on the root, the loop in the subclass), and a subclass that
+/// shadows the name does not change what the inherited macro reads, as Ruby's lexical-then-ancestor lookup.
+#[test]
+fn an_inherited_list_constant_folds_from_where_the_macro_is_written() {
+    let run = emit_and_run::real_blog()
+        .write(
+            "app/models/macro_root.rb",
+            "class MacroRoot\n  NAMES = %i[alpha beta].freeze\nend\n",
+        )
+        .write(
+            "app/models/macro_leaf.rb",
+            "class MacroLeaf < MacroRoot\n  def self.install\n    NAMES.each do |n|\n      define_method(\"#{n}_name\") { n.to_s }\n    end\n  end\nend\n",
+        )
+        .write("app/models/macro_thing.rb", "class MacroThing < MacroLeaf\n  NAMES = %i[gamma].freeze\n  install\nend\n")
+        .run_ruby(
+            "t = MacroThing.new\ngot = [t.alpha_name, t.beta_name, t.respond_to?(:gamma_name)]\nraise \"got #{got.inspect}\" unless got == [\"alpha\", \"beta\", false]\nputs \"inherited constant passed\"\n",
+        );
+    run.assert_passes();
+    assert!(run.stdout.contains("inherited constant passed"), "{}", run.stdout);
+}
+
+/// The class the macro is written in assigns the name a value that does not fold: that value hides the root's, so the
+/// root's list is not read in its place and the macro is not expanded from it.
+#[test]
+fn a_nearer_unfoldable_list_hides_the_inherited_one() {
+    let (_emitted, errors) = emit_and_run::real_blog()
+        .write("app/models/macro_root.rb", "class MacroRoot\n  NAMES = %i[alpha beta].freeze\nend\n")
+        .write(
+            "app/models/macro_leaf.rb",
+            "class MacroLeaf < MacroRoot\n  NAMES = ENV.fetch(\"NAMES\", \"gamma\").split(\",\").map(&:to_sym)\n\n  def self.install\n    NAMES.each do |n|\n      define_method(\"#{n}_name\") { n.to_s }\n    end\n  end\nend\n",
+        )
+        .write("app/models/macro_thing.rb", "class MacroThing < MacroLeaf\n  install\nend\n")
+        .emit(roundhouse::project::BuildTarget::Ruby);
+    assert!(errors.iter().any(|e| e.contains("`install` defines methods this call does not expand")), "{errors:#?}");
+}
+
+/// A macro's default (`def self.install(names = NAMES)`) is read where the method is written, as Ruby evaluates it:
+/// the root's list, though a subclass between assigns the name too.
+#[test]
+fn a_default_reads_its_methods_own_constant() {
+    let run = emit_and_run::real_blog()
+        .write(
+            "app/models/macro_root.rb",
+            "class MacroRoot\n  NAMES = %i[alpha].freeze\n\n  def self.install(names = NAMES)\n    names.each do |n|\n      define_method(\"#{n}_name\") { n.to_s }\n    end\n  end\nend\n",
+        )
+        .write("app/models/macro_leaf.rb", "class MacroLeaf < MacroRoot\n  NAMES = %i[beta].freeze\nend\n")
+        .write("app/models/macro_thing.rb", "class MacroThing < MacroLeaf\n  install\nend\n")
+        .run_ruby("t = MacroThing.new\ngot = [t.alpha_name, t.respond_to?(:beta_name)]\nraise \"got #{got.inspect}\" unless got == [\"alpha\", false]\nputs \"default constant passed\"\n");
+    run.assert_passes();
+    assert!(run.stdout.contains("default constant passed"), "{}", run.stdout);
+}
+
+/// discourse's `DiscoursePluginRegistry.define_register`: a plain class's
+/// own macro guards on `respond_to?` of the name it defines, records it in
+/// a class variable, aliases one singleton method under another name and
+/// yields itself when given a block. The guard answers as the class body
+/// sees it at that call, the record runs in the class body, and the alias
+/// is a copy of the method as the run defined it.
+const REGISTRY: &str = r##"class PluginRegistry
+  @@register_names = Set.new
+
+  def self.define_register(register_name, type)
+    return if respond_to?(register_name)
+    @@register_names << register_name
+
+    define_singleton_method(register_name) do
+      instance_variable_get(:"@#{register_name}") ||
+        instance_variable_set(:"@#{register_name}", type.new)
+    end
+
+    define_method(register_name) { self.class.public_send(register_name) }
+  end
+
+  def self.define_filtered_register(register_name)
+    return if respond_to?(register_name)
+    define_register(register_name, Array)
+
+    singleton_class.alias_method :"_raw_#{register_name}", :"#{register_name}"
+
+    define_singleton_method(register_name) do
+      public_send(:"_raw_#{register_name}").filter_map { |h| h[:value] if h[:enabled] }.uniq
+    end
+
+    define_singleton_method("register_#{register_name.to_s.singularize}") do |value, enabled|
+      public_send(:"_raw_#{register_name}") << { enabled: enabled, value: value }
+    end
+
+    yield(self) if block_given?
+  end
+
+  define_register :javascripts, Set
+  define_register :javascripts, Hash
+  define_filtered_register :stylesheets
+end
+"##;
+
+const REGISTRY_ASSERTIONS: &str = r##"PluginRegistry.javascripts << "a.js"
+PluginRegistry.register_stylesheet("x.css", true)
+PluginRegistry.register_stylesheet("y.css", false)
+PluginRegistry.register_stylesheet("x.css", true)
+got = [PluginRegistry.javascripts.to_a, PluginRegistry.new.javascripts.class.name, PluginRegistry.stylesheets, PluginRegistry._raw_stylesheets.size, PluginRegistry.class_variable_get(:@@register_names).to_a.map(&:to_s)]
+raise got.inspect unless got == [["a.js"], "Set", ["x.css"], 3, ["javascripts", "stylesheets"]]
+puts "registry macros passed"
+"##;
+
+fn registry_app() -> emit_and_run::Overlay {
+    emit_and_run::real_blog().write("app/models/plugin_registry.rb", REGISTRY)
+}
+
+#[test]
+fn a_registry_macro_guarded_on_respond_to_defines_its_methods() {
+    let (_emitted, errors) = registry_app().emit(roundhouse::project::BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    registry_app().run_ruby(REGISTRY_ASSERTIONS).assert_passes();
+}
+
+/// A class that `extend`s a module the program does not define may answer
+/// any name on its class side: the guard is not answered, and the call is
+/// reported rather than expanded past a method the module may provide.
+#[test]
+fn a_registry_macro_beside_an_unknown_extend_is_reported() {
+    let errors = emit_and_run::real_blog()
+        .write("app/models/plugin_registry.rb", &REGISTRY.replacen("class PluginRegistry\n", "class PluginRegistry\n  extend Forwardable\n", 1))
+        .check_errors();
+    assert!(errors.iter().any(|e| e.contains("`define_register` defines methods this call does not expand")), "{errors:#?}");
+}

@@ -17,6 +17,8 @@
 //!
 //! Skips when `ruby` is not on the machine; the CI core job has it.
 
+#[path = "support/prerequisite.rs"]
+mod prerequisite;
 #[path = "support/scratch.rs"]
 mod scratch;
 use std::path::PathBuf;
@@ -82,7 +84,7 @@ fn the_spinel_sidecar_types_path_parameters_as_the_request_hash() {
 #[test]
 fn the_resolver_recalls_a_segment_as_rails_does() {
     if !Command::new("ruby").args(["-e", "1"]).status().is_ok_and(|s| s.success()) {
-        eprintln!("skipping: ruby not available");
+        prerequisite::missing("ruby not available");
         return;
     }
     let out = tree();

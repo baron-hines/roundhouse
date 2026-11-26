@@ -1,3 +1,5 @@
+#[path = "../support/prerequisite.rs"]
+mod prerequisite;
 use super::emit_and_run;
 use std::path::Path;
 use std::process::Command;
@@ -9,7 +11,7 @@ fn controller_writer_values_and_headers_match_rails() {
         .arg("require './tests/support/rails_oracle'; exit(RailsOracle.available?('actionpack') ? 0 : 1)")
         .status().expect("probe Rails gems");
     if !available.success() {
-        eprintln!("skipping controller content-type oracle: actionpack oracle gems are unavailable");
+        prerequisite::missing("controller content-type oracle: actionpack oracle gems are unavailable");
         return;
     }
     let native = Command::new("ruby").arg(support.join("oracle.rb")).arg("rails")

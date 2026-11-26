@@ -18,10 +18,13 @@
 //! broadcasts orchestration, schema → DDL, and router dispatch tables.
 
 pub mod arel;
+pub mod renderable;
+pub mod route_guards;
 pub mod array_columns;
 pub mod associations;
 pub mod association_new;
 pub mod blank;
+pub mod respond_to;
 pub mod broadcast_calls;
 pub mod module_mixins;
 pub mod broadcasts;
@@ -49,6 +52,7 @@ pub mod schema_to_library;
 pub mod seeds_to_library;
 pub mod test_module_to_library;
 pub mod create_block;
+pub mod create_rows;
 pub mod as_json_poro;
 mod as_json_record;
 pub use as_json_writer::WRITER_METHOD as JSON_WRITER_METHOD;
@@ -82,7 +86,7 @@ pub mod unported_rails_subclasses;
 pub mod pathname_ctor;
 pub mod assoc_pluck;
 pub mod try_guard;
-mod core_method_names;
+pub(crate) mod core_method_names;
 pub mod class_body_new;
 pub mod mocha;
 pub mod stub_const;
@@ -124,10 +128,16 @@ pub mod presence_in;
 pub mod relation_ivar_materialize;
 pub mod records_to_relation_arg;
 pub mod save_without_validation;
+pub mod defined_ivar_read;
+pub mod method_missing_calls;
+pub mod dynamic_try;
+pub mod primary_key_send;
+pub(crate) mod core_instance_methods;
 pub mod route_param_recall;
 pub mod expect_string_key;
 pub mod defined_ivar_memo;
 pub mod defined_const_fold;
+mod diverging_args;
 pub mod controller_class_render;
 pub mod dirty_predicate_kwargs;
 pub mod job_test_only;
@@ -192,6 +202,7 @@ pub mod ruby_family_gems;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod gem_refusal;
 pub mod constantize;
+pub mod rooted_constants;
 pub mod params_residue;
 pub mod params_permit;
 pub mod normalizes;
@@ -227,6 +238,7 @@ pub mod view_buffer_passing;
 pub mod view_instrumentation;
 pub mod tag_block_passing;
 pub mod lazy_model_state;
+pub mod missing_attribute;
 pub(crate) mod eager_load;
 pub mod view_to_library;
 
@@ -266,6 +278,7 @@ pub use in_predicate::apply_in_predicate_lowering;
 pub use including::apply_including_lowering;
 pub use relation_select_block::apply_relation_select_block_lowering;
 pub use enum_symbols::apply_enum_symbol_lowering;
+pub(crate) use enum_symbols::WRITER_METHODS as ENUM_WRITER_METHODS;
 pub use has_json::apply_has_json_lowering;
 pub use route_format_suffix::apply_route_format_suffix_lowering;
 pub use route_url_options::apply_route_url_options_lowering;
@@ -339,6 +352,8 @@ const POST_ANALYZE_PASS_ORDER: &[(&str, &[&str])] = &[
     // pruned. First, so every later pass (and the spinel refusal of a
     // runtime `defined?`) sees only the code that can run.
     ("defined_const_fold", &[]),
+    // A call whose argument is Ruby's NameError raises there: after the fold, which may leave such a read live.
+    ("diverging_args", &["defined_const_fold"]),
     // Deletes every class extending a Rails base the runtime does not
     // port (`ApplicationMailbox < ActionMailbox::Base`) before any pass
     // ledgers residue for a body that is not going to emit.
@@ -464,6 +479,7 @@ const POST_ANALYZE_PASS_ORDER: &[(&str, &[&str])] = &[
     // `Rooms::Open.count`-style chains this pass would otherwise wrap
     // one hop too early.
     ("relation_ivar_materialize", &["sti_scope"]),
+    ("relation_difference_materialize", &["relation_ivar_materialize"]),
     // `defined?(@x)` → `@x_defined`, with the flag set beside every
     // assignment to `@x`. Reads a `defined?` send no other pass
     // produces and writes an ivar name no other pass reads, so no
@@ -641,6 +657,10 @@ const POST_ANALYZE_PASS_ORDER: &[(&str, &[&str])] = &[
     ("errors_index", &["errors_add"]),
     ("human_attribute_name", &[]),
     ("i18n_translate", &[]),
+    // `create!(rows)` of an Array → one `create!` per row. Its blockless
+    // calls are none of `create_block`'s; `params_merge` then sees the
+    // per-row call.
+    ("create_rows", &[]),
     ("create_block", &["secure_password_super"]),
     // `<params>.merge(k: v)` written a method away from the permit
     // chain → `Model.from_params(p)` + per-key setters, hoisted above
@@ -712,6 +732,9 @@ const POST_ANALYZE_PASS_ORDER: &[(&str, &[&str])] = &[
     // `record.slice(:a, :b)` on a typed model → a Hash of its typed
     // readers. Reads the analyzer's receiver types; nothing keys on it.
     ("record_slice", &[]),
+    // `record.send(record.class.primary_key)` -> `record.id` on an analyzer-typed record, before the dynamic
+    // send would reach send_static_dispatch's residue.
+    ("primary_key_send", &[]),
     ("send_static_dispatch", &[]),
     // Grounds the plural duration-unit calls that send_static_dispatch
     // synthesizes into case arms, so it must observe that pass's output.
@@ -762,6 +785,10 @@ const POST_ANALYZE_PASS_ORDER: &[(&str, &[&str])] = &[
     // chain that stays dynamic — and on a relation-less target that is
     // now an error (issue #76), not a suppressed warning.
     ("relation_residue", &["duration", "group_count"]),
+    // `assert_respond_to` / `refute_respond_to` / `respond_to?(:sym)` in
+    // the test tree, answered from the analyzer's registry for a target
+    // with no runtime method table (`respond_to.rs`).
+    ("respond_to", &[]),
 ];
 
 /// True iff `POST_ANALYZE_PASS_ORDER` is a valid topological order —
@@ -855,6 +882,8 @@ pub(crate) fn apply_post_analyze_lowerings_for(
     crate::timings::lap_start();
     defined_const_fold::apply_defined_const_fold(app);
     ran!("defined_const_fold");
+    diverging_args::apply(app);
+    ran!("diverging_args");
     let mut diags = unported_rails_subclasses::apply_unported_rails_subclass_drop(app);
     ran!("unported_rails_subclasses");
     spliced_concern_bodies::apply_spliced_concern_body_prune(app);
@@ -877,7 +906,7 @@ pub(crate) fn apply_post_analyze_lowerings_for(
     ran!("params_permit");
     controller_to_library::params::lower_value_reads(app);
     ran!("params_value_reads");
-    indifferent_access::apply_indifferent_access_lowering(app);
+    diags.extend(indifferent_access::apply_indifferent_access_lowering(app));
     ran!("indifferent_access");
     // Not fused: a local bound to `arel_table` is a whole-body fact, which a per-node rewrite cannot see
     arel_attribute::apply_arel_attribute_lowering(app);
@@ -885,6 +914,7 @@ pub(crate) fn apply_post_analyze_lowerings_for(
         fused::apply_fused_independent_rewrites(app);
     });
     save_without_validation::apply_bare_model_saves(app);
+    defined_ivar_read::apply_defined_ivar_read_lowering(app);
     ran!("pathname_ctor");
     ran!("array_ordinal");
     ran!("save_without_validation");
@@ -947,6 +977,8 @@ pub(crate) fn apply_post_analyze_lowerings_for(
     ran!("try_guard");
     record_snapshot::apply_record_snapshot_lowering(app);
     ran!("record_snapshot");
+    method_missing_calls::apply_method_missing_calls(app, registry, target);
+    dynamic_try::apply_dynamic_try(app, target);
     diags.extend(where_range_split::apply_where_range_split(app, target));
     ran!("where_range_split");
     for_each_hook_body(app, &mut |body| {
@@ -962,12 +994,14 @@ pub(crate) fn apply_post_analyze_lowerings_for(
     ran!("sti_scope");
     relation_ivar_materialize::apply_relation_ivar_materialize(app);
     ran!("relation_ivar_materialize");
+    relation_ivar_materialize::apply_relation_difference_materialize(app);
+    ran!("relation_difference_materialize");
     defined_ivar_memo::apply_defined_ivar_memo_lowering(app);
     ran!("defined_ivar_memo");
     sti_subclass_callbacks::apply_sti_subclass_callbacks(app);
     ran!("sti_subclass_callbacks");
     crate::timings::phase("post-analyze: fused pre-tag rewrites", || {
-        fused::apply_fused_pre_tag_rewrites(app);
+        fused::apply_fused_pre_tag_rewrites(app, target);
     });
     ran!("attribute_aliases");
     ran!("sti_is_a");
@@ -985,7 +1019,7 @@ pub(crate) fn apply_post_analyze_lowerings_for(
     ran!("status_literal");
     ran!("to_param_residue");
     crate::timings::phase("post-analyze: fused mid rewrites", || {
-        fused::apply_fused_mid_rewrites(app);
+        fused::apply_fused_mid_rewrites(app, target);
     });
     ran!("route_format_suffix");
     ran!("route_url_options");
@@ -1007,7 +1041,7 @@ pub(crate) fn apply_post_analyze_lowerings_for(
     ran!("inquiry");
     has_one_builder::apply_has_one_builder_lowering(app);
     ran!("has_one_builder");
-    config_reader::apply_config_reader_lowering(app);
+    config_reader::apply_config_reader_lowering_for(app, target);
     ran!("config_reader");
     ran!("symbolize_keys");
     enum_mapping_keys::apply_enum_mapping_keys(app);
@@ -1046,6 +1080,7 @@ pub(crate) fn apply_post_analyze_lowerings_for(
     ran!("partial_qualify");
     diags.extend(first_or_create::apply_first_or_create_lowering(app));
     ran!("first_or_create");
+    diags.extend(view_to_library::conflicting_partial_form_bindings(app));
     case_class_narrow::apply_case_class_narrowing(app);
     ran!("case_class_narrow");
     reset_counters::apply_reset_counters_lowering(app);
@@ -1054,7 +1089,7 @@ pub(crate) fn apply_post_analyze_lowerings_for(
     ran!("authenticate_by");
     // After authenticate_by: its expansion is a `find_by` whose keyword
     // a `normalizes` declaration applies to.
-    normalizes::apply_normalizes_finder_lowering(app);
+    normalizes::apply_normalizes_finder_lowering(app, target);
     ran!("normalizes");
     dead_default::apply_dead_default_lowering(app, registry);
     ran!("dead_default");
@@ -1066,6 +1101,8 @@ pub(crate) fn apply_post_analyze_lowerings_for(
     ran!("human_attribute_name");
     i18n_translate::apply_i18n_translate_lowering(app);
     ran!("i18n_translate");
+    create_rows::apply_create_rows_lowering(app);
+    ran!("create_rows");
     diags.extend(create_block::apply_create_block_inline(app));
     ran!("create_block");
     diags.extend(params_merge::apply_params_merge_lowering(app));
@@ -1095,7 +1132,7 @@ pub(crate) fn apply_post_analyze_lowerings_for(
     ran!("current_set");
     diags.extend(mailer_class_side::apply_mailer_class_side(app));
     ran!("mailer_class_side");
-    diags.extend(mailer_templates::apply_mailer_templates(app));
+    diags.extend(mailer_templates::apply_mailer_templates_for(app, target));
     ran!("mailer_templates");
     diags.extend(job_class_side::apply_job_class_side(app));
     ran!("job_class_side");
@@ -1105,6 +1142,8 @@ pub(crate) fn apply_post_analyze_lowerings_for(
     ran!("module_mattr_storage");
     diags.extend(record_slice::apply_record_slice_lowering(app, registry));
     ran!("record_slice");
+    primary_key_send::apply_primary_key_send(app);
+    ran!("primary_key_send");
     diags.extend(crate::timings::phase("post-analyze: send_dispatch", || {
         send_dispatch::apply_send_static_dispatch(app, registry)
     }));
@@ -1133,6 +1172,8 @@ pub(crate) fn apply_post_analyze_lowerings_for(
         relation_residue::apply_relation_residue_ledger(app, registry)
     }));
     ran!("relation_residue");
+    respond_to::apply(app, registry, target);
+    ran!("respond_to");
     #[cfg(debug_assertions)]
     debug_assert_eq!(
         executed,
@@ -1270,6 +1311,17 @@ pub(crate) fn for_each_test_body(
     }
 }
 
+macro_rules! action_defaults {
+    ($action:ident, $f:ident, $iter:ident, $option:ident) => {
+        for (_, default) in $action.opt_params.$iter() {
+            $f(default);
+        }
+        for default in $action.kw_params.$iter().filter_map(|(_, e)| e.$option()) {
+            $f(default);
+        }
+    };
+}
+
 pub(crate) fn for_each_hook_body(
     app: &mut crate::app::App,
     f: &mut impl FnMut(&mut crate::expr::Expr),
@@ -1400,9 +1452,7 @@ pub(crate) fn for_each_owned_hook_body(
         for item in body {
             match item {
                 crate::dialect::ControllerBodyItem::Action { action, .. } => {
-                    for (_name, default) in &mut action.opt_params {
-                        f(default);
-                    }
+                    action_defaults!(action, f, iter_mut, as_mut);
                     f(&mut action.body)
                 }
                 crate::dialect::ControllerBodyItem::ClassMethod { method, .. } => {
@@ -1452,6 +1502,15 @@ pub(crate) fn for_each_hook_body_ref(
     app: &crate::app::App,
     f: &mut impl FnMut(&crate::expr::Expr),
 ) {
+    for_each_owned_hook_body_ref(app, &mut |_, body| f(body))
+}
+
+/// [`for_each_hook_body_ref`] with each body's owner, as
+/// [`for_each_owned_hook_body`] gives it.
+pub(crate) fn for_each_owned_hook_body_ref(
+    app: &crate::app::App,
+    f: &mut impl FnMut(Option<&crate::ident::ClassId>, &crate::expr::Expr),
+) {
     fn visit_param_defaults(
         params: &[crate::dialect::Param],
         f: &mut impl FnMut(&crate::expr::Expr),
@@ -1463,6 +1522,7 @@ pub(crate) fn for_each_hook_body_ref(
         }
     }
     for model in &app.models {
+        let f = &mut |e: &crate::expr::Expr| f(Some(&model.name), e);
         for item in &model.body {
             match item {
                 crate::dialect::ModelBodyItem::Method { method, .. } => {
@@ -1504,6 +1564,7 @@ pub(crate) fn for_each_hook_body_ref(
         }
     }
     for lc in &app.library_classes {
+        let f = &mut |e: &crate::expr::Expr| f(Some(&lc.name), e);
         for method in &lc.methods {
             visit_param_defaults(&method.params, f);
             f(&method.body);
@@ -1520,6 +1581,7 @@ pub(crate) fn for_each_hook_body_ref(
     }
     // Same set as the mutable twin — see the note there.
     if let Some(lc) = &app.rails_application {
+        let f = &mut |e: &crate::expr::Expr| f(Some(&lc.name), e);
         for method in &lc.methods {
             visit_param_defaults(&method.params, f);
             f(&method.body);
@@ -1535,12 +1597,11 @@ pub(crate) fn for_each_hook_body_ref(
         }
     }
     for controller in &app.controllers {
+        let f = &mut |e: &crate::expr::Expr| f(Some(&controller.name), e);
         for item in &controller.body {
             match item {
                 crate::dialect::ControllerBodyItem::Action { action, .. } => {
-                    for (_name, default) in &action.opt_params {
-                        f(default);
-                    }
+                    action_defaults!(action, f, iter, as_ref);
                     f(&action.body)
                 }
                 crate::dialect::ControllerBodyItem::ClassMethod { method, .. } => {
@@ -1561,10 +1622,10 @@ pub(crate) fn for_each_hook_body_ref(
         }
     }
     if let Some(seeds) = &app.seeds {
-        f(seeds);
+        f(None, seeds);
     }
     for stmt in &app.boot_program {
-        f(stmt);
+        f(None, stmt);
     }
 }
 
@@ -1574,24 +1635,39 @@ macro_rules! forwarding_roots {
     ($app:ident, $f:ident, $iter:ident, $option:ident $(, $mutable:tt)?) => {
         for view in & $($mutable)? $app.views { $f(& $($mutable)? view.body); }
         for tm in & $($mutable)? $app.test_modules {
-            if let Some(setup) = tm.setup.$option() { $f(setup); }
-            for test in & $($mutable)? tm.tests { $f(& $($mutable)? test.body); }
-            for (_, value) in & $($mutable)? tm.constants { $f(value); }
-            for method in & $($mutable)? tm.helpers {
+            test_module_roots!(tm, $f, $iter, $option $(, $mutable)?);
+        }
+    }
+}
+
+// Every emit-bound body of one test module: its setup, tests, constants,
+// helpers (and their defaults), and its own classes' methods (and
+// defaults), constants, class-body calls and class-level ivars.
+macro_rules! test_module_roots {
+    ($tm:ident, $f:ident, $iter:ident, $option:ident $(, $mutable:tt)?) => {
+        if let Some(setup) = $tm.setup.$option() { $f(setup); }
+        for test in & $($mutable)? $tm.tests { $f(& $($mutable)? test.body); }
+        for (_, value) in & $($mutable)? $tm.constants { $f(value); }
+        for method in & $($mutable)? $tm.helpers {
+            $f(& $($mutable)? method.body);
+            for default in method.params.$iter().filter_map(|p| p.default.$option()) { $f(default); }
+        }
+        for class in & $($mutable)? $tm.inner_classes {
+            for method in & $($mutable)? class.methods {
                 $f(& $($mutable)? method.body);
                 for default in method.params.$iter().filter_map(|p| p.default.$option()) { $f(default); }
             }
-            for class in & $($mutable)? tm.inner_classes {
-                for method in & $($mutable)? class.methods {
-                    $f(& $($mutable)? method.body);
-                    for default in method.params.$iter().filter_map(|p| p.default.$option()) { $f(default); }
-                }
-                for (_, value) in & $($mutable)? class.constants { $f(value); }
-                for call in & $($mutable)? class.unknown_calls { $f(call); }
-                for initializer in & $($mutable)? class.class_ivar_initializers { $f(initializer); }
-            }
+            for (_, value) in & $($mutable)? class.constants { $f(value); }
+            for call in & $($mutable)? class.unknown_calls { $f(call); }
+            for initializer in & $($mutable)? class.class_ivar_initializers { $f(initializer); }
         }
     }
+}
+
+/// Every emit-bound body of one test module, the part of
+/// [`for_each_forwarding_body`] that walks it.
+pub(crate) fn for_each_test_module_body(tm: &mut crate::dialect::TestModule, f: &mut impl FnMut(&mut crate::expr::Expr)) {
+    test_module_roots!(tm, f, iter_mut, as_mut, mut);
 }
 
 pub(crate) fn for_each_forwarding_body(app: &mut crate::App, f: &mut impl FnMut(&mut crate::expr::Expr)) {
@@ -1616,15 +1692,6 @@ pub(crate) fn for_each_emit_body(app: &mut crate::App, f: &mut impl FnMut(&mut c
                     | crate::dialect::Association::HasMany { scope: Some(e), .. }
                     | crate::dialect::Association::HasOne { scope: Some(e), .. } => f(e),
                     _ => {}
-                }
-            }
-        }
-    }
-    for controller in &mut app.controllers {
-        for item in &mut controller.body {
-            if let crate::dialect::ControllerBodyItem::Action { action, .. } = item {
-                for default in action.kw_params.iter_mut().filter_map(|(_, e)| e.as_mut()) {
-                    f(default);
                 }
             }
         }
@@ -1684,9 +1751,6 @@ pub(crate) fn for_each_emit_body_ref(app: &crate::App, f: &mut impl FnMut(&crate
             _ => {}
         }
     }
-    for action in app.controllers.iter().flat_map(|c| c.actions()) {
-        for default in action.kw_params.iter().filter_map(|(_, e)| e.as_ref()) { f(default); }
-    }
     for view in &app.views {
         for default in view.strict_locals.iter().flatten().filter_map(|p| p.default.as_ref()) { f(default); }
     }
@@ -1727,7 +1791,7 @@ pub use model_to_library::{
     lower_models_to_library_classes_with_params, lower_models_with_registry,
     lower_models_with_registry_and_params, lower_models_with_registry_params_and_views,
 };
-pub use fixture_to_library::{lower_fixtures_to_library_classes, rewrite_fixture_calls};
+pub use fixture_to_library::{lower_fixtures_to_library_classes, lower_fixtures_to_library_classes_keeping_keys, rewrite_fixture_calls};
 pub use importmap_to_library::lower_importmap_to_library_functions;
 pub use library_extras::{extras_from_funcs, extras_from_lcs};
 pub use routes_to_library::{
@@ -1880,7 +1944,7 @@ mod body_root_tests {
     fn surveys_and_rewrites_visit_each_owned_root_once_in_order() {
         let files = [
             ("app/models/widget.rb", "class Widget < ApplicationRecord\n def probe(value=11); 12; end\n scope :slice, ->(value=13) { 14 }\n before_save :probe, if: -> { 15 }\n has_many :items do\n def extra(value=16); 17; end\n end\n dsl(18)\nend"),
-            ("app/controllers/widgets_controller.rb", "class WidgetsController < ApplicationController\n before_action :probe, if: -> { 19 }, unless: -> { 20 }\n def index(value=21); 22; end\n dsl(23)\nend"),
+            ("app/controllers/widgets_controller.rb", "class WidgetsController < ApplicationController\n before_action :probe, if: -> { 19 }, unless: -> { 20 }\n def index(value=21, keyword: 44, required:); 22; end\n dsl(23)\nend"),
             ("app/services/probe.rb", "class Probe\n ITEM=24\n dsl(25)\n def probe(value=26); 27; end\nend\nclass Counter\n @@counter=nil\n def probe(value=28); 29; end\nend"),
             ("config/application.rb", "module Shell\n class Application < Rails::Application\n def probe(value=30); 31; end\n end\nend"),
             ("db/seeds.rb", "34"),
@@ -1899,7 +1963,7 @@ mod body_root_tests {
             ExprNode::Lit { value: Literal::Int { value: 33 } }));
         let hooks = ["11", "12", "13", "14", "15", "16", "17", "18",
             "26", "27", "24", "25", "28", "29", "@@counter",
-            "30", "31", "32", "33", "19", "20", "21", "22", "23", "34"];
+            "30", "31", "32", "33", "19", "20", "21", "44", "22", "23", "34"];
         let extras = ["35", "40", "36", "37", "41", "39", "38", "43", "42", "@@nested"];
         let mut seen = Vec::new();
         for_each_hook_body_ref(&app, &mut |root| trace(root, &mut seen));
@@ -1916,6 +1980,9 @@ mod body_root_tests {
         let expected: Vec<_> = hooks.into_iter().chain(extras).collect();
         seen.clear();
         for_each_emit_body_ref(&app, &mut |root| trace(root, &mut seen));
+        assert_eq!(seen, expected);
+        seen.clear();
+        for_each_emit_body(&mut app, &mut |root| trace(root, &mut seen));
         assert_eq!(seen, expected);
         seen.clear();
         for_each_forwarding_body(&mut app, &mut |root| {

@@ -759,8 +759,16 @@ module ActionCable
         @cookies
       end
 
+      attr_writer :request
+
+      def request
+        @request = ActionDispatch::Request.for({}) if @request.nil?
+        @request
+      end
+
       def initialize(cookies)
         @cookies = cookies
+        @request = nil
       end
 
       # Rails' Base does not define `connect`; a subclass that wants

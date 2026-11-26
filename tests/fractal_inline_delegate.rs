@@ -2,6 +2,8 @@
 //! Ruby and Active Support's delegation are available) that the rewritten
 //! class behaves as the original does.
 
+#[path = "support/prerequisite.rs"]
+mod prerequisite;
 #[path = "support/scratch.rs"]
 mod scratch;
 use std::fs;
@@ -274,7 +276,7 @@ fn the_rewritten_class_behaves_as_the_original() {
     // build has neither.
     let available = Command::new("ruby").args(["-e", "require 'active_support/core_ext/module/delegation'"]).output();
     if !available.is_ok_and(|output| output.status.success()) {
-        eprintln!("ruby with active_support/core_ext/module/delegation is not available; skipping the runtime comparison");
+        prerequisite::missing("ruby with active_support/core_ext/module/delegation is not available; the runtime comparison does not run");
         return;
     }
     let app = app_with_model("runtime", RUNTIME_MODEL);

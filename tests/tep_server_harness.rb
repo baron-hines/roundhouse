@@ -35,7 +35,7 @@ end
 # opens a stream, which is spinel's business, not this test's.
 %w[
   tep_core url net streamer broadcast_subscription websocket
-  request response parser server server_threaded server_scheduled
+  chunked_body request response parser server server_threaded server_scheduled
 ].each do |f|
   require_relative "../runtime/spinel/tep/#{f}"
 end
@@ -89,6 +89,8 @@ module Sock
     attr_accessor :wire
   end
 
+  # The peer a scripted connection came from (net.rb's sp_net_peer_ip).
+  def self.sp_net_peer_ip(_fd) = "127.0.0.1"
   def self.sp_net_recv_some(_fd, n) = wire.recv(n)
   def self.sp_net_write_str(_fd, s) = wire.write(s)
   def self.sp_net_write_bytes(_fd, s, n) = wire.write(s.byteslice(0, n))

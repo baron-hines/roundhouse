@@ -6,6 +6,12 @@ const ARTICLE_MAP_OVERLAY: &str = "  validates :title, presence: true
 
   def self.lock_for(id) = LOCKS.compute_if_absent(id) { Mutex.new }
   def self.forget_locks = LOCKS.clear
+  def self.lock_ids = LOCKS.keys
+  def self.lock_pairs
+    pairs = []
+    LOCKS.each_pair { |id, lock| pairs << [id, lock.class] }
+    pairs
+  end
 
   class << self
     def remember(id, at) = seen[id] = at
@@ -22,6 +28,8 @@ const ARTICLE_MAP_OVERLAY: &str = "  validates :title, presence: true
 const MAP_SCRIPT: &str = r#"lock = Article.lock_for(1)
 raise "same lock" unless lock.is_a?(Mutex) && Article.lock_for(1).equal?(lock)
 raise "other lock" if Article.lock_for(2).equal?(lock)
+raise "keys" unless Article.lock_ids == [1, 2]
+raise "each_pair" unless Article.lock_pairs == [[1, Thread::Mutex], [2, Thread::Mutex]]
 raise "clear answers the map" unless Article.forget_locks.equal?(Article::LOCKS)
 raise "cleared" if Article.lock_for(1).equal?(lock)
 at = Time.at(0)

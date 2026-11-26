@@ -667,6 +667,7 @@ fn value_type_for(col_type: &ColumnType) -> ValueType {
         | ColumnType::BigInt
         | ColumnType::Reference { .. } => ValueType::Int,
         ColumnType::Boolean => ValueType::Bool,
+        ColumnType::Binary => ValueType::Binary,
         _ => ValueType::Str,
     }
 }
@@ -696,46 +697,59 @@ mod tests {
                         col_type: ColumnType::Integer,
                         nullable: false,
                         default: None,
+                        default_expression: None,
+                        legacy_default_persistence: false,
                         primary_key: true,
                         generated: None,
                         generated_text_compatible: None,
                         generated_int4_compatible: None,
                         array: false,
                         array_stored: false,
+                        unset_until_assigned: false,
+                        collated: false,
                     },
                     Column {
                         name: Symbol::from("article_id"),
                         col_type: ColumnType::Integer,
                         nullable: false,
                         default: None,
+                        default_expression: None,
+                        legacy_default_persistence: false,
                         primary_key: false,
                         generated: None,
                         generated_text_compatible: None,
                         generated_int4_compatible: None,
                         array: false,
                         array_stored: false,
+                        unset_until_assigned: false,
+                        collated: false,
                     },
                     Column {
                         name: Symbol::from("body"),
                         col_type: ColumnType::Text,
                         nullable: false,
                         default: None,
+                        default_expression: None,
+                        legacy_default_persistence: false,
                         primary_key: false,
                         generated: None,
                         generated_text_compatible: None,
                         generated_int4_compatible: None,
                         array: false,
                         array_stored: false,
+                        unset_until_assigned: false,
+                        collated: false,
                     },
                 ],
                 indexes: vec![],
                 foreign_keys: vec![],
+                check_constraints: Vec::new(),
                 virtual_module: None,
                 known_keyless: false,
                 primary_key_columns: Vec::new(),
             },
         );
-        let schema = Schema { tables };
+        let schema = Schema { tables, ..Default::default() };
 
         let mut registry = HashMap::default();
         let mut comment_info = ClassInfo::default();

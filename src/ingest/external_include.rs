@@ -75,6 +75,10 @@ fn include(app: &mut App, target: &ClassId, module: ClassId) -> bool {
         return false;
     };
     if *target != module && !t.includes.contains(&module) {
+        // A statement of its own: a span no other include shares.
+        if t.include_spans.len() == t.includes.len() {
+            t.include_spans.push(crate::span::Span::synthetic());
+        }
         t.includes.push(module);
     }
     true

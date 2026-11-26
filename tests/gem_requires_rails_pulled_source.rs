@@ -52,6 +52,6 @@ fn a_rails_dependent_gem_compiled_from_source_is_not_refused() {
 fn a_rails_dependent_gem_compiled_from_source_runs() {
     let run = app().run_ruby("p AuthenticationHelper.login_without_db_writes({})\n");
     assert!(!run.errors.iter().any(|e| e.contains("gem_requires_rails")), "{:#?}", run.errors);
-    assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+    run.assert_passes();
     assert_eq!(run.stdout, "[{access_token: \"t\"}, [:app]]\n", "{}", run.stderr);
 }

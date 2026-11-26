@@ -10,6 +10,8 @@
 //! Every answer in the tables is actionpack 8.1.4's for the same app
 //! (`rails_answers_the_tables`), except the one `DIVERGENT` lists.
 
+#[path = "support/prerequisite.rs"]
+mod prerequisite;
 #[path = "support/scratch.rs"]
 mod scratch;
 #[path = "support/emit_and_run.rs"]
@@ -380,7 +382,7 @@ fn the_spinel_tree_carries_the_overlay() {
 fn rails_answers_the_tables() {
     let probe = r#"gem "railties", "8.1.4"; gem "activerecord", "8.1.4"; require "rails"; require "sqlite3""#;
     if !Command::new("ruby").args(["-e", probe]).status().is_ok_and(|s| s.success()) {
-        eprintln!("skipping: ruby with railties 8.1.4 and sqlite3 not available");
+        prerequisite::missing("ruby with railties 8.1.4 and sqlite3 not available");
         return;
     }
     for variant in [Variant::PathParams, Variant::PlainKey, Variant::None] {

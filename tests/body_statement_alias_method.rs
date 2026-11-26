@@ -20,13 +20,7 @@ fn an_alias_of_an_ancestors_method_runs_and_one_of_a_macros_method_is_dropped() 
         .write("app/models/attr_required.rb", MACRO)
         .write("app/models/claims.rb", HOOKED)
         .run_ruby(SCRIPT);
-    assert!(
-        run.success,
-        "emitted tree failed in {}\n=== stdout ===\n{}\n=== stderr ===\n{}",
-        run.emitted.display(),
-        run.stdout,
-        run.stderr
-    );
+    run.assert_passes();
     // CRuby 4.0 runs SCRIPT the same way on the source as written.
     assert_eq!(run.stdout.lines().collect::<Vec<_>>(), ["s-1", "token", "claims"], "{}", run.stderr);
 }

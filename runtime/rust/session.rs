@@ -58,6 +58,11 @@ impl Session {
         self.data.remove(key)
     }
 
+    pub fn clear(&mut self) -> Session {
+        self.data.clear();
+        self.clone()
+    }
+
     pub fn len(&self) -> usize {
         self.data.len()
     }

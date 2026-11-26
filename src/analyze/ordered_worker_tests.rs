@@ -402,6 +402,30 @@ fn worker_child() {
             // clean too. The malformed call alone remains refused.
             serde_json::to_vec(&diagnostics).unwrap()
         }
+        "templates_and_tests" => {
+            let mut app = app(&[
+                ("config/routes.rb", "Rails.application.routes.draw do; resources :rooms; end"),
+                ("app/controllers/concerns/tracked.rb", "module Tracked; extend ActiveSupport::Concern; def remember; @seen = @room.to_s; end; end"),
+                ("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base; include Tracked; end"),
+                ("app/controllers/rooms_controller.rb", "class RoomsController < ApplicationController; def show; @room = 'r'; @count = 3; @title = 'x'; end; def index; @rooms = [1, 2]; end; end"),
+                ("app/views/rooms/show.html.erb", "<%= @room.upcase %><%= render 'rooms/card', item: @count %><% @section = 'wide' %>"),
+                ("app/views/rooms/index.html.erb", "<% @rooms.each do |r| %><%= render partial: 'rooms/card', locals: { item: r } %><% end %>"),
+                ("app/views/rooms/_card.html.erb", "<%= item.to_s %><%= @title %>"),
+                ("app/views/layouts/application.html.erb", "<%= @section %><%= @title %><%= yield %>"),
+                ("test/models/a_test.rb", "class ATest < ActiveSupport::TestCase; setup { @x = 1 }; test 'a' do; y = @x + 2; assert_equal 3, y; end; end"),
+                ("test/models/b_test.rb", "class BTest < ActiveSupport::TestCase; def helper_value; 'b'; end; test 'b' do; s = helper_value.upcase; assert_equal 'B', s; end; end"),
+                ("test/models/c_test.rb", "class CTest < ActiveSupport::TestCase; test 'c' do; z = [1, 2].sum; assert_equal 3, z; end; end"),
+            ]);
+            assert!(app.test_modules.len() >= 3, "the app has test modules to type side by side");
+            assert!(!app.concern_spliced_actions.is_empty(), "the concern's action is spliced into a controller");
+            let mut a = Analyzer::new(&app);
+            a.analyze(&mut app);
+            let typed = |e: &Expr| e.ty.is_some();
+            assert!(app.test_modules.iter().all(|m| m.tests.iter().all(|t| typed(&t.body))), "every test body is typed");
+            let mut bytes = snapshot(&a, &app);
+            bytes.extend(serde_json::to_vec(&(&app.test_modules, &app.partial_local_types, &app.view_feeders)).unwrap());
+            bytes
+        }
         _ => panic!("unknown case"),
     };
     std::fs::write(out, bytes).unwrap();
@@ -445,6 +469,10 @@ fn model_publication_keeps_the_sequential_main_schedule() {
 #[test]
 fn complete_parent_metadata_and_ordered_view_events() {
     compare_case("controllers");
+}
+#[test]
+fn templates_and_tests_type_side_by_side_as_one_by_one() {
+    compare_case("templates_and_tests");
 }
 #[test]
 fn mailer_parameters_publish_at_the_original_item() {

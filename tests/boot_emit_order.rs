@@ -33,7 +33,7 @@ fn a_module_declared_above_a_class_loads_before_it() {
     let expected = native(&[("lib/id_service.rb", ID_SERVICE)], &format!("require \"id_service\"\n{script}"));
     assert_eq!(expected, "true\nStandardError\n");
     let run = emit_and_run::empty_app().write("lib/id_service.rb", ID_SERVICE).run_ruby(script);
-    assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+    run.assert_passes();
     assert_eq!(run.stdout, expected, "{}", run.stderr);
 }
 
@@ -60,7 +60,7 @@ fn a_nested_class_written_in_its_own_file_keeps_the_file_its_autoload_names() {
         app = app.write(path, text);
     }
     let run = app.run_ruby(script);
-    assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+    run.assert_passes();
     assert_eq!(run.stdout, expected, "{}", run.stderr);
 }
 
@@ -78,7 +78,7 @@ fn a_nested_class_loads_after_the_parent_constants_above_it() {
     let expected = native(&files, &format!("require \"monorepo_slices/slices_file_contract\"\n{script}"));
     assert_eq!(expected, "7\n[[MonorepoSlices::SlicesFileContract::IssueTrackingLabelValidator, true, false]]\n[:BaseValidator, :DEFAULT_VALIDATOR, :IssueTrackingLabelValidator, :MAX_GITHUB_LABEL_LENGTH, :SLICE_LABEL_LENGTH, :SLICE_LABEL_PREFIX]\n");
     let run = emit_and_run::empty_app().write(files[0].0, files[0].1).run_ruby(script);
-    assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+    run.assert_passes();
     assert_eq!(run.stdout, expected, "{}", run.stderr);
 }
 
@@ -94,7 +94,7 @@ fn gem_same_as_native(name: &str, files: &[(&str, &str)], entry: &str, script: &
         overlay = overlay.write(&format!("vendor/gems/{name}-1.0.0/lib/{path}"), text);
     }
     let run = overlay.run_ruby(script);
-    assert!(run.success, "emitted tree failed in {}\n{}\n{}", run.emitted.display(), run.stdout, run.stderr);
+    run.assert_passes();
     assert!(!run.stderr.contains("file_require_not_carried"), "{}", run.stderr);
     assert_eq!(run.stdout, expected, "{}", run.stderr);
     run

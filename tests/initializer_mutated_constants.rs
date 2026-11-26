@@ -10,6 +10,8 @@
 //! only reads the constant, defines a top-level constant of its own, or
 //! calls the owner, leaves the fold alone.
 
+#[path = "support/prerequisite.rs"]
+mod prerequisite;
 #[path = "support/scratch.rs"]
 mod scratch;
 #[path = "support/emit_and_run.rs"]
@@ -104,7 +106,7 @@ fn an_initializer_that_only_reads_keeps_the_fold() {
 fn rails_reads_the_initializers_value() {
     let probe = r#"gem "activerecord", "8.1.4"; gem "actionpack", "8.1.4"; require "active_record"; require "action_controller"; require "sqlite3""#;
     if !Command::new("ruby").args(["-e", probe]).status().is_ok_and(|s| s.success()) {
-        eprintln!("skipping: ruby with activerecord/actionpack 8.1.4 and sqlite3 not available");
+        prerequisite::missing("ruby with activerecord/actionpack 8.1.4 and sqlite3 not available");
         return;
     }
     let expected = [("news", true, true), ("news", false, false), ("news", false, false), ("news", false, false), ("news", false, false), ("news", false, false)];

@@ -1,3 +1,5 @@
+#[path = "../support/prerequisite.rs"]
+mod prerequisite;
 use super::{dispatcher_json_contract as contract, emit_and_run};
 
 fn observations(stdout: &str) -> Vec<serde_json::Value> {
@@ -35,7 +37,7 @@ fn callback_and_rescue_json_responses_match_rails() {
         .output()
         .expect("Rails oracle");
     if oracle.status.code() == Some(77) {
-        eprintln!("skipping dispatcher JSON oracle: actionpack for RH_RAILS_ORACLE is unavailable");
+        prerequisite::missing("dispatcher JSON oracle: actionpack for RH_RAILS_ORACLE is unavailable");
         return;
     }
     assert!(
@@ -80,7 +82,7 @@ fn review_fixture(name: &str, oracle: bool) {
         script.push_str(&program);
         let output = emit_and_run::ruby().args(["-e", &script]).output().unwrap();
         if output.status.code() == Some(77) {
-            eprintln!("skipping dispatcher {name} oracle: RailsOracle actionpack is unavailable");
+            prerequisite::missing(&format!("dispatcher {name} oracle: RailsOracle actionpack is unavailable"));
             return;
         }
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));

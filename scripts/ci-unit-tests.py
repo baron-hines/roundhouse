@@ -264,14 +264,22 @@ def run(args: argparse.Namespace, report: dict) -> int:
 
 
 SELECTOR = re.compile(r"([a-z0-9_]+)(?::([A-Za-z0-9_]+))?")
+EXACT = re.compile(r"([a-z0-9_]+)((?:::[A-Za-z0-9_]+)+)")
 
 
 def parse_selector(text: str) -> tuple[str, str | None]:
-    """`suite` or `suite:substring`, as `cargo test --test suite substring -- --ignored` selected them."""
+    """`suite`, `suite:substring`, or `suite::path::name`, as `cargo test --test suite [substring|name --exact] -- --ignored` selected them."""
+    exact = EXACT.fullmatch(text) if isinstance(text, str) else None
+    if exact is not None:
+        return exact.group(1), exact.group(0)
     match = SELECTOR.fullmatch(text) if isinstance(text, str) else None
     if match is None:
         raise ContractError(f"invalid ignored-suite selector: {text!r}")
     return match.group(1), match.group(2)
+
+
+def is_exact(suite: str, rest: str | None) -> bool:
+    return rest is not None and rest.startswith(f"{suite}::")
 
 
 def ignored_selection(cases: dict[Case, bool], selectors: list[tuple[str, str | None]]) -> set[Case]:
@@ -280,7 +288,7 @@ def ignored_selection(cases: dict[Case, bool], selectors: list[tuple[str, str | 
     for suite, substring in selectors:
         names = {(binary, name) for (binary, name), ignored in cases.items()
                  if ignored and binary == "roundhouse::all_tests" and name.startswith(f"{suite}::")
-                 and (substring is None or substring in name)}
+                 and (substring is None or (name == substring if is_exact(suite, substring) else substring in name))}
         if not names:
             raise ContractError(f"no ignored cases in the archive for {suite}"
                                 + (f":{substring}" if substring else ""))
@@ -291,6 +299,9 @@ def ignored_selection(cases: dict[Case, bool], selectors: list[tuple[str, str | 
 def selection_filter(selectors: list[tuple[str, str | None]]) -> str:
     clauses = []
     for suite, substring in selectors:
+        if is_exact(suite, substring):
+            clauses.append(f"(test(={substring}))")
+            continue
         clause = f"test(/^{suite}::/)"
         if substring is not None:
             clause += f" & test({substring})"
@@ -321,7 +332,8 @@ def select(args: argparse.Namespace, report: dict) -> int:
                   selected_cases=len(wanted),
                   selected=[{"binary": binary, "name": name} for binary, name in sorted(wanted)])
     print(f"ignored suites: {len(wanted)} cases from {', '.join(args.select)}")
-    check_command(nextest("run", *metadata, "--profile", "ci", "--no-fail-fast", *filters,
+    threads = ["--test-threads", str(args.test_threads)] if args.test_threads else []
+    check_command(nextest("run", *metadata, "--profile", "ci", "--no-fail-fast", *filters, *threads,
                           "--retries", "0", "--no-tests", "fail"))
     return 0
 
@@ -343,7 +355,8 @@ def main(argv: list[str] | None = None) -> int:
     chooser = modes.add_parser("select", help="run named ignored suites from an archive")
     chooser.add_argument("--archive", type=Path, required=True)
     chooser.add_argument("--inventory", type=Path, required=True)
-    chooser.add_argument("--select", action="append", required=True, metavar="SUITE[:SUBSTRING]")
+    chooser.add_argument("--select", action="append", required=True, metavar="SUITE[:SUBSTRING|::PATH::NAME]")
+    chooser.add_argument("--test-threads", type=int, help="run the selected cases this many at a time")
     chooser.add_argument("--report", type=Path, required=True)
     args = parser.parse_args(argv)
     report = {"status": "not-run", "coverage_verified": False}

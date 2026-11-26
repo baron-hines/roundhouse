@@ -58,5 +58,11 @@ if (slow = default.first)
   check("requeued unchanged: enqueued_at", recent.(slow.enqueued_at), slow.enqueued_at.inspect)
 end
 check("low is empty", Sidekiq::Queue.new("low").size == 0, Sidekiq::Queue.new("low").size.to_s)
-check("nothing dead", Sidekiq::DeadSet.new.size == 0, Sidekiq::DeadSet.new.size.to_s)
+dead = Sidekiq::DeadSet.new.to_a
+check("dead set: one job, the old one trimmed", dead.size == 1, dead.map(&:jid).inspect)
+if (d = dead.first)
+  check("dead: display_class", d.display_class == "DeadJob", d.display_class.inspect)
+  check("dead: error_message", d["error_message"] == "out of retries", d["error_message"].inspect)
+  check("dead: score is when it died", (d.score - now).abs < 120, (d.score - now).inspect)
+end
 puts "done"

@@ -18,7 +18,7 @@ pub(crate) fn mounts(app: &App) -> Vec<RackMount> {
     fn contains_mount(entries: &[RouteSpec]) -> bool {
         entries.iter().any(|entry| match entry {
             RouteSpec::RackMount { .. } => true,
-            RouteSpec::Scope { entries, .. } => contains_mount(entries),
+            RouteSpec::Scope { entries, .. } | RouteSpec::Exclusive { entries } => contains_mount(entries),
             _ => false,
         })
     }

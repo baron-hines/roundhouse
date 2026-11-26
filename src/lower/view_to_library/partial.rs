@@ -64,7 +64,75 @@ pub(super) fn emit_flagged_collection_render(
     Some(seq(stmts))
 }
 
+/// `render <var>` over a collection whose partial `plural` names.
+fn emit_collection_render(
+    collection: &Expr,
+    var: &str,
+    plural: &str,
+    locals: Option<&[(Expr, Expr)]>,
+    ctx: &ViewCtx,
+) -> Option<Expr> {
+    let collection_recv = var_ref(Symbol::from(var));
+    bind_locals_once(collection_recv, locals, collection.span, ctx, |recv, locals| {
+        Some(emit_partial_each(recv, plural, locals, ctx))
+    })
+}
+
+/// `render <var>` of one record whose partial `singular` names.
+fn emit_record_render(
+    record: &Expr,
+    var: &str,
+    singular: &str,
+    locals: Option<&[(Expr, Expr)]>,
+    ctx: &ViewCtx,
+) -> Option<Expr> {
+    let plural_camel = camelize_path(&crate::naming::pluralize_snake(singular));
+    let stem = ctx.partial_stems.stem(&plural_camel, singular);
+    let mut record_ref = var_ref(Symbol::from(crate::naming::safe_local(var)));
+    let mut binds = Vec::new();
+    let bound;
+    let mut locals = locals;
+    let entries = locals.unwrap_or_default();
+    if evaluated_out_of_order(entries, call_position(&plural_camel, &stem, None, ctx), ctx) {
+        record_ref = bind_if_first(record_ref, "record", record.span, entries, ctx, &mut binds);
+        bound = bind_effectful_locals(entries, record.span, ctx, &mut binds);
+        locals = Some(&bound);
+    }
+    let mut call_args = vec![record_slot(ctx, &plural_camel, &stem, record_ref)];
+    call_args.extend(partial_extra_args(ctx, &plural_camel, &stem));
+    call_args.extend(locals_extra_args(locals, &plural_camel, &stem, ctx));
+    let method = ctx.render_method(ViewKind::Partial, &plural_camel, &stem);
+    let call = send(
+        Some(Expr::new(
+            Span::synthetic(),
+            ExprNode::Const {
+                path: vec![Symbol::from("Views"), Symbol::from(plural_camel)],
+            },
+        )),
+        method.as_str(),
+        call_args,
+        None,
+        true,
+    );
+    let append = accumulator_append_call(call, ctx);
+    if binds.is_empty() {
+        return Some(append);
+    }
+    binds.push(append);
+    Some(seq(binds))
+}
+
 pub(super) fn emit_render_partial(rp: &RenderPartial<'_>, ctx: &ViewCtx) -> Option<Expr> {
+    // `render @author` where `@author` reads as `author_` beside a local
+    // `author`: the ivar names the partial, its local is the value.
+    if let RenderPartial::Record { record: arg, name, locals } | RenderPartial::Collection { collection: arg, name, locals } = rp
+        && let Some(ivar) = ctx.renamed_ivar(name)
+    {
+        return match singularize(ivar) == ivar {
+            true => emit_record_render(arg, name, ivar, *locals, ctx),
+            false => emit_collection_render(arg, name, ivar, *locals, ctx),
+        };
+    }
     match rp {
         // `render articles` (collection) — iterate, rendering one
         // partial per element. The partial-fn name comes from the
@@ -73,11 +141,7 @@ pub(super) fn emit_render_partial(rp: &RenderPartial<'_>, ctx: &ViewCtx) -> Opti
         // accumulator so a `render @articles` inside a form_with
         // capture appends to `body` rather than the outer `io`.
         RenderPartial::Collection { collection, name, locals } => {
-            let plural = *name;
-            let collection_recv = var_ref(Symbol::from(plural));
-            bind_locals_once(collection_recv, *locals, collection.span, ctx, |recv, locals| {
-                Some(emit_partial_each(recv, plural, locals, ctx))
-            })
+            emit_collection_render(collection, name, name, *locals, ctx)
         }
         // `render @message` (one record) — a single append, not an
         // `each`. Rails resolves the partial through the record's
@@ -87,43 +151,7 @@ pub(super) fn emit_render_partial(rp: &RenderPartial<'_>, ctx: &ViewCtx) -> Opti
         // closure args line up with the call. Its locals are bound
         // before the call when it would run them out of source order
         // (`evaluated_out_of_order`).
-        RenderPartial::Record { record, name, locals } => {
-            let singular = (*name).to_string();
-            let plural_camel = camelize_path(&crate::naming::pluralize_snake(&singular));
-            let stem = ctx.partial_stems.stem(&plural_camel, &singular);
-            let mut record_ref = var_ref(Symbol::from(crate::naming::safe_local(&singular)));
-            let mut binds = Vec::new();
-            let bound;
-            let mut locals = *locals;
-            let entries = locals.unwrap_or_default();
-            if evaluated_out_of_order(entries, call_position(&plural_camel, &stem, None, ctx), ctx) {
-                record_ref = bind_if_first(record_ref, "record", record.span, entries, ctx, &mut binds);
-                bound = bind_effectful_locals(entries, record.span, ctx, &mut binds);
-                locals = Some(&bound);
-            }
-            let mut call_args = vec![record_slot(ctx, &plural_camel, &stem, record_ref)];
-            call_args.extend(partial_extra_args(ctx, &plural_camel, &stem));
-            call_args.extend(locals_extra_args(locals, &plural_camel, &stem, ctx));
-            let method = ctx.render_method(ViewKind::Partial, &plural_camel, &stem);
-            let call = send(
-                Some(Expr::new(
-                    Span::synthetic(),
-                    ExprNode::Const {
-                        path: vec![Symbol::from("Views"), Symbol::from(plural_camel)],
-                    },
-                )),
-                method.as_str(),
-                call_args,
-                None,
-                true,
-            );
-            let append = accumulator_append_call(call, ctx);
-            if binds.is_empty() {
-                return Some(append);
-            }
-            binds.push(append);
-            Some(seq(binds))
-        }
+        RenderPartial::Record { record, name, locals } => emit_record_render(record, name, name, *locals, ctx),
         // `render "form", article: @article` — explicit-name partial.
         // Rewrites to `<accumulator> << Views::<Plural>.<method>(arg)`
         // — a single Send append, NOT an each block, since named
@@ -134,22 +162,51 @@ pub(super) fn emit_render_partial(rp: &RenderPartial<'_>, ctx: &ViewCtx) -> Opti
         // convention; additional hash entries get dropped today —
         // matches existing classifier policy). Its locals are bound as a
         // record render's are.
-        RenderPartial::Named { partial, arg, locals } => {
+        RenderPartial::Named { partial, arg, locals, object } => {
             let entries = locals.unwrap_or_default();
             let (module, stem) = super::partial_name_to_key(partial, &ctx.resource_dir, &ctx.partial_stems);
             let record = match ctx.strict_locals.get(&(module.clone(), stem.clone())) {
                 Some(decl) => decl[0].name.as_str().to_string(),
-                None => singularize(&snake_case(last_segment(&module))),
+                None => ctx
+                    .partial_record_locals
+                    .get(&(module.clone(), stem.clone()))
+                    .cloned()
+                    .unwrap_or_else(|| singularize(&snake_case(last_segment(&module)))),
             };
+            // An `object:` beside `locals:` where either runs code: every
+            // value but a literal binds to a temp in the order the options
+            // hash writes them, as Ruby evaluates it. A plain read is bound
+            // too, since a local after it may assign what it reads.
+            if let Some(o) = object.filter(|_| !entries.is_empty()) {
+                if reads_without_effect(o, ctx) && entries.iter().all(|(_, v)| reads_without_effect(v, ctx)) {
+                    let call = named_partial_object_call(partial, *arg, *locals, Some(o), ctx)?;
+                    return Some(accumulator_append_call(call, ctx));
+                }
+                let mut binds = Vec::new();
+                let mut bind_object = |binds: &mut Vec<Expr>| {
+                    if matches!(&*o.node, ExprNode::Lit { .. }) {
+                        return o.clone();
+                    }
+                    let name = Symbol::from(format!("__object_{}", o.span.start));
+                    binds.push(bind_temp(&name, o.clone()));
+                    Expr { span: o.span, ..var_ref(name) }
+                };
+                let object_first = o.span.start < entries[0].0.span.start;
+                let early = object_first.then(|| bind_object(&mut binds));
+                let bound = bind_local_values(entries, entries[0].1.span, &mut binds);
+                let object = early.unwrap_or_else(|| bind_object(&mut binds));
+                binds.push(accumulator_append_call(named_partial_object_call(partial, *arg, Some(&bound), Some(&object), ctx)?, ctx));
+                return Some(seq(binds));
+            }
             if !evaluated_out_of_order(entries, call_position(&module, &stem, Some(&record), ctx), ctx) {
-                let call = named_partial_call(partial, *arg, *locals, ctx)?;
+                let call = named_partial_object_call(partial, *arg, *locals, *object, ctx)?;
                 return Some(accumulator_append_call(call, ctx));
             }
             // The temps are named after the first local's value, as a
             // collection's are after the collection.
             let mut binds = Vec::new();
             let bound = bind_effectful_locals(entries, entries[0].1.span, ctx, &mut binds);
-            binds.push(accumulator_append_call(named_partial_call(partial, *arg, Some(&bound), ctx)?, ctx));
+            binds.push(accumulator_append_call(named_partial_object_call(partial, *arg, Some(&bound), *object, ctx)?, ctx));
             Some(seq(binds))
         }
         // `render layout: "x" do … end` needs MULTIPLE statements (the
@@ -231,7 +288,7 @@ pub(super) fn emit_render_partial(rp: &RenderPartial<'_>, ctx: &ViewCtx) -> Opti
             let call_args: Vec<Expr> = ctx
                 .partial_ivars
                 .get(&(module_camel.clone(), method_sym.clone()))
-                .map(|ivars| ivars.iter().map(|n| var_ref(n.clone())).collect())
+                .map(|ivars| ivars.iter().map(|n| var_ref(Symbol::from(ctx.ivar_local(n.as_str())))).collect())
                 .unwrap_or_default();
             let render_call = send(
                 Some(Expr::new(
@@ -397,6 +454,26 @@ fn bind_effectful_locals(
         .enumerate()
         .map(|(i, (k, v))| {
             if reads_without_effect(v, ctx) {
+                return (k.clone(), v.clone());
+            }
+            let key = local_key_name(k)
+                .filter(|n| n.chars().all(|c| c == '_' || c.is_ascii_alphanumeric()))
+                .unwrap_or_else(|| i.to_string());
+            let name = Symbol::from(format!("__local_{}_{key}", site.start));
+            binds.push(bind_temp(&name, v.clone()));
+            (k.clone(), Expr { span: v.span, ..var_ref(name) })
+        })
+        .collect()
+}
+
+/// Every `locals:` value but a literal, bound to a temp in order (see
+/// `bind_effectful_locals`, which binds only the ones that run code).
+fn bind_local_values(entries: &[(Expr, Expr)], site: Span, binds: &mut Vec<Expr>) -> Vec<(Expr, Expr)> {
+    entries
+        .iter()
+        .enumerate()
+        .map(|(i, (k, v))| {
+            if matches!(&*v.node, ExprNode::Lit { .. }) {
                 return (k.clone(), v.clone());
             }
             let key = local_key_name(k)
@@ -1260,6 +1337,23 @@ pub(super) fn named_partial_call(
     named_partial_call_with_record(partial, arg, locals, None, ctx)
 }
 
+/// `named_partial_call` for a render that may name its `object:`. With
+/// `locals:` beside it, the record is the object, which Rails binds under
+/// the `as:` name whatever the hash holds. Without them the object is
+/// already the single arg.
+fn named_partial_object_call(
+    partial: &str,
+    arg: Option<&Expr>,
+    locals: Option<&[(Expr, Expr)]>,
+    object: Option<&Expr>,
+    ctx: &ViewCtx,
+) -> Option<Expr> {
+    match (object, locals) {
+        (Some(object), Some(_)) => named_partial_call_bound(partial, None, locals, None, Some(object), ctx),
+        _ => named_partial_call(partial, arg, locals, ctx),
+    }
+}
+
 /// `named_partial_call` with the record argument supplied directly
 /// rather than resolved from `arg`/`locals`.
 ///
@@ -1272,6 +1366,21 @@ pub(super) fn named_partial_call_with_record(
     arg: Option<&Expr>,
     locals: Option<&[(Expr, Expr)]>,
     record_override: Option<Expr>,
+    ctx: &ViewCtx,
+) -> Option<Expr> {
+    named_partial_call_bound(partial, arg, locals, record_override, None, ctx)
+}
+
+/// The named-partial call. A `record_override` is the captured block a
+/// layout render yields, as given. An `object` is the record a render
+/// names beside its `locals:`, which a partial carrying its yield in the
+/// record slot still doesn't take (`record_slot`).
+fn named_partial_call_bound(
+    partial: &str,
+    arg: Option<&Expr>,
+    locals: Option<&[(Expr, Expr)]>,
+    record_override: Option<Expr>,
+    object: Option<&Expr>,
     ctx: &ViewCtx,
 ) -> Option<Expr> {
 
@@ -1303,8 +1412,16 @@ pub(super) fn named_partial_call_with_record(
                     })
                 })
             };
-            let record_name = singularize(&snake_case(last_segment(&module_camel)));
             let strict_key = (module_camel.clone(), method_sym.clone());
+            // The name the partial's definition takes its record by: its
+            // call sites' element local where they agree on one, else the
+            // directory's singular. As written, the `locals:` key it binds
+            // (`as: :class` takes `locals: { class: }`).
+            let record_name = ctx
+                .partial_record_locals
+                .get(&strict_key)
+                .cloned()
+                .unwrap_or_else(|| singularize(&snake_case(last_segment(&module_camel))));
             let strict_decl = ctx.strict_locals.get(&strict_key);
             // A strict-locals partial's positional record is its FIRST
             // declared local (the def side builds the signature from the
@@ -1316,6 +1433,7 @@ pub(super) fn named_partial_call_with_record(
             let record_override_given = record_override.is_some();
             let arg_expr = match (record_override, strict_decl, locals.is_some()) {
                 (Some(record), _, _) => record,
+                (None, _, _) if let Some(object) = object => object.clone(),
                 (None, strict_decl, has_locals) => match (strict_decl, has_locals) {
                 (Some(decl), true) => lookup_local(decl[0].name.as_str())
                     .or_else(|| decl[0].default.clone())

@@ -8,8 +8,10 @@
 # way the web role does, runs two processor threads until they have
 # taken them all, then shuts down with a slow job still running, as
 # TERM does. On the way, the scheduler moves a job pushed for a second
-# later off the schedule set. reader.rb then reads what is left through
-# Sidekiq's own API: the retry set, and the slow job back on its queue.
+# later off the schedule set, and a dead-set write goes through the
+# client's MULTI. reader.rb then reads what is left through Sidekiq's
+# own API: the retry set, the dead set, and the slow job back on its
+# queue.
 require_relative "stubs"
 
 module JobRegistry
@@ -80,6 +82,16 @@ SidekiqScheduler.start(0.5, -1.0)
 push_at("RecordJob", "default", "later", Time.now.to_f + 1.0)
 wait_until("the scheduled job", 20.0) { ran.include?("later") }
 puts "scheduled ran, " + probe.zcard("schedule").to_s + " left, " + probe.zcard("retry").to_s + " to retry"
+
+# The dead-set write a job out of retries takes: ZADD and Sidekiq's two
+# trims in one MULTI. An entry older than :dead_timeout_in_seconds: is
+# trimmed by age as it goes.
+now = Time.now.to_f
+probe.zadd("dead", now - 20000000.0, "{\"jid\":\"ancient\"}")
+SidekiqRedis.write_dead(probe, now,
+  "{\"retry\":0,\"queue\":\"default\",\"class\":\"Sidekiq::ActiveJob::Wrapper\",\"wrapped\":\"DeadJob\",\"args\":[],\"jid\":\"dddddddddddddddddddddddd\",\"error_class\":\"ArgumentError\",\"error_message\":\"out of retries\",\"failed_at\":" + now.to_s + ",\"retry_count\":0}",
+  now - 15552000.0, "-10000")
+puts "dead " + probe.zcard("dead").to_s
 
 push("SlowJob", "default", "s1")
 wait_until("the slow job", 20.0) { ran.include?("slow started") }

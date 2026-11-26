@@ -49,7 +49,7 @@ module ActiveJob
     def self.serialize: (untyped arguments) -> Array[untyped]
     def self.serialize_argument: (untyped argument) -> untyped
     def self.serialize_hash_key: (untyped key) -> String
-    def self.keywords: (Array[String] names, Array[String] parts) -> String
+    def self.keywords: (Array[String] names, Array[String] values) -> String
     def self.keyword_given?: (untyped args, String name) -> bool
     def self.keyword_args: (untyped args, String name) -> Array[untyped]
     def self.ruby2_keywords_hash: (untyped hash) -> untyped

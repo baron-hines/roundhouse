@@ -112,7 +112,7 @@ fn route_for_resolves_to_the_target_path_helper() {
     assert!(src.contains("user_avatar_path"), "{src}");
     assert!(src.contains("avatar_token"), "positional arg lost:\n{src}");
     // No query keys — no array machinery at all.
-    assert!(!src.contains("__q"), "no query means no builder:\n{src}");
+    assert!(!src.contains("route_for_arg"), "no query means no builder:\n{src}");
 }
 
 #[test]

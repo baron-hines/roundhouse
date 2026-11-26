@@ -48,6 +48,21 @@ module ActionDispatch
       extension == "json"
     end
 
+    # Rails' `request.formats.first` as an extension name, before a route
+    # is chosen (what a request constraint reads): the path's extension
+    # (`extension`, "" when none), the Accept header when Rails trusts
+    # it, "js" for an XHR, else "html".
+    def self.format_name(extension, accept, x_requested_with, content_type)
+      return extension unless extension.empty?
+      if should_apply_vary_header?(accept, x_requested_with, content_type, false)
+        preferred = accept.strip.empty? ? content_type : preferred_type(accept)
+        symbol = Mime::Type.symbol_for(preferred.split(";", 2)[0].to_s.strip.downcase)
+        return symbol.to_s unless symbol.nil?
+      end
+      return "js" if x_requested_with.downcase.include?("xmlhttprequest")
+      "html"
+    end
+
     # The Accept list's highest-q media type (`Mime::Type.parse`, then
     # `first`), without its parameters.
     def self.preferred_type(accept)

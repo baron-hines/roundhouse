@@ -347,8 +347,14 @@ if (( SKIP_EMIT == 0 )); then
             # per-target /tmp/rh-*-pass2 dir. For go that includes the
             # v2 overlay (always on); the build step below builds the
             # v2 binary from cmd/v2/.
-            (cd "$REPO_ROOT" && cargo build --quiet --bin emit_preview)
-            (cd "$REPO_ROOT" && "$REPO_ROOT/target/debug/emit_preview" --target "$TARGET" "$FIXTURE" >/dev/null)
+            emit_preview="${ROUNDHOUSE_EMIT_PREVIEW:-}"
+            if [ -z "$emit_preview" ]; then
+                (cd "$REPO_ROOT" && cargo build --quiet --bin emit_preview)
+                emit_preview="$REPO_ROOT/target/debug/emit_preview"
+            elif [ ! -x "$emit_preview" ]; then
+                fail "ROUNDHOUSE_EMIT_PREVIEW=$emit_preview is not an executable"
+            fi
+            (cd "$REPO_ROOT" && "$emit_preview" --target "$TARGET" "$FIXTURE" >/dev/null)
             ;;
     esac
 fi

@@ -425,12 +425,41 @@ fn rewrite_run_callbacks(app: &mut crate::App, runners: &HashMap<ClassId, HashSe
         .filter_map(|m| Some((m.name.clone(), m.parent.clone()?)))
         .chain(app.library_classes.iter().filter_map(|c| Some((c.name.clone(), c.parent.clone()?))))
         .collect();
+    // A concern's own method runs on each includer — and on each
+    // PREPENDER, whose `prepended do` block is the same `class_eval`
+    // there: its `define_model_callbacks` declares the chain the method
+    // then runs. Ruby's `include`/`prepend` brings the method across, so
+    // the runner a concern's body may call is its includers' and
+    // prependers'.
+    let mut module_runners: HashMap<ClassId, HashSet<Symbol>> = HashMap::default();
+    for model in &app.models {
+        let Some(events) = runners.get(&model.name) else { continue };
+        let mut pending = crate::analyze::model_mixins(model);
+        let mut seen: HashSet<ClassId> = HashSet::default();
+        while let Some(id) = pending.pop() {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            module_runners.entry(id.clone()).or_default().extend(events.iter().cloned());
+            // A concern's own Concern includes run on the includer too —
+            // and a prepended one's, which were carried from
+            // `prepended do`.
+            let carried = app
+                .concern_model_items
+                .get(&id)
+                .or_else(|| app.concern_prepended_items.get(&id));
+            if let Some(items) = carried {
+                pending.extend(crate::analyze::body_includes(items));
+            }
+        }
+    }
     crate::lower::for_each_owned_hook_body(app, &mut |owner, e| {
         let has_runner = |event: &Symbol| {
             let mut cur = owner.cloned();
             for _ in 0..32 {
                 let Some(c) = cur else { return false };
                 if runners.get(&c).is_some_and(|r| r.contains(event))
+                    || module_runners.get(&c).is_some_and(|r| r.contains(event))
                     || (models.contains(&c) && RUNTIME_EVENTS.contains(&event.as_str()))
                 {
                     return true;

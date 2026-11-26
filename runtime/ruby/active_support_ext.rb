@@ -43,7 +43,12 @@ require_relative "active_support_number_helper"
 #
 # Other objects use Rails' optional `empty?` protocol. Their `to_s`
 # says nothing about blankness and may even return nil.
+require_relative "json_builder"
+
 module ActiveSupport
+  class DelegationError < ::NoMethodError
+  end
+
   # `ActiveSupport::JSON` — Rails' JSON coder over the json library.
   #
   # `encode` is `value.as_json.to_json` with Rails' default HTML-entity
@@ -151,6 +156,11 @@ module ActiveSupport
   # anything that answers `duplicable?` with false is itself; anything
   # else is its `dup` (an Integer's, nil's or a Symbol's is itself).
   # `lower::symbolize_keys` routes a typed Hash or Array receiver here.
+  # Not a table of hooks to run: an `on_load` block is carried into its class when the app is read, or reported.
+  def self.run_load_hooks(name, base = nil)
+    nil
+  end
+
   def self.deep_dup(value)
     case value
     when Array then value.map { |item| ActiveSupport.deep_dup(item) }
@@ -363,18 +373,40 @@ module ActiveSupport
   end
 
   # Not a `reject!` on each: `errors` holds each detail's full message index for index, so both lose the same entries.
-  def self.errors_delete(errors, details, attribute)
+  # A nil `type_kind` is Rails' `delete(attribute)`, every error on it; otherwise only the entries
+  # whose type is that one — a Symbol type (type_symbolic true), or the message a String type was
+  # added with, which is what Rails' `Error#type` answers for it.
+  def self.errors_delete(errors, details, attribute, type_symbolic, type_kind)
     deleted = []
     i = details.length - 1
     while i >= 0
-      if details[i].attribute == attribute
-        deleted.unshift(details[i].message)
+      detail = details[i]
+      matched = detail.attribute == attribute
+      if matched && !type_kind.nil?
+        matched = detail.symbolic == type_symbolic && detail.kind == type_kind
+      end
+      if matched
+        deleted.unshift(detail.message)
         details.delete_at(i)
         errors.delete_at(i)
       end
       i -= 1
     end
     deleted.empty? ? nil : deleted
+  end
+
+  # Rails' `group_by_attribute`: each attribute with errors, in the order
+  # of its first one, to its `ActiveModel::Error`s — `Enumerable#group_by`
+  # over the errors, so a plain Hash with no default, not `details`. Same
+  # grouping as `errors_details`; reached from `lower::errors_index`.
+  def self.errors_group_by_attribute(details)
+    out = {}
+    details.each do |detail|
+      key = detail.attribute.to_sym
+      out[key] = [] unless out.key?(key)
+      out[key] << detail
+    end
+    out
   end
 
   # Rails' `details`: each attribute's errors, in the order of its first
@@ -498,6 +530,24 @@ module ActiveSupport
     others
   end
 
+  # Rails' `errors.copy!(other)`: the record's own errors go, and each of
+  # the other's is taken as a copy — same attribute, kind and message, and
+  # a full message naming the attribute as THIS model names it, which is
+  # what `errors_import` builds. The copies are this record's own details,
+  # so clearing one errors object's leaves the other's whole. Copying a
+  # record's own errors is a no-op, as Rails' deep_dup of them is.
+  def self.errors_copy(errors, details, others, names, before, between, after)
+    return details if others.equal?(details)
+    errors.clear
+    details.clear
+    # Each copy's Strings are its own, as Rails' deep_dup of an error dups its attribute and type.
+    others.each do |error|
+      copy = ActiveRecord::ErrorDetail.new(error.attribute.dup, error.kind.dup, error.message.dup, error.full_message.dup, error.symbolic, error.optionless)
+      errors_import(errors, details, copy, nil, names, before, between, after)
+    end
+    details
+  end
+
   # `ActiveSupport::MessageVerifier::InvalidSignature` — what a signed
   # value that does not verify raises. Rails hangs it off the verifier
   # class, and the NAME is the whole point: a controller that rescues it
@@ -506,6 +556,41 @@ module ActiveSupport
   # `rescue_from(ActiveSupport::MessageVerifier::InvalidSignature) {
   # head :not_found }` over an avatar URL that carries a signed id.
   #
+  # Not `Rails.log_line`, which a host logger may filter, nor `$stderr`
+  # or `STDERR` puts, which the runtime's typing cannot type: Kernel#warn,
+  # which `-W0` silences where Rails' :stderr behavior would still write.
+  def self.deprecation_line(line)
+    warn(line)
+  end
+
+  # Rails' deprecator a gem keeps for itself (`Devise.deprecator`): `warn`
+  # writes Rails' line to stderr, the default behavior of a deprecator
+  # the app's `config.active_support.deprecation` has not configured.
+  class Deprecation
+    attr_reader :deprecation_horizon, :gem_name
+    attr_accessor :silenced
+
+    def initialize(deprecation_horizon = "next release", gem_name = "Rails")
+      @deprecation_horizon = deprecation_horizon
+      @gem_name = gem_name
+      @silenced = false
+    end
+
+    # Not Rails' "(called from …)" suffix: no target keeps the caller's location.
+    def warn(message = nil, callstack = nil)
+      return nil if @silenced
+      ActiveSupport.deprecation_line("DEPRECATION WARNING: #{message}")
+      nil
+    end
+
+    # Rails installs a `const_missing` hook that warns and answers the
+    # replacement. Not ported: a hook no target has, and a program that
+    # reads no deprecated name never calls it (`deprecate_constant` is
+    # refused where one is read).
+    module DeprecatedConstantAccessor
+    end
+  end
+
   # A namespace with no verifier in it, because ours is
   # `ActionController::MessageVerifier` (it serves the cookie jar first).
   # The error keeps Rails' path so app code that names it resolves.
@@ -514,6 +599,86 @@ module ActiveSupport
       def initialize(message = "ActiveSupport::MessageVerifier::InvalidSignature")
         super(message)
       end
+    end
+  end
+
+  # Rails' PBKDF2 key derivation (`ActiveSupport::KeyGenerator`): `secret` stretched with each salt it is asked for,
+  # 2**16 iterations by default, by the SHA256 digest a `load_defaults 7.0` app sets as its `hash_digest_class`,
+  # or by SHA1, the digest an app rotating its pre-7.0 cookies derives their old keys with.
+  class KeyGenerator
+    def initialize(secret, options = {})
+      digest = options[:hash_digest_class].to_s
+      @sha1 = digest.end_with?("SHA1")
+      # Not a SHA256 key under another digest's name: it would never match the keys that digest derived.
+      raise ArgumentError, "hash_digest_class #{digest} is not supported; keys derive by SHA256 or SHA1" unless digest == "" || @sha1 || digest.end_with?("SHA256")
+      @secret = secret
+      iterations = options[:iterations]
+      @iterations = iterations.nil? ? 65536 : iterations.to_i
+    end
+
+    def generate_key(salt, key_size = 64)
+      return MessageDigest.pbkdf2_sha1(@secret, salt, @iterations, key_size) if @sha1
+      MessageDigest.pbkdf2_sha256(@secret, salt, @iterations, key_size)
+    end
+  end
+
+  # Only the key length of the cookie jar's ciphers: the encryption itself is `ActionController::MessageEncryptor`.
+  # Rails' class, as a tree loading the real ActiveSupport reopens it; the analysis answers no `new` on it (`registry::stdlib`).
+  class MessageEncryptor
+    def self.key_len(cipher = "aes-256-gcm")
+      raise ArgumentError, "unsupported cipher #{cipher}" unless cipher == "aes-256-gcm" || cipher == "aes-256-cbc"
+      32
+    end
+  end
+
+  module Messages
+    # `config.action_dispatch.cookies_rotations`: the old secrets the signed and encrypted cookie jars also accept.
+    # One shared instance, as the app's config has one: this runtime's `Rails.application.config` is built per call.
+    class RotationConfiguration
+      def self.shared
+        @shared ||= RotationConfiguration.new
+      end
+
+      def initialize
+        @signed = []
+        @encrypted = []
+      end
+
+      def signed
+        @signed
+      end
+
+      def encrypted
+        @encrypted
+      end
+
+      # One secret per rotation: a signed verifier takes no second, and the AES-256-GCM jar ignores a sign secret.
+      def rotate(kind, secret)
+        if kind == :signed
+          @signed << secret
+        elsif kind == :encrypted
+          @encrypted << secret
+        end
+        nil
+      end
+    end
+  end
+
+  # `ActiveSupport::CachingKeyGenerator`: each salt and size derived once, as the stretch is the slow part.
+  class CachingKeyGenerator
+    def initialize(key_generator)
+      @key_generator = key_generator
+      @cache_keys = {}
+    end
+
+    def generate_key(salt, key_size = 64)
+      cache_key = "#{salt}|#{key_size}"
+      key = @cache_keys[cache_key]
+      if key.nil?
+        key = @key_generator.generate_key(salt, key_size)
+        @cache_keys[cache_key] = key
+      end
+      key
     end
   end
 
@@ -543,6 +708,28 @@ module ActiveSupport
   # subtracting them.
   def self.excluding(list, *elements)
     list - elements.flatten(1)
+  end
+
+  # AS `Array#extract_options!` (`lower::enumerable_ext`): the trailing
+  # Hash, removed from the Array it was called on, or a new empty one.
+  # Only a plain Hash, as Rails' `Hash#extractable_options?` answers
+  # (`instance_of?(Hash)`): a subclass stays in the Array.
+  # AS `Hash#assert_valid_keys`: the first key outside the list raises, naming the list.
+  def self.assert_valid_keys(hash, valid_keys)
+    # Not the list as given: Rails flattens it, so `assert_valid_keys(KEYS)` and `(:a, [:b])` name the same keys.
+    keys = valid_keys.flatten
+    hash.keys.each do |key|
+      unless keys.include?(key)
+        raise ArgumentError, "Unknown key: #{key.inspect}. Valid keys are: #{keys.map { |valid| valid.inspect }.join(", ")}"
+      end
+    end
+    hash
+  end
+
+  def self.extract_options!(list)
+    last = list.last
+    return list.pop if last.instance_of?(Hash)
+    {}
   end
 
   # AS `Enumerable#pluck` on a receiver the analyzer could not type
@@ -769,6 +956,16 @@ module ActiveSupport
     return out if hash.nil?
     hash.each { |key, item| out[ActiveSupport.indifferent_key(key)] = ActiveSupport.indifferent_value(item, false) }
     out
+  end
+
+  # A Hash a parameter takes where an indifferent one reaches it too: one keyed by Symbol converted, one keyed by String
+  # kept, as the caller's indifferent hash is the one Rails writes in place.
+  def self.indifferent_param(hash)
+    return hash if hash.nil?
+    # Not a value of another class a union lets in (a String): only a Hash has keys to convert.
+    return hash unless hash.is_a?(Hash)
+    return hash if hash.keys.all? { |key| key.is_a?(String) }
+    ActiveSupport.indifferent(hash)
   end
 
   # Not a copy for every Array: Rails converts one written by `[]=` in place, unless it is frozen.
@@ -1649,6 +1846,93 @@ module ActiveSupport
     sign + out + rest
   end
 
+  # bigdecimal/util's `String#to_d` (`BigDecimal.interpret_loosely`): leading whitespace skipped, a sign, then the
+  # longest decimal it can read (`_` only between digits, an exponent only with digits); none reads as a signed zero.
+  def self.loose_decimal_text(raw)
+    # Not by character: the grammar is single-byte ASCII, and a byte string indexes in constant time.
+    text = raw.b
+    i = 0
+    n = text.length
+    i = i + 1 while i < n && " \t\n\v\f\r".include?(text[i].to_s)
+    sign = ""
+    signed = false
+    if i < n && (text[i] == "+" || text[i] == "-")
+      sign = text[i] == "-" ? "-" : ""
+      signed = true
+      i = i + 1
+    end
+    # A special value only as the whole rest (trailing whitespace allowed): `"Infinityjunk"` reads as a zero.
+    rest = text[i, n].to_s.rstrip
+    return sign + "Infinity" if rest == "Infinity"
+    # Not a signed one: bigdecimal reads `NaN` before any sign, so `+NaN` is a zero.
+    return "NaN" if !signed && rest == "NaN"
+    int_part = loose_digits(text, i)
+    i = loose_digits_end(text, i)
+    frac_part = ""
+    if i < n && text[i] == "."
+      frac_part = loose_digits(text, i + 1)
+      i = loose_digits_end(text, i + 1)
+    end
+    return sign + "0" if int_part.empty? && frac_part.empty?
+    exponent = ""
+    if i < n && (text[i] == "e" || text[i] == "E" || text[i] == "d" || text[i] == "D")
+      j = i + 1
+      exp_sign = ""
+      if j < n && (text[j] == "+" || text[j] == "-")
+        exp_sign = text[j].to_s
+        j = j + 1
+      end
+      exp_digits = loose_digits(text, j)
+      exponent = "e" + exp_sign + exp_digits unless exp_digits.empty?
+    end
+    sign + (int_part.empty? ? "0" : int_part) + (frac_part.empty? ? "" : "." + frac_part) + exponent
+  end
+
+  # The digits from `at` on, an `_` kept out between two of them.
+  def self.loose_digits(text, at)
+    out = +""
+    j = at
+    n = text.length
+    while j < n
+      c = text[j].to_s
+      if c >= "0" && c <= "9"
+        out << c
+      elsif !(c == "_" && !out.empty? && j + 1 < n && text[j + 1].to_s >= "0" && text[j + 1].to_s <= "9")
+        break
+      end
+      j = j + 1
+    end
+    out
+  end
+
+  def self.loose_digits_end(text, at)
+    j = at
+    n = text.length
+    seen = false
+    while j < n
+      c = text[j].to_s
+      if c >= "0" && c <= "9"
+        seen = true
+      elsif !(c == "_" && seen && j + 1 < n && text[j + 1].to_s >= "0" && text[j + 1].to_s <= "9")
+        break
+      end
+      j = j + 1
+    end
+    j
+  end
+
+  # `to_d` on what a String's or nil's position holds (a request param, a nullable column): nil is zero, as
+  # bigdecimal/util's `NilClass#to_d`, and a shape with no `to_d` raises.
+  # A value the analysis could not type takes the Numeric reopens' `to_d` too.
+  def self.loose_to_d(value)
+    return BigDecimal("0") if value.nil?
+    return value if value.is_a?(BigDecimal)
+    return BigDecimal(value) if value.is_a?(Integer)
+    return BigDecimal(float_decimal_text(value)) if value.is_a?(Float)
+    raise NoMethodError, "undefined method 'to_d' for a value that is neither a String nor a number" unless value.is_a?(String)
+    BigDecimal(loose_decimal_text(value))
+  end
+
   # Not `f.to_s` as it is: `Float#to_d` keeps the shortest digits but cuts them at 16 without rounding (bigdecimal's BIGDECIMAL_DOUBLE_FIGURES).
   def self.float_decimal_text(f)
     text = f.to_s
@@ -1689,6 +1973,8 @@ module ActiveSupport
   end
 
   class TimeZone
+    MAPPING = ZONE_NAMES
+
     attr_reader :name
 
     def initialize(name, data)

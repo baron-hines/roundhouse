@@ -12,11 +12,12 @@ pub(super) fn specialize(app: &mut App) {
         .filter(|lc| !lc.is_module && !models.contains(&lc.name) && generic(lc))
         .map(|lc| lc.name.clone())
         .collect();
-    // Not a walk of the whole app per candidate: one walk counts every
-    // candidate's `new` sites, and the methods copied for a candidate add
-    // theirs as they are made, so each count is what a fresh walk at that
-    // candidate's turn would find. A name that is a candidate twice (a
-    // reopened class) is counted afresh: its first turn rewrote its sites.
+    // Not a walk of the whole app per candidate: one walk finds every
+    // candidate's `new` sites and the bodies that hold them, and the methods
+    // copied for a candidate add theirs as they are made, so each candidate's
+    // turn counts and rewrites what a fresh walk at that turn would find. A
+    // name that is a candidate twice (a reopened class) is walked afresh: its
+    // first turn rewrote its sites.
     let mut occurrences: crate::det::HashMap<&str, usize> = crate::det::HashMap::default();
     for c in &candidates {
         *occurrences.entry(c.0.as_str()).or_default() += 1;
@@ -27,12 +28,19 @@ pub(super) fn specialize(app: &mut App) {
         .filter(|(_, c)| occurrences[c.0.as_str()] == 1 && !c.0.as_str().split("::").any(str::is_empty))
         .map(|(i, c)| (c.0.as_str().to_string(), i))
         .collect();
-    let mut counts = vec![0usize; candidates.len()];
-    visit_all(app, &mut |e| count_all_sites(e, &keys, &mut counts));
+    let mut found: Vec<Sites> = candidates.iter().map(|_| Sites::default()).collect();
+    crate::lower::for_each_owned_hook_body(app, &mut |owner, e| {
+        count_all_sites(e, &keys, &mut |i| found[i].saw(owner))
+    });
+    for view in &mut app.views {
+        count_all_sites(&mut view.body, &keys, &mut |i| found[i].saw(None));
+    }
+    crate::lower::for_each_test_body(app, &mut |e| count_all_sites(e, &keys, &mut |i| found[i].saw(None)));
     for (ci, class) in candidates.iter().enumerate() {
         let class = class.clone();
-        let sites = if keys.contains_key(class.0.as_str()) {
-            counts[ci]
+        let keyed = keys.contains_key(class.0.as_str());
+        let sites = if keyed {
+            found[ci].count
         } else {
             let mut fresh = 0usize;
             visit_all(app, &mut |e| count_sites(e, &class, &mut fresh));
@@ -53,21 +61,37 @@ pub(super) fn specialize(app: &mut App) {
             original.methods.iter().filter(|m| m.receiver == MethodReceiver::Instance).cloned().collect();
         for i in subclasses {
             let sub = &mut app.library_classes[i];
+            let owner = sub.name.clone();
             for m in &instance {
                 if !sub.methods.iter().any(|own| own.receiver == MethodReceiver::Instance && own.name == m.name) {
                     let mut copy = retarget(m, &sub.name);
-                    count_method_sites(&mut copy, &keys, &mut counts);
+                    count_method_sites(&mut copy, &keys, &mut |i| found[i].saw(Some(&owner)));
                     sub.methods.push(copy);
                 }
             }
         }
         let mut next = 0usize;
         let mut clones: Vec<ClassId> = Vec::new();
-        visit_all(app, &mut |e| rewrite_sites(e, &class, &mut next, &mut clones));
+        if keyed {
+            let here = &found[ci];
+            crate::lower::for_each_owned_hook_body(app, &mut |owner, e| {
+                if here.holds(owner) {
+                    rewrite_sites(e, &class, &mut next, &mut clones);
+                }
+            });
+            if here.unowned {
+                for view in &mut app.views {
+                    rewrite_sites(&mut view.body, &class, &mut next, &mut clones);
+                }
+                crate::lower::for_each_test_body(app, &mut |e| rewrite_sites(e, &class, &mut next, &mut clones));
+            }
+        } else {
+            visit_all(app, &mut |e| rewrite_sites(e, &class, &mut next, &mut clones));
+        }
         for name in clones {
             let mut methods: Vec<MethodDef> = instance.iter().map(|m| retarget(m, &name)).collect();
             for m in &mut methods {
-                count_method_sites(m, &keys, &mut counts);
+                count_method_sites(m, &keys, &mut |i| found[i].saw(Some(&name)));
             }
             app.library_classes.push(LibraryClass {
                 name: name.clone(),
@@ -85,6 +109,31 @@ pub(super) fn specialize(app: &mut App) {
                 class_ivar_initializers: Vec::new(),
             });
         }
+    }
+}
+
+/// A candidate's `new` sites: how many, and the bodies that hold them.
+#[derive(Default)]
+struct Sites {
+    count: usize,
+    owners: crate::det::HashSet<ClassId>,
+    /// A site in a body with no owning class, a view or a test.
+    unowned: bool,
+}
+
+impl Sites {
+    fn saw(&mut self, owner: Option<&ClassId>) {
+        self.count += 1;
+        match owner {
+            Some(owner) => {
+                self.owners.insert(owner.clone());
+            }
+            None => self.unowned = true,
+        }
+    }
+
+    fn holds(&self, owner: Option<&ClassId>) -> bool {
+        owner.map_or(self.unowned, |owner| self.owners.contains(owner))
     }
 }
 
@@ -150,26 +199,26 @@ fn new_of<'e>(e: &'e mut Expr, class: &ClassId) -> Option<&'e mut Expr> {
 }
 
 // The parts of a method `visit_all` walks: its parameter defaults and body.
-fn count_method_sites(m: &mut MethodDef, keys: &crate::det::HashMap<String, usize>, counts: &mut [usize]) {
+fn count_method_sites(m: &mut MethodDef, keys: &crate::det::HashMap<String, usize>, on_site: &mut impl FnMut(usize)) {
     for p in &mut m.params {
         if let Some(default) = &mut p.default {
-            count_all_sites(default, keys, counts);
+            count_all_sites(default, keys, on_site);
         }
     }
-    count_all_sites(&mut m.body, keys, counts);
+    count_all_sites(&mut m.body, keys, on_site);
 }
 
-fn count_all_sites(e: &mut Expr, keys: &crate::det::HashMap<String, usize>, counts: &mut [usize]) {
+fn count_all_sites(e: &mut Expr, keys: &crate::det::HashMap<String, usize>, on_site: &mut impl FnMut(usize)) {
     if let ExprNode::Send { recv: Some(r), method, .. } = &*e.node
         && method.as_str() == "new"
         && let ExprNode::Const { path } = &*r.node
     {
         let written: Vec<&str> = path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect();
         if let Some(&i) = keys.get(&written.join("::")) {
-            counts[i] += 1;
+            on_site(i);
         }
     }
-    e.node.for_each_child_mut(&mut |c| count_all_sites(c, keys, counts));
+    e.node.for_each_child_mut(&mut |c| count_all_sites(c, keys, on_site));
 }
 
 fn count_sites(e: &mut Expr, class: &ClassId, sites: &mut usize) {

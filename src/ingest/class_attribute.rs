@@ -62,7 +62,8 @@ pub(super) fn expand(
             // Concern whose `included` is only `attr_accessor` / custom
             // hooks is not a class_attribute carrier — surveying it
             // polluted store-check and model-concern suites.
-            if included_declares_class_attribute(&lc.unknown_calls) {
+            // Not one no controller includes: the expansion is for controllers alone, and an unused carrier stays on the module unsurveyed below too.
+            if included_declares_class_attribute(&lc.unknown_calls) && surfaces.controllers.values().any(|surface| surface.includes.contains(&lc.name)) {
                 survey::record(&IngestError::Unsupported {
                     file: lc.name.0.as_str().to_string(),
                     message: "class_attribute carrier `included do` must contain only class_attribute and filter DSL"

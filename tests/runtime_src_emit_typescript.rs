@@ -99,7 +99,7 @@ fn errors_rb_transpiles_to_typescript_classes() {
     let classes = parse_library_with_rbs(&ruby, &rbs, "runtime/ruby/active_record/errors.rb")
         .expect("parse_library_with_rbs");
 
-    assert_eq!(classes.len(), 25, "expected 25 classes; got {}", classes.len());
+    assert_eq!(classes.len(), 26, "expected 26 classes; got {}", classes.len());
 
     let not_found = classes
         .iter()

@@ -8,7 +8,8 @@
 //! refused (a raise at render). It is the same object `json.extract!`
 //! builds over the remaining columns, so it lowers to that, wherever the
 //! keys are known: the record is the template's own, the narrowing keys
-//! are literals, and no other statement of the object sets one of them.
+//! are literals, and no other statement of the object sets one of them
+//! (`jbuilder_merge_attributes_override.rs` covers a later pair that does).
 
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;

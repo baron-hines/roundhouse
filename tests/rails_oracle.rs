@@ -3,6 +3,8 @@
 //! Rails checkout, from `RH_RAILS_ORACLE`. Each test runs the helper under
 //! plain `ruby` the way a control does.
 
+#[path = "support/prerequisite.rs"]
+mod prerequisite;
 #[path = "support/scratch.rs"]
 mod scratch;
 use std::path::{Path, PathBuf};
@@ -31,7 +33,7 @@ fn stdout_of(output: &Output) -> String {
 fn release_installed() -> bool {
     let installed = stdout_of(&oracle_ruby(None, r#"puts RailsOracle.available?("activesupport")"#)) == "true";
     if !installed {
-        eprintln!("skipping: the default release of activesupport is not installed");
+        prerequisite::missing("the default release of activesupport is not installed");
     }
     installed
 }

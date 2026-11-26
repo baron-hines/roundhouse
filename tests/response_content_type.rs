@@ -1,4 +1,6 @@
 //! A render inherits charset from response state; head and send_data suppress it.
+#[path = "support/prerequisite.rs"]
+mod prerequisite;
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
@@ -32,7 +34,7 @@ fn response_content_types_match_rails_when_available() {
         .output()
         .expect("Rails response header oracle");
     if oracle.status.code() == Some(77) {
-        eprintln!("skipping response content-type oracle: RailsOracle actionpack is unavailable");
+        prerequisite::missing("response content-type oracle: RailsOracle actionpack is unavailable");
         return;
     }
     assert!(

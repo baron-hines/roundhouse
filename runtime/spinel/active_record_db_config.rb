@@ -205,6 +205,7 @@ module ActiveRecord
     end
 
     def self.connection_pool
+      raise NotImplementedError, "connection_pool is not carried in an app that routes by role and shard" if Db.connection_slot(false) >= 0
       ActiveRecord::ConnectionAdapters::DbPool.new
     end
 

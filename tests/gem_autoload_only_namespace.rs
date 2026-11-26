@@ -86,12 +86,6 @@ fn autoload_only_namespace(eager: bool) {
         app = app.write(&format!("vendor/gems/profkit-1.0.0/lib/{path}"), text);
     }
     let run = app.run_ruby(SCRIPT);
-    assert!(
-        run.success,
-        "emitted tree failed in {}\n=== stdout ===\n{}\n=== stderr ===\n{}",
-        run.emitted.display(),
-        run.stdout,
-        run.stderr
-    );
+    run.assert_passes();
     assert_eq!(lines(run.stdout.as_bytes()), expected, "emitted boot diverges from CRuby");
 }

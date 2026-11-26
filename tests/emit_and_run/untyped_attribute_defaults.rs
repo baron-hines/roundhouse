@@ -1,4 +1,6 @@
 use super::emit_and_run;
+#[path = "../support/prerequisite.rs"]
+mod prerequisite;
 
 const FORM: &str = r#"class FileRequest
   include ActiveModel::Model
@@ -77,9 +79,7 @@ fn omitted_type_array_defaults_on_spinel() {
         .args(["-e", &format!("require {oracle:?}\nexit 77 unless RailsOracle.available?('activemodel')\nRailsOracle.activate('activemodel')\nrequire 'active_model'\n{FORM}\n{NORMALIZER}\n{script}")])
         .output().expect("run ActiveModel reference");
     if reference.status.code() == Some(77) {
-        eprintln!(
-            "skipping ActiveModel comparison: the selected RailsOracle activemodel is unavailable"
-        );
+        prerequisite::missing("ActiveModel comparison: the selected RailsOracle activemodel is unavailable");
         return;
     }
     assert!(

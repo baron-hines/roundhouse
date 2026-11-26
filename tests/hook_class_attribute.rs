@@ -80,7 +80,7 @@ fn an_included_hook_s_class_attribute_is_the_includer_s_as_native() {
         "native control"
     );
     let run = classes.iter().fold(emit_and_run::empty_app(), |overlay, (path, source)| overlay.write(path, source)).run_ruby(SCRIPT);
-    assert!(run.success, "emitted tree failed in {}\n{}\n{}", run.emitted.display(), run.stdout, run.stderr);
+    run.assert_passes();
     assert_eq!(run.stdout, expected, "{}", run.stderr);
 }
 
@@ -129,7 +129,7 @@ fn a_respond_to_guarded_hook_declaration_is_its_branch_as_native() {
         .write("config/application.rb", "require \"redir\"\n")
         .write("vendor/gems/redir-1.0.0/lib/redir.rb", REDIRECTS)
         .run_ruby(script);
-    assert!(run.success, "emitted tree failed in {}\n{}\n{}", run.emitted.display(), run.stdout, run.stderr);
+    run.assert_passes();
     assert!(!run.stderr.contains("file_require_not_carried"), "{}", run.stderr);
     assert_eq!(run.stdout, expected, "{}", run.stderr);
 }
@@ -178,6 +178,6 @@ fn an_included_hook_s_cattr_is_the_includer_s_class_variable_as_native() {
         "native control"
     );
     let run = classes.iter().fold(emit_and_run::empty_app(), |overlay, (path, source)| overlay.write(path, source)).run_ruby(script);
-    assert!(run.success, "emitted tree failed in {}\n{}\n{}", run.emitted.display(), run.stdout, run.stderr);
+    run.assert_passes();
     assert_eq!(run.stdout, expected, "{}", run.stderr);
 }

@@ -78,3 +78,17 @@ fn parallel_callers_never_share_a_directory() {
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
+
+#[test]
+fn a_base_that_does_not_exist_yet_is_created() {
+    // CARGO_TARGET_TMPDIR is only a path until something makes it: a test
+    // binary run from an archived build on a fresh runner sees it missing
+    // unless an earlier test in the same partition happened to create it.
+    let root = scratch::dir("rh-scratch-missing-base");
+    let base = root.join("target").join("tmp");
+    assert!(!base.exists());
+    let dir = scratch::dir_in(&base, "fresh");
+    assert!(dir.is_dir(), "{}", dir.display());
+    assert_eq!(dir.parent(), Some(base.as_path()));
+    std::fs::remove_dir_all(root).unwrap();
+}

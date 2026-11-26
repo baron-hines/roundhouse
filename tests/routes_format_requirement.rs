@@ -8,6 +8,8 @@
 //! answered as CSV and `/exports/1/export.json` and `/raw/1.json` were
 //! served.
 
+#[path = "support/prerequisite.rs"]
+mod prerequisite;
 #[path = "support/emit_and_run.rs"]
 #[allow(dead_code)]
 mod emit_and_run;
@@ -106,7 +108,7 @@ end
 /// over `controller`.
 fn rails_answers(controller: &str, routes: &str, assertions: String) {
     if !Command::new("ruby").args(["-raction_controller", "-e", "1"]).status().is_ok_and(|s| s.success()) {
-        eprintln!("skipping: ruby with the actionpack gem not available");
+        prerequisite::missing("ruby with the actionpack gem not available");
         return;
     }
     let script = format!(

@@ -7,9 +7,11 @@
 //! run them and the scheduler move one pushed for a second later, then
 //! shuts down with a job still running.
 //! `tests/sidekiq_worker_live/reader.rb` reads what is left through
-//! Sidekiq's public API (`Sidekiq::RetrySet`, `Sidekiq::Queue`): the two
-//! failed jobs in the retry set with Sidekiq's error fields, and the
-//! running job back on its queue, unchanged. `tests/sidekiq_worker.rs`
+//! Sidekiq's public API (`Sidekiq::RetrySet`, `Sidekiq::DeadSet`,
+//! `Sidekiq::Queue`): the two failed jobs in the retry set with
+//! Sidekiq's error fields, the job the driver wrote to the dead set
+//! (one MULTI, with an old entry trimmed by age), and the running job
+//! back on its queue, unchanged. `tests/sidekiq_worker.rs`
 //! holds the bytes against Sidekiq's own; this gate proves the clients
 //! deliver them and Sidekiq reads them.
 //!
@@ -27,7 +29,8 @@
 //!
 //! One thread: the tests flush and fill the same scratch database, as
 //! `sidekiq_push_live` does. The Spinel tests need a spinel-redis with
-//! `brpop` (v0.3.1) and, for the scheduler, `script` and `evalsha` (v0.3.2).
+//! `brpop` (v0.3.1), for the scheduler `script` and `evalsha` (v0.3.2),
+//! and for the dead-set write `multi` (v0.3.3).
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -93,6 +96,7 @@ fn ruby(dir: &Path, url: &str, args: &[&str]) -> String {
 fn assert_worked(out: &str) {
     assert!(out.contains("ran r1,r2,r3\n"), "{out}");
     assert!(out.contains("scheduled ran, 0 left, 2 to retry\n"), "{out}");
+    assert!(out.contains("dead 1\n"), "{out}");
     assert!(out.contains("requeued, 1 on default\n"), "{out}");
     assert!(out.contains("worked "), "{out}");
 }
@@ -103,7 +107,7 @@ fn assert_sidekiq_reads(dir: &Path, url: &str) {
     assert!(out.ends_with("done\n"), "the reader did not finish\n{out}");
     let failed: Vec<&str> = out.lines().filter(|l| l.starts_with("FAIL")).collect();
     assert!(failed.is_empty(), "Sidekiq read the worker's writes differently:\n{}", failed.join("\n"));
-    assert!(out.lines().filter(|l| l.starts_with("ok")).count() >= 17, "{out}");
+    assert!(out.lines().filter(|l| l.starts_with("ok")).count() >= 20, "{out}");
 }
 
 #[test]

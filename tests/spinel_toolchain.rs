@@ -46,6 +46,10 @@ mod rack_mounts;
 mod time_change_usec_contract;
 #[path = "spinel_toolchain/time_change_usec.rs"]
 mod time_change_usec;
+#[path = "support/option_dsl.rs"]
+mod option_dsl;
+#[path = "spinel_toolchain/option_dsl.rs"]
+mod option_dsl_native;
 #[path = "support/string_truncate.rs"]
 mod string_truncate;
 #[path = "spinel_toolchain/string_truncate.rs"]
@@ -54,10 +58,42 @@ mod string_truncate_native;
 mod array_excluding;
 #[path = "spinel_toolchain/array_excluding.rs"]
 mod array_excluding_native;
+#[path = "support/haml_class_shortcut_merge.rs"]
+mod haml_class_shortcut_merge;
+#[path = "spinel_toolchain/haml_class_shortcut_merge.rs"]
+mod haml_class_shortcut_merge_native;
 #[path = "spinel_toolchain/lobsters_zero.rs"]
 mod lobsters_zero;
+#[path = "support/addressable_gem.rs"]
+mod addressable_gem;
+#[path = "support/class_param_or_assign.rs"]
+mod class_param_or_assign_app;
+#[path = "spinel_toolchain/class_param_or_assign.rs"]
+mod class_param_or_assign;
+#[path = "spinel_toolchain/addressable.rs"]
+mod addressable;
+#[path = "spinel_toolchain/conditional_definitions.rs"]
+mod conditional_definitions;
+#[path = "support/ordered_options_app.rs"]
+mod ordered_options_app;
+#[path = "spinel_toolchain/ordered_options.rs"]
+mod ordered_options;
+#[path = "support/class_ext_app.rs"]
+mod class_ext_app;
+#[path = "spinel_toolchain/class_ext.rs"]
+mod class_ext;
+#[path = "support/aasm_gem.rs"]
+mod aasm_gem;
+#[path = "spinel_toolchain/aasm.rs"]
+mod aasm;
+#[path = "support/view_component_gem.rs"]
+mod view_component_gem;
+#[path = "spinel_toolchain/view_component.rs"]
+mod view_component;
 #[path = "support/class_attribute.rs"]
 mod class_attribute;
+#[path = "support/service_params_class.rs"]
+mod service_params_class;
 #[path = "support/class_configuration.rs"]
 mod class_configuration;
 #[path = "support/class_body_calls.rs"]
@@ -74,6 +110,14 @@ fn ordinary_class_body_calls_run_natively() {
 mod dry_initializer;
 #[path = "support/data_factory.rs"]
 mod data_factory;
+#[path = "support/data_record_siblings.rs"]
+mod data_record_siblings_contract;
+#[path = "spinel_toolchain/data_record_siblings.rs"]
+mod data_record_siblings;
+#[path = "support/database_routes.rs"]
+mod database_routes_contract;
+#[path = "spinel_toolchain/database_routes.rs"]
+mod database_routes;
 #[path = "support/relation_fork.rs"]
 mod relation_fork_contract;
 #[path = "spinel_toolchain/relation_fork.rs"]
@@ -94,6 +138,8 @@ mod cable_allowed_origins;
 mod public_file_server_headers_contract;
 #[path = "spinel_toolchain/public_file_server_headers.rs"]
 mod public_file_server_headers;
+#[path = "support/puma_boot.rs"]
+mod puma_boot_contract;
 #[path = "support/cable_actions.rs"]
 mod cable_actions_contract;
 #[path = "spinel_toolchain/cable_actions.rs"]
@@ -142,6 +188,10 @@ mod action_controller_head;
 mod conditional_get_contract;
 #[path = "spinel_toolchain/conditional_get.rs"]
 mod conditional_get;
+#[path = "support/controller_layouts.rs"]
+mod controller_layouts_contract;
+#[path = "spinel_toolchain/controller_layouts.rs"]
+mod controller_layouts;
 #[path = "spinel_toolchain/response_headers.rs"]
 mod response_headers;
 #[path = "spinel_toolchain/action_dispatch_request_put.rs"]
@@ -152,12 +202,22 @@ mod strong_params;
 mod params_wrapper;
 #[path = "spinel_toolchain/json_request_values.rs"]
 mod json_request_values;
+#[path = "spinel_toolchain/chunked_body.rs"]
+mod chunked_body;
 #[path = "spinel_toolchain/multipart_file_parts.rs"]
 mod multipart_file_parts;
 #[path = "support/default_format_dispatch.rs"]
 mod default_format_dispatch;
 #[path = "spinel_toolchain/route_default_format.rs"]
 mod route_default_format;
+#[path = "support/route_request_defaults.rs"]
+mod route_request_defaults_contract;
+#[path = "spinel_toolchain/route_request_defaults.rs"]
+mod route_request_defaults;
+#[path = "support/after_initialize_boot.rs"]
+mod after_initialize_boot_contract;
+#[path = "spinel_toolchain/after_initialize_boot.rs"]
+mod after_initialize_boot;
 #[path = "support/json_params.rs"]
 mod json_params_contract;
 #[path = "spinel_toolchain/json_params.rs"]
@@ -174,6 +234,14 @@ mod backticks;
 mod class_side_default_contract;
 #[path = "spinel_toolchain/class_side_default.rs"]
 mod class_side_default;
+#[path = "support/hash_write_through_reader.rs"]
+mod hash_write_through_reader_contract;
+#[path = "spinel_toolchain/hash_write_through_reader.rs"]
+mod hash_write_through_reader;
+#[path = "support/app_class_registry.rs"]
+mod app_class_registry_contract;
+#[path = "spinel_toolchain/app_class_registry.rs"]
+mod app_class_registry;
 #[path = "spinel_toolchain/action_text_sanitize.rs"]
 mod action_text_sanitize;
 #[path = "support/campfire_caches.rs"]
@@ -268,6 +336,18 @@ mod stdlib_scan_zlib;
 mod stdlib_rexml_include_contract;
 #[path = "spinel_toolchain/stdlib_rexml_include.rs"]
 mod stdlib_rexml_include;
+#[path = "support/gem_reopen_source.rs"]
+mod gem_reopen_source_contract;
+#[path = "spinel_toolchain/gem_reopen_source.rs"]
+mod gem_reopen_source;
+#[path = "support/gem_nested_once.rs"]
+mod gem_nested_once_contract;
+#[path = "spinel_toolchain/gem_nested_once.rs"]
+mod gem_nested_once;
+#[path = "support/stdlib_singleton.rs"]
+mod stdlib_singleton_contract;
+#[path = "spinel_toolchain/stdlib_singleton.rs"]
+mod stdlib_singleton;
 #[path = "support/mutable_literals.rs"]
 mod mutable_literals_contract;
 #[path = "spinel_toolchain/mutable_literals.rs"]
@@ -276,6 +356,18 @@ mod mutable_literals;
 mod auto_source_gem_contract;
 #[path = "spinel_toolchain/auto_source_gem.rs"]
 mod auto_source_gem;
+#[path = "support/gem_autoload_helper.rs"]
+mod gem_autoload_helper_contract;
+#[path = "spinel_toolchain/gem_autoload_helper.rs"]
+mod gem_autoload_helper;
+#[path = "support/gem_method_require.rs"]
+mod gem_method_require_contract;
+#[path = "spinel_toolchain/gem_method_require.rs"]
+mod gem_method_require;
+#[path = "support/block_arg_conditional.rs"]
+mod block_arg_conditional_contract;
+#[path = "spinel_toolchain/block_arg_conditional.rs"]
+mod block_arg_conditional;
 #[path = "support/untyped_calendar.rs"]
 mod untyped_calendar_contract;
 #[path = "spinel_toolchain/untyped_calendar.rs"]
@@ -284,6 +376,10 @@ mod untyped_calendar;
 mod enumerable_mixin_contract;
 #[path = "spinel_toolchain/enumerable_mixin.rs"]
 mod enumerable_mixin;
+#[path = "support/enum_where_runtime_cast.rs"]
+mod enum_where_runtime_cast_contract;
+#[path = "spinel_toolchain/enum_where_runtime_cast.rs"]
+mod enum_where_runtime_cast;
 #[path = "support/file_level_struct.rs"]
 mod file_level_struct_contract;
 #[path = "spinel_toolchain/file_level_struct.rs"]
@@ -292,6 +388,10 @@ mod file_level_struct;
 mod concern_class_side_contract;
 #[path = "spinel_toolchain/concern_class_side.rs"]
 mod concern_class_side;
+#[path = "support/library_concern_included_include.rs"]
+mod library_concern_included_include_contract;
+#[path = "spinel_toolchain/library_concern_included_include.rs"]
+mod library_concern_included_include;
 #[path = "support/concern_define_loop.rs"]
 mod concern_define_loop_contract;
 #[path = "spinel_toolchain/concern_define_loop.rs"]
@@ -401,6 +501,15 @@ fn concern_class_attribute_macros_run_at_class_load_natively() {
     let run = class_attribute::overlay().run_spinel(class_attribute::ASSERTIONS);
     run.assert_passes();
     assert!(run.stdout.contains("class_attribute contract passed"));
+}
+
+/// The native half of `emit_and_run::a_class_a_macro_makes_from_its_block_runs`.
+#[test]
+#[ignore = "requires the Spinel toolchain, run in its CI lane"]
+fn a_class_a_macro_makes_from_its_block_runs_natively() {
+    let run = service_params_class::overlay().run_spinel(service_params_class::ASSERTIONS);
+    run.assert_passes();
+    assert!(run.stdout.contains("service params contract passed"));
 }
 
 /// The native half of `emit_and_run::concern_class_attribute_set_to_nil_is_not_unset`.
@@ -519,20 +628,52 @@ fn real_blog_spinel_tests_pass() {
     if std::env::var_os("RH_SPINEL_BUNDLE_COLLECT").is_some() {
         panic!("spinel bundle collect: not bundled");
     }
+    // Not `make spinel-test` on PRs and pushes: it compiles the whole runtime once per test file, four times the
+    // lane's longest test; Full validation (ROUNDHOUSE_SPINEL_SLIM=0) still builds each file alone, as the tree ships.
+    let (target, files) = if std::env::var("ROUNDHOUSE_SPINEL_SLIM").is_ok_and(|v| v == "0") {
+        ("spinel-test".to_string(), 0)
+    } else {
+        let makefile = std::fs::read_to_string(scratch.join("Makefile")).expect("read Makefile");
+        let tests: Vec<&str> = makefile
+            .split("SPINEL_TESTS := \\\n")
+            .nth(1)
+            .expect("Makefile lists SPINEL_TESTS")
+            .lines()
+            .map(|l| l.trim().trim_end_matches('\\').trim())
+            .take_while(|l| !l.is_empty())
+            .collect();
+        assert!(tests.len() > 1, "SPINEL_TESTS: {tests:?}");
+        let requires: String = tests
+            .iter()
+            .map(|t| format!("require_relative {:?}\n", t.trim_start_matches("test/")))
+            .collect();
+        std::fs::write(scratch.join("test/all_spinel_tests.rb"), requires).expect("write test/all_spinel_tests.rb");
+        ("build/test/all_spinel_tests".to_string(), tests.len())
+    };
     let output = Command::new("make")
-        .arg("spinel-test")
+        .arg(&target)
         .current_dir(&scratch)
         .output()
-        .expect("spawn make spinel-test");
-
+        .expect("spawn make");
     assert!(
         output.status.success(),
-        "make spinel-test failed\n\
+        "make {target} failed\n\
          \n=== stdout ===\n{}\n\
          \n=== stderr ===\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
+    if files > 0 {
+        let run = Command::new(scratch.join(&target)).current_dir(&scratch).output().expect("run the suite");
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        assert!(
+            run.status.success(),
+            "{target} failed\n=== stdout ===\n{stdout}\n=== stderr ===\n{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        // Every file's driver ran: one all-green line each.
+        assert_eq!(stdout.matches(" tests passed").count(), files, "{stdout}");
+    }
 }
 
 /// Exercise the shipped CLI/spin package, not the pre-spin_shape test overlay.
@@ -819,3 +960,6 @@ fn full_forwarding_keeps_the_native_argument_contract() {
     run.assert_passes();
     assert_eq!(run.stdout, "full forwarding contract passed\n");
 }
+
+#[path = "spinel_toolchain/data_declaration_composition.rs"]
+mod data_declaration_composition;

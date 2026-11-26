@@ -1,3 +1,5 @@
+#[path = "support/prerequisite.rs"]
+mod prerequisite;
 #[path = "support/emit_and_run.rs"]
 #[allow(dead_code)]
 mod emit_and_run;
@@ -82,7 +84,7 @@ fn rails_agrees_with_resource_module_routes() {
         .output()
         .is_ok_and(|output| output.status.success());
     if !available {
-        eprintln!("skipping: Ruby with actionpack 8.1.4 is not available");
+        prerequisite::missing("Ruby with actionpack 8.1.4 is not available");
         return;
     }
     let script = format!(

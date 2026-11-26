@@ -415,6 +415,21 @@ class ViewHelpersTest < Minitest::Test
       ViewHelpers.stylesheet_link_tag("app", "data-turbo-track": "reload")
   end
 
+  def test_stylesheet_link_tag_escapes_the_href
+    assert_includes ViewHelpers.stylesheet_link_tag("/a\"b.css"), %(href="/a&quot;b.css")
+  end
+
+  def test_stylesheet_link_tag_option_replaces_rel_and_href
+    rel = ViewHelpers.stylesheet_link_tag("app", rel: "preload")
+    assert_includes rel, %(rel="preload")
+    refute_includes rel, %(rel="stylesheet")
+    assert_includes rel, %(href="/assets/app.css")
+    href = ViewHelpers.stylesheet_link_tag("app", href: "/other.css")
+    assert_includes href, %(href="/other.css")
+    refute_includes href, %(href="/assets/app.css")
+    assert_includes href, %(rel="stylesheet")
+  end
+
   def test_javascript_importmap_tags_has_importmap_script
     assert_includes ViewHelpers.javascript_importmap_tags, %(<script type="importmap")
   end

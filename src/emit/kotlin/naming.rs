@@ -52,7 +52,9 @@ fn is_kotlin_keyword(s: &str) -> bool {
 /// `Const` reference) so the disambiguation stays consistent.
 pub fn type_name(qualified: &str) -> String {
     let last = qualified.rsplit("::").next().unwrap_or(qualified);
-    if last == "Base" && qualified.contains("::") {
+    // A namespaced class named like a core error (`I18n::ArgumentError`) would take the core name in the flat package.
+    let shadows_core = matches!(last, "ArgumentError" | "TypeError" | "NameError" | "NoMethodError" | "RuntimeError" | "StandardError" | "KeyError" | "IndexError" | "RangeError");
+    if (last == "Base" || shadows_core) && qualified.contains("::") {
         qualified.split("::").collect::<String>()
     } else {
         last.to_string()

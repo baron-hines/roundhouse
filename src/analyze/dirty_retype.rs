@@ -173,9 +173,18 @@ pub(super) fn dirty_classes_for_retype(
     while qi < queue.len() {
         let id = queue[qi].clone();
         qi += 1;
-        let module = is_module(&id);
+        let controller = controllers.contains(&id);
         for child in children.get(&id).cloned().unwrap_or_default() {
-            if module && !controllers.contains(&child) && !is_module(&child) {
+            // Not every subclass of a plain class either. A model or
+            // library class types its bodies against its own ivars, and
+            // what a subclass reads of it, its method table, reaches the
+            // subclass through the moved names above. Only a controller
+            // seeds its subclasses (Phase B). Counting every subclass sent
+            // one moved exception initializer to all of StandardError's
+            // subclasses, and an included library the app carries no body
+            // of (`Enumerable`), which is never known to be a module, to
+            // all of its includers: past the budget, every round.
+            if !controller && !controllers.contains(&child) && !is_module(&child) {
                 continue;
             }
             if dirty.insert(child.clone()) {
@@ -209,4 +218,65 @@ pub(super) fn dirty_classes_for_retype(
         eprintln!("DBG dirty {}/{budget}: {names:?}", dirty.len());
     }
     (dirty.len() <= budget).then_some(dirty)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dialect::MethodReceiver;
+    use std::path::PathBuf;
+
+    fn id(name: &str) -> ClassId {
+        ClassId(Symbol::from(name))
+    }
+
+    fn app(files: &[(&str, &str)]) -> App {
+        let tree = files.iter().map(|(path, src)| (PathBuf::from(path), src.as_bytes().to_vec())).collect();
+        crate::ingest::ingest_app_from_tree(tree).expect("ingest")
+    }
+
+    /// Classes `name < parent`, the frontier after `owner#method`'s
+    /// parameter row moved and nothing else did.
+    fn frontier(app: &App, classes: &[(&str, Option<&str>)], owner: &str, method: &str) -> Option<HashSet<ClassId>> {
+        let classes: HashMap<ClassId, ClassInfo> = classes
+            .iter()
+            .map(|(name, parent)| (id(name), ClassInfo { parent: parent.map(id), ..Default::default() }))
+            .collect();
+        let key = (id(owner), Symbol::from(method), MethodReceiver::Instance);
+        let now: HashMap<super::super::ParamKey, Vec<Ty>> = [(key.clone(), vec![Ty::Int])].into_iter().collect();
+        let before: HashMap<super::super::ParamKey, Vec<Ty>> = [(key, vec![Ty::Str])].into_iter().collect();
+        let hints = DirtyHints {
+            sig: InferenceSig { instance: HashMap::default(), class_methods: HashMap::default(), params: before },
+            block_value: HashMap::default(),
+        };
+        dirty_classes_for_retype(app, &classes, &now, &HashMap::default(), &hints)
+    }
+
+    const PLAIN: &str = "class One\n  def a; 1; end\nend\nclass Two\n  def a; 1; end\nend\nclass Three\n  def a; 1; end\nend\nclass Four\n  def a; 1; end\nend\nclass Five\n  def a; 1; end\nend\nclass Six\n  def a; 1; end\nend\n";
+
+    #[test]
+    fn a_moved_row_on_a_plain_class_leaves_its_subclasses_clean() {
+        let app = app(&[("app/lib/plain.rb", PLAIN)]);
+        let dirty = frontier(&app, &[("Base", None), ("A", Some("Base")), ("B", Some("Base")), ("C", Some("Base"))], "Base", "initialize")
+            .expect("narrowed");
+        assert!(dirty.contains(&id("Base")), "{dirty:?}");
+        assert!(!dirty.contains(&id("A")) && !dirty.contains(&id("B")) && !dirty.contains(&id("C")), "{dirty:?}");
+    }
+
+    #[test]
+    fn a_moved_row_on_a_controller_dirties_its_subclasses() {
+        let app = app(&[
+            ("app/lib/plain.rb", PLAIN),
+            ("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\n  def helper(x); x; end\nend\n"),
+            ("app/controllers/posts_controller.rb", "class PostsController < ApplicationController\n  def index; end\nend\n"),
+        ]);
+        let dirty = frontier(
+            &app,
+            &[("ApplicationController", None), ("PostsController", Some("ApplicationController"))],
+            "ApplicationController",
+            "helper",
+        )
+        .expect("narrowed");
+        assert!(dirty.contains(&id("PostsController")), "{dirty:?}");
+    }
 }
