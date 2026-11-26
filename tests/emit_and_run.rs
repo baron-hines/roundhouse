@@ -480,6 +480,8 @@ mod backticks;
 mod json_params_contract;
 #[path = "emit_and_run/json_params.rs"]
 mod json_params;
+#[path = "emit_and_run/current_attribute_defaults.rs"]
+mod current_attribute_defaults;
 #[path = "emit_and_run/raw_post_body.rs"]
 mod raw_post_body;
 #[path = "emit_and_run/scoped_new_form.rs"]
