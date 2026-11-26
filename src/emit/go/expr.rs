@@ -508,9 +508,11 @@ pub(super) fn emit_expr(ctx: &EmitCtx, e: &Expr) -> String {
                 }
                 // A nullable column's pointer field: nil takes the fallback,
                 // any stored value (0 included) is itself, as in Ruby.
+                // Not with a nullable column on the right too: the function answers the left's scalar, and the right is a pointer.
                 if let Some(ptr) = nullable_read_go_ty(left)
                     && let Some(scalar) = ptr.strip_prefix('*')
                     && primitive_kind(&right.ty)
+                    && nullable_read_go_ty(right).is_none()
                 {
                     return format!(
                         "func() {scalar} {{ if p := {}; p != nil {{ return *p }}; return {} }}()",
@@ -2190,16 +2192,26 @@ pub(super) fn emit_send(
             // model's own field (`@title`) and a reader call on
             // another record (`article.title` in a view).
             let nilable_col = match &*r.node {
-                ExprNode::Ivar { name } => nullable_column_go_ty(name.as_str()).is_some(),
-                ExprNode::Send { recv: Some(inner), method: m, args, .. } if args.is_empty() => {
-                    !recv_model_defines(inner, m.as_str())
-                        && (nullable_column_go_ty(m.as_str()).is_some()
-                            || recv_column_is_nullable(inner, m.as_str()))
+                ExprNode::Ivar { name } => nullable_column_go_ty(name.as_str()),
+                ExprNode::Send { recv: Some(inner), method: m, args, .. }
+                    if args.is_empty() && !recv_model_defines(inner, m.as_str()) =>
+                {
+                    nullable_column_go_ty(m.as_str()).or_else(|| recv_column_go_ty(inner, m.as_str()))
                 }
-                _ => false,
+                _ => None,
             };
-            if nilable_col {
-                return format!("DerefString({recv_s})");
+            // Not DerefString for every pointer: it takes `*string`, and `nil.to_s` is "" whatever the column holds.
+            match nilable_col.as_deref() {
+                Some("*string") => return format!("DerefString({recv_s})"),
+                Some(ptr) if ptr.starts_with('*') => {
+                    let verb = match ptr {
+                        "*int64" => "%d",
+                        "*float64" => "%g",
+                        _ => "%v",
+                    };
+                    return format!("func() string {{ if p := {recv_s}; p != nil {{ return fmt.Sprintf(\"{verb}\", *p) }}; return \"\" }}()");
+                }
+                _ => {}
             }
             return match r.ty.as_ref() {
                 Some(Ty::Str | Ty::Sym) => recv_s,
