@@ -14,14 +14,26 @@
 //! ```ruby
 //! Current.set(request: r) { body }
 //! # →
-//! __current_set_request = Current.request
-//! Current.request = r
+//! __current_set_arg0_request = r
+//! __current_set_was0_request = Current.request
 //! begin
+//!   Current.request = __current_set_arg0_request
 //!   body
 //! ensure
-//!   Current.request = __current_set_request
+//!   Current.request = __current_set_was0_request
 //! end
 //! ```
+//!
+//! That is `Object#with`'s order: the arguments first (a literal needs
+//! no local), then each attribute saved just before it is assigned. With
+//! a second attribute, its save and assignment follow the first's inside
+//! the `begin`, a count records how many saves were made, and the
+//! `ensure` restores those, in order. A block with parameters, or a
+//! `next` or `break` of its own, runs as
+//! `Current.instance.then { |context| … }`, which yields the instance as
+//! `set` does, and so does one that assigns a local, which keeps the
+//! block's locals its own; any other block runs as its body in place.
+//! Each call site's locals carry its own number.
 //!
 //! ENSURE, NOT A TRAILING ASSIGNMENT, and it is the half that matters:
 //! `Current.set` exists to be exception-safe. campfire's
@@ -60,26 +72,27 @@ pub fn apply_current_set_lowering(app: &mut App) -> Vec<Diagnostic> {
         return Vec::new();
     }
     let mut diags = Vec::new();
-    super::for_each_hook_body(app, &mut |e| rewrite(e, &classes, &mut diags));
+    let mut sites = 0;
+    super::for_each_hook_body(app, &mut |e| rewrite(e, &classes, &mut sites, &mut diags));
     for view in &mut app.views {
-        rewrite(&mut view.body, &classes, &mut diags);
+        rewrite(&mut view.body, &classes, &mut sites, &mut diags);
     }
     for tm in &mut app.test_modules {
         if let Some(setup) = &mut tm.setup {
-            rewrite(setup, &classes, &mut diags);
+            rewrite(setup, &classes, &mut sites, &mut diags);
         }
         for t in &mut tm.tests {
-            rewrite(&mut t.body, &classes, &mut diags);
+            rewrite(&mut t.body, &classes, &mut sites, &mut diags);
         }
         for m in &mut tm.helpers {
-            rewrite(&mut m.body, &classes, &mut diags);
+            rewrite(&mut m.body, &classes, &mut sites, &mut diags);
         }
     }
     diags
 }
 
-fn rewrite(e: &mut Expr, classes: &BTreeSet<String>, diags: &mut Vec<Diagnostic>) {
-    e.node.for_each_child_mut(&mut |c| rewrite(c, classes, diags));
+fn rewrite(e: &mut Expr, classes: &BTreeSet<String>, sites: &mut usize, diags: &mut Vec<Diagnostic>) {
+    e.node.for_each_child_mut(&mut |c| rewrite(c, classes, sites, diags));
     let span = e.span;
     let ExprNode::Send { recv: Some(recv), method, args, block, .. } = &*e.node else { return };
     if method.as_str() != "set" {
@@ -94,11 +107,16 @@ fn rewrite(e: &mut Expr, classes: &BTreeSet<String>, diags: &mut Vec<Diagnostic>
         report(span, &class, "it takes no block, so there is no scope to restore after", diags);
         return;
     };
+    if !matches!(&*body.node, ExprNode::Lambda { .. }) {
+        report(span, &class, "its block is passed as a value (`&blk`, `&method(:m)`), not written at the call", diags);
+        return;
+    }
     let Some(pairs) = keyword_pairs(args) else {
         report(span, &class, "its argument is not a literal keyword hash", diags);
         return;
     };
-    *e = expand(span, &class, &pairs, body);
+    *e = expand(span, &class, &pairs, body, *sites);
+    *sites += 1;
 }
 
 /// `[(attribute, value)]` from the single trailing keyword hash.
@@ -120,30 +138,70 @@ fn keyword_pairs(args: &[Expr]) -> Option<Vec<(String, Expr)>> {
     Some(out)
 }
 
-fn expand(span: Span, class: &str, pairs: &[(String, Expr)], body: &Expr) -> Expr {
+fn expand(span: Span, class: &str, pairs: &[(String, Expr)], body: &Expr, site: usize) -> Expr {
     let mut stmts: Vec<Expr> = Vec::new();
-    // Saves FIRST, all of them, then the assignments — the order Rails'
-    // own `set` uses. A save that read an attribute another pair had
-    // already overwritten would restore the wrong value on a call that
-    // names two.
-    let saved: Vec<(String, Symbol)> = pairs
-        .iter()
-        .map(|(name, _)| (name.clone(), Symbol::from(format!("__current_set_{name}"))))
-        .collect();
-    for ((name, _), (_, local)) in pairs.iter().zip(saved.iter()) {
-        stmts.push(assign_local(span, local.clone(), class_read(span, class, name)));
+    // (numbered per call site, not per nesting level: a lambda defined beside one `set` and called inside another shares the method's locals)
+    let level = if site == 0 { String::new() } else { site.to_string() };
+    let local = |kind: &str, i: usize, name: &str| Symbol::from(format!("__current_set{level}_{kind}{i}_{name}"));
+    // The arguments are evaluated in order before anything is saved, as a
+    // call's arguments are: one that raises leaves every attribute as it
+    // was, and a later one cannot change an earlier one's value.
+    let mut values: Vec<(String, Expr)> = Vec::new();
+    for (i, (name, value)) in pairs.iter().enumerate() {
+        if matches!(&*value.node, ExprNode::Lit { .. }) {
+            values.push((name.clone(), value.clone()));
+        } else {
+            let arg = local("arg", i, name);
+            stmts.push(assign_local(span, arg.clone(), value.clone()));
+            values.push((name.clone(), local_read(span, arg)));
+        }
     }
-    for (name, value) in pairs {
-        stmts.push(class_write(span, class, name, value.clone()));
-    }
+    // Then Rails' `Object#with`: per attribute in order, save it and
+    // assign it, so each save reads after the writes before it; on the
+    // way out, restore the attributes saved so far, in order. The count
+    // of saves made is what lets one `ensure` skip those not reached.
+    let count = Symbol::from(format!("__current_set{level}_saved"));
+    let mut setup: Vec<Expr> = Vec::new();
     let mut restore: Vec<Expr> = Vec::new();
-    for (name, local) in &saved {
-        restore.push(class_write(span, class, name, local_read(span, local.clone())));
+    for (i, (name, value)) in values.iter().enumerate() {
+        let saved = local("was", i, name);
+        let save = assign_local(span, saved.clone(), class_read(span, class, name));
+        let back = class_write(span, class, name, local_read(span, saved.clone()));
+        if i == 0 {
+            stmts.push(save);
+            restore.push(back);
+        } else {
+            stmts.push(assign_local(span, saved, nil(span)));
+            setup.push(save);
+            setup.push(assign_local(span, count.clone(), int(span, i as i64 + 1)));
+            restore.push(Expr::new(
+                span,
+                ExprNode::If {
+                    cond: Expr::new(
+                        span,
+                        ExprNode::Send {
+                            recv: Some(local_read(span, count.clone())),
+                            method: Symbol::from(">="),
+                            args: vec![int(span, i as i64 + 1)],
+                            block: None,
+                            parenthesized: false,
+                        },
+                    ),
+                    then_branch: back,
+                    else_branch: nil(span),
+                },
+            ));
+        }
+        setup.push(class_write(span, class, name, value.clone()));
     }
+    if values.len() > 1 {
+        stmts.push(assign_local(span, count, int(span, 1)));
+    }
+    setup.push(run_block(span, class, body));
     stmts.push(Expr::new(
         span,
         ExprNode::BeginRescue {
-            body: body.clone(),
+            body: seq(span, setup),
             rescues: Vec::new(),
             else_branch: None,
             ensure: Some(Box::new(seq(span, restore))),
@@ -151,6 +209,92 @@ fn expand(span: Span, class: &str, pairs: &[(String, Expr)], body: &Expr) -> Exp
         },
     ));
     seq(span, stmts)
+}
+
+fn nil(span: Span) -> Expr {
+    Expr::new(span, ExprNode::Lit { value: Literal::Nil })
+}
+
+fn int(span: Span, value: i64) -> Expr {
+    Expr::new(span, ExprNode::Lit { value: Literal::Int { value } })
+}
+
+/// The block's run inside the save/restore. A block with no parameters,
+/// no `next`, `break` or `redo` of its own and no locals of its own runs
+/// as its body in place; any
+/// other is handed to `Current.instance.then`, which yields the instance
+/// as Rails' `set` does and keeps the block's own `next`, `break` and
+/// parameters.
+fn run_block(span: Span, class: &str, block: &Expr) -> Expr {
+    let ExprNode::Lambda { params, rest_param, extra_params, block_param, body, .. } = &*block.node else {
+        return block.clone();
+    };
+    if params.is_empty() && rest_param.is_none() && extra_params.is_empty() && block_param.is_none() && !jumps_out(body) && !binds_local(body) {
+        return body.clone();
+    }
+    let instance = Expr::new(
+        span,
+        ExprNode::Send {
+            recv: Some(const_path(span, class)),
+            method: Symbol::from("instance"),
+            args: vec![],
+            block: None,
+            parenthesized: false,
+        },
+    );
+    Expr::new(
+        span,
+        ExprNode::Send {
+            recv: Some(instance),
+            method: Symbol::from("then"),
+            args: vec![],
+            block: Some(block.clone()),
+            parenthesized: false,
+        },
+    )
+}
+
+/// Does `e` hold a `next`, `break` or `redo` that leaves the block itself (one
+/// in a nested block or loop leaves that instead)?
+fn jumps_out(e: &Expr) -> bool {
+    match &*e.node {
+        ExprNode::Next { .. } | ExprNode::Break { .. } | ExprNode::Redo => true,
+        ExprNode::Lambda { .. } | ExprNode::While { .. } => false,
+        _ => {
+            let mut found = false;
+            e.node.for_each_child(&mut |c| found |= jumps_out(c));
+            found
+        }
+    }
+}
+
+/// Does `e` assign a local outside a nested block? Run in place, the
+/// block's own locals would join the method's, and two sibling blocks
+/// would share one.
+fn binds_local(e: &Expr) -> bool {
+    match &*e.node {
+        ExprNode::Assign { target: LValue::Var { .. }, .. }
+        | ExprNode::OpAssign { target: LValue::Var { .. }, .. }
+        | ExprNode::Let { .. } => true,
+        ExprNode::MultiAssign { targets, .. } if targets.iter().any(|t| matches!(t, LValue::Var { .. })) => true,
+        ExprNode::Lambda { .. } => false,
+        _ => {
+            // `rescue => e` and a pattern's names bind locals too.
+            let mut bound: Vec<Symbol> = Vec::new();
+            match &*e.node {
+                ExprNode::BeginRescue { rescues, .. } => bound.extend(rescues.iter().filter_map(|r| r.binding.clone())),
+                ExprNode::CaseMatch { arms, .. } => arms.iter().for_each(|arm| arm.pattern.bound_names(&mut bound)),
+                ExprNode::MatchPredicate { pattern, .. } | ExprNode::MatchRequired { pattern, .. } => pattern.bound_names(&mut bound),
+                _ => {}
+            }
+            if !bound.is_empty() {
+                return true;
+            }
+            let mut found = false;
+            e.node.for_each_child(&mut |c| found |= binds_local(c));
+            found
+        }
+    }
 }
 
 fn seq(span: Span, exprs: Vec<Expr>) -> Expr {
@@ -237,27 +381,147 @@ mod tests {
 
     #[test]
     fn one_attribute_saves_assigns_and_restores_in_an_ensure() {
-        let mut app = app_with("Current.set(request: r) do\n      work\n    end");
+        let mut app = app_with("Current.set(request: \"r\") do\n      work\n    end");
         let diags = apply_current_set_lowering(&mut app);
         assert!(diags.is_empty(), "{diags:?}");
         let out = lowered(&app);
-        assert!(out.contains("__current_set_request = Current.request"), "{out}");
-        assert!(out.contains("Current.request = r"), "{out}");
+        assert!(out.contains("__current_set_was0_request = Current.request"), "{out}");
+        assert!(out.contains("Current.request = \"r\""), "{out}");
         assert!(out.contains("ensure"), "{out}");
-        assert!(out.contains("Current.request = __current_set_request"), "{out}");
+        assert!(out.contains("Current.request = __current_set_was0_request"), "{out}");
     }
 
-    /// Every save runs before any assignment: with two attributes, a
-    /// save that read after a write would restore the new value.
+    /// Each attribute is saved just before it is assigned, as
+    /// `Object#with` does: the second save reads after the first write.
     #[test]
-    fn two_attributes_save_before_either_is_written() {
-        let mut app = app_with("Current.set(request: r, user: u) do\n      work\n    end");
+    fn each_attribute_is_saved_just_before_it_is_assigned() {
+        let mut app = app_with("Current.set(request: \"r\", user: \"u\") do\n      work\n    end");
         let diags = apply_current_set_lowering(&mut app);
         assert!(diags.is_empty(), "{diags:?}");
         let out = lowered(&app);
-        let save_user = out.find("__current_set_user = Current.user").expect(&out);
-        let write_request = out.find("Current.request = r").expect(&out);
-        assert!(save_user < write_request, "a save ran after a write:\n{out}");
+        let at = |s: &str| out.find(s).unwrap_or_else(|| panic!("no `{s}` in:\n{out}"));
+        let order = [
+            at("__current_set_was0_request = Current.request"),
+            at("Current.request = \"r\""),
+            at("__current_set_was1_user = Current.user"),
+            at("Current.user = \"u\""),
+        ];
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "out of Object#with's order:\n{out}");
+    }
+
+    /// The attributes saved are restored in the order they were set,
+    /// each only once its save was made.
+    #[test]
+    fn restores_run_in_order_and_only_for_the_saves_made() {
+        let mut app = app_with("Current.set(request: \"r\", user: \"u\") { work }");
+        assert!(apply_current_set_lowering(&mut app).is_empty());
+        let out = lowered(&app);
+        let ensure = &out[out.find("ensure").expect(&out)..];
+        let request = ensure.find("Current.request = __current_set_was0_request").expect(&out);
+        let user = ensure.find("Current.user = __current_set_was1_user").expect(&out);
+        assert!(request < user, "{out}");
+        assert!(ensure.contains("__current_set_saved >= 2"), "{out}");
+    }
+
+    /// A block that assigns a local keeps it its own: two sibling blocks
+    /// do not share one.
+    #[test]
+    fn a_block_with_a_local_of_its_own_runs_through_then() {
+        let mut app = app_with("Current.set(request: \"r\") { memo = 1 }");
+        assert!(apply_current_set_lowering(&mut app).is_empty());
+        assert!(lowered(&app).contains("Current.instance.then"), "{}", lowered(&app));
+    }
+
+    /// A pattern's names and a rescue's binding are locals of the block's
+    /// own too.
+    #[test]
+    fn a_block_binding_by_pattern_or_rescue_runs_through_then() {
+        for body in ["Current.set(request: \"r\") { 1 => memo }", "Current.set(request: \"r\") { begin; work; rescue => e; e; end }"] {
+            let mut app = app_with(body);
+            assert!(apply_current_set_lowering(&mut app).is_empty());
+            assert!(lowered(&app).contains("Current.instance.then"), "{body}:\n{}", lowered(&app));
+        }
+    }
+
+    /// Two call sites in one body name their locals apart, whatever their
+    /// nesting: a lambda beside one can run inside the other.
+    #[test]
+    fn each_call_site_has_its_own_locals() {
+        let mut app = app_with("Current.set(user: \"a\") { work }\n    Current.set(user: \"b\") { work }");
+        assert!(apply_current_set_lowering(&mut app).is_empty());
+        let out = lowered(&app);
+        assert!(out.contains("__current_set_was0_user") && out.contains("__current_set1_was0_user"), "{out}");
+    }
+
+    /// A `set` in another's argument names its locals apart from the
+    /// outer one's.
+    #[test]
+    fn a_set_in_an_argument_keeps_its_own_locals() {
+        let mut app = app_with("Current.set(user: a, request: Current.set(user: b) { \"c\" }) { work }");
+        assert!(apply_current_set_lowering(&mut app).is_empty());
+        let out = lowered(&app);
+        assert!(out.contains("__current_set1_arg0_user = a") && out.contains("__current_set_arg0_user = b"), "{out}");
+    }
+
+    /// A block passed as a value has no body to run in place: the call
+    /// is reported and left as written.
+    #[test]
+    fn a_block_passed_as_a_value_is_reported_and_left() {
+        let mut app = app_with("Current.set(request: \"r\", &handler)");
+        let diags = apply_current_set_lowering(&mut app);
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(lowered(&app).contains("Current.set"), "{}", lowered(&app));
+    }
+
+    /// The same attribute named twice keeps two locals of its own.
+    #[test]
+    fn a_name_given_twice_keeps_a_local_per_entry() {
+        let mut app = app_with("Current.set(request: a, \"request\" => b) { work }");
+        assert!(apply_current_set_lowering(&mut app).is_empty());
+        let out = lowered(&app);
+        assert!(out.contains("__current_set_arg0_request = a") && out.contains("__current_set_arg1_request = b"), "{out}");
+    }
+
+    /// The block runs: its body sits in the `begin`, not a lambda left
+    /// unrun there.
+    #[test]
+    fn a_plain_block_runs_as_its_body() {
+        let mut app = app_with("x = Current.set(request: r) { work }");
+        assert!(apply_current_set_lowering(&mut app).is_empty());
+        let out = lowered(&app);
+        assert!(out.contains("work") && !out.contains("->") && !out.contains("then"), "{out}");
+    }
+
+    /// A block parameter, and a `next` or `break` of the block's own,
+    /// keep their meaning through `Current.instance.then`.
+    #[test]
+    fn a_block_with_a_parameter_or_a_jump_runs_through_then() {
+        for body in ["Current.set(request: r) { |c| c.request }", "Current.set(request: r) { next 1 }", "Current.set(request: r) { break 1 }", "Current.set(request: r) { redo }"] {
+            let mut app = app_with(body);
+            assert!(apply_current_set_lowering(&mut app).is_empty());
+            let out = lowered(&app);
+            assert!(out.contains("Current.instance.then"), "{body}:\n{out}");
+        }
+    }
+
+    /// A `next` in a nested block or a `break` in a loop leaves that, not
+    /// the `set` block, which runs as its body.
+    #[test]
+    fn a_jump_of_a_nested_block_or_loop_stays_in_place() {
+        let mut app = app_with("Current.set(request: r) { [1].each { |n| next n }; while true; break; end }");
+        assert!(apply_current_set_lowering(&mut app).is_empty());
+        assert!(!lowered(&app).contains("Current.instance.then"), "{}", lowered(&app));
+    }
+
+    /// An argument that is a call is evaluated before the first save.
+    #[test]
+    fn a_call_argument_is_evaluated_before_anything_is_saved() {
+        let mut app = app_with("Current.set(request: build) { work }");
+        assert!(apply_current_set_lowering(&mut app).is_empty());
+        let out = lowered(&app);
+        let value = out.find("__current_set_arg0_request = build").expect(&out);
+        let save = out.find("__current_set_was0_request = Current.request").expect(&out);
+        assert!(value < save, "{out}");
     }
 
     #[test]
