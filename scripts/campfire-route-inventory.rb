@@ -55,4 +55,5 @@ payload = {
   "routes" => routes
 }
 
-puts JSON.pretty_generate(payload)
+# Not stdout: production Campfire logs there, and a boot-time WARN would land inside the JSON.
+File.write(ENV.fetch("ROUTE_INVENTORY_OUTPUT"), JSON.pretty_generate(payload) + "\n")
