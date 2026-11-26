@@ -11,11 +11,34 @@ const CONTROLLER: &str = r#"class PlainsController < ApplicationController
 end
 "#;
 
-fn app() -> emit_and_run::Overlay {
+/// A class with its own `default_url_options` keeps that host under a call's `protocol:` (Rails merges the call's
+/// options over the class's).
+const HOSTED: &str = r#"class HostedsController < ApplicationController
+  def show
+    render plain: [article_url(1, protocol: "https"), article_url(1), article_url(1, protocol: "//"), article_url(1, protocol: "https", port: 8443), article_url(1, port: 8080)].join(" ")
+  end
+
+  private
+
+  def default_url_options
+    { host: "class.example" }
+  end
+end
+"#;
+
+fn plain_app() -> emit_and_run::Overlay {
     emit_and_run::real_blog()
-        .edit("config/routes.rb", "  root \"articles#index\"\n", "  root \"articles#index\"\n  get \"/plain\", to: \"plains#show\", as: :plain\n")
+        .edit("config/routes.rb", "  root \"articles#index\"\n", "  root \"articles#index\"\n  get \"/plain\", to: \"plains#show\", as: :plain\n  get \"/hosted\", to: \"hosteds#show\"\n")
         .write("app/controllers/plains_controller.rb", CONTROLLER)
 }
+
+// Not on Spinel: a controller's own `default_url_options` Hash literal does not compile there yet (the runtime's
+// `url_from_path` local takes the parent's representation), a gap of its own.
+fn app() -> emit_and_run::Overlay {
+    plain_app().write("app/controllers/hosteds_controller.rb", HOSTED)
+}
+
+const HOSTED_EXPECTED: &str = "https://class.example/articles/1 http://class.example/articles/1 //class.example/articles/1 https://class.example:8443/articles/1 http://class.example:8080/articles/1";
 
 const EXPECTED: &str = "https://example.org/articles/1 ftp://example.org/plain https://example.org/articles/1 //example.org/articles/1 http://example.org/articles/1";
 
@@ -28,6 +51,11 @@ raise "GET /plain answered #{{status}}" unless status == 200
 text = +""
 body.each {{ |part| text << part }}
 raise "urls: #{{text.inspect}}" unless text == {EXPECTED:?}
+status, _headers, body = Main.run_rack("REQUEST_METHOD" => "GET", "PATH_INFO" => "/hosted", "QUERY_STRING" => "", "HTTP_HOST" => "example.org", "rack.url_scheme" => "http", "SERVER_NAME" => "example.org", "SERVER_PORT" => "80", "rack.input" => StringIO.new(""))
+raise "GET /hosted answered #{{status}}" unless status == 200
+hosted = +""
+body.each {{ |part| hosted << part }}
+raise "class host: #{{hosted.inspect}}" unless hosted == {HOSTED_EXPECTED:?}
 puts "url helper protocol passed"
 "##
         ))
@@ -37,7 +65,7 @@ puts "url helper protocol passed"
 #[test]
 #[ignore = "requires the Spinel toolchain"]
 fn a_protocol_alone_keeps_the_request_s_host_on_spinel() {
-    app()
+    plain_app()
         .run_spinel(&format!(
             r##"request = ActionDispatch::Request.new
 request.request_method = "GET"

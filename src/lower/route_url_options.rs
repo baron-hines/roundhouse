@@ -101,7 +101,10 @@ pub fn apply_route_url_options_lowering(app: &mut App) {
     for view in &mut app.views {
         position_path_params(&mut view.body, &params);
     }
-    super::for_each_hook_body(app, &mut |e| rewrite(e, &helpers));
+    let own_options = classes_with_own_url_options(app);
+    super::for_each_owned_hook_body(app, &mut |owner, e| {
+        rewrite_owned(e, &helpers, owner.is_some_and(|o| own_options.contains(o)))
+    });
     for view in &mut app.views {
         rewrite(&mut view.body, &helpers);
     }
@@ -480,13 +483,44 @@ fn spread_options_local(arg: &Expr, index: usize, names: &[String]) -> Option<Ve
 }
 
 fn rewrite(expr: &mut Expr, helpers: &crate::det::HashSet<String>) {
-    expr.node.for_each_child_mut(&mut |c| rewrite(c, helpers));
-    rewrite_node(expr, helpers);
+    rewrite_owned(expr, helpers, false);
+}
+
+/// The classes that define `default_url_options` themselves: their bare `_url` calls take that host
+/// (`emit::ruby::library::url_for_own_options`).
+pub(crate) fn classes_with_own_url_options(app: &App) -> crate::det::HashSet<crate::ident::ClassId> {
+    let own = |m: &crate::dialect::MethodDef| m.receiver == crate::dialect::MethodReceiver::Instance && m.name.as_str() == "default_url_options";
+    let mut out = crate::det::HashSet::default();
+    for lc in &app.library_classes {
+        if lc.methods.iter().any(own) {
+            out.insert(lc.name.clone());
+        }
+    }
+    for m in &app.models {
+        if m.methods().any(own) {
+            out.insert(m.name.clone());
+        }
+    }
+    for c in &app.controllers {
+        if c.actions().any(|a| a.name.as_str() == "default_url_options") {
+            out.insert(c.name.clone());
+        }
+    }
+    out
+}
+
+fn rewrite_owned(expr: &mut Expr, helpers: &crate::det::HashSet<String>, own_url_options: bool) {
+    expr.node.for_each_child_mut(&mut |c| rewrite_owned(c, helpers, own_url_options));
+    rewrite_owned_node(expr, helpers, own_url_options);
 }
 
 pub(crate) fn rewrite_node(expr: &mut Expr, helpers: &crate::det::HashSet<String>) {
+    rewrite_owned_node(expr, helpers, false);
+}
+
+pub(crate) fn rewrite_owned_node(expr: &mut Expr, helpers: &crate::det::HashSet<String>, own_url_options: bool) {
     ground_symbol_query_values(expr, helpers);
-    let Some((stem, host, protocol)) = strip_host_options(expr, helpers) else {
+    let Some((stem, host, protocol)) = strip_host_options(expr, helpers, own_url_options) else {
         return;
     };
     let span = expr.span;
@@ -616,6 +650,7 @@ fn ground_symbol_query_values(expr: &mut Expr, helpers: &crate::det::HashSet<Str
 fn strip_host_options(
     expr: &mut Expr,
     helpers: &crate::det::HashSet<String>,
+    own_url_options: bool,
 ) -> Option<(String, Option<Expr>, Option<Expr>)> {
     let ExprNode::Send { recv, method, args, block: None, .. } = &mut *expr.node else {
         return None;
@@ -665,6 +700,17 @@ fn strip_host_options(
             }
             _ => {}
         }
+    }
+    // Not stripped in a class with its own `default_url_options`: a call naming no host takes the class's, and the
+    // emitter's `url_for_own_options` reads the protocol off the call.
+    // Only a protocol and a port: `url_from_path` and `url_for_own_options` take those two, and any other host option
+    // left on the call reached the path helper as an argument.
+    let only_protocol = entries.iter().all(|(k, _)| {
+        !matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } }
+            if HOST_ONLY_OPTIONS.contains(&value.as_str()) && value.as_str() != "protocol" && value.as_str() != "port")
+    });
+    if own_url_options && !chained && host.is_none() && !only_path && only_protocol && method.as_str().ends_with("_url") {
+        return None;
     }
     entries.retain(|(k, _)| {
         !matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } }

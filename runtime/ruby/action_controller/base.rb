@@ -1244,7 +1244,7 @@ module ActionController
     # With no host at all, neither the request's nor the app's, the
     # path is the answer: Rails raises "Missing host to link to!", and
     # a path is what a browser resolves against the page it is on.
-    def url_from_path(path)
+    def url_from_path(path, call_protocol = nil, call_port = nil)
       options = default_url_options
       req_host = request_host_for_redirect
       protocol = request_protocol_for_url
@@ -1255,6 +1255,8 @@ module ActionController
       protocol = options.fetch(:protocol, nil).to_s if options.key?(:protocol)
       host = options.fetch(:host, nil).to_s if options.key?(:host)
       port = options.fetch(:port, nil).to_s if options.key?(:port)
+      protocol = call_protocol unless call_protocol.nil?
+      port = call_port.to_s unless call_port.nil?
       return path if host == ""
       ActionController.build_host_url(protocol, host, port, path)
     end

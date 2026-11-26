@@ -642,8 +642,10 @@ module ActiveRecord
     end
 
     def or!(other)
-      return self if other.null_relation?
+      own_lists
       unload_records
+      merge_reference_names!(other)
+      return self if other.null_relation?
       mine = @wheres.length > 0 ? @wheres.join(" AND ") : "1=1"
       other_wheres = other.where_clauses
       theirs = other_wheres.length > 0 ? other_wheres.join(" AND ") : "1=1"
@@ -677,6 +679,7 @@ module ActiveRecord
         end
       end
       other.having_clauses.each { |h| @havings << h unless @havings.include?(h) }
+      merge_reference_names!(other)
       mark_null! if other.null_relation?
       @none = true if other.explicit_none?
       self
@@ -1631,6 +1634,16 @@ module ActiveRecord
       self
     end
 
+    def reference_names
+      @references
+    end
+
+    # Rails' `references_values |= other.references_values`, for `or`, `and` and `merge`.
+    def merge_reference_names!(other)
+      other.reference_names.each { |n| @references << n unless @references.include?(n) }
+      nil
+    end
+
     # `merge(other)` — fold another relation's WHEREs and ORDER BY in.
     # v1 handles the common case (merging a same-table scope's conditions).
     def merge(other)
@@ -1644,6 +1657,7 @@ module ActiveRecord
         push_where(w)
         @opaque_wheres = true
       end
+      merge_reference_names!(other)
       merge_orders!(other)
       mark_null! if other.null_relation?
       @none = true if other.explicit_none?

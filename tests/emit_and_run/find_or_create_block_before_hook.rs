@@ -81,14 +81,15 @@ ActiveRecord::Base.establish_connection(adapter: "sqlite3", database: ":memory:"
     assert_eq!(String::from_utf8_lossy(&output.stdout), EXPECTED);
 }
 
-/// A private `def after_initialize` the factory cannot call on the record, and an ancestor's `initialize` that runs
+/// A private or protected `def after_initialize` the factory cannot call on the record, and an ancestor's `initialize` that runs
 /// before the block could: both keep the refusal.
 #[test]
 fn a_private_hook_or_an_ancestors_initialize_keeps_the_refusal() {
     let private_hook = "class Badge < ActiveRecord::Base\n  private\n\n  def after_initialize\n    self.token ||= \"t\"\n  end\nend\n";
     let ancestor = "class Base < ActiveRecord::Base\n  self.abstract_class = true\n\n  def initialize(attrs = {})\n    super\n  end\nend\n";
     let child = MODEL.replace("class Badge < ActiveRecord::Base", "class Badge < Base");
-    for (model, base) in [(private_hook.to_string(), None), (child, Some(ancestor))] {
+    let protected_hook = private_hook.replace("  private\n", "  protected\n");
+    for (model, base) in [(private_hook.to_string(), None), (protected_hook, None), (child, Some(ancestor))] {
         let mut overlay = app().write("app/models/badge.rb", &model);
         if let Some(base) = base {
             overlay = overlay.write("app/models/base.rb", base);

@@ -241,7 +241,7 @@ module ActionController
     def request_host_for_redirect: () -> String
     def default_url_options: () -> Hash[Symbol, String]
     def request_protocol_for_url: () -> String
-    def url_from_path: (String path) -> String
+    def url_from_path: (String path, ?String? call_protocol, ?(Integer | String)? call_port) -> String
 
     # Strict targets use Symbols; Ruby/Spinel widens resolve_status.
     def resolve_status: (Symbol s) -> Integer
