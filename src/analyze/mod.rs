@@ -133,6 +133,8 @@ pub struct Analyzer {
     /// The open slots pinned `untyped` once the restamp loop settled,
     /// under `App::pins_unresolved_params`; grows only, so it ends.
     pinned_param_slots: BTreeSet<(ParamKey, usize)>,
+    /// Set once [`Self::pin_open_params`] has moved a row: harvested returns then follow the bodies (`harvest_return::insert_return_after_pin`).
+    returns_follow_pins: bool,
     /// The slots with a default some call site leaves to it (`usize::MAX`:
     /// a call of a method whose shape is not known). A slot no call site leaves takes only what
     /// they pass, not its default too: Warden's `add(label, strategy =
@@ -1509,6 +1511,7 @@ impl Analyzer {
             inferred_params: HashMap::default(),
             open_param_slots: BTreeSet::new(),
             pinned_param_slots: BTreeSet::new(),
+            returns_follow_pins: false,
             defaulted_param_slots: Default::default(),
             seeding_unseen_params: false,
             deferring_pending_slots: false,
@@ -5870,6 +5873,7 @@ impl Analyzer {
                 this.method_return_ty(&lc.name, method).map(|ret| this.widen_empty_base_list(app, lc, method, ret))
             }).collect::<Vec<_>>()
         });
+        let follow_pins = self.returns_follow_pins;
         for (lc, rets) in app.library_classes.iter().zip(returns) {
             let class_id = &lc.name;
             for (method, ret) in lc.methods.iter().zip(rets) {
@@ -5887,7 +5891,10 @@ impl Analyzer {
                 // Untyped (gradual) rather than "no known method". Unlike an
                 // unregistered class, this doesn't mask a typo — the method
                 // has to be defined in the file to land here.
-                Self::register_method_return(target, &method.name, ret.as_ref());
+                match ret {
+                    Some(ret) if follow_pins => harvest_return::insert_return_after_pin(target, &method.name, ret),
+                    ret => Self::register_method_return(target, &method.name, ret.as_ref()),
+                }
             }
         }
         if harvest_tests {
@@ -9477,7 +9484,9 @@ impl Analyzer {
         }
         let rows = self.inferred_params.clone();
         self.apply_pinned_params();
-        self.inferred_params != rows
+        let moved = self.inferred_params != rows;
+        self.returns_follow_pins |= moved;
+        moved
     }
 }
 
@@ -9508,7 +9517,8 @@ fn guessed_receiver_sites<'a>(unknown: &[&'a SendSite], app: &'a App) -> Vec<(&'
     }
     let mut defining: HashMap<&Symbol, Vec<&ClassId>> = HashMap::default();
     for lc in &app.library_classes {
-        for m in lc.methods.iter().filter(|m| m.receiver == MethodReceiver::Instance) {
+        // Not a private method: a call with a receiver never reaches one (MissionControl's private `offset(executions_or_jobs)` took the Integer of `executions_or_jobs.offset(offset_value)`).
+        for m in lc.methods.iter().filter(|m| m.receiver == MethodReceiver::Instance && m.visibility != crate::dialect::MethodVisibility::Private) {
             defining.entry(&m.name).or_default().push(&lc.name);
         }
     }
@@ -13318,7 +13328,7 @@ impl Analyzer {
     /// is measured on a copy. Destructured without `..`, so a new field has
     /// to be listed here; `Copy` fields own no heap.
     pub fn census_drop(self) -> HashMap<ClassId, ClassInfo> {
-        let Analyzer { classes, module_self_types, upload_array_fields, materialized_associations, inferred_params, open_param_slots, pinned_param_slots, defaulted_param_slots, seeding_unseen_params: _, deferring_pending_slots: _, unseen_or_assign_classes, test_call_arities, declared_signatures, adapter, concern_folded, host_folded, inquirers, i18n, helper_modules, helper_index, open_classes, refined_action_bindings, const_resolver, source_indexed, typed_constants, data_factories, class_factories, constant_predicates, data_factories_without_custom_initialize, view_seeds, callers_by_target, controller_action_meta_cache, fixpoint_rounds, fixpoint_checks, settle, written_ivars, class_ivar_writes, site_cache, retyped_since_unify, settled_constants, surveys, retyped_since_survey, unify_memo } = self;
+        let Analyzer { classes, module_self_types, upload_array_fields, materialized_associations, inferred_params, open_param_slots, pinned_param_slots, returns_follow_pins: _, defaulted_param_slots, seeding_unseen_params: _, deferring_pending_slots: _, unseen_or_assign_classes, test_call_arities, declared_signatures, adapter, concern_folded, host_folded, inquirers, i18n, helper_modules, helper_index, open_classes, refined_action_bindings, const_resolver, source_indexed, typed_constants, data_factories, class_factories, constant_predicates, data_factories_without_custom_initialize, view_seeds, callers_by_target, controller_action_meta_cache, fixpoint_rounds, fixpoint_checks, settle, written_ivars, class_ivar_writes, site_cache, retyped_since_unify, settled_constants, surveys, retyped_since_survey, unify_memo } = self;
         let mut freed: Vec<(&str, i64)> = vec![
             ("classes (kept)", crate::memory_census::live_delta(|| classes.clone())),
             ("module_self_types", crate::memory_census::freed_by(|| drop(module_self_types))),

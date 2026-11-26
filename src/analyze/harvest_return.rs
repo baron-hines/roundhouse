@@ -168,6 +168,31 @@ pub(super) fn insert_inferred_return(
     }
 }
 
+/// [`insert_inferred_return`] once the Ruby family has pinned a parameter `untyped`
+/// (`Analyzer::pin_open_params`): the loop had settled, so a return that turns
+/// unknown now does so because of the pin, and keeping the concrete one typed
+/// MissionControl's `limit(executions)` as the `Job` relation its other caller
+/// passes. A bare `Var` is still a callee not typed yet.
+pub(super) fn insert_return_after_pin(
+    table: &mut crate::det::HashMap<Symbol, Ty>,
+    method: &Symbol,
+    ty: Ty,
+) {
+    let ty = super::fixpoint_bound::bound(ty);
+    let next = match table.get(method) {
+        None => Some(ty),
+        Some(Ty::Fn(_)) => None,
+        Some(existing) if *existing == ty || matches!(ty, Ty::Var { .. }) => None,
+        Some(existing) => match untie_recursive_return(existing, &ty) {
+            Some(untied) => (untied != *existing).then_some(untied),
+            None => Some(ty),
+        },
+    };
+    if let Some(next) = next {
+        table.insert(method.clone(), next);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,5 +396,25 @@ mod tests {
         let widened = union(vec![Ty::Str, arr(Ty::Str)]);
         insert_inferred_return(&mut table, &method, widened.clone());
         assert_eq!(table.get(&method), Some(&widened));
+    }
+
+    #[test]
+    fn after_a_pin_an_unknown_return_replaces_a_concrete_one() {
+        let mut table = HashMap::default();
+        let method = Symbol::from("limit");
+        insert_inferred_return(&mut table, &method, cfg());
+        insert_return_after_pin(&mut table, &method, Ty::Untyped);
+        assert_eq!(table.get(&method), Some(&Ty::Untyped));
+        insert_return_after_pin(&mut table, &method, Ty::Var { var: TyVar(0) });
+        assert_eq!(table.get(&method), Some(&Ty::Untyped), "a callee not typed yet is no answer");
+        let declared = Ty::Fn(Box::new(FnTy {
+            params: vec![].into(),
+            ret: std::sync::Arc::new(Ty::Str),
+            block: None,
+            effects: crate::effect::EffectSet::default(),
+        }));
+        table.insert(method.clone(), declared.clone());
+        insert_return_after_pin(&mut table, &method, Ty::Untyped);
+        assert_eq!(table.get(&method), Some(&declared));
     }
 }
