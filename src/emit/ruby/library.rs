@@ -6472,8 +6472,21 @@ fn typed_layout_expr(span: crate::span::Span, node: ExprNode, ty: crate::ty::Ty)
 ///     as Rails' `build_host_url` leaves it out.
 /// `ActionView::ViewHelpers.url_for_options(RouteHelpers.<stem>_path(args), default_url_options)`:
 /// a bare `<x>_url` in a class that defines its own `default_url_options`.
-fn url_for_own_options(stem: &str, args: Vec<Expr>) -> Expr {
+fn url_for_own_options(stem: &str, mut args: Vec<Expr>) -> Expr {
     let synth = |node: ExprNode| Expr::new(crate::span::Span::synthetic(), node);
+    // The call's own `protocol:` over the class's (Rails merges the call's options over `default_url_options`); the
+    // path helper renders no scheme.
+    let mut protocol: Option<Expr> = None;
+    if let Some(last) = args.last_mut()
+        && let ExprNode::Hash { entries, kwargs: true } = &mut *last.node
+    {
+        if let Some(i) = entries.iter().position(|(k, _)| matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "protocol")) {
+            protocol = Some(entries.remove(i).1);
+        }
+        if entries.is_empty() {
+            args.pop();
+        }
+    }
     let path_call = synth(ExprNode::Send {
         recv: Some(synth(ExprNode::Const { path: vec![Symbol::from("RouteHelpers")] })),
         method: Symbol::from(format!("{stem}_path")),
@@ -6481,7 +6494,17 @@ fn url_for_own_options(stem: &str, args: Vec<Expr>) -> Expr {
         block: None,
         parenthesized: true,
     });
-    let options = synth(ExprNode::Send { recv: None, method: Symbol::from("default_url_options"), args: vec![], block: None, parenthesized: false });
+    let mut options = synth(ExprNode::Send { recv: None, method: Symbol::from("default_url_options"), args: vec![], block: None, parenthesized: false });
+    if let Some(protocol) = protocol {
+        let key = synth(ExprNode::Lit { value: Literal::Sym { value: Symbol::from("protocol") } });
+        options = synth(ExprNode::Send {
+            recv: Some(options),
+            method: Symbol::from("merge"),
+            args: vec![synth(ExprNode::Hash { entries: vec![(key, protocol)], kwargs: false })],
+            block: None,
+            parenthesized: true,
+        });
+    }
     let mut call = synth(ExprNode::Send {
         recv: Some(synth(ExprNode::Const { path: vec![Symbol::from("ActionView"), Symbol::from("ViewHelpers")] })),
         method: Symbol::from("url_for_options"),

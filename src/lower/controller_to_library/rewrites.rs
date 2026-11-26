@@ -3038,7 +3038,7 @@ fn rewrite_route_helpers_with(
                 Some(i) => &args[..i],
                 None => args.as_slice(),
             };
-            let projected_args: Vec<Expr> = args
+            let mut projected_args: Vec<Expr> = args
                 .iter()
                 .enumerate()
                 .map(|(i, arg)| {
@@ -3081,6 +3081,22 @@ fn rewrite_route_helpers_with(
                     }
                 })
                 .collect();
+            // The path, with its query suffix when the call carried one;
+            // a controller's `_url` then takes the host half on top.
+            let absolute = absolute_urls && raw.ends_with("_url");
+            // Not a query key: a `_url`'s `protocol:` is the scheme, over the class's `default_url_options` one.
+            let mut call_protocol: Option<Expr> = None;
+            if absolute
+                && let Some(last) = projected_args.last_mut()
+                && let ExprNode::Hash { entries, kwargs: true } = &mut *last.node
+            {
+                if let Some(i) = entries.iter().position(|(k, _)| matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "protocol")) {
+                    call_protocol = Some(entries.remove(i).1);
+                }
+                if entries.is_empty() {
+                    projected_args.pop();
+                }
+            }
             let call = Expr::new(
                 e.span,
                 ExprNode::Send {
@@ -3093,19 +3109,18 @@ fn rewrite_route_helpers_with(
                     parenthesized: *parenthesized,
                 },
             );
-            // The path, with its query suffix when the call carried one;
-            // a controller's `_url` then takes the host half on top.
-            let absolute = absolute_urls && raw.ends_with("_url");
             let to_url = |path: Expr| {
                 if !absolute {
                     return path;
                 }
+                let mut url_args = vec![path];
+                url_args.extend(call_protocol.clone());
                 Expr::new(
                     e.span,
                     ExprNode::Send {
                         recv: None,
                         method: Symbol::from("url_from_path"),
-                        args: vec![path],
+                        args: url_args,
                         block: None,
                         parenthesized: true,
                     },
