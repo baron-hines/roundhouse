@@ -624,3 +624,87 @@ fn a_hook_def_stays_below_a_later_reader_of_its_block() {
         "null",
     );
 }
+
+const PREP_M: (&str, &str) = ("prep_m", "module PrepM\n  extend ActiveSupport::Concern\n\n  def label\n    \"m\"\n  end\nend\n");
+const PREP_N: (&str, &str) = ("prep_n", "module PrepN\n  extend ActiveSupport::Concern\n\n  def label\n    \"n\"\n  end\nend\n");
+const PLAIN_M: (&str, &str) = ("plain_m", "module PlainM\n  def label\n    \"plain m\"\n  end\nend\n");
+
+/// SingleController under PrepParentController (`parent`), with `child_lines`
+/// and `concerns`: Ruby's `label` through the Ruby emit, and the body of the
+/// `label` the Spinel emit splices into SingleController.
+fn parent_case(concerns: &[(&str, &str)], parent: &str, child_lines: &str, want: &str) -> String {
+    let app = || {
+        let mut app = emit_and_run::empty_app()
+            .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::API\nend\n")
+            .write("app/controllers/prep_parent_controller.rb", &format!("class PrepParentController < ApplicationController\n{parent}end\n"));
+        for (file, source) in concerns {
+            app = app.write(&format!("app/controllers/concerns/{file}.rb"), source);
+        }
+        app.write(
+            "app/controllers/single_controller.rb",
+            &format!("class SingleController < PrepParentController\n{child_lines}\n  def show\n    render json: {{ label: label }}\n  end\nend\n"),
+        )
+        .write("config/routes.rb", "Rails.application.routes.draw do\n  get \"/single\" => \"single#show\"\nend\n")
+    };
+    let run = app().run_ruby(&format!(
+        r##"status, _headers, body = begin
+  Main.run_rack("REQUEST_METHOD" => "GET", "PATH_INFO" => "/single", "QUERY_STRING" => "", "rack.input" => StringIO.new(""))
+rescue StandardError => e
+  [e.class.name, {{}}, [e.message[0, 100]]]
+end
+text = +""
+body.each {{ |part| text << part }}
+got = [status, text]
+want = [200, %({{"label":{want:?}}})]
+raise "got #{{got.inspect}}, want #{{want.inspect}}" unless got == want
+puts "parent case passed"
+"##
+    ));
+    run.assert_passes();
+    assert!(run.stdout.contains("parent case passed"), "{}", run.stdout);
+    let (emitted, errors) = app().emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let controller = std::fs::read_to_string(emitted.join("app/controllers/single_controller.rb")).unwrap();
+    let at = controller.find("  def label\n").unwrap_or_else(|| panic!("no spliced label:\n{controller}"));
+    let body = &controller[at + "  def label\n".len()..];
+    body[..body.find("\n  end\n").unwrap()].trim().to_string()
+}
+
+/// The superclass's `prepend PrepM` puts PrepM ahead of it, its `include
+/// PrepN` below: `[Single, PrepM, PrepParent, PrepN]`. The child's includes
+/// of both add nothing (#2278).
+#[test]
+fn a_superclass_prepend_stays_ahead_of_its_includes() {
+    let label = parent_case(&[PREP_M, PREP_N], "  prepend PrepM\n  include PrepN\n", "  include PrepN\n  include PrepM\n", "m");
+    assert_eq!(label, "\"m\"");
+}
+
+/// ActiveSupport::Concern's `prepend_features` does nothing when the class
+/// has the concern through its superclass: `[Single, PrepN, PrepParent,
+/// PrepM]`. A plain module is prepended again: `[PlainM, Single, PrepN,
+/// PrepParent, PlainM]` (#2278).
+#[test]
+fn a_concern_the_superclass_has_is_not_prepended_again() {
+    let label = parent_case(&[PREP_M, PREP_N], "  include PrepM\n", "  prepend PrepM\n  include PrepN\n", "n");
+    assert_eq!(label, "\"n\"");
+    let label = parent_case(&[PLAIN_M, PREP_N], "  include PlainM\n", "  prepend PlainM\n  include PrepN\n", "plain m");
+    assert_eq!(label, "\"plain m\"");
+    // HookM's hook ran on the superclass and defined `label` there, below
+    // the child's PrepN: `[Single, PrepN, PrepParent, HookM]`.
+    let hook_m = ("hook_m", "module HookM\n  extend ActiveSupport::Concern\n\n  included do\n    def label\n      \"hook\"\n    end\n  end\nend\n");
+    let label = parent_case(&[hook_m, PREP_N], "  include HookM\n", "  prepend HookM\n  include PrepN\n", "n");
+    assert_eq!(label, "\"n\"");
+}
+
+/// A prepend runs the concern's `prepended do`, not its `included do`, so
+/// HookDef defines no `label`, and DelegateOne delegates none:
+/// `[HookDef, Single, PlainDef]` (#2278).
+#[test]
+fn a_prepend_runs_no_included_hook() {
+    let lines = "  prepend HookDef\n  include PlainDef\n";
+    assert_eq!(spliced_label(&[HOOK_DEF, PLAIN_DEF], lines, BuildTarget::Spinel), "\"plain\"");
+    single_case(&[HOOK_DEF, PLAIN_DEF], lines, "label", "plain");
+    let delegate_one = ("delegate_one", "module DelegateOne\n  extend ActiveSupport::Concern\n\n  included do\n    delegate :label, to: :source_one\n  end\nend\n");
+    let lines = "  prepend DelegateOne\n  include PlainDef\n";
+    single_case(&[delegate_one, PLAIN_DEF], lines, "label", "plain");
+}
