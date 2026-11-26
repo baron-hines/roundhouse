@@ -153,6 +153,7 @@ fn take_attribute_decls(lc: &mut LibraryClass, refusals: &mut Vec<crate::diagnos
         if let Some(ty) = declared_ty {
             declared.extend(names.iter().map(|name| (name.clone(), ty.clone())));
         }
+        defaults.retain(|(name, _): &(Symbol, Expr)| !names.contains(name));
         if let Some(value) = default {
             defaults.extend(names.iter().map(|name| (name.clone(), value.clone())));
         }
@@ -166,17 +167,19 @@ fn take_attribute_decls(lc: &mut LibraryClass, refusals: &mut Vec<crate::diagnos
 /// A literal written in place is already fresh on each evaluation, which is Rails' `dup`.
 /// Anything else (a constant, a method call) has no `dup`-equivalent shape here.
 fn default_value(value: &Expr) -> Option<Expr> {
-    fn literal(e: &Expr) -> bool {
-        match &*e.node {
-            ExprNode::Lit { .. } => true,
-            ExprNode::Array { elements, .. } => elements.iter().all(literal),
-            ExprNode::Hash { entries, .. } => entries.iter().all(|(k, v)| literal(k) && literal(v)),
-            _ => false,
-        }
+    fn scalar(e: &Expr) -> bool {
+        matches!(&*e.node, ExprNode::Lit { .. })
     }
+    // Nested containers are refused: Rails' shallow `dup` shares them, a literal written in place would not.
+    let literal = |e: &Expr| match &*e.node {
+        ExprNode::Lit { .. } => true,
+        ExprNode::Array { elements, .. } => elements.iter().all(scalar),
+        ExprNode::Hash { entries, .. } => entries.iter().all(|(k, v)| scalar(k) && scalar(v)),
+        _ => false,
+    };
     let nullary = |e: &Expr| match &*e.node {
         ExprNode::Lambda { params, rest_param: None, extra_params, block_param: None, body, .. }
-            if params.is_empty() && extra_params.is_empty() => Some(body.clone()),
+            if params.is_empty() && extra_params.is_empty() => callable_body(body),
         _ => None,
     };
     if literal(value) {
@@ -190,6 +193,35 @@ fn default_value(value: &Expr) -> Option<Expr> {
             if args.is_empty() && matches!(method.as_str(), "proc" | "lambda") => nullary(block),
         _ => None,
     }
+}
+
+/// Inlined into `__reset_attributes`, `self`/ivars/receiverless calls would read the instance rather than the closure's class, and a non-final `return` would leave reset.
+fn callable_body(body: &Expr) -> Option<Expr> {
+    fn context_free(e: &Expr) -> bool {
+        let here = !matches!(
+            &*e.node,
+            ExprNode::SelfRef
+                | ExprNode::Ivar { .. }
+                | ExprNode::Return { .. }
+                | ExprNode::Yield { .. }
+                | ExprNode::Super { .. }
+                | ExprNode::Send { recv: None, .. }
+        );
+        let mut children = true;
+        e.node.for_each_child(&mut |c| children &= context_free(c));
+        here && children
+    }
+    let mut body = body.clone();
+    let last = match &mut *body.node {
+        ExprNode::Seq { exprs } => exprs.last_mut(),
+        _ => Some(&mut body),
+    };
+    if let Some(last) = last {
+        if let ExprNode::Return { value } = &*last.node {
+            *last = value.clone();
+        }
+    }
+    context_free(&body).then_some(body)
 }
 
 /// The synthesized `__reset_attributes` assigns nil; a declared default replaces that value.
