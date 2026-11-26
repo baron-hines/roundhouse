@@ -117,14 +117,37 @@ fn colliding_association_predicates_are_refused_instead_of_collapsed() {
     }
 }
 
+/// The reviewed model's creation blocks, without the colliding-key factories refused above.
+fn block_model() -> String {
+    let model = include_str!("find_or_create_bang_records/review_follow.rb");
+    let start = model.find("  def self.conflicting_keys").expect("conflicting_keys");
+    let end = model.find("  def self.with_block").expect("with_block");
+    format!("{}{}", &model[..start], &model[end..])
+}
+
+/// The reviewed probe's block section, after the records it reads.
+fn block_probe() -> String {
+    let probe = include_str!("find_or_create_bang_records/review_probe.rb");
+    let setup = &probe[..probe.find("\n\n[").expect("setup") + 1];
+    format!("{setup}{}", &probe[probe.find("record = Follow.with_block").expect("block section")..])
+}
+
 #[test]
-fn creation_blocks_cannot_run_after_initialization_callbacks() {
-    for target in [roundhouse::project::BuildTarget::Ruby, roundhouse::project::BuildTarget::Spinel] {
-        let (_, errors) = reviewed_app().emit(target);
-        // Variable and literal conditions alike: on a model with an initialization callback, the block would run after it.
-        assert_eq!(errors.iter().filter(|e| e.contains("creation block must run inside initialize")).count(), 3,
-            "blocks cannot overtake initialization callbacks: {errors:?}");
-    }
+fn creation_blocks_run_before_initialization_callbacks_as_in_rails() {
+    let oracle = std::process::Command::new("ruby")
+        .arg("tests/find_or_create_bang_records/review_oracle.rb")
+        .output()
+        .expect("run Rails review oracle");
+    assert!(oracle.status.success(), "{}", String::from_utf8_lossy(&oracle.stderr));
+    let expected: String = String::from_utf8_lossy(&oracle.stdout)
+        .lines()
+        .filter(|line| ["block ", "existing ", "repair ", "literal "].iter().any(|p| line.starts_with(p)))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    assert_eq!(expected.lines().count(), 4, "{expected}");
+    let run = app().write("app/models/follow.rb", &block_model()).run_ruby(&block_probe());
+    run.assert_passes();
+    assert_eq!(run.stdout, expected);
 }
 
 #[test]
