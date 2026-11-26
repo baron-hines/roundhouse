@@ -4597,7 +4597,10 @@ fn nullable_field_go_ty(e: &Expr) -> Option<String> {
 /// (`article.title` in a view).
 fn nullable_read_go_ty(e: &Expr) -> Option<String> {
     nullable_field_go_ty(e).or_else(|| match &*e.node {
-        ExprNode::Send { recv: Some(inner), method, args, block: None, .. } if args.is_empty() => {
+        // Not a reader the model defines over the column: that method answers its own type, not the column's pointer.
+        ExprNode::Send { recv: Some(inner), method, args, block: None, .. }
+            if args.is_empty() && !recv_model_defines(inner, method.as_str()) =>
+        {
             recv_column_go_ty(inner, method.as_str())
         }
         _ => None,
@@ -4736,7 +4739,8 @@ fn unbox_nullable_column(v: &Expr, v_s: &str, slot_go: &str) -> Option<String> {
 /// to, when the schema declares it nullable.
 fn recv_column_go_ty(recv: &Expr, column: &str) -> Option<String> {
     let Some(Ty::Class { id, .. }) = recv.ty.as_ref() else { return None };
-    let model = id.0.as_str().rsplit("::").next().unwrap_or(id.0.as_str());
+    // Not the last segment: the table is keyed by the model's full path (`Admin::Article`), as `recv_model_defines` reads it.
+    let model = id.0.as_str();
     ALL_NULLABLE_COLUMNS.with(|c| {
         c.borrow().iter().find(|(m, col, _)| m == model && col == column).map(|(_, _, ty)| ty.clone())
     })
