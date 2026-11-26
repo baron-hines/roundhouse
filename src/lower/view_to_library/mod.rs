@@ -254,6 +254,7 @@ pub struct ViewLowerCtx<'a> {
     html_safe_methods: std::rc::Rc<HtmlSafeMarks>,
     model_singulars: std::rc::Rc<crate::det::HashSet<String>>,
     slug_models: std::rc::Rc<crate::det::HashSet<String>>,
+    sti_route_stems: std::rc::Rc<crate::det::HashMap<String, Vec<String>>>,
     bool_readers: std::rc::Rc<crate::det::HashMap<String, crate::det::HashSet<String>>>,
     time_columns: std::rc::Rc<crate::det::HashMap<String, crate::det::HashSet<String>>>,
     store_readers:
@@ -346,6 +347,7 @@ impl<'a> ViewLowerCtx<'a> {
                     .map(|m| app.model_param_key(m.name.0.as_str()))
                     .collect(),
             ),
+            sti_route_stems: std::rc::Rc::new(crate::lower::tag_builder::sti_route_stems(app)),
             slug_models: std::rc::Rc::new(
                 app.models
                     .iter()
@@ -899,6 +901,7 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
         html_safe_methods: lx.html_safe_methods.clone(),
         model_singulars: lx.model_singulars.clone(),
         slug_models: lx.slug_models.clone(),
+        sti_route_stems: lx.sti_route_stems.clone(),
         bool_readers: lx.bool_readers.clone(),
         time_columns: lx.time_columns.clone(),
         store_readers: lx.store_readers.clone(),
@@ -973,7 +976,8 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
         })).flatten();
         ctx.form_records.push(FormBuilderBinding {
             form_param: binding.form_local.clone(),
-            model_name: binding.model_name.clone(),
+            model_name: binding.model_class.as_ref().and_then(|class| ctx.model_param_keys.get(class)).cloned()
+                .unwrap_or_else(|| binding.model_name.clone()),
             model_class: ctx.record_classes.get(&binding.record_local).cloned()
                 .or_else(|| ctx.i18n.model_class(&binding.model_name).map(str::to_owned)),
             record_var: record_var.clone(),
@@ -2415,6 +2419,10 @@ pub(crate) struct PartialFormBinding {
     pub(crate) form_local: String,
     pub(crate) record_local: String,
     pub(crate) model_name: String,
+    /// The defining form's typed model, whose param_key names the fields
+    /// over the record local's name (`bot: @bot` holding a User is
+    /// `user[name]` in Rails).
+    pub(crate) model_class: Option<String>,
     /// The defining `form_with`'s `namespace:` — a partial's fields
     /// belong to that form, so they carry its id prefix too.
     pub(crate) id_prefix: String,
@@ -2591,6 +2599,7 @@ fn partial_form_bindings_and_conflicts(
                                     form_local,
                                     record_local,
                                     model_name,
+                                    model_class: form.model_class.clone(),
                                     id_prefix: id_prefix.to_string(),
                                     builder: form.builder.clone(),
                                     // Not a stock builder's options: only an overriding builder is rebuilt from them, and they would split equal bindings.
@@ -2610,6 +2619,9 @@ fn partial_form_bindings_and_conflicts(
     /// What a form scope hands the partials it renders beside its builder.
     struct FormScope {
         model_name: Option<String>,
+        /// The typed model's class, unless an explicit `scope:` names the fields.
+        model_class: Option<String>,
+        scoped: bool,
         builder: Option<String>,
         options: Vec<(Symbol, Literal)>,
     }
@@ -2631,7 +2643,7 @@ fn partial_form_bindings_and_conflicts(
                     if let Some(form_param) = params.first().filter(|_| extra_params.is_empty()) {
                         let mut record_refs: HashSet<String> = HashSet::default();
                         let mut id_prefix = String::new();
-                        let mut scope = FormScope { model_name: None, builder: None, options: Vec::new() };
+                        let mut scope = FormScope { model_name: None, model_class: None, scoped: false, builder: None, options: Vec::new() };
                         for arg in args {
                             if let ExprNode::Hash { entries, .. } = &*arg.node {
                                 for (k, v) in entries {
@@ -2658,6 +2670,11 @@ fn partial_form_bindings_and_conflicts(
                                             {
                                                 scope.model_name = Some(crate::naming::snake_case(&id.0.as_str().replace("::", "")));
                                             }
+                                            if !scope.scoped
+                                                && let Some(crate::ty::Ty::Class { id, .. }) = named.ty.as_ref().map(|t| t.peel_nilable())
+                                            {
+                                                scope.model_class = Some(id.0.as_str().to_owned());
+                                            }
                                             if let Some(r) = simple_ref(named) {
                                                 record_refs.insert(r);
                                             }
@@ -2665,6 +2682,8 @@ fn partial_form_bindings_and_conflicts(
                                         "scope" => {
                                             if let Some(s) = self::form_with::str_or_sym_literal(v) {
                                                 scope.model_name = Some(s);
+                                                scope.model_class = None;
+                                                scope.scoped = true;
                                             }
                                         }
                                         "builder" => {
@@ -2750,7 +2769,7 @@ fn partial_form_bindings_and_conflicts(
                     &binding.form_local,
                     &refs,
                     &binding.id_prefix,
-                    &FormScope { model_name: Some(binding.model_name.clone()), builder: binding.builder.clone(), options: binding.builder_options.clone() },
+                    &FormScope { model_name: Some(binding.model_name.clone()), model_class: binding.model_class.clone(), scoped: false, builder: binding.builder.clone(), options: binding.builder_options.clone() },
                     &stems,
                     &mut next,
                 );
@@ -5486,6 +5505,8 @@ pub(super) struct ViewCtx {
     /// param is String-typed. Non-slug models pass `record.id`
     /// (Integer param) so strict targets keep a typed scalar.
     pub(super) slug_models: std::rc::Rc<crate::det::HashSet<String>>,
+    /// STI base → subclass route stems (`tag_builder::sti_route_stems`).
+    pub(super) sti_route_stems: std::rc::Rc<crate::det::HashMap<String, Vec<String>>>,
     /// Per-model bool-reader names (`bool_reader_names`): Boolean
     /// columns + bool typed_store attrs. `f.check_box` grounds its
     /// checked state through these (typed ternary instead of the

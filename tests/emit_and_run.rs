@@ -21,12 +21,16 @@ mod native_http;
 mod namespaced_form_partial;
 #[path = "emit_and_run/url_helper_protocol.rs"]
 mod url_helper_protocol;
+#[path = "emit_and_run/guessed_private_method.rs"]
+mod guessed_private_method;
 #[path = "emit_and_run/literal_send_untyped.rs"]
 mod literal_send_untyped;
 #[path = "emit_and_run/duration_defined_units.rs"]
 mod duration_defined_units;
 #[path = "emit_and_run/form_field_attribute_order.rs"]
 mod form_field_attribute_order;
+#[path = "emit_and_run/find_or_create_block_before_hook.rs"]
+mod find_or_create_block_before_hook;
 #[path = "emit_and_run/eager_load_conditions.rs"]
 mod eager_load_conditions;
 #[path = "emit_and_run/zeitwerk_eager_gem.rs"]
@@ -478,6 +482,12 @@ mod backticks;
 mod json_params_contract;
 #[path = "emit_and_run/json_params.rs"]
 mod json_params;
+#[path = "emit_and_run/raw_post_body.rs"]
+mod raw_post_body;
+#[path = "emit_and_run/scoped_new_form.rs"]
+mod scoped_new_form;
+#[path = "emit_and_run/sti_form_route.rs"]
+mod sti_form_route;
 #[path = "support/class_side_default.rs"]
 mod class_side_default_contract;
 #[path = "emit_and_run/class_side_default.rs"]

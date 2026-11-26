@@ -125,26 +125,7 @@ pub fn apply_tag_builder_lowering(
     // on (`sti_scope` has run by this point in the pipeline). A
     // polymorphic URL names its route through the record's CLASS, and
     // for an STI base the class is a runtime question.
-    let sti_stems: crate::det::HashMap<String, Vec<String>> = app
-        .models
-        .iter()
-        .filter(|m| !m.sti_subclass_names.is_empty())
-        .map(|m| {
-            let stems = m
-                .sti_subclass_names
-                .iter()
-                .map(|sub| {
-                    sub.0
-                        .as_str()
-                        .split("::")
-                        .map(crate::naming::snake_case)
-                        .collect::<Vec<_>>()
-                        .join("_")
-                })
-                .collect();
-            (crate::naming::snake_case(m.name.0.as_str()), stems)
-        })
-        .collect();
+    let sti_stems = sti_route_stems(app);
     // A receiver-less `tag` is the builder only where nothing else
     // answers it. A class with its own `tag` — `belongs_to :tag`, a
     // `tag` column, `attr_reader :tag`, a `def tag` — calls ITS reader
@@ -1583,4 +1564,19 @@ mod tests {
         };
         assert_eq!(method.as_str(), "edit_room_path");
     }
+}
+
+/// STI base → subclass route stems (`room` → `["rooms_open", …]`), the
+/// names `dom_prefix` answers for each subclass.
+pub(crate) fn sti_route_stems(app: &crate::App) -> crate::det::HashMap<String, Vec<String>> {
+    app.models
+        .iter()
+        .filter(|m| !m.sti_subclass_names.is_empty())
+        .map(|m| (crate::naming::snake_case(m.name.0.as_str()), m.sti_subclass_names.iter().map(|sub| class_route_stem(sub.0.as_str())).collect()))
+        .collect()
+}
+
+/// `Rooms::Open` → `rooms_open`, the stem of its route helpers.
+pub(crate) fn class_route_stem(class: &str) -> String {
+    class.split("::").map(crate::naming::snake_case).collect::<Vec<_>>().join("_")
 }

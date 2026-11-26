@@ -2520,6 +2520,7 @@ mod tests {
             html_safe_methods: Default::default(),
             model_singulars: Default::default(),
             slug_models: Default::default(),
+            sti_route_stems: Default::default(),
             bool_readers: Default::default(),
             time_columns: Default::default(),
             store_readers: Default::default(),
