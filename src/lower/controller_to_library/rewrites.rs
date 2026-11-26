@@ -3084,15 +3084,21 @@ fn rewrite_route_helpers_with(
             // The path, with its query suffix when the call carried one;
             // a controller's `_url` then takes the host half on top.
             let absolute = absolute_urls && raw.ends_with("_url");
-            // Not a query key: a `_url`'s `protocol:` is the scheme, over the class's `default_url_options` one.
+            // Not query keys: a `_url`'s `protocol:` and `port:` are the host half, over the class's `default_url_options`.
             let mut call_protocol: Option<Expr> = None;
+            let mut call_port: Option<Expr> = None;
             if absolute
                 && let Some(last) = projected_args.last_mut()
                 && let ExprNode::Hash { entries, kwargs: true } = &mut *last.node
             {
-                if let Some(i) = entries.iter().position(|(k, _)| matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "protocol")) {
-                    call_protocol = Some(entries.remove(i).1);
-                }
+                let mut take = |key: &str| {
+                    entries
+                        .iter()
+                        .position(|(k, _)| matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == key))
+                        .map(|i| entries.remove(i).1)
+                };
+                call_protocol = take("protocol");
+                call_port = take("port");
                 if entries.is_empty() {
                     projected_args.pop();
                 }
@@ -3113,8 +3119,12 @@ fn rewrite_route_helpers_with(
                 if !absolute {
                     return path;
                 }
+                let nil = || Expr::new(e.span, ExprNode::Lit { value: Literal::Nil });
                 let mut url_args = vec![path];
-                url_args.extend(call_protocol.clone());
+                if call_protocol.is_some() || call_port.is_some() {
+                    url_args.push(call_protocol.clone().unwrap_or_else(nil));
+                }
+                url_args.extend(call_port.clone());
                 Expr::new(
                     e.span,
                     ExprNode::Send {

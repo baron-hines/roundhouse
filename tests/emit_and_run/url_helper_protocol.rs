@@ -15,7 +15,7 @@ end
 /// options over the class's).
 const HOSTED: &str = r#"class HostedsController < ApplicationController
   def show
-    render plain: [article_url(1, protocol: "https"), article_url(1), article_url(1, protocol: "//")].join(" ")
+    render plain: [article_url(1, protocol: "https"), article_url(1), article_url(1, protocol: "//"), article_url(1, protocol: "https", port: 8443), article_url(1, port: 8080)].join(" ")
   end
 
   private
@@ -38,7 +38,7 @@ fn app() -> emit_and_run::Overlay {
     plain_app().write("app/controllers/hosteds_controller.rb", HOSTED)
 }
 
-const HOSTED_EXPECTED: &str = "https://class.example/articles/1 http://class.example/articles/1 //class.example/articles/1";
+const HOSTED_EXPECTED: &str = "https://class.example/articles/1 http://class.example/articles/1 //class.example/articles/1 https://class.example:8443/articles/1 http://class.example:8080/articles/1";
 
 const EXPECTED: &str = "https://example.org/articles/1 ftp://example.org/plain https://example.org/articles/1 //example.org/articles/1 http://example.org/articles/1";
 

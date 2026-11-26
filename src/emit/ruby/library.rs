@@ -6476,12 +6476,14 @@ fn url_for_own_options(stem: &str, mut args: Vec<Expr>) -> Expr {
     let synth = |node: ExprNode| Expr::new(crate::span::Span::synthetic(), node);
     // The call's own `protocol:` over the class's (Rails merges the call's options over `default_url_options`); the
     // path helper renders no scheme.
-    let mut protocol: Option<Expr> = None;
+    let mut taken: Vec<(Expr, Expr)> = Vec::new();
     if let Some(last) = args.last_mut()
         && let ExprNode::Hash { entries, kwargs: true } = &mut *last.node
     {
-        if let Some(i) = entries.iter().position(|(k, _)| matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "protocol")) {
-            protocol = Some(entries.remove(i).1);
+        for key in ["protocol", "port"] {
+            if let Some(i) = entries.iter().position(|(k, _)| matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == key)) {
+                taken.push(entries.remove(i));
+            }
         }
         if entries.is_empty() {
             args.pop();
@@ -6495,12 +6497,11 @@ fn url_for_own_options(stem: &str, mut args: Vec<Expr>) -> Expr {
         parenthesized: true,
     });
     let mut options = synth(ExprNode::Send { recv: None, method: Symbol::from("default_url_options"), args: vec![], block: None, parenthesized: false });
-    if let Some(protocol) = protocol {
-        let key = synth(ExprNode::Lit { value: Literal::Sym { value: Symbol::from("protocol") } });
+    if !taken.is_empty() {
         options = synth(ExprNode::Send {
             recv: Some(options),
             method: Symbol::from("merge"),
-            args: vec![synth(ExprNode::Hash { entries: vec![(key, protocol)], kwargs: false })],
+            args: vec![synth(ExprNode::Hash { entries: taken, kwargs: false })],
             block: None,
             parenthesized: true,
         });

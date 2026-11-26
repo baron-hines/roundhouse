@@ -703,7 +703,13 @@ fn strip_host_options(
     }
     // Not stripped in a class with its own `default_url_options`: a call naming no host takes the class's, and the
     // emitter's `url_for_own_options` reads the protocol off the call.
-    if own_url_options && !chained && host.is_none() && !only_path {
+    // Only a protocol and a port: `url_from_path` and `url_for_own_options` take those two, and any other host option
+    // left on the call reached the path helper as an argument.
+    let only_protocol = entries.iter().all(|(k, _)| {
+        !matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } }
+            if HOST_ONLY_OPTIONS.contains(&value.as_str()) && value.as_str() != "protocol" && value.as_str() != "port")
+    });
+    if own_url_options && !chained && host.is_none() && !only_path && only_protocol {
         return None;
     }
     entries.retain(|(k, _)| {
