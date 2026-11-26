@@ -484,6 +484,34 @@ fn file_load_ranks(app: &App) -> HashMap<String, Option<usize>> {
     ranks
 }
 
+/// A module-body call that reads nothing beyond a constant it names:
+/// `extend`/`include`/`prepend` of a constant, or an `included` /
+/// `class_methods` / `prepended` block (which runs at the include, not here).
+fn is_load_inert_module_call(call: &Expr) -> bool {
+    let ExprNode::Send { recv: None, method, args, block, .. } = &*call.node else { return false };
+    match method.as_str() {
+        "extend" | "include" | "prepend" => {
+            block.is_none() && !args.is_empty() && args.iter().all(|a| matches!(&*a.node, ExprNode::Const { .. }))
+        }
+        "included" | "class_methods" | "prepended" => args.is_empty() && block.is_some(),
+        _ => false,
+    }
+}
+
+/// A constant's value that runs nothing as the file loads: a literal, or an
+/// Array or Hash of them, optionally frozen.
+fn is_literal_value(value: &Expr) -> bool {
+    match &*value.node {
+        ExprNode::Lit { .. } => true,
+        ExprNode::Array { elements, .. } => elements.iter().all(is_literal_value),
+        ExprNode::Hash { entries, .. } => entries.iter().all(|(k, v)| is_literal_value(k) && is_literal_value(v)),
+        ExprNode::Send { recv: Some(recv), method, args, block: None, .. } => {
+            method.as_str() == "freeze" && args.is_empty() && is_literal_value(recv)
+        }
+        _ => false,
+    }
+}
+
 fn normalize_path(path: &str) -> String {
     let mut out: Vec<&str> = Vec::new();
     for segment in path.split('/') {
@@ -696,9 +724,12 @@ fn rebase_relative(child_name: &str, parent_name: &str, target: &str, app: &App)
         }
     }
     // Longest common prefix, then `..` for what the parent has left.
+    // The target's LAST segment is a file, never a shared directory (as
+    // in `relpath`): `Feeds::Strategy::Base`'s `../../feeds`, rebased into
+    // `feeds/strategy.rb`, matched every segment and came out as "".
     let common = parent_dir
         .iter()
-        .zip(resolved.iter())
+        .zip(&resolved[..resolved.len().saturating_sub(1)])
         .take_while(|(a, b)| a == b)
         .count();
     let ups = parent_dir.len() - common;
@@ -6826,9 +6857,10 @@ fn memoized_fixture_body(label: &Symbol, lookup: &Expr) -> Expr {
 
 pub(crate) fn apply_duration_lowering(lcs: &mut [LibraryClass], app: &App) {
     let temporal_predicates = !crate::lower::duration::app_defines_temporal_predicates(app);
+    let defined = crate::lower::duration::app_defined_units(app);
     for lc in lcs.iter_mut() {
         for m in &mut lc.methods {
-            crate::lower::duration::apply_duration_rewrites(&mut m.body, temporal_predicates, true);
+            crate::lower::duration::apply_duration_rewrites(&mut m.body, temporal_predicates, true, &defined);
         }
     }
 }
@@ -9684,6 +9716,65 @@ fn emit_library_class_decl_inner(
     // require them even when they're same-dir siblings (plain Ruby has no
     // Rails autoload). Resolve through the same model/library_class anchor.
     let mut nested_include_requires = BTreeSet::new();
+    // The include each of those requires is for: one whose module body
+    // reads a constant written above its `include` loads where the
+    // `include` stands instead (see `late_includes`).
+    let mut nested_require_of: Vec<(ClassId, String)> = Vec::new();
+    // When the nested file reopens this class with the header this file
+    // writes (the same superclass, from `outer_class_parent`), loading it
+    // first declares the same class, so its require stands with the
+    // file's other top-level requires. Spinel places a file a top-level
+    // `require_relative` loads; one a class body loads waits until every
+    // other require of it is placed, which a cycle of requires never is.
+    // Not under a namespace the runtime owns: the nested file then opens
+    // with one compound header (`module ActionText::Markdown::Uploads`),
+    // which looks this class up instead of declaring it.
+    let under_runtime_namespace = name.contains("::")
+        && require_path_for_body_const(&[name.split("::").next().unwrap_or(name).to_string()], app, classes, "")
+            .is_some_and(|p| p.starts_with("runtime/"));
+    let reopens_with_own_header = !lc.is_module
+        && lc.data_define().is_none()
+        && !under_runtime_namespace
+        && is_app_class(name, app, classes)
+        && outer_class_parent(name, app, classes) == lc.parent;
+    // …and when loading it first can't observe that the class isn't open
+    // yet: the nested module's body runs nothing that reads another
+    // constant (its constants are literals, and no class-body call the
+    // ingest didn't model), and its file requires no file but this
+    // class's superclass's, which this file has already required. A
+    // require of anything else (a constant its body reads, whose file reads
+    // this class) would run before `class` here, and after it on the
+    // class-body path.
+    let parent_anchor = lc.parent.as_ref().and_then(|p| require_path_for_parent(p, app, classes));
+    // Every opening of the name counts: the emitter writes them all into
+    // the one file, so any of them may read a constant or require a file.
+    let nested_file_loads_nothing_new = |inc: &ClassId, anchor: &str| -> bool {
+        let openings = library_classes_named(inc.0.as_str(), app, classes);
+        if openings.is_empty() || !openings.iter().all(|c| c.is_module) {
+            return false;
+        }
+        let Some(parent_anchor) = parent_anchor.as_deref() else { return false };
+        let path = PathBuf::from(format!("{anchor}.rb"));
+        let dir = anchor.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        openings.into_iter().all(|module| {
+            if !module.unknown_calls.iter().all(is_load_inert_module_call)
+                || !module.class_ivar_initializers.is_empty()
+                || !module.conditional_definitions.is_empty()
+                || !module.constants.iter().all(|(_, value)| is_literal_value(value))
+            {
+                return false;
+            }
+            let guarded = read_statement_cleanup(module);
+            let rendered = super::expr::with_emitted_file(&path, || {
+                emit_library_class_decl_inner(guarded.as_ref(), app, classes, factories, path.clone(), &[], &[])
+            });
+            rendered.content.lines().map(str::trim_start).filter(|l| l.starts_with("require")).all(|line| {
+                line.strip_prefix("require_relative ")
+                    .map(|target| normalize_path(&format!("{dir}/{}", target.trim().trim_matches('"'))) == parent_anchor)
+                    .unwrap_or(false)
+            })
+        })
+    };
     // A model's `prepend Concern` names a module this file must load
     // before the class body runs, exactly as an `include` does — and one
     // the concern splice claimed, so there IS a module to load: an
@@ -9697,7 +9788,14 @@ fn emit_library_class_decl_inner(
         .filter(|m| m.name == lc.name)
         .flat_map(|m| crate::analyze::claimed_prepend_statements(m, &app.concern_prepended_items))
         .collect();
-    for inc in lc.includes.iter().chain(prepends.iter().flatten()) {
+    // A lifted `X = Data.define(…) { include M }` this file writes runs its include where the constant stands, as the class's own does.
+    let factory_includes: Vec<crate::ident::ClassId> = lc
+        .constants
+        .iter()
+        .filter_map(|(cname, _)| lifted_data_factory(lc, cname.as_str(), classes, factories))
+        .flat_map(|factory| factory.includes.iter().cloned())
+        .collect();
+    for inc in lc.includes.iter().chain(prepends.iter().flatten()).chain(factory_includes.iter()) {
         // SPLIT on `::` — an include's ClassId is one Symbol holding the
         // whole path, and the const resolver keys on the ROOT segment.
         // Unsplit, `Turbo::Streams::StreamName::ClassMethods` was its
@@ -9707,11 +9805,14 @@ fn emit_library_class_decl_inner(
         if let Some(anchor) = require_path_for_body_const(&path, app, classes, name) {
             if anchor != self_anchor {
                 let nested_prefix = format!("{self_anchor}/");
-                if anchor.starts_with(&nested_prefix) {
+                if anchor.starts_with(&nested_prefix)
+                    && !(reopens_with_own_header && nested_file_loads_nothing_new(inc, &anchor))
+                {
                     // Nested constants such as `Account::Joinable` reopen
                     // their containing class. Load them after that class is
                     // declared, otherwise the nested file runs too early.
                     nested_include_requires.insert(relpath(&out_dir, &anchor));
+                    nested_require_of.push((inc.clone(), relpath(&out_dir, &anchor)));
                 } else {
                     requires.push(relpath(&out_dir, &anchor));
                 }
@@ -9777,6 +9878,9 @@ fn emit_library_class_decl_inner(
         Initializer(&'a Expr),
         Call(&'a Expr),
         Include(&'a ClassId),
+        // A positioned include's file, loaded where the source has the
+        // `include`; the include itself is written with the methods.
+        Load(&'a ClassId),
         Method(&'a MethodDef),
     }
     // A model's body is its own file's. What a Concern's `included` block
@@ -9962,6 +10066,112 @@ fn emit_library_class_decl_inner(
             body_requires.extend(resolve_all(default, false));
         }
     }
+    // A concern nested under this class (`Ledger::Stamping`) loads from
+    // the class body, ahead of its statements, and Rails loads it where
+    // the `include` names it. When the concern's module body reads, at
+    // load, a constant this body writes above that `include`
+    // (`KINDS = Ledger::TYPES.map(&:upcase)` below `TYPES = …`), it would
+    // run before the constant exists. Such an include, and every include
+    // the source writes after it, goes where the source has it, and its
+    // file loads there: the split below closes the class after the
+    // constant and requires the file, as for a constant initializer.
+    let readers = constant_readers(lc, app, classes, &resolve);
+    let include_span = |i: usize, inc: &ClassId| -> Option<Span> {
+        if let Some(span) = lc.include_spans.get(i).filter(|span| !span.is_synthetic()) {
+            return Some(*span);
+        }
+        let written = inc.0.as_str().trim_start_matches("::");
+        app.models.iter().filter(|m| m.name == lc.name && Some(m.span.file) == model_file).find_map(|m| {
+            m.body.iter().find_map(|item| {
+                let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { return None };
+                let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { return None };
+                let names = args.iter().any(|arg| match &*arg.node {
+                    ExprNode::Const { path } => {
+                        let path = path.iter().map(|seg| seg.as_str()).collect::<Vec<_>>().join("::");
+                        written == path || written.ends_with(&format!("::{path}"))
+                    }
+                    _ => false,
+                });
+                (method.as_str() == "include" && names && Some(expr.span.file) == model_file).then_some(expr.span)
+            })
+        })
+    };
+    let mut late_requires: BTreeSet<String> = BTreeSet::new();
+    let mut late_from: Option<u32> = None;
+    let mut late_file = None;
+    let mut late_includes: Vec<(&ClassId, String)> = Vec::new();
+    for (i, inc) in lc.includes.iter().enumerate() {
+        let Some(span) = include_span(i, inc) else { continue };
+        let Some((_, require)) = nested_require_of.iter().find(|(of, _)| of == inc) else { continue };
+        if requires.contains(require) || body_requires.contains(require) {
+            continue;
+        }
+        // An ordered body writes this include itself, where the source has
+        // it, and never moves it: its require stays at the class top.
+        if ordered_includes.iter().any(|(_, o)| *o == inc) {
+            continue;
+        }
+        let reads_earlier = body.iter().any(|(at, item)| match item {
+            BodyItem::Constant(c, value) => {
+                *at < span.start
+                    && value.span.file == span.file
+                    && readers.get(lc.constants[*c].0.as_str()).is_some_and(|r| r.contains(require))
+            }
+            _ => false,
+        });
+        // Offsets compare only within one file: a late include in another
+        // file than the first one keeps main's class-top shape.
+        if reads_earlier && late_file.is_none_or(|file| file == span.file) {
+            late_requires.insert(require.clone());
+            late_from = Some(late_from.map_or(span.start, |from| from.min(span.start)));
+            late_file = Some(span.file);
+        }
+    }
+    let mut moved_to_body: Vec<&ClassId> = Vec::new();
+    if let (Some(from), Some(file)) = (late_from, late_file) {
+        // Offsets order includes only within the late include's file. One
+        // with no span there (an `include` a hook writes in its concern's
+        // file, or one in another opening) has no place of its own in this
+        // body: once an include has moved, it follows the include before
+        // it, so the moved includes keep the order `lc.includes` gives
+        // them. Before that, it stays at the class top.
+        let mut last_at: Option<u32> = None;
+        for (i, inc) in lc.includes.iter().enumerate() {
+            let at = match include_span(i, inc) {
+                Some(span) if span.file == file => {
+                    if span.start < from {
+                        continue;
+                    }
+                    span.start
+                }
+                _ => match last_at {
+                    Some(at) => at,
+                    None => continue,
+                },
+            };
+            last_at = Some(at);
+            if ordered_includes.iter().any(|(_, o)| *o == inc) {
+                continue;
+            }
+            let require = nested_require_of.iter().find(|(of, _)| of == inc).map(|(_, r)| r.clone());
+            if let Some(require) = require.filter(|r| late_requires.contains(r)) {
+                late_includes.push((inc, require));
+            }
+            if positioned.iter().any(|(_, p)| *p == inc) {
+                // Its hook needs the methods above it: only its file loads here.
+                if late_includes.iter().any(|(late, _)| *late == inc) {
+                    body.push((at, BodyItem::Load(inc)));
+                }
+                continue;
+            }
+            moved_to_body.push(inc);
+            body.push((at, BodyItem::Include(inc)));
+        }
+        body.sort_by_key(|(start, _)| *start);
+    }
+    let late_require = |inc: &ClassId| -> BTreeSet<String> {
+        late_includes.iter().filter(|(late, _)| *late == inc).map(|(_, r)| r.clone()).collect()
+    };
     // …and each eager initializer's own, in order, because WHERE those go
     // matters. A class body runs top to bottom, and a required file can
     // read this one's earlier constants — campfire's `ContentFilters`
@@ -9986,9 +10196,9 @@ fn emit_library_class_decl_inner(
             BodyItem::Constant(_, expr) | BodyItem::Initializer(expr) | BodyItem::Call(expr) => {
                 resolve_all(expr, true)
             }
-            BodyItem::Method(_) | BodyItem::Include(_) => BTreeSet::new(),
+            BodyItem::Include(inc) | BodyItem::Load(inc) => late_require(inc),
+            BodyItem::Method(_) => BTreeSet::new(),
         }).collect();
-    let readers = constant_readers(lc, app, classes, &resolve);
     let mut splits = std::collections::BTreeMap::new();
     for p in 1..per_body.len() {
         let mut before: BTreeSet<String> = body_requires.clone();
@@ -10171,6 +10381,7 @@ fn emit_library_class_decl_inner(
         names: nested.iter().map(|block| block.name.clone()).collect(),
     });
 
+    nested_include_requires.retain(|r| !late_requires.contains(r));
     for require in &nested_include_requires {
         writeln!(s, "{body_pad}require_relative {require:?}").unwrap();
     }
@@ -10186,7 +10397,10 @@ fn emit_library_class_decl_inner(
     // it the class's ancestors. An ordered body interleaves its methods
     // with ivar writes and keeps the other includes first.
     for inc in &lc.includes {
-        if positioned.iter().any(|(_, p)| *p == inc) || ordered_includes.iter().any(|(_, p)| *p == inc) {
+        if positioned.iter().any(|(_, p)| *p == inc)
+            || ordered_includes.iter().any(|(_, p)| *p == inc)
+            || moved_to_body.contains(&inc)
+        {
             continue;
         }
         nested.borrow_mut().write_include(&mut s, depth, lc, inc);
@@ -10206,7 +10420,7 @@ fn emit_library_class_decl_inner(
         let names: Vec<String> = statement.iter().map(|inc| include_name(inc)).collect();
         writeln!(s, "{body_pad}prepend {}", names.join(", ")).unwrap();
     }
-    if lc.includes.len() > positioned.len() + ordered_includes.len() && !lc.methods.is_empty() {
+    if lc.includes.len() > positioned.len() + ordered_includes.len() + moved_to_body.len() && !lc.methods.is_empty() {
         writeln!(s).unwrap();
     }
 
@@ -10239,9 +10453,30 @@ fn emit_library_class_decl_inner(
                     crate::emit::diagnostics::push(crate::diagnostic::Diagnostic::unsupported(
                         call.span, None, "Data.define", "delegate in a Data.define block could not be lowered"));
                 }
+                // A nested module an include names is written ahead of the factory, as the owner's own includes ask.
+                for include in &factory.includes {
+                    nested.borrow_mut().write_include(s, depth, lc, include);
+                }
                 writeln!(s, "{body_pad}{} = {rendered} do", cname.as_str()).unwrap();
+                // Each `include A, B` as one call, among the methods where the block wrote it: Ruby includes a call's
+                // arguments last first, and an `included` hook may read a method defined above it.
+                let mut groups: Vec<(u32, Vec<&str>)> = Vec::new();
+                for (i, include) in factory.includes.iter().enumerate() {
+                    let start = factory.include_spans.get(i).map_or(0, |span| span.start);
+                    match groups.last_mut() {
+                        Some((at, names)) if *at == start && factory.include_spans.len() == factory.includes.len() => names.push(include.0.as_str()),
+                        _ => groups.push((start, vec![include.0.as_str()])),
+                    }
+                }
+                let mut pending = groups.into_iter().peekable();
                 for method in &factory.methods {
+                    while let Some((_, names)) = pending.next_if(|(at, _)| *at <= method.name_span.start) {
+                        writeln!(s, "{body_pad}  include {}", names.join(", ")).unwrap();
+                    }
                     render_library_method(s, method, &format!("{body_pad}  "));
+                }
+                for (_, names) in pending {
+                    writeln!(s, "{body_pad}  include {}", names.join(", ")).unwrap();
                 }
                 writeln!(s, "{body_pad}end").unwrap();
                 continue;
@@ -10417,6 +10652,7 @@ fn emit_library_class_decl_inner(
                     nested.borrow_mut().write_include(s, depth, lc, inc);
                     writeln!(s, "{body_pad}{}", include_line(inc)).unwrap();
                 }
+                BodyItem::Load(_) => {}
                 BodyItem::Method(method) => {
                     writeln!(s).unwrap();
                     render_method(s, method);
@@ -10816,7 +11052,7 @@ fn constant_readers(
         for call in other.unknown_calls.iter().chain(&other.class_ivar_initializers) {
             walk_const_paths(call, &mut paths);
         }
-        for path in &paths {
+        for path in paths.into_iter().map(unrooted_read) {
             let read = match path.split_last() {
                 Some((last, prefix)) if names.contains(last.as_str()) => {
                     prefix.iter().map(String::as_str).eq(own_segs.iter().copied())
@@ -10834,6 +11070,16 @@ fn constant_readers(
         }
     }
     out
+}
+
+/// A read's path as `constant_readers` keys it: the rooted `::Ledger::TYPES`
+/// (stored with a leading empty segment) reads the same constant as
+/// `Ledger::TYPES`. A rooted bare `::TYPES` stays rooted: it is no nested read.
+fn unrooted_read(mut path: Vec<String>) -> Vec<String> {
+    if path.len() > 2 && path[0].is_empty() {
+        path.remove(0);
+    }
+    path
 }
 
 /// Every constant path each library class's load-time code (constant
@@ -10890,7 +11136,7 @@ impl ConstantReaderIndex {
                 walk_const_paths(call, &mut paths);
             }
             for path in paths {
-                index.entry(path).or_default().push(j);
+                index.entry(unrooted_read(path)).or_default().push(j);
             }
         }
         let key = app as *const App as usize;
@@ -11795,7 +12041,9 @@ fn require_path_for_parent(parent: &ClassId, app: &App, classes: &[LibraryClass]
             return Some("runtime/gem_facades".to_string());
         }
     }
-    None
+    // Not only the parents listed above: a superclass is read as the class body loads (mission_control-jobs' `I18n::Config`).
+    let segments: Vec<String> = raw.trim_start_matches("::").split("::").map(str::to_string).collect();
+    require_path_for_body_const(&segments, app, classes, "").filter(|anchor| anchor.starts_with("runtime/"))
 }
 
 /// Roots hosted by `runtime/ruby/gem_facades.rb` — the one file that
@@ -11968,6 +12216,10 @@ fn require_path_for_body_const(
     }
     if joined == "ActiveSupport::Duration" {
         return Some("runtime/active_support_duration".to_string());
+    }
+    // Not lazily: mission_control-jobs reads `ActiveSupport::Logger.new(nil)` as its module loads.
+    if joined == "ActiveSupport::Logger" {
+        return Some("runtime/logger".to_string());
     }
     match first.as_str() {
         // `Views::*` refs always go through the per-app aggregator at
@@ -13970,6 +14222,59 @@ end
             );
         }
         src.push_str("  end\n  nil\nend\n");
+    }
+
+    // Not a has_many, whose JOIN repeats owners (Rails dedups), nor a table the query already joins (Rails reuses it).
+    let own = model.table.0.as_str();
+    let mut joins = String::new();
+    for (name, kind) in &targets {
+        let (table, on) = match kind {
+            PreloadKind::BelongsTo { fk, table, .. } => (table.clone(), format!("{{t}}.id = {own}.{fk}")),
+            PreloadKind::HasOne { fk, owner_key, target } => {
+                let Some(t) = app.models.iter().find(|m| m.name.0.as_str() == target) else { continue };
+                (t.table.0.as_str().to_string(), format!("{{t}}.{fk} = {own}.{owner_key}"))
+            }
+            _ => continue,
+        };
+        let aliased = format!("LEFT OUTER JOIN {table} {name} ON {}", on.replace("{t}", name));
+        let plain = format!("LEFT OUTER JOIN {table} ON {}", on.replace("{t}", &table));
+        let names = |q: &str| format!("conditions.include?(\"\\\"{q}\\\".\")");
+        let _ = write!(
+            joins,
+            "  when \"{name}\"\n    return nil if joined.include?(\"JOIN {table} \")\n    return {aliased:?} if {}\n    return {plain:?} if {}\n",
+            names(name),
+            names(&table)
+        );
+    }
+    if !joins.is_empty() {
+        let _ = write!(
+            src,
+            r#"
+def self._eager_load_joins(specs, conditions, joined)
+  out = []
+  specs.each do |spec|
+    if spec.is_a?(Hash)
+      spec.each_key do |name|
+        join = _eager_load_join(name.to_s, conditions, joined)
+        out << join unless join.nil?
+      end
+    elsif spec.is_a?(Array)
+      _eager_load_joins(spec, conditions, joined).each {{ |join| out << join }}
+    elsif !spec.nil?
+      join = _eager_load_join(spec.to_s, conditions, joined)
+      out << join unless join.nil?
+    end
+  end
+  out
+end
+
+def self._eager_load_join(name, conditions, joined)
+  case name
+{joins}  end
+  nil
+end
+"#
+        );
     }
 
     // Spec walker — the entry point `Relation#to_a` calls. Specs are

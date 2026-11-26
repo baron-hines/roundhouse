@@ -94,14 +94,12 @@ puts "doorkeeper passed"
 "##;
 
 /// What the gem still does that no tree answers, none of which this flow reaches: constants Ruby itself could not
-/// find there (`MissingConfigurationBuilderClass`, which nothing defines; `Errors::…` from a compact
-/// `module Doorkeeper::Orm::ActiveRecord::Mixins`), the applications
+/// find there (`Errors::…` from a compact `module Doorkeeper::Orm::ActiveRecord::Mixins`; the
+/// `MissingConfigurationBuilderClass` nothing defines is Ruby's NameError, as it raises), the applications
 /// page's sanitizing `simple_format`, and four calls the analysis cannot type.
-const KNOWN_GAPS: [&str; 8] = [
-    "constant not supported (all targets): Doorkeeper::MissingConfigurationBuilderClass",
+const KNOWN_GAPS: [&str; 6] = [
     "constant not supported (all targets): Errors::UnableToGenerateToken",
     "constant not supported (all targets): Errors::TokenGeneratorNotFound",
-    "simple_format not supported (all targets)",
     "no known method `missing_param`",
     "no known method `transform_secret` on nil",
     "no known method `constantize` on String?",

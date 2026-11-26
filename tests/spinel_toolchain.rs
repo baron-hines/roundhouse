@@ -92,6 +92,8 @@ mod view_component_gem;
 mod view_component;
 #[path = "support/class_attribute.rs"]
 mod class_attribute;
+#[path = "support/service_params_class.rs"]
+mod service_params_class;
 #[path = "support/class_configuration.rs"]
 mod class_configuration;
 #[path = "support/class_body_calls.rs"]
@@ -354,6 +356,10 @@ mod mutable_literals;
 mod auto_source_gem_contract;
 #[path = "spinel_toolchain/auto_source_gem.rs"]
 mod auto_source_gem;
+#[path = "support/gem_autoload_helper.rs"]
+mod gem_autoload_helper_contract;
+#[path = "spinel_toolchain/gem_autoload_helper.rs"]
+mod gem_autoload_helper;
 #[path = "support/gem_method_require.rs"]
 mod gem_method_require_contract;
 #[path = "spinel_toolchain/gem_method_require.rs"]
@@ -495,6 +501,15 @@ fn concern_class_attribute_macros_run_at_class_load_natively() {
     let run = class_attribute::overlay().run_spinel(class_attribute::ASSERTIONS);
     run.assert_passes();
     assert!(run.stdout.contains("class_attribute contract passed"));
+}
+
+/// The native half of `emit_and_run::a_class_a_macro_makes_from_its_block_runs`.
+#[test]
+#[ignore = "requires the Spinel toolchain, run in its CI lane"]
+fn a_class_a_macro_makes_from_its_block_runs_natively() {
+    let run = service_params_class::overlay().run_spinel(service_params_class::ASSERTIONS);
+    run.assert_passes();
+    assert!(run.stdout.contains("service params contract passed"));
 }
 
 /// The native half of `emit_and_run::concern_class_attribute_set_to_nil_is_not_unset`.

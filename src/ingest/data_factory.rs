@@ -28,7 +28,7 @@ pub(super) fn declaration<'pr>(node: &Node<'pr>) -> Option<CallNode<'pr>> {
             visibility::definition(statement).is_some()
                 || statement
                     .as_call_node()
-                    .is_some_and(|call| visibility::marker(&call))
+                    .is_some_and(|call| visibility::marker(&call) || constant_include(&call).is_some())
         })
         .then_some(call)
 }
@@ -147,6 +147,7 @@ pub(super) fn collect(
         let visibility = Visibility::resolve(Some(&body), file, None)?;
         let mut methods = Vec::new();
         let mut unknown_calls = Vec::new();
+        let (mut includes, mut include_spans) = (Vec::new(), Vec::new());
         for statement in flatten_statements(body) {
             if let Some(def) = visibility::definition(&statement) {
                 if def
@@ -179,6 +180,12 @@ pub(super) fn collect(
                 }
                 // The shared delegate pass validates options and expands these forwarders.
                 unknown_calls.push(ingest_expr(&statement, file)?);
+            } else if let Some(paths) = statement.as_call_node().and_then(|call| constant_include(&call)) {
+                // `Data.define(:value) { include Name }`: Ruby runs the block on the new class, so the module is its own include.
+                for path in paths {
+                    includes.push(ClassId(Symbol::from(path.join("::"))));
+                    include_spans.push(node_span(&statement, file));
+                }
             } else if let Some(target) = statement.as_call_node().and_then(|call| delegate_missing_target(&call)) {
                 // Rails' `delegate_missing_to :target` (active_support/core_ext/module/delegation.rb): the two
                 // methods it defines. The target read through `self`, not bare: a target named `block` or `args`
@@ -210,8 +217,8 @@ pub(super) fn collect(
             is_module: false,
             parent: Some(ClassId(Symbol::from("Data"))),
             parent_span: node_span(&call.receiver().unwrap(), file),
-            includes: Vec::new(),
-            include_spans: Vec::new(),
+            includes,
+            include_spans,
             methods,
             class_ivar_initializers: Vec::new(),
             nullable_columns: Vec::new(),
@@ -224,6 +231,16 @@ pub(super) fn collect(
         });
     }
     Ok(factories)
+}
+
+/// `include A, B` of constants, with no receiver or block: each path as written.
+fn constant_include(call: &ruby_prism::CallNode<'_>) -> Option<Vec<Vec<String>>> {
+    if call.receiver().is_some() || call.block().is_some() || constant_id_str(&call.name()) != "include" {
+        return None;
+    }
+    let args: Vec<_> = call.arguments()?.arguments().iter().collect();
+    (!args.is_empty()).then_some(())?;
+    args.iter().map(|arg| constant_path_of(arg)).collect()
 }
 
 /// `delegate_missing_to :account`: a literal Symbol target and nothing else (no `allow_nil:`).

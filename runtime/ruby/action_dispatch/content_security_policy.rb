@@ -55,14 +55,44 @@ module ActionDispatch
     end
 
     def build
+      build_in(nil, nil, [])
+    end
+
+    # A source a controller's `content_security_policy` block gave as a lambda: Rails runs it in the controller as it
+    # builds the header, so it is held as this marker and asked of the controller then. No source token holds `{`.
+    DYNAMIC_PREFIX = "{csp-source:"
+
+    def self.dynamic_source(index)
+      DYNAMIC_PREFIX + index.to_s + "}"
+    end
+
+    # The header, each dynamic source answered by `controller` (none without one), and `'nonce-…'` after the sources
+    # of each of `nonce_directives` when the request has a nonce, as Rails' `build_directives` writes them.
+    def build_in(controller, nonce, nonce_directives)
       n = @names.length
       return "" if n == 0
       i = 0
       out = +""
       while i < n
         out = out + "; " if i > 0
-        out = out + @names[i].to_s + " " + join_sources(@values[i])
+        name = @names[i].to_s
+        out = out + name + " " + join_sources(resolve_sources(@values[i], controller))
+        out = out + " 'nonce-" + nonce + "'" if !nonce.nil? && nonce_directives.include?(name)
         i += 1
+      end
+      out
+    end
+
+    def resolve_sources(list, controller)
+      return [] if list.nil?
+      out = []
+      list.each do |item|
+        source = item.to_s
+        if source.start_with?(DYNAMIC_PREFIX) && !controller.nil?
+          out << controller.content_security_policy_source(source[DYNAMIC_PREFIX.length, source.length - DYNAMIC_PREFIX.length - 1].to_i).to_s
+        else
+          out << source
+        end
       end
       out
     end
@@ -78,12 +108,14 @@ module ActionDispatch
       copy
     end
 
+    # Rails' middleware: not on a 304 (a cached page's nonces would not match), nor over a header already set.
     def self.write_header(controller)
       req = controller.request
       return nil if req.nil?
+      return nil if controller.status == 304 || !controller.headers["Content-Security-Policy"].nil?
       policy = req.content_security_policy
       return nil if policy.nil?
-      built = policy.build
+      built = policy.build_in(controller, req.content_security_policy_nonce, Rails.application.content_security_policy_nonce_directives)
       return nil if built.empty?
       controller.headers["Content-Security-Policy"] = built
       nil

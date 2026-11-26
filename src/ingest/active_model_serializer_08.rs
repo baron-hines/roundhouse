@@ -561,6 +561,26 @@ pub(super) fn lower(app: &mut crate::App, sources: &[SourceFile]) -> IngestResul
     if reopened && tree.iter().all(|n| done.contains(n)) {
         app.library_classes.retain(|c| c.name.0.as_str() != SERIALIZER);
     }
+    // `include ActiveModel::SerializerSupport` gives `active_model_serializer`, which the implicit pairs above
+    // answered, and `read_attribute_for_serialization`, `send` by another name, which the expansion reads as a
+    // reader. The gem's module is not emitted, so the include would be an `uninitialized constant` at class load;
+    // an app's own call of either is a method the class does not have, reported as one.
+    for lc in app.library_classes.iter_mut() {
+        let spanned = lc.include_spans.len() == lc.includes.len();
+        let mut at = 0;
+        let spans = std::mem::take(&mut lc.include_spans);
+        lc.includes.retain(|i| {
+            let keep = i.0.as_str().trim_start_matches("::") != "ActiveModel::SerializerSupport";
+            if spanned && keep {
+                lc.include_spans.push(spans[at]);
+            }
+            at += 1;
+            keep
+        });
+        if !spanned {
+            lc.include_spans = spans;
+        }
+    }
     Ok(())
 }
 
@@ -706,6 +726,9 @@ struct Walk<'a> {
     extra: Vec<String>,
     /// Constants the body assigns a literal list of Symbols, by name.
     lists: HashMap<String, Vec<String>>,
+    /// The list constants a method reads an options key from (`LIST.each { |k| options[k] }`): a later write would
+    /// change the keys the method reads when it runs, which is after the whole body.
+    keyed_lists: HashSet<String>,
     /// Each class macro a tree class defines (`def self.staff_attributes(*attrs)`): its classes and their sources.
     macros: &'a HashMap<String, Vec<(String, usize)>>,
     /// The constants the tree's class bodies assign, by full name.
@@ -744,7 +767,7 @@ fn collect(
     if class_text.contains("@ams_") {
         return Err(refuse(source, class.location().start_offset(), "an instance variable named `@ams_…` would be the expansion's"));
     }
-    let mut ctx = Walk { name, tree, modules, sources, stmts: Vec::new(), defs: Vec::new(), visible: true, at: 0, hooked: Vec::new(), hook_seen: false, extra: Vec::new(), lists: HashMap::default(), macros, consts, lineage, expanded: Vec::new(), concern: false, implicit: implicit.0.clone(), implicit_refusal: implicit.1.clone() };
+    let mut ctx = Walk { name, tree, modules, sources, stmts: Vec::new(), defs: Vec::new(), visible: true, at: 0, hooked: Vec::new(), hook_seen: false, extra: Vec::new(), lists: HashMap::default(), keyed_lists: HashSet::default(), macros, consts, lineage, expanded: Vec::new(), concern: false, implicit: implicit.0.clone(), implicit_refusal: implicit.1.clone() };
     if let Some(body) = class.body() {
         walk(&mut ctx, flatten_statements(body), source, Mode::Class)?;
     }
@@ -825,17 +848,21 @@ fn walk(ctx: &mut Walk<'_>, body: Vec<ruby_prism::Node<'_>>, source: &SourceFile
             } else {
                 Vec::new()
             };
-            let mut calls = GemCalls { found: None, supers: false, option_locals };
+            let mut calls = GemCalls::new(option_locals, &ctx.lists, ctx.name);
             ruby_prism::Visit::visit(&mut calls, &stmt);
             if let Some((call, at)) = calls.found {
                 return Err(refuse(source, at, &format!("`{call}` is the gem's, outside the subset")));
             }
+            ctx.keyed_lists.extend(calls.keyed);
             ctx.defs.push(Def { name: method, at, visible: ctx.visible, supers: calls.supers, from_module: matches!(mode, Mode::Module) });
             continue;
         }
         // Every write replaces the list: `FIELDS = [].freeze` after `FIELDS = [:title]` declares nothing.
         if let Some(w) = stmt.as_constant_write_node() {
             let name = constant_id_str(&w.name()).to_string();
+            if ctx.keyed_lists.contains(&name) {
+                return Err(fail(&format!("`{name}` is assigned again after a method reads options keys from it")));
+            }
             match symbol_list(&w.value()) {
                 Some(names) => ctx.lists.insert(name, names),
                 None => ctx.lists.remove(&name),
@@ -1560,7 +1587,7 @@ fn unroll_stmts(ctx: &mut Walk<'_>, names: &[String], param: &str, stmts: &[ruby
                     if method_name.starts_with("ams_") || method_name == "initialize" || GEM_ONLY.contains(&method_name.as_str()) {
                         return Err(fail(&format!("`define_method` of `{method_name}`, which the expansion writes")));
                     }
-                    let mut calls = GemCalls { found: None, supers: false, option_locals: Vec::new() };
+                    let mut calls = GemCalls::new(Vec::new(), &HashMap::default(), "");
                     ruby_prism::Visit::visit(&mut calls, &mblock.as_node());
                     if let Some((call, _)) = calls.found {
                         return Err(fail(&format!("`{call}` in a `define_method` block is the gem's, outside the subset")));
@@ -1582,7 +1609,7 @@ fn unroll_stmts(ctx: &mut Walk<'_>, names: &[String], param: &str, stmts: &[ruby
                         let Some(def) = d.as_def_node().filter(|d| d.receiver().is_none()) else {
                             return Err(fail("a `class_eval` string holding other than methods"));
                         };
-                        let mut calls = GemCalls { found: None, supers: false, option_locals: Vec::new() };
+                        let mut calls = GemCalls::new(Vec::new(), &HashMap::default(), "");
                         ruby_prism::Visit::visit(&mut calls, d);
                         if let Some((call, _)) = calls.found {
                             return Err(fail(&format!("`{call}` in a `class_eval` string is the gem's, outside the subset")));
@@ -1867,6 +1894,40 @@ struct GemCalls {
     found: Option<(String, usize)>,
     supers: bool,
     option_locals: Vec<String>,
+    /// The class's literal Symbol-list constants that hold none of the keys the gem adds, and the class's own name.
+    safe_lists: HashSet<String>,
+    owner: String,
+    /// The parameter of each `LIST.each` block the walk is inside, with its list: a key from one of those lists.
+    listed: Vec<(String, String)>,
+    /// The lists a key read here came from.
+    keyed: HashSet<String>,
+    /// The listed parameters the block assigns: no longer a key from the list.
+    rebound: HashSet<String>,
+}
+
+impl GemCalls {
+    fn new(option_locals: Vec<String>, lists: &HashMap<String, Vec<String>>, owner: &str) -> Self {
+        let safe_lists = lists.iter().filter(|(_, names)| !names.iter().any(|n| matches!(n.as_str(), "hash" | "unique_values"))).map(|(k, _)| k.clone()).collect();
+        GemCalls { found: None, supers: false, option_locals, safe_lists, owner: owner.rsplit("::").next().unwrap_or(owner).to_string(), listed: Vec::new(), keyed: HashSet::default(), rebound: HashSet::default() }
+    }
+
+    fn rebind(&mut self, name: String) {
+        if self.listed.iter().any(|(n, _)| *n == name) {
+            self.rebound.insert(name);
+        }
+    }
+
+    /// `LIST` or `Owner::LIST`, one of the class's safe lists: its name.
+    fn list_name(&self, node: &ruby_prism::Node<'_>) -> Option<String> {
+        if let Some(read) = node.as_constant_read_node() {
+            let name = constant_id_str(&read.name()).to_string();
+            return self.safe_lists.contains(&name).then_some(name);
+        }
+        let path = node.as_constant_path_node()?;
+        let name = constant_id_str(&path.name()?).to_string();
+        let own = path.parent().is_some_and(|p| p.as_constant_read_node().is_some_and(|r| constant_id_str(&r.name()) == self.owner));
+        (own && self.safe_lists.contains(&name)).then_some(name)
+    }
 }
 
 impl<'pr> ruby_prism::Visit<'pr> for GemCalls {
@@ -1881,26 +1942,69 @@ impl<'pr> ruby_prism::Visit<'pr> for GemCalls {
         // Every key of a multi-key reader; only the first of `fetch` and the like, whose second is a default.
         let keys: &[ruby_prism::Node<'_>] = match name {
             "values_at" | "slice" | "except" => &args,
-            "[]" | "fetch" | "key?" | "has_key?" | "include?" | "member?" | "dig" | "delete" => &args[..args.len().min(1)],
+            // `options[:include_status] = true` after `super`: the Hash is the caller's, as the gem's `@options = options` keeps it.
+            "[]" | "[]=" | "store" | "fetch" | "key?" | "has_key?" | "include?" | "member?" | "dig" | "delete" => &args[..args.len().min(1)],
             _ => &[],
         };
         let shared = keys.iter().filter_map(symbol_value).find(|k| matches!(k.as_str(), "hash" | "unique_values"));
         let on_options = node.receiver().is_some_and(|r| options_read(&r, &self.option_locals));
+        // `PostSerializer::INSTANCE_VARS.each { |name| opts[name] }`: a key from a literal list the gem's keys are not in.
+        let listed = |k: &ruby_prism::Node<'_>| {
+            k.as_local_variable_read_node().and_then(|l| {
+                let name = constant_id_str(&l.name());
+                (!self.rebound.contains(name)).then(|| self.listed.iter().rev().find(|(n, _)| n == name).map(|(_, list)| list.clone())).flatten()
+            })
+        };
+        let mut keyed = Vec::new();
         if self.found.is_none() && on_options {
             if let Some(key) = shared {
                 self.found = Some((format!("{name}(:{key})"), node.location().start_offset()));
-            } else if keys.is_empty() || !keys.iter().all(|k| symbol_value(k).is_some()) {
+            } else if keys.is_empty() || !keys.iter().all(|k| symbol_value(k).is_some() || listed(k).map(|list| keyed.push(list)).is_some()) {
                 // The whole Hash (`opts.size`, `opts.keys`) or a computed key: it may see the keys the gem adds.
                 self.found = Some((format!("options.{name}"), node.location().start_offset()));
             }
         }
+        self.keyed.extend(keyed);
+        let list = node.receiver().and_then(|r| self.list_name(&r));
+        let param = (name == "each" && node.arguments().is_none() && list.is_some())
+            .then(|| node.block().and_then(|b| b.as_block_node()))
+            .flatten()
+            .and_then(|b| b.parameters())
+            .and_then(|p| p.as_block_parameters_node())
+            .and_then(|p| p.parameters())
+            .and_then(|p| match p.requireds().iter().collect::<Vec<_>>().as_slice() {
+                [only] => only.as_required_parameter_node().map(|r| constant_id_str(&r.name()).to_string()),
+                _ => None,
+            });
+        let pushed = param.is_some();
+        self.listed.extend(param.map(|p| (p, list.clone().unwrap_or_default())));
         ruby_prism::visit_call_node(self, node);
+        if pushed {
+            self.listed.pop();
+        }
     }
     fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
+        self.rebind(constant_id_str(&node.name()).to_string());
         if options_read(&node.value(), &self.option_locals) {
             self.option_locals.push(constant_id_str(&node.name()).to_string());
         }
         ruby_prism::visit_local_variable_write_node(self, node);
+    }
+    fn visit_local_variable_operator_write_node(&mut self, node: &ruby_prism::LocalVariableOperatorWriteNode<'pr>) {
+        self.rebind(constant_id_str(&node.name()).to_string());
+        ruby_prism::visit_local_variable_operator_write_node(self, node);
+    }
+    fn visit_local_variable_or_write_node(&mut self, node: &ruby_prism::LocalVariableOrWriteNode<'pr>) {
+        self.rebind(constant_id_str(&node.name()).to_string());
+        ruby_prism::visit_local_variable_or_write_node(self, node);
+    }
+    fn visit_local_variable_and_write_node(&mut self, node: &ruby_prism::LocalVariableAndWriteNode<'pr>) {
+        self.rebind(constant_id_str(&node.name()).to_string());
+        ruby_prism::visit_local_variable_and_write_node(self, node);
+    }
+    fn visit_local_variable_target_node(&mut self, node: &ruby_prism::LocalVariableTargetNode<'pr>) {
+        self.rebind(constant_id_str(&node.name()).to_string());
+        ruby_prism::visit_local_variable_target_node(self, node);
     }
     fn visit_super_node(&mut self, node: &ruby_prism::SuperNode<'pr>) {
         self.supers = true;
@@ -2144,6 +2248,8 @@ const PER_CLASS_API: &[(&str, &str)] = &[
     ("root_name", "  def root_name\n    ams_root_name\n  end\n"),
     ("attributes", "  def attributes\n    ams_attributes\n  end\n"),
     ("serializable_hash", "  def serializable_hash\n    return nil if @object.nil?\n    ams_serializable_hash\n  end\n"),
+    // The gem's `to_json` is ActiveSupport's `Object#to_json`, `ActiveSupport::JSON.encode(self)`, which encodes what `as_json` answers.
+    ("to_json", "  def to_json(options = nil)\n    ActiveSupport::JSON.encode(as_json(options || {}))\n  end\n"),
     ("as_json", "  def as_json(options = {})\n    options ||= {}\n    root = options.fetch(:root, @options.fetch(:root, root_name))\n    if root\n      hash = {}\n      @ams_side = hash\n      @ams_unique = {}\n      body = serializable_hash\n      hash[root] = body\n      include_meta(hash)\n      hash\n    else\n      serializable_hash\n    end\n  end\n"),
 ];
 

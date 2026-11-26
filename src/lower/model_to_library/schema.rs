@@ -427,13 +427,14 @@ pub(super) fn push_schema_methods(
             model,
             runtime_relation == super::RuntimeRelation::Present,
         ));
-        // An enum label can share its column's name. Rails' enum predicate
-        // overrides the generic attribute query in that case; otherwise
-        // push_user_methods would discard the value comparison as a duplicate.
-        let predicate = Symbol::from(format!("{}?", col.name.as_str()));
-        if !model.enums.contains_key(&col.name)
-            || !super::associations::model_defines_instance_method(model, &predicate)
-        {
+        // The model's own `<col>?` (a `def`, or an enum label sharing the
+        // column's name) overrides the generic attribute query, as in
+        // Rails, where attribute methods live in a module the class
+        // includes; otherwise push_user_methods would keep the generated
+        // predicate and discard the model's as a duplicate. A `def` that
+        // calls `super` wants the generated one, which has no other name
+        // to reach it by yet, so the generated predicate stays there.
+        if !own_column_predicate(model, col) {
             methods.push(synth_column_predicate(owner, col));
         }
         // `<col>_previously_changed?` and `saved_change_to_<col>?`
@@ -965,13 +966,10 @@ pub(super) fn push_schema_methods(
 pub fn shakeable_synthesized_names(table: &Table, model: &Model) -> Vec<Symbol> {
     let mut names: Vec<Symbol> = Vec::new();
     for col in &table.columns {
-        // Mirror push_schema_methods: an enum's user-defined predicate
-        // was not synthesized and must never be a shake candidate.
-        let predicate = Symbol::from(format!("{}?", col.name.as_str()));
-        if !model.enums.contains_key(&col.name)
-            || !super::associations::model_defines_instance_method(model, &predicate)
-        {
-            names.push(predicate);
+        // Mirror push_schema_methods: a model's own predicate was not
+        // synthesized and must never be a shake candidate.
+        if !own_column_predicate(model, col) {
+            names.push(Symbol::from(format!("{}?", col.name.as_str())));
         }
         // Mirrors the two `synth_column_dirty_pred` spellings (both
         // skipped for `id`, which Base answers from its own flag).
@@ -1171,6 +1169,29 @@ fn synth_fill_timestamps(owner: &ClassId, table: &Table) -> Option<MethodDef> {
 /// affix `Pred`/`_pred`. Before that was uniform this synthesizer fired for
 /// boolean columns only (and no fixture has one, so it was never exercised
 /// cross-target).
+/// The model's own `<col>?` (a `def`, or an enum label sharing the
+/// column's name) replaces the generated attribute predicate, which is
+/// then neither synthesized nor a tree-shake candidate.
+pub fn own_column_predicate(model: &Model, col: &Column) -> bool {
+    let predicate = Symbol::from(format!("{}?", col.name.as_str()));
+    super::associations::model_defines_instance_method(model, &predicate)
+        && (model.enums.contains_key(&col.name) || !instance_method_calls_super(model, &predicate))
+}
+
+/// Some instance `def` of `name` in the model body calls `super`.
+fn instance_method_calls_super(model: &Model, name: &Symbol) -> bool {
+    use crate::dialect::ModelBodyItem;
+    fn calls_super(e: &Expr) -> bool {
+        let mut found = matches!(&*e.node, ExprNode::Super { .. });
+        e.node.for_each_child(&mut |c| found = found || calls_super(c));
+        found
+    }
+    model.body.iter().any(|item| {
+        matches!(item, ModelBodyItem::Method { method, .. }
+            if method.name == *name && method.receiver == MethodReceiver::Instance && calls_super(&method.body))
+    })
+}
+
 fn synth_column_predicate(owner: &ClassId, col: &Column) -> MethodDef {
     let col_ty = ty_of_column(&col.col_type);
     // The ivar's real type — nullable columns hold nil, and the
@@ -2991,7 +3012,10 @@ fn synth_column_dirty_pred(owner: &ClassId, col: &Column, name: Symbol) -> Metho
 /// the hook-call tails in `synth_initialize` and the hydration
 /// factories, so hook-free models (the whole blog fixture) emit
 /// nothing new on any target.
-pub(super) fn model_declares_after_initialize(model: &Model) -> bool {
+/// The synthesized `initialize`'s second parameter, true when the caller runs the initialization callbacks itself.
+pub(crate) const DEFER_INITIALIZE_CALLBACKS: &str = "defer_initialize_callbacks";
+
+pub(crate) fn model_declares_after_initialize(model: &Model) -> bool {
     use crate::dialect::ModelBodyItem;
     model.body.iter().any(|item| match item {
         ModelBodyItem::Method { method, .. } => {
@@ -3811,7 +3835,8 @@ fn synth_initialize(
     // with `HYDRATE_ATTRS` (see `hydrate_attrs_const`): that record is
     // an empty shell until its columns land, and the factory fires the
     // hook itself once they have.
-    if model_declares_after_initialize(model) {
+    let defers = model_declares_after_initialize(model);
+    if defers {
         let hook = Expr::new(
             Span::synthetic(),
             ExprNode::Send {
@@ -3823,10 +3848,22 @@ fn synth_initialize(
             },
         );
         let hydrating = bool_send(var_ref(Symbol::from("attrs")), "equal?", hydrate_attrs_const());
+        // Not run here for a creation block: Rails yields the record to it before its initialization callbacks, and the
+        // block cannot be passed to `new` on every target, so `lower::first_or_create` runs it and then the hook.
+        let deferred = var_ref(Symbol::from(DEFER_INITIALIZE_CALLBACKS));
+        let cond = Expr::new(
+            Span::synthetic(),
+            ExprNode::BoolOp {
+                op: crate::expr::BoolOpKind::Or,
+                surface: crate::expr::BoolOpSurface::Symbol,
+                left: hydrating,
+                right: with_ty(deferred, Ty::Bool),
+            },
+        );
         stmts.push(Expr::new(
             Span::synthetic(),
             ExprNode::If {
-                cond: with_ty(no_arg_send(hydrating, "!"), Ty::Bool),
+                cond: with_ty(no_arg_send(with_ty(cond, Ty::Bool), "!"), Ty::Bool),
                 then_branch: hook,
                 else_branch: Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
             },
@@ -3845,10 +3882,17 @@ fn synth_initialize(
         ExprNode::Hash { entries: Vec::new(), kwargs: false },
     );
     let attrs_ty = Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Untyped) };
+    let mut sig_params = vec![crate::ty::Param {
+        name: attrs.clone(), ty: attrs_ty.into(), kind: crate::ty::ParamKind::Optional,
+    }];
+    let mut params = vec![Param::with_default(attrs.clone(), attrs_default)];
+    if defers {
+        let name = Symbol::from(DEFER_INITIALIZE_CALLBACKS);
+        sig_params.push(crate::ty::Param { name: name.clone(), ty: Ty::Bool.into(), kind: crate::ty::ParamKind::Optional });
+        params.push(Param::with_default(name, Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Bool { value: false } })));
+    }
     let signature = Ty::Fn(Box::new(FnTy {
-        params: vec![crate::ty::Param {
-            name: attrs.clone(), ty: attrs_ty.into(), kind: crate::ty::ParamKind::Optional,
-        }].into(),
+        params: sig_params.into(),
         block: None,
         ret: std::sync::Arc::new(Ty::Nil),
         effects: EffectSet::default(),
@@ -3860,7 +3904,7 @@ fn synth_initialize(
         name_span: crate::span::Span::synthetic(),
         name: Symbol::from("initialize"),
         receiver: MethodReceiver::Instance,
-        params: vec![Param::with_default(attrs.clone(), attrs_default)],
+        params,
         body: seq(stmts),
         signature: Some(signature),
         effects: EffectSet::default(),

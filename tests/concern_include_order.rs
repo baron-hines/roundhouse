@@ -17,6 +17,8 @@
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
+use roundhouse::project::BuildTarget;
+
 const CONCERNS: &[(&str, &str)] = &[
     ("first_label", "module FirstLabel\n  extend ActiveSupport::Concern\n\n  def label\n    \"first\"\n  end\nend\n"),
     ("second_label", "module SecondLabel\n  extend ActiveSupport::Concern\n\n  def label\n    \"second\"\n  end\nend\n"),
@@ -257,4 +259,368 @@ want = {}
     let run = app().run_ruby(&script);
     run.assert_passes();
     assert!(run.stdout.contains("include order passed"), "{}", run.stdout);
+}
+
+/// The app of one controller that includes `include_lines` and renders
+/// `method`, with the concerns in `files`. Its private `source_one` and
+/// `source_two` answer what a delegated `label` reads.
+fn single_app(files: &[(&str, &str)], include_lines: &str, method: &str) -> emit_and_run::Overlay {
+    let mut app = emit_and_run::empty_app()
+        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::API\nend\n")
+        .write("app/models/label_source.rb", "class LabelSource\n  def initialize(label)\n    @label = label\n  end\n\n  attr_reader :label\nend\n");
+    for (file, source) in files {
+        app = app.write(&format!("app/controllers/concerns/{file}.rb"), source);
+    }
+    app.write(
+        "app/controllers/single_controller.rb",
+        &format!(
+            "class SingleController < ApplicationController\n{include_lines}\n  def show\n    render json: {{ label: {method} }}\n  end\n\n  private\n\n  def source_one\n    LabelSource.new(\"source one\")\n  end\n\n  def source_two\n    LabelSource.new(\"source two\")\n  end\nend\n"
+        ),
+    )
+    .write("config/routes.rb", "Rails.application.routes.draw do\n  get \"/single\" => \"single#show\"\nend\n")
+}
+
+/// The controller as `target` emits it, from the app `single_app` makes.
+fn emitted_controller(files: &[(&str, &str)], include_lines: &str, target: BuildTarget) -> String {
+    let (emitted, errors) = single_app(files, include_lines, "label").emit(target);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let path = emitted.join("app/controllers/single_controller.rb");
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+/// The modules each `include` of the ingested controller names, as the
+/// splice and the analyzer read them: after a hook's includes are carried
+/// onto the controller's own `include`.
+fn ingested_include_lines(files: &[(&str, &str)], include_lines: &str) -> Vec<Vec<String>> {
+    use roundhouse::dialect::ControllerBodyItem;
+    use roundhouse::expr::ExprNode;
+    let mut tree: std::collections::HashMap<std::path::PathBuf, Vec<u8>> = std::collections::HashMap::new();
+    tree.insert("app/controllers/application_controller.rb".into(), b"class ApplicationController < ActionController::API\nend\n".to_vec());
+    for (file, source) in files {
+        tree.insert(format!("app/controllers/concerns/{file}.rb").into(), source.as_bytes().to_vec());
+    }
+    tree.insert(
+        "app/controllers/single_controller.rb".into(),
+        format!("class SingleController < ApplicationController\n{include_lines}\n  def show\n    head :ok\n  end\nend\n").into_bytes(),
+    );
+    let app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest");
+    let controller = app.controllers.iter().find(|c| c.name.0.as_str() == "SingleController").expect("SingleController");
+    controller
+        .body
+        .iter()
+        .filter_map(|item| match item {
+            ControllerBodyItem::Unknown { expr, .. } => match &*expr.node {
+                ExprNode::Send { recv: None, method, args, .. } if method.as_str() == "include" => Some(
+                    args.iter()
+                        .map(|arg| match &*arg.node {
+                            ExprNode::Const { path } => path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::"),
+                            other => format!("{other:?}"),
+                        })
+                        .collect(),
+                ),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// The body of `def label` in the controller `target` emits, its lines
+/// trimmed.
+fn spliced_label(files: &[(&str, &str)], include_lines: &str, target: BuildTarget) -> String {
+    let controller = emitted_controller(files, include_lines, target);
+    let at = controller.find("  def label\n").unwrap_or_else(|| panic!("no spliced label:\n{controller}"));
+    let body = &controller[at + "  def label\n".len()..];
+    let end = body.find("\n  end\n").unwrap_or_else(|| panic!("label unterminated:\n{controller}"));
+    body[..end].trim().to_string()
+}
+
+/// One controller reading `method` through the modules in `files`, against
+/// Ruby's answer for the same modules.
+fn single_case(files: &[(&str, &str)], include_lines: &str, method: &str, want: &str) {
+    let app = single_app(files, include_lines, method);
+    let script = format!(
+        r##"status, _headers, body = begin
+  Main.run_rack("REQUEST_METHOD" => "GET", "PATH_INFO" => "/single", "QUERY_STRING" => "", "rack.input" => StringIO.new(""))
+rescue StandardError => e
+  [e.class.name, {{}}, [e.message[0, 100]]]
+end
+text = +""
+body.each {{ |part| text << part }}
+got = [status, text]
+want = [200, %({{"label":{want:?}}})]
+raise "got #{{got.inspect}}, want #{{want.inspect}}" unless got == want
+puts "single case passed"
+"##
+    );
+    let run = app.run_ruby(&script);
+    run.assert_passes();
+    assert!(run.stdout.contains("single case passed"), "{}", run.stdout);
+}
+
+/// A plain module whose body only includes others is still an ancestor:
+/// `[Single, PlainOnlyAb, PlainOnlyB, PlainOnlyA]` (#2278).
+#[test]
+fn a_plain_module_of_includes_only_passes_its_ancestors_on() {
+    single_case(
+        &[
+            ("plain_only_a", "module PlainOnlyA\n  def plain_a_only\n    \"plain a\"\n  end\nend\n"),
+            ("plain_only_b", "module PlainOnlyB\n  def label\n    \"plain b\"\n  end\nend\n"),
+            ("plain_only_ab", "module PlainOnlyAb\n  include PlainOnlyA\n  include PlainOnlyB\nend\n"),
+        ],
+        "  include PlainOnlyAb\n",
+        "plain_a_only",
+        "plain a",
+    );
+}
+
+/// `self.include` in a concern of includes only is the same include:
+/// `[Single, SelfWrapper, HookDef]`, and HookDef's hook defines `label` (#2278).
+#[test]
+fn a_concern_of_self_includes_only_passes_its_hook_on() {
+    single_case(
+        &[
+            ("hook_def", "module HookDef\n  extend ActiveSupport::Concern\n\n  included do\n    def label\n      \"hook\"\n    end\n  end\nend\n"),
+            ("self_wrapper", "module SelfWrapper\n  self.extend ActiveSupport::Concern\n  self.include HookDef\nend\n"),
+        ],
+        "  include SelfWrapper\n",
+        "label",
+        "hook",
+    );
+}
+
+/// `self.included do` is the same hook: its `label` is defined on the
+/// controller, ahead of the later PlainDef's (#2278).
+#[test]
+fn a_self_included_hook_defines_on_the_includer() {
+    single_case(
+        &[
+            ("hook_self", "module HookSelf\n  extend ActiveSupport::Concern\n\n  self.included do\n    def label\n      \"hook\"\n    end\n  end\nend\n"),
+            ("plain_def", "module PlainDef\n  extend ActiveSupport::Concern\n\n  def label\n    \"plain\"\n  end\nend\n"),
+        ],
+        "  include HookSelf\n  include PlainDef\n",
+        "label",
+        "hook",
+    );
+}
+
+const HOOK_DEF: (&str, &str) = ("hook_def", "module HookDef\n  extend ActiveSupport::Concern\n\n  included do\n    def label\n      \"hook\"\n    end\n  end\nend\n");
+const PLAIN_DEF: (&str, &str) = ("plain_def", "module PlainDef\n  extend ActiveSupport::Concern\n\n  def label\n    \"plain\"\n  end\nend\n");
+
+/// `include B, C, HookWrapper` includes HookWrapper first, and its hook
+/// includes B right above it. The explicit B then finds B there and moves
+/// nothing, and C goes above them: `[Single, C, B, HookWrapper]` (#2278).
+#[test]
+fn a_hook_include_goes_in_before_the_explicit_arguments_left_of_it() {
+    let files = [
+        ("b", "module B\n  def label\n    \"b\"\n  end\nend\n"),
+        ("c", "module C\n  def label\n    \"c\"\n  end\nend\n"),
+        ("hook_wrapper", "module HookWrapper\n  extend ActiveSupport::Concern\n\n  included do\n    include B\n  end\nend\n"),
+    ];
+    let lines = "  include B, C, HookWrapper\n";
+    // The explicit B stays beside the one the hook carries: dropping either
+    // would put B back ahead of C.
+    assert_eq!(ingested_include_lines(&files, lines), [["B", "C", "B", "HookWrapper"]]);
+    assert_eq!(spliced_label(&files, lines, BuildTarget::Spinel), "\"c\"");
+    single_case(&files, lines, "label", "c");
+}
+
+/// The hook's `label` is defined on the controller when it is included. A
+/// later opening's `label` is the module's own, below the controller, so the
+/// hook's answers (#2278).
+#[test]
+fn a_hook_def_stands_over_a_later_ordinary_def_of_its_name() {
+    let files = [(
+        "hook_reopen",
+        "module HookReopen\n  extend ActiveSupport::Concern\n\n  included do\n    def label\n      \"hook\"\n    end\n  end\nend\n\nmodule HookReopen\n  def label\n    \"ordinary\"\n  end\nend\n",
+    )];
+    let lines = "  include HookReopen\n";
+    assert_eq!(spliced_label(&files, lines, BuildTarget::Spinel), "\"hook\"");
+    single_case(&files, lines, "label", "hook");
+}
+
+/// Each plain wrapper runs its concern's hook on itself, so each holds its
+/// own forwarder. W3 is the nearest ancestor, and its forwarder reads
+/// `source_two` (#2278).
+#[test]
+fn a_hook_forwarder_stands_on_each_plain_wrapper_it_ran_on() {
+    let files = [
+        ("delegate_one", "module DelegateOne\n  extend ActiveSupport::Concern\n\n  included { delegate :label, to: :source_one }\nend\n"),
+        ("delegate_two", "module DelegateTwo\n  extend ActiveSupport::Concern\n\n  included { delegate :label, to: :source_two }\nend\n"),
+        ("w1", "module W1\n  include DelegateOne\nend\n"),
+        ("w2", "module W2\n  include DelegateTwo\nend\n"),
+        ("w3", "module W3\n  include DelegateTwo\nend\n"),
+    ];
+    let lines = "  include W2\n  include W1\n  include W3\n";
+    assert_eq!(spliced_label(&files, lines, BuildTarget::Spinel), "self.source_two.label");
+    single_case(&files, lines, "label", "source two");
+}
+
+/// A plain wrapper takes a concern's deferred dependencies itself: HookDef's
+/// hook runs on Wrapper, so its `label` is Wrapper's, ahead of PlainDef's
+/// below (#2278).
+#[test]
+fn a_deferred_hook_runs_on_the_plain_wrapper() {
+    let files = [
+        HOOK_DEF,
+        PLAIN_DEF,
+        ("hook_bundle", "module HookBundle\n  extend ActiveSupport::Concern\n\n  include HookDef\nend\n"),
+        ("wrapper", "module Wrapper\n  include HookBundle\n  include PlainDef\nend\n"),
+    ];
+    let lines = "  include Wrapper\n";
+    assert_eq!(spliced_label(&files, lines, BuildTarget::Spinel), "\"hook\"");
+    single_case(&files, lines, "label", "hook");
+}
+
+/// HookReopen's hook defines `label` on the includer, and a later opening's
+/// ordinary `label` is the module's own, below it.
+const HOOK_REOPEN: (&str, &str) = (
+    "hook_reopen",
+    "module HookReopen\n  extend ActiveSupport::Concern\n\n  included do\n    def label\n      \"hook\"\n    end\n  end\nend\n\nmodule HookReopen\n  def label\n    \"ordinary\"\n  end\nend\n",
+);
+
+/// `single_app`'s controller, under `HookLibParent`: a class in lib/ that
+/// includes HookReopen.
+fn lib_parent_app(child_lines: &str) -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::API\nend\n")
+        .write(&format!("app/controllers/concerns/{}.rb", HOOK_REOPEN.0), HOOK_REOPEN.1)
+        .write("lib/hook_lib_parent.rb", "class HookLibParent < ApplicationController\n  include HookReopen\nend\n")
+        .write(
+            "app/controllers/single_controller.rb",
+            &format!("class SingleController < HookLibParent\n{child_lines}\n  def show\n    render json: {{ label: label }}\n  end\nend\n"),
+        )
+        .write("config/routes.rb", "Rails.application.routes.draw do\n  get \"/single\" => \"single#show\"\nend\n")
+}
+
+/// The hook ran on the lib/ superclass, so `label` is HookLibParent's own:
+/// `[SingleController, HookLibParent, HookReopen]`. The child's repeated
+/// include runs no hook and adds nothing (#2278).
+#[test]
+fn a_hook_def_that_ran_on_a_lib_superclass_stands_over_the_modules_own() {
+    for child_lines in ["  include HookReopen\n", ""] {
+        let (emitted, errors) = lib_parent_app(child_lines).emit(BuildTarget::Spinel);
+        assert!(errors.is_empty(), "{errors:#?}");
+        // The lib/ class holds the hook's `label` once, as its own.
+        let parent = std::fs::read_to_string(emitted.join("app/models/hook_lib_parent.rb")).unwrap();
+        let lines: Vec<&str> = parent.lines().filter(|l| !l.starts_with("#<SPINEL_SOURCE>")).map(str::trim).collect();
+        let defs: Vec<usize> = (0..lines.len()).filter(|&i| lines[i] == "def label").collect();
+        assert!(matches!(defs.as_slice(), [at] if lines[at + 1] == "\"hook\""), "{parent}");
+        let controller = std::fs::read_to_string(emitted.join("app/controllers/single_controller.rb")).unwrap();
+        if let Some(at) = controller.find("  def label\n") {
+            assert_eq!(controller[at..].lines().nth(1).map(str::trim), Some("\"hook\""), "{child_lines:?}:\n{controller}");
+        }
+        let run = lib_parent_app(child_lines).run_ruby(
+            r##"status, _headers, body = begin
+  Main.run_rack("REQUEST_METHOD" => "GET", "PATH_INFO" => "/single", "QUERY_STRING" => "", "rack.input" => StringIO.new(""))
+rescue StandardError => e
+  [e.class.name, {}, [e.message[0, 100]]]
+end
+text = +""
+body.each { |part| text << part }
+got = [status, text]
+want = [200, %({"label":"hook"})]
+raise "got #{got.inspect}, want #{want.inspect}" unless got == want
+puts "lib parent case passed"
+"##,
+        );
+        run.assert_passes();
+        assert!(run.stdout.contains("lib parent case passed"), "{child_lines:?}: {}", run.stdout);
+    }
+}
+
+/// SingleController under `parent`, a class from `libs`, with `concerns`;
+/// against Ruby's answer for `label`, as JSON. The Spinel emit has no errors.
+fn lib_case(concerns: &[(&str, &str)], libs: &[(&str, &str)], parent: &str, want: &str) {
+    let app = || {
+        let mut app = emit_and_run::empty_app()
+            .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::API\nend\n");
+        for (file, source) in concerns {
+            app = app.write(&format!("app/controllers/concerns/{file}.rb"), source);
+        }
+        for (file, source) in libs {
+            app = app.write(&format!("lib/{file}.rb"), source);
+        }
+        app.write(
+            "app/controllers/single_controller.rb",
+            &format!("class SingleController < {parent}\n  def show\n    render json: {{ label: label }}\n  end\nend\n"),
+        )
+        .write("config/routes.rb", "Rails.application.routes.draw do\n  get \"/single\" => \"single#show\"\nend\n")
+    };
+    let (_, errors) = app().emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let run = app().run_ruby(&format!(
+        r##"status, _headers, body = begin
+  Main.run_rack("REQUEST_METHOD" => "GET", "PATH_INFO" => "/single", "QUERY_STRING" => "", "rack.input" => StringIO.new(""))
+rescue StandardError => e
+  [e.class.name, {{}}, [e.message[0, 100]]]
+end
+text = +""
+body.each {{ |part| text << part }}
+got = [status, text]
+want = [200, %({{"label":{want}}})]
+raise "got #{{got.inspect}}, want #{{want.inspect}}" unless got == want
+puts "lib case passed"
+"##
+    ));
+    run.assert_passes();
+    assert!(run.stdout.contains("lib case passed"), "{}", run.stdout);
+}
+
+/// BaseParent's hook ran and its own `label` replaced the hook's. The
+/// subclass's repeated include adds nothing and runs no hook, so BaseParent's
+/// `label` answers (#2278).
+#[test]
+fn a_lib_class_takes_no_hook_def_for_a_module_its_superclass_has() {
+    lib_case(
+        &[HOOK_REOPEN],
+        &[
+            ("base_parent", "class BaseParent < ApplicationController\n  include HookReopen\n\n  def label\n    \"base\"\n  end\nend\n"),
+            ("derived_parent", "class DerivedParent < BaseParent\n  include HookReopen\nend\n"),
+        ],
+        "DerivedParent",
+        "\"base\"",
+    );
+}
+
+/// HookOnly's hook runs after HookReopen's, so its `label` stands: the
+/// module lookup finds it already, ahead of HookReopen (#2278).
+#[test]
+fn a_lib_class_leaves_a_name_two_hooks_define_to_the_modules() {
+    lib_case(
+        &[HOOK_REOPEN, ("hook_only", "module HookOnly\n  extend ActiveSupport::Concern\n\n  included do\n    def label\n      \"b hook\"\n    end\n  end\nend\n")],
+        &[("pair_parent", "class PairParent < ApplicationController\n  include HookReopen\n  include HookOnly\nend\n")],
+        "PairParent",
+        "\"b hook\"",
+    );
+}
+
+/// TwiceParent's first opening ran the hook and then replaced its `label`;
+/// the second opening's include runs no hook (#2278).
+#[test]
+fn a_lib_class_takes_no_hook_def_on_a_repeated_include_of_its_own() {
+    lib_case(
+        &[HOOK_REOPEN],
+        &[
+            ("twice_parent", "class TwiceParent < ApplicationController\n  include HookReopen\n\n  def label\n    \"base\"\n  end\nend\n"),
+            ("twice_parent_again", "class TwiceParent < ApplicationController\n  include HookReopen\nend\n"),
+        ],
+        "TwiceParent",
+        "\"base\"",
+    );
+}
+
+/// The block's `attr_reader :label` comes after its `def label` and replaces
+/// it on the includer: `label` reads the unset `@label` (#2278).
+#[test]
+fn a_hook_def_stays_below_a_later_reader_of_its_block() {
+    lib_case(
+        &[(
+            "hook_reader",
+            "module HookReader\n  extend ActiveSupport::Concern\n\n  included do\n    def label\n      \"hook\"\n    end\n    attr_reader :label\n  end\nend\n\nmodule HookReader\n  def label\n    \"ordinary\"\n  end\nend\n",
+        )],
+        &[("reader_parent", "class ReaderParent < ApplicationController\n  include HookReader\nend\n")],
+        "ReaderParent",
+        "null",
+    );
 }

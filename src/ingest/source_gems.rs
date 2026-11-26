@@ -23,9 +23,21 @@ pub(super) struct SourceGem {
     /// autoload reaches: Ruby reads them the first time their constant is
     /// read, not while the gem boots.
     autoload_only: BTreeSet<PathBuf>,
+    /// Compiled into the Spinel tree alone (`auto_source_gems`): the ruby family loads the real gem, so its
+    /// load-time probes answer as Spinel does.
+    pub spinel_only: bool,
 }
 
 impl SourceGem {
+    /// The text of each file the gem compiles, its load-time branches settled as the mount reads them.
+    pub(super) fn texts<V: Vfs + ?Sized>(&self, vfs: &V) -> Vec<String> {
+        self.files
+            .iter()
+            .filter_map(|rel| vfs.read_to_string(&self.installed.join(rel)).ok())
+            .map(|text| super::ruby_conditions::settled_for(&text, self.spinel_only).unwrap_or(text))
+            .collect()
+    }
+
     /// Does the gem define what `path`, one of its files under the mount,
     /// declares before the app's autoloaders are set up? Not for a file only
     /// a feature-name autoload reaches: Zeitwerk sets its own autoload over
@@ -89,7 +101,7 @@ pub(super) fn resolve<V: Vfs + ?Sized>(
             files.extend(more);
             autoload_only = files.difference(&at_boot).cloned().collect();
         }
-        gems.push(SourceGem { mount: dir.join(MOUNT).join(format!("{name}-{version}")), installed, files, autoload_only });
+        gems.push(SourceGem { mount: dir.join(MOUNT).join(format!("{name}-{version}")), installed, files, autoload_only, spinel_only: false });
     }
     Ok(gems)
 }
@@ -124,6 +136,7 @@ pub(super) fn framework_models<V: Vfs + ?Sized>(vfs: &V, dir: &Path, lock: Optio
         installed,
         files,
         autoload_only: BTreeSet::new(),
+        spinel_only: false,
     })
 }
 
@@ -354,7 +367,7 @@ pub(super) fn zeitwerk_ignored<V: Vfs + ?Sized>(vfs: &V, lib: &Path) -> Vec<Path
 }
 
 // `None` for a root or an ignore this cannot read as a path, or a root outside lib/: mounting what it leaves out would ingest code the gem never loads.
-fn zeitwerk_dirs(text: &str, dir: &Path, lib: &Path) -> Option<(Vec<PathBuf>, Vec<PathBuf>)> {
+pub(crate) fn zeitwerk_dirs(text: &str, dir: &Path, lib: &Path) -> Option<(Vec<PathBuf>, Vec<PathBuf>)> {
     let for_gem = text.contains("Zeitwerk::Loader.for_gem");
     if !(for_gem || text.contains("Zeitwerk::Loader.new")) || !text.contains(".setup") {
         return None;
@@ -397,6 +410,29 @@ fn zeitwerk_dirs(text: &str, dir: &Path, lib: &Path) -> Option<(Vec<PathBuf>, Ve
     Some((roots, ignores))
 }
 
+/// The paths a loader's `do_not_eager_load` names, or `None` for one this cannot read as a path.
+pub(crate) fn zeitwerk_eager_exclusions(text: &str, dir: &Path) -> Option<Vec<PathBuf>> {
+    struct Calls<'a> {
+        dir: &'a Path,
+        paths: Vec<Option<PathBuf>>,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Calls<'_> {
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            if node.name().as_slice() == b"do_not_eager_load" && node.receiver().is_some() {
+                match node.arguments() {
+                    Some(args) => self.paths.extend(args.arguments().iter().map(|a| path_of(&a, self.dir).map(|p| normalize(&p)))),
+                    None => self.paths.push(None),
+                }
+            }
+            ruby_prism::visit_call_node(self, node);
+        }
+    }
+    let parsed = super::prism::parse_silent(text.as_bytes());
+    let mut calls = Calls { dir, paths: Vec::new() };
+    ruby_prism::Visit::visit(&mut calls, &parsed.node());
+    calls.paths.into_iter().collect()
+}
+
 pub(super) fn path_of(node: &ruby_prism::Node<'_>, dir: &Path) -> Option<PathBuf> {
     let text = |n: &ruby_prism::Node<'_>| n.as_string_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned());
     if let Some(call) = node.as_call_node() {
@@ -434,8 +470,9 @@ pub(super) fn path_of(node: &ruby_prism::Node<'_>, dir: &Path) -> Option<PathBuf
 /// `autoload` to a feature name (one ending in `.rb` is a path Zeitwerk
 /// defers to, as to a defined constant).
 fn requires(text: &str) -> Vec<(bool, String, bool)> {
-    /// `.4`: the blocks entered, each with its own locals and the outer ones it writes.
-    struct Finder(Vec<(bool, String, bool)>, usize, Vec<Vec<u8>>, usize, Vec<(Vec<Vec<u8>>, Vec<Vec<u8>>)>);
+    /// `.4`: the blocks entered, each with its own locals and the outer ones it writes. `.5`: the file's helpers that
+    /// register an autoload of their two arguments (`autoload_helpers`), whose literal calls count as `autoload`s.
+    struct Finder(Vec<(bool, String, bool)>, usize, Vec<Vec<u8>>, usize, Vec<(Vec<Vec<u8>>, Vec<Vec<u8>>)>, Vec<Vec<u8>>);
     /// `File.dirname(__FILE__)` or `__dir__`: the directory of the file being loaded.
     fn file_dir(node: &ruby_prism::Node<'_>) -> bool {
         if let Some(call) = node.as_call_node() {
@@ -447,6 +484,22 @@ fn requires(text: &str) -> Vec<(bool, String, bool)> {
             return file && call.name().as_slice() == b"dirname" && matches!(args.as_slice(), [a] if a.as_source_file_node().is_some());
         }
         false
+    }
+    /// `File.expand_path("json", __dir__)` or `File.join(__dir__, "json")` (message_bus's codecs): a path relative to
+    /// the file, as `require_relative` takes it.
+    fn dir_relative(node: &ruby_prism::Node<'_>) -> Option<String> {
+        let call = node.as_call_node()?;
+        if !call.receiver().and_then(|r| r.as_constant_read_node()).is_some_and(|c| c.name().as_slice() == b"File") {
+            return None;
+        }
+        let args: Vec<_> = call.arguments()?.arguments().iter().collect();
+        let literal = |n: &ruby_prism::Node<'_>| n.as_string_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned());
+        let rest = match (call.name().as_slice(), args.as_slice()) {
+            (b"expand_path", [rest, dir]) if file_dir(dir) => literal(rest)?,
+            (b"join", [dir, rest]) if file_dir(dir) => literal(rest)?,
+            _ => return None,
+        };
+        (!rest.starts_with('/') && !rest.is_empty()).then_some(rest)
     }
     impl Finder {
         /// `"#{direc}/method_source/version"` over `direc = File.dirname(__FILE__)` (method_source): a path relative to
@@ -543,7 +596,11 @@ fn requires(text: &str) -> Vec<(bool, String, bool)> {
             let args: Vec<_> = node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
             let feature = match (relative, args.as_slice()) {
                 (Some(_), [arg]) => arg.as_string_node(),
-                (None, [name, arg]) if method.as_slice() == b"autoload" && self.1 == 0 && name.as_symbol_node().is_some() => {
+                (None, [name, arg])
+                    if (method.as_slice() == b"autoload" || self.5.iter().any(|h| h.as_slice() == method.as_slice()))
+                        && self.1 == 0
+                        && name.as_symbol_node().is_some() =>
+                {
                     arg.as_string_node()
                 }
                 _ => None,
@@ -555,17 +612,107 @@ fn requires(text: &str) -> Vec<(bool, String, bool)> {
             } else if relative == Some(false)
                 && node.receiver().is_none()
                 && let [arg] = args.as_slice()
-                && let Some(path) = self.built_relative(arg)
+                && let Some(path) = self.built_relative(arg).or_else(|| dir_relative(arg))
             {
+                self.0.push((true, path, false));
+            } else if relative.is_none()
+                && method.as_slice() == b"autoload"
+                && self.1 == 0
+                && node.receiver().is_none()
+                && let [name, arg] = args.as_slice()
+                && name.as_symbol_node().is_some()
+                && let Some(path) = dir_relative(arg)
+            {
+                // A path, as one ending in `.rb` is: Zeitwerk defers to it as to a defined constant.
                 self.0.push((true, path, false));
             }
             ruby_prism::visit_call_node(self, node);
         }
     }
     let parsed = super::prism::parse_silent(text.as_bytes());
-    let mut finder = Finder(Vec::new(), 0, Vec::new(), 0, Vec::new());
+    let mut finder = Finder(Vec::new(), 0, Vec::new(), 0, Vec::new(), autoload_helpers(&parsed.node()));
     ruby_prism::Visit::visit(&mut finder, &parsed.node());
     finder.0
+}
+
+/// The names of a file's `def self.x(name, path)` whose body registers an autoload of its two parameters as one of
+/// its statements, as the mail gem's `register_autoload` does: a literal call of one is the gem's `autoload`.
+pub(super) fn autoload_helpers(root: &ruby_prism::Node<'_>) -> Vec<Vec<u8>> {
+    struct Defs(Vec<Vec<u8>>);
+    impl<'pr> ruby_prism::Visit<'pr> for Defs {
+        fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+            let on_self = node.receiver().is_some_and(|r| r.as_self_node().is_some());
+            let params = node.parameters();
+            let names: Vec<Vec<u8>> = params
+                .as_ref()
+                .filter(|p| p.optionals().is_empty() && p.rest().is_none() && p.posts().is_empty() && p.keywords().is_empty() && p.keyword_rest().is_none() && p.block().is_none())
+                .map(|p| p.requireds().iter().filter_map(|r| r.as_required_parameter_node().map(|n| n.name().as_slice().to_vec())).collect())
+                .unwrap_or_default();
+            let registers = |s: &ruby_prism::Node<'_>| {
+                let Some(call) = s.as_call_node() else { return false };
+                let args: Vec<_> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+                call.name().as_slice() == b"autoload"
+                    && call.block().is_none()
+                    && call.receiver().is_none_or(|r| r.as_self_node().is_some())
+                    && matches!(args.as_slice(), [a, b]
+                        if a.as_local_variable_read_node().is_some_and(|v| v.name().as_slice() == names[0].as_slice())
+                            && b.as_local_variable_read_node().is_some_and(|v| v.name().as_slice() == names[1].as_slice()))
+            };
+            if on_self
+                && names.len() == 2
+                && node.body().and_then(|b| b.as_statements_node()).is_some_and(|b| b.body().iter().filter(|s| registers(s)).count() == 1)
+                && !node.body().is_some_and(|b| changes_a_param(&b, &names))
+            {
+                self.0.push(node.name().as_slice().to_vec());
+            }
+            ruby_prism::visit_def_node(self, node);
+        }
+    }
+    let mut defs = Defs(Vec::new());
+    ruby_prism::Visit::visit(&mut defs, root);
+    defs.0
+}
+
+/// Whether a helper's body may make a parameter differ from the caller's argument by the time it registers:
+/// a write of the parameter (`path = "x/" + path`), or a call on it (`path << "x"`, `path.sub!(…)`). A table write
+/// such as `@autoloads[name] = path` reads both and changes neither.
+fn changes_a_param(body: &ruby_prism::Node<'_>, names: &[Vec<u8>]) -> bool {
+    struct Changes<'a>(&'a [Vec<u8>], bool);
+    impl Changes<'_> {
+        fn param(&mut self, name: &[u8]) {
+            self.1 |= self.0.iter().any(|n| n.as_slice() == name);
+        }
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Changes<'_> {
+        fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
+            self.param(node.name().as_slice());
+            ruby_prism::visit_local_variable_write_node(self, node);
+        }
+        fn visit_local_variable_operator_write_node(&mut self, node: &ruby_prism::LocalVariableOperatorWriteNode<'pr>) {
+            self.param(node.name().as_slice());
+            ruby_prism::visit_local_variable_operator_write_node(self, node);
+        }
+        fn visit_local_variable_or_write_node(&mut self, node: &ruby_prism::LocalVariableOrWriteNode<'pr>) {
+            self.param(node.name().as_slice());
+            ruby_prism::visit_local_variable_or_write_node(self, node);
+        }
+        fn visit_local_variable_and_write_node(&mut self, node: &ruby_prism::LocalVariableAndWriteNode<'pr>) {
+            self.param(node.name().as_slice());
+            ruby_prism::visit_local_variable_and_write_node(self, node);
+        }
+        fn visit_local_variable_target_node(&mut self, node: &ruby_prism::LocalVariableTargetNode<'pr>) {
+            self.param(node.name().as_slice());
+        }
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            if let Some(v) = node.receiver().and_then(|r| r.as_local_variable_read_node()) {
+                self.param(v.name().as_slice());
+            }
+            ruby_prism::visit_call_node(self, node);
+        }
+    }
+    let mut changes = Changes(names, false);
+    ruby_prism::Visit::visit(&mut changes, body);
+    changes.1
 }
 
 /// The directories a method that calls `autoload` (or `send(:autoload, …)`) builds a path under:
@@ -749,8 +896,8 @@ impl<V: Vfs + ?Sized> MountVfs<'_, V> {
         self.gems.iter().find_map(|gem| path.strip_prefix(&gem.mount).ok().map(|rel| (gem, rel.to_path_buf())))
     }
 
-    fn as_loaded(&self, text: String) -> String {
-        let text = super::ruby_conditions::settled(&text).unwrap_or(text);
+    fn as_loaded(&self, text: String, spinel_only: bool) -> String {
+        let text = super::ruby_conditions::settled_for(&text, spinel_only).unwrap_or(text);
         if !text.contains("LoadError") {
             return text;
         }
@@ -783,17 +930,15 @@ impl<V: Vfs + ?Sized> Vfs for MountVfs<'_, V> {
             return Ok(bytes);
         }
         match String::from_utf8(bytes) {
-            Ok(text) => Ok(self.as_loaded(text).into_bytes()),
+            Ok(text) => Ok(self.as_loaded(text, self.mounted(path).is_some_and(|(gem, _)| gem.spinel_only)).into_bytes()),
             Err(err) => Ok(err.into_bytes()),
         }
     }
 
     fn read_to_string(&self, path: &Path) -> io::Result<String> {
         let text = self.inner.read_to_string(&self.file(path)?)?;
-        if self.mounted(path).is_none() {
-            return Ok(text);
-        }
-        Ok(self.as_loaded(text))
+        let Some((gem, _)) = self.mounted(path) else { return Ok(text) };
+        Ok(self.as_loaded(text, gem.spinel_only))
     }
 
     fn read_dir(&self, path: &Path) -> io::Result<Vec<PathBuf>> {
@@ -949,6 +1094,36 @@ require \"#{dir}/gone\"
         let gems = resolve(&crate::vfs::FsVfs::new(), &root.join("app"), Some(&lock), &["widgets".to_string()]).unwrap();
         let files: Vec<_> = gems[0].files.iter().map(|p| p.display().to_string()).collect();
         assert_eq!(files, vec!["lib/widgets/base.rb", "lib/widgets.rb"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// message_bus's `autoload :Json, File.expand_path("json", __dir__)` and a `require File.join(__dir__, …)`: a
+    /// path the file's own directory spells is that file's sibling, as `require_relative` names it.
+    #[test]
+    fn a_path_built_from_the_file_s_directory_is_followed() {
+        let root = std::env::temp_dir().join(format!("rh-source-gems-expand-path-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let write = |path: &str, text: &str| {
+            let full = root.join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, text).unwrap();
+        };
+        write("app/.bundle/config", "---\nBUNDLE_PATH: \"vendor/bundle\"\n");
+        let gem = "app/vendor/bundle/ruby/3.4.0/gems/widgets-1.0";
+        write(&format!("{gem}/lib/widgets.rb"), "require_relative \"widgets/codec/base\"\nrequire File.join(__dir__, \"widgets/helper\")\n");
+        write(
+            &format!("{gem}/lib/widgets/codec/base.rb"),
+            "module Widgets\n  module Codec\n    autoload :Json, File.expand_path(\"json\", __dir__)\n    autoload :Oj, File.expand_path(\"oj\", File.dirname(__FILE__))\n  end\nend\n",
+        );
+        write(&format!("{gem}/lib/widgets/codec/json.rb"), "module Widgets; module Codec; class Json; end; end; end\n");
+        write(&format!("{gem}/lib/widgets/codec/oj.rb"), "module Widgets; module Codec; class Oj; end; end; end\n");
+        write(&format!("{gem}/lib/widgets/helper.rb"), "module Widgets; class Helper; end; end\n");
+        let lock = Lockfile::parse("GEM\n  remote: https://rubygems.org/\n  specs:\n    widgets (1.0)\n\nDEPENDENCIES\n  widgets\n");
+        let gems = resolve(&crate::vfs::FsVfs::new(), &root.join("app"), Some(&lock), &["widgets".to_string()]).unwrap();
+        let mut files: Vec<_> = gems[0].files.iter().map(|p| p.display().to_string()).collect();
+        files.sort();
+        assert_eq!(files, vec!["lib/widgets.rb", "lib/widgets/codec/base.rb", "lib/widgets/codec/json.rb", "lib/widgets/codec/oj.rb", "lib/widgets/helper.rb"]);
+        assert!(gems[0].autoload_only.is_empty(), "{:?}", gems[0].autoload_only);
         let _ = std::fs::remove_dir_all(&root);
     }
 

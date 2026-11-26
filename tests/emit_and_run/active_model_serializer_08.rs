@@ -741,3 +741,116 @@ fn an_active_model_serializer_08_deferred_array_over_an_options_local_stays_the_
         .check_errors();
     assert!(errors.iter().any(|e| e.contains("ActiveModel::ArraySerializer")), "{errors:#?}");
 }
+
+/// `options[:include_status] = true` after `super` in `initialize`
+/// (discourse's `UserCardSerializer`): the gem's `@object, @options =
+/// object, options` keeps the caller's Hash, so the write reaches the
+/// serializer's own `include_status?` and the Hash the caller passed.
+#[test]
+fn an_active_model_serializer_08_writing_an_option_in_initialize_lowers() {
+    let run = status_overlay().run_ruby(STATUS_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("option write passed"));
+    let errors = status_overlay().check_errors();
+    assert!(errors.is_empty(), "{errors:#?}");
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn an_active_model_serializer_08_writing_an_option_in_initialize_lowers_on_spinel() {
+    let run = status_overlay().run_spinel_with_db(STATUS_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("option write passed"));
+}
+
+fn status_overlay() -> emit_and_run::Overlay {
+    let status = "class StatusSerializer < ActiveModel::Serializer\n  attributes :id, :status\n\n  def initialize(object, options = {})\n    super\n    options[:include_status] = true\n  end\n\n  def status\n    \"on\"\n  end\n\n  def include_status?\n    options[:include_status]\n  end\nend\n";
+    overlay().write("app/serializers/status_serializer.rb", status)
+}
+
+const STATUS_SCRIPT: &str = "a = Article.create!(title: \"Hello\", body: \"A long body\")\nopts = {}\ngot = StatusSerializer.new(a, opts).as_json(root: false)\nraise got.inspect unless got == { id: a.id, status: \"on\" }\nraise opts.inspect unless opts[:include_status] == true\nputs \"option write passed\"\n";
+
+/// discourse's `PostSerializer`: `initialize` copies the options its
+/// literal `INSTANCE_VARS` list names into accessors the class body's
+/// loop defined. A key from that list is a named key, as a Symbol is; a
+/// list holding `:hash`, which the gem adds, stays refused.
+#[test]
+fn an_active_model_serializer_08_reading_options_through_a_literal_list_lowers() {
+    let errors = listed_overlay().check_errors();
+    assert!(errors.is_empty(), "{errors:#?}");
+    let run = listed_overlay().run_ruby(LISTED_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("listed options passed"));
+    roundhouse::ingest::survey::activate();
+    let _ = roundhouse::ingest::ingest_app_from_tree(tree(&postish("add_raw\n    hash")));
+    let ledger: Vec<String> = roundhouse::ingest::survey::drain().iter().map(|e| e.to_string()).collect();
+    assert!(ledger.iter().any(|e| e.contains("options.include?")), "{ledger:#?}");
+    // A listed name the block assigns over is no longer a key from the list.
+    let rebound = postish("add_raw\n    add_title").replace("public_send(\"#{name}=\", opts[name]) if opts.include? name", "name = :hash\n      public_send(:add_raw=, opts[name]) if opts.include? name");
+    roundhouse::ingest::survey::activate();
+    let _ = roundhouse::ingest::ingest_app_from_tree(tree(&rebound));
+    let ledger: Vec<String> = roundhouse::ingest::survey::drain().iter().map(|e| e.to_string()).collect();
+    assert!(ledger.iter().any(|e| e.contains("options.include?") || e.contains("[](:hash)") || e.contains("include?(:hash)")), "{ledger:#?}");
+    // The list assigned again after the method reads from it: the method runs with the later list.
+    let reassigned = postish("add_raw\n    add_title").replace("  def raw\n", "  INSTANCE_VARS = %i[hash]\n\n  def raw\n");
+    roundhouse::ingest::survey::activate();
+    let _ = roundhouse::ingest::ingest_app_from_tree(tree(&reassigned));
+    let ledger: Vec<String> = roundhouse::ingest::survey::drain().iter().map(|e| e.to_string()).collect();
+    assert!(ledger.iter().any(|e| e.contains("is assigned again after a method reads options keys from it")), "{ledger:#?}");
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn an_active_model_serializer_08_reading_options_through_a_literal_list_lowers_on_spinel() {
+    let run = listed_overlay().run_spinel_with_db(LISTED_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("listed options passed"));
+}
+
+fn postish(list: &str) -> String {
+    format!("class PostishSerializer < ActiveModel::Serializer\n  INSTANCE_VARS = %i[\n    {list}\n  ]\n\n  INSTANCE_VARS.each {{ |v| public_send(:attr_accessor, v) }}\n\n  attributes :id, :raw\n\n  def initialize(object, opts)\n    super(object, opts)\n    PostishSerializer::INSTANCE_VARS.each do |name|\n      public_send(\"#{{name}}=\", opts[name]) if opts.include? name\n    end\n  end\n\n  def raw\n    object.title\n  end\n\n  def include_raw?\n    @add_raw\n  end\nend\n")
+}
+
+fn listed_overlay() -> emit_and_run::Overlay {
+    overlay().write("app/serializers/postish_serializer.rb", &postish("add_raw\n    add_title"))
+}
+
+const LISTED_SCRIPT: &str = "a = Article.create!(title: \"Hello\", body: \"A long body\")\nwith = PostishSerializer.new(a, add_raw: true).as_json(root: false)\nraise with.inspect unless with == { id: a.id, raw: \"Hello\" }\nwithout = PostishSerializer.new(a, {}).as_json(root: false)\nraise without.inspect unless without == { id: a.id }\nb = Article.create!(title: \"<b>&\", body: \"A long body\")\ndumped = MultiJson.dump(PostishSerializer.new(b, add_raw: true))\nraise dumped unless dumped == %Q({\"postish\":{\"id\":#{b.id},\"raw\":\"\\\\u003cb\\\\u003e\\\\u0026\"}})\nbare = PostishSerializer.new(b, add_raw: true).to_json(root: false)\nraise bare unless bare == %Q({\"id\":#{b.id},\"raw\":\"\\\\u003cb\\\\u003e\\\\u0026\"})\nputs \"listed options passed\"\n";
+
+/// A plain class a serializer renders includes `ActiveModel::Serialization`
+/// (Rails) or `ActiveModel::SerializerSupport` (the gem), as discourse's
+/// `TopicList` and `UserSummary` do: neither is a module the emitted
+/// program has, and the expansion reads attributes by their readers, as
+/// the modules' `send` alias answers. A call of `serializable_hash` on the
+/// class itself stays a method it does not have.
+#[test]
+fn an_active_model_serializer_08_renders_a_class_including_the_serialization_mixins() {
+    let errors = mixin_overlay().check_errors();
+    assert!(errors.is_empty(), "{errors:#?}");
+    let run = mixin_overlay().run_ruby(MIXIN_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("serialization mixins passed"));
+    let errors = mixin_overlay()
+        .write("app/controllers/stat_dumps_controller.rb", "class StatDumpsController < ApplicationController\n  def show\n    render plain: Stat.new(1).serializable_hash.to_s\n  end\nend\n")
+        .check_errors();
+    assert!(errors.iter().any(|e| e.contains("serializable_hash")), "{errors:#?}");
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn an_active_model_serializer_08_renders_a_class_including_the_serialization_mixins_on_spinel() {
+    let run = mixin_overlay().run_spinel_with_db(MIXIN_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("serialization mixins passed"));
+}
+
+fn mixin_overlay() -> emit_and_run::Overlay {
+    overlay()
+        .write("app/models/stat.rb", "class Stat\n  include ActiveModel::Serialization\n\n  attr_reader :n\n\n  def initialize(n)\n    @n = n\n  end\nend\n")
+        .write("app/models/tally.rb", "class Tally\n  include ActiveModel::SerializerSupport\n\n  attr_reader :total\n\n  def initialize(total)\n    @total = total\n  end\nend\n")
+        .write("app/serializers/stat_serializer.rb", "class StatSerializer < ActiveModel::Serializer\n  attributes :n\nend\n")
+        .write("app/serializers/tally_serializer.rb", "class TallySerializer < ActiveModel::Serializer\n  attributes :total\nend\n")
+}
+
+const MIXIN_SCRIPT: &str = "s = StatSerializer.new(Stat.new(3)).as_json(root: false)\nraise s.inspect unless s == { n: 3 }\nt = TallySerializer.new(Tally.new(7)).as_json\nraise t.inspect unless t == { tally: { total: 7 } }\nputs \"serialization mixins passed\"\n";
+

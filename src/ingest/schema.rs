@@ -2141,6 +2141,22 @@ fn leave_out_default(gap: &SqlDefaultGap, dialect: GeneratedExpressionDialect, f
 
 /// [`leave_out_default`] for a parsed column's options.
 fn leave_out_column_default(opts: &mut ColumnOpts, dialect: GeneratedExpressionDialect, file: &str, table: &str, column: &str) {
+    // `now()` is MySQL's and PostgreSQL's clock, the one CURRENT_TIMESTAMP is. SQLite has no such function: Rails'
+    // table takes the text there and an insert relying on it fails, so a SQLite app's DDL keeps it as written. An app
+    // whose database is not known keeps the refusal.
+    if let Some((span, Err(gap))) = &opts.default_expression
+        && gap.sql.as_deref().is_some_and(|sql| sql.replace(' ', "").eq_ignore_ascii_case("now()"))
+    {
+        let carried = match dialect {
+            GeneratedExpressionDialect::OtherDatabase => Some("CURRENT_TIMESTAMP"),
+            GeneratedExpressionDialect::Sqlite => Some("now()"),
+            _ => None,
+        };
+        if let Some(sql) = carried {
+            opts.default_expression = Some((*span, Ok(sql.to_string())));
+            return;
+        }
+    }
     if let Some((span, Err(gap))) = &opts.default_expression {
         if leave_out_default(gap, dialect, file, *span, table, column) {
             opts.default_expression = None;
@@ -4178,6 +4194,20 @@ mod tests {
         assert_eq!((&token.col_type, token.nullable), (&ColumnType::String { limit: None }, false));
         assert_eq!((token.default.as_deref(), token.default_expression.as_deref()), (None, None));
         assert_eq!(gaps, [strict]);
+    }
+
+    /// `now()` (lobsters' `story_texts.created_at`): a MySQL or PostgreSQL app's clock is CURRENT_TIMESTAMP, the one the
+    /// emitted SQLite table applies; a SQLite app's DDL keeps the text as Rails' table does (an insert relying on it
+    /// fails there, as in Rails); an app whose database is not known keeps the refusal.
+    #[test]
+    fn a_now_default_follows_the_app_s_database() {
+        let source = "ActiveRecord::Schema[8.1].define(version: 1) do\n  create_table :story_texts do |t|\n    t.datetime :created_at, default: -> { \"now()\" }, null: false\n  end\nend\n";
+        for (dialect, carried) in [(GeneratedExpressionDialect::OtherDatabase, "CURRENT_TIMESTAMP"), (GeneratedExpressionDialect::Sqlite, "now()")] {
+            let schema = ingest_schema_with_generated_expression_dialect(source.as_bytes(), "db/schema.rb", dialect).expect("ingests");
+            assert_eq!(col(&schema, "story_texts", "created_at").default_expression.as_deref(), Some(carried), "{dialect:?}");
+        }
+        let refused = ingest_schema_with_generated_expression_dialect(source.as_bytes(), "db/schema.rb", GeneratedExpressionDialect::Portable);
+        assert!(refused.is_err(), "{refused:?}");
     }
 
     /// The migration fold too: a refused default no longer takes its

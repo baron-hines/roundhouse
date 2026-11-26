@@ -69,6 +69,12 @@ module Rails
     AppPath.new("public")
   end
 
+  # Empty, not ported: a gem's command (mission_control-jobs' `Authentication`) only needs its superclass to load.
+  module Command
+    class Base
+    end
+  end
+
   # Plain value object, no Pathname subclassing (the runtime stays
   # statically resolvable).
   # Not ActiveSupport's gem-path rewriting: a silenced frame never shows it, and only a `:noise` reading would.
@@ -507,22 +513,23 @@ module Rails
   # corpus is `Rails.logger.error "..."` (campfire: 7 sites, all
   # rescue-path reports); the lazy block form has no caller and an
   # optional block is its own hazard on the strict targets.
+  # Not a required message: Ruby's Logger takes none (lobsters' seeds write a bare `Rails.logger.debug`).
   class Logger
-    def info(message)
+    def info(message = nil)
       Rails.log_line("[rails] INFO " + message.to_s)
     end
 
-    def error(message)
+    def error(message = nil)
       Rails.log_line("[rails] ERROR " + message.to_s)
     end
 
-    def warn(message)
+    def warn(message = nil)
       Rails.log_line("[rails] WARN " + message.to_s)
     end
 
-    def debug(message); end
+    def debug(message = nil); end
 
-    def fatal(message)
+    def fatal(message = nil)
       Rails.log_line("[rails] FATAL " + message.to_s)
     end
   end
@@ -816,6 +823,30 @@ module Rails
       nil
     end
 
+    # `config.content_security_policy_nonce_generator`: none unless an initializer sets one, when ingest overrides
+    # these on the app's reopen with the lambda's body.
+    def content_security_policy_nonce_generator?
+      false
+    end
+
+    def content_security_policy_nonce_generated(request)
+      ""
+    end
+
+    # The request's nonce for the view helpers, which have no request of their own: nil outside one, or without a
+    # generator, as Rails' `request&.content_security_policy_nonce` is.
+    def content_security_policy_nonce_current
+      # Not the request first: a tree that serves no request (a helper unit) loads no `ActionController::Current`.
+      return nil unless content_security_policy_nonce_generator?
+      req = ActionController::Current.request
+      req.nil? ? nil : req.content_security_policy_nonce
+    end
+
+    # Rails' DEFAULT_NONCE_DIRECTIVES, where the app names none.
+    def content_security_policy_nonce_directives
+      ["script-src", "style-src"]
+    end
+
     # `Rails.application.importmap`. Paths are already `/assets/…`
     # from ingest; `to_json` ignores the resolver. The string is the
     # pretty script body the layout embeds, because a CSP hash of a
@@ -940,6 +971,10 @@ module Rails
       @action_controller
     end
 
+    def action_dispatch
+      ActionDispatchOptions.new
+    end
+
     # `config.session_options`, what `config.session_store` was given: the cookie's name alone, as ingest lifts no
     # other option (`path:`, `domain:`, `secure:` are not read, and a cookie a gem scopes by them takes none).
     def session_options
@@ -950,6 +985,21 @@ module Rails
     # list is the one ingest lifts from the app's `config.filter_parameters`.
     def filter_parameters
       Rails.application.config_filter_parameters
+    end
+  end
+
+  # The salts are Rails' defaults: the cookie jars derive with these, whatever an app assigns to them.
+  class ActionDispatchOptions
+    def cookies_rotations
+      ActiveSupport::Messages::RotationConfiguration.shared
+    end
+
+    def signed_cookie_salt
+      ActionController::MessageVerifier::SIGNED_COOKIE_SALT
+    end
+
+    def authenticated_encrypted_cookie_salt
+      ActionController::MessageEncryptor::SALT
     end
   end
 

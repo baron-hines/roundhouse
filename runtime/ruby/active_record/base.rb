@@ -624,6 +624,12 @@ module ActiveRecord
     def self.preload_associations(_records, _specs)
     end
 
+    # Not left to `preload_associations` alone: an `includes` whose association a condition names is a JOIN in Rails
+    # (`includes(:article).where(article: {…})`); models with such associations answer theirs.
+    def self._eager_load_joins(_specs, _conditions, _joined)
+      []
+    end
+
     # Per-model adapter primitives — public AR API delegates here.
     # Default implementations route through the legacy
     # `ActiveRecord.adapter.X` + `instantiate` path so subclasses that
@@ -1218,6 +1224,20 @@ module ActiveRecord
     def changed?
       changes = changes_to_save
       !changes.empty?
+    end
+
+    # ActiveModel::Dirty's names over the same diffs: `changes` is the pending one (`changes_to_save`), keyed by column
+    # String as Rails' indifferent Hash reads it; `previous_changes` the last save's; `changed` the pending columns.
+    def changes
+      changes_to_save
+    end
+
+    def previous_changes
+      saved_changes
+    end
+
+    def changed
+      changes_to_save.keys
     end
 
     def has_changes_to_save?

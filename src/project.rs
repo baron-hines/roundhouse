@@ -2517,7 +2517,7 @@ fn report_native_ruby_syntax(app: &App, target: BuildTarget) {
     if matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Jruby) {
         return;
     }
-    fn visit(expr: &crate::expr::Expr, target: BuildTarget, load_time: bool) {
+    fn visit(expr: &crate::expr::Expr, target: BuildTarget, load_time: bool, app_loaders: &[&str]) {
         use crate::expr::{ExprNode, LValue};
         let construct = match &*expr.node {
             ExprNode::ForwardKeywords if target == BuildTarget::Spinel => None,
@@ -2572,6 +2572,15 @@ fn report_native_ruby_syntax(app: &App, target: BuildTarget) {
             | ExprNode::OpAssign { target: LValue::Var { name, .. }, .. }
                 if name.as_str().starts_with('$') => Some("global variable write"),
             ExprNode::Var { name, .. } if name.as_str().starts_with("@@") && target != BuildTarget::Spinel => Some("class variable read"),
+            // message_bus's `require "message_bus/backends/#{backend}"`: the tree has no load path, and Spinel resolves a
+            // require as it builds, so a name only the run time knows loads nothing (a LoadError where Ruby loads it).
+            ExprNode::Send { recv: None, method, args, block: None, .. }
+                if matches!(method.as_str(), "require" | "load")
+                    && !app_loaders.contains(&method.as_str())
+                    && matches!(args.as_slice(), [a] if !matches!(&*a.node, ExprNode::Lit { .. })) =>
+            {
+                Some("require of a name built at run time")
+            }
             _ => None,
         };
         if let Some(construct) = construct {
@@ -2580,11 +2589,19 @@ fn report_native_ruby_syntax(app: &App, target: BuildTarget) {
                 "native Ruby semantics have no verified implementation on this target",
             );
         }
-        expr.node.for_each_child(&mut |child| visit(child, target, load_time));
+        expr.node.for_each_child(&mut |child| visit(child, target, load_time, app_loaders));
     }
+    // An app method of the name anywhere (a model's `load(name)`) keeps its calls out of the refusal, as
+    // `report_ruby_only_sends` keeps them: the call's body carries no mark of the method it dispatched to.
+    let defines = |name: &str| {
+        app.models.iter().any(|model| model.methods().any(|method| method.name.as_str() == name))
+            || app.library_classes.iter().any(|class| class.methods.iter().any(|method| method.name.as_str() == name))
+            || app.controllers.iter().any(|controller| controller.actions().any(|action| action.name.as_str() == name))
+    };
+    let app_loaders: Vec<&str> = ["require", "load"].into_iter().filter(|name| defines(name)).collect();
     let load_time = crate::lower::defined_const_fold::load_time_roots(app);
     crate::lower::for_each_emit_body_ref(app, &mut |expr| {
-        visit(expr, target, load_time.contains(&(expr as *const crate::expr::Expr as usize)))
+        visit(expr, target, load_time.contains(&(expr as *const crate::expr::Expr as usize)), &app_loaders)
     });
 }
 
@@ -4118,13 +4135,14 @@ fn target_files_inner(
             .map(|s| s.as_str().to_string())
             .collect();
         // Ruby's text-level shake uses a global name set. An optional
-        // predicate on another model must not expose a user's enum override
-        // to shaking; conservatively keep that name on every model.
+        // predicate on another model must not expose a model's own column
+        // predicate (a `def` or an enum label) to shaking; conservatively
+        // keep that name on every model.
         for model in &app.models {
-            for column in model.enums.keys() {
-                let predicate = crate::ident::Symbol::from(format!("{}?", column.as_str()));
-                if crate::lower::model_to_library::model_defines_instance_method(model, &predicate) {
-                    synth_shakeable.remove(predicate.as_str());
+            let Some(table) = app.schema.tables.get(&model.table.0) else { continue };
+            for col in &table.columns {
+                if crate::lower::model_to_library::own_column_predicate(model, col) {
+                    synth_shakeable.remove(&format!("{}?", col.name.as_str()));
                 }
             }
         }
@@ -6019,6 +6037,38 @@ fn rewrite_carried_requires(files: &mut [(String, String)], app: &App, program: 
     }
 }
 
+// Not loaded lazily: production Rails eager-loads a gem's Zeitwerk-managed files at boot (mission_control-jobs' `push_dir`).
+fn zeitwerk_eager_programs(app: &App, is_program: impl Fn(&str) -> bool) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for entry in &app.boot_gem_entries {
+        let entry = normalize_source(entry);
+        let Some(text) = app.sources.iter().find(|f| normalize_source(&f.path) == entry).map(|f| f.text.as_str()) else { continue };
+        let Some(at) = entry.rfind("/lib/") else { continue };
+        let lib = std::path::Path::new(&entry[..at + 4]);
+        let dir = std::path::Path::new(&entry).parent().unwrap_or(lib);
+        let Some((roots, mut ignores)) = crate::ingest::source_gems::zeitwerk_dirs(text, dir, lib) else { continue };
+        let Some(lazy) = crate::ingest::source_gems::zeitwerk_eager_exclusions(text, dir) else { continue };
+        ignores.extend(lazy);
+        let mut managed: Vec<String> = app
+            .sources
+            .iter()
+            .map(|f| normalize_source(&f.path))
+            .filter(|p| *p != entry && is_program(p))
+            .filter(|p| {
+                let path = std::path::Path::new(p);
+                roots.iter().any(|r| path.starts_with(r)) && !ignores.iter().any(|i| path.starts_with(i))
+            })
+            .collect();
+        managed.sort();
+        for p in managed {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
 fn apply_file_programs(files: &mut Vec<(String, String)>, app: &App) {
     use std::fmt::Write;
     if app.file_programs.is_empty() {
@@ -6247,9 +6297,11 @@ fn apply_file_programs(files: &mut Vec<(String, String)>, app: &App) {
         }
         files.push((format!("app/{}.rb", anchor_of(&program.source)), out));
     }
-    // What boot reaches: the gem entries' programs and what they require.
+    // What boot reaches: the gem entries' programs, what they require, and what their Zeitwerk loaders eager-load.
+    let eager = zeitwerk_eager_programs(app, |p| programs.contains_key(p));
     let mut reached: crate::det::HashSet<String> = Default::default();
     let mut pending: Vec<String> = app.boot_gem_entries.iter().map(|e| normalize_source(e)).filter(|e| programs.contains_key(e)).collect();
+    pending.extend(eager.iter().cloned());
     while let Some(next) = pending.pop() {
         if reached.insert(next.clone()) {
             pending.extend(edges.get(&next).into_iter().flatten().cloned());
@@ -6347,6 +6399,9 @@ fn apply_file_programs(files: &mut Vec<(String, String)>, app: &App) {
         if programs.contains_key(&entry) {
             writeln!(boot, "RoundhouseAutoload.require_gem_file({:?})", anchor_of(&entry)).unwrap();
         }
+    }
+    for program in &eager {
+        writeln!(boot, "RoundhouseAutoload.require_gem_file({:?})", anchor_of(program)).unwrap();
     }
     // A declaration file's load-time require of a constant under an
     // autoloaded namespace loads that namespace's program, as reading the
@@ -10285,7 +10340,8 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
         if !matches!(target, "jruby" | "spinel")
             && let crate::expr::ExprNode::Const { path } = &*expr.node
             && let ["Socket", flag] = path.iter().map(|s| s.as_str()).skip_while(|s| s.is_empty()).collect::<Vec<_>>()[..]
-            && crate::analyze::is_core_value_constant(&format!("Socket::{flag}"))
+            && (crate::analyze::is_core_value_constant(&format!("Socket::{flag}"))
+                || crate::analyze::platform_constant_type(&format!("Socket::{flag}")).is_some())
         {
             emit::diagnostics::report_unsupported(
                 expr.span,
@@ -14007,7 +14063,7 @@ fn drop_facades_the_program_defines(files: &mut [(String, String)]) {
 /// Constant → bundled library that provides it. One table, read by
 /// both the pass that writes the requires and the gate that checks a
 /// tree for missing ones — a second copy is how the rule drifts.
-const BUNDLED: [(&str, &str); 31] = [
+const BUNDLED: [(&str, &str); 33] = [
     // INERT in our trees, and deliberately: `runtime/spinel/base64.rb`
     // defines `Base64` without requiring the library, which the second
     // condition below reads as "the program defines it" and drops the
@@ -14096,11 +14152,13 @@ const BUNDLED: [(&str, &str); 31] = [
     // `packages/openssl`; an app that signs a payload without HTTP never
     // loads it through net/http.
     ("OpenSSL", "openssl"),
-    // `Monitor.new`, `UNIXServer.new` / `UNIXSocket.new`, `Open3.capture3`
+    // `Monitor.new`, `Socket.const_defined?(:SOL_TCP)`, `UNIXServer.new` / `UNIXSocket.new`, `Open3.capture3`
     // and `Find.find`: the standard library on CRuby/JRuby; spinel
     // defines Monitor and the socket classes only after the require, and
     // takes `packages/open3` and `packages/find`.
     ("Monitor", "monitor"),
+    ("MonitorMixin", "monitor"),
+    ("Socket", "socket"),
     ("UNIXServer", "socket"),
     ("UNIXSocket", "socket"),
     ("Open3", "open3"),

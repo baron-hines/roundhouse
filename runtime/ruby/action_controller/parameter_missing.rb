@@ -49,6 +49,19 @@ module ActionController
   class UnknownFormat < StandardError
   end
 
+  # responders' `ActionController::Responder` raises it for a format no renderer answers.
+  class MissingRenderer < LoadError
+    def initialize(format)
+      super("No renderer defined for format: #{format}")
+    end
+  end
+
+  # The renderers Rails registers itself (`add :json`, `add :js`, `add :xml`); a gem's `Renderers.add`
+  # (turbo-rails' `:turbo_stream`) is not modeled.
+  module Renderers
+    RENDERERS = Set.new([:json, :js, :xml])
+  end
+
   # Raised by app code to answer 404 for a path that a route matches
   # but the app rejects (for example, a page number out of bounds).
   # Rails maps it to 404 in `ActionDispatch::ExceptionWrapper`, and the

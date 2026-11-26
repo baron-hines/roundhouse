@@ -126,6 +126,10 @@ class SafeString < String
 end
 
 class String
+  # Not only rewritten at emit: a receiver a gem hands the app is untyped (lobsters' rack-attack `request.path.starts_with?`).
+  alias_method :starts_with?, :start_with? unless method_defined?(:starts_with?)
+  alias_method :ends_with?, :end_with? unless method_defined?(:ends_with?)
+
   # AS specializes String#blank? to treat whitespace-only as blank.
   def blank?
     empty? || match?(/\A[[:space:]]*\z/)

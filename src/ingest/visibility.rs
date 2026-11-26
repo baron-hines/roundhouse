@@ -1008,6 +1008,7 @@ impl Visibility {
         struct Declarations {
             invalid: bool,
             reject_defs: bool,
+            in_block: usize,
         }
         impl<'pr> ruby_prism::Visit<'pr> for Declarations {
             fn visit_branch_node_enter(&mut self, node: Node<'pr>) {
@@ -1037,13 +1038,19 @@ impl Visibility {
                             .and_then(|clause| clause.statements())
                             .is_some_and(|s| body_has_marker(Some(s.as_node())))
                 } else {
-                    node.as_call_node().is_some_and(|c| c.receiver().is_none() && marker(&c))
+                    node.as_call_node().is_some_and(|c| c.receiver().is_none() && marker(&c) && (self.in_block == 0 || c.arguments().is_some()))
                 };
             }
             fn visit_def_node(&mut self, _node: &ruby_prism::DefNode<'pr>) {
                 // DSL blocks (e.g. has_many extensions) own their defs, not
                 // the enclosing class. Never inspect ordinary def bodies.
                 self.invalid |= self.reject_defs;
+            }
+            // Not a named marker (`with_options do protected :x= end` sets the class's `x=`): a bare one in a call's block sets the visibility of the block's own `def`s only, which whoever reads that block models or refuses.
+            fn visit_block_node(&mut self, node: &ruby_prism::BlockNode<'pr>) {
+                self.in_block += !self.reject_defs as usize;
+                ruby_prism::visit_block_node(self, node);
+                self.in_block -= !self.reject_defs as usize;
             }
         }
         // A def inside a call's block belongs to that block's owner, not
@@ -1058,6 +1065,7 @@ impl Visibility {
         let mut declarations = Declarations {
             invalid: false,
             reject_defs: !owns_defs,
+            in_block: 0,
         };
         ruby_prism::Visit::visit(&mut declarations, node);
         if declarations.invalid {

@@ -130,7 +130,7 @@ pub(crate) fn compiler_runtime_gems() -> &'static [(Marker, &'static str)] {
     // (constant an emitted body names, gem that defines it). Only gems
     // whose absence is a RUNTIME error belong here — the list is the
     // façade's, not a survey of what an app might like.
-    const RUNTIME_GEMS: [(Marker, &str); 27] = [
+    const RUNTIME_GEMS: [(Marker, &str); 28] = [
         (Marker::Constant("Faye"), "faye-websocket"),
         (Marker::Constant("EventMachine"), "eventmachine"),
         (Marker::Constant("BCrypt"), "bcrypt"),
@@ -219,6 +219,8 @@ pub(crate) fn compiler_runtime_gems() -> &'static [(Marker, &'static str)] {
         // installed, which the app's own Gemfile (image_processing →
         // ruby-vips) already asked of the machine.
         (Marker::AnyText(&[VARIATION_MARKER]), "ruby-vips"),
+        // Not only the variant marker: an app's own `Vips::Image` (lobsters' StoryImage) needs the gem too.
+        (Marker::Constant("Vips"), "ruby-vips"),
         // The HTTP client an app calls. The real gem runs on this lane;
         // the strict targets refuse it (`lower::ruby_family_gems`). `Constant`
         // matches `Faraday.new` / `Faraday::…` / `rescue Faraday`; the
@@ -826,7 +828,6 @@ const FATES: &[(&str, GemFate)] = &[
     ("bundler-audit", GemFate::Infrastructure),
     ("capybara", GemFate::Infrastructure),
     ("climate_control", GemFate::Infrastructure),
-    ("connection_pool", GemFate::Infrastructure),
     ("database_consistency", GemFate::Infrastructure),
     ("debug", GemFate::Infrastructure),
     ("dockerfile-rails", GemFate::Infrastructure),
@@ -1020,6 +1021,10 @@ pub(crate) fn is_core_constant(written: &[&str]) -> bool {
 /// no such file is on its load path.
 pub(crate) fn is_framework_feature(feature: &str) -> bool {
     let root = feature.split('/').next().unwrap_or(feature);
+    // Not required as written: the runtime ports a Framework-fate `-rails` gem's engine (MC's importmap-rails); i18n is the real gem.
+    if feature == root && root.ends_with("-rails") && !compiler_tree_loads_gem(root) && FATES.iter().any(|(name, fate)| *name == root && *fate == GemFate::Framework) {
+        return true;
+    }
     matches!(
         root,
         "rails" | "railties" | "active_support" | "activesupport" | "active_record" | "activerecord" | "arel"
@@ -1161,18 +1166,19 @@ pub fn namespace_of(gem: &str) -> String {
 /// once the emitted program names that gem's namespace.
 ///
 /// A normal gem's entry file is `lib/<gem>.rb`, and the constant lowercases
-/// to that name (`duckdb` → `DuckDB`). The same file exists for three
-/// irregular constants: `caxlsx` (`lib/caxlsx.rb`), `polars-df`
-/// (`lib/polars-df.rb`), and `ruby_llm` (`lib/ruby_llm.rb`). Requiring the
-/// lowercased constant (`axlsx`, `polars`, `rubyllm`) is not that entry.
+/// to that name, its underscores aside (`duckdb` → `DuckDB`, `message_bus`
+/// → `MessageBus`, `ruby_llm` → `RubyLLM`): Bundler requires the gem by
+/// that name. The same file exists for two irregular constants: `caxlsx`
+/// (`lib/caxlsx.rb`) and `polars-df` (`lib/polars-df.rb`). Requiring the
+/// lowercased constant (`axlsx`, `polars`) is not that entry.
 ///
 /// `rubyzip` is not in this set. `require "rubyzip"` is not a file; the gem
 /// loads as `zip`.
 pub fn loads_by_gem_name(gem: &str) -> bool {
-    if namespace_of(gem).eq_ignore_ascii_case(gem) {
+    if namespace_of(gem).eq_ignore_ascii_case(&gem.replace('_', "")) {
         return true;
     }
-    matches!(gem, "caxlsx" | "polars-df" | "ruby_llm")
+    matches!(gem, "caxlsx" | "polars-df")
 }
 
 /// The top-level constants a gem might define, best guess first: the
@@ -1954,6 +1960,24 @@ mod tests {
         assert!(!stubs.contains("WebPush"), "{stubs:?}");
     }
 
+    /// mission_control-jobs' engine requires importmap-rails, turbo-rails and stimulus-rails, which the runtime ports;
+    /// a gem the app ships stays a require.
+    #[test]
+    fn a_framework_fate_gem_is_a_framework_feature() {
+        for feature in ["importmap-rails", "turbo-rails", "stimulus-rails", "rails/engine"] {
+            assert!(is_framework_feature(feature), "{feature}");
+        }
+        assert!(!is_framework_feature("rotp"));
+        assert!(!is_framework_feature("i18n/backend/simple"));
+        assert!(!is_framework_feature("i18n"));
+    }
+
+    /// lobsters' own `Vips::Image` needs ruby-vips loaded, not only an Active Storage variant.
+    #[test]
+    fn an_app_s_vips_constant_needs_ruby_vips() {
+        assert!(compiler_runtime_gems().iter().any(|(marker, gem)| *gem == "ruby-vips" && matches!(marker, Marker::Constant("Vips"))));
+    }
+
     #[test]
     fn gemfile_requires_reads_each_spelling() {
         let found = gemfile_requires(
@@ -2277,6 +2301,7 @@ end
             "rubyzip has no rubyzip.rb entry; boot must not require that name:\n{boot}"
         );
         assert!(loads_by_gem_name("duckdb") && loads_by_gem_name("mcp"));
+        assert!(loads_by_gem_name("message_bus") && loads_by_gem_name("ruby_llm"));
         assert!(!loads_by_gem_name("rubyzip"));
     }
 

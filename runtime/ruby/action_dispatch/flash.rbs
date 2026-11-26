@@ -21,7 +21,7 @@ module ActionDispatch
 
     def initialize: (?Hash[String, String]? other) -> void
     def begin_carry: () -> nil
-    def carry_other: (String key, String value) -> nil
+    def carry_other: (String key, untyped value) -> nil
     def carried: (String key) -> nil
 
     def now: () -> FlashNow

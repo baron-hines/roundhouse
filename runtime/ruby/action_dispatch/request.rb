@@ -333,8 +333,9 @@ module ActionDispatch
       @request_method == "HEAD"
     end
 
+    # Rails' `/XMLHttpRequest/i.match?`: anywhere in the header, any case.
     def xhr?
-      @env.fetch("HTTP_X_REQUESTED_WITH", "").to_s == "XMLHttpRequest"
+      @env.fetch("HTTP_X_REQUESTED_WITH", "").to_s.downcase.include?("xmlhttprequest")
     end
 
     def inertia?
@@ -517,6 +518,19 @@ module ActionDispatch
       src = Rails.application.content_security_policy
       @content_security_policy = src.nil? ? nil : src.dup
       @content_security_policy
+    end
+
+    # Rails' `content_security_policy_nonce`: nil without a generator, else generated once per request.
+    def content_security_policy_nonce
+      return nil unless Rails.application.content_security_policy_nonce_generator?
+      @csp_nonce = Rails.application.content_security_policy_nonce_generated(self) if @csp_nonce.nil?
+      @csp_nonce
+    end
+
+    # A controller's `content_security_policy` block on a request whose app has no policy: Rails starts a new one.
+    def content_security_policy=(policy)
+      @csp_ready = true
+      @content_security_policy = policy
     end
 
     # Absolute URL of this request. Feed templates interpolate it as

@@ -62,7 +62,7 @@ mod diagnostic;
 pub(crate) use diagnostic::some_operands_take_it;
 mod const_resolution;
 mod lambda_local;
-pub(crate) use const_resolution::{ConstResolver, ConstResolverTask, definition_index, has_ambiguous_namespace, is_core_value_constant};
+pub(crate) use const_resolution::{ConstResolver, ConstResolverTask, definition_index, has_ambiguous_namespace, is_core_value_constant, platform_constant_type};
 pub use const_resolution::DefinitionIndex;
 pub use const_resolution::PreparedConstResolver;
 use const_resolution::ResolvedConstant;
@@ -1989,6 +1989,7 @@ impl<'a> BodyTyper<'a> {
                 // A later typing pass may resolve a value constant whose
                 // owner was unknown in an earlier constant fixpoint round.
                 crate::expr::ExprCold::set_diagnostic(&mut expr.cold, None);
+                let platform_guarded = expr.decisions & crate::expr::PLATFORM_GUARDED_CONST != 0;
                 let generated = expr_span.file.0 == 0
                     || expr.decisions & crate::expr::GENERATED_CONST_REF != 0;
                 // A real FileId outside the snapshot is an indexing
@@ -2236,6 +2237,10 @@ impl<'a> BodyTyper<'a> {
                     expr.decisions |= crate::expr::GUARDED_NAME_ERROR;
                     return self.compute(expr, ctx);
                 }
+                let ty = match ty {
+                    Ty::Var { .. } if platform_guarded => const_resolution::platform_constant_type(written_class_id(path).0.as_str()).unwrap_or(ty),
+                    ty => ty,
+                };
                 if indexed_source && matches!(ty, Ty::Var { .. }) {
                     crate::expr::ExprCold::set_diagnostic(&mut expr.cold, Some(crate::diagnostic::DiagnosticKind::Unsupported {
                         target: None,
@@ -3690,6 +3695,30 @@ impl<'a> BodyTyper<'a> {
                 {
                     let elem = args[0].ty.as_ref().and_then(kernel_array_elem);
                     return Ty::Array { elem: std::sync::Arc::new(elem.unwrap_or_else(unknown)) };
+                }
+                // Not typed from the argument's class alone: `rand(0)` is a Float, `rand(1.5)` an Integer and
+                // `rand(1...1)` nil, so only a literal whose value settles it is typed (`rand(0..9999)`, `rand(10)`).
+                if recv.is_none() && method.as_str() == "rand" && args.len() <= 1
+                    && block.is_none()
+                    && matches!(dispatched, Ty::Var { .. } | Ty::Untyped)
+                    && !self.app_defines(ctx.self_ty.as_ref(), method)
+                {
+                    let int = |e: &Option<Expr>| match e.as_ref().map(|e| &*e.node) {
+                        Some(ExprNode::Lit { value: crate::expr::Literal::Int { value } }) => Some(*value),
+                        _ => None,
+                    };
+                    let answer = match args.first().map(|a| &*a.node) {
+                        None => Some(Ty::Float),
+                        Some(ExprNode::Lit { value: crate::expr::Literal::Int { value } }) if *value != 0 => Some(Ty::Int),
+                        Some(ExprNode::Range { begin, end, exclusive }) => match (int(begin), int(end)) {
+                            (Some(b), Some(e)) if if *exclusive { b < e } else { b <= e } => Some(Ty::Int),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(answer) = answer {
+                        return answer;
+                    }
                 }
                 let translate = matches!(method.as_str(), "t" | "translate");
                 let catalog = self.i18n.map_or(crate::i18n::Catalog::rails_default(), |c| c.or_rails_default());
@@ -5690,6 +5719,19 @@ impl BodyTyper<'_> {
             if let Some(ty) = classes.get(module).and_then(|m| m.instance_methods.get(name)) {
                 return Some(ty.clone()).filter(|t| !t.is_open());
             }
+        }
+        // Past its own includes, a module's `super` is the next method of the class that mixes it in: one that
+        // `prepend`s it (not among its includes) answers with its own (redis's `Redis::LibIdentity#connection_prelude`).
+        if info.is_module
+            && !class_side
+            && info.parent.is_none()
+            && let Some((_, Ty::Class { id: host, .. })) = self.module_self_types.and_then(|m| m.get(owner))
+            && host != owner
+            && let Some(host_info) = classes.get(host)
+            && !host_info.includes.contains(owner)
+            && let Some(ty) = host_info.instance_methods.get(name)
+        {
+            return Some(ty.clone()).filter(|t| !t.is_open());
         }
         let mut parent = info.parent.clone();
         let mut seen = 0;
@@ -8932,7 +8974,7 @@ pub(super) const RUBY_TOP_LEVEL: &[&str] = &[
     "Base64", "Benchmark", "BigDecimal", "CGI", "CSV", "Comparable", "Complex", "Coverage",
     "Date", "DateTime", "Digest", "Dir", "ERB", "Encoding", "Enumerable", "Errno", "Etc",
     "Fiber", "File", "FileUtils", "Find", "Forwardable", "GC", "IO", "IPAddr", "JSON",
-    "Kernel", "Logger", "Marshal", "Math", "Monitor", "Mutex", "Net", "ObjectSpace", "Open3",
+    "Kernel", "Logger", "Marshal", "Math", "Monitor", "MonitorMixin", "Mutex", "Net", "ObjectSpace", "Open3",
     "OpenSSL", "OpenStruct", "PP", "Pathname", "Prism", "Process", "Psych", "Random",
     "Rational", "Ripper", "SecureRandom", "Set", "Shellwords", "Signal", "Singleton",
     "Socket", "StringIO", "Struct", "Tempfile", "Thread", "Time", "Timeout", "URI", "YAML",

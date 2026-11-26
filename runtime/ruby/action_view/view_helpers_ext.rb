@@ -11,13 +11,10 @@ require_relative "../action_view_number_helper"
 
 module ActionView
   module ViewHelpers
-    # `content_security_policy_nonce` — the per-request CSP script
-    # nonce Rails interpolates into `<script nonce=…>`. No app in the
-    # corpus sets a nonce generator (campfire's policy is hash-based,
-    # so the page stays cacheable), and a stable token keeps a layout
-    # that does interpolate one rendering without a randomness primitive.
+    # `content_security_policy_nonce`: the request's nonce, nil without a generator (lobsters' layout writes it into
+    # `<script nonce=…>`, and the header carries the same value).
     def self.content_security_policy_nonce
-      "roundhouse-nonce"
+      Rails.application.content_security_policy_nonce_current
     end
 
     # Rails' `csp_meta_tag`: a `<meta name="csp-nonce">` when a policy
@@ -43,7 +40,9 @@ module ActionView
     def self.csp_meta_tag
       return "<meta name=\"csp-nonce\" />" if @csp_policy_for_test
       return "" if Rails.application.content_security_policy.nil?
-      "<meta name=\"csp-nonce\" />"
+      nonce = Rails.application.content_security_policy_nonce_current
+      return "<meta name=\"csp-nonce\" />" if nonce.nil?
+      "<meta name=\"csp-nonce\" content=\"" + nonce + "\" />"
     end
 
     # The ruby family's `url_for_path` (see the universal body in

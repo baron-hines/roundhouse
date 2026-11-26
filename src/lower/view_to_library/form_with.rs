@@ -1171,16 +1171,30 @@ fn classify_form_with_components(
     // `url:` beside `model:` overrides the resource-convention action
     // (Rails consults url first; lobsters' settings form has no
     // `setting_path` route for the convention to name). Fields still
-    // name under the model. Method: an explicit `method:` opt wins,
-    // else form_with's POST default.
+    // name under the model. Method: an explicit `method:` opt wins;
+    // else, for a record the view knows is a model, Rails' own
+    // `persisted? ? :patch : :post` (url: does not change the verb, so
+    // campfire's message edit form PATCHes); else form_with's POST.
     if let Some(url) = url_expr {
-        // `method:` steers the form verb (captured out of opts above);
-        // default POST like the url-only branch.
+        let method = method_expr.clone().unwrap_or_else(|| {
+            if is_known_model_record(&model, ctx) {
+                Expr::new(
+                    Span::synthetic(),
+                    ExprNode::If {
+                        cond: send(Some(model.clone()), "persisted?", Vec::new(), None, false),
+                        then_branch: lit_sym(Symbol::from("patch")),
+                        else_branch: lit_sym(Symbol::from("post")),
+                    },
+                )
+            } else {
+                default_post()
+            }
+        });
         return Some(FormWithComponents {
             model_name: scope.clone().unwrap_or_else(|| record_model_name(&model, ctx, &singular)),
             model,
             action: route_helperize(url, &route_helpers, ctx),
-            method: method_expr.clone().unwrap_or_else(default_post),
+            method,
             opts_entries,
             id_prefix: namespace.clone().unwrap_or_default(),
         });
@@ -1218,7 +1232,7 @@ fn classify_form_with_components(
         send(Some(model.clone()), "id", Vec::new(), None, false)
     };
     let member_path =
-        super::member_path_call(ctx, &format!("{singular}_path"), member_arg);
+        super::member_path_call(ctx, &format!("{singular}_path"), member_arg.clone());
     let collection_helper = format!("{}_path", crate::lower::routes::collection_name(&singular, plural));
     let collection_path = send(
         Some(route_helpers()),
@@ -1249,6 +1263,7 @@ fn classify_form_with_components(
             },
         ),
     };
+    let action = sti_action(ctx, &model, &singular, &persisted, &member_arg, action);
     // An explicit `method:` wins (Rails honors it verbatim); otherwise
     // the resource convention — PATCH for a persisted record, POST for a
     // new one. Feeds both the `<form>`'s `_method` override and
@@ -1272,6 +1287,41 @@ fn classify_form_with_components(
         opts_entries,
         id_prefix: namespace.unwrap_or_default(),
     })
+}
+
+/// Rails routes `form_with model: record` through the record's CLASS
+/// (`polymorphic_path`): a new `Rooms::Open` posts to `rooms_opens_path`,
+/// a persisted one to `rooms_open_path(id)`. A record typed as the
+/// subclass takes its routes directly; one typed as an STI base asks
+/// `dom_prefix` at run time, one arm per subclass the routes declare,
+/// the base action last (as `tag_builder` does for `link_to [:edit, @room]`).
+fn sti_action(ctx: &ViewCtx, record: &Expr, singular: &str, persisted: &Expr, member_arg: &Expr, base: Expr) -> Expr {
+    let has = |n: &str| ctx.route_helper_names.contains(n);
+    let arm = |stem: &str| {
+        let member_name = format!("{stem}_path");
+        let collection_name = format!("{}_path", crate::lower::routes::collection_name(stem, &crate::naming::pluralize_snake(stem)));
+        let member = has(&member_name).then(|| super::member_path_call(ctx, &member_name, member_arg.clone()));
+        let collection = has(&collection_name).then(|| super::route_helpers_call(&collection_name, Vec::new()));
+        match (member, collection) {
+            (Some(m), Some(c)) => Some(Expr::new(Span::synthetic(), ExprNode::If { cond: persisted.clone(), then_branch: m, else_branch: c })),
+            (m, c) => m.or(c),
+        }
+    };
+    if let Some(crate::ty::Ty::Class { id, .. }) = record.ty.as_ref().map(crate::ty::Ty::peel_nilable) {
+        let stem = crate::lower::tag_builder::class_route_stem(id.0.as_str());
+        if stem != singular && ctx.sti_route_stems.values().any(|stems| stems.contains(&stem)) {
+            return arm(&stem).unwrap_or(base);
+        }
+    }
+    let Some(stems) = ctx.sti_route_stems.get(singular) else { return base };
+    let mut dispatch = base;
+    for stem in stems.iter().rev() {
+        let Some(arm) = arm(stem) else { continue };
+        let prefix = send(Some(record.clone()), "dom_prefix", Vec::new(), None, true);
+        let cond = send(Some(prefix), "==", vec![lit_str(stem.clone())], None, false);
+        dispatch = Expr::new(Span::synthetic(), ExprNode::If { cond, then_branch: arm, else_branch: dispatch });
+    }
+    dispatch
 }
 
 /// The typed record class used for metadata, independent of its field prefix.
@@ -1303,6 +1353,29 @@ pub(super) fn form_model_class(model: &Expr, parameter: &str, ctx: &ViewCtx) -> 
 /// falls back to the directory singular when the record's type isn't a
 /// known model — that fallback is the whole pre-existing behavior, so an
 /// untyped record is no worse off than before.
+/// The model expression is a record of a model the view's ivar-type map
+/// knows (an ivar, local or bare reader), so `persisted?` is defined on
+/// it. A constructed `X.new` is never persisted and form objects aren't
+/// known models, so both keep the POST default.
+fn is_known_model_record(model: &Expr, ctx: &ViewCtx) -> bool {
+    let name = match &*model.node {
+        ExprNode::Var { name, .. } | ExprNode::Ivar { name } => name.as_str(),
+        ExprNode::Send { recv: None, method, args, block: None, .. } if args.is_empty() => {
+            method.as_str()
+        }
+        _ => return false,
+    };
+    // The expression's own type first: a local can share a name with a model ivar and hold a form object.
+    if let Some(crate::ty::Ty::Class { id, .. }) = model.ty.as_ref().map(crate::ty::Ty::peel_nilable) {
+        // An STI subclass is a library class, so its own key is not among the models'.
+        let stem = crate::lower::tag_builder::class_route_stem(id.0.as_str());
+        return ctx.model_param_keys.get(id.0.as_str()).is_some_and(|key| ctx.model_singulars.contains(key))
+            || ctx.sti_route_stems.values().any(|stems| stems.contains(&stem));
+    }
+    // Not every typed ivar: a form object (`SearchForm`) has no `persisted?`, and keeps POST as in Rails.
+    ctx.ivar_models.get(name).is_some_and(|key| ctx.model_singulars.contains(key))
+}
+
 fn record_model_name(model: &Expr, ctx: &ViewCtx, fallback: &str) -> String {
     // `model: Message.new` — a record CONSTRUCTED in the form call,
     // which is what a form for a not-yet-persisted resource looks like
@@ -1833,6 +1906,7 @@ mod tests {
             ),
             model_lineage: Default::default(),
             slug_models: Default::default(),
+            sti_route_stems: Default::default(),
             bool_readers: Default::default(),
             time_columns: Default::default(),
             store_readers: Default::default(),

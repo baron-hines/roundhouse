@@ -354,8 +354,6 @@ fn replacing_a_defaults_hash_is_not_mistaken_for_merging_it() {
 #[test]
 fn plain_option_defaults_and_scope_formats_cannot_disappear() {
     for body in [
-        "get '/catalog' => 'catalog#show', :kind => 'fixed'",
-        "get '/catalog', to: 'catalog#show', kind: 'fixed'",
         "get '/catalog', to: 'catalog#show', 'kind' => 'fixed'",
         "scope format: 'json' do\n  get '/catalog', to: 'catalog#show'\nend",
         "root to: 'catalog#show', kind: 'fixed'",

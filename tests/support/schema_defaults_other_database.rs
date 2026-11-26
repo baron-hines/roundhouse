@@ -19,7 +19,7 @@ fn notes_schema(column: &str) -> String {
 /// column each sets.
 const DUMPED: &[(&str, &str, &str)] = &[
     ("    t.uuid \"uuid\", default: -> { \"gen_random_uuid()\" }, null: false", "uuid", "gen_random_uuid()"),
-    ("    t.datetime \"seen_at\", default: -> { \"now()\" }", "seen_at", "now()"),
+    ("    t.datetime \"seen_at\", default: -> { \"statement_timestamp()\" }", "seen_at", "statement_timestamp()"),
     ("    t.date \"day\", default: -> { \"('now'::text)::date\" }", "day", "('now'::text)::date"),
 ];
 
@@ -129,7 +129,7 @@ fn other_database_migrations_leave_out_function_defaults() {
     let migration = concat!(
         "class CreateNotes < ActiveRecord::Migration[8.1]\n  def change\n",
         "    create_table :notes do |t|\n      t.uuid :uuid, default: -> { \"gen_random_uuid()\" }, null: false\n      t.string :token, default: \"x\"\n    end\n",
-        "    add_column :notes, :seen_at, :datetime, default: -> { \"now()\" }\n",
+        "    add_column :notes, :seen_at, :datetime, default: -> { \"statement_timestamp()\" }\n",
         "    change_column_default :notes, :token, from: \"x\", to: -> { \"md5(random()::text)\" }\n",
         "    change_column :notes, :seen_at, :datetime, default: -> { \"clock_timestamp()\" }\n",
         "  end\nend\n",
@@ -142,7 +142,7 @@ fn other_database_migrations_leave_out_function_defaults() {
     }
     assert!(!column(&schema, "uuid").nullable);
     assert_eq!(warnings.len(), 4, "{warnings:#?}");
-    for sql in ["gen_random_uuid()", "now()", "md5(random()::text)", "clock_timestamp()"] {
+    for sql in ["gen_random_uuid()", "statement_timestamp()", "md5(random()::text)", "clock_timestamp()"] {
         assert_eq!(warnings.iter().filter(|w| w.contains(&format!("`{sql}`"))).count(), 1, "{sql}: {warnings:#?}");
         assert!(!ddl.contains(sql), "{ddl}");
     }
@@ -151,4 +151,50 @@ fn other_database_migrations_leave_out_function_defaults() {
         files.extend(database.map(|d| ("config/database.yml", d)));
         assert!(ingest(&files).unwrap_err().contains("default for notes.uuid"), "{database:?}");
     }
+}
+
+/// `now()` is no function default to leave out: a PostgreSQL app's is CURRENT_TIMESTAMP, the clock the emitted SQLite
+/// table applies, and a SQLite app's DDL keeps the text, as Rails' table on SQLite takes it (and an insert relying on
+/// it fails there). `config/database.yml.sample` names the database where the app ships no `database.yml`
+/// (lobsters'); with neither, the refusal stays.
+#[test]
+fn a_now_default_follows_the_app_s_database() {
+    let schema = notes_schema("    t.datetime \"seen_at\", default: -> { \"now()\" }, null: false");
+    let (ingested, warnings, ddl) = ingest(&[("db/schema.rb", &schema), ("config/database.yml", POSTGRES)]).unwrap();
+    assert_eq!(column(&ingested, "seen_at").default_expression.as_deref(), Some("CURRENT_TIMESTAMP"));
+    assert!(warnings.is_empty(), "{warnings:#?}");
+    assert!(ddl.contains("DEFAULT (CURRENT_TIMESTAMP)"), "{ddl}");
+    for config in ["config/database.yml", "config/database.yml.sample"] {
+        let (ingested, warnings, ddl) = ingest(&[("db/schema.rb", &schema), (config, SQLITE)]).unwrap();
+        assert_eq!(column(&ingested, "seen_at").default_expression.as_deref(), Some("now()"), "{config}");
+        assert!(warnings.is_empty(), "{config}: {warnings:#?}");
+        assert!(ddl.contains("DEFAULT (now())"), "{config}: {ddl}");
+    }
+    let (code, err) = check("--strict", &schema, None);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("line 5: default for notes.seen_at: SQL defaults require"), "{err}");
+}
+
+/// The emitted SQLite app takes a SQLite app's `now()` table as Rails does: a row that gives the column is stored,
+/// and one that relies on the default fails on SQLite's missing `now()`, as Rails' insert there does.
+#[test]
+fn a_sqlite_app_s_now_default_fails_only_where_an_insert_relies_on_it() {
+    let schema = "ActiveRecord::Schema[8.1].define(version: 2026_01_01_000000) do\n  create_table \"notes\", force: :cascade do |t|\n    t.datetime \"seen_at\", default: -> { \"now()\" }, null: false\n    t.string \"title\"\n  end\nend\n";
+    emit_and_run::empty_app()
+        .write("db/schema.rb", schema)
+        .write("config/database.yml.sample", SQLITE)
+        .write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n")
+        .write("app/models/note.rb", "class Note < ApplicationRecord\nend\n")
+        .write("config/routes.rb", "Rails.application.routes.draw do\nend\n")
+        .run_ruby(r##"Note.create!(title: "given", seen_at: Time.now)
+raise "the given row: #{Note.count}" unless Note.count == 1
+begin
+  Note.create!(title: "defaulted")
+  raise "an insert relying on now() was stored"
+rescue StandardError => e
+  raise "not SQLite's missing now(): #{e.class}: #{e.message}" unless e.message.include?("now")
+end
+puts "now default passed"
+"##)
+        .assert_passes();
 }

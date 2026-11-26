@@ -80,6 +80,9 @@ mod boot_program;
 mod engine_config;
 mod engine_helpers;
 mod interpolated_renders;
+mod controller_csp;
+mod simple_format_sanitize;
+mod render_layout_choice;
 mod container_specialize;
 mod controller_class_methods;
 mod controller_delegates;
@@ -108,6 +111,8 @@ pub mod invisible_captcha;
 pub mod generated_helpers;
 pub mod jbuilder;
 pub mod library_class;
+mod top_level_mixins;
+mod platform_guards;
 mod file_program;
 pub(crate) use file_program::{normalize_source, resolve_gem_require};
 pub(crate) fn source_gems_mount() -> &'static str {

@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test'
-import { signIn, watchForFailures, triage, report } from './helpers.js'
+import { watchForFailures, triage, report } from './helpers.js'
 
 // The first campfire browser spec, and deliberately the least clever
 // one: it asserts that nothing 404s and nothing throws. No layout, no
@@ -22,12 +22,26 @@ import { signIn, watchForFailures, triage, report } from './helpers.js'
 // is a string in `config/importmap.rb`, and nothing but a browser ever
 // checks that a file exists behind it.
 
-test('the sign-in page and the room page load with nothing missing and nothing thrown', async ({ page }) => {
+// Its own signed-out context: the config's shared session would skip the sign-in page, and its assets with it.
+test('the sign-in page loads with nothing missing and nothing thrown', async ({ browser }) => {
+  const context = await browser.newContext({ storageState: { cookies: [], origins: [] } })
+  const page = await context.newPage()
+  try {
+    const findings = watchForFailures(page)
+    await page.goto('/session/new')
+    await page.waitForLoadState('load')
+    const { open } = triage([...findings.responses, ...findings.failed, ...findings.console, ...findings.errors])
+    expect(open, `the browser reported ${open.length} unledgered failure(s):\n${report(findings)}`).toEqual([])
+  } finally {
+    await context.close()
+  }
+})
+
+test('the room page loads with nothing missing and nothing thrown', async ({ page }) => {
   // BEFORE the first navigation — a listener attached after `goto`
   // misses everything the document itself pulled in.
   const findings = watchForFailures(page)
 
-  await signIn(page)
   await page.goto('/rooms/1')
 
   // Give the module graph a bounded window to finish resolving. NOT a
@@ -65,7 +79,6 @@ test('the sign-in page and the room page load with nothing missing and nothing t
 // still boot no JavaScript at all — which is what "unstyled at 200"
 // looked like from the outside for the whole of this app's history.
 test('the room page boots its client: Turbo connects and Stimulus is mounted', async ({ page }) => {
-  await signIn(page)
   await page.goto('/rooms/1')
 
   // Campfire's own system-test helper waits for exactly this, and for a
