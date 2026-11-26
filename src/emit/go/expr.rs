@@ -508,7 +508,7 @@ pub(super) fn emit_expr(ctx: &EmitCtx, e: &Expr) -> String {
                 }
                 // A nullable column's pointer field: nil takes the fallback,
                 // any stored value (0 included) is itself, as in Ruby.
-                if let Some(ptr) = nullable_field_go_ty(left)
+                if let Some(ptr) = nullable_read_go_ty(left)
                     && let Some(scalar) = ptr.strip_prefix('*')
                     && primitive_kind(&right.ty)
                 {
