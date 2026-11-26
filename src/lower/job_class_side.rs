@@ -289,7 +289,7 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
             }
         }
         // Sidekiq reads an ActiveJob job's blocks through its wrapper (`delay_for`'s `msg["wrapped"]`), which the worker doesn't yet.
-        if sidekiq && !is_worker {
+        if sidekiq && !is_worker && adapters.get(lc.name.0.as_str()).and_then(|a| a.as_deref()).is_none_or(|a| a == "sidekiq") {
             for call in &lc.unknown_calls {
                 if let ExprNode::Send { recv: None, method, .. } = &*call.node
                     && matches!(method.as_str(), "sidekiq_retry_in" | "sidekiq_retries_exhausted")

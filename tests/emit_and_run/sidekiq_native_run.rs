@@ -217,3 +217,14 @@ fn an_active_job_retry_block_is_an_error() {
         .emit(BuildTarget::Ruby);
     assert!(errors.iter().any(|e| e.contains("isn't called by Roundhouse's Sidekiq worker")), "{errors:#?}");
 }
+
+/// A hook works on the message that is written, as `JobRetry` passes its
+/// `msg`: a `retry_in` that moves the job to another queue moves the retry.
+#[test]
+fn a_hooks_change_to_the_message_is_written() {
+    let worker = "class ArgsWorker\n  include Sidekiq::Job\n  sidekiq_options retry: 3\n  sidekiq_retry_in do |count, exception, msg|\n    msg[\"queue\"] = \"low\"\n    30\n  end\n\n  def perform(id, name, opts = {}, list = [], flag = nil)\n    raise ArgumentError, \"no\"\n  end\nend\n";
+    let script = "WRITES = [\"\"]\nWRITES.clear\nmodule SidekiqWorker\n  def self.write_retry(at, json)\n    WRITES << json\n    nil\n  end\nend\nActiveJob.register_drain\nSidekiqPush.start_recording\nArticle.enqueue_native\nraw = SidekiqPush.recorded.find { |l| l.start_with?(\"lpush queue:default \") }.sub(\"lpush queue:default \", \"\")\nSidekiqPush.stop_recording\nSidekiqWorker.run(\"default\", raw)\nraise WRITES.inspect unless WRITES.length == 1 && JSON.parse(WRITES[0])[\"queue\"] == \"low\"\nputs \"hook change written\"\n";
+    let run = on_sidekiq(worker, CALLS).run_ruby(script);
+    run.assert_passes();
+    assert!(run.stdout.contains("hook change written"), "{}", run.stdout);
+}

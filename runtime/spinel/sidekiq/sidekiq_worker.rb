@@ -488,6 +488,10 @@ module SidekiqWorker
       end
     rescue StandardError => e
       fail_native(env, raw, queue, label, e, started)
+    rescue Exception => e
+      # Not a shutdown: JobRetry#global retries any other Exception, with no worker for the hooks.
+      raise e if e.is_a?(SignalException) || e.is_a?(SystemExit)
+      fail_job(env, raw, queue, label, e.class.name.to_s, e.message, started)
     end
     nil
   end
@@ -506,30 +510,38 @@ module SidekiqWorker
     count = SidekiqEnvelope.next_retry_count(env)
     failed = SidekiqEnvelope.with_error(raw, queue, error_class, e.message, now)
     worker = SidekiqEnvelope.klass(env)
+    # One message through both hooks, as JobRetry passes its msg: what a hook changes is what gets written.
+    msg = JSON.parse(failed)
     if SidekiqEnvelope.exhausted?(env, count, max_retries, now)
-      exhaust_native(env, worker, failed, e, label)
+      exhaust_native(worker, failed, msg, e, label)
       return nil
     end
-    choice = JobRegistry.native_retry_in(worker, count, e, JSON.parse(failed))
+    choice = JobRegistry.native_retry_in(worker, count, e, msg)
     if choice == -1
       log("INFO", label + " discarded: sidekiq_retry_in")
     elsif choice == -2
-      exhaust_native(env, worker, failed, e, label)
+      exhaust_native(worker, failed, msg, e, label)
     else
       delay = choice > 0 ? choice : count**4 + 15
-      write_retry(Time.now.to_f + delay + rand(10 * (count + 1)), failed)
+      write_retry(Time.now.to_f + delay + rand(10 * (count + 1)), as_changed(failed, msg))
     end
     nil
   end
 
-  def self.exhaust_native(env, worker, failed, e, label)
-    discarded = JobRegistry.native_retries_exhausted(worker, JSON.parse(failed), e)
-    if discarded || SidekiqEnvelope.discard_when_exhausted?(env)
+  def self.exhaust_native(worker, failed, msg, e, label)
+    discarded = JobRegistry.native_retries_exhausted(worker, msg, e)
+    if discarded || SidekiqEnvelope.discard_when_exhausted?(msg)
       log("INFO", label + " discarded: retries exhausted")
     else
-      write_dead(failed)
+      write_dead(as_changed(failed, msg))
     end
     nil
+  end
+
+  # `failed`'s own bytes unless a hook changed the message: those are Sidekiq's, key for key.
+  def self.as_changed(failed, msg)
+    now = JSON.generate(msg)
+    now == JSON.generate(JSON.parse(failed)) ? failed : now
   end
 
   # Sidekiq's retry rules for a job that failed (`JobRetry#process_retry`).

@@ -1301,6 +1301,7 @@ fn join(a: NativeCodec, b: NativeCodec) -> Option<NativeCodec> {
         }
         (Null, Nullable(x)) | (Nullable(x), Null) => Nullable(x),
         (Null, x) | (x, Null) => Nullable(Box::new(x)),
+        (Nullable(x), Nullable(y)) => Nullable(Box::new(join(*x, *y)?)),
         (Nullable(x), y) | (y, Nullable(x)) => Nullable(Box::new(join(*x, y)?)),
         (Array(x), Array(y)) => Array(Box::new(join(*x, *y)?)),
         (Hash(x), Hash(y)) => Hash(Box::new(join(*x, *y)?)),
@@ -1330,7 +1331,7 @@ pub fn apply_ruby(lcs: &mut [LibraryClass], app: &App) {
     for lc in lcs.iter_mut() {
         let Some(plan) = app.native_plans.iter().find(|p| p.worker == lc.name.0.as_str()) else { continue };
         if plan.is_payload() && unreadable(plan).is_none() {
-            add_jid_accessor(lc);
+            add_jid_accessor(lc, app);
         }
         for m in lc.methods.iter_mut() {
             if m.receiver == MethodReceiver::Class
@@ -1586,8 +1587,11 @@ pub fn take_retry_blocks(lc: &mut LibraryClass) -> Vec<Expr> {
 
 /// `Sidekiq::Job`'s `jid` / `jid=`, which `perform_native` sets before
 /// `perform` as Sidekiq's processor does. One the worker writes stays.
-fn add_jid_accessor(lc: &mut LibraryClass) {
-    let has = |lc: &LibraryClass, n: &str| lc.methods.iter().any(|m| m.receiver == MethodReceiver::Instance && m.name.as_str() == n);
+fn add_jid_accessor(lc: &mut LibraryClass, app: &App) {
+    let has = |lc: &LibraryClass, n: &str| {
+        lc.methods.iter().any(|m| m.receiver == MethodReceiver::Instance && m.name.as_str() == n)
+            || ancestry(app, lc).iter().any(|c| c.methods.iter().any(|m| m.receiver == MethodReceiver::Instance && m.name.as_str() == n))
+    };
     let span = Span::synthetic();
     let method = |name: &str, params: Vec<crate::dialect::Param>, body: Expr, kind: crate::dialect::AccessorKind, ret: Ty| MethodDef {
         visibility: crate::dialect::MethodVisibility::Public,
