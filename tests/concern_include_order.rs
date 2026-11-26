@@ -624,3 +624,61 @@ fn a_hook_def_stays_below_a_later_reader_of_its_block() {
         "null",
     );
 }
+
+/// HookReopen with `hook2` and `ordinary2`: a second concern whose hook
+/// `label` a later opening's ordinary `label` shadows.
+const HOOK_REOPEN2: (&str, &str) = (
+    "hook_reopen2",
+    "module HookReopen2\n  extend ActiveSupport::Concern\n\n  included do\n    def label\n      \"hook2\"\n    end\n  end\nend\n\nmodule HookReopen2\n  def label\n    \"ordinary2\"\n  end\nend\n",
+);
+
+/// The body line of each `def label` the Spinel emit gives the lib/ class
+/// in `file`.
+fn lib_label_bodies(concerns: &[(&str, &str)], libs: &[(&str, &str)], file: &str) -> Vec<String> {
+    let mut app = emit_and_run::empty_app()
+        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::API\nend\n");
+    for (name, source) in concerns {
+        app = app.write(&format!("app/controllers/concerns/{name}.rb"), source);
+    }
+    for (name, source) in libs {
+        app = app.write(&format!("lib/{name}.rb"), source);
+    }
+    let (emitted, errors) = app.emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let class = std::fs::read_to_string(emitted.join(format!("app/models/{file}.rb"))).unwrap();
+    let lines: Vec<&str> = class.lines().filter(|l| !l.starts_with("#<SPINEL_SOURCE>")).map(str::trim).collect();
+    (0..lines.len()).filter(|&i| lines[i] == "def label").map(|i| lines[i + 1].to_string()).collect()
+}
+
+/// Both hooks define `label` on the class, in the order the includes run,
+/// so the last one's stands over both modules' own (#2278). Within one
+/// `include A, B`, B is included first, so A's hook runs last.
+#[test]
+fn a_lib_class_takes_the_last_hooks_def_of_two() {
+    for (includes, want) in [
+        ("  include HookReopen\n  include HookReopen2\n", "\"hook2\""),
+        ("  include HookReopen2\n  include HookReopen\n", "\"hook\""),
+        ("  include HookReopen, HookReopen2\n", "\"hook\""),
+    ] {
+        let libs = [("two_hook_parent", format!("class TwoHookParent < ApplicationController\n{includes}end\n"))];
+        let libs: Vec<(&str, &str)> = libs.iter().map(|(f, s)| (*f, s.as_str())).collect();
+        assert_eq!(lib_label_bodies(&[HOOK_REOPEN, HOOK_REOPEN2], &libs, "two_hook_parent"), [want], "{includes:?}");
+        lib_case(&[HOOK_REOPEN, HOOK_REOPEN2], &libs, "TwoHookParent", want);
+    }
+}
+
+/// The block's `def label` comes after its `attr_reader :label` and replaces
+/// the reader on the includer, whether or not a later opening's ordinary
+/// `label` shadows it on the module (#2278).
+#[test]
+fn a_hook_def_below_its_reader_stands() {
+    let hook = "module HookReaderFirst\n  extend ActiveSupport::Concern\n\n  included do\n    attr_reader :label\n    def label\n      \"hook\"\n    end\n  end\nend\n";
+    let reopened = format!("{hook}\nmodule HookReaderFirst\n  def label\n    \"ordinary\"\n  end\nend\n");
+    for source in [reopened.as_str(), hook] {
+        let concern = ("hook_reader_first", source);
+        let libs = [("reader_first_parent", "class ReaderFirstParent < ApplicationController\n  include HookReaderFirst\nend\n")];
+        assert_eq!(lib_label_bodies(&[concern], &libs, "reader_first_parent"), ["\"hook\""], "{source}");
+        lib_case(&[concern], &libs, "ReaderFirstParent", "\"hook\"");
+    }
+}
+

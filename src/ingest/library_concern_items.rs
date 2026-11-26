@@ -82,9 +82,20 @@ pub(super) fn splice(app: &mut App) {
         let openings_of_class = || app.library_classes.iter().filter(|c| !c.is_module && c.name == *class);
         let earlier: Vec<&ClassId> =
             app.library_classes[..i].iter().filter(|c| !c.is_module && c.name == *class).flat_map(|c| c.includes.iter()).collect();
-        // The last hook def of each name per module, and whether the module's
-        // own def of the name shadows it.
-        let mut ran: Vec<(&MethodDef, bool)> = Vec::new();
+        // Where a direct include runs its hook: statement order, and within
+        // one `include A, B` the last argument first. A module a hook includes
+        // runs at a point not read here.
+        let direct = &app.library_classes[i];
+        let run_at = |module: &ClassId| {
+            if direct.include_spans.len() != direct.includes.len() {
+                return None;
+            }
+            direct.includes.iter().enumerate().filter(|(_, m)| *m == module).map(|(k, _)| (direct.include_spans[k].start, std::cmp::Reverse(k))).max()
+        };
+        // The last hook def of each name per module, whether the module's own
+        // def of the name shadows it, and whether the block declares a reader
+        // of the name above it.
+        let mut ran: Vec<(&MethodDef, bool, &ClassId, bool)> = Vec::new();
         let mut seen: Vec<&ClassId> = Vec::new();
         for module in includes.iter().filter(|m| !inherited.contains(*m) && !earlier.contains(m)) {
             if seen.contains(&module) {
@@ -102,18 +113,25 @@ pub(super) fn splice(app: &mut App) {
                 .collect();
             for (at, def) in hooked.iter().enumerate() {
                 if !hooked[at + 1..].iter().any(|later| later.name == def.name) {
-                    ran.push((*def, own.contains(&&def.name)));
+                    ran.push((*def, own.contains(&&def.name), module, reader_above(app, module, def)));
                 }
             }
         }
-        let mut hook_defs: Vec<MethodDef> = Vec::new();
-        for (def, shadowed) in &ran {
-            // Of two hooks that define the name, the one that runs last wins,
-            // an order not read here: those stay as the modules have them.
-            let alone = ran.iter().filter(|(d, _)| d.name == def.name).count() == 1;
+        let mut hook_defs: Vec<(MethodDef, bool)> = Vec::new();
+        for (def, shadowed, module, reader) in &ran {
+            // Of two hooks that define the name, the one that runs last wins.
+            // When one of them runs at a point not read, they stay as the
+            // modules have them.
+            let rivals: Option<Vec<_>> = ran.iter().filter(|r| r.0.name == def.name).map(|r| run_at(r.2)).collect();
+            let last = match rivals {
+                Some(at) if at.len() > 1 => at.into_iter().max() == run_at(module),
+                _ => ran.iter().filter(|r| r.0.name == def.name).count() == 1,
+            };
             let written = openings_of_class().flat_map(|c| &c.methods).any(|m| m.receiver == MethodReceiver::Instance && m.name == def.name);
-            if *shadowed && alone && !written {
-                hook_defs.push((*def).clone());
+            // A def below the block's own reader replaces it on the includer,
+            // where the module's def would stand behind the reader.
+            if (*shadowed || *reader) && last && !written {
+                hook_defs.push(((*def).clone(), *reader));
             }
         }
         let lc = &mut app.library_classes[i];
@@ -157,8 +175,12 @@ pub(super) fn splice(app: &mut App) {
             }
         }
         // After the block's accessors: an `attr_reader` the block declares
-        // after its def replaces the def on the includer, as it does here.
-        for def in hook_defs {
+        // after its def replaces the def on the includer, as it does here,
+        // and one declared above the def gives way to it.
+        for (def, below_reader) in hook_defs {
+            if below_reader {
+                lc.methods.retain(|m| !(m.receiver == MethodReceiver::Instance && m.name == def.name));
+            }
             if !lc.methods.iter().any(|m| m.receiver == MethodReceiver::Instance && m.name == def.name) {
                 lc.methods.push(def);
             }
@@ -177,6 +199,29 @@ pub(super) fn in_included_hook(lc: &LibraryClass, m: &MethodDef) -> bool {
                 && call.span.start <= at.start
                 && at.end <= call.span.end
         })
+}
+
+/// Whether the `included` block that writes `def` declares a reader of its
+/// name (`attr_reader` or `attr_accessor`) above it.
+fn reader_above(app: &App, module: &ClassId, def: &MethodDef) -> bool {
+    let at = def.name_span;
+    let Some(block) = app.library_classes.iter().filter(|o| o.is_module && o.name == *module).flat_map(|o| &o.unknown_calls).find_map(|call| {
+        let hook = matches!(&*call.node, ExprNode::Send { recv, method, block: Some(_), .. }
+            if method.as_str() == "included" && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)));
+        (hook && call.span.file == at.file && call.span.start <= at.start && at.end <= call.span.end).then_some(call.span)
+    }) else {
+        return false;
+    };
+    let items = app.concern_model_items.get(module).into_iter().flatten();
+    items.into_iter().any(|item| {
+        let ModelBodyItem::Unknown { expr, .. } = item else { return false };
+        let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node else { return false };
+        matches!(method.as_str(), "attr_reader" | "attr_accessor")
+            && args.iter().any(|a| matches!(&*a.node, ExprNode::Lit { value: Literal::Sym { value } } if *value == def.name))
+            && expr.span.file == block.file
+            && block.start <= expr.span.start
+            && expr.span.end <= at.start
+    })
 }
 
 /// The modules the classes above `parent` and `parent` itself include, with
