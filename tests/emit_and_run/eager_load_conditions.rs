@@ -9,7 +9,7 @@ mod prerequisite;
 
 use super::emit_and_run;
 
-const FEED: &str = r#"class Feed
+const FEED: &str = r##"class Feed
   def by_association
     Comment.order(:id).includes(:article).where(article: { title: "First" }).map(&:commenter)
   end
@@ -44,6 +44,15 @@ const FEED: &str = r#"class Feed
     ["refused"]
   end
 
+  def rewritten
+    count = Comment.includes(:article).references(:articles).where("articles.title = ?", "First").update_all(body: "seen")
+    "#{count}:#{Comment.where(body: "seen").count}"
+  end
+
+  def removed
+    Comment.includes(:article).where("articles.title = ?", "Second").merge(Comment.references(:articles)).delete_all
+  end
+
   def split
     Comment.order(:id)
       .then { |comments| preload(comments) }
@@ -61,7 +70,7 @@ const FEED: &str = r#"class Feed
     comments.where(article: { title: "First" })
   end
 end
-"#;
+"##;
 
 fn app() -> emit_and_run::Overlay {
     emit_and_run::real_blog()
@@ -69,7 +78,7 @@ fn app() -> emit_and_run::Overlay {
         .write("app/models/feed.rb", FEED)
         .write(
             "app/controllers/feeds_controller.rb",
-            "class FeedsController < ApplicationController\n  def index\n    feed = Feed.new\n    render plain: \"#{feed.by_association.join(\",\")} #{feed.by_table.join(\",\")} #{feed.split.join(\",\")} #{feed.joined.join(\",\")} #{feed.referenced.join(\",\")} #{feed.merged.join(\",\")} #{feed.anded.join(\",\")} #{feed.ored.join(\",\")} #{feed.unreferenced.join(\",\")}\"\n  end\nend\n",
+            "class FeedsController < ApplicationController\n  def index\n    feed = Feed.new\n    render plain: \"#{feed.by_association.join(\",\")} #{feed.by_table.join(\",\")} #{feed.split.join(\",\")} #{feed.joined.join(\",\")} #{feed.referenced.join(\",\")} #{feed.merged.join(\",\")} #{feed.anded.join(\",\")} #{feed.ored.join(\",\")} #{feed.unreferenced.join(\",\")} #{feed.rewritten} #{feed.removed}\"\n  end\nend\n",
         )
 }
 
@@ -80,7 +89,7 @@ Comment.create!(article: second, commenter: "Bob", body: "A comment")
 Comment.create!(article: first, commenter: "Cy", body: "A comment")
 "#;
 
-const EXPECTED: &str = "Ann,Cy Bob Ann,Cy Bob Ann,Cy Ann,Cy Bob Bob,Cy refused";
+const EXPECTED: &str = "Ann,Cy Bob Ann,Cy Bob Ann,Cy Ann,Cy Bob Bob,Cy refused 2:2 1";
 
 #[test]
 fn conditions_on_an_included_association_join_it() {
@@ -138,7 +147,7 @@ class Comment < ActiveRecord::Base
   belongs_to :article
 end
 {FEED}{SEED}feed = Feed.new
-print "#{{feed.by_association.join(",")}} #{{feed.by_table.join(",")}} #{{feed.split.join(",")}} #{{feed.joined.join(",")}} #{{feed.referenced.join(",")}} #{{feed.merged.join(",")}} #{{feed.anded.join(",")}} #{{feed.ored.join(",")}} #{{feed.unreferenced.join(",")}}"
+print "#{{feed.by_association.join(",")}} #{{feed.by_table.join(",")}} #{{feed.split.join(",")}} #{{feed.joined.join(",")}} #{{feed.referenced.join(",")}} #{{feed.merged.join(",")}} #{{feed.anded.join(",")}} #{{feed.ored.join(",")}} #{{feed.unreferenced.join(",")}} #{{feed.rewritten}} #{{feed.removed}}"
 "##
     );
     let output = std::process::Command::new("ruby").args(["-e", &script]).output().expect("Rails oracle");
