@@ -304,7 +304,9 @@ module Main
     # detaches a plain mutable Hash (callers write scratch keys the real
     # ENV would reject); params delegation gets the same merged hash the
     # controller sees.
-    env["RAW_POST_DATA"] = request.fetch(:raw_body, "")
+    raw_body = request.fetch(:raw_body, "")
+    # Not set when empty: an unread DELETE body must stay on the input stream for `request.body`.
+    env["RAW_POST_DATA"] = raw_body unless raw_body.empty?
     controller.request = ActionDispatch::Request.new(env.to_h, merged)
     # Not read back from the controller: Devise's FailureApp delegates `flash` to the request.
     controller.request.flash = flash

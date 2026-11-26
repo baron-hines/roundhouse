@@ -1339,7 +1339,10 @@ fn is_known_model_record(model: &Expr, ctx: &ViewCtx) -> bool {
     };
     // The expression's own type first: a local can share a name with a model ivar and hold a form object.
     if let Some(crate::ty::Ty::Class { id, .. }) = model.ty.as_ref().map(crate::ty::Ty::peel_nilable) {
-        return ctx.model_param_keys.get(id.0.as_str()).is_some_and(|key| ctx.model_singulars.contains(key));
+        // An STI subclass is a library class, so its own key is not among the models'.
+        let stem = crate::lower::tag_builder::class_route_stem(id.0.as_str());
+        return ctx.model_param_keys.get(id.0.as_str()).is_some_and(|key| ctx.model_singulars.contains(key))
+            || ctx.sti_route_stems.values().any(|stems| stems.contains(&stem));
     }
     // Not every typed ivar: a form object (`SearchForm`) has no `persisted?`, and keeps POST as in Rails.
     ctx.ivar_models.get(name).is_some_and(|key| ctx.model_singulars.contains(key))

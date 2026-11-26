@@ -18,14 +18,18 @@ fn sti_subclass_form_action_follows_the_records_class() {
         .edit(
             "config/routes.rb",
             "  resources :articles do",
-            "  namespace :articles do\n    resources :featureds, only: [:show, :new, :create]\n  end\n\n  resources :articles do",
+            "  namespace :articles do\n    resources :featureds, only: [:show, :new, :create, :edit]\n  end\n\n  resources :articles do",
         )
         .write("app/models/articles/featured.rb", "class Articles::Featured < Article\nend\n")
         .write(
             "app/controllers/articles/featureds_controller.rb",
-            "class Articles::FeaturedsController < ApplicationController\n  def show\n    head :ok\n  end\n\n  def new\n    @article = Articles::Featured.new\n  end\n\n  def create\n    head :ok\n  end\nend\n",
+            "class Articles::FeaturedsController < ApplicationController\n  def show\n    head :ok\n  end\n\n  def new\n    @article = Articles::Featured.new\n  end\n\n  def create\n    head :ok\n  end\n\n  def edit\n    @article = Articles::Featured.new(title: \"Saved\", body: \"A sufficiently long article body.\")\n    @article.save!\n  end\nend\n",
         )
         .write("app/views/articles/featureds/new.html.erb", "<%= render \"articles/form\", article: @article %>\n")
+        .write(
+            "app/views/articles/featureds/edit.html.erb",
+            "<%= form_with model: @article, url: \"/articles/#{@article.id}\" do |form| %><%= form.text_field :title %><% end %>\n",
+        )
         .run_ruby(
             r#"
 require "stringio"
@@ -54,6 +58,9 @@ raise "new plain article must post to /articles: #{html[/<form[^>]*>/]}" unless 
 status, html = get("/articles/featureds/new")
 raise "new featured #{status}" unless status == 200
 raise "new featured article must post to /articles/featureds: #{html[/<form[^>]*>/]}" unless html.include?(%(action="/articles/featureds"))
+status, html = get("/articles/featureds/#{featured.id}/edit")
+raise "featured edit with url: #{status}" unless status == 200
+raise "a persisted subclass record with url: must PATCH: #{html[/<form.*?<\/form>/m]}" unless html.include?(%(name="_method" value="patch"))
 puts "sti form routes OK"
 "#,
         )
