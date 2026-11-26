@@ -14029,8 +14029,9 @@ fn drop_facades_the_program_defines(files: &mut [(String, String)]) {
         })
         .flat_map(|(_, c)| c.lines().filter_map(top_name).collect::<Vec<_>>())
         .collect();
-    // The paths the gem's own top-level headers open, whole (`SVG::Graph::Graph`, `SVG`): one it declares itself needs no shell.
-    let declared: std::collections::BTreeSet<String> = files
+    // The paths the gem's own top-level headers open, whole (`SVG::Graph::Graph`, `SVG`), and how: a module, a class, or a
+    // class with a superclass.
+    let declared: std::collections::BTreeMap<String, &'static str> = files
         .iter()
         .filter(|(p, c)| {
             !p.starts_with("runtime/")
@@ -14039,17 +14040,33 @@ fn drop_facades_the_program_defines(files: &mut [(String, String)]) {
         })
         .flat_map(|(_, c)| {
             c.lines()
-                .filter_map(|l| l.strip_prefix("module ").or_else(|| l.strip_prefix("class ")))
-                .map(|rest| rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':').collect::<String>())
+                .filter_map(|l| {
+                    let (kind, rest) = match (l.strip_prefix("module "), l.strip_prefix("class ")) {
+                        (Some(rest), _) => ("module", rest),
+                        (_, Some(rest)) => ("class", rest),
+                        _ => return None,
+                    };
+                    let path: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':').collect();
+                    let kind = if kind == "class" && rest[path.len()..].trim_start().starts_with('<') { "subclass" } else { kind };
+                    Some((path, kind))
+                })
                 .collect::<Vec<_>>()
         })
-        .collect();
+        .fold(std::collections::BTreeMap::new(), |mut map, (path, kind)| {
+            // A class with a superclass in one header is that class in every other.
+            let entry = map.entry(path).or_insert(kind);
+            if kind == "subclass" || (kind == "class" && *entry == "module") {
+                *entry = kind;
+            }
+            map
+        });
     for (path, content) in files.iter_mut() {
         if path != "runtime/gem_facades.rb" && path != "runtime/gem_facades.rbs" {
             continue;
         }
         let lines: Vec<&str> = content.lines().collect();
         let mut keep = vec![true; lines.len()];
+        let mut replaced: std::collections::BTreeMap<usize, String> = std::collections::BTreeMap::new();
         let mut i = 0;
         while i < lines.len() {
             if top_name(lines[i]).is_some_and(|n| defined.contains(&n)) {
@@ -14078,11 +14095,22 @@ fn drop_facades_the_program_defines(files: &mut [(String, String)]) {
                         let close = (j + 1..=end).find(|&k| lines[k].trim_start() == "end" && indent_of(lines[k]) == indent).unwrap_or(end);
                         let name = trimmed["module ".len()..].trim().to_string();
                         let path = names.iter().cloned().chain(std::iter::once(name.clone())).collect::<Vec<_>>().join("::");
-                        // Not one the gem declares itself (`class SVG`): a `module` shell would reopen its class as a module.
-                        if !declared.contains(&path) && (j + 1..close).any(|k| declares(lines[k]) && indent_of(lines[k]) == indent + 2) {
+                        // The gem's own kind for a path it declares: a `module` shell would reopen its class as a module. Not a
+                        // class it gives a superclass: this file loads first, and a bare `class` here would be Object's.
+                        let header = match declared.get(&path).copied() {
+                            None | Some("module") => Some("module"),
+                            Some("class") => Some("class"),
+                            _ => None,
+                        };
+                        if let Some(header) = header
+                            && (j + 1..close).any(|k| declares(lines[k]) && indent_of(lines[k]) == indent + 2)
+                        {
                             open.push(indent);
-                            names.push(name);
+                            names.push(name.clone());
                             keep[j] = true;
+                            if header == "class" {
+                                replaced.insert(j, format!("{}class {name}", " ".repeat(indent)));
+                            }
                         }
                     } else if trimmed == "end" && open.last() == Some(&indent) {
                         open.pop();
@@ -14096,7 +14124,12 @@ fn drop_facades_the_program_defines(files: &mut [(String, String)]) {
             }
         }
         if keep.iter().any(|k| !k) {
-            let mut out: String = lines.iter().zip(&keep).filter(|(_, k)| **k).map(|(l, _)| format!("{l}\n")).collect();
+            let mut out: String = lines
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| keep[*j])
+                .map(|(j, l)| format!("{}\n", replaced.get(&j).map(String::as_str).unwrap_or(l)))
+                .collect();
             if !content.ends_with('\n') {
                 out.pop();
             }
@@ -17265,8 +17298,14 @@ mod tests {
         assert_eq!(files[0].1, "module GemFacade\nend\n\nmodule SVG\n  module Graph\n  end\nend\n\nmodule ROTP\nend\n\nmodule Mail\nend\n");
         // A gem that declares the namespace itself (`class SVG`) gets no `module` shell to reopen it as.
         declared[1].1 = "#<SPINEL_SOURCE>lobsters/.roundhouse/source_gems/svg-graph-2.2.2/lib/SVG.rb:1\nclass SVG\nend\nclass SVG::Graph::Graph\nend\n".to_string();
+        let mut subclassed = declared.clone();
         drop_facades_the_program_defines(&mut declared);
-        assert_eq!(declared[0].1, "module GemFacade\nend\n\n\nmodule ROTP\nend\n\nmodule Mail\nend\n");
+        // A class without a superclass keeps a `class` shell, so `SVG::Graph` still exists for the compound header.
+        assert_eq!(declared[0].1, "module GemFacade\nend\n\nclass SVG\n  module Graph\n  end\nend\n\nmodule ROTP\nend\n\nmodule Mail\nend\n");
+        // Not one with a superclass: this file loads before the gem, and a bare `class SVG` would make it Object's.
+        subclassed[1].1 = subclassed[1].1.replace("class SVG\n", "class SVG < Base\n");
+        drop_facades_the_program_defines(&mut subclassed);
+        assert_eq!(subclassed[0].1, "module GemFacade\nend\n\n\nmodule ROTP\nend\n\nmodule Mail\nend\n");
     }
 
     #[test]
