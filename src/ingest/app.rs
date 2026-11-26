@@ -6337,9 +6337,14 @@ fn splice_concerns_into_controllers(app: &mut App, resolver: &crate::analyze::Co
         // last; the chain used to list them the other way round.
         // Each module comes with the body index of the `include` that
         // registers it.
-        let filter_order: Vec<(usize, crate::ident::ClassId)> = statements
+        // A `prepend` runs the concern's `prepended do`, not its `included
+        // do`, so its filters are not registered (#2278).
+        let included_statements: Vec<&(usize, Vec<crate::ident::ClassId>)> =
+            statements.iter().filter(|(at, _)| !is_prepend(&controller.body[*at])).collect();
+        let included_groups: Vec<Vec<crate::ident::ClassId>> = included_statements.iter().map(|(_, group)| group.clone()).collect();
+        let filter_order: Vec<(usize, crate::ident::ClassId)> = included_statements
             .iter()
-            .zip(filter_registration_by_statement(&include_groups, &filter_edges))
+            .zip(filter_registration_by_statement(&included_groups, &filter_edges))
             .flat_map(|((at, _), modules)| modules.into_iter().map(move |module| (*at, module)))
             .collect();
         // Every module the controller reaches, nearest ancestor first:
