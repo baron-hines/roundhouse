@@ -45,13 +45,14 @@ pub fn lower_current_attributes(app: &mut crate::App) {
     let mut generated: Vec<(usize, Vec<MethodDef>)> = Vec::new();
     let mut lowered: Vec<ClassId> = Vec::new();
     let mut signatures: Vec<(ClassId, Symbol, crate::ty::Ty)> = Vec::new();
+    let mut refusals = Vec::new();
     for (i, lc) in app.library_classes.iter_mut().enumerate() {
         if lc.parent.as_ref().map(|p| p.0.as_str()) != Some(BASE) {
             continue;
         }
-        let (attrs, declared) = take_attribute_decls(lc);
+        let (attrs, declared, defaults) = take_attribute_decls(lc, &mut refusals);
         let delegates = take_delegate_decls(lc);
-        rewrite_super_writers(lc, &attrs);
+        rewrite_super_accessors(lc, &attrs);
         let src = synthesized_source(lc, &attrs, &delegates);
         // Isolated in its own `prism::scope` — never the outer one
         // that spans the whole app's ingest — so a bug in
@@ -63,6 +64,7 @@ pub fn lower_current_attributes(app: &mut crate::App) {
         let methods = match parsed {
             Ok(classes) if diags.is_empty() => {
                 let mut methods: Vec<MethodDef> = classes.into_iter().flat_map(|c| c.methods).collect();
+                place_defaults(&mut methods, &defaults);
                 for (name, signature) in declare_attribute_types(&mut methods, &declared) {
                     signatures.push((lc.name.clone(), name, signature));
                 }
@@ -100,6 +102,7 @@ pub fn lower_current_attributes(app: &mut crate::App) {
     // Extended, not replaced: a later pass (`acts_as_tenant`) lowers a
     // class it synthesizes the same way.
     app.current_attribute_classes.extend(lowered);
+    app.current_attribute_refusals.extend(refusals);
 }
 
 /// `attribute :session, :user, :request` — consumed, not replayed.
@@ -108,9 +111,10 @@ pub fn lower_current_attributes(app: &mut crate::App) {
 /// which ingest reads as a cast around the call: that type is returned
 /// with each name the call lists. Without unwrapping it the declaration was not taken,
 /// the class got no accessor, and `Current.tenant` had no method.
-fn take_attribute_decls(lc: &mut LibraryClass) -> (Vec<Symbol>, Vec<(Symbol, crate::ty::Ty)>) {
+fn take_attribute_decls(lc: &mut LibraryClass, refusals: &mut Vec<crate::diagnostic::Diagnostic>) -> (Vec<Symbol>, Vec<(Symbol, crate::ty::Ty)>, Vec<(Symbol, Expr)>) {
     let mut out = Vec::new();
     let mut declared = Vec::new();
+    let mut defaults = Vec::new();
     lc.unknown_calls.retain(|call| {
         let (call, declared_ty) = match &*call.node {
             ExprNode::Cast { value, target_ty } => (value, Some(target_ty)),
@@ -127,14 +131,83 @@ fn take_attribute_decls(lc: &mut LibraryClass) -> (Vec<Symbol>, Vec<(Symbol, cra
                 _ => None,
             })
             .collect();
+        let mut default = None;
+        for arg in args {
+            let ExprNode::Hash { entries, .. } = &*arg.node else { continue };
+            for (key, value) in entries {
+                let reproduced = matches!(&*key.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "default")
+                    .then(|| default_value(value))
+                    .flatten();
+                match reproduced {
+                    Some(value) => default = Some(value),
+                    // Consumed all the same: replayed on the now-plain class, the call would raise when it loads.
+                    None => refusals.push(crate::diagnostic::Diagnostic::unsupported(
+                        key.span,
+                        None,
+                        "CurrentAttributes attribute option",
+                        "only `default:` with a literal or a no-argument callable is reproduced; the attribute reads nil instead",
+                    )),
+                }
+            }
+        }
         if let Some(ty) = declared_ty {
             declared.extend(names.iter().map(|name| (name.clone(), ty.clone())));
+        }
+        if let Some(value) = default {
+            defaults.extend(names.iter().map(|name| (name.clone(), value.clone())));
         }
         out.extend(names);
         false
     });
-    (out, declared)
+    (out, declared, defaults)
 }
+
+/// What `resolve_defaults` assigns: a callable's result, or a fresh copy of a literal.
+/// A literal written in place is already fresh on each evaluation, which is Rails' `dup`.
+/// Anything else (a constant, a method call) has no `dup`-equivalent shape here.
+fn default_value(value: &Expr) -> Option<Expr> {
+    fn literal(e: &Expr) -> bool {
+        match &*e.node {
+            ExprNode::Lit { .. } => true,
+            ExprNode::Array { elements, .. } => elements.iter().all(literal),
+            ExprNode::Hash { entries, .. } => entries.iter().all(|(k, v)| literal(k) && literal(v)),
+            _ => false,
+        }
+    }
+    let nullary = |e: &Expr| match &*e.node {
+        ExprNode::Lambda { params, rest_param: None, extra_params, block_param: None, body, .. }
+            if params.is_empty() && extra_params.is_empty() => Some(body.clone()),
+        _ => None,
+    };
+    if literal(value) {
+        return Some(value.clone());
+    }
+    if let Some(body) = nullary(value) {
+        return Some(body);
+    }
+    match &*value.node {
+        ExprNode::Send { recv: None, method, args, block: Some(block), .. }
+            if args.is_empty() && matches!(method.as_str(), "proc" | "lambda") => nullary(block),
+        _ => None,
+    }
+}
+
+/// The synthesized `__reset_attributes` assigns nil; a declared default replaces that value.
+fn place_defaults(methods: &mut [MethodDef], defaults: &[(Symbol, Expr)]) {
+    let Some(reset) = methods.iter_mut().find(|m| m.receiver == MethodReceiver::Instance && m.name.as_str() == RESET_ATTRIBUTES) else { return };
+    fn visit(e: &mut Expr, defaults: &[(Symbol, Expr)]) {
+        if let ExprNode::Assign { target: crate::expr::LValue::Ivar { name }, value } = &mut *e.node {
+            if let Some((_, default)) = defaults.iter().find(|(a, _)| a == name) {
+                *value = default.clone();
+            }
+            return;
+        }
+        e.node.for_each_child_mut(&mut |c| visit(c, defaults));
+    }
+    visit(&mut reset.body, defaults);
+}
+
+const RESET_ATTRIBUTES: &str = "__reset_attributes";
 
 /// The synthesized reader answers, and the writer takes, an
 /// attribute's declared type, nilable: every attribute reads nil until
@@ -235,38 +308,63 @@ fn take_delegate_decls(lc: &mut LibraryClass) -> Vec<Delegation> {
     out
 }
 
-/// `super(value)` inside an app-written `<attr>=` is the generated
-/// storage write. Rewrite it in place so no superclass is needed.
-fn rewrite_super_writers(lc: &mut LibraryClass, attrs: &[Symbol]) {
+/// `super` inside an app-written `<attr>`, `<attr>=`, `reset` or
+/// `initialize` is the generated method it overrides: the storage read or
+/// write, or the defaults reset. Rewrite it in place so no superclass is needed.
+fn rewrite_super_accessors(lc: &mut LibraryClass, attrs: &[Symbol]) {
     for m in &mut lc.methods {
         if m.receiver != MethodReceiver::Instance {
             continue;
         }
-        let Some(attr) = m.name.as_str().strip_suffix('=') else { continue };
-        if !attrs.iter().any(|a| a.as_str() == attr) {
+        let name = m.name.as_str();
+        let target = if matches!(name, "reset" | "initialize") {
+            SuperTarget::Reset
+        } else if let Some(attr) = name.strip_suffix('=').filter(|a| attrs.iter().any(|x| x.as_str() == *a)) {
+            // A bare `super` forwards the writer's own parameter.
+            let param = m.params.first().map(|p| p.name.clone());
+            SuperTarget::Write(Symbol::from(attr), param)
+        } else if attrs.iter().any(|a| a.as_str() == name) {
+            SuperTarget::Read(Symbol::from(name))
+        } else {
             continue;
-        }
-        let ivar = Symbol::from(attr);
-        rewrite_super(&mut m.body, &ivar);
+        };
+        rewrite_super(&mut m.body, &target);
     }
 }
 
-fn rewrite_super(expr: &mut Expr, ivar: &Symbol) {
-    expr.node.for_each_child_mut(&mut |c| rewrite_super(c, ivar));
+enum SuperTarget {
+    Read(Symbol),
+    Write(Symbol, Option<Symbol>),
+    Reset,
+}
+
+fn rewrite_super(expr: &mut Expr, target: &SuperTarget) {
+    expr.node.for_each_child_mut(&mut |c| rewrite_super(c, target));
     let ExprNode::Super { args } = &*expr.node else { return };
-    // `super` with no argument list (`ZSuper`) forwards the method's own
-    // params; campfire writes the explicit `super(value)` form, and only
-    // that is reproduced — a bare `super` keeps its shape and stays
-    // visible rather than being guessed at.
-    let Some(value) = args.as_ref().and_then(|a| a.first()).cloned() else { return };
     let span = expr.span;
-    *expr = Expr::new(
-        span,
-        ExprNode::Assign {
-            target: crate::expr::LValue::Ivar { name: ivar.clone() },
-            value,
+    let node = match target {
+        SuperTarget::Read(ivar) if args.as_ref().is_none_or(|a| a.is_empty()) => ExprNode::Ivar { name: ivar.clone() },
+        SuperTarget::Write(ivar, param) => {
+            let value = match args {
+                Some(a) if a.len() == 1 => a[0].clone(),
+                None => match param {
+                    Some(p) => Expr::new(span, ExprNode::Var { id: crate::ident::VarId(0), name: p.clone() }),
+                    None => return,
+                },
+                _ => return,
+            };
+            ExprNode::Assign { target: crate::expr::LValue::Ivar { name: ivar.clone() }, value }
+        }
+        SuperTarget::Reset if args.as_ref().is_none_or(|a| a.is_empty()) => ExprNode::Send {
+            recv: None,
+            method: Symbol::from(RESET_ATTRIBUTES),
+            args: Vec::new(),
+            block: None,
+            parenthesized: false,
         },
-    );
+        _ => return,
+    };
+    *expr = Expr::new(span, node);
 }
 
 /// Build the synthesized half as Ruby and let ingest parse it, rather
@@ -306,9 +404,18 @@ fn synthesized_source(
     // reason: `Thread#[]` answers untyped, and a `nil?` test leaves it so.
     let key = format!("__current_attrs_{}", class.replace("::", "_"));
     body.push_str(&format!(
-        "  def self.instance\n    c = Thread.current[:{key}]\n    return c if c.is_a?({class})\n    c = {class}.new\n    Thread.current[:{key}] = c\n    c\n  end\n\n\
-         \x20 def self.reset\n    Thread.current[:{key}] = {class}.new\n    nil\n  end\n\n"
+        "  def self.instance\n    c = Thread.current[:{key}]\n    return c if c.is_a?({class})\n    c = {class}.new\n    Thread.current[:{key}] = c\n    c\n  end\n\n"
     ));
+    // Rails' `reset` keeps the instance and reassigns each attribute its default, without the app's writers.
+    let mut assigns: String = attrs.iter().map(|a| format!("    @{} = nil\n", a.as_str())).collect();
+    assigns.push_str("    nil\n");
+    body.push_str(&format!("  def {RESET_ATTRIBUTES}\n{assigns}  end\n\n"));
+    if !defines("initialize") {
+        body.push_str(&format!("  def initialize\n    {RESET_ATTRIBUTES}\n  end\n\n"));
+    }
+    if !defines("reset") {
+        body.push_str(&format!("  def reset\n    {RESET_ATTRIBUTES}\n  end\n\n"));
+    }
 
     for a in attrs {
         let a = a.as_str();
@@ -351,7 +458,7 @@ fn synthesized_source(
     // Class-level forwarders — the surface app code actually calls
     // (`Current.user`, `Current.account`). Rails gets these from
     // `method_missing`; a statically-resolved target needs them real.
-    let mut forwarded: Vec<String> = Vec::new();
+    let mut forwarded: Vec<String> = vec!["reset".to_string()];
     for a in attrs {
         forwarded.push(a.as_str().to_string());
         forwarded.push(format!("{}=", a.as_str()));
@@ -360,7 +467,7 @@ fn synthesized_source(
         forwarded.push(d.name.clone());
     }
     for m in &lc.methods {
-        if m.receiver == MethodReceiver::Instance {
+        if m.receiver == MethodReceiver::Instance && m.name.as_str() != "initialize" {
             forwarded.push(m.name.as_str().to_string());
         }
     }
