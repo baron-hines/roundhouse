@@ -708,3 +708,21 @@ fn a_prepend_runs_no_included_hook() {
     let lines = "  prepend DelegateOne\n  include PlainDef\n";
     single_case(&[delegate_one, PLAIN_DEF], lines, "label", "plain");
 }
+
+/// A prepend runs the concern's `prepended do`, not its `included do`, so
+/// no filter its `included do` declares is registered: `@ran` stays unset
+/// (#2278).
+#[test]
+fn a_prepend_registers_no_included_filter() {
+    let filter = ("hook_filter", "module HookFilter\n  extend ActiveSupport::Concern\n\n  included do\n    before_action :from_hook\n  end\n\n  def from_hook\n    @ran = \"ran\"\n  end\nend\n");
+    single_case(&[filter], "  prepend HookFilter\n", "(@ran || \"none\")", "none");
+    let around = ("hook_around", "module HookAround\n  extend ActiveSupport::Concern\n\n  included do\n    around_action :wrap\n  end\n\n  def wrap\n    @ran = \"around\"\n    yield\n  end\nend\n");
+    single_case(&[around], "  prepend HookAround\n", "(@ran || \"none\")", "none");
+    // Nothing observes an `after_action` in the response: the emitted
+    // controller registers none.
+    let after = ("hook_after", "module HookAfter\n  extend ActiveSupport::Concern\n\n  included do\n    after_action :after_hook\n  end\n\n  def after_hook\n    nil\n  end\nend\n");
+    let (emitted, errors) = single_app(&[after], "  prepend HookAfter\n", "(@ran || \"none\")").emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let controller = std::fs::read_to_string(emitted.join("app/controllers/single_controller.rb")).unwrap();
+    assert!(!controller.contains("self.after_hook"), "{controller}");
+}
