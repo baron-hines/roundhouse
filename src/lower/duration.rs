@@ -650,7 +650,7 @@ pub(crate) fn rewrite_durations(expr: &mut Expr, defined: &BTreeSet<String>) {
     let guarded = rewrite
         && matches!(&*expr.node, ExprNode::Send { recv: Some(r), method, .. }
             if !is_numeric_expr(r) && defined.contains(method.as_str()));
-    // Not read twice: a receiver that runs something (`fetch.seconds`) is bound once and both arms read the binding.
+    // Not read twice: a receiver that runs something (`fetch.seconds`) is bound once in the test and both arms read the binding.
     let bound = guarded.then(|| match &*expr.node {
         ExprNode::Send { recv: Some(r), .. } if !matches!(&*r.node, ExprNode::Var { .. } | ExprNode::Ivar { .. } | ExprNode::Const { .. }) => {
             let name = Symbol::from(format!("_duration_receiver_{}", expr.span.start));
@@ -690,8 +690,13 @@ pub(crate) fn rewrite_durations(expr: &mut Expr, defined: &BTreeSet<String>) {
         let ExprNode::Send { args, .. } = &*expr.node else { return };
         let span = expr.span;
         let numeric = Expr::new(span, ExprNode::Const { path: vec![Symbol::from("Numeric")] });
+        // Bound in the test itself, not by a `Let`: a Let renders as statements, and `x = <Let>` stored the receiver.
+        let tested = match &bound {
+            Some((name, value)) => Expr::new(span, ExprNode::Assign { target: LValue::Var { id: VarId(0), name: name.clone() }, value: value.clone() }),
+            None => args[0].clone(),
+        };
         let cond = Expr::new(span, ExprNode::Send {
-            recv: Some(args[0].clone()),
+            recv: Some(tested),
             method: Symbol::from("is_a?"),
             args: vec![numeric],
             block: None,
@@ -700,10 +705,5 @@ pub(crate) fn rewrite_durations(expr: &mut Expr, defined: &BTreeSet<String>) {
         let duration = std::mem::replace(expr, Expr::new(span, ExprNode::Lit { value: Literal::Nil }));
         *expr = Expr::new(span, ExprNode::If { cond, then_branch: duration, else_branch: reader });
         expr.ty = Some(Ty::Untyped);
-        if let Some((name, value)) = bound {
-            let body = std::mem::replace(expr, Expr::new(span, ExprNode::Lit { value: Literal::Nil }));
-            *expr = Expr::new(span, ExprNode::Let { id: VarId(0), name, value, body });
-            expr.ty = Some(Ty::Untyped);
-        }
     }
 }

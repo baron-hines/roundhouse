@@ -27,7 +27,8 @@ const TIMER: &str = r#"class Timer
   end
 
   def through_a_call
-    current.seconds.to_i
+    stored = current.seconds
+    stored.to_i
   end
 
   def current
