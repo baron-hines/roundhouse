@@ -70,3 +70,28 @@ puts "ActiveStorage::Current.base_url integer port contract passed"
         )
         .assert_passes();
 }
+
+const PORT_AND_SET_SCRIPT: &str = r##"ActiveStorage::Current.url_options = { protocol: "https", host: "a.test", port: 443 }
+raise "standard https port kept: #{ActiveStorage::Current.base_url}" unless ActiveStorage::Current.base_url == "https://a.test"
+ActiveStorage::Current.url_options = { protocol: "http://", host: "a.test", port: 80 }
+raise "standard http port kept: #{ActiveStorage::Current.base_url}" unless ActiveStorage::Current.base_url == "http://a.test"
+ActiveStorage::Current.url_options = { protocol: "http", host: "a.test", port: nil }
+raise "nil port: #{ActiveStorage::Current.base_url}" unless ActiveStorage::Current.base_url == "http://a.test"
+inner = ActiveStorage::Current.set(url_options: { protocol: "http", host: "b.test", port: 3000 }) do
+  ActiveStorage::Current.base_url
+end
+raise "set block value: #{inner}" unless inner == "http://b.test:3000"
+raise "set did not restore: #{ActiveStorage::Current.base_url}" unless ActiveStorage::Current.base_url == "http://a.test"
+puts "ok"
+"##;
+
+#[test]
+fn active_storage_current_omits_a_standard_port() {
+    emit_and_run::real_blog().run_ruby(PORT_AND_SET_SCRIPT).assert_passes();
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn active_storage_current_port_and_set_on_spinel() {
+    emit_and_run::real_blog().run_spinel(PORT_AND_SET_SCRIPT).assert_passes();
+}

@@ -1100,16 +1100,16 @@ module ActiveStorage
 
     # `protocol://host[:port]`, or "" with no options set. `protocol`
     # is taken with or without Rails' trailing `://` (`request.protocol`
-    # carries it; a hand-written `protocol: "https"` does not).
+    # carries it; a hand-written `protocol: "https"` does not). A standard
+    # port is left out, as Rails' `url_for` does.
     def self.base_url
       options = url_options()
       return "" if options.nil?
-      host = options.fetch(:host, "")
+      host = options.fetch(:host, "").to_s
       return "" if host == ""
-      protocol = options.fetch(:protocol, "http").sub("://", "")
-      # Rails hands Integer ports (`port: 3000`); coerce so concat stays
-      # a String even after RBS widened values to `untyped`.
+      protocol = options.fetch(:protocol, "http").to_s.sub("://", "")
       port = options.fetch(:port, "").to_s
+      port = "" if port == (protocol == "https" ? "443" : "80")
       port == "" ? protocol + "://" + host : protocol + "://" + host + ":" + port
     end
   end
