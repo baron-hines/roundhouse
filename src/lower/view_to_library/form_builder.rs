@@ -230,9 +230,10 @@ fn emit_check_box(
     // `<input name="user[f]" type="hidden" value="0">`.
     let autocomplete = if ctx.hidden_autocomplete { " autocomplete=\"off\"" } else { "" };
     let hidden = lit_str(format!("<input name=\"{model_name}[{field_str}]\" type=\"hidden\" value=\"0\"{autocomplete} />"));
+    // Not after the caller's: `CheckBox#render` assigns `type` and `value` over theirs, where they stood.
+    let opts = &assign_opt(&assign_opt(opts, "type", lit_str("checkbox".to_string())), "value", lit_str("1".to_string()));
     let mut parts = vec![InterpPart::Text { value: "<input".to_string() }];
     append_attr_parts(&mut parts, opts);
-    parts.push(InterpPart::Text { value: " type=\"checkbox\" value=\"1\"".to_string() });
     // Checked state, typed instead of the runtime `checked_box_attr`
     // seam (an untyped truthiness walk, CRuby-overlay-only). A PROVABLE
     // bool reader (Boolean column / bool typed_store attr / `attribute
@@ -322,13 +323,10 @@ fn emit_radio_button(
         })
         .cloned()
         .collect();
+    // Not after the caller's: `RadioButton#render` assigns `type` and the positional value over theirs.
+    let attr_opts = assign_opt(&assign_opt(&attr_opts, "type", lit_str("radio".to_string())), "value", to_s(value.clone()));
     let mut parts = vec![InterpPart::Text { value: "<input".to_string() }];
     append_attr_parts(&mut parts, &attr_opts);
-    parts.push(InterpPart::Text { value: " type=\"radio\" value=\"".to_string() });
-    parts.push(InterpPart::Expr {
-        expr: view_helpers_call("html_escape", vec![to_s(value.clone())]),
-    });
-    parts.push(InterpPart::Text { value: "\"".to_string() });
     // Checked state, inline instead of the runtime `radio_checked_attr`
     // seam. An explicit `checked:` opt wins (lobsters' search radios:
     // `checked: @search.what == "stories"` — previously it leaked into
@@ -1668,6 +1666,7 @@ fn emit_color_field(
         return vec![accumulator_append_call(lit_str(String::new()), ctx)];
     };
     let field_str = field_sym.as_str();
+    let opts = &default_type_opt(opts, "color");
     let mut parts = vec![InterpPart::Text { value: "<input".to_string() }];
     // A String literal `value:` stays an ordinary attribute; any other is
     // decided at render.
@@ -1733,6 +1732,7 @@ fn emit_datetime_local_field(
         return vec![accumulator_append_call(lit_str(String::new()), ctx)];
     };
     let field_str = field_sym.as_str();
+    let opts = &default_type_opt(opts, "datetime-local");
     let mut parts = vec![InterpPart::Text { value: "<input".to_string() }];
     if value_opt_position(opts).is_some() {
         append_attr_parts(&mut parts, opts);
@@ -1996,6 +1996,7 @@ fn text_field_parts(
     binding: &FormBuilderBinding,
     field: &str,
 ) -> Vec<InterpPart> {
+    let opts = &default_type_opt(opts, ty);
     let mut parts = vec![InterpPart::Text { value: "<input".to_string() }];
     append_attr_parts(&mut parts, opts);
     if !opts_have_key(opts, "size")
@@ -2024,6 +2025,39 @@ fn push_input_tail(
         parts.push(InterpPart::Expr { expr: value });
     }
     parts.push(InterpPart::Text { value: format!("{} />", name_id_attrs_for(binding, field, opts)) });
+}
+
+/// The options with `key` set to `value` where the caller's stood, or after
+/// them: a Hash keeps an assigned key where it was (`options["type"] = "checkbox"`).
+fn assign_opt(opts: &[(Expr, Expr)], key: &str, value: Expr) -> Vec<(Expr, Expr)> {
+    let mut out = opts.to_vec();
+    match out.iter().position(|(k, _)| matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == key)) {
+        Some(i) => out[i].1 = value,
+        None => out.push((lit_sym(Symbol::from(key)), value)),
+    }
+    out
+}
+
+/// `options["type"] ||= field_type`: a caller's `type:` that is nil or false,
+/// at render or as a literal, is the field's own type, in its place.
+fn default_type_opt(opts: &[(Expr, Expr)], ty: &str) -> Vec<(Expr, Expr)> {
+    let Some(given) = opt_value(opts, "type") else {
+        return opts.to_vec();
+    };
+    let typed = match &*given.node {
+        ExprNode::Lit { value: Literal::Str { .. } | Literal::Sym { .. } } => given,
+        ExprNode::Lit { value: Literal::Nil | Literal::Bool { value: false } } => lit_str(ty.to_string()),
+        _ => Expr::new(
+            Span::synthetic(),
+            ExprNode::BoolOp {
+                op: crate::expr::BoolOpKind::Or,
+                surface: crate::expr::BoolOpSurface::Symbol,
+                left: given,
+                right: lit_str(ty.to_string()),
+            },
+        ),
+    };
+    assign_opt(opts, "type", typed)
 }
 
 fn opt_value(opts: &[(Expr, Expr)], key: &str) -> Option<Expr> {

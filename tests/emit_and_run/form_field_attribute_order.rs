@@ -23,7 +23,11 @@ const FIELDS: &str = r#"<%= form_with model: @entry, url: "/" do |form| %>
 <%= form.hidden_field :title, class: "c" %>
 <%= form.color_field :color %>
 <%= form.radio_button :kind, "a" %>
+<%= form.radio_button :kind, "b", value: "z", type: "x" %>
 <%= form.check_box :enabled, class: "c" %>
+<%= form.check_box :enabled, value: "0", type: "x" %>
+<%= form.password_field :title, type: nil %>
+<%= form.text_field :title, type: @entry.color %>
 <%= form.text_area :title, size: "5x2", class: "c" %>
 <%= form.submit "Go", class: "b" %>
 <% end %>"#;
@@ -37,7 +41,11 @@ const EXPECTED: &str = r##"<label class="l" for="entry_title">Title</label>
 <input class="c" type="hidden" value="Hi" name="entry[title]" id="entry_title" />
 <input value="#000000" type="color" name="entry[color]" id="entry_color" />
 <input type="radio" value="a" checked="checked" name="entry[kind]" id="entry_kind_a" />
+<input value="b" type="radio" name="entry[kind]" id="entry_kind_b" />
 <input name="entry[enabled]" type="hidden" value="0" /><input class="c" type="checkbox" value="1" checked="checked" name="entry[enabled]" id="entry_enabled" />
+<input name="entry[enabled]" type="hidden" value="0" /><input value="1" type="checkbox" checked="checked" name="entry[enabled]" id="entry_enabled" />
+<input type="password" name="entry[title]" id="entry_title" />
+<input type="text" value="Hi" name="entry[title]" id="entry_title" />
 <textarea class="c" name="entry[title]" id="entry_title" cols="5" rows="2">
 Hi</textarea>
 <input type="submit" name="commit" value="Go" class="b" data-disable-with="Go" />
@@ -85,11 +93,11 @@ fn form_field_order_matches_rails() {
     let helper = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/rails_oracle.rb");
     let script = format!(
         r##"require {helper:?}
-unless RailsOracle.available?("activerecord", "actionview", "actionpack")
-  warn "skipping form field oracle: #{{RailsOracle.label}} needs activerecord, actionview and actionpack"
+unless RailsOracle.available?("activerecord", "actionview", "actionpack", sqlite3: ">= 2.9")
+  warn "skipping form field oracle: #{{RailsOracle.label}} needs activerecord, actionview, actionpack and sqlite3"
   exit 77
 end
-RailsOracle.activate("activerecord", "actionview", "actionpack")
+RailsOracle.activate("activerecord", "actionview", "actionpack", sqlite3: ">= 2.9")
 require "active_record"
 require "action_view"
 require "action_controller"
@@ -151,11 +159,11 @@ fn hidden_field_order_matches_rails() {
     let helper = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/rails_oracle.rb");
     let script = format!(
         r##"require {helper:?}
-unless RailsOracle.available?("activerecord", "actionview", "actionpack")
-  warn "skipping hidden field oracle: #{{RailsOracle.label}} needs activerecord, actionview and actionpack"
+unless RailsOracle.available?("activerecord", "actionview", "actionpack", sqlite3: ">= 2.9")
+  warn "skipping hidden field oracle: #{{RailsOracle.label}} needs activerecord, actionview, actionpack and sqlite3"
   exit 77
 end
-RailsOracle.activate("activerecord", "actionview", "actionpack")
+RailsOracle.activate("activerecord", "actionview", "actionpack", sqlite3: ">= 2.9")
 require "active_record"
 require "action_view"
 require "action_controller"
