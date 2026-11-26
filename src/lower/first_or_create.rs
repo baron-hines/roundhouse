@@ -77,11 +77,19 @@ pub fn apply_first_or_create_lowering(app: &mut App) -> Vec<crate::diagnostic::D
             _ => false,
         }));
         let own_hook = crate::lower::model_to_library::schema::model_declares_after_initialize(model);
-        let other_hook = model.body.iter().any(|item| matches!(item, crate::dialect::ModelBodyItem::Method { method, .. }
-            if method.receiver == crate::dialect::MethodReceiver::Instance && method.name.as_str() == "initialize"))
+        let defines = |model: &crate::dialect::Model, name: &str| model.body.iter().any(|item| matches!(item,
+            crate::dialect::ModelBodyItem::Method { method, .. }
+                if method.receiver == crate::dialect::MethodReceiver::Instance && method.name.as_str() == name));
+        // Not a private `def after_initialize`: the factory calls the hook on the record, which a private method refuses.
+        let private_hook = model.body.iter().any(|item| matches!(item,
+            crate::dialect::ModelBodyItem::Method { method, .. }
+                if method.receiver == crate::dialect::MethodReceiver::Instance && method.name.as_str() == "after_initialize"
+                    && method.visibility == crate::dialect::MethodVisibility::Private));
+        let other_hook = defines(model, "initialize") || private_hook
             || std::iter::successors(model.parent.as_ref().and_then(|p| app.models.iter().find(|m| &m.name == p)), |model| {
                 model.parent.as_ref().and_then(|parent| app.models.iter().find(|m| &m.name == parent))
-            }).take(app.models.len()).any(crate::lower::model_to_library::schema::model_declares_after_initialize);
+            }).take(app.models.len()).any(|ancestor| defines(ancestor, "initialize")
+                || crate::lower::model_to_library::schema::model_declares_after_initialize(ancestor));
         (model.name.clone(), CreationModel {
             fields: (!unsupported_initializer).then_some(fields), foreign_keys, initialization_hook,
             deferred_hook: own_hook && !other_hook,
