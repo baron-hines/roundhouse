@@ -75,11 +75,18 @@ pub(super) fn splice(app: &mut App) {
         // Not a module a superclass has already: Ruby's `include` adds nothing
         // for it, and ActiveSupport runs no hook.
         let inherited = inherited_modules(app, app.library_classes[i].parent.as_ref());
+        // Nor one an earlier opening of this class includes: the repeated
+        // include runs no hook either. A def any opening writes is the
+        // class's own, as is one the block's accessors define (below).
+        let class = &app.library_classes[i].name;
+        let openings_of_class = || app.library_classes.iter().filter(|c| !c.is_module && c.name == *class);
+        let earlier: Vec<&ClassId> =
+            app.library_classes[..i].iter().filter(|c| !c.is_module && c.name == *class).flat_map(|c| c.includes.iter()).collect();
         // The last hook def of each name per module, and whether the module's
         // own def of the name shadows it.
         let mut ran: Vec<(&MethodDef, bool)> = Vec::new();
         let mut seen: Vec<&ClassId> = Vec::new();
-        for module in includes.iter().filter(|m| !inherited.contains(*m)) {
+        for module in includes.iter().filter(|m| !inherited.contains(*m) && !earlier.contains(m)) {
             if seen.contains(&module) {
                 continue;
             }
@@ -104,13 +111,12 @@ pub(super) fn splice(app: &mut App) {
             // Of two hooks that define the name, the one that runs last wins,
             // an order not read here: those stay as the modules have them.
             let alone = ran.iter().filter(|(d, _)| d.name == def.name).count() == 1;
-            let written = app.library_classes[i].methods.iter().any(|m| m.receiver == MethodReceiver::Instance && m.name == def.name);
+            let written = openings_of_class().flat_map(|c| &c.methods).any(|m| m.receiver == MethodReceiver::Instance && m.name == def.name);
             if *shadowed && alone && !written {
                 hook_defs.push((*def).clone());
             }
         }
         let lc = &mut app.library_classes[i];
-        lc.methods.extend(hook_defs);
         for (id, span) in added {
             lc.includes.push(id);
             lc.include_spans.push(span);
@@ -148,6 +154,13 @@ pub(super) fn splice(app: &mut App) {
                 if writer && !defines(lc, &format!("{}=", name.as_str())) {
                     lc.methods.push(super::library_class::synth_attr_writer(&lc.name, &name, MethodReceiver::Instance));
                 }
+            }
+        }
+        // After the block's accessors: an `attr_reader` the block declares
+        // after its def replaces the def on the includer, as it does here.
+        for def in hook_defs {
+            if !lc.methods.iter().any(|m| m.receiver == MethodReceiver::Instance && m.name == def.name) {
+                lc.methods.push(def);
             }
         }
     }

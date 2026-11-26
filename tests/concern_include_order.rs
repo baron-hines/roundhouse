@@ -530,7 +530,7 @@ puts "lib parent case passed"
 }
 
 /// SingleController under `parent`, a class from `libs`, with `concerns`;
-/// against Ruby's answer for `label`. The Spinel emit has no errors.
+/// against Ruby's answer for `label`, as JSON. The Spinel emit has no errors.
 fn lib_case(concerns: &[(&str, &str)], libs: &[(&str, &str)], parent: &str, want: &str) {
     let app = || {
         let mut app = emit_and_run::empty_app()
@@ -558,7 +558,7 @@ end
 text = +""
 body.each {{ |part| text << part }}
 got = [status, text]
-want = [200, %({{"label":{want:?}}})]
+want = [200, %({{"label":{want}}})]
 raise "got #{{got.inspect}}, want #{{want.inspect}}" unless got == want
 puts "lib case passed"
 "##
@@ -579,7 +579,7 @@ fn a_lib_class_takes_no_hook_def_for_a_module_its_superclass_has() {
             ("derived_parent", "class DerivedParent < BaseParent\n  include HookReopen\nend\n"),
         ],
         "DerivedParent",
-        "base",
+        "\"base\"",
     );
 }
 
@@ -591,6 +591,36 @@ fn a_lib_class_leaves_a_name_two_hooks_define_to_the_modules() {
         &[HOOK_REOPEN, ("hook_only", "module HookOnly\n  extend ActiveSupport::Concern\n\n  included do\n    def label\n      \"b hook\"\n    end\n  end\nend\n")],
         &[("pair_parent", "class PairParent < ApplicationController\n  include HookReopen\n  include HookOnly\nend\n")],
         "PairParent",
-        "b hook",
+        "\"b hook\"",
+    );
+}
+
+/// TwiceParent's first opening ran the hook and then replaced its `label`;
+/// the second opening's include runs no hook (#2278).
+#[test]
+fn a_lib_class_takes_no_hook_def_on_a_repeated_include_of_its_own() {
+    lib_case(
+        &[HOOK_REOPEN],
+        &[
+            ("twice_parent", "class TwiceParent < ApplicationController\n  include HookReopen\n\n  def label\n    \"base\"\n  end\nend\n"),
+            ("twice_parent_again", "class TwiceParent < ApplicationController\n  include HookReopen\nend\n"),
+        ],
+        "TwiceParent",
+        "\"base\"",
+    );
+}
+
+/// The block's `attr_reader :label` comes after its `def label` and replaces
+/// it on the includer: `label` reads the unset `@label` (#2278).
+#[test]
+fn a_hook_def_stays_below_a_later_reader_of_its_block() {
+    lib_case(
+        &[(
+            "hook_reader",
+            "module HookReader\n  extend ActiveSupport::Concern\n\n  included do\n    def label\n      \"hook\"\n    end\n    attr_reader :label\n  end\nend\n\nmodule HookReader\n  def label\n    \"ordinary\"\n  end\nend\n",
+        )],
+        &[("reader_parent", "class ReaderParent < ApplicationController\n  include HookReader\nend\n")],
+        "ReaderParent",
+        "null",
     );
 }
