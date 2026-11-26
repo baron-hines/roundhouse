@@ -42,6 +42,10 @@ module JobRegistry
     false
   end
 
+  def self.perform_native(worker, args, jid)
+    false
+  end
+
   def self.instantiate(job_class)
     nil
   end

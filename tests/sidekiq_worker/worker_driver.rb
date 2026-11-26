@@ -251,10 +251,48 @@ module JobRegistry
     false
   end
 
+  # What `sidekiq_native::perform_native_source` writes for NativeWorker
+  # (`perform(id, tags = [], opts = {})`, Integer, Array of Strings, Hash of mixed scalars).
+  def self.native_read_native_worker_1_0(v, where)
+    SidekiqEnvelope.native_array(v, where)
+    out = [""]
+    out.clear
+    v.each { |x| out << SidekiqEnvelope.native_str(x, where) }
+    out
+  end
+
+  def self.perform_native(worker, args, jid)
+    case worker
+    when "NativeWorker"
+      n = SidekiqEnvelope.native_args(args)
+      if n == 1
+        NativeWorker.new.perform(SidekiqEnvelope.native_int(args[0], "NativeWorker#perform argument 0 (`id`)"))
+      elsif n == 2
+        NativeWorker.new.perform(SidekiqEnvelope.native_int(args[0], "NativeWorker#perform argument 0 (`id`)"), native_read_native_worker_1_0(args[1], "NativeWorker#perform argument 1 (`tags`)"))
+      elsif n == 3
+        NativeWorker.new.perform(SidekiqEnvelope.native_int(args[0], "NativeWorker#perform argument 0 (`id`)"), native_read_native_worker_1_0(args[1], "NativeWorker#perform argument 1 (`tags`)"), SidekiqEnvelope.native_scalar_hash(args[2], "NativeWorker#perform argument 2 (`opts`)"))
+      else
+        raise ArgumentError, "wrong number of arguments (given " + n.to_s + ", expected 1..3)"
+      end
+      true
+    else
+      false
+    end
+  end
+
   # The app's `Sidekiq.configure_client` `url:`, which a tree on
   # :sidekiq must give: the worker has no localhost fallback.
   def self.sidekiq_redis_url
     "redis://localhost:6379/0"
+  end
+end
+
+class NativeWorker
+  RAN = [""]
+
+  def perform(id, tags = [], opts = {})
+    RAN << id.to_s + " " + tags.join(",") + " " + opts.length.to_s
+    nil
   end
 end
 
@@ -295,6 +333,11 @@ SidekiqWorker.parse(["sidekiq", "-q", "high", "-q", "low", "-c", "1", "-t", "1"]
 popped.each { |raw| SidekiqRedis::SCRIPT.push("queue:high\t" + raw) }
 SidekiqRedis::SCRIPT.push("queue:low\t" + JSON.generate({ "retry" => true, "queue" => "low", "class" => "HardWorker", "args" => [1], "jid" => "aaaaaaaaaaaaaaaaaaaaaaaa" }))
 SidekiqRedis::SCRIPT.push("queue:low\t" + JSON.generate({ "retry" => false, "queue" => "low", "class" => "HardWorker", "args" => [2], "jid" => "bbbbbbbbbbbbbbbbbbbbbbbb" }))
+NativeWorker::RAN.clear
+SidekiqRedis::SCRIPT.push("queue:low\t" + JSON.generate({ "retry" => false, "queue" => "low", "class" => "NativeWorker", "args" => [7], "jid" => "dddddddddddddddddddddddd" }))
+SidekiqRedis::SCRIPT.push("queue:low\t" + JSON.generate({ "retry" => false, "queue" => "low", "class" => "NativeWorker", "args" => [8, ["a", "b"], { "k" => "v", "n" => 1 }], "jid" => "eeeeeeeeeeeeeeeeeeeeeeee" }))
+# A String where `id` is an Integer fails the job (dropped: retry false) and runs nothing.
+SidekiqRedis::SCRIPT.push("queue:low\t" + JSON.generate({ "retry" => false, "queue" => "low", "class" => "NativeWorker", "args" => ["9"], "jid" => "ffffffffffffffffffffffff" }))
 # Malformed envelopes fail their job, not the processor.
 SidekiqRedis::SCRIPT.push("queue:low\tnull")
 SidekiqRedis::SCRIPT.push("queue:low\t" + JSON.generate({ "retry" => true, "queue" => "low", "class" => "Sidekiq::ActiveJob::Wrapper", "wrapped" => "NoArgsJob", "jid" => "cccccccccccccccccccccccc" }))
@@ -311,6 +354,7 @@ Process.kill("TERM", Process.pid)
 SidekiqWorker.supervise
 SidekiqWorker::THREADS.each { |t| t.join }
 check("all processors stopped", SidekiqWorker.running == 0, SidekiqWorker.running.to_s)
+check("native jobs run with as many arguments as they carry", NativeWorker::RAN == ["7  0", "8 a,b 2"], NativeWorker::RAN.join(" / "))
 check("each job starts with an empty broadcast log", Broadcasts::STALE[0] == 0 && Broadcasts::SENT[0] > 1,
   Broadcasts::STALE[0].to_s + " of " + Broadcasts::SENT[0].to_s + " stale")
 SidekiqRedis.take_log.each { |line| puts line }

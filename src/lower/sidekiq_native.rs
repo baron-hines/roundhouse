@@ -27,7 +27,11 @@
 //!   `JobRegistry.push_native_<worker>(…)`, and files the planning
 //!   errors. Ruby emitter only, as `job_payload::apply_ruby`.
 //! - [`registry_source`] writes each `push_native_<worker>` into
-//!   `JobRegistry`, beside the ActiveJob writers.
+//!   `JobRegistry`, beside the ActiveJob writers, and
+//!   [`perform_native_source`] the `perform_native` arm Roundhouse's
+//!   worker runs a popped job through, reading each argument back with
+//!   the same codec. A codec it can't read back ([`unreadable`]) is an
+//!   error at the enqueue.
 //!
 //! The bytes are held to a recording of real Sidekiq 8.1.7
 //! (`tests/sidekiq_native/sidekiq.json`) by
@@ -75,6 +79,9 @@ pub enum NativeCodec {
 pub struct NativeParam {
     pub name: Symbol,
     pub codec: NativeCodec,
+    /// `perform` gives it a default, so a job may stop before it.
+    #[serde(default)]
+    pub optional: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1169,7 +1176,7 @@ fn plan_params(params: &[crate::dialect::Param], sites: &[Site]) -> Result<Vec<N
         if contains_unknown(&codec) {
             return Err((format!("`{}`: the type of an empty Array's or Hash's elements is unknown", p.name.as_str()), None));
         }
-        out.push(NativeParam { name: p.name.clone(), codec });
+        out.push(NativeParam { name: p.name.clone(), codec, optional: p.default.is_some() });
     }
     Ok(out)
 }
@@ -1373,6 +1380,16 @@ pub fn apply_ruby(lcs: &mut [LibraryClass], app: &App) {
                 }
                 continue;
             }
+            if m.name.as_str() == "perform_async"
+                && let Some(reason) = unreadable(plan)
+            {
+                crate::emit::diagnostics::push(error(
+                    m.name_span,
+                    "native-job-unreadable",
+                    "argument not readable",
+                    format!("sidekiq_native: `{}`: {reason}; its pushed jobs would fail in the worker", plan.worker),
+                ));
+            }
             let span = m.body.span;
             let vars: Vec<Expr> = m
                 .params
@@ -1493,6 +1510,125 @@ pub fn registry_source(plans: &[NativePlan]) -> String {
         s.push_str("  end\n\n");
     }
     s
+}
+
+/// `JobRegistry.perform_native(worker, args, jid)`, which the worker runs
+/// for a popped job that isn't ActiveJob's: one `when` per planned worker,
+/// spelled as a literal class (a name from the wire is never turned into
+/// one), that reads each argument back with its codec and calls
+/// `W.new.perform(…)` with as many as the job carries, as Sidekiq's
+/// processor does. False for a class this app doesn't have, which the
+/// worker fails as Sidekiq's NameError. Written for every tree on
+/// `:sidekiq`, with no arms when there are no workers.
+pub fn perform_native_source(plans: &[NativePlan]) -> String {
+    let mut helpers = String::new();
+    let mut arms = String::new();
+    for plan in plans.iter().filter(|p| p.is_payload() && unreadable(p).is_none()) {
+        let readable: Vec<&NativeParam> = plan.params.iter().take_while(|p| p.codec != NativeCodec::Omitted).collect();
+        let required = plan.params.iter().filter(|p| !p.optional).count();
+        let total = plan.params.len();
+        let reads: Vec<String> = readable
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let at = format!("{}#perform argument {i} (`{}`)", plan.worker, p.name.as_str());
+                read_native(&p.codec, &format!("args[{i}]"), &ruby_str(&at), &format!("{}_{i}", plan.suffix()), 0, &mut helpers)
+            })
+            .collect();
+        arms.push_str(&format!("    when {}\n", ruby_str(&plan.worker)));
+        arms.push_str("      n = SidekiqEnvelope.native_args(args)\n");
+        let expected = if required == total { required.to_string() } else { format!("{required}..{total}") };
+        for k in required..=readable.len() {
+            let kw = if k == required { "if" } else { "elsif" };
+            arms.push_str(&format!("      {kw} n == {k}\n        {}.new.perform({})\n", plan.worker, reads[..k].join(", ")));
+        }
+        if readable.len() < total {
+            let why = format!("{}#perform argument {}: no call site in this app passes it, so its type is unknown", plan.worker, readable.len());
+            arms.push_str(&format!("      elsif n <= {total}\n        raise TypeError, {}\n", ruby_str(&why)));
+        }
+        arms.push_str(&format!(
+            "      else\n        raise ArgumentError, \"wrong number of arguments (given \" + n.to_s + \", expected {expected})\"\n      end\n      true\n"
+        ));
+    }
+    let mut s = helpers;
+    s.push_str("  def self.perform_native(worker, args, jid)\n");
+    if arms.is_empty() {
+        s.push_str("    false\n");
+    } else {
+        s.push_str(&format!("    case worker\n{arms}    else\n      false\n    end\n"));
+    }
+    s.push_str("  end\n\n");
+    s
+}
+
+/// Why the worker can't read a planned worker's arguments back, if it can't:
+/// a nil or a mixed scalar inside an Array or a Hash has no typed slot.
+pub fn unreadable(plan: &NativePlan) -> Option<String> {
+    fn inner_ok(c: &NativeCodec) -> bool {
+        match c {
+            NativeCodec::Bool | NativeCodec::Int | NativeCodec::Float | NativeCodec::Str => true,
+            NativeCodec::Array(x) | NativeCodec::Hash(x) => **x == NativeCodec::Scalar || inner_ok(x),
+            _ => false,
+        }
+    }
+    fn top_ok(c: &NativeCodec) -> bool {
+        match c {
+            NativeCodec::Null | NativeCodec::Omitted | NativeCodec::Scalar => true,
+            NativeCodec::Nullable(x) => inner_ok(x),
+            other => inner_ok(other),
+        }
+    }
+    plan.params.iter().find(|p| !top_ok(&p.codec)).map(|p| {
+        format!(
+            "`{}`'s Array or Hash holds nil or values of different types, which Roundhouse's Sidekiq worker can't read back into a typed `perform`",
+            p.name.as_str()
+        )
+    })
+}
+
+/// The value at `v` read back as `codec`, as Ruby text; an Array or a Hash
+/// gets a helper in `helpers`, which builds its result from a typed seed.
+fn read_native(codec: &NativeCodec, v: &str, at: &str, id: &str, depth: usize, helpers: &mut String) -> String {
+    let e = "SidekiqEnvelope";
+    match codec {
+        NativeCodec::Bool => format!("{e}.native_bool({v}, {at})"),
+        NativeCodec::Int => format!("{e}.native_int({v}, {at})"),
+        NativeCodec::Float => format!("{e}.native_float({v}, {at})"),
+        NativeCodec::Str => format!("{e}.native_str({v}, {at})"),
+        NativeCodec::Null => format!("{e}.native_null({v}, {at})"),
+        NativeCodec::Scalar => format!("{e}.native_scalar({v}, {at})"),
+        NativeCodec::Omitted => "nil".to_string(),
+        NativeCodec::Nullable(inner) => {
+            format!("({v}.nil? ? nil : {})", read_native(inner, v, at, id, depth, helpers))
+        }
+        NativeCodec::Array(inner) if **inner == NativeCodec::Scalar => format!("{e}.native_scalar_array({v}, {at})"),
+        NativeCodec::Hash(inner) if **inner == NativeCodec::Scalar => format!("{e}.native_scalar_hash({v}, {at})"),
+        NativeCodec::Array(inner) | NativeCodec::Hash(inner) => {
+            let name = format!("native_read_{id}_{depth}");
+            let each = read_native(inner, "x", "where", id, depth + 1, helpers);
+            let seed = seed(codec);
+            let body = if matches!(codec, NativeCodec::Array(_)) {
+                format!("    {e}.native_array(v, where)\n    out = {seed}\n    out.clear\n    v.each {{ |x| out << {each} }}\n    out\n")
+            } else {
+                format!("    {e}.native_hash(v, where)\n    out = {seed}\n    out.clear\n    v.each {{ |k, x| out[k.to_s] = {each} }}\n    out\n")
+            };
+            helpers.push_str(&format!("  def self.{name}(v, where)\n{body}  end\n\n"));
+            format!("{name}({v}, {at})")
+        }
+    }
+}
+
+/// A literal of `codec`'s type, the form Spinel infers an element type from.
+fn seed(codec: &NativeCodec) -> String {
+    match codec {
+        NativeCodec::Bool => "true".to_string(),
+        NativeCodec::Int => "0".to_string(),
+        NativeCodec::Float => "0.0".to_string(),
+        NativeCodec::Str => "\"\"".to_string(),
+        NativeCodec::Array(x) => format!("[{}]", seed(x)),
+        NativeCodec::Hash(x) => format!("{{ \"\" => {} }}", seed(x)),
+        _ => "nil".to_string(),
+    }
 }
 
 /// The JSON for `v` under `codec`, as Ruby text. `depth` keeps the block
