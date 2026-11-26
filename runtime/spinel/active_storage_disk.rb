@@ -321,7 +321,7 @@ module ActiveStorage
   end
 
   # Rails' `ActiveStorage::SetCurrent`, which every engine controller
-  # includes: the request's protocol, host and port become the options the
+  # includes: the request's protocol and host become the options the
   # disk service builds its urls against, so a redirect or a direct
   # upload url is absolute the way Rails' is.
   def self.set_current(request)
@@ -329,7 +329,6 @@ module ActiveStorage
     ActiveStorage::Current.url_options = {
       protocol: request.base_url.start_with?("https://") ? "https" : "http",
       host: request.host,
-      port: request.port,
     }
     nil
   end
