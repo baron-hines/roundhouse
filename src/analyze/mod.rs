@@ -9508,7 +9508,8 @@ fn guessed_receiver_sites<'a>(unknown: &[&'a SendSite], app: &'a App) -> Vec<(&'
     }
     let mut defining: HashMap<&Symbol, Vec<&ClassId>> = HashMap::default();
     for lc in &app.library_classes {
-        for m in lc.methods.iter().filter(|m| m.receiver == MethodReceiver::Instance) {
+        // Not a private method: a call with a receiver never reaches one (MissionControl's private `offset(executions_or_jobs)` took the Integer of `executions_or_jobs.offset(offset_value)`).
+        for m in lc.methods.iter().filter(|m| m.receiver == MethodReceiver::Instance && m.visibility != crate::dialect::MethodVisibility::Private) {
             defining.entry(&m.name).or_default().push(&lc.name);
         }
     }
