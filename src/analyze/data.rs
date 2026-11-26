@@ -5,7 +5,7 @@ use crate::det::{HashMap, HashSet};
 
 use crate::App;
 use crate::diagnostic::Diagnostic;
-use crate::dialect::{LibraryClassOrigin, ModelBodyItem};
+use crate::dialect::{LibraryClassOrigin, MethodReceiver, ModelBodyItem};
 use crate::expr::{Expr, ExprNode, Literal, LValue, RESOLVED_DATA_FACTORY};
 use crate::ident::{ClassId, Symbol};
 use crate::span::Span;
@@ -82,7 +82,7 @@ pub(super) fn register(
             return;
         }
         let mut info = classes.remove(&id).unwrap_or_default();
-        let instance = add_data_methods(&mut info, &id, members);
+        let instance = add_data_methods(app, &mut info, &id, members);
         classes.insert(id, info);
         factories.insert(value.span, instance);
     };
@@ -111,7 +111,7 @@ pub(super) fn register(
             continue;
         }
         let Some(info) = classes.get_mut(&class.name) else { continue };
-        let instance = add_data_methods(info, &class.name, members.iter().cloned());
+        let instance = add_data_methods(app, info, &class.name, members.iter().cloned());
         factories.insert(span, instance);
     }
     factories
@@ -128,6 +128,24 @@ pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
     let resolver = app.const_resolver.for_sources(&app.sources);
     let mut diagnostics = Vec::new();
     for factory in &app.library_classes {
+        if let Some(span) = factory.data_constructor_visibility()
+            && app.library_classes.iter().any(|owner| matches!(owner.name.0.as_str(), "Module" | "Class")
+                && owner.methods.iter().any(|method| matches!(method.name.as_str(), "private" | "public" | "protected" | "private_class_method"))) {
+            diagnostics.push(Diagnostic::unsupported(span, None, "Data.define", "Data visibility macro has an app-defined owner")); continue;
+        }
+        if let Some(span) = factory.data_constructor_visibility()
+            && (app.library_classes.iter().any(|class| !class.parent_span.is_synthetic()
+                && class.parent.as_ref().is_none_or(|parent| {
+                    let path = parent.0.as_str().split("::").map(Symbol::from).collect::<Vec<_>>();
+                    resolver.namespace(class.parent_span, &path).is_none()
+                        || resolver.declaration_name(class.parent_span, &path) == Some(factory.name.0.as_str())
+                })) || app.library_classes.iter().flat_map(|class| &class.constants).any(|(_, value)| {
+                    matches!(&*value.node, ExprNode::Const { path } if resolver.declaration_name(value.span, path) == Some(factory.name.0.as_str()))
+                })) {
+            diagnostics.push(Diagnostic::unsupported(span, None, "Data.define",
+                "constructor visibility with Data subclasses requires a direct superclass namespace, not an alias or expression; subclasses are not modeled"));
+            continue;
+        }
         if factory.data_define().is_some() {
             for (_, value) in &factory.constants {
                 if let ExprNode::Send { recv: Some(recv), method, .. } = &*value.node
@@ -182,13 +200,24 @@ pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
 
 /// `new`, `with` and one reader per member, on the class that a
 /// factory creates. The result is the instance type.
-fn add_data_methods(info: &mut ClassInfo, id: &ClassId, members: impl IntoIterator<Item = Symbol>) -> Ty {
+fn add_data_methods(app: &App, info: &mut ClassInfo, id: &ClassId, members: impl IntoIterator<Item = Symbol>) -> Ty {
     let instance = Ty::Class {
         id: id.clone(),
         args: vec![].into(),
     };
+    // A source definition replaces the generated method, so its return
+    // starts unknown and harvest reads the last definition's body. One
+    // that calls `super` keeps the generated return.
+    let generated = |name: &str, receiver: MethodReceiver| {
+        let replaced = app.library_classes.iter().filter(|class| class.name == *id)
+            .flat_map(|class| &class.methods)
+            .filter(|method| method.name.as_str() == name && method.receiver == receiver)
+            .last()
+            .is_some_and(|method| method.signature.is_none() && !super::expr_calls_super(&method.body));
+        if replaced { Ty::Untyped } else { instance.clone() }
+    };
     info.class_methods
-        .insert(Symbol::from("new"), instance.clone());
+        .insert(Symbol::from("new"), generated("new", MethodReceiver::Class));
     info.declares_constructor = true;
     // A member declaration establishes a reader, not its value type.
     // Data has no generated writers. A block method of the same name
@@ -196,7 +225,7 @@ fn add_data_methods(info: &mut ClassInfo, id: &ClassId, members: impl IntoIterat
     for member in members {
         info.instance_methods.entry(member).or_insert(Ty::Untyped);
     }
-    info.instance_methods.entry(Symbol::from("with")).or_insert(instance.clone());
+    info.instance_methods.entry(Symbol::from("with")).or_insert_with(|| generated("with", MethodReceiver::Instance));
     instance
 }
 

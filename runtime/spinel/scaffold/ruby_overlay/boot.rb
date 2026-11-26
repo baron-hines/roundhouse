@@ -49,6 +49,7 @@ require_relative "runtime/db"
 # the stdlib equivalents with semantically-identical implementations
 # for the surface framework Ruby actually uses.
 require_relative "runtime/base64"
+require_relative "runtime/securerandom_active_support"
 # stdlib Shellwords, including String#shellescape. The Spinel port is
 # runtime/shellwords_spinel.rb and must not be named shellwords.rb:
 # runtime/ is on $LOAD_PATH, so the library's own name would answer a
@@ -111,6 +112,7 @@ require_relative "runtime/type_toolkit"
 # `config_for`'s answer: a Hash subclass with `method_missing`, so it cannot
 # live in the shared runtime that reads it (CRuby overlay only).
 require_relative "runtime/active_support_ordered_options"
+require_relative "runtime/active_support_gzip"
 # Blank-predicate helper for receivers `src/lower/blank.rs` had no static
 # type to ground on. CRuby could serve those sites through the core_ext
 # reopen above; it now takes the same lowered call every other
@@ -118,13 +120,18 @@ require_relative "runtime/active_support_ordered_options"
 require_relative "runtime/active_support_ext"
 require_relative "runtime/active_support_calendar"
 require_relative "runtime/active_model_validator"
+require_relative "runtime/active_model_name"
 # ActiveSupport::JSON.encode straight through the C generator when the
 # value is already JSON-native; the shared walk otherwise.
 require_relative "runtime/active_support_json_cruby"
 require_relative "runtime/action_view_number_helper"
 require_relative "runtime/action_view_form_builder_extras"
+# A builder the form lowering does not expand (an app's subclass, a gem's) runs at request time.
+require_relative "runtime/action_view_form_builder"
+require_relative "runtime/action_view_tags"
 require_relative "runtime/active_record"
 require_relative "runtime/active_record_bang"
+require_relative "runtime/active_record_runtime_macros"
 # `ActiveRecord::Base.connection_db_config`, `connection_pool` and
 # `transaction_open?` over the Db shim loaded above.
 require_relative "runtime/active_record_db_config"

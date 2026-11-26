@@ -15,7 +15,7 @@ use crate::dialect::{
     AccessorKind, LibraryClass, MethodDef, MethodReceiver, MethodVisibility,
 };
 use crate::expr::{Expr, ExprNode, Literal, RESOLVED_DATA_FACTORY};
-use crate::ty::{Param, ParamKind, Ty};
+use crate::ty::{FnTy, Param, ParamKind, Ty};
 
 thread_local! {
     /// True while rendering a class-side `def self.x` signature. See the
@@ -172,7 +172,8 @@ fn render_class(
         render_data_factory(&mut s, lc, name.as_str(), value, &body_pad, factory);
     }
 
-    for m in &lc.methods {
+    for (index, m) in lc.methods.iter().enumerate() {
+        if lc.data_define().is_some() && lc.methods[index + 1..].iter().any(|later| later.name == m.name && later.receiver == m.receiver) { continue; }
         let line = render_method(m, &segments);
         let visibility = if lc.data_define().is_some() && m.visibility != MethodVisibility::Public { "private " } else { "" };
         writeln!(s, "{body_pad}{visibility}{line}").unwrap();
@@ -282,7 +283,7 @@ fn plain_writer(m: &MethodDef) -> bool {
 
 fn render_attr_reader(m: &MethodDef, enclosing: &[&str]) -> String {
     let ty = match &m.signature {
-        Some(Ty::Fn { ret, .. }) => ty_to_rbs_in(ret, enclosing),
+        Some(Ty::Fn(fn_ty)) => ty_to_rbs_in(&fn_ty.ret, enclosing),
         _ => "untyped".to_string(),
     };
     format!("attr_reader {}: {}", m.name.as_str(), ty)
@@ -290,7 +291,8 @@ fn render_attr_reader(m: &MethodDef, enclosing: &[&str]) -> String {
 
 fn render_attr_writer(m: &MethodDef, enclosing: &[&str]) -> String {
     let ty = match &m.signature {
-        Some(Ty::Fn { params, .. }) if !params.is_empty() => {
+        Some(Ty::Fn(fn_ty)) if !fn_ty.params.is_empty() => {
+            let FnTy { params, .. } = &**fn_ty;
             ty_to_rbs_in(&params[0].ty, enclosing)
         }
         _ => "untyped".to_string(),
@@ -309,7 +311,8 @@ fn render_def(m: &MethodDef, enclosing: &[&str]) -> String {
     // A full forwarder has no named rest binding. Neither its keywords
     // nor its block can be inferred from the synthetic signature slot.
     let sig = match &m.signature {
-        Some(Ty::Fn { params, block, ret, .. }) if !m.params.iter().any(|p| p.forwarding) => {
+        Some(Ty::Fn(fn_ty)) if !m.params.iter().any(|p| p.forwarding) => {
+            let FnTy { params, block, ret, .. } = &**fn_ty;
             let params_str = render_typed_params(params, enclosing);
             let block_str = match block.as_deref() {
                 Some(b) => format!(" {{ {} }}", render_block_ty(b, enclosing)),
@@ -389,7 +392,8 @@ fn render_typed_params(params: &[Param], enclosing: &[&str]) -> String {
 
 fn render_block_ty(b: &Ty, enclosing: &[&str]) -> String {
     match b {
-        Ty::Fn { params, ret, .. } => {
+        Ty::Fn(fn_ty) => {
+            let FnTy { params, ret, .. } = &**fn_ty;
             let p = render_typed_params(params, enclosing);
             format!("({p}) -> {}", ty_to_rbs_in(ret, enclosing))
         }
@@ -495,7 +499,8 @@ fn ty_to_rbs_in(ty: &Ty, enclosing: &[&str]) -> String {
                 format!("{name}[{}]", a.join(", "))
             }
         }
-        Ty::Fn { params, ret, .. } => {
+        Ty::Fn(fn_ty) => {
+            let FnTy { params, ret, .. } = &**fn_ty;
             // Procs in value position render as `^(Params) -> Ret`.
             let p = render_typed_params(params, enclosing);
             format!("^({p}) -> {}", rbs(ret))
@@ -583,8 +588,7 @@ pub(super) fn emit_library_class_rbs_decls(app: &crate::App) -> Vec<EmittedFile>
     app.library_classes
         .iter()
         .map(|lc| {
-            let file_stem = crate::naming::underscore(lc.name.0.as_str());
-            let rb_path = PathBuf::from(format!("app/models/{file_stem}.rb"));
+            let rb_path = super::class_paths::class_rb(lc.name.0.as_str());
             emit_library_class_rbs(lc, &rb_path)
         })
         .collect()

@@ -457,6 +457,18 @@ fn walk_stmt(stmt: &Expr, ctx: &ViewCtx) -> Vec<Expr> {
                     return vec![assign_accumulator_string_new(disc), stmt];
                 }
             }
+            // `<% page_title "Orders" %>`: an app helper called for its
+            // effect (a `content_for` deposit), its value discarded, as
+            // Rails' `<% %>` does. It takes the same rewrite an output
+            // tag's helper call does. A bare read of a template local of
+            // that name is the local, not the helper.
+            if ctx.app_helper_names.contains(method.as_str()) && !ctx.reads_local(stmt) {
+                return vec![rewrite_helpers_in_expr(stmt, ctx)];
+            }
+            // `<% raise ArgumentError, "…" %>`: Rails raises as the page renders; dropped, the page rendered on.
+            if matches!(method.as_str(), "raise" | "fail") && !ctx.reads_local(stmt) {
+                return vec![rewrite_helpers_in_expr(stmt, ctx)];
+            }
             vec![todo_io_append("unknown stmt", stmt.span)]
         }
         // `<% case action_name when "all" %>…<% when … %>…<% end %>` at
@@ -572,6 +584,52 @@ fn walk_stmt(stmt: &Expr, ctx: &ViewCtx) -> Vec<Expr> {
         // genuinely a statement (the prior TODO-append swallowed the
         // side effect and broke stack-walking templates).
         ExprNode::Send { recv: Some(_), block: None, .. } => vec![stmt.clone()],
+        // A call on a value with a block, for its effect (a component's slot: `<% card.with_header { "Title" } %>`,
+        // or `<% card.with_item do %> markup <% end %>`). Kept as written; a template body is captured into a string
+        // the block returns, as an output helper's is, not left as buffer writes the block does not own.
+        ExprNode::Send { recv: Some(recv), method, args, block: Some(block), parenthesized } => {
+            let ExprNode::Lambda { rest_param, extra_params, params, block_param, body, block_style } = &*block.node else {
+                return vec![stmt.clone()];
+            };
+            if !block_body_is_template(body) {
+                return vec![stmt.clone()];
+            }
+            let cap = next_capture_name(&ctx.accumulator);
+            let cap_ctx = ViewCtx {
+                accumulator: cap.clone(),
+                ..ctx.with_locals(params.iter().chain(extra_params.iter().map(|p| &p.name)).map(|p| p.as_str().to_string()))
+            };
+            let mut cap_stmts = vec![assign_accumulator_string_new(&cap)];
+            cap_stmts.extend(walk_body(body, &cap_ctx));
+            // Not a plain String: Rails' `capture` answers the block's markup safe, and the slot escapes one that is not.
+            // `raw`, not `.html_safe`, which the emit unwraps where it reads the mark statically.
+            let helpers = Expr::new(Span::synthetic(), ExprNode::Const { path: vec![Symbol::from("ActionView"), Symbol::from("ViewHelpers")] });
+            cap_stmts.push(Expr::new(
+                Span::synthetic(),
+                ExprNode::Send { recv: Some(helpers), method: Symbol::from("raw"), args: vec![accumulator_result_ref(&cap)], block: None, parenthesized: true },
+            ));
+            let new_block = Expr::new(
+                block.span,
+                ExprNode::Lambda {
+                    rest_param: rest_param.clone(),
+                    extra_params: extra_params.clone(),
+                    params: params.clone(),
+                    block_param: block_param.clone(),
+                    body: seq(cap_stmts),
+                    block_style: *block_style,
+                },
+            );
+            vec![Expr::new(
+                stmt.span,
+                ExprNode::Send {
+                    recv: Some(rewrite_helpers_in_expr(recv, ctx)),
+                    method: method.clone(),
+                    args: args.iter().map(|a| rewrite_helpers_in_expr(a, ctx)).collect(),
+                    block: Some(new_block),
+                    parenthesized: *parenthesized,
+                },
+            )]
+        }
         ExprNode::Raise { .. } => vec![stmt.clone()],
         // A bare literal — most often the synthesized `nil` arm `<% unless
         // %>` lowers to — renders nothing and does nothing: nothing is
@@ -968,7 +1026,9 @@ fn emit_io_append(arg: &Expr, ctx: &ViewCtx) -> Vec<Expr> {
                 .iter()
                 .find(|b| b.form_param == name)
             {
-                if let Some(fb) = classify_form_builder_method(method.as_str()) {
+                if let Some(fb) = classify_form_builder_method(method.as_str())
+                    && !binding.overridden.contains(method.as_str())
+                {
                     // Not for a recordless form: Trix's input id is the record's dom_id, which it has none of.
                     if !(binding.recordless && matches!(fb, FormBuilderMethod::RichTextArea)) {
                         return emit_form_builder_inline(binding, fb, sa, ctx);
@@ -991,7 +1051,9 @@ fn emit_io_append(arg: &Expr, ctx: &ViewCtx) -> Vec<Expr> {
     {
         if let Some(name) = super::form_with::form_param_ref_name(r) {
             if let Some(binding) = ctx.form_records.iter().find(|b| b.form_param == name) {
-                if let Some(fb) = classify_form_builder_method(method.as_str()) {
+                if let Some(fb) = classify_form_builder_method(method.as_str())
+                    && !binding.overridden.contains(method.as_str())
+                {
                     if let Some(out) =
                         emit_form_builder_block_inline(binding, fb, sa, block, ctx)
                     {
@@ -1494,9 +1556,18 @@ fn emit_io_append(arg: &Expr, ctx: &ViewCtx) -> Vec<Expr> {
                         params.iter().chain(extra_params.iter().map(|p| &p.name)).map(|p| p.as_str().to_string()),
                     )
                 };
+                // A helper a gem mixes into the view (`simple_form_for`): Rails' method, on a view context, whose block's
+                // capture is the template's markup, a safe buffer.
+                let on_view_context = recv.is_none()
+                    && ctx.view_context_helpers.contains(method.as_str())
+                    && !ctx.app_helper_names.contains(method.as_str());
                 let mut cap_stmts = vec![assign_accumulator_string_new(cap)];
                 cap_stmts.extend(walk_body(body, &cap_ctx));
-                cap_stmts.push(accumulator_result_ref(cap));
+                cap_stmts.push(if on_view_context {
+                    Expr::new(Span::synthetic(), ExprNode::Send { recv: Some(accumulator_result_ref(cap)), method: Symbol::from("html_safe"), args: Vec::new(), block: None, parenthesized: false })
+                } else {
+                    accumulator_result_ref(cap)
+                });
                 let new_block = Expr::new(
                     block.span,
                     ExprNode::Lambda { rest_param: rest_param.clone(), extra_params: extra_params.clone(),
@@ -1506,10 +1577,17 @@ fn emit_io_append(arg: &Expr, ctx: &ViewCtx) -> Vec<Expr> {
                         block_style: *block_style,
                     },
                 );
+                let view_context = Expr::new(Span::synthetic(), ExprNode::Send {
+                    recv: Some(Expr::new(Span::synthetic(), ExprNode::Const { path: vec![Symbol::from("ActionView"), Symbol::from("Base")] })),
+                    method: Symbol::from("new"),
+                    args: Vec::new(),
+                    block: None,
+                    parenthesized: false,
+                });
                 let rebuilt = Expr::new(
                     inner.span,
                     ExprNode::Send {
-                        recv: recv.as_ref().map(|r| rewrite_helpers_in_expr(r, ctx)),
+                        recv: if on_view_context { Some(view_context) } else { recv.as_ref().map(|r| rewrite_helpers_in_expr(r, ctx)) },
                         method: method.clone(),
                         args: sa.iter().map(|a| rewrite_helpers_in_expr(a, ctx)).collect(),
                         block: Some(new_block),
@@ -1885,6 +1963,16 @@ pub(super) fn classify_template_helper<'a>(
 /// before the html_escape wrap, matching the convention every
 /// emitter would otherwise have to repeat.
 pub(super) fn rewrite_helpers_in_expr(e: &Expr, ctx: &ViewCtx) -> Expr {
+    // `link_to "Back", :back` by any route a link takes: `:back` is Rails' `url_for(:back)`, the referrer.
+    if let ExprNode::Send { recv: None, method, args, block, parenthesized } = &*e.node
+        && method.as_str() == "link_to"
+        && args.get(1).is_some_and(|a| matches!(&*a.node, ExprNode::Lit { value: crate::expr::Literal::Sym { value } } if value.as_str() == "back"))
+    {
+        let mut args = args.clone();
+        args[1] = super::view_helpers_call("back_url", Vec::new());
+        let swapped = Expr { node: Box::new(ExprNode::Send { recv: None, method: method.clone(), args, block: block.clone(), parenthesized: *parenthesized }), ..e.clone() };
+        return rewrite_helpers_in_expr(&swapped, ctx);
+    }
     // `x.presence` in a view's output (`<%= r[:title].presence || t(...) %>`):
     // ActiveSupport's Object#presence, which only the CRuby overlay can
     // reopen onto every value. `lower::blank` grounds it in app bodies but
@@ -1909,6 +1997,7 @@ pub(super) fn rewrite_helpers_in_expr(e: &Expr, ctx: &ViewCtx) -> Expr {
                 },
             );
             call.ty = e.ty.clone();
+            call.decisions |= e.decisions & crate::expr::ERASED_KEYWORD_SPLAT;
             return call;
         }
     }
@@ -2080,6 +2169,9 @@ pub(super) fn rewrite_helpers_in_expr(e: &Expr, ctx: &ViewCtx) -> Expr {
     out.decisions |= e.decisions & crate::expr::CONST_PATH;
     // A grounded `iso8601` (`to_rfc3339`) stays one: the Ruby emit prints `iso8601` by this flag.
     out.decisions |= e.decisions & crate::expr::GROUNDED_TIME_FORMAT;
+    // A `**opts` argument the keyword lowering made positional stays a
+    // splat on the Ruby emit (`expr::ERASED_KEYWORD_SPLAT`).
+    out.decisions |= e.decisions & crate::expr::ERASED_KEYWORD_SPLAT;
     // Not a fresh, untyped node: a rebuilt `[]` the i18n lowering typed `Array[String]` would read as `Array[untyped]`
     out.ty = e.ty.clone();
     out
@@ -2427,22 +2519,29 @@ mod tests {
             nilable_scalar_reads: Default::default(),
             html_safe_methods: Default::default(),
             model_singulars: Default::default(),
+            model_lineage: Default::default(),
             slug_models: Default::default(),
+            sti_route_stems: Default::default(),
             bool_readers: Default::default(),
             time_columns: Default::default(),
             store_readers: Default::default(),
             route_helper_names: Default::default(),
             app_helper_names: Default::default(),
+            view_context_helpers: Default::default(),
             direct_route_helpers: Default::default(),
             i18n: Default::default(),
             route_helper_arity: Default::default(),
             form_wrappers: Default::default(),
+            builder_overrides: Default::default(),
+            hidden_autocomplete: false,
+            nested_attributes: Default::default(),
             form_with_entry: false,
             model_param_keys: Default::default(),
             stylesheets: Vec::new(),
             lexxy: false,
             lexxy_editor_adapter: false,
             partial_ivars: Default::default(),
+            partial_record_locals: Default::default(),
             ivar_records: Default::default(),
             formats: vec!["html".to_string()],
             view_formats: Default::default(),

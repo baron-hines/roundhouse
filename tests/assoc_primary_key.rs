@@ -239,8 +239,8 @@ fn a_keyed_has_one_through_refuses_and_keeps_no_reader() {
 
 #[test]
 fn an_unkeyed_has_one_through_is_untouched() {
-    // Not this change's concern: main lowers it as a direct query, and
-    // it still does.
+    // No key to refuse. (Its collection hop is refused on its own, as
+    // Rails refuses it: `through_singular_hop_readers`.)
     let (msgs, out) = refused_models(&[
         (
             "class Article < ApplicationRecord\n  has_many :source_notes, foreign_key: :source_id\n  has_one :source_profile, through: :source_notes\nend\n",

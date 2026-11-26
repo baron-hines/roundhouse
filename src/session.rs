@@ -55,9 +55,14 @@ fn analyze_and_lower_in_session(app: &mut App, target: crate::build_target::Buil
     }
     let mut analyzer = crate::analyze::Analyzer::new(app);
     analyzer.analyze(app);
+    // Before the shake: a render that becomes `render_in` is what reaches the object's rendering code (a gem's).
+    if crate::lower::renderable::apply(app) {
+        analyzer = crate::analyze::Analyzer::new(app);
+        analyzer.analyze(app);
+    }
     // Typed again without the gem code the program does not reach: its calls are no evidence for what the reached code is
     // passed, as Warden's `update(label, &block)`, which nothing calls, would type `add`'s strategy `untyped`.
-    if crate::project::shakes_source_gems(app, target)
+    if crate::source_gem_shake::shakes_source_gems(app, target)
         && let Some(trimmed) = crate::source_gem_shake::shake(app)
     {
         *app = trimmed;
@@ -121,6 +126,8 @@ pub fn analyze_and_lower_for(app: &mut App, target: crate::build_target::BuildTa
         let mut found = crate::ingest::validates_with::expand(app);
         crate::ingest::mailer_defaults::expand(app);
         crate::ingest::has_many_hold::expand(app);
+        crate::ingest::has_one_write::expand(app);
+        found.extend(crate::ingest::has_one_write::refuse(app, true));
         found.extend(crate::ingest::each_validator::expand(app, target.as_str()));
         found.extend(crate::ingest::mailer_helpers::apply(app, target.as_str()));
         found.extend(crate::ingest::mailer_callbacks::expand(app, target.as_str()));
@@ -128,6 +135,7 @@ pub fn analyze_and_lower_for(app: &mut App, target: crate::build_target::BuildTa
     } else {
         let mut found = crate::ingest::each_validator::refuse(app, target.as_str());
         found.extend(crate::ingest::mailer_callbacks::refuse(app, target.as_str()));
+        found.extend(crate::ingest::has_one_write::refuse(app, false));
         found
     };
     if !target.parses_numericality_input() {
@@ -138,4 +146,54 @@ pub fn analyze_and_lower_for(app: &mut App, target: crate::build_target::BuildTa
     }
     refused.extend(analyze_and_lower_with_target(app, target));
     refused
+}
+
+/// What the target's own tree answers, which `check` still reports for the targets that do not: an external include
+/// or constant the lockfile places, and what [`drop_runtime_answered`] drops.
+pub fn drop_answered_by_target(app: &App, target: crate::build_target::BuildTarget, diags: &mut Vec<Diagnostic>) {
+    use crate::build_target::BuildTarget;
+    drop_runtime_answered(target, diags);
+    // CRuby can carry an external include only when the lockfile uniquely
+    // identifies its gem and the defining source has a matching literal
+    // top-level require. Keep check's source diagnostic and all strict-target
+    // refusals unchanged.
+    if matches!(target, BuildTarget::Ruby | BuildTarget::Jruby) {
+        let (external_namespaces, supported_includes) = if target == BuildTarget::Ruby {
+            (crate::gems::locked_external_gem_namespaces(app), crate::gems::statically_resolved_external_includes(app))
+        } else {
+            (crate::gems::native_extension_gem_namespaces(app), Default::default())
+        };
+        let mut external_roots = crate::gems::ExternalRootIndex::new(&external_namespaces);
+        diags.retain(|diagnostic| match &diagnostic.kind {
+            crate::diagnostic::DiagnosticKind::Unsupported {
+                construct, detail, ..
+            } if construct.as_str() == "include" => !supported_includes.contains_key(detail),
+            crate::diagnostic::DiagnosticKind::Unsupported {
+                construct, detail, ..
+            } if construct.as_str() == "constant" => !external_roots.names_any(detail),
+            _ => true,
+        });
+    }
+}
+
+/// What the Ruby family's runtime answers, which every other target refuses: a custom form builder's own methods
+/// (its overlay carries Rails' FormBuilder) and a gem file's statements (`ingest::gem_load_program` runs them in the
+/// file's program).
+pub fn drop_runtime_answered(target: crate::build_target::BuildTarget, diags: &mut Vec<Diagnostic>) {
+    use crate::build_target::BuildTarget;
+    // Spinel's SQLite Db opens the pools of an app that routes by role and shard (`ingest::database_ownership`); no
+    // other target's does, and they keep the refusal.
+    if target == BuildTarget::Spinel {
+        diags.retain(|diagnostic| !matches!(&diagnostic.kind, crate::diagnostic::DiagnosticKind::Unsupported { construct, .. } if construct.as_str() == "database_routes"));
+    }
+    if !matches!(target, BuildTarget::Ruby | BuildTarget::Jruby) {
+        return;
+    }
+    diags.retain(|diagnostic| match &diagnostic.kind {
+        crate::diagnostic::DiagnosticKind::Unsupported { construct, .. } if construct.as_str() == "custom form builder method" => false,
+        crate::diagnostic::DiagnosticKind::Unsupported { target: Some(only), construct, .. } => {
+            !(only.as_str() == "spinel" && construct.as_str() == "gem file statement")
+        }
+        _ => true,
+    });
 }

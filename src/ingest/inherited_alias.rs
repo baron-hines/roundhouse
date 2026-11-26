@@ -75,6 +75,17 @@ pub(super) fn captured_since(count: usize) -> Option<Span> {
 /// `alias to from` at `span`, captured as `alias_method :to, :from`.
 pub(super) fn capture(to: &str, from: &str, span: Span) -> Expr {
     DEFERRED.with(|d| d.borrow_mut().push(span));
+    alias_method_call(to, from, span)
+}
+
+/// A captured alias the walk resolved where it stood (a `class << self` alias of the class's `def self.m`): no longer
+/// one [`settle`] looks up, which would find no call left at its span.
+pub(super) fn resolved(span: Span) {
+    DEFERRED.with(|d| d.borrow_mut().retain(|s| *s != span));
+}
+
+/// `alias to from` at `span` as the `alias_method :to, :from` it is.
+fn alias_method_call(to: &str, from: &str, span: Span) -> Expr {
     let sym = |name: &str| Expr::new(span, ExprNode::Lit { value: Literal::Sym { value: Symbol::from(name) } });
     Expr::new(
         span,
@@ -121,6 +132,7 @@ pub(super) fn settle(app: &mut App, held: Vec<Held>) {
                     call.span == *span
                         && alias_call(call).is_some_and(|(receiver, _, from)| {
                             ancestor_method(&candidates, lc, from, receiver, call.span).is_some()
+                                || answered_outside_the_app(&candidates, lc, from, receiver)
                         })
                 })
             })
@@ -137,6 +149,35 @@ pub(super) fn settle(app: &mut App, held: Vec<Held>) {
         }
         if !changed {
             break;
+        }
+    }
+    // An alias Ruby resolves outside the app's classes (`answered_outside_the_app`) gets no copy, so every Ruby tree
+    // writes it where the source has it, Spinel's too (an `alias_method` of a Hash subclass's `[]`).
+    let mut outside: Vec<(usize, usize, String)> = Vec::new();
+    {
+        let candidates: Vec<&LibraryClass> = app.library_classes.iter().collect();
+        for (_, h) in held.iter().enumerate().filter(|(i, _)| carried[*i]) {
+            for k in h.classes.clone() {
+                let lc = &app.library_classes[k];
+                for (j, call) in lc.unknown_calls.iter().enumerate() {
+                    let Some((receiver, _, from)) = alias_call(call) else { continue };
+                    // Not a class-side one (`class << self; alias [] new; end`): the in-place replay writes the class body.
+                    if receiver == MethodReceiver::Instance
+                        && h.spans.contains(&call.span)
+                        && ancestor_method(&candidates, lc, from, receiver, call.span).is_none()
+                        && answered_outside_the_app(&candidates, lc, from, receiver)
+                    {
+                        outside.push((k, j, h.path.clone()));
+                    }
+                }
+            }
+        }
+    }
+    for (k, j, path) in outside {
+        app.library_classes[k].unknown_calls[j].decisions |= crate::expr::REPLAYED_CLASS_BODY;
+        // Still the gap's on the other targets, which get no copy of what the alias names.
+        if super::survey::is_active() {
+            super::survey::record(&super::IngestError::Unsupported { file: path, message: REFUSAL.into() });
         }
     }
     let mut refused: Vec<(usize, Span)> =
@@ -176,6 +217,38 @@ pub(super) fn resolve(app: &mut App) {
                         .flat_map(|c| c.methods.iter())
                         .any(|m| m.name.as_str() == name && m.receiver == receiver)
                 };
+                // `alias_method :state_without_scope, :state` in a reopening (aasm's persistence/base.rb), the original
+                // in another file of the class: the gem loads, so that one ran first, and this body's own `state` is
+                // written below the alias.
+                if !defines(to) && !lc.methods.iter().any(|m| m.name.as_str() == from && m.receiver == receiver && (m.name_span.file != call.span.file || m.name_span.start < call.span.start)) {
+                    let elsewhere: Vec<&MethodDef> = candidates
+                        .iter()
+                        .filter(|c| c.name == lc.name && !std::ptr::eq(**c, lc))
+                        .flat_map(|c| c.methods.iter())
+                        .filter(|m| m.name.as_str() == from && m.receiver == receiver)
+                        .collect();
+                    // Not where anything above the class could define it: then another file's def may come after the alias,
+                    // which copied that one. `ancestor_method` finding none is no proof, so no declaration may name one.
+                    let alone = candidates.iter().filter(|c| c.name == lc.name).all(|c| {
+                        c.parent.is_none()
+                            && c.includes.is_empty()
+                            && !c.unknown_calls.iter().any(|call| matches!(&*call.node, ExprNode::Send { recv: None, method, .. } if matches!(method.as_str(), "include" | "prepend" | "extend")))
+                    });
+                    // Nor a name every object answers (`to_s`): then Object's is what an alias read ahead of the other file copies.
+                    let everyones = super::library_class::OBJECT_BUILTINS.iter().any(|(name, _, _)| *name == from);
+                    if let [original] = elsewhere[..]
+                        && !calls_super(&original.body)
+                        && alone
+                        && !everyones
+                    {
+                        let mut copy = original.clone();
+                        copy.name = Symbol::from(to);
+                        copy.name_span = call.span;
+                        copy.body.decisions |= crate::expr::INHERITED_ALIAS_COPY;
+                        copies.push((i, copy));
+                        continue;
+                    }
+                }
                 if defines(to) || defines(from) {
                     continue;
                 }
@@ -252,6 +325,10 @@ fn calls_super(expr: &Expr) -> bool {
     if matches!(&*expr.node, ExprNode::Super { .. }) {
         return true;
     }
+    // Not left to the child walk: it does not enter `defined?`, and `defined?(super)` asks the alias name's super too.
+    if let ExprNode::Defined { operand } = &*expr.node {
+        return calls_super(operand);
+    }
     let mut found = false;
     expr.node.for_each_child(&mut |c| found = found || calls_super(c));
     found
@@ -309,6 +386,18 @@ fn ancestor_method<'a>(
                 .last()
         })
     };
+    // A class-side alias in `class << self` names a class method of the class itself, defined above it by
+    // `def self.m` (regexp_parser's `alias :scan :lex`) or `def Const.m` (net-smtp's): "this body" was the singleton's.
+    if receiver == MethodReceiver::Class
+        && let Some(found) = named(app, lc.name.0.as_str())
+            .into_iter()
+            .flat_map(|c| c.methods.iter())
+            .filter(|m| m.name.as_str() == name && m.receiver == MethodReceiver::Class)
+            .filter(|m| m.name_span.file == at.file && m.name_span.start < at.start)
+            .last()
+    {
+        return Some(found);
+    }
     let mut seen: Vec<String> = vec![lc.name.0.as_str().to_string()];
     let mut class = lc.name.0.as_str().to_string();
     let mut parent = named(app, &class).into_iter().filter(|c| !c.is_module).find_map(|c| c.parent.clone());
@@ -327,9 +416,93 @@ fn ancestor_method<'a>(
     None
 }
 
+/// Whether Ruby resolves the alias's original outside the app's classes: a module the class includes defines it, or
+/// the superclass chain ends at a core container class (Hashie's `Dash < Hash` aliasing `[]`). The Ruby family writes
+/// the alias back (`BODY_STATEMENT`), which Ruby resolves as the source's did, and gives no copy to the other targets.
+// Not checked against the core class's methods: an original it lacks fails as the source's alias does, at load.
+fn answered_outside_the_app(app: &[&LibraryClass], lc: &LibraryClass, name: &str, receiver: MethodReceiver) -> bool {
+    // On the class side: a method of Ruby's `Class` (Hashie's `class << self; alias [] new; end`), or of a module the
+    // class extends that is not the app's (rack-protection's `extend Rack::Utils` then `alias escape_url escape`).
+    const CLASS_METHODS: &[&str] = &["new", "allocate", "name", "to_s", "inspect", "superclass"];
+    if receiver == MethodReceiver::Class {
+        let extends_outside = lc.unknown_calls.iter().any(|call| {
+            matches!(&*call.node, ExprNode::Send { recv: None, method, args, .. } if method.as_str() == "extend"
+                && args.iter().any(|a| matches!(&*a.node, ExprNode::Const { path } if {
+                    let written = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::");
+                    !app.iter().any(|c| c.is_module && (c.name.0.as_str() == written || c.name.0.as_str().ends_with(&format!("::{written}"))))
+                })))
+        });
+        // ...or one the app does not define on the class, which Ruby found where the source loads (simplecov's
+        // `class << Process; alias fork_without_simplecov fork`).
+        return CLASS_METHODS.contains(&name) || extends_outside
+            || !named(app, lc.name.0.as_str()).into_iter().flat_map(|c| c.methods.iter()).any(|m| m.name.as_str() == name && m.receiver == MethodReceiver::Class);
+    }
+    if receiver != MethodReceiver::Instance {
+        return false;
+    }
+    // An include is the app's module it names from where the class is (rexml's `include Node` in `REXML::Child`), or
+    // one the app does not carry (erb's `include ERB::Escape`, a C extension's), which Ruby resolves the alias in.
+    let includes_it = |class: &str| {
+        named(app, class).into_iter().flat_map(|c| c.includes.iter()).any(|module| {
+            let Some(resolved) = module_named(app, class, module.0.as_str()) else { return true };
+            app.iter().filter(|c| c.is_module && c.name.0.as_str() == resolved).flat_map(|c| c.methods.iter()).any(|m| m.name.as_str() == name)
+                || core_module_answers(&resolved, name)
+        })
+    };
+    let mut class = lc.name.0.as_str().to_string();
+    for _ in 0..32 {
+        if includes_it(&class) {
+            return true;
+        }
+        // A class that names no superclass is Object's (ast's `alias :original_dup :dup`), or a core class the gem
+        // reopens (debug's `class Binding`). Not one of another gem's it may reopen (brakeman's `class Sexp`): nothing
+        // tells it from a class of the app's own, whose alias of a name nothing defines raises as the file loads.
+        let Some(written) = named(app, &class).into_iter().filter(|c| !c.is_module).find_map(|c| c.parent.clone()) else {
+            return OBJECT_METHODS.binary_search(&name).is_ok() || CORE_CLASSES.binary_search(&class.as_str()).is_ok();
+        };
+        // Not the class itself: `class Hash < ::Hash` in `module Hashie` names the top-level one, whose `::` the
+        // written parent may not keep.
+        match superclass(app, &class, written.0.as_str()).filter(|resolved| *resolved != class) {
+            Some(resolved) => class = resolved,
+            // A superclass the app does not carry (another gem's: brakeman's `Sexp`, ruby_parser's) holds what Ruby
+            // resolves the alias against: the tree leaves that class to whoever defines it, as it does a core one.
+            None => return true,
+        }
+    }
+    false
+}
+
+/// Does a core module a class includes (`include Enumerable`) define `name`?
+fn core_module_answers(module: &str, name: &str) -> bool {
+    match module.trim_start_matches("::") {
+        "Enumerable" => ENUMERABLE_METHODS.binary_search(&name).is_ok(),
+        "Comparable" => COMPARABLE_METHODS.binary_search(&name).is_ok(),
+        "Kernel" => OBJECT_METHODS.binary_search(&name).is_ok(),
+        _ => false,
+    }
+}
+
 /// The library class `written` names as `class`'s superclass: looked up
 /// from the namespace the `class` statement is in outwards, then at the
 /// top level.
+/// The module `written` names from `class`'s namespace outwards: the app's, a core one ([`core_module_answers`]'s), or
+/// None for one the app does not carry.
+fn module_named(app: &[&LibraryClass], class: &str, written: &str) -> Option<String> {
+    let bare = written.trim_start_matches("::");
+    let core = matches!(bare, "Enumerable" | "Comparable" | "Kernel");
+    let is_module = |name: &str| app.iter().any(|c| c.is_module && c.name.0.as_str() == name);
+    if written.starts_with("::") {
+        return (is_module(bare) || core).then(|| bare.to_string());
+    }
+    // Not the core module first: an `A::Enumerable` of the app's is what `include Enumerable` names inside `A::C`.
+    let scope: Vec<&str> = class.split("::").collect();
+    (0..=scope.len())
+        .rev()
+        .map(|depth| if depth == 0 { bare.to_string() } else { format!("{}::{bare}", scope[..depth].join("::")) })
+        .find(|candidate| is_module(candidate))
+        .or_else(|| core.then(|| bare.to_string()))
+}
+
 fn superclass(app: &[&LibraryClass], class: &str, written: &str) -> Option<String> {
     if let Some(absolute) = written.strip_prefix("::") {
         return app.iter().any(|c| !c.is_module && c.name.0.as_str() == absolute).then(|| absolute.to_string());
@@ -341,3 +514,51 @@ fn superclass(app: &[&LibraryClass], class: &str, written: &str) -> Option<Strin
         .map(|depth| if depth == 0 { written.to_string() } else { format!("{}::{written}", scope[..depth].join("::")) })
         .find(|candidate| is_class(candidate))
 }
+
+/// Ruby 4.0 `Object`'s instance methods, private ones included (`ruby --disable-gems`).
+const OBJECT_METHODS: &[&str] = &[
+    "!", "!=", "!~", "<=>", "==", "===", "Array", "Complex",
+    "Float", "Hash", "Integer", "Pathname", "Rational", "String", "__callee__", "__dir__",
+    "__id__", "__method__", "__send__", "`", "abort", "at_exit", "autoload", "autoload?",
+    "binding", "block_given?", "caller", "caller_locations", "catch", "class", "clone", "define_singleton_method",
+    "display", "dup", "enum_for", "eql?", "equal?", "eval", "exec", "exit",
+    "exit!", "extend", "fail", "fork", "format", "freeze", "frozen?", "gets",
+    "global_variables", "hash", "initialize", "initialize_clone", "initialize_copy", "initialize_dup", "inspect", "instance_eval",
+    "instance_exec", "instance_of?", "instance_variable_defined?", "instance_variable_get", "instance_variable_set", "instance_variables", "instance_variables_to_inspect", "is_a?",
+    "iterator?", "itself", "kind_of?", "lambda", "load", "local_variables", "loop", "method",
+    "method_missing", "methods", "nil?", "object_id", "open", "p", "pp", "print",
+    "printf", "private_methods", "proc", "protected_methods", "public_method", "public_methods", "public_send", "putc",
+    "puts", "raise", "rand", "readline", "readlines", "remove_instance_variable", "require", "require_relative",
+    "respond_to?", "respond_to_missing?", "select", "send", "set_trace_func", "singleton_class", "singleton_method", "singleton_method_added",
+    "singleton_method_removed", "singleton_method_undefined", "singleton_methods", "sleep", "spawn", "sprintf", "srand", "syscall",
+    "system", "tap", "test", "then", "throw", "to_enum", "to_s", "trace_var",
+    "trap", "untrace_var", "warn", "yield_self",
+];
+/// Ruby 4.0 `Enumerable`'s and `Comparable`'s instance methods.
+const ENUMERABLE_METHODS: &[&str] = &[
+    "all?", "any?", "chain", "chunk", "chunk_while", "collect", "collect_concat", "compact",
+    "count", "cycle", "detect", "drop", "drop_while", "each_cons", "each_entry", "each_slice",
+    "each_with_index", "each_with_object", "entries", "filter", "filter_map", "find", "find_all", "find_index",
+    "first", "flat_map", "grep", "grep_v", "group_by", "include?", "inject", "lazy",
+    "map", "max", "max_by", "member?", "min", "min_by", "minmax", "minmax_by",
+    "none?", "one?", "partition", "reduce", "reject", "reverse_each", "select", "slice_after",
+    "slice_before", "slice_when", "sort", "sort_by", "sum", "take", "take_while", "tally",
+    "to_a", "to_h", "to_set", "uniq", "zip",
+];
+const COMPARABLE_METHODS: &[&str] = &[
+    "<", "<=", "==", ">", ">=", "between?", "clamp",
+];
+/// Ruby 4.0's top-level classes (`ruby --disable-gems`): a gem that reopens one aliases what Ruby defines there.
+const CORE_CLASSES: &[&str] = &[
+    "ArgumentError", "Array", "BasicObject", "Binding", "Class", "ClosedQueueError", "Complex", "ConditionVariable",
+    "Data", "Dir", "EOFError", "Encoding", "EncodingError", "Enumerator", "Exception", "FalseClass",
+    "Fiber", "FiberError", "File", "Float", "FloatDomainError", "FrozenError", "Hash", "IO",
+    "IOError", "IndexError", "Integer", "Interrupt", "KeyError", "LoadError", "LocalJumpError", "MatchData",
+    "Method", "Module", "Mutex", "NameError", "NilClass", "NoMatchingPatternError", "NoMatchingPatternKeyError", "NoMemoryError",
+    "NoMethodError", "NotImplementedError", "Numeric", "Object", "Pathname", "Proc", "Queue", "Ractor",
+    "Random", "Range", "RangeError", "Rational", "Refinement", "Regexp", "RegexpError", "RubyVM",
+    "RuntimeError", "ScriptError", "SecurityError", "Set", "SignalException", "SizedQueue", "StandardError", "StopIteration",
+    "String", "Struct", "Symbol", "SyntaxError", "SystemCallError", "SystemExit", "SystemStackError", "Thread",
+    "ThreadError", "ThreadGroup", "Time", "TracePoint", "TrueClass", "TypeError", "UnboundMethod", "UncaughtThrowError",
+    "ZeroDivisionError",
+];

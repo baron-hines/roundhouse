@@ -7,6 +7,7 @@
 pub mod adapter;
 pub mod analyze;
 pub mod app;
+mod app_answers;
 #[cfg(feature = "memory-census")]
 pub mod memory_census;
 pub mod builder;
@@ -64,6 +65,7 @@ pub mod lsp;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod mcp;
 pub mod naming;
+pub mod observed_shapes;
 pub mod par;
 pub mod profile;
 /// Target identity and the policies lowering reads (`param_binds_enabled`,

@@ -112,8 +112,12 @@ pub fn apply_html_safe_lowering(app: &mut App) {
             }
         }
     }
+    let components = components(app);
     for lc in &mut app.library_classes {
-        for m in &mut lc.methods {
+        if components.contains(lc.name.0.as_str()) {
+            continue;
+        }
+        for m in lc.methods.iter_mut().filter(|m| !from_source_gem(&app.sources, m)) {
             rewrite(&mut m.body);
         }
     }
@@ -131,6 +135,65 @@ pub fn apply_html_safe_lowering(app: &mut App) {
             rewrite(&mut m.body);
         }
     }
+}
+
+// Nor a component's (a class whose instances answer `render_in`, a ViewComponent): it renders on the view context too,
+// and its marks reach the page through the gem's code (a slot's `to_s`), past any lowering that reads the mark.
+fn components(app: &App) -> crate::det::HashSet<String> {
+    app.library_classes
+        .iter()
+        .filter(|lc| crate::lower::renderable::renders_itself(app, &lc.name))
+        .map(|lc| lc.name.0.as_str().to_string())
+        .collect()
+}
+
+// A source gem's method runs on the view context at request time (simple_form's `content = "".html_safe`, then
+// `content.safe_concat …`): the Ruby family's `SafeString` answers the mark there, which erasing would drop.
+fn from_source_gem(sources: &[crate::span::SourceFile], m: &crate::dialect::MethodDef) -> bool {
+    (m.name_span.file.0 as usize)
+        .checked_sub(1)
+        .and_then(|i| sources.get(i))
+        .is_some_and(|f| crate::ingest::absence_guards::is_source_gem_path(&f.path))
+}
+
+/// Every other target has no safe String (Spinel has one only where components render): a source gem's marks are
+/// erased there, as the app's are.
+/// Not erased on Spinel where components render: its tree ships a safe String then (`runtime/spinel/safe_string_spinel.rb`),
+/// which `project::inject_spinel_active_support_requires` loads on this same test.
+pub fn spinel_keeps_marks(app: &App) -> bool {
+    app.library_classes.iter().any(|lc| lc.name.0.as_str() == "ViewComponent::Base")
+}
+
+pub fn lower_for_target(app: &App, target: crate::build_target::BuildTarget) -> Option<App> {
+    use crate::build_target::BuildTarget;
+    if matches!(target, BuildTarget::Ruby | BuildTarget::Jruby) {
+        return None;
+    }
+    if target == BuildTarget::Spinel && spinel_keeps_marks(app) {
+        return None;
+    }
+    fn marks(e: &Expr) -> bool {
+        let mut found = matches!(&*e.node, ExprNode::Send { recv: Some(_), method, args, block: None, .. } if method.as_str() == "html_safe" && args.is_empty());
+        e.node.for_each_child(&mut |c| found |= marks(c));
+        found
+    }
+    let components = components(app);
+    let kept = |lc: &crate::dialect::LibraryClass, m: &crate::dialect::MethodDef, sources: &[crate::span::SourceFile]| {
+        from_source_gem(sources, m) || components.contains(lc.name.0.as_str())
+    };
+    if !app.library_classes.iter().any(|lc| lc.methods.iter().any(|m| kept(lc, m, &app.sources) && marks(&m.body))) {
+        return None;
+    }
+    let mut app = app.clone();
+    let sources = std::mem::take(&mut app.sources);
+    for lc in app.library_classes.iter_mut() {
+        let keep_all = components.contains(lc.name.0.as_str());
+        for m in lc.methods.iter_mut().filter(|m| keep_all || from_source_gem(&sources, m)) {
+            rewrite(&mut m.body);
+        }
+    }
+    app.sources = sources;
+    Some(app)
 }
 
 /// Can this body return a marked value? Every tail position is a

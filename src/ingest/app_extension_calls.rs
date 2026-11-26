@@ -12,9 +12,11 @@
 //! same ordered replay only for value-only class state. Dispatching methods
 //! and unverified order retain the existing dropped-call warning.
 //!
-//! Only top-level statements are marked: a call inside a block or
-//! condition (`plugins.each { |p| load_settings(p) }`) is not one the
-//! replay can carry whole, and stays dropped and reported.
+//! A call inside a condition or loop (`if GlobalSetting.load_plugins?`
+//! over `Dir[…].each { |file| load_settings(file) }`) is carried with
+//! the whole statement, when the statement's every call on the class is
+//! to an extended module's method and it reads only locals it binds;
+//! otherwise it stays dropped and reported.
 
 use crate::det::HashSet;
 
@@ -133,7 +135,11 @@ pub(super) fn mark(app: &mut App) {
                 _ => None,
             });
             let replays = own_call || through_own_reader || on_app_class.is_some();
-            if replays && !hook && block.is_none() && !expr.span.is_synthetic() {
+            // A block only to the class's own class method (OmniAuth's `uid do … end`, spliced from the Strategy's
+            // ClassMethods), which takes it as Ruby hands it over.
+            // Nor a block reading a local of the class body, which the replayed call no longer stands beside.
+            let block_ok = block.as_ref().is_none_or(|b| own_call && direct.contains(method.as_str()) && reads_no_local(b) && args.iter().all(reads_no_local));
+            if replays && !hook && block_ok && !expr.span.is_synthetic() {
                 let local_new = own_call && !direct.contains(method.as_str());
                 if local_new && (mixed_body || args.iter().any(|a| !literal_argument(a))
                     || redefined.contains(&owner) || parents.get(&owner).and_then(|p| dispatching.get(p)).is_some_and(|m| m.contains(method.as_str()))
@@ -176,10 +182,12 @@ pub(super) fn mark(app: &mut App) {
             let ModelBodyItem::Unknown { expr, .. } = item else { continue };
             // A call of its own class method (`custom_strategy :title, with: …`)
             // runs as the class loads, as a library class's does.
-            if let ExprNode::Send { recv, method, args, block: None, .. } = &*expr.node
+            // A block only to a class method the model itself has (aasm's `aasm do … end`, its ClassMethods spliced in), as a library class's.
+            if let ExprNode::Send { recv, method, args, block, .. } = &*expr.node
                 && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
                 && own.contains(method.as_str())
                 && !expr.span.is_synthetic()
+                && block.as_ref().is_none_or(|b| direct.contains(method.as_str()) && reads_no_local(b) && args.iter().all(reads_no_local))
             {
                 if direct.contains(method.as_str())
                     || (!mixed_body && !redefined.contains(&owner)
@@ -189,6 +197,11 @@ pub(super) fn mark(app: &mut App) {
                     expr.decisions |= crate::expr::REPLAYED_CLASS_BODY;
                     if !direct.contains(method.as_str()) { expr.decisions |= crate::expr::INHERITED_CLASS_BODY; }
                 }
+                continue;
+            }
+            let reaches = |m: &str| extended.iter().any(|&i| modules[i].1.contains(m));
+            if !expr.span.is_synthetic() && whole_statement(expr, &reaches) {
+                expr.decisions |= crate::expr::REPLAYED_CLASS_BODY;
                 continue;
             }
             let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { continue };
@@ -321,6 +334,86 @@ fn inherited_class_methods(
     (parents, methods, redefined, dispatching)
 }
 
+/// A condition or loop whose every call on the class is to an extended
+/// module's method, at least one of them, and which reads only locals
+/// it has assigned before the read, in scope.
+fn whole_statement(expr: &crate::expr::Expr, reaches: &dyn Fn(&str) -> bool) -> bool {
+    let compound = match &*expr.node {
+        ExprNode::If { .. } | ExprNode::Case { .. } | ExprNode::While { .. } => true,
+        ExprNode::Send { block: Some(_), .. } => true,
+        _ => false,
+    };
+    if !compound {
+        return false;
+    }
+    let mut calls = 0usize;
+    let mut clean = true;
+    walk(expr, &mut |e| match &*e.node {
+        ExprNode::Send { recv, method, .. } if recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)) => {
+            if reaches(method.as_str()) { calls += 1 } else { clean = false }
+        }
+        // A `yield`, `return` or `super` in a class body means another frame than the replayed one.
+        ExprNode::Yield { .. } | ExprNode::Return { .. } | ExprNode::Super { .. } | ExprNode::ForwardArgs | ExprNode::Retry | ExprNode::Redo
+        | ExprNode::MultiAssign { .. } => clean = false,
+        _ => {}
+    });
+    clean && calls > 0 && initialized_reads(expr, &mut Vec::new())
+}
+
+/// Every local `expr` reads is one assigned earlier on its path, or a parameter of an enclosing block.
+// Not one assigned anywhere in the statement: the replay drops the body's own assignment before it, so
+// `names = names.map { … }` or a read after a branch that may not have run would read another value.
+fn initialized_reads(expr: &crate::expr::Expr, bound: &mut Vec<crate::ident::Symbol>) -> bool {
+    match &*expr.node {
+        ExprNode::Var { name, .. } => bound.contains(name),
+        ExprNode::OpAssign { target: crate::expr::LValue::Var { name, .. }, value, .. } => bound.contains(name) && initialized_reads(value, bound),
+        ExprNode::Assign { target: crate::expr::LValue::Var { name, .. }, value } => {
+            let ok = initialized_reads(value, bound);
+            bound.push(name.clone());
+            ok
+        }
+        ExprNode::Seq { exprs } => exprs.iter().all(|e| initialized_reads(e, bound)),
+        ExprNode::Defined { operand } => scoped(bound, |b| initialized_reads(operand, b)),
+        ExprNode::Lambda { params, rest_param, extra_params, block_param, body, .. } => scoped(bound, |b| {
+            b.extend(params.iter().cloned());
+            b.extend(rest_param.iter().cloned());
+            b.extend(block_param.iter().cloned());
+            extra_params.iter().all(|p| {
+                // Not binding what a default assigns: a caller passing the argument skips it.
+                let ok = p.default.as_ref().is_none_or(|d| scoped(b, |b| initialized_reads(d, b)));
+                b.push(p.name.clone());
+                ok
+            }) && initialized_reads(body, b)
+        }),
+        ExprNode::If { cond, then_branch, else_branch } => {
+            initialized_reads(cond, bound)
+                && scoped(bound, |b| initialized_reads(then_branch, b))
+                && scoped(bound, |b| initialized_reads(else_branch, b))
+        }
+        _ => {
+            let mut ok = true;
+            expr.node.for_each_child(&mut |c| ok &= scoped(bound, |b| initialized_reads(c, b)));
+            ok
+        }
+    }
+}
+
+fn scoped(bound: &mut Vec<crate::ident::Symbol>, f: impl FnOnce(&mut Vec<crate::ident::Symbol>) -> bool) -> bool {
+    let depth = bound.len();
+    let ok = f(bound);
+    bound.truncate(depth);
+    ok
+}
+
+fn walk(e: &crate::expr::Expr, f: &mut dyn FnMut(&crate::expr::Expr)) {
+    f(e);
+    // Not left to `for_each_child` alone, which does not enter a `defined?` operand.
+    if let ExprNode::Defined { operand } = &*e.node {
+        walk(operand, f);
+    }
+    e.node.for_each_child(&mut |c| walk(c, f));
+}
+
 fn mixin_statement(expr: &crate::expr::Expr) -> bool {
     matches!(&*expr.node, ExprNode::Send { recv, method, .. }
         if recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
@@ -348,6 +441,8 @@ fn reads_no_local(expr: &crate::expr::Expr) -> bool {
 fn reads_only(expr: &crate::expr::Expr, bound: &mut Vec<crate::ident::Symbol>) -> bool {
     match &*expr.node {
         ExprNode::Var { name, .. } => return bound.contains(name),
+        // `x += 1` reads `x` too, which the target alone does not show.
+        ExprNode::OpAssign { target: crate::expr::LValue::Var { name, .. }, .. } if !bound.contains(name) => return false,
         // Not left to `for_each_child`, which does not enter a `defined?` operand.
         ExprNode::Defined { operand } => return reads_only(operand, bound),
         ExprNode::Lambda { params, rest_param, extra_params, block_param, body, .. } => {

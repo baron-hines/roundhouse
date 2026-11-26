@@ -17,6 +17,10 @@ require_relative "i18n_host"
 # signature here can type, so `lower::i18n_translate` spells each call
 # site out over `enter_locale` / `leave_locale`.
 module I18n
+  # Not Ruby's own: the gem's errors share this parent, which `rescue I18n::ArgumentError` catches.
+  class ArgumentError < ::ArgumentError
+  end
+
   # `I18n.locale = :xx` for a locale the app does not make available
   # (the gem's `enforce_available_locales`, true by default).
   class InvalidLocale < ArgumentError

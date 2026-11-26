@@ -181,6 +181,7 @@ pub(super) fn merge_route_files(files: Vec<FileRoutes>) -> RouteTable {
         table.direct_helpers.extend(file.table.direct_helpers);
         table.redirects.extend(file.table.redirects);
         table.diagnostics.extend(file.table.diagnostics);
+        table.url_protocols.extend(file.table.url_protocols);
         appended.extend(file.appended);
     }
     prepended.extend(table.entries);
@@ -244,6 +245,7 @@ fn ingest_route_file_in_frame(
         active: RefCell::new(Vec::new()),
         hoisted: RefCell::new(Vec::new()),
         diagnostics: RefCell::new(Vec::new()),
+        url_protocols: RefCell::new(Vec::new()),
         mount_scope_depth: Cell::new(0),
         scope_controller: RefCell::new(None),
         mounted_engines: RefCell::new(HashSet::default()),
@@ -314,7 +316,7 @@ fn ingest_route_file_in_frame(
     diagnostics.extend(refused_route_diagnostics(&prepended, source, file));
     diagnostics.extend(refused_route_diagnostics(&appended, source, file));
     Ok(FileRoutes {
-        table: RouteTable { entries, direct_helpers, redirects: redirect_sink::drain(), diagnostics },
+        table: RouteTable { entries, direct_helpers, redirects: redirect_sink::drain(), diagnostics, url_protocols: cx.url_protocols.take() },
         prepended,
         appended,
     })
@@ -414,6 +416,8 @@ struct Ctx<'a> {
     hoisted: RefCell<Vec<RouteSpec>>,
     /// Located errors recovered while retaining sibling routes.
     diagnostics: RefCell<Vec<Diagnostic>>,
+    /// `root … protocol:` options, by the helper stem they set the protocol of.
+    url_protocols: RefCell<Vec<(String, crate::span::Span)>>,
     /// Fixed runtime mounts cannot inherit path/constraint DSL wrappers.
     mount_scope_depth: Cell<usize>,
     /// The `controller:` of the enclosing `scope controller: :x do` /
@@ -836,6 +840,7 @@ fn walk_engine_body(body: Node<'_>, file: &str) -> IngestResult<EngineWalk> {
         active: RefCell::new(Vec::new()),
         hoisted: RefCell::new(Vec::new()),
         diagnostics: RefCell::new(Vec::new()),
+        url_protocols: RefCell::new(Vec::new()),
         mount_scope_depth: Cell::new(1),
         scope_controller: RefCell::new(None),
         mounted_engines: RefCell::new(HashSet::default()),
@@ -1491,7 +1496,16 @@ fn ingest_route_stmts<'pr>(
         }
 
         if !route_options_kept(&call, &method) {
-            route_refusal(&call.as_node(), file, cx, "route defaults", "only literal `format` and segment defaults reach the table");
+            route_refusal(&call.as_node(), file, cx, "route defaults", "this route option or defaults form is not modeled");
+        } else if method == "root"
+            && let Some((stem, span)) = root_url_protocol(&call, file)
+        {
+            // A scope renames the helper (`admin_root`), which the call sites are matched by.
+            if cx.mount_scope_depth.get() == 0 {
+                cx.url_protocols.borrow_mut().push((stem, span));
+            } else {
+                route_refusal(&call.as_node(), file, cx, "route defaults", "a scoped root's `protocol:` is not modeled");
+            }
         }
         // Per-entry recovery: one `mount`/`use_doorkeeper` must not
         // zero the whole table. Survey mode records the gap and keeps
@@ -1527,10 +1541,26 @@ fn empty_splat_value(value: &Node<'_>) -> bool {
     value.as_nil_node().is_some() || value.as_hash_node().is_some_and(|h| h.elements().iter().all(|item| empty_route_splat(&item)))
 }
 
+fn route_default_literal(node: &Node<'_>) -> Option<crate::expr::Literal> {
+    use crate::expr::Literal;
+    if let Some(value) = string_value(node) { return Some(Literal::Str { value }); }
+    if let Some(value) = symbol_value(node) { return Some(Literal::Sym { value: Symbol::from(value) }); }
+    if let Some(value) = super::util::integer_value(node) { return Some(Literal::Int { value }); }
+    if let Some(value) = bool_value(node) { return Some(Literal::Bool { value }); }
+    node.as_nil_node().map(|_| Literal::Nil)
+}
+
+/// Rails' route options a verb reads as itself rather than as a default (`Mapper::Mapping`'s keys).
+fn route_reserved_option(key: &str) -> bool {
+    matches!(key, "anchor" | "module" | "shallow" | "shallow_path" | "shallow_prefix" | "param" | "only" | "except" | "internal" | "format")
+}
+
 /// Literal `defaults:` the table keeps (scope ones are checked per route), and no option the ingesters skip.
 fn route_options_kept(call: &ruby_prism::CallNode<'_>, method: &str) -> bool {
-    let default_kept = |default: Node<'_>| empty_route_splat(&default) || default.as_assoc_node().is_some_and(|pair| symbol_or_string_value(&pair.value()).is_some()
-        && symbol_value(&pair.key()).is_some_and(|key| method == "scope" || (key == "format" && http_method_from(method).is_some())));
+    let default_kept = |default: Node<'_>| empty_route_splat(&default) || default.as_assoc_node().is_some_and(|pair| symbol_value(&pair.key()).is_some_and(|key|
+        if http_method_from(method).is_some() && matches!(key.as_str(), "controller" | "action") { false } else
+        if method == "scope" || key == "format" { symbol_or_string_value(&pair.value()).is_some() && (method == "scope" || http_method_from(method).is_some()) }
+        else { http_method_from(method).is_some() && route_default_literal(&pair.value()).is_some() }));
     let literal_format = |value: Node<'_>| symbol_or_string_value(&value).is_some() || bool_value(&value).is_some()
         || value.as_nil_node().is_some() || value.as_regular_expression_node().is_some();
     let (mut defaults_seen, mut path_seen, mut format_seen) = (false, false, false);
@@ -1544,8 +1574,10 @@ fn route_options_kept(call: &ruby_prism::CallNode<'_>, method: &str) -> bool {
                 Some(key) if key != "defaults" && pair.value().as_regular_expression_node().is_some() => true,
                 Some(key) if key == "defaults" => !std::mem::replace(&mut defaults_seen, true)
                     && pair.value().as_hash_node().is_some_and(|hash| hash.elements().iter().all(&default_kept)),
+                Some(key) if key == "protocol" && method == "root" => true,
                 Some(key) => matches!(key.as_str(), "path" | "as" | "controller" | "action" | "constraints" | "to" | "via")
                     || (http_method_from(method).is_some() && key == "on")
+                    || (http_method_from(method).is_some() && !route_reserved_option(&key) && route_default_literal(&pair.value()).is_some())
                     || (matches!(method, "scope" | "namespace" | "resources" | "resource") && matches!(key.as_str(), "module" | "only" | "except" | "shallow" | "path_names"))
                     || (matches!(method, "resources" | "resource") && matches!(key.as_str(), "param" | "concerns")),
                 None => http_method_from(method).is_some() && !std::mem::replace(&mut path_seen, true)
@@ -1555,6 +1587,26 @@ fn route_options_kept(call: &ruby_prism::CallNode<'_>, method: &str) -> bool {
     };
     let routed = http_method_from(method).is_some() || matches!(method, "root" | "scope" | "namespace" | "resources" | "resource");
     !routed || call.arguments().is_none_or(|args| args.arguments().iter().all(&mut read))
+}
+
+/// The `protocol:` of a `root` route, under the helper stem its `as:` names (`root` without one).
+fn root_url_protocol(call: &ruby_prism::CallNode<'_>, file: &str) -> Option<(String, crate::span::Span)> {
+    let args = call.arguments()?;
+    let pairs: Vec<_> = args
+        .arguments()
+        .iter()
+        .filter_map(|arg| arg.as_keyword_hash_node())
+        .flat_map(|options| options.elements().iter().filter_map(|option| option.as_assoc_node()).collect::<Vec<_>>())
+        .collect();
+    let protocol = pairs.iter().find(|pair| symbol_value(&pair.key()).as_deref() == Some("protocol"))?;
+    // The last `as:`, as `ingest_root_route` names the helper by it.
+    let stem = pairs
+        .iter()
+        .rev()
+        .find(|pair| symbol_value(&pair.key()).as_deref() == Some("as"))
+        .and_then(|pair| symbol_or_string_value(&pair.value()))
+        .unwrap_or_else(|| "root".to_string());
+    Some((stem, super::util::node_span(&protocol.as_node(), file)))
 }
 
 fn route_refusal(node: &Node<'_>, file: &str, cx: &Ctx<'_>, construct: &str, detail: &str) {
@@ -3869,6 +3921,7 @@ fn ingest_explicit_route(
     let mut action_kwarg: Option<String> = None;
     let mut controller_kwarg: Option<String> = None;
     let mut defaults_format: Option<String> = None;
+    let mut request_defaults = IndexMap::new();
     // The INLINE spelling of `member do … end` / `collection do … end`.
     // Rails accepts both, and campfire writes `delete :clear, on:
     // :collection`; only the block form was recognized, so the route was
@@ -4000,10 +4053,11 @@ fn ingest_explicit_route(
                     "defaults" => {
                         if let Some(defaults) = value.as_hash_node() {
                             for entry in defaults.elements().iter() {
-                                if let Some(pair) = entry.as_assoc_node()
-                                    && symbol_value(&pair.key()).as_deref() == Some("format")
-                                {
-                                    defaults_format = rname(&pair.value());
+                                if let Some(pair) = entry.as_assoc_node() && let Some(key) = symbol_value(&pair.key()) {
+                                    if key == "format" { defaults_format = rname(&pair.value()); }
+                                    else if let Some(value) = route_default_literal(&pair.value()) {
+                                        request_defaults.insert(Symbol::from(key), (value, super::util::node_span(&entry, file)));
+                                    }
                                 }
                             }
                         }
@@ -4053,6 +4107,10 @@ fn ingest_explicit_route(
                             constraints.insert(Symbol::from(crate::dialect::FORMAT_REQUIREMENT), crate::dialect::FORMAT_NONE.to_string());
                         }
                     }
+                    // `get "login" => "static#show", :id => "login"`: Rails' `normalize_defaults` takes every option that is not a Regexp as a default.
+                    other if !route_reserved_option(other) && let Some(literal) = route_default_literal(value) => {
+                        request_defaults.insert(Symbol::from(other), (literal, super::util::node_span(&el, file)));
+                    }
                     other => {
                         if let Some(v) = string_value(value) {
                             constraints.insert(Symbol::from(other), v);
@@ -4097,7 +4155,7 @@ fn ingest_explicit_route(
         } else {
             redirect_sink::push(&path, location, status)
         };
-        return Ok(Some(RouteSpec::Explicit {
+        return Ok(Some(RouteSpec::Explicit { defaults: request_defaults,
             method,
             path,
             controller: ClassId(Symbol::from(REDIRECT_CONTROLLER)),
@@ -4126,7 +4184,7 @@ fn ingest_explicit_route(
         }
         let Some(path) = path else { return Ok(None) };
         refuse_unmodeled_endpoint(call, file, cx, &method, &path, kind);
-        return Ok(Some(RouteSpec::Explicit {
+        return Ok(Some(RouteSpec::Explicit { defaults: request_defaults,
             method,
             path,
             controller: ClassId(Symbol::from(UNMODELED_ENDPOINT_CONTROLLER)),
@@ -4188,7 +4246,7 @@ fn ingest_explicit_route(
                         (MODULE_CONTROLLER.to_string(), action)
                     }
                 };
-                return Ok(Some(RouteSpec::Explicit {
+                return Ok(Some(RouteSpec::Explicit { defaults: request_defaults,
                     method,
                     path: p,
                     controller: ClassId(Symbol::from(controller)),
@@ -4221,7 +4279,7 @@ fn ingest_explicit_route(
         }
     };
 
-    Ok(Some(RouteSpec::Explicit {
+    Ok(Some(RouteSpec::Explicit { defaults: request_defaults,
         method,
         path: path.unwrap_or_default(),
         controller: ClassId(Symbol::from(controller_class_name(&controller))),
@@ -4300,7 +4358,7 @@ fn ingest_root_route(
         } else {
             redirect_sink::push("/", location, status)
         };
-        return Ok(Some(RouteSpec::Explicit {
+        return Ok(Some(RouteSpec::Explicit { defaults: IndexMap::new(),
             method: HttpMethod::Get,
             path: "/".to_string(),
             controller: ClassId(Symbol::from(REDIRECT_CONTROLLER)),
@@ -4319,7 +4377,7 @@ fn ingest_root_route(
             // no controller of its own, so Rails takes the scope's module
             // (`search#new`), as for a bare verb.
             (Some(action), None) => {
-                return Ok(Some(RouteSpec::Explicit {
+                return Ok(Some(RouteSpec::Explicit { defaults: IndexMap::new(),
                     method: HttpMethod::Get,
                     path: "/".to_string(),
                     controller: ClassId(Symbol::from(MODULE_CONTROLLER)),
@@ -4338,7 +4396,7 @@ fn ingest_root_route(
         // Rails still names it `root`, so the helper is kept (see
         // [`UNMODELED_ENDPOINT_CONTROLLER`]).
         refuse_unmodeled_endpoint(call, file, cx, &HttpMethod::Get, "/", kind);
-        return Ok(Some(RouteSpec::Explicit {
+        return Ok(Some(RouteSpec::Explicit { defaults: IndexMap::new(),
             method: HttpMethod::Get,
             path: "/".to_string(),
             controller: ClassId(Symbol::from(UNMODELED_ENDPOINT_CONTROLLER)),

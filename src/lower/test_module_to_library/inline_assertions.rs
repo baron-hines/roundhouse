@@ -23,11 +23,19 @@
 //!   - `assert_same a, b`               → `raise "…" if !a.equal?(b)`
 //!   - `assert_not_same a, b` / `refute_same a, b` → `raise "…" if a.equal?(b)`
 //!   - `assert_instance_of K, x`        → `raise "…" if !x.instance_of?(K)`
+//!   - `assert_respond_to o, :sym`      → `raise "…" if !o.respond_to?(:sym)`
+//!   - `refute_respond_to o, :sym` / `assert_not_respond_to o, :sym`
+//!                                      → `raise "…" if o.respond_to?(:sym)`
+//!   (the `respond_to?` folds to a literal where `o`'s class is known:
+//!   `lower::respond_to`)
 //!   (`assert_match` and `assert_operator` deliberately not lowered —
 //!   nilable-value handling and Class-subclass `<` checks aren't
 //!   cross-target-safe. Each target's test_helper handles them; Ruby's
 //!   TestBase provides both.)
 //!   - `assert_predicate o, :sym`       → `raise "…" if !o.sym` (sym from Symbol literal)
+//!   - `assert_respond_to o, :sym`      → `raise "…" if !o.respond_to?(:sym)`
+//!   - `refute_respond_to o, :sym` / `assert_not_respond_to o, :sym`
+//!                                      → `raise "…" if o.respond_to?(:sym)`
 //!   - `flunk msg`                      → `raise msg` (Minitest's "Epic Fail!" without one)
 //!   - `assert_difference("X.m"[, d]) { body }` → before/after capture
 //!   - `assert_no_difference("X.m") { body }`   → same, delta 0
@@ -261,6 +269,26 @@ fn rewrite_send(e: &Expr, own: &dyn Fn(&str) -> bool) -> Option<Expr> {
                 "refute_kind_of failed".to_string(),
             ))
         }
+        // `assert_respond_to obj, :sym` — object first, as Minitest has it.
+        // The `respond_to?` it leaves is answered at compile time where the
+        // receiver's class is known (`lower::respond_to`); a Symbol literal
+        // only, so that answer is about a name the source wrote.
+        "assert_respond_to" if args.len() >= 2 && is_sym_lit(&args[1]) => {
+            let obj = args[0].clone();
+            Some(raise_if(
+                span,
+                not_expr(span, send_method(span, obj, "respond_to?", vec![args[1].clone()])),
+                "assert_respond_to failed".to_string(),
+            ))
+        }
+        "refute_respond_to" | "assert_not_respond_to" if args.len() >= 2 && is_sym_lit(&args[1]) => {
+            let obj = args[0].clone();
+            Some(raise_if(
+                span,
+                send_method(span, obj, "respond_to?", vec![args[1].clone()]),
+                "refute_respond_to failed".to_string(),
+            ))
+        }
         // OBJECT IDENTITY, which is a different question from `==` and
         // the only one these tests are asking: campfire's
         // `content_filters_test` proves `SanitizeAttributes` builds a
@@ -349,6 +377,20 @@ fn rewrite_send(e: &Expr, own: &dyn Fn(&str) -> bool) -> Option<Expr> {
                 send_method(span, obj, &sym, vec![]),
                 "refute_predicate failed".to_string(),
             ))
+        }
+        // `assert_respond_to obj, :sym` — Minitest's own wording of
+        // `assert obj.respond_to?(:sym)`, and refuted the same way. Only
+        // a Symbol literal: a computed name is left to the helper.
+        "assert_respond_to" | "refute_respond_to" | "assert_not_respond_to" if args.len() >= 2 => {
+            if !matches!(&*args[1].node, ExprNode::Lit { value: Literal::Sym { .. } }) {
+                return None;
+            }
+            let responds = send_method(span, args[0].clone(), "respond_to?", vec![args[1].clone()]);
+            Some(if method.as_str() == "assert_respond_to" {
+                raise_if(span, not_expr(span, responds), "assert_respond_to failed".to_string())
+            } else {
+                raise_if(span, responds, format!("{} failed", method.as_str()))
+            })
         }
         // `assert_raise` is Test::Unit's spelling, aliased by Rails and
         // written by campfire's `unfurl_links_controller_test`. Same
@@ -847,6 +889,10 @@ fn send_method(span: Span, recv: Expr, method: &str, args: Vec<Expr>) -> Expr {
             parenthesized: true,
         },
     )
+}
+
+fn is_sym_lit(e: &Expr) -> bool {
+    matches!(&*e.node, ExprNode::Lit { value: Literal::Sym { .. } })
 }
 
 /// Synthesize `!cond` as the unary `!` Send the Ruby emitter

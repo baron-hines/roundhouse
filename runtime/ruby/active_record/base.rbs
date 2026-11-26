@@ -71,11 +71,19 @@ module ActiveRecord
 
   module Reflection
     class AssociationReflection
-      def initialize: (Symbol name, untyped counter_cache_column) -> void
+      @macro: Symbol
+      @foreign_key: String
+      @polymorphic: bool
+      def initialize: (Symbol name, untyped counter_cache_column, Symbol macro, String foreign_key, bool polymorphic) -> void
       def name: () -> Symbol
       def counter_cache_column: () -> untyped
       def klass: () -> untyped
-      def macro: () -> untyped
+      def macro: () -> Symbol
+      def belongs_to?: () -> bool
+      def foreign_key: () -> String
+      def polymorphic?: () -> bool
+      def options: () -> Hash[Symbol, bool]
+      def foreign_type: () -> String?
     end
   end
 
@@ -159,6 +167,9 @@ module ActiveRecord
     def self._sti_type_names: () -> Array[String]
     def self.primary_key: () -> String
     def self._association_names: () -> Array[Symbol]
+    def self._association_macros: () -> Array[Symbol]
+    def self._association_foreign_keys: () -> Array[String]
+    def self._association_polymorphic: () -> Array[bool]
     def self.reflect_on_association: (Symbol | String name) -> ActiveRecord::Reflection::AssociationReflection?
     def self.reflect_on_association_at: (String needle, Integer i) -> ActiveRecord::Reflection::AssociationReflection?
     def self._cast_primary_key: (Integer | String id) -> (Integer | String | nil)
@@ -170,11 +181,14 @@ module ActiveRecord
     def self.schema_date_columns: () -> Array[Symbol]
     def self.schema_boolean_columns: () -> Array[Symbol]
     def self.schema_decimal_columns: () -> Array[Symbol]
+    def self.schema_enum_columns: () -> Array[Symbol]
+    def self._enum_where_value: (String _col, Integer | Float | bool | Symbol | String | nil _value) -> (Integer | String)?
     def self.instantiate: (Hash[String, untyped] _row) -> Base
 
     # Eager-load hook consumed by `Relation#to_a`; the Ruby emit path
     # synthesizes per-model overrides, this default is a no-op.
     def self.preload_associations: (Array[untyped] _records, Array[untyped] _specs) -> void
+    def self._eager_load_joins: (Array[untyped] _specs, String _conditions, String _joined) -> Array[String]
 
     # Subclass-overridden instance API. `attributes` returns the
     # column hash for adapter writes; `assign_from_row` populates
@@ -191,6 +205,9 @@ module ActiveRecord
     def saved_change_to_attribute?: (Symbol name) -> bool
     def saved_change_to_attribute: (Symbol name) -> untyped
     def changes_to_save: () -> Hash[String, untyped]
+    def changes: () -> Hash[String, untyped]
+    def previous_changes: () -> Hash[String, untyped]
+    def changed: () -> Array[String]
     def attribute_changed?: (String name) -> bool
     def will_save_change_to_attribute?: (Symbol | String name) -> bool
     def changed?: () -> bool
@@ -198,6 +215,7 @@ module ActiveRecord
     def attribute_was: (String name) -> untyped
     def clear_attribute_change: (String name) -> nil
     def restore_attribute!: (String name) -> nil
+    def restore_attributes: () -> Array[String]
     def id_previously_changed?: () -> bool
     def previously_new_record?: () -> bool
 
@@ -241,6 +259,7 @@ module ActiveRecord
     # `void` keeps TS from requiring an explicit `return ...;` for
     # the trailing assignment.
     def mark_persisted!: () -> void
+    def _set_inverse_from_queries: (Symbol name, Array[Base] records) -> void
 
     # cache_key / cache_version / cache_key_with_version — see
     # connection.rb's Base reopen, NOT this file: base.rb is transpiled
@@ -347,6 +366,7 @@ module ActiveRecord
     def stamps_timestamps?: () -> bool
 
     def valid?: () -> bool
+    def validate!: () -> bool
 
     # Equality protocol intentionally not defined here — see comment
     # in base.rb for the cross-target rationale.

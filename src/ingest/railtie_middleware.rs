@@ -10,9 +10,12 @@
 //!
 //! `use` appends: the middleware sits after Rails' own (the static file
 //! server, `ActionDispatch::RequestId`, the session), just before the
-//! routes. Only `use` with the class alone is read; a middleware given
-//! arguments or placed with `insert_before` / `insert_after` is
-//! reported as unsupported instead of left out.
+//! routes. Only `use` with the class alone is read, and the two places
+//! the emitted stack has an edge for: `insert_after
+//! ActionDispatch::RequestId` (its first) and `insert_before
+//! ActionDispatch::Flash` (past the session, ahead of every `use`); a
+//! middleware given arguments or placed anywhere else is reported as
+//! unsupported instead of left out.
 
 use crate::det::HashSet;
 use std::path::{Path, PathBuf};
@@ -27,7 +30,7 @@ use crate::vfs::Vfs;
 use super::prism_api::PrismLocation;
 use super::util::{
     class_name_path, constant_id_str, constant_path_is_rooted, constant_path_of, find_all_classes_with_nesting,
-    find_all_module_declarations_with_scope, flatten_statements, module_name_path,
+    find_all_module_declarations_with_scope, flatten_statements, module_name_path, walk_calls,
 };
 
 /// A `use(K)` as written, before `K` is resolved where the Railtie's body names it.
@@ -43,6 +46,27 @@ struct Use {
     block: Option<String>,
     /// Run as its class body loads, not from an initializer: Bundler requires the gem before the app's class body runs.
     at_load: bool,
+    /// Where on the stack it goes.
+    front: Place,
+}
+
+/// A middleware's place on the emitted stack, which runs from right inside Rails' RequestId to the routes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Place {
+    /// `insert_after ActionDispatch::RequestId, K`: the stack's first.
+    Front,
+    /// `insert_before ActionDispatch::Flash, K` (message_bus's): past the session, ahead of every `use`d one, which
+    /// Rails appends after Flash.
+    BeforeFlash,
+    /// `use K`: appended.
+    End,
+}
+
+pub(super) struct MiddlewareLoop {
+    pub collection: Expr,
+    pub statement: Option<Expr>,
+    pub app_param: String,
+    pub refusal: Diagnostic,
 }
 
 /// What the app's gems put on its stack, outermost first.
@@ -52,15 +76,20 @@ pub(super) struct Stack {
     pub blocks: crate::det::HashMap<String, String>,
     /// The Rack env keys a stacked middleware's `call(env)` writes, and the class it writes there.
     pub env_writes: crate::det::HashMap<String, String>,
+    /// What each class writes into the env, for a class stacked later (a loop's, `fold_middleware_loops`).
+    pub env_writes_by_class: crate::det::HashMap<String, crate::det::HashMap<String, String>>,
     /// Where each stacked `config.middleware.use` of the app's `config/application.rb` starts.
     pub application_taken: Vec<u32>,
     pub diags: Vec<Diagnostic>,
     /// An initializer's loop that inserts a middleware per element (`Devise.omniauth_configs.each do … use … end`): the
-    /// collection, and the refusal that stands unless the app's settings leave it empty.
-    pub loops: Vec<(Expr, Diagnostic)>,
+    /// collection, the loop as written with the initializer's `app` parameter, and the refusal that stands unless the
+    /// app's settings leave it empty or the loop unrolls.
+    pub loops: Vec<MiddlewareLoop>,
 }
 
 pub(super) fn read<V: Vfs + ?Sized>(vfs: &V, dir: &Path, gem_libs: &[PathBuf]) -> Stack {
+    let settings = app_settings(vfs, dir);
+    let defaulted = defaulted_settings(vfs, dir);
     let mut out = Vec::new();
     let mut diags = Vec::new();
     let mut loops = Vec::new();
@@ -100,13 +129,15 @@ pub(super) fn read<V: Vfs + ?Sized>(vfs: &V, dir: &Path, gem_libs: &[PathBuf]) -
                 let Some(body) = class.body() else { continue };
                 let own = scope.iter().cloned().chain(class_name_path(&class).unwrap_or_default()).collect::<Vec<_>>();
                 let lexical: Vec<String> = std::iter::once(own.join("::")).chain(nesting).collect();
+                let body_text = class.body().map(|b| String::from_utf8_lossy(b.location().as_slice()).into_owned()).unwrap_or_default();
+                let guards = Guards { body_text, defaulted: &defaulted, predicates: class.body().map(setting_predicates).unwrap_or_default(), settings: &settings };
                 // Not `file_id` alone: a file library ingest has not registered yet answers no file.
                 let file_id = super::sources::register(&name, &String::from_utf8_lossy(&bytes));
                 if matches!(loaded, Loading::Autoload | Loading::Unknown) {
                     // Not reported for a Railtie that inserts no middleware (acts_as_follower's): its loading changes no stack.
                     let (mut probe_uses, mut probe_diags, mut probe_loops) = (Vec::new(), Vec::new(), Vec::new());
                     for stmt in flatten_statements(body) {
-                        read_initializer(&stmt, file_id, &name, &lexical, &mut probe_uses, &mut probe_diags, &mut probe_loops);
+                        read_initializer(&stmt, file_id, &name, &lexical, &guards, &mut probe_uses, &mut probe_diags, &mut probe_loops);
                         read_class_body_use(&stmt, file_id, &lexical, false, &mut probe_uses, &mut probe_diags);
                     }
                     if probe_uses.is_empty() && probe_diags.is_empty() && probe_loops.is_empty() {
@@ -127,7 +158,7 @@ pub(super) fn read<V: Vfs + ?Sized>(vfs: &V, dir: &Path, gem_libs: &[PathBuf]) -
                     continue;
                 }
                 for stmt in flatten_statements(body) {
-                    read_initializer(&stmt, file_id, &name, &lexical, &mut uses, &mut diags, &mut loops);
+                    read_initializer(&stmt, file_id, &name, &lexical, &guards, &mut uses, &mut diags, &mut loops);
                     read_class_body_use(&stmt, file_id, &lexical, false, &mut uses, &mut diags);
                 }
             }
@@ -138,7 +169,7 @@ pub(super) fn read<V: Vfs + ?Sized>(vfs: &V, dir: &Path, gem_libs: &[PathBuf]) -
         let defined = defined_constants(vfs, &files);
         for u in uses {
             match resolve(&u, &defined).or_else(|| resolve(&u, &every_gem_defines)) {
-                Some(class) => out.push((class, u.ordered, u.span, u.block, u.at_load)),
+                Some(class) => out.push((class, u.ordered, u.span, u.block, u.at_load, u.front)),
                 None => diags.push(Diagnostic::unsupported(
                     u.span,
                     None,
@@ -165,16 +196,20 @@ pub(super) fn read<V: Vfs + ?Sized>(vfs: &V, dir: &Path, gem_libs: &[PathBuf]) -
         // Not stacked: a class neither a source gem nor the app defines (`Rack::Deflater`) stays the ledger's warning, as before.
         if let Some(class) = resolve(&u, defines) {
             application_taken.push(u.span.start);
-            app_uses.push((class, false, u.span, u.block, true));
+            app_uses.push((class, false, u.span, u.block, true, Place::End));
         }
     }
     let out: Vec<_> = {
-        let (load, init): (Vec<_>, Vec<_>) = out.into_iter().partition(|u| u.4);
-        load.into_iter().chain(app_uses).chain(init).collect()
+        let (front, rest): (Vec<_>, Vec<_>) = out.into_iter().partition(|u| u.5 == Place::Front);
+        let (flash, rest): (Vec<_>, Vec<_>) = rest.into_iter().partition(|u| u.5 == Place::BeforeFlash);
+        let (load, init): (Vec<_>, Vec<_>) = rest.into_iter().partition(|u| u.4);
+        // Each `insert_after RequestId` lands right after it, ahead of the ones inserted before: Rails' order is the reverse.
+        // Each `insert_before Flash` lands right before it, after the ones inserted before.
+        front.into_iter().rev().chain(flash).chain(load).chain(app_uses).chain(init).collect()
     };
     // Not stacked in reading order when initializers order themselves: Rails sorts them by `before:` and `after:`.
     if out.len() > 1 {
-        for (_, _, span, _, _) in out.iter().filter(|(_, ordered, _, _, _)| *ordered) {
+        for (_, _, span, _, _, _) in out.iter().filter(|(_, ordered, _, _, _, _)| *ordered) {
             diags.push(Diagnostic::unsupported(
                 *span,
                 None,
@@ -183,50 +218,177 @@ pub(super) fn read<V: Vfs + ?Sized>(vfs: &V, dir: &Path, gem_libs: &[PathBuf]) -
             ));
         }
     }
-    let blocks = out.iter().filter_map(|(class, _, _, block, _)| block.clone().map(|b| (class.clone(), b))).collect();
-    let classes: Vec<String> = out.into_iter().map(|(class, _, _, _, _)| class).collect();
-    let env_writes = env_writes(vfs, &every_lib_file, &classes, &every_gem_defines);
-    Stack { classes, blocks, env_writes, application_taken, diags, loops }
+    // Blocks are kept per class, not per entry: a class stacked twice with different blocks is refused rather than given one twice.
+    for (i, (class, _, span, block, _, _)) in out.iter().enumerate() {
+        if out[..i].iter().any(|(c, _, _, b, _, _)| c == class && b != block) {
+            diags.push(Diagnostic::unsupported(*span, None, "railtie middleware",
+                format!("`{class}` is stacked twice with different construction blocks: the emitted stack keeps one per class")));
+        }
+    }
+    let blocks = out.iter().filter_map(|(class, _, _, block, _, _)| block.clone().map(|b| (class.clone(), b))).collect();
+    let classes: Vec<String> = out.into_iter().map(|(class, _, _, _, _, _)| class).collect();
+    let env_writes_by_class = env_writes_by_class(vfs, &every_lib_file, &every_gem_defines);
+    let mut env_writes = crate::det::HashMap::default();
+    stacked_env_writes(&env_writes_by_class, &classes, &mut env_writes);
+    Stack { classes, blocks, env_writes, env_writes_by_class, application_taken, diags, loops }
 }
 
-/// `env["warden"] = Proxy.new(env, self)`: a top-level statement of a stacked class's `call(env)`,
-/// writing a literal key with a constructed class, which is then in the env below it on every request.
-fn env_writes<V: Vfs + ?Sized>(vfs: &V, files: &[PathBuf], stacked: &[String], defined: &HashSet<String>) -> crate::det::HashMap<String, String> {
-    let mut out = crate::det::HashMap::default();
+/// `env["warden"] = Proxy.new(env, self)`: a stacked class writing a literal key with a constructed class, which is
+/// then in the env below it on every request. The write may be in any of its methods or of the modules it includes
+/// (OmniAuth::Strategy's `callback_phase`), on the `call(env)` parameter, `@env` or the `env` reader, and the value
+/// may be a method of theirs that answers the construction (`env['omniauth.auth'] = auth_hash`, whose last
+/// expression is `AuthHash.new(...).tap { ... }`).
+// A key written with two different classes is left untyped: which one the request holds is the run time's.
+fn env_writes_by_class<V: Vfs + ?Sized>(vfs: &V, files: &[PathBuf], defined: &HashSet<String>) -> crate::det::HashMap<String, crate::det::HashMap<String, String>> {
+    #[derive(Default)]
+    struct Owner {
+        includes: Vec<String>,
+        writes: Vec<(String, Built)>,
+        answers: crate::det::HashMap<String, String>,
+    }
+    enum Built {
+        Class(String),
+        Method(String),
+    }
+    let built = |value: &Node<'_>, lexical: &[String]| -> Option<String> {
+        let mut value = value.as_call_node()?;
+        if constant_id_str(&value.name()) == "tap" && value.arguments().is_none() {
+            value = value.receiver()?.as_call_node()?;
+        }
+        if constant_id_str(&value.name()) != "new" {
+            return None;
+        }
+        let receiver = value.receiver()?;
+        let path = constant_path_of(&receiver)?;
+        let rooted = receiver.as_constant_path_node().is_some_and(|p| constant_path_is_rooted(&p));
+        resolve(&Use { path, rooted, lexical: lexical.to_vec(), span: Span::default(), ordered: false, block: None, at_load: false, front: Place::End }, defined)
+    };
+    let read_owner = |body: Node<'_>, lexical: &[String]| -> Owner {
+        let mut owner = Owner::default();
+        for stmt in flatten_statements(body) {
+            if let Some(include) = stmt.as_call_node().filter(|c| constant_id_str(&c.name()) == "include" && c.receiver().is_none()) {
+                for arg in include.arguments().map(|a| a.arguments().iter().collect::<Vec<_>>()).unwrap_or_default() {
+                    let Some(path) = constant_path_of(&arg) else { continue };
+                    let rooted = arg.as_constant_path_node().is_some_and(|p| constant_path_is_rooted(&p));
+                    let u = Use { path, rooted, lexical: lexical.to_vec(), span: Span::default(), ordered: false, block: None, at_load: false, front: Place::End };
+                    owner.includes.extend(resolve(&u, defined));
+                }
+                continue;
+            }
+            let Some(def) = stmt.as_def_node().filter(|d| d.receiver().is_none()) else { continue };
+            let Some(body) = def.body() else { continue };
+            // Only `call(env)`'s parameter is Rack's env; another method's first parameter is whatever it is passed.
+            let param = matches!(constant_id_str(&def.name()), "call" | "_call")
+                .then(|| def.parameters().and_then(|p| p.requireds().iter().next()).and_then(|p| p.as_required_parameter_node().map(|r| constant_id_str(&r.name()).to_string())))
+                .flatten();
+            let statements = flatten_statements(body);
+            if let Some(class) = statements.last().and_then(|last| built(last, lexical)) {
+                owner.answers.insert(constant_id_str(&def.name()).to_string(), class);
+            }
+            for stmt in &statements {
+                walk_calls(stmt, &mut |call| {
+                    if constant_id_str(&call.name()) != "[]=" {
+                        return;
+                    }
+                    let on_env = call.receiver().is_some_and(|r| {
+                        r.as_local_variable_read_node().is_some_and(|v| param.as_deref() == Some(constant_id_str(&v.name())))
+                            || r.as_instance_variable_read_node().is_some_and(|v| constant_id_str(&v.name()) == "@env")
+                            || r.as_call_node().is_some_and(|c| constant_id_str(&c.name()) == "env" && c.receiver().is_none() && c.arguments().is_none())
+                    });
+                    let args: Vec<Node<'_>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+                    let ([key, value], true) = (args.as_slice(), on_env) else { return };
+                    let Some(key) = key.as_string_node().map(|k| String::from_utf8_lossy(k.unescaped()).into_owned()) else { return };
+                    if let Some(class) = built(value, lexical) {
+                        owner.writes.push((key, Built::Class(class)));
+                    } else if let Some(m) = value.as_call_node().filter(|c| c.receiver().is_none() && c.arguments().is_none() && c.block().is_none()) {
+                        owner.writes.push((key, Built::Method(constant_id_str(&m.name()).to_string())));
+                    }
+                });
+            }
+        }
+        owner
+    };
+    let mut owners: crate::det::HashMap<String, Owner> = crate::det::HashMap::default();
     for file in files {
         let Ok(bytes) = vfs.read(file) else { continue };
         let parsed = super::prism::parse_silent(&bytes);
         let root = parsed.node();
         for (scope, nesting, class) in find_all_classes_with_nesting(&root) {
             let own = scope.iter().cloned().chain(class_name_path(&class).unwrap_or_default()).collect::<Vec<_>>().join("::");
-            if !stacked.contains(&own) {
-                continue;
-            }
             let lexical: Vec<String> = std::iter::once(own.clone()).chain(nesting).collect();
             let Some(body) = class.body() else { continue };
-            for stmt in flatten_statements(body) {
-                let Some(def) = stmt.as_def_node().filter(|d| constant_id_str(&d.name()) == "call" && d.receiver().is_none()) else { continue };
-                let param = def.parameters().and_then(|p| p.requireds().iter().next()).and_then(|p| p.as_required_parameter_node().map(|r| constant_id_str(&r.name()).to_string()));
-                let (Some(param), Some(body)) = (param, def.body()) else { continue };
-                for write in flatten_statements(body) {
-                    let Some(call) = write.as_call_node().filter(|c| constant_id_str(&c.name()) == "[]=") else { continue };
-                    let on_env = call.receiver().and_then(|r| r.as_local_variable_read_node()).is_some_and(|r| constant_id_str(&r.name()) == param);
-                    let args: Vec<Node<'_>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
-                    let ([key, value], true) = (args.as_slice(), on_env) else { continue };
-                    let Some(key) = key.as_string_node().map(|k| String::from_utf8_lossy(k.unescaped()).into_owned()) else { continue };
-                    let Some(built) = value.as_call_node().filter(|c| constant_id_str(&c.name()) == "new") else { continue };
-                    let Some(receiver) = built.receiver() else { continue };
-                    let Some(path) = constant_path_of(&receiver) else { continue };
-                    let rooted = receiver.as_constant_path_node().is_some_and(|p| constant_path_is_rooted(&p));
-                    let u = Use { path, rooted, lexical: lexical.clone(), span: Span::default(), ordered: false, block: None, at_load: false };
-                    if let Some(class) = resolve(&u, defined) {
-                        out.insert(key, class);
+            let read = read_owner(body, &lexical);
+            let entry = owners.entry(own).or_default();
+            entry.includes.extend(read.includes);
+            entry.writes.extend(read.writes);
+            entry.answers.extend(read.answers);
+        }
+        for (scope, module) in find_all_module_declarations_with_scope(&root) {
+            let path: Vec<String> = scope.iter().cloned().chain(module_name_path(&module).unwrap_or_default()).collect();
+            let own = path.join("::");
+            // Nested `module A; module B` declarations, as gems write them: each enclosing name is in the nesting.
+            let lexical: Vec<String> = (1..=path.len()).rev().map(|end| path[..end].join("::")).collect();
+            let Some(body) = module.body() else { continue };
+            let read = read_owner(body, &lexical);
+            let entry = owners.entry(own).or_default();
+            entry.includes.extend(read.includes);
+            entry.writes.extend(read.writes);
+            entry.answers.extend(read.answers);
+        }
+    }
+    let mut by_class = crate::det::HashMap::default();
+    let classes: Vec<String> = owners.keys().cloned().collect();
+    for class in &classes {
+        let mut out: crate::det::HashMap<String, String> = crate::det::HashMap::default();
+        let mut conflicting: HashSet<String> = HashSet::default();
+        let mut chain = vec![class.clone()];
+        let mut i = 0;
+        while i < chain.len() && chain.len() < 32 {
+            let more: Vec<String> = owners.get(&chain[i]).map(|o| o.includes.clone()).unwrap_or_default();
+            chain.extend(more.into_iter().filter(|m| !chain.contains(m)).collect::<Vec<_>>());
+            i += 1;
+        }
+        let answer = |m: &str| chain.iter().find_map(|o| owners.get(o).and_then(|o| o.answers.get(m)).cloned());
+        for owner in chain.iter().filter_map(|o| owners.get(o)) {
+            for (key, value) in &owner.writes {
+                let class = match value {
+                    Built::Class(c) => Some(c.clone()),
+                    Built::Method(m) => answer(m),
+                };
+                let Some(class) = class else { continue };
+                match out.get(key) {
+                    Some(seen) if seen != &class => {
+                        conflicting.insert(key.clone());
+                    }
+                    _ => {
+                        out.insert(key.clone(), class);
                     }
                 }
             }
         }
+        out.retain(|k, _| !conflicting.contains(k));
+        if !out.is_empty() {
+            by_class.insert(class.clone(), out);
+        }
     }
-    out
+    by_class
+}
+
+/// The env keys the stacked classes write, a key two of them write with different classes marked by an empty class.
+// Not removed here: a later fold over another class would write the key again as if no conflict had been seen.
+pub(super) fn stacked_env_writes(by_class: &crate::det::HashMap<String, crate::det::HashMap<String, String>>, stacked: &[String], into: &mut crate::det::HashMap<String, String>) {
+    for class in stacked {
+        for (key, value) in by_class.get(class).into_iter().flatten() {
+            match into.get(key) {
+                Some(seen) if seen != value => {
+                    into.insert(key.clone(), String::new());
+                }
+                _ => {
+                    into.insert(key.clone(), value.clone());
+                }
+            }
+        }
+    }
 }
 
 /// The app's own `config.middleware.use K` (with or without a block) in its `Rails::Application` body.
@@ -296,7 +458,7 @@ fn read_class_body_use(stmt: &Node<'_>, file: crate::span::FileId, lexical: &[St
         let body = b.body().map(|body| String::from_utf8_lossy(body.location().as_slice()).into_owned()).unwrap_or_default();
         format!("{{ {params}\n{body}\n}}")
     });
-    uses.push(Use { path, rooted, lexical: lexical.to_vec(), span, ordered: false, block, at_load: true });
+    uses.push(Use { path, rooted, lexical: lexical.to_vec(), span, ordered: false, block, at_load: true, front: Place::End });
 }
 
 #[derive(PartialEq)]
@@ -431,7 +593,9 @@ fn uncertain_loads(node: &Node<'_>, out: &mut Vec<Load>) {
 }
 
 fn rails_defined(predicate: &Node<'_>) -> bool {
-    predicate.as_defined_node().and_then(|d| constant_path_of(&d.value())).is_some_and(|path| path == ["Rails"])
+    predicate.as_defined_node().and_then(|d| constant_path_of(&d.value())).is_some_and(|path| {
+        matches!(path.iter().map(String::as_str).collect::<Vec<_>>().as_slice(), ["Rails"] | ["Rails", "Railtie"] | ["Rails", "Engine"])
+    })
 }
 
 /// Whether Bundler's `require` of the gem reaches `file`: from the entry file (`lib/<name>.rb`, or the
@@ -566,14 +730,230 @@ fn each_collection<'p>(stmt: &Node<'p>) -> Option<(Node<'p>, String)> {
 }
 
 /// `initializer "…" do |app| app.middleware.use(K) end`.
+/// What a Railtie's initializer guard reads: the Railtie's own predicates over the app's settings.
+/// Rails::Application::Configuration's boolean settings an app leaves unset, with Rails 8.1's value for them.
+const RAILS_BOOLEAN_DEFAULTS: &[(&str, bool)] = &[("api_only", false)];
+
+struct Guards<'a> {
+    /// The Railtie class body's source, for a write of a setting a guard reads.
+    body_text: String,
+    /// Each [`RAILS_BOOLEAN_DEFAULTS`] key every environment answers alike, over `config/application.rb` and Rails'
+    /// default; `None` where the environments differ or an initializer writes it. Absent: no file sets it.
+    defaulted: &'a crate::det::HashMap<String, Option<String>>,
+    /// `def skip_middleware?(config) = return false if !config.respond_to?(:k); config.k` (message_bus): the
+    /// predicate's name and the setting `k` it answers.
+    predicates: crate::det::HashMap<String, String>,
+    /// The app's `config.k = …` in `config/application.rb` and every `config/environments/*.rb`: the value's
+    /// source, or `None` where they disagree.
+    settings: &'a crate::det::HashMap<String, Option<String>>,
+}
+
+impl Guards<'_> {
+    /// What `cond` answers when the initializer runs, where the Railtie's predicates over the app's literal settings decide it.
+    fn decide(&self, cond: &Node<'_>, app: &str) -> Option<bool> {
+        let call = cond.as_call_node()?;
+        let name = constant_id_str(&call.name());
+        if name == "!" && call.arguments().is_none() {
+            return self.decide(&call.receiver()?, app).map(|b| !b);
+        }
+        if let Some(recv) = call.receiver() {
+            return self.app_setting(&recv, &name, call.arguments().is_none(), app);
+        }
+        let key = self.predicates.get(&*name.to_string())?;
+        let args: Vec<_> = call.arguments()?.arguments().iter().collect();
+        let [arg] = args.as_slice() else { return None };
+        let config = arg.as_call_node()?;
+        let on_app = config.receiver().and_then(|r| r.as_local_variable_read_node()).is_some_and(|l| constant_id_str(&l.name()) == app);
+        if !(on_app && constant_id_str(&config.name()) == "config" && config.arguments().is_none()) {
+            return None;
+        }
+        // Not set: the predicate's `respond_to?` guard answers false.
+        match self.settings.get(key.as_str()) {
+            None => Some(false),
+            Some(Some(value)) => match value.as_str() {
+                "true" => Some(true),
+                "false" | "nil" => Some(false),
+                _ => None,
+            },
+            Some(None) => None,
+        }
+    }
+
+    /// `statements` with each `if`/`unless` a guard decides replaced by the branch Rails runs.
+    /// `app.config.k` read directly: the app's literal setting, or Rails' default where the app sets none.
+    fn app_setting(&self, recv: &Node<'_>, key: &str, bare: bool, app: &str) -> Option<bool> {
+        let config = recv.as_call_node()?;
+        let on_app = config.receiver().and_then(|r| r.as_local_variable_read_node()).is_some_and(|l| constant_id_str(&l.name()) == app);
+        if !(bare && on_app && constant_id_str(&config.name()) == "config" && config.arguments().is_none()) {
+            return None;
+        }
+        // Not decided where this Railtie itself writes the setting: it may change it before the guard runs.
+        if self.body_text.contains(&format!("config.{key} =")) || self.body_text.contains(&format!("config.{key}=")) {
+            return None;
+        }
+        let boolean = |value: &str| match value {
+            "true" => Some(true),
+            "false" | "nil" => Some(false),
+            _ => None,
+        };
+        if let Some((_, default)) = RAILS_BOOLEAN_DEFAULTS.iter().find(|(k, _)| *k == key) {
+            return match self.defaulted.get(key) {
+                Some(Some(value)) => boolean(value),
+                Some(None) => None,
+                None => Some(*default),
+            };
+        }
+        match self.settings.get(key) {
+            None => None,
+            Some(Some(value)) => boolean(value),
+            Some(None) => None,
+        }
+    }
+
+    fn expand<'pr>(&self, statements: Vec<Node<'pr>>, app: &str, depth: usize) -> Vec<Node<'pr>> {
+        let branch = |node: Option<ruby_prism::StatementsNode<'pr>>| node.map(|s| s.body().iter().collect::<Vec<_>>()).unwrap_or_default();
+        let mut out = Vec::new();
+        for stmt in statements {
+            if depth < 8 && let Some(node) = stmt.as_if_node() && let Some(taken) = self.decide(&node.predicate(), app) {
+                let chosen = if taken {
+                    branch(node.statements())
+                } else {
+                    match node.subsequent() {
+                        Some(sub) if let Some(els) = sub.as_else_node() => branch(els.statements()),
+                        Some(sub) => vec![sub],
+                        None => Vec::new(),
+                    }
+                };
+                out.extend(self.expand(chosen, app, depth + 1));
+                continue;
+            }
+            if depth < 8 && let Some(node) = stmt.as_unless_node() && let Some(taken) = self.decide(&node.predicate(), app) {
+                let chosen = if taken { node.else_clause().map(|e| branch(e.statements())).unwrap_or_default() } else { branch(node.statements()) };
+                out.extend(self.expand(chosen, app, depth + 1));
+                continue;
+            }
+            out.push(stmt);
+        }
+        out
+    }
+}
+
+/// A Railtie's `def m(config)` whose body is `return false if !config.respond_to?(:k)` then `config.k`: `m` answers setting `k`.
+fn setting_predicates(body: Node<'_>) -> crate::det::HashMap<String, String> {
+    let mut out = crate::det::HashMap::default();
+    for stmt in flatten_statements(body) {
+        let Some(def) = stmt.as_def_node() else { continue };
+        if def.receiver().is_some() {
+            continue;
+        }
+        let Some(params) = def.parameters() else { continue };
+        let required: Vec<_> = params.requireds().iter().collect();
+        let [param] = required.as_slice() else { continue };
+        let Some(param) = param.as_required_parameter_node().map(|p| constant_id_str(&p.name()).to_string()) else { continue };
+        let Some(body) = def.body() else { continue };
+        let stmts = flatten_statements(body);
+        let [guard, read] = stmts.as_slice() else { continue };
+        let is_param = |n: Option<Node<'_>>| n.and_then(|n| n.as_local_variable_read_node()).is_some_and(|l| constant_id_str(&l.name()) == param);
+        let Some(read) = read.as_call_node() else { continue };
+        if !is_param(read.receiver()) || read.arguments().is_some() {
+            continue;
+        }
+        let key = constant_id_str(&read.name()).to_string();
+        let Some(guard) = guard.as_if_node() else { continue };
+        let returns_false = guard.statements().map(|s| s.body().iter().collect::<Vec<_>>()).is_some_and(|b| {
+            matches!(b.as_slice(), [r] if r.as_return_node().and_then(|r| r.arguments()).is_some_and(|a| matches!(a.arguments().iter().collect::<Vec<_>>().as_slice(), [v] if v.as_false_node().is_some())))
+        });
+        let asks = guard.predicate().as_call_node().filter(|n| constant_id_str(&n.name()) == "!").and_then(|n| n.receiver()).and_then(|r| r.as_call_node()).is_some_and(|q| {
+            constant_id_str(&q.name()) == "respond_to?"
+                && is_param(q.receiver())
+                && q.arguments().is_some_and(|a| matches!(a.arguments().iter().collect::<Vec<_>>().as_slice(), [k] if k.as_symbol_node().is_some_and(|k| String::from_utf8_lossy(k.unescaped()) == key)))
+        });
+        if returns_false && asks && guard.subsequent().is_none() {
+            out.insert(constant_id_str(&def.name()).to_string(), key);
+        }
+    }
+    out
+}
+
+/// The app's top-level `config.k = v` settings Rails has read when the Railtie initializers run: `config/application.rb`
+/// and each environment file, the value only where every one that sets it agrees.
+/// Each environment's own value of a defaulted setting: its file's, else `config/application.rb`'s, else Rails'
+/// default. A key the environments answer differently, or an initializer writes, is `None`.
+fn defaulted_settings<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> crate::det::HashMap<String, Option<String>> {
+    let assigned = |file: &Path| -> crate::det::HashMap<String, String> {
+        let Ok(bytes) = vfs.read(file) else { return Default::default() };
+        super::app::extract_config_assignments(&bytes, &file.display().to_string())
+            .into_iter()
+            .filter_map(|(path, value)| match path.as_slice() {
+                [key] => Some((key.clone(), value.trim().to_string())),
+                _ => None,
+            })
+            .collect()
+    };
+    let base = assigned(&dir.join("config/application.rb"));
+    let mut envs = Vec::new();
+    if let Ok(entries) = vfs.read_dir(&dir.join("config/environments")) {
+        envs = entries.into_iter().filter(|p| p.extension().is_some_and(|e| e == "rb")).map(|p| assigned(&p)).collect();
+    }
+    let mut initializers = Vec::new();
+    if let Ok(entries) = vfs.read_dir(&dir.join("config/initializers")) {
+        initializers = entries.into_iter().filter(|p| p.extension().is_some_and(|e| e == "rb")).map(|p| assigned(&p)).collect();
+    }
+    let mut out = crate::det::HashMap::default();
+    for (key, default) in RAILS_BOOLEAN_DEFAULTS {
+        let key = key.to_string();
+        let set_anywhere = base.contains_key(&key) || envs.iter().any(|e| e.contains_key(&key));
+        if initializers.iter().any(|i| i.contains_key(&key)) {
+            out.insert(key, None);
+            continue;
+        }
+        if !set_anywhere {
+            continue;
+        }
+        let fallback = base.get(&key).cloned().unwrap_or_else(|| default.to_string());
+        let values: Vec<String> = if envs.is_empty() { vec![fallback.clone()] } else { envs.iter().map(|e| e.get(&key).cloned().unwrap_or_else(|| fallback.clone())).collect() };
+        let agreed = values.iter().all(|v| *v == values[0]);
+        out.insert(key, agreed.then(|| values[0].clone()));
+    }
+    out
+}
+
+fn app_settings<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> crate::det::HashMap<String, Option<String>> {
+    let mut files = vec![dir.join("config/application.rb")];
+    if let Ok(entries) = vfs.read_dir(&dir.join("config/environments")) {
+        let mut envs: Vec<PathBuf> = entries.into_iter().filter(|p| p.extension().is_some_and(|e| e == "rb")).collect();
+        envs.sort();
+        files.extend(envs);
+    }
+    let mut out: crate::det::HashMap<String, Option<String>> = crate::det::HashMap::default();
+    for file in files {
+        let Ok(bytes) = vfs.read(&file) else { continue };
+        for (path, value) in super::app::extract_config_assignments(&bytes, &file.display().to_string()) {
+            let [key] = path.as_slice() else { continue };
+            let value = value.trim().to_string();
+            match out.get(key) {
+                Some(Some(prior)) if *prior != value => {
+                    out.insert(key.clone(), None);
+                }
+                Some(_) => {}
+                None => {
+                    out.insert(key.clone(), Some(value));
+                }
+            }
+        }
+    }
+    out
+}
+
 fn read_initializer(
     stmt: &Node<'_>,
     file: crate::span::FileId,
     path: &str,
     lexical: &[String],
+    guards: &Guards<'_>,
     uses: &mut Vec<Use>,
     diags: &mut Vec<Diagnostic>,
-    loops: &mut Vec<(Expr, Diagnostic)>,
+    loops: &mut Vec<MiddlewareLoop>,
 ) {
     let Some(call) = stmt.as_call_node() else { return };
     if constant_id_str(&call.name()) != "initializer" || call.receiver().is_some() {
@@ -599,7 +979,7 @@ fn read_initializer(
         })
     });
     let Some(body) = block.body() else { return };
-    let statements = flatten_statements(body);
+    let statements = guards.expand(flatten_statements(body), &app, 0);
     for (at, inner) in statements.iter().enumerate() {
         let inner = inner.clone();
         let loc = inner.location();
@@ -622,7 +1002,12 @@ fn read_initializer(
                     !statements[..at].iter().any(|before| String::from_utf8_lossy(before.location().as_slice()).contains(root.as_str()))
                 });
                 match collection.and_then(|(c, _)| super::expr::ingest_expr(&c, path).ok()) {
-                    Some(collection) => loops.push((collection, refusal)),
+                    Some(collection) => loops.push(MiddlewareLoop {
+                        collection,
+                        statement: super::expr::ingest_expr(&inner, path).ok(),
+                        app_param: app.clone(),
+                        refusal,
+                    }),
                     None => diags.push(refusal),
                 }
             }
@@ -633,17 +1018,37 @@ fn read_initializer(
         let class = match (verb, args.as_slice()) {
             ("use", [only]) if use_call.block().is_none() => constant_path_of(only).map(|path| {
                 let rooted = only.as_constant_path_node().is_some_and(|p| constant_path_is_rooted(&p));
-                (path, rooted)
+                (path, rooted, Place::End)
             }),
+            // The emitted stack starts right inside Rails' RequestId, so a middleware inserted after it is the stack's first.
+            ("insert_after", [anchor, only])
+                if use_call.block().is_none()
+                    && constant_path_of(anchor).is_some_and(|a| a == ["ActionDispatch", "RequestId"]) =>
+            {
+                constant_path_of(only).map(|path| {
+                    let rooted = only.as_constant_path_node().is_some_and(|p| constant_path_is_rooted(&p));
+                    (path, rooted, Place::Front)
+                })
+            }
+            // The emitted stack keeps none of Rails' own past the session, so right before Flash is ahead of the `use`d ones.
+            ("insert_before", [anchor, only])
+                if use_call.block().is_none()
+                    && constant_path_of(anchor).is_some_and(|a| a == ["ActionDispatch", "Flash"]) =>
+            {
+                constant_path_of(only).map(|path| {
+                    let rooted = only.as_constant_path_node().is_some_and(|p| constant_path_is_rooted(&p));
+                    (path, rooted, Place::BeforeFlash)
+                })
+            }
             _ => None,
         };
         match class {
-            Some((path, rooted)) => uses.push(Use { path, rooted, lexical: lexical.to_vec(), span, ordered, block: None, at_load: false }),
+            Some((path, rooted, front)) => uses.push(Use { path, rooted, lexical: lexical.to_vec(), span, ordered, block: None, at_load: false, front }),
             None => diags.push(Diagnostic::unsupported(
                 span,
                 None,
                 "railtie middleware",
-                format!("`{verb}` with these arguments: only `app.middleware.use(Klass)` is put on the emitted stack"),
+                format!("`{verb}` with these arguments: only `app.middleware.use(Klass)`, `insert_after ActionDispatch::RequestId, Klass` and `insert_before ActionDispatch::Flash, Klass` are put on the emitted stack"),
             )),
         }
     }
@@ -732,6 +1137,45 @@ mod tests {
         assert!(diags.is_empty(), "{diags:?}");
     }
 
+    /// message_bus's shape: `insert_before ActionDispatch::Flash` lands past the session, behind a middleware inserted
+    /// after RequestId and ahead of every `use`d one, two of them in the order inserted; another anchor stays refused.
+    #[test]
+    fn a_middleware_inserted_before_flash_sits_between_the_front_and_the_used_ones() {
+        let railtie = "module Gem\n  class A\n  end\n  class B\n  end\n  class C\n  end\n  class D\n  end\n  class Railtie < Rails::Railtie\n    initializer \"gem.all\" do |app|\n      app.middleware.use(D)\n      app.middleware.insert_before(ActionDispatch::Flash, B)\n      app.middleware.insert_before(ActionDispatch::Flash, C)\n      app.middleware.insert_after(ActionDispatch::RequestId, A)\n    end\n  end\nend\n";
+        let (classes, diags) = read(&[("/gem/lib/gem.rb", railtie)]);
+        assert_eq!(classes, ["Gem::A", "Gem::B", "Gem::C", "Gem::D"], "{diags:?}");
+        assert!(diags.is_empty(), "{diags:?}");
+        let elsewhere = railtie.replace("insert_before(ActionDispatch::Flash, C)", "insert_before(ActionDispatch::Cookies, C)");
+        let (classes, diags) = read(&[("/gem/lib/gem.rb", &elsewhere)]);
+        assert_eq!(classes, ["Gem::A", "Gem::B", "Gem::D"], "{diags:?}");
+        assert!(diags.iter().any(|d| d.contains("`insert_before` with these arguments")), "{diags:?}");
+    }
+
+    /// request_store's shape: the entry requires the Railtie under `if defined?(Rails::Railtie)`, which holds in a Rails
+    /// app, and the initializer inserts after `ActionDispatch::RequestId` under `if ActionDispatch.const_defined?
+    /// :RequestId`, which actionpack 8.1 answers true: the middleware is the stack's first, ahead of a later `use`.
+    #[test]
+    fn a_railtie_required_when_rails_is_and_inserted_after_request_id_heads_the_stack() {
+        let entry = "require \"gem/middleware\"\nrequire \"gem/railtie\" if defined?(Rails::Railtie)\n\nmodule Store\nend\n";
+        let middleware = "module Store\n  class Middleware\n    def initialize(app)\n      @app = app\n    end\n  end\n\n  class Later\n    def initialize(app)\n      @app = app\n    end\n  end\nend\n";
+        let railtie = "module Store\n  class Railtie < ::Rails::Railtie\n    initializer \"store.later\" do |app|\n      app.middleware.use(Later)\n    end\n\n    initializer \"store.insert_middleware\" do |app|\n      if ActionDispatch.const_defined? :RequestId\n        app.config.middleware.insert_after ActionDispatch::RequestId, Store::Middleware\n      else\n        app.config.middleware.insert_after Rack::MethodOverride, Store::Middleware\n      end\n    end\n  end\nend\n";
+        let (classes, diags) = read(&[
+            ("/gem/lib/gem.rb", entry),
+            ("/gem/lib/gem/middleware.rb", middleware),
+            ("/gem/lib/gem/railtie.rb", railtie),
+        ]);
+        assert_eq!(classes, ["Store::Middleware", "Store::Later"], "{diags:?}");
+        assert!(diags.is_empty(), "{diags:?}");
+        let twice = "module Gem\n  class A\n  end\n  class B\n  end\n  class Railtie < Rails::Railtie\n    initializer \"gem.both\" do |app|\n      app.middleware.insert_after ActionDispatch::RequestId, A\n      app.middleware.insert_after ActionDispatch::RequestId, B\n    end\n  end\nend\n";
+        let (classes, diags) = read(&[("/gem/lib/gem.rb", twice)]);
+        assert_eq!(classes, ["Gem::B", "Gem::A"], "{diags:?}");
+        // The same class stacked again with another block keeps one block per class: refused.
+        let blocks = "module Gem\n  class A\n  end\n  class Railtie < Rails::Railtie\n    initializer \"gem.both\" do |app|\n      app.middleware.insert_after ActionDispatch::RequestId, A\n    end\n  end\nend\n";
+        let application = "module Blog\n  class Application < Rails::Application\n    config.middleware.use Gem::A do |a|\n      a.x = 1\n    end\n  end\nend\n";
+        let (_, diags) = read(&[("/gem/lib/gem.rb", blocks), ("/app/config/application.rb", application)]);
+        assert!(diags.iter().any(|d| d.contains("stacked twice with different construction blocks")), "{diags:?}");
+    }
+
     /// The app's own `config.middleware.use` of a class in its lib/ sits where a source gem's class would.
     #[test]
     fn the_apps_own_use_of_its_own_class_sits_between_class_body_and_initializer_uses() {
@@ -773,6 +1217,62 @@ mod tests {
 
     fn railtie(body: &str) -> String {
         format!("module Gem\n  class Railtie < Rails::Railtie\n{body}\n  end\nend\n")
+    }
+
+    /// message_bus's Railtie: the insertion sits under `if !skip_middleware?(app.config)`, a predicate of the
+    /// Railtie's own over `config.skip_message_bus_middleware`. The app's literal setting decides it, and an
+    /// `api_only?` guard inside picks the branch Rails runs; a setting the environments disagree on stays refused.
+    #[test]
+    fn a_railtie_guard_the_app_s_settings_decide_is_folded() {
+        let rt = railtie("    initializer \"gem.configure\" do |app|\n      if !skip_middleware?(app.config)\n        if api_only?(app.config)\n          app.middleware.use(Middleware)\n        else\n          app.middleware.insert_before(ActionDispatch::Flash, Middleware)\n        end\n      end\n    end\n\n    def skip_middleware?(config)\n      return false if !config.respond_to?(:skip_gem_middleware)\n\n      config.skip_gem_middleware\n    end\n\n    def api_only?(config)\n      return false if !config.respond_to?(:api_only)\n\n      config.api_only\n    end");
+        let run = |application: &str, production: &str| {
+            read(&[
+                ("/gem/lib/gem.rb", ENTRY),
+                ("/gem/lib/gem/railtie.rb", rt.as_str()),
+                ("/app/config/application.rb", application),
+                ("/app/config/environments/production.rb", production),
+            ])
+        };
+        let app = |lines: &str| format!("module App\n  class Application < Rails::Application\n{lines}  end\nend\n");
+        // Skipped: nothing is inserted, and nothing is refused.
+        assert_eq!(run(&app("    config.skip_gem_middleware = true\n"), ""), (vec![], vec![]));
+        // API-only: the `use` branch.
+        assert_eq!(run(&app("    config.api_only = true\n"), "").0, vec!["Gem::Middleware".to_string()]);
+        // Neither set: the `insert_before ActionDispatch::Flash` branch.
+        assert_eq!(run(&app(""), ""), (vec!["Gem::Middleware".to_string()], vec![]));
+        // The environments disagree: the guard is not decided.
+        let (_, diags) = run(&app("    config.skip_gem_middleware = true\n"), "Rails.application.configure do\n  config.skip_gem_middleware = false\nend\n");
+        assert!(diags.iter().any(|d| d.contains("inserted under a condition")), "{diags:?}");
+    }
+
+    /// mission_control-jobs' engine: `if app.config.api_only` read directly. Rails leaves `api_only` false where the app
+    /// sets none, so nothing is inserted; an app setting it true gets the `use`.
+    #[test]
+    fn a_railtie_guard_on_an_app_setting_reads_rails_default_where_the_app_sets_none() {
+        let rt = railtie("    initializer \"gem.middleware\" do |app|\n      if app.config.api_only\n        app.middleware.use(Middleware)\n      end\n    end");
+        let run = |application: &str| {
+            read(&[("/gem/lib/gem.rb", ENTRY), ("/gem/lib/gem/railtie.rb", rt.as_str()), ("/app/config/application.rb", application)])
+        };
+        let app = |lines: &str| format!("module App\n  class Application < Rails::Application\n{lines}  end\nend\n");
+        assert_eq!(run(&app("")), (vec![], vec![]));
+        assert_eq!(run(&app("    config.api_only = true\n")), (vec!["Gem::Middleware".to_string()], vec![]));
+        // Set in development alone: production keeps Rails' false, so the environments differ and nothing is decided.
+        let (_, diags) = read(&[
+            ("/gem/lib/gem.rb", ENTRY),
+            ("/gem/lib/gem/railtie.rb", rt.as_str()),
+            ("/app/config/application.rb", &app("")),
+            ("/app/config/environments/development.rb", "Rails.application.configure do\n  config.api_only = true\nend\n"),
+            ("/app/config/environments/production.rb", "Rails.application.configure do\nend\n"),
+        ]);
+        assert!(diags.iter().any(|d| d.contains("inserted under a condition")), "{diags:?}");
+        // Written by the Railtie itself: not folded from the app's files.
+        let writes = rt.replace("      if app.config.api_only", "      app.config.api_only = true\n      if app.config.api_only");
+        let (_, diags) = read(&[("/gem/lib/gem.rb", ENTRY), ("/gem/lib/gem/railtie.rb", writes.as_str()), ("/app/config/application.rb", &app(""))]);
+        assert!(diags.iter().any(|d| d.contains("inserted under a condition")), "{diags:?}");
+        // A setting Rails has no default for here stays undecided.
+        let rt = rt.replace("app.config.api_only", "app.config.eager_load");
+        let (_, diags) = read(&[("/gem/lib/gem.rb", ENTRY), ("/gem/lib/gem/railtie.rb", rt.as_str()), ("/app/config/application.rb", &app(""))]);
+        assert!(diags.iter().any(|d| d.contains("inserted under a condition")), "{diags:?}");
     }
 
     #[test]

@@ -532,6 +532,13 @@ pub(crate) fn rewrite_node(expr: &mut Expr, helpers: &crate::det::HashSet<String
                 ),
             ),
         }),
+        // Not `"https://://"`: Rails' `normalize_protocol` drops a written `://` or `:`.
+        Some(p) if matches!(&*p.node, ExprNode::Lit { value: Literal::Str { .. } }) => {
+            let ExprNode::Lit { value: Literal::Str { value } } = &*p.node else { unreachable!() };
+            let scheme = value.trim_end_matches("//").trim_end_matches(':');
+            // Not `://host`: Rails writes `"//"` as a protocol-relative URL.
+            parts.push(InterpPart::Text { value: if scheme.is_empty() { "//".to_string() } else { format!("{scheme}://") } });
+        }
         Some(p) => {
             parts.push(InterpPart::Expr { expr: p });
             parts.push(InterpPart::Text { value: "://".to_string() });
@@ -540,10 +547,10 @@ pub(crate) fn rewrite_node(expr: &mut Expr, helpers: &crate::det::HashSet<String
             expr: crate::lower::view_to_library::rails_application_call("protocol"),
         }),
     }
-    let host = if hash_read(&host) {
-        nil_or(host.clone(), crate::lower::view_to_library::rails_application_call("domain"), host)
-    } else {
-        host
+    let host = match host {
+        Some(h) if hash_read(&h) => nil_or(h.clone(), crate::lower::view_to_library::rails_application_call("domain"), h),
+        Some(h) => h,
+        None => crate::lower::view_to_library::rails_application_call("domain"),
     };
     parts.push(InterpPart::Expr { expr: host });
     parts.push(InterpPart::Expr { expr: path_call });
@@ -609,7 +616,7 @@ fn ground_symbol_query_values(expr: &mut Expr, helpers: &crate::det::HashSet<Str
 fn strip_host_options(
     expr: &mut Expr,
     helpers: &crate::det::HashSet<String>,
-) -> Option<(String, Expr, Option<Expr>)> {
+) -> Option<(String, Option<Expr>, Option<Expr>)> {
     let ExprNode::Send { recv, method, args, block: None, .. } = &mut *expr.node else {
         return None;
     };
@@ -691,5 +698,10 @@ fn strip_host_options(
     // what `emit::ruby::library::rewrite_url_helpers_absolute` builds
     // for the explicit `…routes.url_helpers.x_url(…, host:)` chain.
     // Two spellings, one rendering.
-    Some((stem.to_string(), host?, protocol))
+    // Not any protocol alone: only a literal one, normalized below; a run-time value (nil, `false`, "https://") stays as it was.
+    let literal_protocol = protocol.as_ref().is_some_and(|p| matches!(&*p.node, ExprNode::Lit { value: Literal::Str { .. } }));
+    if host.is_none() && !literal_protocol {
+        return None;
+    }
+    Some((stem.to_string(), host, protocol))
 }

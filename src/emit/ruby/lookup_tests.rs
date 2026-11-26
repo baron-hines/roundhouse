@@ -405,6 +405,7 @@ fn installed_indexes_keep_the_app_and_models_slice_immutably_borrowed() {
         }
         struct RouteHelpers;
         fn walk_const_paths(_: &(), _: &mut BTreeSet<Vec<String>>) {}
+        fn unrooted_read(path: Vec<String>) -> Vec<String> { path }
         fn model_body_names(_: &[Model]) -> HashSet<Symbol> { HashSet::default() }
         fn declared_spellings(_: &App) -> HashMap<String, rbs::Spellings> { HashMap::default() }
     "#;

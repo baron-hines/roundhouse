@@ -29,6 +29,24 @@ use crate::det::{HashMap, HashSet};
 use crate::expr::{Expr, ExprNode};
 
 pub(super) fn carry(app: &mut App) {
+    // (not a class's own `class_eval`: it may never run the block)
+    let evaluators: HashSet<String> = app.library_classes.iter()
+        .filter(|c| c.methods.iter().any(|m| m.receiver == crate::dialect::MethodReceiver::Class
+            && matches!(m.name.as_str(), "class_eval" | "module_eval" | "class_exec" | "module_exec")))
+        .map(|c| c.name.0.to_string())
+        .collect();
+    for program in &mut app.file_programs {
+        let items = std::mem::take(&mut program.items);
+        for item in items {
+            match &item {
+                ProgramItem::Statement(e) => match class_eval_mixins(e, &evaluators) {
+                    Some(calls) => program.items.extend(calls.into_iter().map(ProgramItem::Statement)),
+                    None => program.items.push(item),
+                },
+                _ => program.items.push(item),
+            }
+        }
+    }
     let programs: HashMap<String, &FileProgram> =
         app.file_programs.iter().map(|p| (super::normalize_source(&p.source), p)).collect();
     if programs.is_empty() {
@@ -52,6 +70,7 @@ pub(super) fn carry(app: &mut App) {
         walk.file(&next);
     }
     let (taken, left) = (walk.taken, walk.left);
+    app.gem_loaded_files.extend(walk.seen);
     app.gem_load_statements.extend(taken.iter().map(|e| e.span));
     app.boot_program.splice(0..0, taken);
     app.gem_route_gaps.extend(left.into_iter().map(|span| {
@@ -64,6 +83,47 @@ pub(super) fn carry(app: &mut App) {
         gap.severity = crate::diagnostic::Severity::Warning;
         gap
     }));
+}
+
+/// `VersionGem::Version.class_eval do extend VersionGem::Basic end` (version_gem, snaky_hash): a file-level
+/// block of nothing but mixins, as the calls `VersionGem::Version.extend(VersionGem::Basic)` it runs. Both read
+/// their constants from the file's top level, so the calls name what the block's statements named.
+fn class_eval_mixins(e: &Expr, evaluators: &HashSet<String>) -> Option<Vec<Expr>> {
+    let ExprNode::Send { recv: Some(recv), method, args, block: Some(block), .. } = &*e.node else { return None };
+    let ExprNode::Const { path } = &*recv.node else { return None };
+    let written = path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>().join("::");
+    if evaluators.contains(&written)
+        || !matches!(method.as_str(), "class_eval" | "module_eval" | "class_exec" | "module_exec")
+        || !args.is_empty()
+    {
+        return None;
+    }
+    let ExprNode::Lambda { params, rest_param: None, extra_params, block_param: None, body, .. } = &*block.node else { return None };
+    if !params.is_empty() || !extra_params.is_empty() {
+        return None;
+    }
+    let statements: Vec<&Expr> = match &*body.node {
+        ExprNode::Seq { exprs } => exprs.iter().collect(),
+        _ => vec![body],
+    };
+    let mut calls = Vec::new();
+    for statement in statements {
+        let ExprNode::Send { recv: None, method, args, block: None, .. } = &*statement.node else { return None };
+        if !matches!(method.as_str(), "extend" | "include" | "prepend")
+            || args.is_empty()
+            || !args.iter().all(|a| matches!(&*a.node, ExprNode::Const { .. }))
+        {
+            return None;
+        }
+        calls.push(Expr::new(statement.span, ExprNode::Send {
+            recv: Some(recv.clone()),
+            method: method.clone(),
+            args: args.clone(),
+            block: None,
+            parenthesized: true,
+        }));
+    }
+    (!calls.is_empty()).then_some(calls)
 }
 
 /// The constants the app's own code (any body outside the gem files' programs) and its model macros' includes name.

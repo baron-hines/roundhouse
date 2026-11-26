@@ -155,6 +155,10 @@ fn emit_bind_calls(stmt: &Symbol, binds: &[Bind], read_id: usize) -> Vec<Expr> {
             ValueType::IntOpt => "bind_int_opt",
             ValueType::StrOpt => "bind_text_opt",
             ValueType::BoolOpt => "bind_bool_opt",
+            // The binders that run (the ruby family's) pick the storage
+            // class from the value's encoding, as for text.
+            ValueType::Binary => "bind_text",
+            ValueType::BinaryOpt => "bind_text_opt",
             ValueType::FloatOpt => unreachable!("unserialized float in bind path"),
         };
         let position = if shaped {
@@ -201,22 +205,30 @@ impl SqliteVisitor {
     /// Execute an insert that returns selected columns from that same
     /// statement. Generated-column persistence uses this to hydrate the
     /// database-owned values without a second, post-commit SELECT.
+    /// `returning_key` is None for a table with no key to return (a keyless
+    /// table on PostgreSQL, which has no rowid): the first column is then
+    /// the integer 0, so the columns after it keep their places.
     pub(crate) fn visit_insert_returning(
         &self,
         ins: &Insert,
         schema: &Schema,
-        returning_key: &Symbol,
+        returning_key: Option<&Symbol>,
         key_is_integer: bool,
         returning_columns: &[Symbol],
     ) -> Expr {
-        let key_ident = crate::naming::sql_ident(returning_key.as_str());
         // Spinel snapshots SQLite integer cells through sqlite3_column_int
         // (32-bit). Return integer keys as text so the shared result capture
         // does not truncate them before the adapter parses them back.
-        let key_projection = if key_is_integer {
-            format!("CAST({key_ident} AS TEXT)")
-        } else {
-            key_ident
+        let key_projection = match returning_key {
+            None => "0".to_string(),
+            Some(key) => {
+                let key_ident = crate::naming::sql_ident(key.as_str());
+                if key_is_integer {
+                    format!("CAST({key_ident} AS TEXT)")
+                } else {
+                    key_ident
+                }
+            }
         };
         let mut projection = vec![key_projection];
         projection.extend(
@@ -1219,6 +1231,19 @@ fn push_predicate_segments(
             segments.push(lit_str(format!("{} = ", crate::naming::sql_ident(col.column.as_str()))));
             push_value_segment(segments, val, param, binds);
         }
+        Predicate::NullSafeEq(col, val) => {
+            segments.push(lit_str(format!("{} {} ", crate::naming::sql_ident(col.column.as_str()), Dialect::current().null_safe_eq())));
+            push_value_segment(segments, val, param, binds);
+        }
+        Predicate::NotEq(col, val) => {
+            segments.push(lit_str(format!("{} != ", crate::naming::sql_ident(col.column.as_str()))));
+            push_value_segment(segments, val, param, binds);
+        }
+        Predicate::LowerEq(col, val) => {
+            segments.push(lit_str(format!("LOWER({}) = LOWER(", crate::naming::sql_ident(col.column.as_str()))));
+            push_value_segment(segments, val, param, binds);
+            segments.push(lit_str(")".to_string()));
+        }
         Predicate::And(l, r) => {
             push_predicate_segments(segments, l, param, binds, read_id);
             segments.push(lit_str(" AND ".to_string()));
@@ -1277,6 +1302,8 @@ fn escape_value(db: &ClassId, val: &Value) -> Expr {
                 ValueType::StrOpt => "escape_string_opt",
                 ValueType::FloatOpt => "escape_float_opt",
                 ValueType::BoolOpt => "escape_bool_opt",
+                ValueType::Binary => "escape_binary",
+                ValueType::BinaryOpt => "escape_binary_opt",
             };
             db_call(db, method, vec![expr.clone()])
         }
@@ -1507,6 +1534,8 @@ mod tests {
                         generated_int4_compatible: None,
                         array: false,
                         array_stored: false,
+                        unset_until_assigned: false,
+                        collated: false,
                     },
                     Column {
                         name: Symbol::from("title"),
@@ -1521,6 +1550,8 @@ mod tests {
                         generated_int4_compatible: None,
                         array: false,
                         array_stored: false,
+                        unset_until_assigned: false,
+                        collated: false,
                     },
                 ],
                 indexes: vec![],
@@ -1531,7 +1562,7 @@ mod tests {
                 primary_key_columns: Vec::new(),
             },
         );
-        (Schema { tables }, ClassId(Symbol::from("Article")))
+        (Schema { tables, ..Default::default() }, ClassId(Symbol::from("Article")))
     }
 
     fn id_col() -> ColRef {

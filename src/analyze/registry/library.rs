@@ -221,10 +221,46 @@ pub(in crate::analyze) fn register(
             }
             false
         };
+        // `default_params`, from the runtime's own signature: a mailer's code reads it (Devise's `mailer_sender`), and
+        // its values are never a Proc here, a Proc `default` being a generated method's call by now.
+        {
+            const RBS: &str = include_str!("../../../runtime/ruby/action_mailer.rbs");
+            if let Ok(parsed) = crate::rbs::parse_app_signatures(RBS) {
+                let id = ClassId(Symbol::from("ActionMailer::Base"));
+                if let Some(methods) = parsed.get(&id) {
+                    let cls = classes.entry(id).or_default();
+                    for (m, ty) in methods.iter().filter(|(m, _)| m.as_str() == "default_params") {
+                        cls.instance_methods.entry(m.clone()).or_insert_with(|| ty.clone());
+                    }
+                    // The mails `deliveries` holds: the runtime's `Message`, read as its signature says.
+                    let message = ClassId(Symbol::from("ActionMailer::Message"));
+                    if let Some(message_methods) = parsed.get(&message).cloned() {
+                        let mc = classes.entry(message).or_default();
+                        for (m, ty) in message_methods {
+                            mc.instance_methods.entry(m).or_insert(ty);
+                        }
+                    }
+                    let id = ClassId(Symbol::from("ActionMailer::Base"));
+                    let cls = classes.entry(id).or_default();
+                    // Not left unknown now that the class is: its class side is the runtime's too.
+                    for (m, ty) in methods.iter().filter(|(m, _)| matches!(m.as_str(), "deliveries" | "base_default_params" | "default")) {
+                        cls.class_methods.entry(m.clone()).or_insert_with(|| ty.clone());
+                    }
+                }
+            }
+        }
         let delivery_ty = Ty::Class {
             id: ClassId(Symbol::from("ActionMailer::MessageDelivery")),
             args: vec![].into(),
         };
+        // Rails' mailers include the routes' url helpers; a bare one is given `RouteHelpers` as its receiver
+        // (`lower::route_helper_receiver`). Not on each mailer: an app mailer ancestor's method of the name comes first.
+        {
+            let base = classes.entry(ClassId(Symbol::from("ActionMailer::Base"))).or_default();
+            for name in route_helper_names {
+                base.instance_methods.entry(Symbol::from(name.as_str())).or_insert(Ty::Str);
+            }
+        }
         let own_with = crate::lower::mailer_class_side::defines_with(app);
         for lc in &app.library_classes {
             if lc.is_file_constants() || !is_mailer(&lc.name) {
@@ -356,7 +392,7 @@ pub(in crate::analyze) fn register(
                         && m.name.as_str() == "perform"
                 })
                 .and_then(|m| match &m.signature {
-                    Some(Ty::Fn { ret, .. }) => Some((**ret).clone()),
+                    Some(Ty::Fn(fn_ty)) => Some((*fn_ty.ret).clone()),
                     _ => None,
                 })
                 .unwrap_or(Ty::Untyped);

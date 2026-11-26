@@ -75,21 +75,21 @@ fn to_completion(script: &str) -> String {
 
 /// Start from `fixtures/real-blog`.
 pub fn real_blog() -> Overlay {
-    Overlay { base: roundhouse::fixtures::real_blog().to_path_buf(), scratch_base: false, edits: Vec::new() }
+    Overlay { base: roundhouse::fixtures::real_blog().to_path_buf(), scratch_base: false, edits: Vec::new(), observe_boot: false }
 }
 
 /// Start from `fixtures/tiny-blog-uuid`: `posts.id` a uuid and
 /// `comments.post_id` a uuid foreign key.
 pub fn tiny_blog_uuid() -> Overlay {
     let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/tiny-blog-uuid");
-    Overlay { base, scratch_base: false, edits: Vec::new() }
+    Overlay { base, scratch_base: false, edits: Vec::new(), observe_boot: false }
 }
 
 /// Start from an empty tree and `write` the app file by file, for a
 /// shape the blog cannot be edited into, such as an app with no views.
 pub fn empty_app() -> Overlay {
     let base = scratch_dir();
-    Overlay { base, scratch_base: true, edits: Vec::new() }
+    Overlay { base, scratch_base: true, edits: Vec::new(), observe_boot: false }
 }
 
 pub struct Overlay {
@@ -97,6 +97,8 @@ pub struct Overlay {
     /// `base` is this overlay's own scratch tree, removed once copied.
     scratch_base: bool,
     edits: Vec<Edit>,
+    /// Ingest with what the gems do to the app's classes as the app itself boots (`check`'s observation).
+    observe_boot: bool,
 }
 
 enum Edit {
@@ -106,6 +108,13 @@ enum Edit {
 }
 
 impl Overlay {
+    /// Ingest the app as `roundhouse check` does once its own boot is observed: the bundle the boot runs under is
+    /// `ROUNDHOUSE_BOOT_BUNDLE_PATH`'s, and the observation must answer, or the test fails.
+    pub fn with_observed_boot(mut self) -> Self {
+        self.observe_boot = true;
+        self
+    }
+
     /// Add a file, or replace one outright.
     pub fn write(mut self, path: &str, content: &str) -> Self {
         self.edits.push(Edit::Write { path: path.into(), content: content.as_bytes().to_vec() });
@@ -180,6 +189,30 @@ impl Overlay {
         Run::new(command.join(" "), emitted, errors, output)
     }
 
+    /// Emit, then load several of the emitted test files into one Ruby
+    /// process, in order, as `bin/rails test` loads a suite.
+    pub fn run_tests(self, test_paths: &[&str]) -> Run {
+        let (emitted, errors) = self.emit_tree(BuildTarget::Ruby);
+        let load = "ARGV.each { |path| require File.expand_path(path) }";
+        let output = ruby()
+            .args(["-Itest", "-I.", "-e", load])
+            .args(test_paths)
+            .current_dir(&emitted)
+            .output()
+            .expect("spawn ruby");
+        Run::new(format!("ruby -Itest -I. -e '{load}' {}", test_paths.join(" ")), emitted, errors, output)
+    }
+
+    /// Emit the Spinel tree, then run one of its test files with
+    /// `spin test <path>`. Spinel writes `test/<dir>/x_test.rb` as
+    /// `test/x_test.rb`, so `test_path` is the emitted path.
+    pub fn run_spin_test(self, test_path: &str) -> Run {
+        let (emitted, errors) = self.emit_tree(BuildTarget::Spinel);
+        let output =
+            Command::new("spin").args(["test", test_path]).current_dir(&emitted).output().expect("spawn spin");
+        Run::new(format!("spin test {test_path}"), emitted, errors, output)
+    }
+
     /// Emit, then run `script` against the booted app: `main.rb` is
     /// required and the default adapter configured on an in-memory
     /// database before the script's first line.
@@ -203,6 +236,8 @@ impl Overlay {
             .arg(&script)
             .current_dir(&emitted)
             .env("BLOG_DB", ":memory:")
+            // A variable a test's guard reads, unset unless the test sets it.
+            .env_remove("SHELF_SLUG")
             .envs(env.iter().copied())
             .output()
             .expect("spawn ruby");
@@ -238,12 +273,13 @@ impl Overlay {
     fn run_spinel_with_flags(self, script: &str, flags: &[&str]) -> Run {
         // Before the bundle's key: a recorded case and its lookup hash the same script.
         let script = &to_completion(script);
-        if let Some(dir) = bundle::collect_dir() {
+        // Not bundled when the boot is observed: the shared build ingests without the observation.
+        if let Some(dir) = bundle::collect_dir().filter(|_| !self.observe_boot) {
             bundle::record(&dir, &self, script, flags);
             panic!("spinel bundle collect: recorded, not run");
         }
         // Not the bundled run's failure as the test's: another case's added method or route rides in that build, so it is judged again alone.
-        let shared = bundle::run_shared(&self, script, flags).filter(|run| run.success);
+        let shared = if self.observe_boot { None } else { bundle::run_shared(&self, script, flags).filter(|run| run.success) };
         // Nor the bundle's errors as the case's: the group is checked merged, where another case's
         // added method can answer a call this one leaves unresolved. A case with errors of its own
         // runs alone, so its `Run` carries them and the program is its own.
@@ -255,6 +291,34 @@ impl Overlay {
         std::fs::write(emitted.join("contract.rb"), format!("require_relative \"boot\"\n{script}"))
             .expect("write native consumer");
         compile_and_run_contract(emitted, errors, flags).expecting_completion()
+    }
+
+    /// `run_spinel` through the `roundhouse` binary, which boots the app's CRuby tree to observe what a gem does to
+    /// a class it holds in a variable (`observed_shapes`); the library build the other runs take does not. Its
+    /// errors are the binary's: a first build without `--allow-unsupported` lists them, as that flag prints them
+    /// as warnings, and the second writes the tree (the observation is cached by then).
+    #[allow(dead_code)]
+    pub fn run_spinel_observed(self, script: &str) -> Run {
+        let (scratch, source) = self.materialize();
+        let build = |allow: bool, out: &Path| {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_roundhouse"));
+            command.args(["--target", "spinel"]);
+            if allow {
+                command.arg("--allow-unsupported");
+            }
+            command.arg(&source).arg("-o").arg(out).output().expect("spawn roundhouse")
+        };
+        let checked = build(false, &scratch.join("checked"));
+        let errors = String::from_utf8_lossy(&checked.stderr)
+            .lines()
+            .filter_map(|l| l.split_once(": error[").map(|(at, rest)| format!("{at}: {}", rest.split_once("]: ").map_or(rest, |(_, msg)| msg))))
+            .collect();
+        let emitted = scratch.join("emitted");
+        let built = build(true, &emitted);
+        assert!(built.status.success(), "roundhouse --target spinel failed:\n{}", String::from_utf8_lossy(&built.stderr));
+        std::fs::write(emitted.join("contract.rb"), format!("require_relative \"boot\"\n{}", to_completion(script)))
+            .expect("write native consumer");
+        compile_and_run_contract(emitted, errors, &[]).expecting_completion()
     }
 
     /// `run_spinel` for a probe that does not need the app: compile only the
@@ -450,6 +514,19 @@ impl Overlay {
                 }
             }
         }
+        // Not another overlay's patches: a test thread may run an observed overlay before this one.
+        roundhouse::observed_shapes::uninstall();
+        if self.observe_boot {
+            let (app, _) = roundhouse::ingest::prism::scope(|| ingest_app(&source));
+            let app = app.expect("ingest the overlaid fixture before observing its boot");
+            let gems = roundhouse::observed_shapes::needed(&app);
+            assert!(!gems.is_empty(), "no gem the app reaches changes a class held in a variable");
+            let dir = source.canonicalize().expect("canonical app dir");
+            let key = roundhouse::observed_shapes::key(&dir);
+            let (patches, refused) = roundhouse::observed_shapes::observe_app(&dir, &gems, &key);
+            assert!(refused.is_empty(), "the observed boot did not answer: {refused:?}");
+            roundhouse::observed_shapes::install(patches.expect("the observed boot's patches apply"));
+        }
 
         (scratch, source)
     }
@@ -480,6 +557,42 @@ impl Overlay {
         diags.into_iter().filter(|d| d.severity == Severity::Warning).map(|d| d.message).collect()
     }
 
+    /// The warnings emitting the overlaid app for `target` reports — the
+    /// `target_files` diagnostics an error-only `emit` drops.
+    pub fn emit_warnings(self, target: BuildTarget) -> Vec<Diagnostic> {
+        let (scratch, source) = self.materialize();
+        let (app, _) = roundhouse::ingest::prism::scope(|| ingest_app(&source));
+        let mut app = app.expect("ingest the overlaid fixture");
+        roundhouse::session::analyze_and_lower_for(&mut app, target);
+        let (_files, diags) = roundhouse::emit::diagnostics::scope(|| roundhouse::project::target_files(&app, &source, target));
+        let _ = std::fs::remove_dir_all(&scratch);
+        diags.into_iter().filter(|d| d.severity == Severity::Warning).collect()
+    }
+
+    /// Every diagnostic ingest reports for the overlaid tree, warnings included.
+    #[allow(dead_code)]
+    pub fn ingest_diagnostics(self) -> Vec<Diagnostic> {
+        let (scratch, source) = self.materialize();
+        let (app, diags) = roundhouse::ingest::prism::scope(|| ingest_app(&source));
+        // A failed ingest also reports no warnings: an absence check on them
+        // must not pass for that.
+        app.expect("ingest the overlaid fixture");
+        let _ = std::fs::remove_dir_all(&scratch);
+        diags
+    }
+
+    /// The warnings the target-aware lowering reports for `target`
+    /// (`session::analyze_and_lower_for`): a construct the target's lowering
+    /// doesn't reach, kept a reported gap there.
+    pub fn lowering_warnings(self, target: BuildTarget) -> Vec<Diagnostic> {
+        let (scratch, source) = self.materialize();
+        let (app, _) = roundhouse::ingest::prism::scope(|| ingest_app(&source));
+        let mut app = app.expect("ingest the overlaid fixture");
+        let diags = roundhouse::session::analyze_and_lower_for(&mut app, target);
+        let _ = std::fs::remove_dir_all(&scratch);
+        diags.into_iter().filter(|d| d.severity == Severity::Warning).collect()
+    }
+
     fn emit_app_tree(self, target: BuildTarget) -> (PathBuf, roundhouse::App, Vec<Diagnostic>) {
         self.emit_app_tree_with_lowering(target, true)
     }
@@ -497,13 +610,22 @@ impl Overlay {
         let mut found: Vec<_> = ingest_diags.into_iter().chain(diagnose(&app)).chain(lower_diags).collect();
         // As the CLI does: a gem's code the app does not reach is no error of the emitted program.
         roundhouse::source_gem_shake::demote_unreached_gem_errors(&app, &mut found);
+        // As the CLI does: what the target's runtime answers is no error of its tree.
+        roundhouse::session::drop_runtime_answered(target, &mut found);
         let mut errors: Vec<_> = found.into_iter().filter(|d| d.severity == Severity::Error).collect();
 
         let emitted = scratch.join("emitted");
-        let (files, emit_diags) = roundhouse::emit::diagnostics::scope(|| {
-            roundhouse::project::target_files(&app, &source, target)
+        // As the CLI does: a send on an app model the written Ruby defines nothing for is an error.
+        let ((files, emit_diags), rendered) = roundhouse::emit::ruby::record_rendered(|| {
+            roundhouse::emit::diagnostics::scope(|| roundhouse::project::target_files(&app, &source, target))
         });
         let mut emit_diags = emit_diags;
+        if let Ok(files) = &files
+            && roundhouse::emit::audit::gates(target)
+        {
+            let models = app.models.iter().map(|m| m.name.0.as_str()).collect();
+            emit_diags.extend(roundhouse::emit::audit::audit(&rendered, files, &models, &app.sources));
+        }
         roundhouse::source_gem_shake::demote_unreached_gem_errors(&app, &mut emit_diags);
         errors.extend(emit_diags.into_iter().filter(|d| d.severity == Severity::Error));
         let files = match files {
@@ -551,6 +673,19 @@ pub struct Run {
     exited_zero: bool,
     pub stdout: String,
     pub stderr: String,
+    /// The last process's exit status, for a failure that printed nothing (a signal).
+    pub status: String,
+}
+
+fn command_of_status(status: &std::process::ExitStatus) -> &'static str {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if status.signal().is_some() {
+            return "killed by a signal";
+        }
+    }
+    if status.success() { "exited 0" } else { "exited non-zero" }
 }
 
 impl Run {
@@ -563,6 +698,7 @@ impl Run {
             exited_zero: output.status.success(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            status: format!("{} ({})", output.status, command_of_status(&output.status)),
         }
     }
 
@@ -606,7 +742,8 @@ impl Run {
         assert!(
             self.success || !self.exited_zero,
             "the emitted program exited 0 without reaching the end of its script (an early `exit` or \
-             `return`, or a swallowed raise), so its checks did not all run: `{}` in {}\n\
+             `return`, or a swallowed raise), so its checks did not all run: `{}` in {} \
+             (ROUNDHOUSE_KEEP_EMITTED=1 keeps the tree)\n\
              \n=== stdout ===\n{}\n=== stderr ===\n{}",
             self.command,
             self.emitted.display(),
@@ -615,7 +752,8 @@ impl Run {
         );
         assert!(
             self.success,
-            "analysis and emit are clean but the emitted program failed: `{}` in {}\n\
+            "analysis and emit are clean but the emitted program failed: `{}` in {} \
+             (ROUNDHOUSE_KEEP_EMITTED=1 keeps the tree)\n\
              \n=== stdout ===\n{}\n=== stderr ===\n{}",
             self.command,
             self.emitted.display(),
@@ -625,10 +763,9 @@ impl Run {
     }
 }
 
-/// A run takes its scratch tree with it, unless its test is failing (the
-/// failure names the tree) or `ROUNDHOUSE_KEEP_EMITTED=1` keeps every one.
-/// A run expected to fail is a passing test and is removed too. Left
-/// behind, a full suite fills `/tmp`'s inodes.
+/// A run takes its scratch tree with it, passed or failed, unless
+/// `ROUNDHOUSE_KEEP_EMITTED=1` keeps every one (a failure names its tree).
+/// Left behind, a full suite fills `/tmp`'s inodes.
 impl Drop for Run {
     fn drop(&mut self) {
         remove_scratch(&self.emitted);
@@ -660,7 +797,7 @@ impl Drop for Emitted {
 }
 
 fn remove_scratch(emitted: &Path) {
-    if !std::thread::panicking() && std::env::var_os("ROUNDHOUSE_KEEP_EMITTED").is_none() {
+    if std::env::var_os("ROUNDHOUSE_KEEP_EMITTED").is_none() {
         if let Some(scratch) = emitted.parent() {
             let _ = std::fs::remove_dir_all(scratch);
         }
@@ -733,10 +870,10 @@ pub mod bundle {
 
     // Not the group's tree itself: each test writes its database and its log into the tree, and tests run in parallel.
     pub fn http_shared(overlay: &Overlay) -> Option<PathBuf> {
-        let (dir, map) = manifest()?;
-        let (group, _) = map.get(&key(overlay, "", &[HTTP])?)?;
+        let dir = PathBuf::from(std::env::var_os("RH_SPINEL_BUNDLE")?);
+        let (group, _) = shared_case(&dir, &key(overlay, "", &[HTTP])?)?;
         let emitted = scratch_dir().join("emitted");
-        copy_tree(&dir.join(group), &emitted);
+        copy_tree(&dir.join(&group), &emitted);
         Some(emitted)
     }
 
@@ -748,21 +885,33 @@ pub mod bundle {
     fn merged_edits(cases: &[&Case]) -> Option<Vec<Edit>> {
         let empty = cases[0].base.as_os_str() == EMPTY;
         let mut files: BTreeMap<String, Option<String>> = BTreeMap::new();
-        let mut written: BTreeMap<&str, &[u8]> = BTreeMap::new();
+        let mut written: BTreeMap<&str, (usize, Vec<u8>)> = BTreeMap::new();
         let mut removed: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
         let mut seen: std::collections::BTreeSet<(&str, &str, &str)> = std::collections::BTreeSet::new();
         let mut out = Vec::new();
         for case in cases {
+            let mut own: BTreeMap<&str, &[u8]> = BTreeMap::new();
             for edit in &case.edits {
                 match edit {
                     Edit::Write { path, content } => {
                         if removed.contains(path.as_str()) || files.contains_key(path.as_str()) {
                             return None;
                         }
-                        match written.insert(path.as_str(), content.as_slice()) {
-                            Some(before) if before != content.as_slice() => return None,
-                            Some(_) => continue,
-                            None => out.push(clone_edit(edit)),
+                        // Not merged with the case's own earlier write: in its own build the later one replaces it.
+                        if own.insert(path.as_str(), content.as_slice()).is_some_and(|before| before != content.as_slice()) {
+                            return None;
+                        }
+                        match written.get_mut(path.as_str()) {
+                            Some((_, before)) if *before == *content => continue,
+                            Some((at, before)) => {
+                                let merged = merged_listing(path, before, content)?;
+                                out[*at] = Edit::Write { path: path.clone(), content: merged.clone() };
+                                *before = merged;
+                            }
+                            None => {
+                                written.insert(path.as_str(), (out.len(), content.clone()));
+                                out.push(clone_edit(edit));
+                            }
                         }
                     }
                     Edit::Replace { path, find, replace } => {
@@ -798,10 +947,73 @@ pub mod bundle {
         Some(out)
     }
 
+    // Not refused as two writes of one file: each empty-app case writes its whole schema and routes, which sit side by side.
+    pub fn merged_listing(path: &str, before: &[u8], content: &[u8]) -> Option<Vec<u8>> {
+        if path != "db/schema.rb" && path != ROUTES {
+            return None;
+        }
+        let (head, mut merged) = listing(std::str::from_utf8(before).ok()?)?;
+        let (other_head, added) = listing(std::str::from_utf8(content).ok()?)?;
+        // Not one head for both: a schema's version is part of what it declares.
+        if head != other_head {
+            return None;
+        }
+        for statement in added {
+            let name = listing_name(&statement);
+            match merged.iter().find(|s| listing_name(s) == name) {
+                Some(s) if *s == statement => {}
+                Some(_) => return None,
+                None => merged.push(statement),
+            }
+        }
+        let mut text = format!("{head}\n");
+        for statement in &merged {
+            text.push_str(statement);
+        }
+        text.push_str("end\n");
+        Some(text.into_bytes())
+    }
+
+    fn listing(text: &str) -> Option<(&str, Vec<String>)> {
+        let (head, rest) = text.split_once('\n')?;
+        if !head.ends_with(" do") || head.starts_with(' ') {
+            return None;
+        }
+        let rest = rest.trim_end_matches('\n');
+        let body = if rest == "end" { "" } else { rest.strip_suffix("\nend")? };
+        let mut statements: Vec<String> = Vec::new();
+        for line in body.lines() {
+            let top = line.starts_with("  ") && !line.starts_with("   ") && line.trim() != "end";
+            match statements.last_mut() {
+                Some(last) if !top => {
+                    last.push_str(line);
+                    last.push('\n');
+                }
+                _ => statements.push(format!("{line}\n")),
+            }
+        }
+        Some((head, statements))
+    }
+
+    fn listing_name(statement: &str) -> String {
+        let first = statement.trim_start();
+        let mut words = first.splitn(3, |c: char| c.is_whitespace() || c == '(');
+        let verb = words.next().unwrap_or("");
+        match verb {
+            "create_table" | "get" | "post" | "put" | "patch" | "delete" | "match" | "resources" | "resource" | "namespace" | "scope" => {
+                // Not the spelling: `:widgets`, `"widgets"` and `'widgets'` name one table.
+                let name = words.next().unwrap_or("").trim_end_matches(',').trim_start_matches(':');
+                format!("{verb} {}", name.trim_matches(|c| c == '"' || c == '\''))
+            }
+            "root" => "root".to_string(),
+            _ => first.to_string(),
+        }
+    }
+
     fn build_http(cases: &[&Case]) -> Option<PathBuf> {
         let edits = merged_edits(cases)?;
         let empty = cases[0].base.as_os_str() == EMPTY;
-        let overlay = Overlay { base: if empty { scratch_dir() } else { cases[0].base.clone() }, scratch_base: empty, edits };
+        let overlay = Overlay { base: if empty { scratch_dir() } else { cases[0].base.clone() }, scratch_base: empty, edits, observe_boot: false };
         let (emitted, errors) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| overlay.emit_tree(BuildTarget::Spinel))).ok()?;
         if !errors.is_empty() || spin_build(&emitted).is_err() {
             remove_scratch(&emitted);
@@ -871,28 +1083,42 @@ pub mod bundle {
         std::fs::write(dir.join(format!("{key}.json")), case.to_string()).expect("write bundle case");
     }
 
-    fn manifest() -> Option<&'static (PathBuf, BTreeMap<String, (String, usize)>)> {
-        static MANIFEST: std::sync::OnceLock<Option<(PathBuf, BTreeMap<String, (String, usize)>)>> = std::sync::OnceLock::new();
-        MANIFEST
-            .get_or_init(|| {
-                let dir = PathBuf::from(std::env::var_os("RH_SPINEL_BUNDLE")?);
-                let text = std::fs::read_to_string(dir.join("manifest.json")).ok()?;
-                let map: BTreeMap<String, (String, usize)> = serde_json::from_str(&text).ok()?;
-                Some((dir, map))
-            })
-            .as_ref()
+    // Not read once per process: the suite starts while the bundle still builds, so a case's file appears later.
+    pub fn shared_case(dir: &Path, key: &str) -> Option<(String, usize)> {
+        let pending: Vec<String> = serde_json::from_str(&std::fs::read_to_string(dir.join("pending.json")).ok()?).ok()?;
+        if !pending.iter().any(|k| k == key) {
+            return None;
+        }
+        let done = dir.join("done").join(format!("{key}.json"));
+        loop {
+            // Not left on `finished` alone: the build may finish between this read and that check.
+            let finished = dir.join("finished").exists();
+            if let Ok(text) = std::fs::read_to_string(&done) {
+                return serde_json::from_str::<Option<(String, usize)>>(&text).ok()?;
+            }
+            if finished {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
     }
 
     // Not the group's tree itself: a contract may write into its tree, and tests run in parallel.
     pub fn run_shared(overlay: &Overlay, script: &str, flags: &[&str]) -> Option<Run> {
-        let (dir, map) = manifest()?;
-        let (group, case) = map.get(&key(overlay, script, flags)?)?;
+        let dir = PathBuf::from(std::env::var_os("RH_SPINEL_BUNDLE")?);
+        let (group, case) = shared_case(&dir, &key(overlay, script, flags)?)?;
         let emitted = scratch_dir().join("emitted");
-        copy_tree(&dir.join(group), &emitted);
-        let output = Command::new(emitted.join("contract"))
-            .arg(case.to_string())
-            .current_dir(&emitted)
-            .output()
+        copy_tree(&dir.join(&group), &emitted);
+        // Not one spawn: another test thread's fork can still hold the copied binary open for writing, and Linux refuses to run it then.
+        let output = (0..100)
+            .find_map(|_| match Command::new(emitted.join("contract")).arg(case.to_string()).current_dir(&emitted).output() {
+                Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    None
+                }
+                result => Some(result),
+            })
+            .expect("bundled native consumer stayed busy")
             .expect("run bundled native consumer");
         // The recorded script already ends in the completion line (`run_spinel_with_flags`).
         Some(Run::new(format!("spinel bundle {group} && ./contract {case}"), emitted, Vec::new(), output).expecting_completion())
@@ -936,7 +1162,7 @@ pub mod bundle {
         // Not merged blindly: two cases writing one path differently would leave only the last (`merged_edits`).
         let edits = merged_edits(cases)?;
         let empty = cases[0].base.as_os_str() == EMPTY;
-        let overlay = Overlay { base: if empty { scratch_dir() } else { cases[0].base.clone() }, scratch_base: empty, edits };
+        let overlay = Overlay { base: if empty { scratch_dir() } else { cases[0].base.clone() }, scratch_base: empty, edits, observe_boot: false };
         let (emitted, errors) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| overlay.emit_tree(BuildTarget::Spinel))).ok()?;
         if !errors.is_empty() {
             remove_scratch(&emitted);
@@ -984,6 +1210,7 @@ pub mod bundle {
     // The edits that change a file of the base app rather than add one beside it. Not one that only
     // adds methods (`adds_only_methods`): it changes nothing another case's script calls, and a
     // case that fails in the shared build is run again alone (`Overlay::run_spinel_with_flags`).
+    // Nor a route the case adds, which no other case's script reaches (`http_base_edits`).
     fn base_edits(case: &Case) -> u64 {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         let in_base = |path: &str| case.base.as_os_str() != EMPTY && case.base.join(path).exists();
@@ -992,6 +1219,7 @@ pub mod bundle {
                 Edit::Write { path, content } if in_base(path) => ("w", path, content).hash(&mut h),
                 Edit::Write { .. } => {}
                 Edit::Replace { find, replace, .. } if adds_only_methods(find, replace) => {}
+                Edit::Replace { path, find, replace } if inserts_route(path, find, replace) => {}
                 Edit::Replace { path, find, replace } => ("r", path, find, replace).hash(&mut h),
                 Edit::Remove { path } => ("d", path).hash(&mut h),
             }
@@ -1001,7 +1229,17 @@ pub mod bundle {
 
     const ROUTES: &str = "config/routes.rb";
 
-    // `base_edits` but for routes a case inserts, which change nothing another case's requests reach.
+    // Not any prefix or suffix match: `resources :articles` made `resources :articles, only: [:index]` rewrites the route.
+    fn inserts_route(path: &str, find: &str, replace: &str) -> bool {
+        path == ROUTES
+            && match (replace.strip_prefix(find), replace.strip_suffix(find)) {
+                (Some(after), _) if find.ends_with('\n') || after.starts_with('\n') => true,
+                (_, Some(before)) => before.ends_with('\n'),
+                _ => false,
+            }
+    }
+
+    // `base_edits` but apart on added methods: a server that fails shared is not built again alone, and two cases adding one name both compose.
     fn http_base_edits(case: &Case) -> u64 {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         let in_base = |path: &str| case.base.as_os_str() != EMPTY && case.base.join(path).exists();
@@ -1009,8 +1247,7 @@ pub mod bundle {
             match edit {
                 Edit::Write { path, content } if in_base(path) => ("w", path, content).hash(&mut h),
                 Edit::Write { .. } => {}
-                Edit::Replace { path, find, replace }
-                    if path == ROUTES && (replace.starts_with(find.as_str()) || replace.ends_with(find.as_str())) => {}
+                Edit::Replace { path, find, replace } if inserts_route(path, find, replace) => {}
                 Edit::Replace { path, find, replace } => ("r", path, find, replace).hash(&mut h),
                 Edit::Remove { path } => ("d", path).hash(&mut h),
             }
@@ -1030,12 +1267,28 @@ pub mod bundle {
 
     // Each case's share of the compiles it took part in, failed ones included: a bundled test runs
     // in well under a second, so without this its recorded seconds hide what its shard paid (#1781).
-    fn charge(cases: &[&Case], elapsed: f64, seconds: &Seconds) {
+    fn charge(cases: &[&Case], elapsed: f64, seconds: &Seconds, out: &Path) {
         let mut s = seconds.lock().unwrap();
         for case in cases {
             if let Some(test) = &case.test {
                 *s.entry(test.clone()).or_default() += elapsed / cases.len() as f64;
             }
+        }
+        // Not only once all are built: a suite ends, and is charged its share, while other groups still build.
+        write_atomic(&out.join("seconds.json"), serde_json::to_string(&*s).unwrap().as_bytes());
+    }
+
+    // Not a plain write: a test waiting on the file could read it half written.
+    fn write_atomic(path: &Path, bytes: &[u8]) {
+        let tmp = path.with_extension(format!("tmp{:?}", std::thread::current().id()).replace(['(', ')'], ""));
+        std::fs::write(&tmp, bytes).expect("write bundle file");
+        std::fs::rename(&tmp, path).expect("publish bundle file");
+    }
+
+    fn settle(out: &Path, cases: &[&Case], built: Option<&str>) {
+        for (i, case) in cases.iter().enumerate() {
+            let fate = built.map(|group| (group.to_string(), i));
+            write_atomic(&out.join("done").join(format!("{}.json", case.key)), serde_json::to_string(&fate).unwrap().as_bytes());
         }
     }
 
@@ -1047,11 +1300,12 @@ pub mod bundle {
         seconds: &Seconds,
     ) {
         if cases.len() < 2 {
+            settle(out, &cases, None);
             return;
         }
         let start = std::time::Instant::now();
         let built = if cases[0].flags.iter().any(|f| f == HTTP) { build_http(&cases) } else { build(&cases) };
-        charge(&cases, start.elapsed().as_secs_f64(), seconds);
+        charge(&cases, start.elapsed().as_secs_f64(), seconds, out);
         if let Some(tree) = built {
             let dest = out.join(name);
             let _ = std::fs::remove_dir_all(&dest);
@@ -1061,6 +1315,7 @@ pub mod bundle {
             for (i, case) in cases.iter().enumerate() {
                 m.insert(case.key.clone(), (name.to_string(), i));
             }
+            settle(out, &cases, Some(name));
             eprintln!("spinel bundle {name}: {} cases", cases.len());
             return;
         }
@@ -1129,6 +1384,9 @@ pub mod bundle {
         let manifest = std::sync::Mutex::new(BTreeMap::new());
         let seconds = std::sync::Mutex::new(BTreeMap::new());
         let chunks = chunks(&cases);
+        std::fs::create_dir_all(out.join("done")).expect("bundle done dir");
+        let pending: Vec<&str> = chunks.iter().filter(|c| c.len() > 1).flatten().map(|c| c.key.as_str()).collect();
+        write_atomic(&out.join("pending.json"), serde_json::to_string(&pending).unwrap().as_bytes());
         let workers = std::thread::available_parallelism().map_or(2, |n| n.get());
         let next = std::sync::atomic::AtomicUsize::new(0);
         std::thread::scope(|s| {
@@ -1145,6 +1403,7 @@ pub mod bundle {
         std::fs::write(out.join("manifest.json"), serde_json::to_string(&manifest).unwrap()).expect("write manifest");
         // Read by ci-plan.py run-tests, which adds each test's share to the seconds it records.
         let seconds = seconds.into_inner().unwrap();
-        std::fs::write(out.join("seconds.json"), serde_json::to_string(&seconds).unwrap()).expect("write bundle seconds");
+        write_atomic(&out.join("seconds.json"), serde_json::to_string(&seconds).unwrap().as_bytes());
+        std::fs::write(out.join("finished"), "").expect("mark bundle finished");
     }
 }

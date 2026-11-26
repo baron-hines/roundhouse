@@ -228,6 +228,12 @@ module ActionDispatch
       @session = value
     end
 
+    # Rails' `Request#reset_session` (Warden's `reset_session!` on sign-out): the session emptied in place, so what
+    # holds it sees it empty too.
+    def reset_session
+      session.clear
+    end
+
     # Whether the dispatcher should leave the session cookie alone this
     # response (Rails: the session middleware skips its commit).
     def session_skip?
@@ -287,7 +293,13 @@ module ActionDispatch
     def self.for_env(env)
       found = env["roundhouse.request"]
       return found if found.is_a?(ActionDispatch::Request)
-      ActionDispatch::Request.new
+      # Not a request of its own env: what it is asked for and writes (its cookie jar) is the env's, as Rails' is.
+      request = ActionDispatch::Request.new
+      request.env = env
+      # The session the dispatcher restored into the env, so a reset here is the one it persists.
+      restored = env["rack.session"]
+      request.session = restored if restored.is_a?(ActionDispatch::Session)
+      request
     end
 
     # Rails' HTTP_METHOD_LOOKUP: the verb as a Symbol, `M-SEARCH` as `:m_search`.
@@ -321,8 +333,9 @@ module ActionDispatch
       @request_method == "HEAD"
     end
 
+    # Rails' `/XMLHttpRequest/i.match?`: anywhere in the header, any case.
     def xhr?
-      @env.fetch("HTTP_X_REQUESTED_WITH", "").to_s == "XMLHttpRequest"
+      @env.fetch("HTTP_X_REQUESTED_WITH", "").to_s.downcase.include?("xmlhttprequest")
     end
 
     def inertia?
@@ -335,6 +348,12 @@ module ActionDispatch
       else
         @path + "?" + @query_string
       end
+    end
+
+    # Rack's PATH_INFO, the path below the mount point, which `path`
+    # holds here (Rails' `path` is `script_name + path_info`).
+    def path_info
+      @path
     end
 
     # No middleware rewrites paths here, so original_* == current.
@@ -499,6 +518,19 @@ module ActionDispatch
       src = Rails.application.content_security_policy
       @content_security_policy = src.nil? ? nil : src.dup
       @content_security_policy
+    end
+
+    # Rails' `content_security_policy_nonce`: nil without a generator, else generated once per request.
+    def content_security_policy_nonce
+      return nil unless Rails.application.content_security_policy_nonce_generator?
+      @csp_nonce = Rails.application.content_security_policy_nonce_generated(self) if @csp_nonce.nil?
+      @csp_nonce
+    end
+
+    # A controller's `content_security_policy` block on a request whose app has no policy: Rails starts a new one.
+    def content_security_policy=(policy)
+      @csp_ready = true
+      @content_security_policy = policy
     end
 
     # Absolute URL of this request. Feed templates interpolate it as

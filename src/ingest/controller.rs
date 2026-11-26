@@ -361,7 +361,7 @@ pub fn ingest_controller(source: &[u8], file: &str) -> IngestResult<Option<Contr
                 Some(
                     super::singleton_class::ingest_singleton_body(&sc, &owner, file, &|def| {
                         super::library_class::ingest_library_method(def, &owner, file)
-                    })
+                    }, false)
                     .map(|b| (b.methods, b.class_body)),
                 )
             } else {
@@ -444,6 +444,7 @@ pub fn ingest_controller(source: &[u8], file: &str) -> IngestResult<Option<Contr
         body: body_items,
         layout,
         sibling_classes,
+        csp_header: false,
     }))
 }
 
@@ -794,19 +795,19 @@ pub(super) fn parse_filter_call_on(
     let kind = match macro_name {
         // `append_*` is Rails' alias of the plain macro (AbstractController::Callbacks).
         "before_action" | "prepend_before_action" | "append_before_action" => FilterKind::Before,
-        "around_action" | "append_around_action" => FilterKind::Around,
+        "around_action" | "append_around_action" | "prepend_around_action" => FilterKind::Around,
         "after_action" | "append_after_action" => FilterKind::After,
         "skip_before_action" => FilterKind::Skip,
         "skip_around_action" => FilterKind::SkipAround,
         "skip_after_action" => FilterKind::SkipAfter,
         _ => return Ok(None),
     };
-    // Rails moves a `prepend_before_action` callback to the head of the
-    // WHOLE chain, ahead of inherited filters too — see `Filter::prepend`.
-    // `prepend_around_action` / `prepend_after_action` are not modeled:
-    // no controller in this codebase's fixtures uses either, so they
-    // stay unrecognized rather than risk a wrong-order claim.
-    let mut prepend = macro_name == "prepend_before_action";
+    // Rails moves a `prepend_before_action` or `prepend_around_action`
+    // callback to the head of the WHOLE chain, ahead of inherited filters
+    // too — see `Filter::prepend`. `prepend_after_action` is not modeled:
+    // no controller in this codebase's fixtures uses it, so it stays
+    // unrecognized rather than risk a wrong-order claim.
+    let mut prepend = matches!(macro_name, "prepend_before_action" | "prepend_around_action");
 
     let Some(args) = call.arguments() else { return Ok(None) };
 

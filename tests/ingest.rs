@@ -1319,7 +1319,8 @@ fn unmodeled_validates_options_warn_and_drop_their_rule_or_call() {
         r#"
 class Widget < ApplicationRecord
   validates :name, presence: true, uniqueness: { conditions: -> { where(active: true) } }
-  validates :stock, comparison: { less_than_or_equal_to: :max_stock }
+  # A bound computed from neither a literal, a Symbol, a lambda nor a value constant.
+  validates :stock, comparison: { less_than_or_equal_to: Time.now }
   validates :price, numericality: { greater_than: 0, odd: true }
   validates :bounded, numericality: { equal_to: 1, other_than: 2 }
   # A two-parameter lambda would splice an unbound parameter into `def
@@ -2607,7 +2608,25 @@ fn cattr_defaults_cannot_be_silently_dropped_with_native_initializers() {
                 );
             }
         }
-        for default in ["**{default: 41}", "**options", "instance_reader: false, default: 41"] {
+        // `instance_reader: false` beside a default leaves only the instance copy out: the seed and the class-side
+        // accessors stand, as Rails defines them.
+        {
+            let source = format!("class Probe; {declaration} :count, instance_reader: false, default: 41; end");
+            let classes = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb").unwrap();
+            assert!(
+                classes[0].class_ivar_initializers.iter().any(|expr| {
+                    matches!(&*expr.node, ExprNode::Assign { target: LValue::Var { name, .. }, value }
+                        if name.as_str() == "@@count" && matches!(&*value.node, ExprNode::Lit { value: Literal::Int { value: 41 } }))
+                }),
+                "{declaration}: {:?}",
+                classes[0].class_ivar_initializers
+            );
+            assert!(
+                !classes[0].methods.iter().any(|m| m.name.as_str() == "count" && m.receiver == roundhouse::dialect::MethodReceiver::Instance),
+                "{declaration}: no instance reader"
+            );
+        }
+        for default in ["**{default: 41}", "**options"] {
             let call = format!("{declaration} :count, {default}");
             let source = format!("class Probe; {call}; end");
             let classes = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb")
@@ -2665,6 +2684,19 @@ fn native_classvar_initialization_uses_owned_initializer_ir() {
             .expect_err("separate class-body buckets cannot preserve interleaving");
         assert!(err.to_string().contains("requires source ordering"), "{err}");
     }
+}
+
+/// simple_form's module body: ActiveSupport::Autoload's `autoload :X` and `eager_autoload do … end`, class variables
+/// written a block that closes over nothing, and a call of the module's own class method at its end, which the
+/// emitter replays in source order. A block that reads a local of the class body is not carried.
+#[test]
+fn native_classvar_initialization_beside_autoloads_blocks_and_an_own_class_method_call() {
+    let source = b"module Probe\n  extend ActiveSupport::Autoload\n  autoload :Helpers\n  eager_autoload do\n    autoload :Inputs\n  end\n  @@label = ->(label, required) { \"#{required} #{label}\" }\n  @@error = proc do |tag, _| tag end\n  @@wrappers = {}\n  def self.wrappers(name, &block)\n    @@wrappers[name] = block\n  end\n  wrappers :default do |b| b end\nend\n";
+    roundhouse::ingest::ingest_library_classes(source, "probe.rb").expect("ingests");
+    let closing = b"module Probe\n  prefix = \"x\"\n  @@label = ->(label) { prefix + label }\nend\n";
+    // Not a library class at all: a body that assigns a local is left to the file's program.
+    let closed = roundhouse::ingest::ingest_library_classes(closing, "probe.rb");
+    assert!(matches!(&closed, Ok(classes) if classes.is_empty()), "{closed:?}");
 }
 
 #[test]
@@ -3570,4 +3602,43 @@ end
     let names: Vec<(&str, &str)> = flat.iter().map(|r| (r.path.as_str(), r.as_name.as_str())).collect();
     assert!(names.contains(&("/log_in", "create")), "{names:?}");
     assert!(names.contains(&("/away", "new")), "{names:?}");
+}
+
+#[test]
+fn a_rooted_class_in_a_model_body_is_walked_as_nested_not_beside() {
+    use roundhouse::ingest::library_class::{ingest_library_classes_beside, ingest_nested_library_classes};
+
+    // A gem file whose model body declares `class ::StaticFiles`: Ruby
+    // names it at the top level, but it is written inside the model,
+    // so the nested walk takes it and the walk beside the model leaves
+    // it alone. Taken by both, it was registered twice.
+    let src = br#"module Tessera
+  class Node
+    include ActiveModel::Validations
+    validate :named
+
+    class ::StaticFiles
+      def self.call(env)
+        [200, {}, ["static"]]
+      end
+    end
+
+    def named
+    end
+  end
+
+  class Helpers
+    def self.tag
+      :helpers
+    end
+  end
+end
+"#;
+    let names = |classes: Vec<roundhouse::dialect::LibraryClass>| {
+        classes.into_iter().map(|c| c.name.0.as_str().to_string()).collect::<Vec<_>>()
+    };
+    let beside = names(ingest_library_classes_beside(src, "lib/tessera/node.rb", "Tessera::Node").expect("beside"));
+    let nested = names(ingest_nested_library_classes(src, "lib/tessera/node.rb", "Tessera::Node").expect("nested"));
+    assert_eq!(beside, ["Tessera::Helpers"], "beside the model");
+    assert!(nested.contains(&"StaticFiles".to_string()), "nested in the model: {nested:?}");
 }

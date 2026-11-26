@@ -83,3 +83,152 @@ fn reading_the_middleware_registers_no_source_after_the_snapshot() {
         assert!(stack.contains(stacked), "{target:?}: {stack}");
     }
 }
+
+// Not served over HTTP: as in rack_attack.rs, the emitted adapter runs on CRuby over a stand-in server.
+#[test]
+fn the_spinel_adapter_keeps_the_routes_cookies_when_the_middleware_copies_the_headers() {
+    let (tree, errors) =
+        with_application_lines(emit_and_run::real_blog(), "    config.middleware.use ProbeUse\n").emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let adapter = std::fs::read_to_string(tree.join("runtime/gem_middleware.rb"))
+        .expect("gem_middleware.rb")
+        .replace("ProbeUse.new(App.new)", "Copy.new(App.new)");
+    let script = format!(
+        r#"{adapter}
+module Tep
+  def self.str_hash = {{}}
+end
+module ActionDispatch
+  class Session
+  end
+  module Routing
+    class RouteSet
+      def self.finalize_app! = nil
+    end
+  end
+end
+Res = Struct.new(:status, :headers, :body, :file_path, :streaming, :set_cookies, :header_fields)
+Req = Struct.new(:verb, :path, :raw_query, :remote_host, :http_version, :req_headers, :raw_body, :listener_transport)
+ReqObj = Struct.new(:request_id, :env, :session)
+module Main
+  def self.dispatch_request(req, res, _obj)
+    res.status = 200
+    res.headers["x-routes"] = req.path
+    res.body = +"routes body"
+    res.set_cookies << "a=1"
+  end
+end
+class Copy
+  def initialize(app)
+    @app = app
+  end
+  def call(env)
+    status, headers, body = @app.call(env)
+    case env["PATH_INFO"]
+    when "/own" then [status, headers.merge("set-cookie" => "own=1"), body]
+    else [status, headers.dup, body]
+    end
+  end
+end
+def run(path)
+  res = Res.new(0, {{}}, +"", +"", false, [], [])
+  GemMiddleware.dispatch(Req.new("GET", path, "", "127.0.0.1", "HTTP/1.1", {{}}, "", "tcp"), res, ReqObj.new("id", {{}}, {{}}))
+  res
+end
+res = run("/copy")
+raise "copy: #{{res.to_h}}" unless res.set_cookies == ["a=1"] && res.headers == {{ "x-routes" => "/copy" }}
+res = run("/own")
+raise "own: #{{res.to_h}}" unless res.set_cookies == ["own=1", "a=1"] && res.headers == {{ "x-routes" => "/own" }}
+puts "cookies passed"
+"#
+    );
+    let out = std::process::Command::new("ruby").args(["-e", &script]).output().expect("spawn ruby");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("cookies passed"), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// request_store's middleware shape: the body handed up is wrapped in `Rack::BodyProxy`, whose block runs once the
+/// server closes it (the rack gem's on the ruby family, `runtime/ruby/rack_body_proxy.rb` on Spinel).
+const CLEARING: &str = r#"class Clearing
+  def self.cleared
+    @cleared || 0
+  end
+
+  def self.clear!
+    @cleared = cleared + 1
+  end
+
+  def initialize(app)
+    @app = app
+  end
+
+  def call(env)
+    status, headers, body = @app.call(env)
+    body = Rack::BodyProxy.new(body) do
+      Clearing.clear!
+    end
+    [status, headers, body]
+  end
+end
+"#;
+
+#[test]
+fn a_body_proxys_block_runs_when_the_body_is_closed() {
+    let run = emit_and_run::real_blog()
+        .write("lib/clearing.rb", CLEARING)
+        .edit("config/application.rb", AUTOLOAD, &format!("{AUTOLOAD}    config.middleware.use Clearing\n"))
+        .run_ruby(r#"
+env = { "REQUEST_METHOD" => "GET", "PATH_INFO" => "/articles", "QUERY_STRING" => "", "REMOTE_ADDR" => "127.0.0.1",
+        "HTTP_HOST" => "localhost", "rack.input" => StringIO.new("") }
+status, _headers, body = Main.run_rack(env)
+before = Clearing.cleared
+text = +""
+body.each { |part| text << part }
+body.close
+body.close
+raise "status #{status}, cleared #{before} then #{Clearing.cleared}" unless status == 200 && before == 0 && Clearing.cleared == 1 && text.include?("Articles")
+puts "body proxy passed"
+"#);
+    run.assert_passes();
+    assert!(run.stdout.contains("body proxy passed"), "{}", run.stdout);
+}
+
+#[test]
+fn the_spinel_tree_carries_the_body_proxy_port() {
+    let (tree, errors) = emit_and_run::real_blog()
+        .write("lib/clearing.rb", CLEARING)
+        .edit("config/application.rb", AUTOLOAD, &format!("{AUTOLOAD}    config.middleware.use Clearing\n"))
+        .emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let port = std::fs::read_to_string(tree.join("runtime/rack_body_proxy.rb")).expect("rack_body_proxy.rb");
+    assert!(port.contains("class BodyProxy"), "{port}");
+    // Loaded where the middleware names it, not only copied.
+    let mut loaded = false;
+    for entry in walk(&tree) {
+        if entry.extension().is_some_and(|e| e == "rb")
+            && std::fs::read_to_string(&entry).is_ok_and(|t| {
+                t.contains("class Clearing")
+                    && t.lines().any(|l| {
+                        let l = l.trim_start();
+                        (l.starts_with("require ") || l.starts_with("require_relative ")) && l.contains("rack_body_proxy")
+                    })
+            })
+        {
+            loaded = true;
+        }
+    }
+    assert!(loaded, "no file naming Clearing requires runtime/rack_body_proxy");
+}
+
+fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(walk(&path));
+        } else {
+            out.push(path);
+        }
+    }
+    out
+}

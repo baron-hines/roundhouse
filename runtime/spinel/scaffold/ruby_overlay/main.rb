@@ -221,7 +221,9 @@ module Main
     env["roundhouse.path_params"] ||= matched.path_params
     controller = endpoint.nil? ? Main.instantiate_controller(matched.controller) : endpoint[0]
     merged = matched.path_params.dup
-    request[:params].each { |k, v| merged[k] = v }
+    # Rails' `params.merge!(path_parameters)`: a captured segment wins over the query and body.
+    request[:params].each { |k, v| merged[k] = v unless matched.path_params.key?(k) }
+    RouteTable.route_defaults(matched.defaults, merged, matched.path_params)
     controller.params  = merged
     controller.path_parameters = matched.path_params
 
@@ -302,11 +304,14 @@ module Main
     # detaches a plain mutable Hash (callers write scratch keys the real
     # ENV would reject); params delegation gets the same merged hash the
     # controller sees.
+    env["RAW_POST_DATA"] = request.fetch(:raw_body, "")
     controller.request = ActionDispatch::Request.new(env.to_h, merged)
     # Not read back from the controller: Devise's FailureApp delegates `flash` to the request.
     controller.request.flash = flash
     # The env's own request, which a gem's `ActionDispatch::Request.new(env)` is (`Request.for_env`).
     env["roundhouse.request"] = controller.request
+    # Rails' `request.cookie_jar` is the controller's `cookies`: Warden's `cookies` (Devise's remember-me) reads and writes it.
+    controller.cookies = controller.request.adopt_cookie_jar(controller.cookies)
     controller.request.path_parameters = Main.route_parameters(controller, matched)
     # The body's params alone, for ParamsWrapper (`Params.wrap`).
     controller.request.request_parameters = request[:body_params]
@@ -382,7 +387,7 @@ module Main
     httponly_cookies = {}
     expires_cookies = {}
     jar.pending.each do |k, v|
-      out_cookies[k] = v
+      out_cookies[k] = jar.deleted?(k) ? nil : v
       secure_cookies[k] = true if jar.flag_secure?(k)
       httponly_cookies[k] = jar.flag_httponly?(k)
       ss = jar.flag_samesite(k).to_s
@@ -426,10 +431,13 @@ module Main
       extra_headers[controller.headers.key_at(hi)] = controller.headers.val_at(hi)
       hi += 1
     end
+    # Rails' `redirect_to` sets no type: a redirect keeps the one a
+    # filter assigned, and only an unset type is text/html, the
+    # controller's default. The spinel dispatcher does the same.
     if is_redirect
       [controller.status,
        %(<a href="#{ActionView::ViewHelpers.html_escape(controller.location.to_s)}">Redirecting</a>),
-       "text/html; charset=utf-8", controller.location, out_cookies, extra_headers, secure_cookies, samesite_cookies, httponly_cookies, expires_cookies]
+       controller.content_type, controller.location, out_cookies, extra_headers, secure_cookies, samesite_cookies, httponly_cookies, expires_cookies]
     else
       # The controller body IS the full page: the Ruby emit path's
       # `apply_layout_lowering` wraps each html action render in

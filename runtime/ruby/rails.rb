@@ -69,6 +69,12 @@ module Rails
     AppPath.new("public")
   end
 
+  # Empty, not ported: a gem's command (mission_control-jobs' `Authentication`) only needs its superclass to load.
+  module Command
+    class Base
+    end
+  end
+
   # Plain value object, no Pathname subclassing (the runtime stays
   # statically resolvable).
   # Not ActiveSupport's gem-path rewriting: a silenced frame never shows it, and only a `:noise` reading would.
@@ -164,6 +170,30 @@ module Rails
       path = File.expand_path(@base)
       AppPath.new(dir.nil? ? path : File.expand_path(path, dir))
     end
+
+    # Pathname#mkpath (`mkdir -p`): makes each missing directory, leaves an
+    # existing one, raises Errno::EEXIST through a file, answers the path.
+    def mkpath
+      parts = @base.split("/")
+      built = @base.start_with?("/") ? "/" : ""
+      i = 0
+      while i < parts.length
+        part = parts[i]
+        unless part.empty? || part == "."
+          built = built.empty? || built == "/" ? built + part : built + "/" + part
+          unless Dir.exist?(built)
+            begin
+              Dir.mkdir(built)
+            rescue SystemCallError
+              # Another process made it first: fine, as in FileUtils.mkdir_p; a file there still raises.
+              raise unless Dir.exist?(built)
+            end
+          end
+        end
+        i += 1
+      end
+      self
+    end
   end
 
   # One store per process. A fresh `Cache.new` per call would make every
@@ -200,6 +230,11 @@ module Rails
 
   def self.application
     Application.new
+  end
+
+  # Rails' `Rails.configuration`, the application's config.
+  def self.configuration
+    Rails.application.config
   end
 
   # `Rails.env.production?` etc. — a plain object answering the known
@@ -478,22 +513,23 @@ module Rails
   # corpus is `Rails.logger.error "..."` (campfire: 7 sites, all
   # rescue-path reports); the lazy block form has no caller and an
   # optional block is its own hazard on the strict targets.
+  # Not a required message: Ruby's Logger takes none (lobsters' seeds write a bare `Rails.logger.debug`).
   class Logger
-    def info(message)
+    def info(message = nil)
       Rails.log_line("[rails] INFO " + message.to_s)
     end
 
-    def error(message)
+    def error(message = nil)
       Rails.log_line("[rails] ERROR " + message.to_s)
     end
 
-    def warn(message)
+    def warn(message = nil)
       Rails.log_line("[rails] WARN " + message.to_s)
     end
 
-    def debug(message); end
+    def debug(message = nil); end
 
-    def fatal(message)
+    def fatal(message = nil)
       Rails.log_line("[rails] FATAL " + message.to_s)
     end
   end
@@ -517,6 +553,11 @@ module Rails
     # disagreement clears the session on every request.
     def session_cookie_key
       "_session"
+    end
+
+    # Rails' default with no `config.eager_load`; the app's environments override it on the reopen.
+    def eager_load
+      false
     end
 
     def propshaft_asset_path(source)
@@ -677,7 +718,7 @@ module Rails
     # unset, drops the meta tag — the same page Rails renders without
     # credentials configured.
     def credentials
-      {}
+      Credentials.new
     end
 
     # The Rack env defaults every request starts from
@@ -782,6 +823,30 @@ module Rails
       nil
     end
 
+    # `config.content_security_policy_nonce_generator`: none unless an initializer sets one, when ingest overrides
+    # these on the app's reopen with the lambda's body.
+    def content_security_policy_nonce_generator?
+      false
+    end
+
+    def content_security_policy_nonce_generated(request)
+      ""
+    end
+
+    # The request's nonce for the view helpers, which have no request of their own: nil outside one, or without a
+    # generator, as Rails' `request&.content_security_policy_nonce` is.
+    def content_security_policy_nonce_current
+      # Not the request first: a tree that serves no request (a helper unit) loads no `ActionController::Current`.
+      return nil unless content_security_policy_nonce_generator?
+      req = ActionController::Current.request
+      req.nil? ? nil : req.content_security_policy_nonce
+    end
+
+    # Rails' DEFAULT_NONCE_DIRECTIVES, where the app names none.
+    def content_security_policy_nonce_directives
+      ["script-src", "style-src"]
+    end
+
     # `Rails.application.importmap`. Paths are already `/assets/…`
     # from ingest; `to_json` ignores the resolver. The string is the
     # pretty script body the layout embeds, because a CSP hash of a
@@ -795,6 +860,85 @@ module Rails
     # the empty map an app with no pins would hash, and no page embeds it.
     def importmap_json
       "{\"imports\":{}}"
+    end
+  end
+
+  # `Rails.application.credentials` with nothing configured: Rails' `EncryptedConfiguration`, whose every key reads
+  # nil (`credentials.secret_key_base`, `credentials[:vapid]`, `credentials.dig(:vapid, :public_key)`), and whose
+  # `fetch` of a key it does not hold answers its block, else its default, else raises, as a Hash's does.
+  class Credentials
+    def secret_key_base
+      nil
+    end
+
+    def [](key)
+      nil
+    end
+
+    def dig(*keys)
+      nil
+    end
+
+    def fetch(key, *default, &block)
+      return block.call(key) unless block.nil?
+      raise KeyError, "key not found: #{key.inspect}" if default.empty?
+      default[0]
+    end
+
+    def key?(key)
+      false
+    end
+
+    def has_key?(key)
+      false
+    end
+
+    def include?(key)
+      false
+    end
+
+    def keys
+      []
+    end
+
+    def values
+      []
+    end
+
+    def to_h
+      {}
+    end
+
+    def config
+      {}
+    end
+
+    def merge(other)
+      other
+    end
+
+    def each
+      self
+    end
+
+    def empty?
+      true
+    end
+
+    def any?
+      false
+    end
+
+    def present?
+      false
+    end
+
+    def blank?
+      true
+    end
+
+    def nil?
+      false
     end
   end
 
@@ -818,14 +962,44 @@ module Rails
       ENV["RAILS_RELATIVE_URL_ROOT"]
     end
 
+    # `config.eager_load`, per environment from config/environments (`ingest::action_controller_caching_config`).
+    def eager_load
+      Rails.application.eager_load
+    end
+
     def action_controller
       @action_controller
+    end
+
+    def action_dispatch
+      ActionDispatchOptions.new
+    end
+
+    # `config.session_options`, what `config.session_store` was given: the cookie's name alone, as ingest lifts no
+    # other option (`path:`, `domain:`, `secure:` are not read, and a cookie a gem scopes by them takes none).
+    def session_options
+      { key: Rails.application.session_cookie_key }
     end
 
     # `Rails.application.config.filter_parameters` read at run time. The
     # list is the one ingest lifts from the app's `config.filter_parameters`.
     def filter_parameters
       Rails.application.config_filter_parameters
+    end
+  end
+
+  # The salts are Rails' defaults: the cookie jars derive with these, whatever an app assigns to them.
+  class ActionDispatchOptions
+    def cookies_rotations
+      ActiveSupport::Messages::RotationConfiguration.shared
+    end
+
+    def signed_cookie_salt
+      ActionController::MessageVerifier::SIGNED_COOKIE_SALT
+    end
+
+    def authenticated_encrypted_cookie_salt
+      ActionController::MessageEncryptor::SALT
     end
   end
 

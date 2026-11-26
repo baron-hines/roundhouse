@@ -258,6 +258,13 @@ pub fn emit_expr(e: &Expr) -> String {
             }
         }
     }
+    if let ExprNode::Send { recv: None, method, args, block: None, .. } = &*e.node
+        && args.is_empty()
+        && e.decisions & crate::expr::WRITTEN_EMPTY_PARENS != 0
+        && method.as_str().chars().next().is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+    {
+        return format!("{method}()");
+    }
     emit_node(&e.node)
 }
 
@@ -385,6 +392,15 @@ fn emit_node(n: &ExprNode) -> String {
             let brace = block.as_ref().is_some_and(|b| {
                 matches!(&*b.node, ExprNode::Lambda { block_style: crate::expr::BlockStyle::Brace, .. })
             });
+            // `self.[](key, &blk)` (Hashie's `method_missing`): the bracket form takes no block, so a call with one is
+            // written as the method call it is.
+            if let (Some(r), Some(b)) = (recv.as_ref(), block.as_ref())
+                && method.as_str() == "[]"
+            {
+                let args_s: Vec<String> = args.iter().map(emit_arg).collect();
+                let base = format!("{}.[]({})", emit_postfix_recv(r), args_s.join(", "));
+                return emit_do_block(&base, b);
+            }
             let base = emit_send_base(recv.as_ref(), method, args, *parenthesized || (brace && !args.is_empty()));
             match block {
                 None => base,
@@ -1560,7 +1576,9 @@ pub(super) fn emit_send_base(
             // operand needs parens too.
             // A trailing-modifier operand (`(x rescue nil) == true`) would
             // swallow the operator.
+            // Nor an open-ended one (`raise E.new(m) =~ /x/` raises the comparison): it takes the operator in.
             let lhs = if renders_as_trailing_modifier(r)
+                || renders_open_ended(r)
                 || binop_of(r).is_some_and(|o| {
                     binop_prec(o) < prec || (prec == 30 && binop_prec(o) == 30)
                 })
@@ -1569,7 +1587,7 @@ pub(super) fn emit_send_base(
             } else {
                 emit_expr(r)
             };
-            let rhs = if binop_of(&args[0]).is_some_and(|o| binop_prec(o) <= prec) {
+            let rhs = if binop_of(&args[0]).is_some_and(|o| binop_prec(o) <= prec) || renders_open_ended(&args[0]) {
                 format!("({})", args_s[0])
             } else {
                 args_s[0].clone()
@@ -1669,6 +1687,11 @@ fn binop_of(e: &Expr) -> Option<&str> {
         // re-parses as `hrc = (HatRequest.count > 0)`, the local becoming
         // the comparison.
         ExprNode::Assign { .. } | ExprNode::OpAssign { .. } | ExprNode::MultiAssign { .. } => Some("="),
+        // A statement sequence at a value site (`lower::update_kwargs`'
+        // `rec.x = v; rec.save` for `rec.update(x: v) == true`): bare, its
+        // newline ends the operator's line, and the operator applies to
+        // the last statement only.
+        ExprNode::Seq { exprs } if exprs.len() > 1 => Some("="),
         // A range binds looser than every infix operator and `||`/`&&`:
         // `out << (start...limit)` written bare is `(out << start)...limit`,
         // which pushes the Integer (and `ruby -w` flags the range as
@@ -1790,7 +1813,7 @@ pub(super) fn emit_do_block(base: &str, block: &Expr) -> String {
         // lobsters' `Rails.cache.fetch(key, &block)` forward returned
         // the Proc, poisoning `@comments` to Proc under spinel and
         // silently mis-caching on CRuby. Re-attach as a `&` argument.
-        let fwd = emit_expr(block);
+        let fwd = emit_arg(block);
         return if let Some(stripped) = base.strip_suffix(')') {
             if stripped.ends_with('(') {
                 format!("{stripped}&{fwd})")
@@ -2535,6 +2558,13 @@ mod tests {
         // as the same command.
         let raise = Expr::new(Span::default(), ExprNode::Raise { value: lit_str("missing") });
         assert_eq!(emit_expr(&or_sym(send(None, "found", vec![]), raise)), "found || (raise \"missing\")");
+    }
+
+    #[test]
+    fn synthesized_raise_operand_of_a_binary_operator_is_parenthesized() {
+        // An absent constant read as `Raise` in `RUBY_ENGINE =~ /rbx/` (method_source): bare, `raise` takes `=~` in.
+        let raise = Expr::new(Span::default(), ExprNode::Raise { value: lit_str("missing") });
+        assert_eq!(emit_expr(&send(Some(raise), "=~", vec![lit_str("rbx")])), "(raise \"missing\") =~ \"rbx\"");
     }
 
     #[test]

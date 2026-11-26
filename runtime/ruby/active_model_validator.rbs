@@ -11,4 +11,10 @@ module ActiveModel
     def attributes: () -> Array[Symbol]
     def validate_each: (untyped record, Symbol attribute, untyped value) -> nil
   end
+
+  class ValidationError < StandardError
+    @model: Object
+    def initialize: (String message, Object model) -> void
+    def model: () -> Object
+  end
 end

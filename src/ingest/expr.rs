@@ -1209,17 +1209,19 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
                 return Ok(source_file_path_lit(span, dir));
             }
             if let Some(body) = writing_connection_block(&c) {
-                return match body {
-                    WritingBlock::Body(Some(body)) => ingest_expr(&body, file),
-                    WritingBlock::Body(None) => Ok(Expr::new(span, ExprNode::Lit { value: Literal::Nil })),
-                    WritingBlock::Forwarded(name) => Ok(Expr::new(span, ExprNode::Send {
+                let mut body = match body {
+                    WritingBlock::Body(Some(body)) => ingest_expr(&body, file)?,
+                    WritingBlock::Body(None) => Expr::new(span, ExprNode::Lit { value: Literal::Nil }),
+                    WritingBlock::Forwarded(name) => Expr::new(span, ExprNode::Send {
                         recv: Some(Expr::new(span, ExprNode::Var { id: crate::ident::VarId(0), name })),
                         method: Symbol::from("call"),
                         args: Vec::new(),
                         block: None,
                         parenthesized: false,
-                    })),
+                    }),
                 };
+                body.decisions |= crate::expr::ERASED_WRITING_SCOPE;
+                return Ok(body);
             }
             let args: Vec<Expr> = if let Some(a) = c.arguments() {
                 ingest_forwardable_arguments(&a, file)?
@@ -1829,7 +1831,12 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         }
         n if n.as_lambda_node().is_some() => {
             let l = n.as_lambda_node().unwrap();
-            refuse_block_capture(l.parameters(), file)?;
+            // A stabby lambda's `&block` is its own parameter (view_component's slot lambdas take one), kept as a
+            // `define_method` block's is; an anonymous `&` has no name to keep.
+            let block_param = named_block_param(l.parameters());
+            if block_param.is_none() {
+                refuse_block_capture(l.parameters(), file)?;
+            }
             let extra_params = block_extra_params(l.parameters(), file)?;
             let params = block_param_names(l.parameters());
             let mut rest_param = lambda_rest_param(l.parameters());
@@ -1838,7 +1845,7 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             // opening_loc is `{`); `->(x) do body end` exists but isn't
             // idiomatic and doesn't appear in any fixture yet.
             let block_style = block_style_from_opening(l.opening_loc().as_slice());
-            ExprNode::Lambda { extra_params, rest_param, params, block_param: None, body, block_style }
+            ExprNode::Lambda { extra_params, rest_param, params, block_param, body, block_style }
         }
         n if n.as_yield_node().is_some() => {
             let y = n.as_yield_node().unwrap();
@@ -2449,14 +2456,14 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             }
             let else_branch = match b.else_clause() {
                 Some(e) => match e.statements() {
-                    Some(s) => Some(ingest_expr(&s.as_node(), file)?),
+                    Some(s) => Some(Box::new(ingest_expr(&s.as_node(), file)?)),
                     None => None,
                 },
                 None => None,
             };
             let ensure = match b.ensure_clause() {
                 Some(e) => match e.statements() {
-                    Some(s) => Some(ingest_expr(&s.as_node(), file)?),
+                    Some(s) => Some(Box::new(ingest_expr(&s.as_node(), file)?)),
                     None => None,
                 },
                 None => None,
@@ -3135,6 +3142,14 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
                                 && c.arguments().is_some_and(|a| a.arguments().iter().all(|x| x.as_symbol_node().is_some()))
                         })
                     });
+                // `(class << hash; self; end)`: the body answers the singleton class and defines nothing, which is
+                // `hash.singleton_class` (Hashie's `IndifferentAccess.inject!`).
+                if let [only] = stmts.as_slice()
+                    && only.as_self_node().is_some()
+                {
+                    let owner = ingest_expr(&sc.expression(), file)?;
+                    return Ok(Expr::new(span, ExprNode::Send { recv: Some(owner), method: Symbol::from("singleton_class"), args: Vec::new(), block: None, parenthesized: false }));
+                }
                 if attrs {
                     let owner = ingest_expr(&sc.expression(), file)?;
                     let singleton = Expr::new(span, ExprNode::Send { recv: Some(owner), method: Symbol::from("singleton_class"), args: Vec::new(), block: None, parenthesized: false });
@@ -3163,7 +3178,17 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             });
         }
     };
-    Ok(Expr::new(span, expr_node))
+    let mut out = Expr::new(span, expr_node);
+    if let Some(c) = node.as_call_node()
+        && c.receiver().is_none()
+        && c.arguments().is_none()
+        && c.block().is_none()
+        && c.opening_loc().is_some()
+        && matches!(&*out.node, ExprNode::Send { recv: None, args, .. } if args.is_empty())
+    {
+        out.decisions |= crate::expr::WRITTEN_EMPTY_PARENS;
+    }
+    Ok(out)
 }
 
 /// Ingest a `case/in` arm's pattern, unwrapping a guard first when the
@@ -4373,8 +4398,12 @@ fn destructure_block_params(params_node: Option<Node<'_>>, body: Expr, file: &st
     // otherwise become the value: a rest binding answers the tail, and
     // `map { |(month, *row)| }` would return those tails.
     let body_empty = matches!(&*body.node, ExprNode::Seq { exprs } if exprs.is_empty());
+    // A writing block read as its body stays one statement, with its mark
+    // (`ERASED_WRITING_SCOPE`): spliced in, a routed app could not put the
+    // call back around it.
+    let erased = body.decisions & crate::expr::ERASED_WRITING_SCOPE != 0;
     match *body.node {
-        ExprNode::Seq { exprs } => prelude.extend(exprs),
+        ExprNode::Seq { exprs } if !erased => prelude.extend(exprs),
         other => prelude.push(Expr { node: Box::new(other), ..body }),
     }
     if body_empty {
@@ -4472,9 +4501,15 @@ fn desugar_post_params(rest_param: &mut Option<Symbol>, posts: Vec<Symbol>, body
             )
         })
         .collect();
+    // As in `destructure_block_params`: a marked body stays one statement.
+    let erased = body.decisions & crate::expr::ERASED_WRITING_SCOPE != 0;
     match *body.node {
-        ExprNode::Seq { exprs: inner } => exprs.extend(inner),
-        other => exprs.push(Expr::new(body.span, other)),
+        ExprNode::Seq { exprs: inner } if !erased => exprs.extend(inner),
+        other => {
+            let mut only = Expr::new(body.span, other);
+            only.decisions = body.decisions;
+            exprs.push(only);
+        }
     }
     Expr::new(Span::synthetic(), ExprNode::Seq { exprs })
 }
@@ -4505,8 +4540,10 @@ fn scope_block_locals(params_node: Option<Node<'_>>, mut body: Expr) -> Expr {
                 },
             );
             let mut exprs = vec![init];
+            // As in `destructure_block_params`: a marked body stays one statement.
+            let erased = body.decisions & crate::expr::ERASED_WRITING_SCOPE != 0;
             match *body.node {
-                ExprNode::Seq { exprs: inner } => exprs.extend(inner),
+                ExprNode::Seq { exprs: inner } if !erased => exprs.extend(inner),
                 other => exprs.push(Expr { node: Box::new(other), ..body }),
             }
             body = Expr::new(Span::synthetic(), ExprNode::Seq { exprs });

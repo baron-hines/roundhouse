@@ -26,7 +26,7 @@ pub(crate) mod primary_key_guard;
 pub(crate) mod accessor_surface;
 pub(crate) mod schema;
 pub use schema::col_storage_name;
-pub use schema::shakeable_synthesized_names;
+pub use schema::{own_column_predicate, shakeable_synthesized_names};
 pub(crate) mod validations;
 mod associations;
 pub(crate) use associations::polymorphic_type_switch;
@@ -42,10 +42,10 @@ use crate::expr::{Expr, ExprNode, Literal};
 use crate::ident::{ClassId, Symbol, VarId};
 use crate::schema::{Column, ColumnType, Schema, Table};
 use crate::span::Span;
-use crate::ty::{Row, Ty};
+use crate::ty::{FnTy, Row, Ty};
 
 use self::associations::{push_association_methods, push_dependent_destroy, ThroughJoins};
-pub(crate) use self::associations::{ThroughWriterJoin, through_writer_join};
+pub(crate) use self::associations::{ThroughWriterJoin, fk_sentinel, through_writer_join};
 pub(crate) use self::associations::model_defines_instance_method;
 pub(crate) use self::markers::attribute_api_decls;
 pub(crate) use self::markers::block_callback_shape;
@@ -422,7 +422,12 @@ pub(crate) fn lower_models_inner_with_ruby_values(
     runtime_relation: RuntimeRelation,
     partial_stems: &crate::lower::view_to_library::PartialStems,
 ) -> (Vec<LibraryClass>, HashMap<ClassId, crate::analyze::ClassInfo>) {
+    // Every target's lowering holds a NOT NULL integer that `presence:`
+    // checks unset until assigned, as Rails reads it nil until then.
+    let unset_schema = crate::lower::validations::hold_unset_presence_columns(models, schema);
+    let schema = &unset_schema;
     let mut all_methods: Vec<(Vec<MethodDef>, ClassId, Option<&Table>, &Model)> = Vec::new();
+    let string_enums = if ruby_read_values { crate::lower::arel::StringEnums::of_models(models, schema) } else { Default::default() };
     let mut classes: HashMap<ClassId, crate::analyze::ClassInfo> = HashMap::default();
     let _body_names = schema::share_model_body_names(models, &Default::default());
     for model in models {
@@ -570,6 +575,9 @@ pub(crate) fn lower_models_inner_with_ruby_values(
                 crate::ModelBodyItem::Method { method, .. } if method.receiver == crate::dialect::MethodReceiver::Class => {
                     Some(method.name.clone())
                 }
+                // A scope too: a has_many whose scope names one
+                // (`-> { long }`) chains it on the key query.
+                crate::ModelBodyItem::Scope { scope, .. } => Some(scope.name.clone()),
                 _ => None,
             })
             .collect()
@@ -618,11 +626,14 @@ pub(crate) fn lower_models_inner_with_ruby_values(
                 && (unfolded.contains(&key) || relation_returns.contains_key(&key));
             if !unfold {
                 crate::lower::arel::rewrite_arel_in_expr_with_ruby_values(
-                    &mut method.body, schema, &classes, &[], ruby_read_values,
+                    &mut method.body, schema, &classes, &[], ruby_read_values.then_some(&string_enums),
                     &relation_class_methods,
                     crate::lower::arel::SqliteVisitor { param_binds },
                 );
             }
+            // After the Arel pass, which inlines a finder over `@<col>`
+            // (an association reader) and not over a reader call.
+            read_held_columns_through_readers(std::slice::from_mut(method), table);
             type_method_body(method, &classes, table, Some(model));
         }
         out.push(model_class(model, methods, table));
@@ -939,15 +950,76 @@ pub(crate) fn collect_model_constants(model: &Model) -> Vec<(Symbol, Expr)> {
 /// stay in sync with the claiming passes — each entry names the pass
 /// that consumes the shape.
 fn defines_methods_in_block(expr: &crate::expr::Expr) -> bool {
-    fn walk(expr: &crate::expr::Expr) -> bool {
-        if matches!(&*expr.node, ExprNode::Send { recv: None, method, .. } if method.as_str() == "define_method") {
-            return true;
+    unrolled_block_call(expr).is_some()
+}
+
+/// The call on the class a model-body block runs that is not carried out
+/// of it: `define_method`, `define_singleton_method` or `scope` anywhere
+/// in the block, or any class macro among a loop's own statements
+/// (`%i[a b].each { |f| validates f, presence: true }`), which no
+/// model-body recognizer reads out of a loop.
+fn unrolled_block_call(expr: &crate::expr::Expr) -> Option<String> {
+    /// The loops a model body runs class calls through.
+    const LOOPS: &[&str] = &[
+        "each", "each_with_index", "each_with_object", "each_pair", "each_key", "each_value", "each_slice", "each_cons",
+        "reverse_each", "map", "collect", "times",
+    ];
+    fn on_class(recv: &Option<crate::expr::Expr>) -> bool {
+        recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+    }
+    // `define_singleton_method` and `singleton_class` are Object's too: in
+    // a block callback (`after_initialize do … end`) they are the record's,
+    // which the callback lowering carries. Only a loop's are the class's.
+    fn walk(expr: &crate::expr::Expr, in_loop: bool) -> Option<String> {
+        if let ExprNode::Send { recv, method, .. } = &*expr.node {
+            // On the class: receiverless or `self.scope`.
+            if on_class(recv) && matches!(method.as_str(), "define_method" | "scope") {
+                return Some(method.to_string());
+            }
+            if in_loop && on_class(recv) && method.as_str() == "define_singleton_method" {
+                return Some(method.to_string());
+            }
+            if in_loop
+                && method.as_str() == "define_method"
+                && let Some(r) = recv
+                && let ExprNode::Send { recv: sc_recv, method: sc, args, block: None, .. } = &*r.node
+                && sc.as_str() == "singleton_class"
+                && args.is_empty()
+                && on_class(sc_recv)
+            {
+                return Some("singleton_class.define_method".into());
+            }
         }
-        let mut found = false;
-        expr.node.for_each_child(&mut |child| found |= walk(child));
+        let mut found = None;
+        expr.node.for_each_child(&mut |child| {
+            if found.is_none() {
+                found = walk(child, in_loop);
+            }
+        });
         found
     }
-    matches!(&*expr.node, ExprNode::Send { block: Some(block), .. } if walk(block))
+    fn loop_call(body: &crate::expr::Expr) -> Option<String> {
+        let statements = match &*body.node {
+            ExprNode::Seq { exprs } => exprs.as_slice(),
+            _ => std::slice::from_ref(body),
+        };
+        statements.iter().find_map(|s| match &*s.node {
+            ExprNode::Send { recv, method, .. } if on_class(recv) => Some(method.to_string()),
+            _ => None,
+        })
+    }
+    match &*expr.node {
+        ExprNode::Send { method, block: Some(block), .. } => {
+            let in_loop = LOOPS.contains(&method.as_str());
+            walk(block, in_loop).or_else(|| {
+                let ExprNode::Lambda { body, .. } = &*block.node else { return None };
+                in_loop.then(|| loop_call(body)).flatten()
+            })
+        }
+        // `while`/`until` in the body runs its statements as a block does.
+        ExprNode::While { body, .. } => walk(body, true).or_else(|| loop_call(body)),
+        _ => None,
+    }
 }
 
 /// Interim subset of #1302's unclaimed-call errors: dropping encryption
@@ -980,6 +1052,40 @@ pub(crate) fn encrypts_diagnostics(app: &crate::App) -> Vec<crate::diagnostic::D
     out
 }
 
+/// A model-body block that runs `define_method`, `define_singleton_method`
+/// or `scope`, or a loop that runs any class macro (`validates`,
+/// `attribute`, `before_save`), that `ingest::define_method_loop` could
+/// not unroll (`kinds.each do |kind| define_method(…) … end` over a value
+/// known only when the class loads, or a receiverless block): no lowering
+/// carries what it declares, so the emitted model would lack it. An error
+/// for `check`, as the call sites would raise NoMethodError and the
+/// declarations would not run.
+pub(crate) fn unrolled_loop_diagnostics(app: &crate::App) -> Vec<crate::diagnostic::Diagnostic> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::default();
+    for model in &app.models {
+        for item in &model.body {
+            let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { continue };
+            // A receiverless block too (`each do |size| scope size, … end`):
+            // nothing in a model body claims one that defines methods.
+            let Some(call) = unrolled_block_call(expr) else { continue };
+            if expr.decisions & (crate::expr::REPLAYED_CLASS_BODY | crate::expr::INHERITED_VISIBILITY) != 0
+                || expr.diagnostic().is_some() || !seen.insert(expr.span)
+            {
+                continue;
+            }
+            out.push(crate::diagnostic::Diagnostic::unsupported(
+                expr.span, None, "runtime-defined method",
+                format!(
+                    "a block in the body of `{}` runs `{call}` in a shape the compile could not unroll; what it declares would be missing from the output",
+                    model.name.0.as_str()
+                ),
+            ));
+        }
+    }
+    out
+}
+
 fn report_unclaimed_unknowns(model: &Model, schema: &Schema) {
     use crate::diagnostic::{Diagnostic, Severity};
     use crate::expr::LValue;
@@ -988,6 +1094,11 @@ fn report_unclaimed_unknowns(model: &Model, schema: &Schema) {
         let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { continue };
         // Replayed where the source has it (`ingest::app_extension_calls`).
         if expr.decisions & crate::expr::REPLAYED_CLASS_BODY != 0 {
+            continue;
+        }
+        // `prepend Concern`: the concern splice carried the module's
+        // `prepended do` items here and the Ruby emit writes the line.
+        if expr.decisions & crate::expr::CONCERN_PREPEND != 0 {
             continue;
         }
         // `connects_to` / `establish_connection`: the model's database,
@@ -1007,22 +1118,11 @@ fn report_unclaimed_unknowns(model: &Model, schema: &Schema) {
             continue;
         };
         let name = method.as_str();
+        // `KINDS.each { |k| define_method(…) }` that `define_method_loop` could not unroll: `check`'s error (`unrolled_loop_diagnostics`).
+        if defines_methods_in_block(expr) {
+            continue;
+        }
         if let Some(recv) = recv {
-            // `KINDS.each { |k| define_method(…) }` that `define_method_loop` could not unroll: its methods are dropped with it.
-            if defines_methods_in_block(expr) {
-                let mut d = Diagnostic::unsupported(
-                    expr.span,
-                    None,
-                    "runtime-defined method",
-                    format!(
-                        "a `define_method` loop in the body of `{}` the compile could not unroll; the methods it defines are not emitted",
-                        model.name.0.as_str()
-                    ),
-                );
-                d.severity = Severity::Warning;
-                crate::emit::diagnostics::push(d);
-                continue;
-            }
             // Class-body writes are sends too, and dropping an unclaimed
             // setting must report just like dropping a receiver-less DSL.
             if !matches!(&*recv.node, ExprNode::SelfRef)
@@ -1238,6 +1338,11 @@ fn report_unclaimed_unknowns(model: &Model, schema: &Schema) {
         }
         // `primary_abstract_class` — claimed by markers.rs.
         if name == "primary_abstract_class" {
+            continue;
+        }
+        // `self.abstract_class = true|false` — the older spelling of the
+        // same marker, read in order by `markers::is_abstract_class`.
+        if name == "abstract_class=" && self::markers::is_literal_abstract_class_write(expr) {
             continue;
         }
         // `include Notifications` — a model concern, spliced by the
@@ -1611,7 +1716,7 @@ fn build_methods_with_finder_inputs(
         let writable_fields =
             permitted_fields.map(|fields| writable_permit_fields(model, Some(table), fields));
         let permitted_fields = writable_fields.as_deref();
-        push_schema_methods(&mut methods, model, models, table, &through_joins, runtime_relation);
+        push_schema_methods(&mut methods, model, models, table, &through_joins, runtime_relation, schema.expression_dialect);
         // Per-model Level-3 adapter primitives (`_adapter_find_by_id`, etc.)
         // — typed methods that go directly from SQL composition to typed
         // model instances over the `Sqlite` primitive surface. See
@@ -1727,8 +1832,8 @@ fn build_methods_with_finder_inputs(
             })
         })
         .unwrap_or_else(|| Symbol::from("id"));
-    push_validate_method(&mut methods, model, errors_readers, runtime_relation, &primary_key);
-    push_association_methods(&mut methods, model, models, &through_joins, runtime_relation);
+    push_validate_method(&mut methods, model, errors_readers, runtime_relation, &primary_key, schema.tables.get(&model.table.0), schema);
+    push_association_methods(&mut methods, model, models, &through_joins, runtime_relation, schema.tables.get(&model.table.0));
     push_dependent_destroy(&mut methods, model, &through_joins);
     push_unknown_marker_methods(&mut methods, model);
     push_attr_accessor_methods(&mut methods, model);
@@ -1860,10 +1965,16 @@ fn build_methods_with_finder_inputs(
 ///     an earlier real method, but only when that method was already
 ///     selected from the model body; generated framework methods are not
 ///     reordered by source spans.
+///   * A method a class-body macro synthesized in place in the body
+///     (`delegated_type`'s `build_<role>`, an enum's predicates) yields
+///     to a real `def` written after it, as Ruby's later definition
+///     replaces it. A `def` written before the macro still wins.
 fn push_user_methods(methods: &mut Vec<MethodDef>, model: &Model, columns: &HashSet<crate::ident::Symbol>) {
     use crate::dialect::{AccessorKind, ModelBodyItem};
     use crate::expr::{ExprNode, LValue};
     let mut selected_source_methods = HashSet::default();
+    // The body's own synthesized methods (a class-body macro's, in place).
+    let mut macro_methods: HashSet<(crate::ident::Symbol, crate::dialect::MethodReceiver)> = HashSet::default();
     for item in &model.body {
         let ModelBodyItem::Method { method, .. } = item else { continue };
         if let Some(idx) = methods
@@ -1932,12 +2043,29 @@ fn push_user_methods(methods: &mut Vec<MethodDef>, model: &Model, columns: &Hash
                 selected_source_methods.insert(method.name_span);
                 continue;
             }
-            if incoming_is_real && (existing_is_attr_half || incoming_is_later_delegate) {
+            // A class-body macro's generated method (`delegated_type`'s
+            // `build_<role>`, synthesized in place) yields to a `def` the
+            // body writes after it, as a later definition replaces it in Ruby.
+            let incoming_replaces_macro_method = !method.name_span.is_synthetic()
+                && macro_methods.contains(&(existing.name.clone(), existing.receiver));
+            // A second `def` of a name the body already defined: Ruby's later definition replaces the earlier one.
+            // A `(...)` def on either side stays with the forwarding survey, which refuses the collision.
+            let forwards = |m: &MethodDef| m.params.iter().any(|p| p.forwarding);
+            let incoming_is_later_def = !method.name_span.is_synthetic()
+                && selected_source_methods.contains(&existing.name_span)
+                && existing.name_span.file == method.name_span.file
+                && method.name_span.start > existing.name_span.start
+                && !forwards(existing)
+                && !forwards(method);
+            if incoming_is_real && (existing_is_attr_half || incoming_is_later_delegate || incoming_replaces_macro_method || incoming_is_later_def) {
                 selected_source_methods.remove(&existing.name_span);
                 methods[idx] = method.clone();
                 selected_source_methods.insert(method.name_span);
             }
             continue;
+        }
+        if method.name_span.is_synthetic() && matches!(method.kind, AccessorKind::Method) {
+            macro_methods.insert((method.name.clone(), method.receiver));
         }
         methods.push(method.clone());
         selected_source_methods.insert(method.name_span);
@@ -2594,12 +2722,12 @@ pub(crate) fn push_scope_variants(
                     receiver: MethodReceiver::Class,
                     params,
                     body,
-                    signature: Some(Ty::Fn {
+                    signature: Some(Ty::Fn(Box::new(FnTy {
                         params: sig_params.into(),
                         block: None,
                         ret: std::sync::Arc::new(Ty::Untyped),
                         effects: crate::effect::EffectSet::default(),
-                    }),
+                    }))),
                     effects: crate::effect::EffectSet::default(),
                     enclosing_class: Some(model_name.0.clone()),
                     kind: AccessorKind::Method,
@@ -2794,7 +2922,7 @@ fn build_class_info_with_finder_inputs(
         };
         method_map
             .entry(m.name.clone())
-            .or_insert_with(|| Ty::Fn {
+            .or_insert_with(|| Ty::Fn(Box::new(FnTy {
                 // Retain the calling convention too: a positional Hash
                 // default must still normalize keyword syntax into a Hash.
                 // Unsigned methods retain default types, not call-site seeds.
@@ -2807,7 +2935,7 @@ fn build_class_info_with_finder_inputs(
                     .then(|| std::sync::Arc::new(Ty::Untyped)),
                 ret: std::sync::Arc::new(inferred.clone()),
                 effects: m.effects.clone(),
-            });
+            })));
         kind_map.entry(m.name.clone()).or_insert(m.kind);
     }
 
@@ -3215,7 +3343,7 @@ fn broadcasts_class_info() -> crate::analyze::ClassInfo {
     // Hash, Crystal NamedTuple → named params, TS object literal).
     use crate::dialect::AccessorKind;
     let opts_ty = Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Untyped) };
-    let sig = Ty::Fn {
+    let sig = Ty::Fn(Box::new(FnTy {
         params: vec![crate::ty::Param {
             name: Symbol::from("opts"),
             ty: opts_ty.into(),
@@ -3224,7 +3352,7 @@ fn broadcasts_class_info() -> crate::analyze::ClassInfo {
         block: None,
         ret: std::sync::Arc::new(Ty::Nil),
         effects: crate::effect::EffectSet::pure(),
-    };
+    }));
     for name in ["prepend", "replace", "remove", "append"] {
         info.class_methods.insert(Symbol::from(name), sig.clone());
         info.class_method_kinds.insert(Symbol::from(name), AccessorKind::Method);
@@ -3267,12 +3395,15 @@ fn type_method_body(
 ) {
     let typer = crate::analyze::BodyTyper::new(classes);
     let mut ctx = crate::analyze::Ctx::default();
-    if let Some(Ty::Fn { params, .. }) = &method.signature {
-        for (param, sig) in method.params.iter().zip(params.iter()) {
+    if let Some(Ty::Fn(fn_ty)) = &method.signature {
+        for (param, sig) in method.params.iter().zip(fn_ty.params.iter()) {
             ctx.local_bindings.insert(param.name.clone(), (*sig.ty).clone());
         }
     }
-    if let Some(enclosing) = &method.enclosing_class {
+    // Not the module a method was written in when it runs in the model: an included or extended module's method
+    // (Devise's `serialize_from_session`) has the model as `self`, and the module answers none of the model's methods.
+    let enclosing = method.enclosing_class.as_ref().filter(|e| model.is_none_or(|m| m.name.0 == **e));
+    if let Some(enclosing) = enclosing {
         ctx.self_ty = Some(Ty::Class {
             id: ClassId(enclosing.clone()),
             args: vec![].into(),
@@ -3401,12 +3532,12 @@ fn backfill_scalar_signature(method: &mut MethodDef, body_ty: Ty) {
             kind: p.ty_kind(),
         })
         .collect();
-    method.signature = Some(Ty::Fn {
+    method.signature = Some(Ty::Fn(Box::new(FnTy {
         params,
         block: None,
         ret: std::sync::Arc::new(body_ty),
         effects: crate::effect::EffectSet::default(),
-    });
+    })));
 }
 
 /// Does `e` contain a `return` anywhere, nested blocks included?
@@ -3551,7 +3682,7 @@ pub fn ty_of_column_stored(col: &Column) -> Ty {
 /// Build a `Ty::Fn` signature from positional (name, type) pairs and a return type.
 /// Effects default to pure — callers refine if needed (lifecycle hooks etc.).
 pub(crate) fn fn_sig(params: Vec<(Symbol, Ty)>, ret: Ty) -> Ty {
-    Ty::Fn {
+    Ty::Fn(Box::new(FnTy {
         params: params
             .into_iter()
             .map(|(name, ty)| crate::ty::Param {
@@ -3563,7 +3694,7 @@ pub(crate) fn fn_sig(params: Vec<(Symbol, Ty)>, ret: Ty) -> Ty {
         block: None,
         ret: std::sync::Arc::new(ret),
         effects: crate::effect::EffectSet::pure(),
-    }
+    }))
 }
 
 pub(super) fn var_ref(name: Symbol) -> Expr {
@@ -3588,15 +3719,61 @@ pub(super) fn is_id_column(name: &Symbol) -> bool {
     s == "id" || s.ends_with("_id")
 }
 
+/// A column held unset for its presence check
+/// (`validations::hold_unset_presence_columns`) has no `@<col>` slot:
+/// a body that reads it (a `belongs_to`'s reader and autosave, a model
+/// method) reads its reader, which answers 0 until it is assigned, as
+/// the slot did before; one that assigns it calls its writer, or unsets
+/// `@<col>_raw` for a nil.
+fn read_held_columns_through_readers(methods: &mut [MethodDef], table: Option<&Table>) {
+    use crate::expr::{Expr, ExprNode, LValue};
+    fn rewrite(expr: &mut Expr, col: &Symbol, storage: &Symbol) {
+        expr.node.for_each_child_mut(&mut |c| rewrite(c, col, storage));
+        match &mut *expr.node {
+            ExprNode::Ivar { name } if name == col => {
+                *expr.node = ExprNode::Send { recv: None, method: col.clone(), args: vec![], block: None, parenthesized: false };
+            }
+            // `@<col> = nil` unsets the slot; any other value goes
+            // through the writer, which fills it (so a strict target's
+            // slot stays nilable however the body's value is typed).
+            ExprNode::Assign { target: LValue::Ivar { name }, value } if name == col => {
+                if matches!(&*value.node, ExprNode::Lit { value: crate::expr::Literal::Nil }) {
+                    *name = storage.clone();
+                } else {
+                    let value = value.clone();
+                    *expr.node = ExprNode::Send {
+                        recv: Some(Expr::new(expr.span, ExprNode::SelfRef)),
+                        method: Symbol::from(format!("{}=", col.as_str())),
+                        args: vec![value],
+                        block: None,
+                        parenthesized: false,
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(table) = table else { return };
+    for col in table.columns.iter().filter(|c| c.unset_until_assigned) {
+        let storage = schema::col_storage_name(col);
+        // Instance methods only: a class method's `@<col>` is the class's own state.
+        for method in methods.iter_mut().filter(|m| m.receiver == MethodReceiver::Instance) {
+            rewrite(&mut method.body, &col.name, &storage);
+        }
+    }
+}
+
 /// The schema columns a class stores that the DB declares nullable —
 /// the `LibraryClass::nullable_columns` payload. Same rule as
-/// `ty_of_column_slot`: nullable, primary key excluded.
+/// `ty_of_column_slot`: nullable, primary key excluded. A column held
+/// unset for its presence check is named by its `<col>_raw` slot, the
+/// nilable field; its reader answers the column's own type.
 pub(crate) fn nullable_column_names(table: Option<&Table>) -> Vec<Symbol> {
     let Some(t) = table else { return Vec::new() };
     t.columns
         .iter()
         .filter(|c| c.nullable && !c.primary_key)
-        .map(|c| c.name.clone())
+        .map(|c| if c.unset_until_assigned { schema::col_storage_name(c) } else { c.name.clone() })
         .collect()
 }
 
@@ -3604,6 +3781,58 @@ pub(crate) fn nullable_column_names(table: Option<&Table>) -> Vec<Symbol> {
 mod tests {
     use super::*;
     use std::{collections::HashMap, path::PathBuf};
+
+    /// The held column's `@<col>` reads become reader calls in instance
+    /// methods only; a class method's `@<col>` is the class's own state.
+    #[test]
+    fn held_column_reads_rewrite_in_instance_methods_only() {
+        let method = |receiver| MethodDef {
+            visibility: crate::dialect::MethodVisibility::Public,
+            unsupported_formals: None,
+            has_anonymous_block: false,
+            name_span: Span::synthetic(),
+            name: Symbol::from("cached"),
+            receiver,
+            params: Vec::new(),
+            body: Expr::new(Span::synthetic(), ExprNode::Ivar { name: Symbol::from("quota") }),
+            signature: None,
+            effects: crate::effect::EffectSet::default(),
+            enclosing_class: None,
+            kind: AccessorKind::Method,
+            is_async: false,
+            mutates_self: false,
+            block_param: None,
+        };
+        let table = crate::schema::Table {
+            name: Symbol::from("plans"),
+            columns: vec![crate::schema::Column {
+                name: Symbol::from("quota"),
+                col_type: crate::schema::ColumnType::Integer,
+                nullable: true,
+                default: None,
+                default_expression: None,
+                legacy_default_persistence: false,
+                primary_key: false,
+                generated: None,
+                generated_text_compatible: None,
+                generated_int4_compatible: None,
+                array: false,
+                array_stored: false,
+                unset_until_assigned: true,
+                collated: false,
+            }],
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+            known_keyless: false,
+            primary_key_columns: Vec::new(),
+            virtual_module: None,
+        };
+        let mut methods = vec![method(MethodReceiver::Instance), method(MethodReceiver::Class)];
+        read_held_columns_through_readers(&mut methods, Some(&table));
+        assert!(matches!(&*methods[0].body.node, ExprNode::Send { recv: None, method, .. } if method.as_str() == "quota"), "{:?}", methods[0].body);
+        assert!(matches!(&*methods[1].body.node, ExprNode::Ivar { name } if name.as_str() == "quota"), "{:?}", methods[1].body);
+    }
 
     /// Framework normalization must not replace a same-named application class.
     #[test]
@@ -3751,7 +3980,7 @@ mod tests {
             evens.body.ty = Some(ty);
             let got = article_info(&app, &methods).class_methods.get(&Symbol::from("evens")).cloned();
             match got {
-                Some(Ty::Fn { ret, .. }) if kept => assert_eq!(*ret, ints),
+                Some(Ty::Fn(fn_ty)) if kept => assert_eq!(*fn_ty.ret, ints),
                 None if !kept => {}
                 other => panic!("unexpected registry entry: {other:?}"),
             }
