@@ -288,6 +288,28 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
                 ));
             }
         }
+        // Sidekiq reads an ActiveJob job's blocks through its wrapper (`delay_for`'s `msg["wrapped"]`), which the worker doesn't yet.
+        if sidekiq && !is_worker {
+            for call in &lc.unknown_calls {
+                if let ExprNode::Send { recv: None, method, .. } = &*call.node
+                    && matches!(method.as_str(), "sidekiq_retry_in" | "sidekiq_retries_exhausted")
+                {
+                    let mut d = crate::lower::residue_diagnostic(
+                        "job_class_side",
+                        "job-retry-block",
+                        call.span,
+                        "retry block not lowered",
+                        format!(
+                            "job_class_side: `{}` — an ActiveJob job's {} isn't called by Roundhouse's Sidekiq worker; its failed jobs would take Sidekiq's default handling",
+                            lc.name.0.as_str(),
+                            method.as_str()
+                        ),
+                    );
+                    d.severity = crate::diagnostic::Severity::Error;
+                    diags.push(d);
+                }
+            }
+        }
         let entries: &[&str] = if is_worker { &["perform_async"] } else { &["perform_later", "perform_now"] };
         let class_side = &own_entries[lc.name.0.as_str()];
         let adapter = adapters.get(lc.name.0.as_str()).and_then(|a| a.as_deref());

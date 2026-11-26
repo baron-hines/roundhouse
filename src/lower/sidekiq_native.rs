@@ -1329,6 +1329,9 @@ pub fn apply_ruby(lcs: &mut [LibraryClass], app: &App) {
     }
     for lc in lcs.iter_mut() {
         let Some(plan) = app.native_plans.iter().find(|p| p.worker == lc.name.0.as_str()) else { continue };
+        if plan.is_payload() && unreadable(plan).is_none() {
+            add_jid_accessor(lc);
+        }
         for m in lc.methods.iter_mut() {
             if m.receiver == MethodReceiver::Class
                 && plan.is_payload()
@@ -1581,6 +1584,51 @@ pub fn take_retry_blocks(lc: &mut LibraryClass) -> Vec<Expr> {
     refused
 }
 
+/// `Sidekiq::Job`'s `jid` / `jid=`, which `perform_native` sets before
+/// `perform` as Sidekiq's processor does. One the worker writes stays.
+fn add_jid_accessor(lc: &mut LibraryClass) {
+    let has = |lc: &LibraryClass, n: &str| lc.methods.iter().any(|m| m.receiver == MethodReceiver::Instance && m.name.as_str() == n);
+    let span = Span::synthetic();
+    let method = |name: &str, params: Vec<crate::dialect::Param>, body: Expr, kind: crate::dialect::AccessorKind, ret: Ty| MethodDef {
+        visibility: crate::dialect::MethodVisibility::Public,
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        name_span: span,
+        name: Symbol::from(name),
+        receiver: MethodReceiver::Instance,
+        params,
+        body,
+        signature: Some(Ty::Fn(Box::new(crate::ty::FnTy {
+            params: if name.ends_with('=') {
+                vec![crate::ty::Param { name: Symbol::from("value"), ty: Ty::Str.into(), kind: crate::ty::ParamKind::Required }].into()
+            } else {
+                Vec::new().into()
+            },
+            block: None,
+            ret: std::sync::Arc::new(ret),
+            effects: crate::effect::EffectSet::pure(),
+        }))),
+        effects: crate::effect::EffectSet::default(),
+        enclosing_class: Some(lc.name.0.clone()),
+        kind,
+        is_async: false,
+        mutates_self: name.ends_with('='),
+        block_param: None,
+    };
+    if !has(lc, "jid") {
+        let read = typed(span, ExprNode::Ivar { name: Symbol::from("jid") }, Ty::Str);
+        let m = method("jid", Vec::new(), read, crate::dialect::AccessorKind::AttributeReader, Ty::Str);
+        lc.methods.push(m);
+    }
+    if !has(lc, "jid=") {
+        let mut value = Expr::new(span, ExprNode::Var { id: crate::ident::VarId(0), name: Symbol::from("value") });
+        value.ty = Some(Ty::Str);
+        let assign = typed(span, ExprNode::Assign { target: crate::expr::LValue::Ivar { name: Symbol::from("jid") }, value }, Ty::Str);
+        let m = method("jid=", vec![crate::dialect::Param::positional(Symbol::from("value"))], assign, crate::dialect::AccessorKind::AttributeWriter, Ty::Str);
+        lc.methods.push(m);
+    }
+}
+
 /// A `next` in the block's own body, outside any block nested in it.
 fn next_to_return(e: &mut Expr) {
     if let ExprNode::Next { value } = &mut *e.node {
@@ -1673,7 +1721,7 @@ pub fn perform_native_source(plans: &[NativePlan]) -> String {
         let expected = if required == total { required.to_string() } else { format!("{required}..{total}") };
         for k in required..=readable.len() {
             let kw = if k == required { "if" } else { "elsif" };
-            arms.push_str(&format!("      {kw} n == {k}\n        {}.new.perform({})\n", plan.worker, reads[..k].join(", ")));
+            arms.push_str(&format!("      {kw} n == {k}\n        w = {}.new\n        w.jid = jid\n        w.perform({})\n", plan.worker, reads[..k].join(", ")));
         }
         if readable.len() < total {
             let why = format!("{}#perform argument {}: no call site in this app passes it, so its type is unknown", plan.worker, readable.len());

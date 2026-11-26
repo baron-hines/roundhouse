@@ -292,11 +292,17 @@ module JobRegistry
     when "NativeWorker"
       n = SidekiqEnvelope.native_args(args)
       if n == 1
-        NativeWorker.new.perform(SidekiqEnvelope.native_int(args[0], "NativeWorker#perform argument 0 (`id`)"))
+        w = NativeWorker.new
+        w.jid = jid
+        w.perform(SidekiqEnvelope.native_int(args[0], "NativeWorker#perform argument 0 (`id`)"))
       elsif n == 2
-        NativeWorker.new.perform(SidekiqEnvelope.native_int(args[0], "NativeWorker#perform argument 0 (`id`)"), native_read_native_worker_1_0(args[1], "NativeWorker#perform argument 1 (`tags`)"))
+        w = NativeWorker.new
+        w.jid = jid
+        w.perform(SidekiqEnvelope.native_int(args[0], "NativeWorker#perform argument 0 (`id`)"), native_read_native_worker_1_0(args[1], "NativeWorker#perform argument 1 (`tags`)"))
       elsif n == 3
-        NativeWorker.new.perform(SidekiqEnvelope.native_int(args[0], "NativeWorker#perform argument 0 (`id`)"), native_read_native_worker_1_0(args[1], "NativeWorker#perform argument 1 (`tags`)"), SidekiqEnvelope.native_scalar_hash(args[2], "NativeWorker#perform argument 2 (`opts`)"))
+        w = NativeWorker.new
+        w.jid = jid
+        w.perform(SidekiqEnvelope.native_int(args[0], "NativeWorker#perform argument 0 (`id`)"), native_read_native_worker_1_0(args[1], "NativeWorker#perform argument 1 (`tags`)"), SidekiqEnvelope.native_scalar_hash(args[2], "NativeWorker#perform argument 2 (`opts`)"))
       else
         raise ArgumentError, "wrong number of arguments (given " + n.to_s + ", expected 1..3)"
       end
@@ -316,8 +322,16 @@ end
 class NativeWorker
   RAN = [""]
 
+  def jid
+    @jid
+  end
+
+  def jid=(value)
+    @jid = value
+  end
+
   def perform(id, tags = [], opts = {})
-    RAN << id.to_s + " " + tags.join(",") + " " + opts.length.to_s
+    RAN << id.to_s + " " + tags.join(",") + " " + opts.length.to_s + " " + jid[0, 4]
     nil
   end
 end
@@ -404,7 +418,7 @@ SidekiqWorker.supervise
 SidekiqWorker::THREADS.each { |t| t.join }
 check("all processors stopped", SidekiqWorker.running == 0, SidekiqWorker.running.to_s)
 check("retry hooks see the job as it will be written", HookWorker::NOTES == ["retry_in 0 hook 1 0", "exhausted ArgumentError hook 2"], HookWorker::NOTES.join(" / "))
-check("native jobs run with as many arguments as they carry", NativeWorker::RAN == ["7  0", "8 a,b 2"], NativeWorker::RAN.join(" / "))
+check("native jobs run with as many arguments as they carry", NativeWorker::RAN == ["7  0 dddd", "8 a,b 2 eeee"], NativeWorker::RAN.join(" / "))
 check("each job starts with an empty broadcast log", Broadcasts::STALE[0] == 0 && Broadcasts::SENT[0] > 1,
   Broadcasts::STALE[0].to_s + " of " + Broadcasts::SENT[0].to_s + " stale")
 SidekiqRedis.take_log.each { |line| puts line }

@@ -195,3 +195,25 @@ fn a_retry_block_that_cant_be_called_is_an_error() {
     let (_, errors) = on_sidekiq(worker, CALLS).emit(BuildTarget::Ruby);
     assert!(errors.iter().any(|e| e.contains("takes no block Roundhouse can call")), "{errors:#?}");
 }
+
+/// A `perform` that reads `jid` reads the job's, as Sidekiq sets it.
+#[test]
+fn a_native_job_reads_its_jid() {
+    let worker = "class ArgsWorker\n  include Sidekiq::Job\n  NOTES = [\"\"]\n\n  def perform(id, name, opts = {}, list = [], flag = nil)\n    NOTES << jid\n    nil\n  end\nend\n";
+    let script = "NOTES = ArgsWorker::NOTES\nNOTES.clear\nJobRegistry.perform_native(\"ArgsWorker\", [1, \"n\"], \"0123456789abcdef01234567\")\nraise NOTES.inspect unless NOTES == [\"0123456789abcdef01234567\"]\nputs \"jid read\"\n";
+    let run = on_sidekiq(worker, CALLS).run_ruby(script);
+    run.assert_passes();
+    assert!(run.stdout.contains("jid read"), "{}", run.stdout);
+}
+
+/// An ActiveJob job's Sidekiq retry block is an error: Roundhouse's worker
+/// doesn't read it through the wrapper as Sidekiq does.
+#[test]
+fn an_active_job_retry_block_is_an_error() {
+    let job = "class HookJob < ApplicationJob\n  sidekiq_retry_in { |count| 10 }\n\n  def perform(id)\n    nil\n  end\nend\n";
+    let (_, errors) = on_sidekiq(ARGS_WORKER, CALLS)
+        .write("app/jobs/hook_job.rb", job)
+        .edit("app/models/article.rb", "  validates :title, presence: true\n", "  validates :title, presence: true\n\n  def self.hook_job\n    HookJob.perform_later(1)\n  end\n")
+        .emit(BuildTarget::Ruby);
+    assert!(errors.iter().any(|e| e.contains("isn't called by Roundhouse's Sidekiq worker")), "{errors:#?}");
+}
