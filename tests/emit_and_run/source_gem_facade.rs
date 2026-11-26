@@ -35,6 +35,7 @@ fn a_namespace_a_source_compiled_gem_defines_leaves_the_gem_facade() {
     assert!(facades.contains("module Markly"), "the other façades stay:\n{facades}");
     let sig = std::fs::read_to_string(emitted.join("runtime/gem_facades.rbs")).expect("gem_facades.rbs");
     assert!(!sig.contains("class TimeSeries"), "{sig}");
+    assert!(sig.contains("module SVG\n  module Graph\n  end\nend\n"), "{sig}");
 }
 
 /// An app's own reopening of a façade's namespace (campfire's

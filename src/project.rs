@@ -14029,6 +14029,21 @@ fn drop_facades_the_program_defines(files: &mut [(String, String)]) {
         })
         .flat_map(|(_, c)| c.lines().filter_map(top_name).collect::<Vec<_>>())
         .collect();
+    // The paths the gem's own top-level headers open, whole (`SVG::Graph::Graph`, `SVG`): one it declares itself needs no shell.
+    let declared: std::collections::BTreeSet<String> = files
+        .iter()
+        .filter(|(p, c)| {
+            !p.starts_with("runtime/")
+                && p.ends_with(".rb")
+                && c.lines().any(|l| l.starts_with("#<SPINEL_SOURCE>") && l.contains(crate::ingest::source_gems::MOUNT))
+        })
+        .flat_map(|(_, c)| {
+            c.lines()
+                .filter_map(|l| l.strip_prefix("module ").or_else(|| l.strip_prefix("class ")))
+                .map(|rest| rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':').collect::<String>())
+                .collect::<Vec<_>>()
+        })
+        .collect();
     for (path, content) in files.iter_mut() {
         if path != "runtime/gem_facades.rb" && path != "runtime/gem_facades.rbs" {
             continue;
@@ -14053,6 +14068,7 @@ fn drop_facades_the_program_defines(files: &mut [(String, String)]) {
                 let indent_of = |line: &str| line.len() - line.trim_start().len();
                 let declares = |line: &str| line.trim_start().starts_with("module ") || line.trim_start().starts_with("class ");
                 let mut open: Vec<usize> = Vec::new();
+                let mut names: Vec<String> = Vec::new();
                 for j in i..=end {
                     let line = lines[j];
                     let indent = indent_of(line);
@@ -14060,12 +14076,17 @@ fn drop_facades_the_program_defines(files: &mut [(String, String)]) {
                     let is_module = trimmed.strip_prefix("module ").is_some_and(|rest| rest.chars().all(|c| c.is_alphanumeric() || c == '_'));
                     if is_module && open.len() * 2 == indent {
                         let close = (j + 1..=end).find(|&k| lines[k].trim_start() == "end" && indent_of(lines[k]) == indent).unwrap_or(end);
-                        if (j + 1..close).any(|k| declares(lines[k]) && indent_of(lines[k]) == indent + 2) {
+                        let name = trimmed["module ".len()..].trim().to_string();
+                        let path = names.iter().cloned().chain(std::iter::once(name.clone())).collect::<Vec<_>>().join("::");
+                        // Not one the gem declares itself (`class SVG`): a `module` shell would reopen its class as a module.
+                        if !declared.contains(&path) && (j + 1..close).any(|k| declares(lines[k]) && indent_of(lines[k]) == indent + 2) {
                             open.push(indent);
+                            names.push(name);
                             keep[j] = true;
                         }
                     } else if trimmed == "end" && open.last() == Some(&indent) {
                         open.pop();
+                        names.pop();
                         keep[j] = true;
                     }
                 }
@@ -17239,8 +17260,13 @@ mod tests {
             ("app/models/svg/graph/graph.rb".to_string(), gem.to_string()),
             ("app/models/rotp/base32.rb".to_string(), rotp.to_string()),
         ];
+        let mut declared = files.clone();
         drop_facades_the_program_defines(&mut files);
         assert_eq!(files[0].1, "module GemFacade\nend\n\nmodule SVG\n  module Graph\n  end\nend\n\nmodule ROTP\nend\n\nmodule Mail\nend\n");
+        // A gem that declares the namespace itself (`class SVG`) gets no `module` shell to reopen it as.
+        declared[1].1 = "#<SPINEL_SOURCE>lobsters/.roundhouse/source_gems/svg-graph-2.2.2/lib/SVG.rb:1\nclass SVG\nend\nclass SVG::Graph::Graph\nend\n".to_string();
+        drop_facades_the_program_defines(&mut declared);
+        assert_eq!(declared[0].1, "module GemFacade\nend\n\n\nmodule ROTP\nend\n\nmodule Mail\nend\n");
     }
 
     #[test]
