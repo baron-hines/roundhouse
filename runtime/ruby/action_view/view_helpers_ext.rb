@@ -89,12 +89,13 @@ module ActionView
       host = options[:host]
       return url_for_path(path) if host.nil?
       hostport = host.to_s
-      port = options[:port]
-      hostport = hostport + ":" + port.to_s unless port.nil?
+      port = ActionController.url_port_of(hostport)
+      if options.key?(:port)
+        given = options[:port]
+        port = given.nil? ? "" : given.to_s
+      end
       protocol = options[:protocol]
-      ActionController.build_host_url(
-        protocol.nil? ? "http://" : protocol.to_s, hostport, ActionController.url_port_of(hostport), path
-      )
+      ActionController.build_host_url(protocol.nil? ? "http://" : protocol.to_s, hostport, port, path)
     end
 
     # The ruby family's `asset_url` and `image_url` (see the universal
