@@ -226,6 +226,25 @@ module Db
     tables
   end
 
+  # The relations whose `scoping { }` block runs on this thread,
+  # innermost last (relation.rb's `Relation.current_scope_for`), in
+  # `Thread.current` for the reason the unscoped tables are. Nil until
+  # the first push, which seeds the list with its element.
+  def self._current_scopes
+    Thread.current[:ar_current_scopes]
+  end
+
+  def self._push_current_scope(scope)
+    scopes = Thread.current[:ar_current_scopes]
+    if scopes.nil?
+      scopes = [scope]
+      Thread.current[:ar_current_scopes] = scopes
+    else
+      scopes << scope
+    end
+    scopes
+  end
+
   # Request-scoped connection lease. Mirrors db_cruby.rb: checks out a
   # Conn under @mutex (parking on @cv while the pool is momentarily
   # exhausted), binds it to fiber-storage so `current_dbh` resolves to it
@@ -258,6 +277,11 @@ module Db
 
   def self.adapter_name
     "sqlite3"
+  end
+
+  # One database: a connection handle is the shared one (db.rbs).
+  def self.connection_slot(_base)
+    -1
   end
 
   def self.transaction_open?

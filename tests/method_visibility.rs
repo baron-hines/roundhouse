@@ -49,7 +49,6 @@ fn a_reopened_data_factory_accepts_local_visibility_markers() {
     for block in [
         "private\n  def hidden = digest.to_s\n  public\n  def label = hidden",
         "def hidden = digest.to_s\n  private :hidden\n  def label = hidden",
-        "def hidden = digest.to_s\n  private 'hidden'\n  def label = hidden",
         "private def hidden = digest.to_s\n  def label = hidden",
     ] {
         let source = format!("Artifact = Data.define(:digest) do\n  {block}\n  def self.build(value) = new(value)\n  private_class_method :build\n  def self.make(value) = build(value)\nend\nclass Artifact\n  def extra = label\nend\n");

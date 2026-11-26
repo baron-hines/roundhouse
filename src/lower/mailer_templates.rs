@@ -230,6 +230,7 @@ fn module_mails(app: &App, mailers: &BTreeSet<String>) -> (BTreeSet<String>, Has
 
 /// The directories a looking-up mailer's code spells for `template_path`, beside its own: a String literal in it or
 /// the modules it includes, or the tail of an interpolation (`"#{scoped_path}/mailer"`), any directory ending so.
+#[derive(Debug, PartialEq)]
 pub(crate) struct LookupDirs {
     own: String,
     spelled: BTreeSet<String>,
@@ -254,6 +255,11 @@ impl LookupDirs {
 /// Each looking-up mailer's `LookupDirs`, and the actions a template under a directory other than its own is named
 /// after.
 pub(crate) fn lookup_dirs(app: &App) -> HashMap<String, (LookupDirs, Vec<String>)> {
+    lookup_dirs_of(app, looking_up_mailers(app))
+}
+
+/// [`lookup_dirs`] of the mailers [`looking_up_mailers_with`] found.
+pub(crate) fn lookup_dirs_of(app: &App, looking: BTreeSet<String>) -> HashMap<String, (LookupDirs, Vec<String>)> {
     fn strings(e: &Expr, spelled: &mut BTreeSet<String>, tails: &mut BTreeSet<String>, names: &mut BTreeSet<String>) {
         match &*e.node {
             ExprNode::Lit { value: Literal::Str { value } } if !value.is_empty() => {
@@ -274,8 +280,10 @@ pub(crate) fn lookup_dirs(app: &App) -> HashMap<String, (LookupDirs, Vec<String>
         }
         e.node.for_each_child(&mut |c| strings(c, spelled, tails, names));
     }
+    if looking.is_empty() {
+        return HashMap::default();
+    }
     let mailers = super::mailer_class_side::mailer_names(app);
-    let looking = looking_up_mailers(app);
     let (_, includes_of) = module_mails(app, &mailers);
     let parents: HashMap<String, Option<String>> = app
         .library_classes
@@ -312,6 +320,14 @@ pub(crate) fn lookup_dirs(app: &App) -> HashMap<String, (LookupDirs, Vec<String>
 /// The mailers whose `mail` looks its template up when it runs, so a template named after one of their actions
 /// under another directory is theirs to render (`__mail_rendered`).
 pub(crate) fn looking_up_mailers(app: &App) -> BTreeSet<String> {
+    let own_opts: BTreeSet<&str> =
+        app.library_classes.iter().filter(|lc| spells_template_opts(lc)).map(|lc| lc.name.0.as_str()).collect();
+    looking_up_mailers_with(app, &own_opts)
+}
+
+/// Whether a method of `lc` calls `mail` with `template_name:` or `template_path:`: the class's part of
+/// [`looking_up_mailers`], a function of its trees alone.
+pub(crate) fn spells_template_opts(lc: &crate::dialect::LibraryClass) -> bool {
     fn template_opts(e: &Expr) -> bool {
         let mut found = matches!(&*e.node, ExprNode::Send { recv: None, method, args, .. } if method.as_str() == "mail"
             && args.first().is_some_and(|a| matches!(&*a.node, ExprNode::Hash { entries, .. } if entries.iter().any(|(k, _)|
@@ -319,18 +335,17 @@ pub(crate) fn looking_up_mailers(app: &App) -> BTreeSet<String> {
         e.node.for_each_child(&mut |c| found |= template_opts(c));
         found
     }
+    lc.methods.iter().any(|m| template_opts(&m.body))
+}
+
+/// [`looking_up_mailers`], given the names of the library classes [`spells_template_opts`] holds for.
+pub(crate) fn looking_up_mailers_with(app: &App, own_opts: &BTreeSet<&str>) -> BTreeSet<String> {
     let mailers = super::mailer_class_side::mailer_names(app);
     let (module_mail, includes_of) = module_mails(app, &mailers);
     let parents: HashMap<String, Option<String>> = app
         .library_classes
         .iter()
         .map(|lc| (lc.name.0.as_str().to_string(), lc.parent.as_ref().map(|p| p.0.as_str().to_string())))
-        .collect();
-    let own_opts: BTreeSet<&str> = app
-        .library_classes
-        .iter()
-        .filter(|lc| lc.methods.iter().any(|m| template_opts(&m.body)))
-        .map(|lc| lc.name.0.as_str())
         .collect();
     // A subclass of one looks up too: its parent's `mail` runs for it, under its own directory.
     mailers
@@ -515,8 +530,12 @@ fn callback_names(app: &App, mailers: &BTreeSet<String>) -> crate::det::HashSet<
         for m in &lc.methods {
             let (mut starts, mut called) = (false, Vec::new());
             calls(&m.body, &mut starts, &mut called);
+            // By the action's name: a callback that is itself a public method (lobsters' `check_email_blocklist`) is
+            // called through its action body, `__mailer_action_<name>`, whose bare `mail` is the callback's too.
+            // Not a method's call of its own action body (a zero-argument action's `self.__mailer_action_<itself>`).
             if starts {
-                out.extend(called.into_iter().filter(|n| crate::ingest::mailer_callbacks::action_of(n) == n.as_str()));
+                let own = format!("{}{}", crate::ingest::mailer_callbacks::ACTION_PREFIX, m.name.as_str());
+                out.extend(called.into_iter().filter(|n| *n != own).map(|n| crate::ingest::mailer_callbacks::action_of(&n).to_string()));
             }
         }
     }

@@ -413,6 +413,7 @@ fn parse_column_def(
         array: false,
         array_stored: false,
         unset_until_assigned: false,
+        collated: top_level_words(modifiers).iter().any(|(_, word)| word == "COLLATE"),
     }))
 }
 
@@ -1482,7 +1483,7 @@ fn parse_generated_modifier(modifiers: &str) -> Result<Option<GeneratedColumn>, 
         return Err("only NULL or NOT NULL may follow the generated storage mode".into());
     }
 
-    Ok(Some(GeneratedColumn { expression, storage }))
+    Ok(Some(GeneratedColumn { expression, storage, native: false }))
 }
 
 /// Consume only an optional `NULL` or `NOT NULL` clause plus SQL trivia.

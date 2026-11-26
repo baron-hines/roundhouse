@@ -14,6 +14,11 @@ module Rails
   def self.application: () -> Application
   def self.configuration: () -> FrameworkConfig
 
+  module Command
+    class Base
+    end
+  end
+
   class BacktraceCleaner
     APP_DIRS_PATTERN: Regexp
     RENDER_TEMPLATE_PATTERN: Regexp
@@ -32,6 +37,7 @@ module Rails
     def read: () -> String
     def exist?: () -> bool
     def expand_path: (?(String | AppPath)? dir) -> AppPath
+    def mkpath: () -> AppPath
   end
 
   class Env
@@ -74,15 +80,16 @@ module Rails
   end
 
   class Logger
-    def info: (untyped message) -> void
-    def error: (untyped message) -> void
-    def warn: (untyped message) -> void
-    def debug: (untyped message) -> void
-    def fatal: (untyped message) -> void
+    def info: (?untyped message) -> void
+    def error: (?untyped message) -> void
+    def warn: (?untyped message) -> void
+    def debug: (?untyped message) -> void
+    def fatal: (?untyped message) -> void
   end
 
   class Application
     def session_cookie_key: () -> String
+    def eager_load: () -> bool
     def propshaft_asset_path: (String source) -> String
     def forgery_protection_verification_strategy: () -> String
     def public_file_server_headers: () -> Hash[String, String]
@@ -113,6 +120,10 @@ module Rails
     def default_per_page: () -> Integer
     def config: () -> FrameworkConfig
     def content_security_policy: () -> ActionDispatch::ContentSecurityPolicy?
+    def content_security_policy_nonce_generator?: () -> bool
+    def content_security_policy_nonce_generated: (ActionDispatch::Request request) -> String
+    def content_security_policy_nonce_directives: () -> Array[String]
+    def content_security_policy_nonce_current: () -> String?
     def importmap: () -> ImportmapMap
     def importmap_json: () -> String
   end
@@ -148,13 +159,21 @@ module Rails
     def initialize: () -> void
     def assets: () -> AssetConfig
     def relative_url_root: () -> String?
+    def eager_load: () -> bool
     def action_controller: () -> ActionControllerOptions
+    def action_dispatch: () -> ActionDispatchOptions
     def filter_parameters: () -> Array[String | Regexp]
     def session_options: () -> Hash[Symbol, String]
   end
 
   class ActionControllerOptions
     def relative_url_root: () -> String?
+  end
+
+  class ActionDispatchOptions
+    def cookies_rotations: () -> ActiveSupport::Messages::RotationConfiguration
+    def signed_cookie_salt: () -> String
+    def authenticated_encrypted_cookie_salt: () -> String
   end
 
   class ImportmapMap

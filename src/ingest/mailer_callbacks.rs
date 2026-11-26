@@ -45,7 +45,7 @@ use crate::dialect::{LibraryClass, MethodReceiver, MethodVisibility};
 use crate::expr::{Expr, ExprNode, Literal};
 use crate::span::Span;
 
-const ACTION_PREFIX: &str = "__mailer_action_";
+pub(crate) const ACTION_PREFIX: &str = "__mailer_action_";
 const CALLBACK_PREFIX: &str = "__mailer_callback_";
 const CONDITION_PREFIX: &str = "__mailer_condition_";
 

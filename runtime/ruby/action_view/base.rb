@@ -17,3 +17,85 @@ module ActionView
     end
   end
 end
+
+module ActionView
+  # Rails 8.1's `ActionView::OutputBuffer`: a template's markup, a String escaped as it is appended unless html_safe
+  # (`ERB::Util.unwrapped_html_escape`), raw through `safe_concat`. A component's render (view_component's
+  # `render_in`) starts one.
+  class OutputBuffer
+    def initialize(buffer = "")
+      @raw_buffer = +""
+      @raw_buffer << buffer
+    end
+
+    def to_s
+      @raw_buffer
+    end
+
+    def to_str
+      @raw_buffer.dup
+    end
+
+    def length
+      @raw_buffer.length
+    end
+
+    def empty?
+      @raw_buffer.empty?
+    end
+
+    def html_safe?
+      true
+    end
+
+    def <<(value)
+      @raw_buffer << ActionView::ViewHelpers.html_escape(value) unless value.nil?
+      self
+    end
+
+    def safe_concat(value)
+      @raw_buffer << value
+      self
+    end
+  end
+
+  # What a view's `lookup_context` answers a component: no request variant (`+phone`) and the HTML format, the
+  # template a request without either renders.
+  class LookupContext
+    def variants
+      []
+    end
+
+    def formats
+      [:html]
+    end
+  end
+
+  class Base
+    def lookup_context
+      @lookup_context ||= LookupContext.new
+    end
+
+    # Rails' renderer and content_for flow: none is modelled here, and a component reads them only through helpers
+    # this runtime does not have (older Rails' path helpers, `content_for` from a component).
+    def view_renderer
+      nil
+    end
+
+    def view_flow
+      nil
+    end
+
+    # A view built on its own (`ActionView::Base.new`, as a component's `render_in` is handed one) has no controller.
+    def controller
+      nil
+    end
+
+    # ERB::Util's `html_escape`, which Rails' view includes (view_component's `maybe_escape_html` calls it bare).
+    # Not ERB::Util's check of a safe String first, which no typed String answers here: view_component's one caller
+    # (`maybe_escape_html`) hands it only text that is not html_safe.
+    def html_escape(text)
+      ActionView::ViewHelpers.html_escape(text.to_s)
+    end
+  end
+end

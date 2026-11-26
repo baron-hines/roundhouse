@@ -75,21 +75,21 @@ fn to_completion(script: &str) -> String {
 
 /// Start from `fixtures/real-blog`.
 pub fn real_blog() -> Overlay {
-    Overlay { base: roundhouse::fixtures::real_blog().to_path_buf(), scratch_base: false, edits: Vec::new() }
+    Overlay { base: roundhouse::fixtures::real_blog().to_path_buf(), scratch_base: false, edits: Vec::new(), observe_boot: false }
 }
 
 /// Start from `fixtures/tiny-blog-uuid`: `posts.id` a uuid and
 /// `comments.post_id` a uuid foreign key.
 pub fn tiny_blog_uuid() -> Overlay {
     let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/tiny-blog-uuid");
-    Overlay { base, scratch_base: false, edits: Vec::new() }
+    Overlay { base, scratch_base: false, edits: Vec::new(), observe_boot: false }
 }
 
 /// Start from an empty tree and `write` the app file by file, for a
 /// shape the blog cannot be edited into, such as an app with no views.
 pub fn empty_app() -> Overlay {
     let base = scratch_dir();
-    Overlay { base, scratch_base: true, edits: Vec::new() }
+    Overlay { base, scratch_base: true, edits: Vec::new(), observe_boot: false }
 }
 
 pub struct Overlay {
@@ -97,6 +97,8 @@ pub struct Overlay {
     /// `base` is this overlay's own scratch tree, removed once copied.
     scratch_base: bool,
     edits: Vec<Edit>,
+    /// Ingest with what the gems do to the app's classes as the app itself boots (`check`'s observation).
+    observe_boot: bool,
 }
 
 enum Edit {
@@ -106,6 +108,13 @@ enum Edit {
 }
 
 impl Overlay {
+    /// Ingest the app as `roundhouse check` does once its own boot is observed: the bundle the boot runs under is
+    /// `ROUNDHOUSE_BOOT_BUNDLE_PATH`'s, and the observation must answer, or the test fails.
+    pub fn with_observed_boot(mut self) -> Self {
+        self.observe_boot = true;
+        self
+    }
+
     /// Add a file, or replace one outright.
     pub fn write(mut self, path: &str, content: &str) -> Self {
         self.edits.push(Edit::Write { path: path.into(), content: content.as_bytes().to_vec() });
@@ -180,6 +189,30 @@ impl Overlay {
         Run::new(command.join(" "), emitted, errors, output)
     }
 
+    /// Emit, then load several of the emitted test files into one Ruby
+    /// process, in order, as `bin/rails test` loads a suite.
+    pub fn run_tests(self, test_paths: &[&str]) -> Run {
+        let (emitted, errors) = self.emit_tree(BuildTarget::Ruby);
+        let load = "ARGV.each { |path| require File.expand_path(path) }";
+        let output = ruby()
+            .args(["-Itest", "-I.", "-e", load])
+            .args(test_paths)
+            .current_dir(&emitted)
+            .output()
+            .expect("spawn ruby");
+        Run::new(format!("ruby -Itest -I. -e '{load}' {}", test_paths.join(" ")), emitted, errors, output)
+    }
+
+    /// Emit the Spinel tree, then run one of its test files with
+    /// `spin test <path>`. Spinel writes `test/<dir>/x_test.rb` as
+    /// `test/x_test.rb`, so `test_path` is the emitted path.
+    pub fn run_spin_test(self, test_path: &str) -> Run {
+        let (emitted, errors) = self.emit_tree(BuildTarget::Spinel);
+        let output =
+            Command::new("spin").args(["test", test_path]).current_dir(&emitted).output().expect("spawn spin");
+        Run::new(format!("spin test {test_path}"), emitted, errors, output)
+    }
+
     /// Emit, then run `script` against the booted app: `main.rb` is
     /// required and the default adapter configured on an in-memory
     /// database before the script's first line.
@@ -203,6 +236,8 @@ impl Overlay {
             .arg(&script)
             .current_dir(&emitted)
             .env("BLOG_DB", ":memory:")
+            // A variable a test's guard reads, unset unless the test sets it.
+            .env_remove("SHELF_SLUG")
             .envs(env.iter().copied())
             .output()
             .expect("spawn ruby");
@@ -238,12 +273,13 @@ impl Overlay {
     fn run_spinel_with_flags(self, script: &str, flags: &[&str]) -> Run {
         // Before the bundle's key: a recorded case and its lookup hash the same script.
         let script = &to_completion(script);
-        if let Some(dir) = bundle::collect_dir() {
+        // Not bundled when the boot is observed: the shared build ingests without the observation.
+        if let Some(dir) = bundle::collect_dir().filter(|_| !self.observe_boot) {
             bundle::record(&dir, &self, script, flags);
             panic!("spinel bundle collect: recorded, not run");
         }
         // Not the bundled run's failure as the test's: another case's added method or route rides in that build, so it is judged again alone.
-        let shared = bundle::run_shared(&self, script, flags).filter(|run| run.success);
+        let shared = if self.observe_boot { None } else { bundle::run_shared(&self, script, flags).filter(|run| run.success) };
         // Nor the bundle's errors as the case's: the group is checked merged, where another case's
         // added method can answer a call this one leaves unresolved. A case with errors of its own
         // runs alone, so its `Run` carries them and the program is its own.
@@ -255,6 +291,34 @@ impl Overlay {
         std::fs::write(emitted.join("contract.rb"), format!("require_relative \"boot\"\n{script}"))
             .expect("write native consumer");
         compile_and_run_contract(emitted, errors, flags).expecting_completion()
+    }
+
+    /// `run_spinel` through the `roundhouse` binary, which boots the app's CRuby tree to observe what a gem does to
+    /// a class it holds in a variable (`observed_shapes`); the library build the other runs take does not. Its
+    /// errors are the binary's: a first build without `--allow-unsupported` lists them, as that flag prints them
+    /// as warnings, and the second writes the tree (the observation is cached by then).
+    #[allow(dead_code)]
+    pub fn run_spinel_observed(self, script: &str) -> Run {
+        let (scratch, source) = self.materialize();
+        let build = |allow: bool, out: &Path| {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_roundhouse"));
+            command.args(["--target", "spinel"]);
+            if allow {
+                command.arg("--allow-unsupported");
+            }
+            command.arg(&source).arg("-o").arg(out).output().expect("spawn roundhouse")
+        };
+        let checked = build(false, &scratch.join("checked"));
+        let errors = String::from_utf8_lossy(&checked.stderr)
+            .lines()
+            .filter_map(|l| l.split_once(": error[").map(|(at, rest)| format!("{at}: {}", rest.split_once("]: ").map_or(rest, |(_, msg)| msg))))
+            .collect();
+        let emitted = scratch.join("emitted");
+        let built = build(true, &emitted);
+        assert!(built.status.success(), "roundhouse --target spinel failed:\n{}", String::from_utf8_lossy(&built.stderr));
+        std::fs::write(emitted.join("contract.rb"), format!("require_relative \"boot\"\n{}", to_completion(script)))
+            .expect("write native consumer");
+        compile_and_run_contract(emitted, errors, &[]).expecting_completion()
     }
 
     /// `run_spinel` for a probe that does not need the app: compile only the
@@ -450,6 +514,19 @@ impl Overlay {
                 }
             }
         }
+        // Not another overlay's patches: a test thread may run an observed overlay before this one.
+        roundhouse::observed_shapes::uninstall();
+        if self.observe_boot {
+            let (app, _) = roundhouse::ingest::prism::scope(|| ingest_app(&source));
+            let app = app.expect("ingest the overlaid fixture before observing its boot");
+            let gems = roundhouse::observed_shapes::needed(&app);
+            assert!(!gems.is_empty(), "no gem the app reaches changes a class held in a variable");
+            let dir = source.canonicalize().expect("canonical app dir");
+            let key = roundhouse::observed_shapes::key(&dir);
+            let (patches, refused) = roundhouse::observed_shapes::observe_app(&dir, &gems, &key);
+            assert!(refused.is_empty(), "the observed boot did not answer: {refused:?}");
+            roundhouse::observed_shapes::install(patches.expect("the observed boot's patches apply"));
+        }
 
         (scratch, source)
     }
@@ -492,6 +569,30 @@ impl Overlay {
         diags.into_iter().filter(|d| d.severity == Severity::Warning).collect()
     }
 
+    /// Every diagnostic ingest reports for the overlaid tree, warnings included.
+    #[allow(dead_code)]
+    pub fn ingest_diagnostics(self) -> Vec<Diagnostic> {
+        let (scratch, source) = self.materialize();
+        let (app, diags) = roundhouse::ingest::prism::scope(|| ingest_app(&source));
+        // A failed ingest also reports no warnings: an absence check on them
+        // must not pass for that.
+        app.expect("ingest the overlaid fixture");
+        let _ = std::fs::remove_dir_all(&scratch);
+        diags
+    }
+
+    /// The warnings the target-aware lowering reports for `target`
+    /// (`session::analyze_and_lower_for`): a construct the target's lowering
+    /// doesn't reach, kept a reported gap there.
+    pub fn lowering_warnings(self, target: BuildTarget) -> Vec<Diagnostic> {
+        let (scratch, source) = self.materialize();
+        let (app, _) = roundhouse::ingest::prism::scope(|| ingest_app(&source));
+        let mut app = app.expect("ingest the overlaid fixture");
+        let diags = roundhouse::session::analyze_and_lower_for(&mut app, target);
+        let _ = std::fs::remove_dir_all(&scratch);
+        diags.into_iter().filter(|d| d.severity == Severity::Warning).collect()
+    }
+
     fn emit_app_tree(self, target: BuildTarget) -> (PathBuf, roundhouse::App, Vec<Diagnostic>) {
         self.emit_app_tree_with_lowering(target, true)
     }
@@ -514,10 +615,17 @@ impl Overlay {
         let mut errors: Vec<_> = found.into_iter().filter(|d| d.severity == Severity::Error).collect();
 
         let emitted = scratch.join("emitted");
-        let (files, emit_diags) = roundhouse::emit::diagnostics::scope(|| {
-            roundhouse::project::target_files(&app, &source, target)
+        // As the CLI does: a send on an app model the written Ruby defines nothing for is an error.
+        let ((files, emit_diags), rendered) = roundhouse::emit::ruby::record_rendered(|| {
+            roundhouse::emit::diagnostics::scope(|| roundhouse::project::target_files(&app, &source, target))
         });
         let mut emit_diags = emit_diags;
+        if let Ok(files) = &files
+            && roundhouse::emit::audit::gates(target)
+        {
+            let models = app.models.iter().map(|m| m.name.0.as_str()).collect();
+            emit_diags.extend(roundhouse::emit::audit::audit(&rendered, files, &models, &app.sources));
+        }
         roundhouse::source_gem_shake::demote_unreached_gem_errors(&app, &mut emit_diags);
         errors.extend(emit_diags.into_iter().filter(|d| d.severity == Severity::Error));
         let files = match files {
@@ -565,6 +673,19 @@ pub struct Run {
     exited_zero: bool,
     pub stdout: String,
     pub stderr: String,
+    /// The last process's exit status, for a failure that printed nothing (a signal).
+    pub status: String,
+}
+
+fn command_of_status(status: &std::process::ExitStatus) -> &'static str {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if status.signal().is_some() {
+            return "killed by a signal";
+        }
+    }
+    if status.success() { "exited 0" } else { "exited non-zero" }
 }
 
 impl Run {
@@ -577,6 +698,7 @@ impl Run {
             exited_zero: output.status.success(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            status: format!("{} ({})", output.status, command_of_status(&output.status)),
         }
     }
 
@@ -620,7 +742,8 @@ impl Run {
         assert!(
             self.success || !self.exited_zero,
             "the emitted program exited 0 without reaching the end of its script (an early `exit` or \
-             `return`, or a swallowed raise), so its checks did not all run: `{}` in {}\n\
+             `return`, or a swallowed raise), so its checks did not all run: `{}` in {} \
+             (ROUNDHOUSE_KEEP_EMITTED=1 keeps the tree)\n\
              \n=== stdout ===\n{}\n=== stderr ===\n{}",
             self.command,
             self.emitted.display(),
@@ -629,7 +752,8 @@ impl Run {
         );
         assert!(
             self.success,
-            "analysis and emit are clean but the emitted program failed: `{}` in {}\n\
+            "analysis and emit are clean but the emitted program failed: `{}` in {} \
+             (ROUNDHOUSE_KEEP_EMITTED=1 keeps the tree)\n\
              \n=== stdout ===\n{}\n=== stderr ===\n{}",
             self.command,
             self.emitted.display(),
@@ -639,10 +763,9 @@ impl Run {
     }
 }
 
-/// A run takes its scratch tree with it, unless its test is failing (the
-/// failure names the tree) or `ROUNDHOUSE_KEEP_EMITTED=1` keeps every one.
-/// A run expected to fail is a passing test and is removed too. Left
-/// behind, a full suite fills `/tmp`'s inodes.
+/// A run takes its scratch tree with it, passed or failed, unless
+/// `ROUNDHOUSE_KEEP_EMITTED=1` keeps every one (a failure names its tree).
+/// Left behind, a full suite fills `/tmp`'s inodes.
 impl Drop for Run {
     fn drop(&mut self) {
         remove_scratch(&self.emitted);
@@ -674,7 +797,7 @@ impl Drop for Emitted {
 }
 
 fn remove_scratch(emitted: &Path) {
-    if !std::thread::panicking() && std::env::var_os("ROUNDHOUSE_KEEP_EMITTED").is_none() {
+    if std::env::var_os("ROUNDHOUSE_KEEP_EMITTED").is_none() {
         if let Some(scratch) = emitted.parent() {
             let _ = std::fs::remove_dir_all(scratch);
         }
@@ -890,7 +1013,7 @@ pub mod bundle {
     fn build_http(cases: &[&Case]) -> Option<PathBuf> {
         let edits = merged_edits(cases)?;
         let empty = cases[0].base.as_os_str() == EMPTY;
-        let overlay = Overlay { base: if empty { scratch_dir() } else { cases[0].base.clone() }, scratch_base: empty, edits };
+        let overlay = Overlay { base: if empty { scratch_dir() } else { cases[0].base.clone() }, scratch_base: empty, edits, observe_boot: false };
         let (emitted, errors) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| overlay.emit_tree(BuildTarget::Spinel))).ok()?;
         if !errors.is_empty() || spin_build(&emitted).is_err() {
             remove_scratch(&emitted);
@@ -1039,7 +1162,7 @@ pub mod bundle {
         // Not merged blindly: two cases writing one path differently would leave only the last (`merged_edits`).
         let edits = merged_edits(cases)?;
         let empty = cases[0].base.as_os_str() == EMPTY;
-        let overlay = Overlay { base: if empty { scratch_dir() } else { cases[0].base.clone() }, scratch_base: empty, edits };
+        let overlay = Overlay { base: if empty { scratch_dir() } else { cases[0].base.clone() }, scratch_base: empty, edits, observe_boot: false };
         let (emitted, errors) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| overlay.emit_tree(BuildTarget::Spinel))).ok()?;
         if !errors.is_empty() {
             remove_scratch(&emitted);
@@ -1087,6 +1210,7 @@ pub mod bundle {
     // The edits that change a file of the base app rather than add one beside it. Not one that only
     // adds methods (`adds_only_methods`): it changes nothing another case's script calls, and a
     // case that fails in the shared build is run again alone (`Overlay::run_spinel_with_flags`).
+    // Nor a route the case adds, which no other case's script reaches (`http_base_edits`).
     fn base_edits(case: &Case) -> u64 {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         let in_base = |path: &str| case.base.as_os_str() != EMPTY && case.base.join(path).exists();
@@ -1095,6 +1219,7 @@ pub mod bundle {
                 Edit::Write { path, content } if in_base(path) => ("w", path, content).hash(&mut h),
                 Edit::Write { .. } => {}
                 Edit::Replace { find, replace, .. } if adds_only_methods(find, replace) => {}
+                Edit::Replace { path, find, replace } if inserts_route(path, find, replace) => {}
                 Edit::Replace { path, find, replace } => ("r", path, find, replace).hash(&mut h),
                 Edit::Remove { path } => ("d", path).hash(&mut h),
             }
@@ -1104,7 +1229,17 @@ pub mod bundle {
 
     const ROUTES: &str = "config/routes.rb";
 
-    // `base_edits` but for routes a case inserts, which change nothing another case's requests reach.
+    // Not any prefix or suffix match: `resources :articles` made `resources :articles, only: [:index]` rewrites the route.
+    fn inserts_route(path: &str, find: &str, replace: &str) -> bool {
+        path == ROUTES
+            && match (replace.strip_prefix(find), replace.strip_suffix(find)) {
+                (Some(after), _) if find.ends_with('\n') || after.starts_with('\n') => true,
+                (_, Some(before)) => before.ends_with('\n'),
+                _ => false,
+            }
+    }
+
+    // `base_edits` but apart on added methods: a server that fails shared is not built again alone, and two cases adding one name both compose.
     fn http_base_edits(case: &Case) -> u64 {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         let in_base = |path: &str| case.base.as_os_str() != EMPTY && case.base.join(path).exists();
@@ -1112,8 +1247,7 @@ pub mod bundle {
             match edit {
                 Edit::Write { path, content } if in_base(path) => ("w", path, content).hash(&mut h),
                 Edit::Write { .. } => {}
-                Edit::Replace { path, find, replace }
-                    if path == ROUTES && (replace.starts_with(find.as_str()) || replace.ends_with(find.as_str())) => {}
+                Edit::Replace { path, find, replace } if inserts_route(path, find, replace) => {}
                 Edit::Replace { path, find, replace } => ("r", path, find, replace).hash(&mut h),
                 Edit::Remove { path } => ("d", path).hash(&mut h),
             }

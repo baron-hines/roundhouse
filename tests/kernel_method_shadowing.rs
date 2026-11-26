@@ -330,7 +330,7 @@ fn methods_on_the_other_side_do_not_shadow_kernel() {
     let source = r#"class KernelCalls
   def load(value) = "instance"
   def self.print(value) = 37
-  def self.read_file(path) = load(path)
+  def self.read_file(path) = load("catalog.rb")
   def printed = print("")
   def self.formatted = format("%s", "kernel")
 end
@@ -347,7 +347,7 @@ end
     run.assert_passes();
     assert_eq!(run.stdout, "kernel\nnil\n");
     let builtin = rbs(
-        "class BuiltinOnly\n  def self.read_file(path) = load(path)\nend\n",
+        "class BuiltinOnly\n  def self.read_file(path) = load(\"catalog.rb\")\nend\n",
         "builtin_only",
     );
     assert!(

@@ -174,6 +174,9 @@ pub enum RenderPartial<'a> {
         partial: &'a str,
         arg: Option<&'a Expr>,
         locals: Option<&'a [(Expr, Expr)]>,
+        /// An explicit `object:`, which Rails binds under the partial's
+        /// `as:` name whatever `locals:` holds.
+        object: Option<&'a Expr>,
     },
     /// `render partial: "stories/listdetail", collection: stories, as:
     /// :story` — the explicit-kwarg collection form: iterate `collection`,
@@ -349,6 +352,7 @@ pub fn classify_render_partial<'a>(
                 partial: value,
                 arg: None,
                 locals: None,
+                object: None,
             }),
             // Explicit kwarg form: `render partial: "x/y", collection: c,
             // as: :item` / `render partial: "x/y", item: rec`.
@@ -393,6 +397,7 @@ pub fn classify_render_partial<'a>(
                 partial: partial.as_str(),
                 arg,
                 locals: Some(entries),
+                object: None,
             })
         }
         _ => None,
@@ -436,6 +441,11 @@ fn classify_object_render_locals<'a>(
         }
         _ => None,
     }
+}
+
+/// A literal `nil` or `false`.
+pub fn is_falsy_lit(e: &Expr) -> bool {
+    matches!(&*e.node, ExprNode::Lit { value: Literal::Nil | Literal::Bool { value: false } })
 }
 
 /// A model's `to_partial_path`: its `model_name.collection` and its
@@ -524,6 +534,7 @@ fn classify_render_kwargs(entries: &[(Expr, Expr)]) -> Option<RenderPartial<'_>>
     let mut dyn_partial: Option<(&Expr, &str)> = None;
     let mut collection: Option<&Expr> = None;
     let mut as_name: Option<&str> = None;
+    let mut object: Option<&Expr> = None;
     let mut first_local: Option<&Expr> = None;
     let mut locals_entries: Option<&[(Expr, Expr)]> = None;
     let mut cached = false;
@@ -546,11 +557,20 @@ fn classify_render_kwargs(entries: &[(Expr, Expr)]) -> Option<RenderPartial<'_>>
                 }
             }
             Some("collection") => collection = Some(v),
-            Some("as") => {
-                if let ExprNode::Lit { value: Literal::Sym { value } } = &*v.node {
-                    as_name = Some(value.as_str());
+            // The record, which is also the single named-partial arg
+            // below.
+            Some("object") => {
+                object = Some(v);
+                if first_local.is_none() {
+                    first_local = Some(v);
                 }
             }
+            // `as: :name` or `as: "name"`: Rails takes `as.to_sym`.
+            Some("as") => match &*v.node {
+                ExprNode::Lit { value: Literal::Sym { value } } => as_name = Some(value.as_str()),
+                ExprNode::Lit { value: Literal::Str { value } } => as_name = Some(value.as_str()),
+                _ => {}
+            },
             // Which formats the partial is looked up in, not a local
             // (`render_formats_option`).
             Some("formats") => {}
@@ -609,6 +629,7 @@ fn classify_render_kwargs(entries: &[(Expr, Expr)]) -> Option<RenderPartial<'_>>
             partial,
             arg: first_local,
             locals: locals_entries,
+            object,
         })
     }
 }
@@ -841,6 +862,12 @@ pub fn classify_view_helper<'a>(
             let slot = extract_sym_or_str(&args[0])?;
             Some(ViewHelperKind::ContentForGetter { slot })
         }
+        // No content reads the slot, as Rails' `content_for` does when
+        // its content is nil or false.
+        ("content_for", 2) if is_falsy_lit(&args[1]) => {
+            let slot = extract_sym_or_str(&args[0])?;
+            Some(ViewHelperKind::ContentForGetter { slot })
+        }
         ("content_for", 2) => {
             let slot = extract_sym_or_str(&args[0])?;
             Some(ViewHelperKind::ContentForSetter {
@@ -1060,6 +1087,84 @@ pub fn view_method_name(stem: &str) -> crate::ident::Symbol {
 
 /// Map a Ruby form method name to the lowered method kind. Rails
 /// accepts both `text_area` and `textarea` as aliases; fold them.
+/// The stock fields each app builder (`class StyledFormBuilder < ActionView::Helpers::FormBuilder`) or a builder it
+/// descends from defines again, keyed by the builder's class path: Rails dispatches them to that override.
+pub fn form_builder_overrides(app: &crate::App) -> crate::det::HashMap<String, crate::det::HashSet<String>> {
+    form_builder_overrides_in(&app.library_classes)
+}
+
+pub fn form_builder_overrides_in(classes: &[crate::dialect::LibraryClass]) -> crate::det::HashMap<String, crate::det::HashSet<String>> {
+    // Every declaration of a name is one class: a reopening names no superclass, and its methods are the class's.
+    let decls = |id: &crate::ident::ClassId| -> Vec<&crate::dialect::LibraryClass> {
+        classes.iter().filter(|l| l.name == *id).collect()
+    };
+    let mut out: crate::det::HashMap<String, crate::det::HashSet<String>> = crate::det::HashMap::default();
+    let mut names: Vec<&crate::ident::ClassId> = classes.iter().map(|c| &c.name).collect();
+    names.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+    names.dedup();
+    for name in names {
+        let mut overrides = crate::det::HashSet::default();
+        let mut current = Some(name.clone());
+        let mut descends = false;
+        for _ in 0..32 {
+            let Some(id) = current.take() else { break };
+            // The class's own methods and its included modules', nested includes too.
+            let mut owners: Vec<&crate::dialect::LibraryClass> = decls(&id);
+            let mut seen: crate::det::HashSet<*const crate::dialect::LibraryClass> = crate::det::HashSet::default();
+            while let Some(owner) = owners.pop() {
+                if !seen.insert(owner as *const _) {
+                    continue;
+                }
+                for m in owner.methods.iter().filter(|m| m.receiver == crate::dialect::MethodReceiver::Instance) {
+                    if classify_form_builder_method(m.name.as_str()).is_some() {
+                        overrides.insert(m.name.as_str().to_string());
+                    }
+                }
+                owners.extend(owner.includes.iter().flat_map(|inc| decls(inc)));
+            }
+            let Some(parent) = decls(&id).iter().find_map(|c| c.parent.clone()) else { break };
+            if parent.0.as_str().trim_start_matches("::") == "ActionView::Helpers::FormBuilder" {
+                descends = true;
+                break;
+            }
+            current = Some(parent);
+        }
+        if descends && !overrides.is_empty() {
+            out.insert(name.0.as_str().to_string(), overrides);
+        }
+    }
+    out
+}
+
+/// The associations each model accepts nested attributes for (`accepts_nested_attributes_for`, or its generated
+/// `<assoc>_attributes=`), keyed by model class and association name, valued true for a collection (has_many).
+pub fn nested_attribute_associations(app: &crate::App) -> crate::det::HashMap<(String, String), bool> {
+    use crate::dialect::{Association, ModelBodyItem};
+    let mut out = crate::det::HashMap::default();
+    for model in &app.models {
+        let accepts = |assoc: &str| {
+            let writer = format!("{assoc}_attributes=");
+            model.body.iter().any(|item| match item {
+                ModelBodyItem::Method { method, .. } => method.name.as_str() == writer,
+                ModelBodyItem::Unknown { expr, .. } => matches!(&*expr.node, crate::expr::ExprNode::Send { recv: None, method, args, .. }
+                    if method.as_str() == "accepts_nested_attributes_for"
+                        && args.iter().any(|a| matches!(&*a.node, crate::expr::ExprNode::Lit { value: crate::expr::Literal::Sym { value } } if value.as_str() == assoc))),
+                _ => false,
+            })
+        };
+        for association in model.associations() {
+            let (name, collection) = match association {
+                Association::HasMany { name, .. } | Association::HasAndBelongsToMany { name, .. } => (name, true),
+                Association::HasOne { name, .. } | Association::BelongsTo { name, .. } => (name, false),
+            };
+            if accepts(name.as_str()) {
+                out.insert((model.name.0.as_str().to_string(), name.as_str().to_string()), collection);
+            }
+        }
+    }
+    out
+}
+
 pub fn classify_form_builder_method(method: &str) -> Option<FormBuilderMethod> {
     match method {
         "label" => Some(FormBuilderMethod::Label),
@@ -1818,7 +1923,7 @@ mod tests {
         let rp =
             classify_render_partial(None, "render", &args, None, &|_| true, &|_| false).unwrap();
         match rp {
-            RenderPartial::Named { partial, arg, locals } => {
+            RenderPartial::Named { partial, arg, locals, .. } => {
                 assert_eq!(partial, "layouts/lightbox");
                 assert!(arg.is_none() && locals.is_none());
             }

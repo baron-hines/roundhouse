@@ -256,8 +256,12 @@ pub(crate) fn responds(surface: &Surface, class: &ClassId, name: &Symbol) -> Opt
             return if private == public { None } else { Some(public) };
         }
         // A signed member (a column, an association, a declared
-        // accessor), which is public.
-        if cls.instance_methods.contains_key(name) {
+        // accessor), which is public. Not a name whose only signature is
+        // a sidecar one for a `def self.name`: that signature describes
+        // the class method, and an instance does not respond to it.
+        let class_side_signature = cls.source_class_methods.contains(name)
+            && cls.sidecar_only_instance_methods.contains(name);
+        if cls.instance_methods.contains_key(name) && !class_side_signature {
             return Some(true);
         }
         if column_method(cls, name) {
@@ -443,6 +447,49 @@ mod tests {
         assert_eq!(ask(&registry, "Snapshot", "shop_id"), Some(false));
         assert_eq!(ask(&registry, "Snapshot", "checksum=="), Some(false), "only the generated suffixes");
         assert_eq!(ask(&registry, "Snapshot", "checksum?="), Some(false));
+    }
+
+    #[test]
+    fn a_class_methods_sidecar_signature_is_not_an_instance_method() {
+        // `#: (String) -> Snapshot?` over `def self.labelled`: analysis
+        // files the signature under instance_methods, with the class
+        // method's source name beside it.
+        let mut registry = registry();
+        let model = registry.get_mut(&id("Snapshot")).unwrap();
+        model.instance_methods.insert(Symbol::from("labelled"), Ty::Nil);
+        model.source_class_methods.insert(Symbol::from("labelled"));
+        model.sidecar_only_instance_methods.insert(Symbol::from("labelled"));
+        let surface = Surface { registry: &registry, model_parents: HashMap::default() };
+        assert_eq!(responds(&surface, &id("Snapshot"), &Symbol::from("labelled")), Some(false));
+        assert_eq!(responds(&surface, &id("Snapshot"), &Symbol::from("digest")), Some(true));
+        // The same name defined on the instance side as well answers.
+        let mut registry = registry;
+        registry.get_mut(&id("Snapshot")).unwrap().source_instance_methods.insert(Symbol::from("labelled"));
+        registry.get_mut(&id("Snapshot")).unwrap().public_instance_methods.insert(Symbol::from("labelled"));
+        let surface = Surface { registry: &registry, model_parents: HashMap::default() };
+        assert_eq!(responds(&surface, &id("Snapshot"), &Symbol::from("labelled")), Some(true));
+    }
+
+    #[test]
+    fn an_accessor_or_association_beside_a_class_method_still_answers() {
+        // `attr_accessor :labelled` and `has_many :tags` register their
+        // names before any sidecar signature, so a sidecar-signed
+        // `def self.labelled` / `def self.tags` does not hide them.
+        let mut registry = registry();
+        let model = registry.get_mut(&id("Snapshot")).unwrap();
+        for name in ["labelled", "labelled=", "tags"] {
+            model.instance_methods.insert(Symbol::from(name), Ty::Untyped);
+        }
+        model.source_class_methods.extend(["labelled", "tags"].map(Symbol::from));
+        // The sidecar loop saw them already registered: not sidecar-only.
+        assert_eq!(ask(&registry, "Snapshot", "labelled"), Some(true));
+        assert_eq!(ask(&registry, "Snapshot", "labelled="), Some(true));
+        assert_eq!(ask(&registry, "Snapshot", "tags"), Some(true));
+        // A class method with only a sidecar signature does not.
+        let model = registry.get_mut(&id("Snapshot")).unwrap();
+        model.sidecar_only_instance_methods.insert(Symbol::from("labelled"));
+        assert_eq!(ask(&registry, "Snapshot", "labelled"), Some(false));
+        assert_eq!(ask(&registry, "Snapshot", "tags"), Some(true));
     }
 
     #[test]

@@ -111,6 +111,9 @@ pub struct RailsDependentGem {
     pub gem: String,
     /// The evidence that requiring the gem reaches Rails.
     pub why: String,
+    /// Read from the lockfile (the gem depends on railties), not written in a project extension.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub inferred: bool,
 }
 
 /// A `runtime_gems` row.
@@ -344,7 +347,7 @@ fn load_gems(
             return Err(bad("rails_dependent rows need a gem and the evidence (why)".into()));
         }
         refused.push(Origin { gem: row.gem.clone(), key: "rails_dependent", file: file.to_string() });
-        loaded.rails_dependent.push(RailsDependentGem { gem: row.gem, why: row.why });
+        loaded.rails_dependent.push(RailsDependentGem { gem: row.gem, why: row.why, inferred: false });
     }
     for row in gems.runtime_gems {
         if row.gem.is_empty() {
@@ -448,7 +451,8 @@ runtime_gems:
             loaded.rails_dependent,
             vec![RailsDependentGem {
                 gem: "widget-engine".into(),
-                why: "requiring it loads 3 Rails framework files".into()
+                why: "requiring it loads 3 Rails framework files".into(),
+                inferred: false,
             }]
         );
         assert_eq!(

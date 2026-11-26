@@ -5,7 +5,141 @@ use crate::ident::Symbol;
 use crate::ty::Ty;
 
 pub fn apply_params_permit_lowering(app: &mut App) {
-    super::for_each_hook_body(app, &mut rewrite);
+    let lists = helper_filter_lists(&app.controllers);
+    let none = HelperLists::default();
+    super::for_each_owned_hook_body(app, &mut |owner, body| {
+        rewrite(body, owner.and_then(|o| lists.get(o)).unwrap_or(&none))
+    });
+}
+
+/// A controller's no-argument methods that answer a literal filter list, by name.
+type HelperLists = crate::det::HashMap<Symbol, Vec<Expr>>;
+
+/// Per controller, the methods it has or inherits whose body is a literal list of Symbols or Strings (`%i[a b]`,
+/// `%w[a b]`, `[:a, "b"]`, optionally `.freeze`), so `permit(*helper)` can be read as the list written inline (as
+/// `permit_splat` does for the typed params chain, #858). The nearest definition wins, and a list a descendant
+/// overrides with another, or that may hide behind a module a descendant includes, is left out.
+fn helper_filter_lists(
+    controllers: &[crate::dialect::Controller],
+) -> crate::det::HashMap<crate::ident::ClassId, HelperLists> {
+    let by_name: crate::det::HashMap<&crate::ident::ClassId, &crate::dialect::Controller> =
+        controllers.iter().map(|c| (&c.name, c)).collect();
+    let mut out = crate::det::HashMap::default();
+    for controller in controllers {
+        let mut lists = HelperLists::default();
+        let mut seen = crate::det::HashSet::default();
+        let mut current = Some(controller);
+        let mut depth = 0;
+        while let Some(c) = current
+            && depth < 32
+        {
+            // A later definition in one class body replaces an earlier one, as Ruby's does.
+            for def in c.actions().collect::<Vec<_>>().into_iter().rev() {
+                if !seen.insert(def.name.clone()) {
+                    continue;
+                }
+                if def.formal_params().is_empty()
+                    && def.block_param.is_none()
+                    && let Some(list) = literal_filter_list(&def.body)
+                {
+                    lists.insert(def.name.clone(), list);
+                }
+            }
+            depth += 1;
+            current = c.parent.as_ref().and_then(|p| by_name.get(p).copied());
+        }
+        if !lists.is_empty() {
+            out.insert(controller.name.clone(), lists);
+        }
+    }
+    // An ancestor's body runs on its descendants too, where `*helper` answers the descendant's own list. A list a
+    // descendant overrides with other names, or with a body that is not a literal list, is not the ancestor's to
+    // write inline.
+    let names_of = |list: &Vec<Expr>| filter_names(list);
+    let overridden: Vec<(crate::ident::ClassId, Symbol)> = out
+        .iter()
+        .flat_map(|(owner, lists)| lists.iter().map(move |(name, list)| (owner, name, list)))
+        .filter(|(owner, name, list)| {
+            controllers.iter().any(|d| {
+                d.name != **owner
+                    && descends_from(d, owner, &by_name)
+                    && (out.get(&d.name).and_then(|l| l.get(*name)).map(names_of) != Some(names_of(list))
+                        || includes_unread_module(d))
+            })
+        })
+        .map(|(owner, name, _)| (owner.clone(), name.clone()))
+        .collect();
+    for (owner, name) in overridden {
+        if let Some(lists) = out.get_mut(&owner) {
+            lists.remove(&name);
+        }
+    }
+    out
+}
+
+/// Whether `controller` still includes or prepends a module after ingest spliced in the concerns it could read (a
+/// gem's, or one the tree does not define): that module's methods are unknown here and may override a helper.
+fn includes_unread_module(controller: &crate::dialect::Controller) -> bool {
+    controller.body.iter().any(|item| {
+        matches!(item, crate::dialect::ControllerBodyItem::Unknown { expr, .. }
+            if matches!(&*expr.node, ExprNode::Send { recv: None, method, .. } if matches!(method.as_str(), "include" | "prepend")))
+    })
+}
+
+/// Whether `ancestor` is on `controller`'s superclass chain.
+fn descends_from(
+    controller: &crate::dialect::Controller,
+    ancestor: &crate::ident::ClassId,
+    by_name: &crate::det::HashMap<&crate::ident::ClassId, &crate::dialect::Controller>,
+) -> bool {
+    let mut parent = controller.parent.as_ref();
+    for _ in 0..32 {
+        let Some(p) = parent else { return false };
+        if p == ancestor {
+            return true;
+        }
+        parent = by_name.get(p).and_then(|c| c.parent.as_ref());
+    }
+    false
+}
+
+/// The elements of a literal list of Symbols or Strings (`%i[a b]`, `["a", :b].freeze`), or `None`.
+fn literal_filter_list(body: &Expr) -> Option<Vec<Expr>> {
+    let body = match &*body.node {
+        ExprNode::Seq { exprs } if exprs.len() == 1 => &exprs[0],
+        _ => body,
+    };
+    let array = match &*body.node {
+        ExprNode::Send { recv: Some(r), method, args, block: None, .. } if method.as_str() == "freeze" && args.is_empty() => r,
+        _ => body,
+    };
+    let ExprNode::Array { elements, .. } = &*array.node else { return None };
+    elements
+        .iter()
+        .all(|e| matches!(&*e.node, ExprNode::Lit { value: Literal::Sym { .. } | Literal::Str { .. } }))
+        .then(|| elements.clone())
+}
+
+/// `permit`'s arguments with each splat of a literal list (`*%i[a b]`) or of a helper answering one
+/// (`*shared_fields`) written inline, or `None` when a splat is neither.
+fn inline_filter_splats(args: &[Expr], lists: &HelperLists) -> Option<Vec<Expr>> {
+    let mut out = Vec::with_capacity(args.len());
+    for arg in args {
+        let ExprNode::Splat { value } = &*arg.node else {
+            out.push(arg.clone());
+            continue;
+        };
+        match &*value.node {
+            ExprNode::Array { .. } => out.extend(literal_filter_list(value)?),
+            ExprNode::Send { recv, method, args, block: None, .. }
+                if args.is_empty() && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)) =>
+            {
+                out.extend(lists.get(method)?.iter().cloned());
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
 }
 
 fn is_param_value(ty: Option<&Ty>) -> bool {
@@ -69,33 +203,129 @@ fn is_required_list(e: &Expr) -> bool {
 /// `params.require(:list).map { |item| ... }`: Rails makes each element an
 /// `ActionController::Parameters` (actionpack 8.1.4), and the runtime's
 /// are String-keyed Hashes, so the element's own calls lower here.
-fn rewrite_element_block(expr: &mut Expr) {
+fn rewrite_element_block(expr: &mut Expr, lists: &HelperLists) {
     let ExprNode::Send { recv: Some(r), method, block: Some(block), .. } = &mut *expr.node else { return };
     if !ELEMENT_BLOCK_METHODS.contains(&method.as_str()) || !is_required_list(r) {
         return;
     }
     let ExprNode::Lambda { params, body, .. } = &mut *block.node else { return };
     let Some(item) = params.first().cloned() else { return };
-    rewrite_element_calls(body, &item);
-}
-
-fn rewrite_element_calls(expr: &mut Expr, item: &Symbol) {
-    if matches!(&*expr.node, ExprNode::Lambda { params, .. } if params.contains(item)) {
+    // A block that reassigns the name holds another value there (`w = { kind: "old" }`): its keys are not the element's.
+    if assigns_local(body, &item) {
         return;
     }
-    expr.node.for_each_child_mut(&mut |c| rewrite_element_calls(c, item));
+    rewrite_element_calls(body, &item, lists);
+}
+
+/// Whether `expr` binds the local `name` anywhere, after which it no longer holds the element. Every binding form
+/// a source program can reach here with: an assignment (`=`, `op=`, `||=`, `&&=`, a multiple assignment), a pattern
+/// binding (`=> w`, `in w`, a `case … in` arm) and a `rescue … => w`. `for w in …` and a named capture
+/// (`/(?<w>…)/ =~ s`) arrive as plain assignments, as ingest desugars them. Not inside a nested block or lambda that
+/// binds its own `name`: that write is to its parameter.
+fn assigns_local(expr: &Expr, name: &Symbol) -> bool {
+    if binds_name(expr, name) {
+        return false;
+    }
+    let is_name = |lv: &crate::expr::LValue| matches!(lv, crate::expr::LValue::Var { name: n, .. } if n == name);
+    let mut found = match &*expr.node {
+        ExprNode::Assign { target, .. } | ExprNode::OpAssign { target, .. } => is_name(target),
+        ExprNode::MultiAssign { targets, .. } => targets.iter().any(is_name),
+        ExprNode::MatchRequired { pattern, .. } | ExprNode::MatchPredicate { pattern, .. } => pattern_binds(pattern, name),
+        ExprNode::CaseMatch { arms, .. } => arms.iter().any(|arm| pattern_binds(&arm.pattern, name)),
+        ExprNode::BeginRescue { rescues, .. } => rescues.iter().any(|r| r.binding.as_ref() == Some(name)),
+        _ => false,
+    };
+    expr.node.for_each_child(&mut |c| found |= assigns_local(c, name));
+    found
+}
+
+/// Whether a match pattern binds the local `name` anywhere in it (`w`, `{ kind: } => w`, `[*w]`, `{ w: }`, `**w`).
+fn pattern_binds(pattern: &crate::expr::MatchPattern, name: &Symbol) -> bool {
+    use crate::expr::{HashRest, MatchPattern};
+    match pattern {
+        MatchPattern::Value { .. } | MatchPattern::Nil => false,
+        MatchPattern::Bind { name: n } => n == name,
+        MatchPattern::Capture { pattern, name: n } => n == name || pattern_binds(pattern, name),
+        MatchPattern::Alt { alternatives } => alternatives.iter().any(|p| pattern_binds(p, name)),
+        MatchPattern::Array { pre, rest, post, .. } => {
+            matches!(rest, Some(Some(n)) if n == name) || pre.iter().chain(post).any(|p| pattern_binds(p, name))
+        }
+        MatchPattern::Find { pre_rest, middle, post_rest, .. } => {
+            pre_rest.as_ref() == Some(name) || post_rest.as_ref() == Some(name) || middle.iter().any(|p| pattern_binds(p, name))
+        }
+        MatchPattern::Hash { pairs, rest, .. } => {
+            matches!(rest, Some(HashRest::Collect { name: n }) if n == name)
+                || pairs.iter().any(|(key, p)| match p {
+                    Some(p) => pattern_binds(p, name),
+                    None => key == name,
+                })
+        }
+    }
+}
+
+/// Whether `expr` is a block or lambda that binds `name` under any parameter kind (`|name|`, `name = {}`, `*name`,
+/// `name:`, `&name`), so `name` inside it is its own value.
+fn binds_name(expr: &Expr, name: &Symbol) -> bool {
+    matches!(&*expr.node, ExprNode::Lambda { params, rest_param, extra_params, block_param, .. }
+        if params.contains(name)
+            || rest_param.as_ref() == Some(name)
+            || block_param.as_ref() == Some(name)
+            || extra_params.iter().any(|p| &p.name == name))
+}
+
+fn rewrite_element_calls(expr: &mut Expr, item: &Symbol, lists: &HelperLists) {
+    // A nested block or lambda that binds the element's name reads its own value there, not the element.
+    if binds_name(expr, item) {
+        return;
+    }
+    expr.node.for_each_child_mut(&mut |c| rewrite_element_calls(c, item, lists));
+    // A write by Symbol key (`item[:kind] = v`, `item[:kind] ||= v`) stores the String key the reads beside it read:
+    // on Rails' Parameters both spellings are one key.
+    if let ExprNode::Assign { target: crate::expr::LValue::Index { recv, index }, .. }
+    | ExprNode::OpAssign { target: crate::expr::LValue::Index { recv, index }, .. } = &mut *expr.node
+        && matches!(&*recv.node, ExprNode::Var { name, .. } if name == item)
+    {
+        if let Some(name) = sym_name(index) {
+            *index = str_lit(index.span, name);
+        }
+        return;
+    }
+    // The same write as one target of a multiple assignment (`item[:kind], other = v, w`).
+    if let ExprNode::MultiAssign { targets, .. } = &mut *expr.node {
+        for target in targets {
+            if let crate::expr::LValue::Index { recv, index } = target
+                && matches!(&*recv.node, ExprNode::Var { name, .. } if name == item)
+                && let Some(name) = sym_name(index)
+            {
+                *index = str_lit(index.span, name);
+            }
+        }
+        return;
+    }
     let ExprNode::Send { recv: Some(r), method, args, block, .. } = &mut *expr.node else { return };
     if !matches!(&*r.node, ExprNode::Var { name, .. } if name == item) {
         return;
     }
     match method.as_str() {
         "permit" | "expect" if block.is_none() => {
-            if let Some(mut new) = element_filter(expr) {
+            // `permit(*shared_fields, :x)`: Rails flattens the filters, so a splat of a literal list is that list.
+            let ExprNode::Send { args, .. } = &*expr.node else { return };
+            let inlined = if args.iter().any(|a| matches!(&*a.node, ExprNode::Splat { .. })) {
+                let Some(args) = inline_filter_splats(args, lists) else { return };
+                let mut e = expr.clone();
+                if let ExprNode::Send { args: slot, .. } = &mut *e.node {
+                    *slot = args;
+                }
+                Some(e)
+            } else {
+                None
+            };
+            if let Some(mut new) = element_filter(inlined.as_ref().unwrap_or(expr)) {
                 new.ty = expr.ty.clone();
                 *expr = new;
             }
         }
-        "[]" | "fetch" | "key?" | "has_key?" | "include?" | "member?" | "dig" => {
+        "[]" | "[]=" | "fetch" | "key?" | "has_key?" | "include?" | "member?" | "dig" => {
             let keys = if method.as_str() == "dig" { args.len() } else { args.len().min(1) };
             for key in args.iter_mut().take(keys) {
                 if let Some(name) = sym_name(key) {
@@ -112,14 +342,7 @@ fn rewrite_element_calls(expr: &mut Expr, item: &Symbol) {
 fn element_filter(e: &Expr) -> Option<Expr> {
     let ExprNode::Send { recv: Some(r), method, args, .. } = &*e.node else { return None };
     let params_const = || Expr::new(e.span, ExprNode::Const { path: vec![Symbol::from("Params")] });
-    let allowed = |names: Vec<String>| {
-        let mut list = Expr::new(e.span, ExprNode::Array {
-            elements: names.into_iter().map(|n| str_lit(e.span, n)).collect(),
-            style: Default::default(),
-        });
-        list.ty = Some(Ty::Array { elem: std::sync::Arc::new(Ty::Str) });
-        send(e.span, Some(params_const()), "allowed_scalars", vec![r.clone(), list])
-    };
+    let allowed = |names: Vec<String>| allowed_scalars(e.span, r, names);
     if method.as_str() == "expect" {
         let [key] = args.as_slice() else { return None };
         let name = sym_name(key)?;
@@ -131,12 +354,43 @@ fn element_filter(e: &Expr) -> Option<Expr> {
     if args.is_empty() {
         return None;
     }
-    Some(allowed(args.iter().map(sym_name).collect::<Option<Vec<_>>>()?))
+    Some(allowed(filter_names(args)?))
 }
 
-fn rewrite(expr: &mut Expr) {
-    rewrite_element_block(expr);
-    expr.node.for_each_child_mut(&mut rewrite);
+/// `params[:spec]&.dig(:arch)`, which ingest binds as `(__safe_nav = params[:spec]) && __safe_nav.dig(:arch)`: the
+/// temporary holds the same params value `params[:spec].dig(:os)` reads, so its Symbol literal keys are the String
+/// keys the request's Hash holds, as the emit writes them for the plain call.
+fn stringify_safe_nav_param_reads(expr: &mut Expr) {
+    let ExprNode::BoolOp { op: crate::expr::BoolOpKind::And, left, right, .. } = &mut *expr.node else { return };
+    let ExprNode::Assign { target: crate::expr::LValue::Var { name: temp, .. }, value } = &*left.node else { return };
+    // A value read out of the request's params, which keeps its String keys. Not any Parameters: a `permit` result
+    // (`params.permit(:a)&.dig(:a)`) is lowered to a Symbol-keyed Hash, which its Symbol read finds.
+    let params_value = is_param_value(value.ty.as_ref())
+        || matches!(&*value.node, ExprNode::Send { recv: Some(r), method, .. } if method.as_str() == "[]" && is_request_params(r));
+    if !temp.as_str().starts_with("__safe_nav") || !params_value {
+        return;
+    }
+    let ExprNode::Send { recv: Some(r), method, args, .. } = &mut *right.node else { return };
+    if !matches!(&*r.node, ExprNode::Var { name, .. } if name == temp) {
+        return;
+    }
+    let keys = match method.as_str() {
+        "dig" => args.len(),
+        // Not `include?` / `member?`: a params value may be an Array, where they test an element, not a key.
+        "[]" | "fetch" | "key?" | "has_key?" => args.len().min(1),
+        _ => 0,
+    };
+    for key in args.iter_mut().take(keys) {
+        if let Some(name) = sym_name(key) {
+            *key = str_lit(key.span, name);
+        }
+    }
+}
+
+fn rewrite(expr: &mut Expr, lists: &HelperLists) {
+    rewrite_element_block(expr, lists);
+    expr.node.for_each_child_mut(&mut |c| rewrite(c, lists));
+    stringify_safe_nav_param_reads(expr);
     // A top-level `params.permit(:a, :b)` CONSUMED IN PLACE, as a call's
     // argument — the Rails 8 authentication generator's
     // `@user.update(params.permit(:password, :password_confirmation))`
@@ -151,6 +405,7 @@ fn rewrite(expr: &mut Expr) {
             }
         }
     }
+    symbolize_permitted_key_args(expr, &crate::det::HashSet::default());
     if parameters_on_hash(expr) {
         return;
     }
@@ -158,10 +413,17 @@ fn rewrite(expr: &mut Expr) {
     let nested = is_param_value(r.ty.as_ref());
     let replacement = match (method.as_str(), args.as_slice()) {
         ("permit!" | "to_unsafe_h", []) if nested || is_request_params(r) => Some(r.clone()),
-        ("permit", keys) if nested && !keys.is_empty() => {
-            let Some(names) = keys.iter().map(sym_name).collect::<Option<Vec<_>>>() else { return };
-            Some(send(expr.span, Some(r.clone()), "slice", names.into_iter().map(|n| str_lit(expr.span, n)).collect()))
-        }
+        ("permit", keys) if nested && !keys.is_empty() => match filter_names(keys) {
+            // The all-Symbol spelling, as main lowers it.
+            Some(names) if keys.iter().all(|k| sym_name(k).is_some()) => {
+                Some(send(expr.span, Some(r.clone()), "slice", names.into_iter().map(|n| str_lit(expr.span, n)).collect()))
+            }
+            // A String or Array-literal filter (`permit("a")`, `permit(%w[a b])`) keeps only scalar values, as Rails'
+            // scalar filter does, with the scalar filter an element's `permit` lowers to: a Hash or an Array is dropped.
+            Some(names) => Some(allowed_scalars(expr.span, r, names)),
+            // maybe's `params.fetch(:q, {}).permit(:search, accounts: [])`: the nested filters a request's own permit takes.
+            None => filtered_call(expr),
+        },
         ("require", [key]) if nested => {
             let Some(name) = sym_name(key) else { return };
             let params = Expr::new(expr.span, ExprNode::Const { path: vec![Symbol::from("Params")] });
@@ -187,6 +449,216 @@ pub(crate) fn rewrite_bare_permits(expr: &mut Expr) {
         *expr = permitted;
     } else if let Some(filtered) = filtered_chain(expr) {
         *expr = filtered;
+    }
+    symbolize_permitted_key_args(expr, &crate::det::HashSet::default());
+}
+
+/// Whether `e` answers the Symbol-keyed Hash a top-level `permit` lowers to (`Params.permitted`, or the `permit` call
+/// still to be lowered), a no-argument call of one of `helpers` that answers it (`permitted_helpers`), or what a call
+/// that keeps its keys answers from either (`params.permit(%w[a b]).merge(c: 1).compact`). By how the value was built,
+/// not by its type: a `Hash[Symbol, String]` the app builds itself keeps Ruby's String-is-not-a-Symbol answers.
+fn from_permitted(e: &Expr, helpers: &crate::det::HashSet<Symbol>) -> bool {
+    if permitted_chain(e).is_some() || is_helper_call(e, helpers) {
+        return true;
+    }
+    // A block can end the call early with `break`, whose value need not hold the receiver's keys, so the walk stops
+    // at any call with a block (`merge(a: 1) { break other }`).
+    let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*e.node else { return false };
+    match method.as_str() {
+        "permitted" => matches!(&*r.node, ExprNode::Const { path } if path.len() == 1 && path[0].as_str() == "Params"),
+        // Any other merged Hash may bring String keys, which a String key argument names in Ruby, so the walk
+        // stops at a `merge` that takes anything but Hash literals with Symbol literal keys.
+        "merge" | "reverse_merge" | "with_defaults" => args.iter().all(is_symbol_keyed_hash) && from_permitted(r, helpers),
+        "compact" | "compact_blank" | "except" | "slice" => from_permitted(r, helpers),
+        _ => false,
+    }
+}
+
+/// A Hash literal whose keys are all Symbol literals (`{ a: 1 }`; no String or computed key, no `**rest`).
+fn is_symbol_keyed_hash(e: &Expr) -> bool {
+    let ExprNode::Hash { entries, .. } = &*e.node else { return false };
+    entries.iter().all(|(k, _)| matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { .. } }))
+}
+
+/// `x_params` or `self.x_params`, with no arguments and no block, naming one of `helpers`.
+fn is_helper_call(e: &Expr, helpers: &crate::det::HashSet<Symbol>) -> bool {
+    matches!(&*e.node, ExprNode::Send { recv, method, args, block: None, .. }
+        if args.is_empty()
+            && helpers.contains(method)
+            && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)))
+}
+
+/// The private helpers with no parameters whose value is the Symbol-keyed Hash a top-level `permit` with literal
+/// names lowers to (`def x_params = params.permit(%w[a b])`), before or after that lowering, so a key-taking call on
+/// their result names its Symbol keys (#2279). Only a straight-line body whose last statement is the permit: a body
+/// with a `return` may answer something else, and a memoized `@x ||= params.permit(...)` answers whatever the ivar
+/// already holds, so neither counts.
+pub(crate) fn permitted_helpers(privs: &[crate::dialect::Action]) -> crate::det::HashSet<Symbol> {
+    let none = crate::det::HashSet::default();
+    privs
+        .iter()
+        .filter(|a| a.params.fields.is_empty() && !has_return(&a.body) && from_permitted(value_tail(&a.body), &none))
+        .map(|a| a.name.clone())
+        .collect()
+}
+
+/// What a body answers: its last statement.
+fn value_tail(e: &Expr) -> &Expr {
+    match &*e.node {
+        ExprNode::Seq { exprs } if !exprs.is_empty() => value_tail(exprs.last().unwrap()),
+        _ => e,
+    }
+}
+
+/// Whether `e` holds a `return` anywhere.
+fn has_return(e: &Expr) -> bool {
+    if matches!(&*e.node, ExprNode::Return { .. }) {
+        return true;
+    }
+    let mut found = false;
+    e.node.for_each_child(&mut |c| found = found || has_return(c));
+    found
+}
+
+/// `x_params.except("a")` → `x_params.except(:a)` for each of `helpers` (`permitted_helpers`), as
+/// `symbolize_permitted_key_args` does on the `permit` written inline.
+pub(crate) fn symbolize_permitted_helper_reads(expr: &mut Expr, helpers: &crate::det::HashSet<Symbol>) {
+    if helpers.is_empty() {
+        return;
+    }
+    expr.node.for_each_child_mut(&mut |c| symbolize_permitted_helper_reads(c, helpers));
+    symbolize_permitted_key_args(expr, helpers);
+}
+
+/// `params.permit(%w[a b]).except("a")` → `.except(:a)`. Rails' Parameters take a String key as they take a Symbol,
+/// and the Hash `permit` lowered to holds Symbol keys, so a String key name on it is its Symbol: a String literal
+/// becomes the Symbol, `*%w[a]` becomes `*%i[a]`, another String `key.to_sym`, another splatted String Array
+/// `*keys.map { |x| x.to_sym }` (#2279). A Hash literal `merge` takes keeps its keys as written.
+fn symbolize_permitted_key_args(expr: &mut Expr, helpers: &crate::det::HashSet<Symbol>) {
+    let ExprNode::Send { recv: Some(r), method, args, .. } = &mut *expr.node else { return };
+    if !from_permitted(r, helpers) {
+        return;
+    }
+    match method.as_str() {
+        "except" | "slice" | "values_at" => args.iter_mut().for_each(symbolize_key),
+        // One key: a splatted list may carry more than the key (`fetch(*%w[a default])`), so only its first element is
+        // the key (#2293). `dig` walks nested values, whose keys this Hash does not hold, so its splat stays as written.
+        "[]" | "fetch" | "key?" | "has_key?" | "include?" | "member?" | "delete" | "dig" => {
+            let splat_list = method.as_str() != "dig" && args.first().is_some_and(|a| matches!(&*a.node, ExprNode::Splat { .. }));
+            if splat_list {
+                symbolize_first_of_splat(args);
+            } else if let Some(first) = args.first_mut()
+                && !matches!(&*first.node, ExprNode::Splat { .. })
+            {
+                symbolize_key(first);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A one-key lookup whose arguments start with a splatted list: the list's first element is the key, the rest the
+/// default. A literal list is written out, its first String the Symbol (`fetch(*%w[a b])` → `fetch(:a, "b")`); a
+/// String Array variable reads its first element as the key (`fetch(*keys)` → `fetch(keys[0].to_sym, *keys.drop(1))`).
+/// Any other splat stays as written.
+fn symbolize_first_of_splat(args: &mut Vec<Expr>) {
+    let ExprNode::Splat { value } = &*args[0].node else { return };
+    let value = value.clone();
+    let span = args[0].span;
+    if let ExprNode::Array { elements, .. } = &*value.node {
+        // A nested splat first (`fetch(*[*%w[a b]])`) holds the default too, which must not become a Symbol: as written.
+        if elements.is_empty() || matches!(&*elements[0].node, ExprNode::Splat { .. }) {
+            return;
+        }
+        let mut spread: Vec<Expr> = elements.clone();
+        symbolize_key(&mut spread[0]);
+        args.splice(0..1, spread);
+        return;
+    }
+    // Only a variable that is the whole argument list: with more arguments after it (`fetch(*keys, :body)`) an empty
+    // list leaves the key to them, which `keys[0]` would not, so it stays as written.
+    let pure = matches!(&*value.node, ExprNode::Var { .. } | ExprNode::Ivar { .. });
+    if args.len() != 1 || !pure || !matches!(&value.ty, Some(Ty::Array { elem }) if **elem == Ty::Str) {
+        return;
+    }
+    let mut zero = Expr::new(span, ExprNode::Lit { value: Literal::Int { value: 0 } });
+    zero.ty = Some(Ty::Int);
+    let mut first = send(span, Some(value.clone()), "[]", vec![zero]);
+    first.ty = Some(Ty::Str);
+    let mut key = send(span, Some(first), "to_sym", vec![]);
+    key.ty = Some(Ty::Sym);
+    let mut one = Expr::new(span, ExprNode::Lit { value: Literal::Int { value: 1 } });
+    one.ty = Some(Ty::Int);
+    let mut rest = send(span, Some(value.clone()), "drop", vec![one]);
+    rest.ty = value.ty.clone();
+    let mut splat = Expr::new(span, ExprNode::Splat { value: rest });
+    splat.ty = args[0].ty.clone();
+    args.splice(0..1, [key, splat]);
+}
+
+/// A String literal → its Symbol; false for anything else.
+fn symbolize_literal(e: &mut Expr) -> bool {
+    let ExprNode::Lit { value: Literal::Str { value } } = &*e.node else { return false };
+    let sym = Symbol::from(value.as_str());
+    *e.node = ExprNode::Lit { value: Literal::Sym { value: sym } };
+    e.ty = Some(Ty::Sym);
+    true
+}
+
+/// One key argument: a String literal, a splatted String Array literal, or another String (or splatted String Array).
+fn symbolize_key(arg: &mut Expr) {
+    if symbolize_literal(arg) {
+        return;
+    }
+    let span = arg.span;
+    let sym_array = || Some(Ty::Array { elem: std::sync::Arc::new(Ty::Sym) });
+    if let ExprNode::Splat { value } = &mut *arg.node {
+        if let ExprNode::Array { elements, style } = &mut *value.node {
+            if !elements.is_empty() && elements.iter().all(|e| matches!(&*e.node, ExprNode::Lit { value: Literal::Str { .. } })) {
+                for element in elements.iter_mut() {
+                    symbolize_literal(element);
+                }
+                if *style == crate::expr::ArrayStyle::PercentW {
+                    *style = crate::expr::ArrayStyle::PercentI;
+                }
+                value.ty = sym_array();
+                arg.ty = Some(Ty::Sym);
+            }
+            return;
+        }
+        if !matches!(&value.ty, Some(Ty::Array { elem }) if **elem == Ty::Str) {
+            return;
+        }
+        // `*keys` → `*keys.map { |x| x.to_sym }`.
+        let x = Symbol::from("x");
+        let mut var = Expr::new(span, ExprNode::Var { id: crate::ident::VarId(0), name: x.clone() });
+        var.ty = Some(Ty::Str);
+        let mut body = send(span, Some(var), "to_sym", vec![]);
+        body.ty = Some(Ty::Sym);
+        let block = Expr::new(span, ExprNode::Lambda {
+            extra_params: Vec::new(),
+            params: vec![x],
+            rest_param: None,
+            block_param: None,
+            body,
+            block_style: crate::expr::BlockStyle::Brace,
+        });
+        let mut mapped = Expr::new(span, ExprNode::Send {
+            recv: Some(value.clone()),
+            method: Symbol::from("map"),
+            args: vec![],
+            block: Some(block),
+            parenthesized: false,
+        });
+        mapped.ty = sym_array();
+        *value = mapped;
+        arg.ty = Some(Ty::Sym);
+        return;
+    }
+    if matches!(arg.ty, Some(Ty::Str)) {
+        let mut to_sym = send(span, Some(arg.clone()), "to_sym", vec![]);
+        to_sym.ty = Some(Ty::Sym);
+        *arg = to_sym;
     }
 }
 
@@ -253,7 +725,7 @@ fn filtered_call(e: &Expr) -> Option<Expr> {
     let ExprNode::Send { recv: Some(r), args, .. } = &*e.node else { return None };
     let (last, scalars) = args.split_last()?;
     let ExprNode::Hash { entries, .. } = &*last.node else { return None };
-    let names = scalars.iter().map(sym_name).collect::<Option<Vec<_>>>()?;
+    let names = filter_names(scalars)?;
     let nested = nested_candidates(e, &crate::ident::ClassId(Symbol::from("")));
     // A key the parser could not read (`k: [{ … }]`) would be dropped silently.
     if entries.is_empty() || nested.len() != entries.len() {
@@ -297,7 +769,7 @@ fn permitted_chain(e: &Expr) -> Option<Expr> {
     if method.as_str() != "permit" || args.is_empty() || !is_request_params(r) || is_param_value(r.ty.as_ref()) {
         return None;
     }
-    let names = args.iter().map(sym_name).collect::<Option<Vec<_>>>()?;
+    let names = filter_names(args)?;
     let params_const = || Expr::new(e.span, ExprNode::Const { path: vec![Symbol::from("Params")] });
     let mut acc = Expr::new(e.span, ExprNode::Hash { entries: vec![], kwargs: false });
     acc.ty = Some(permitted_ty());
@@ -312,6 +784,37 @@ fn permitted_chain(e: &Expr) -> Option<Expr> {
 /// What `Params.permitted` answers: the Symbol-keyed scalars.
 fn permitted_ty() -> Ty {
     Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Str) }
+}
+
+/// The names a `permit` filter list spells, as Rails' `permit(*filters)` reads them: a Symbol or a String literal, or an
+/// Array literal of those (`permit(%w[a b])`, `permit("a", "b")`), flattened. `None` for anything else.
+fn filter_names(args: &[Expr]) -> Option<Vec<String>> {
+    let mut names = Vec::new();
+    for arg in args {
+        match &*arg.node {
+            ExprNode::Array { elements, .. } => names.extend(filter_names(elements)?),
+            _ => names.push(filter_name(arg)?),
+        }
+    }
+    Some(names)
+}
+
+fn filter_name(e: &Expr) -> Option<String> {
+    match &*e.node {
+        ExprNode::Lit { value: Literal::Str { value } } => Some(value.clone()),
+        _ => sym_name(e),
+    }
+}
+
+/// `Params.allowed_scalars(recv, ["a", "b"])`: the named keys of `recv` whose values are not a Hash or an Array.
+fn allowed_scalars(span: crate::span::Span, recv: &Expr, names: Vec<String>) -> Expr {
+    let mut list = Expr::new(span, ExprNode::Array {
+        elements: names.into_iter().map(|n| str_lit(span, n)).collect(),
+        style: Default::default(),
+    });
+    list.ty = Some(Ty::Array { elem: std::sync::Arc::new(Ty::Str) });
+    let params_const = Expr::new(span, ExprNode::Const { path: vec![Symbol::from("Params")] });
+    send(span, Some(params_const), "allowed_scalars", vec![recv.clone(), list])
 }
 
 fn sym_name(e: &Expr) -> Option<String> {
@@ -429,9 +932,14 @@ fn parameters_on_hash(expr: &mut Expr) -> bool {
             *key = text;
             false
         }
-        // Not a literal key: the emit's coercion writes those as Rails reads them.
+        // Not a literal key: the emit's coercion writes those as Rails reads them. Not a splatted list either, which
+        // is the key and the default (`fetch(*%w[a b])`), not one key, nor a Symbol key on a `permit` result, which
+        // the permit lowering already named as its Hash's Symbol key (`fetch(*keys)`'s `keys[0].to_sym`, #2293).
         ("[]" | "fetch" | "key?" | "has_key?", [key, ..])
-            if !matches!(key.ty, Some(Ty::Str)) && !matches!(&*key.node, ExprNode::Lit { .. }) =>
+            if !matches!(key.ty, Some(Ty::Str))
+                && !matches!(&*key.node, ExprNode::Lit { .. } | ExprNode::Splat { .. })
+                && !(matches!(key.ty, Some(Ty::Sym))
+                    && matches!(&*r.node, ExprNode::Send { method: m, .. } if m.as_str() == "permit")) =>
         {
             let sym = key.clone();
             let mut text = send(span, Some(sym), "to_s", vec![]);

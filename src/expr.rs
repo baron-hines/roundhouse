@@ -21,8 +21,20 @@ use crate::ty::Ty;
 /// The source reference names a modeled class or module. The Ruby emitter
 /// uses its resolved `Ty::Class` when it changes lexical nesting.
 pub const RESOLVED_CLASS_REF: u64 = 1 << 2;
+/// An empty `{}` / `[]` seed whose type a later write in its body refined and stamped back: the next analysis of
+/// the body starts it from that stamp less its unknown arms, which an earlier round's untyped ivars left there.
+pub const REFINED_EMPTY_SEED: u64 = 1 << 45;
+/// A receiverless call the source wrote with empty parentheses (`h()`): the Ruby emit keeps them, as bare the name
+/// reads a local of the same name. A synthesized call's `parenthesized` is a default and says nothing.
+pub const WRITTEN_EMPTY_PARENS: u64 = 1 << 46;
+/// An `include M` written in a Concern's `class_methods do … end`: Ruby's ClassMethods includes M, so M's methods are
+/// the includer's class methods (`ingest::app::class_methods_includes` copies them onto the Concern's class side).
+pub const CLASS_METHODS_INCLUDE: u64 = 1 << 47;
 /// The value is a proven class/module object, rather than a nominal instance.
 pub const CLASS_OBJECT_VALUE: u64 = 1 << 5;
+/// The receiver of `base.extend(M)` in a module's `extended(base)` hook: the class Ruby hands the hook, so the
+/// `extend` is that class's, not `Object#extend` (`lower::object_extend`).
+pub const MIXIN_HOOK_BASE: u64 = 1 << 41;
 /// Positive instance provenance for generated model-indexer key lowering.
 /// A nominal `Ty::Class` alone is not instance evidence.
 pub const INDEXER_INSTANCE_VALUE: u64 = 1 << 39;
@@ -102,6 +114,12 @@ pub const HELPER_BODY_TRANSLATE: u64 = 1 << 18;
 /// replays where the source has it (`ingest::app_extension_calls`).
 pub const REPLAYED_CLASS_BODY: u64 = 1 << 19;
 
+/// A model's class-body `prepend Concern`, whose `prepended do` items the
+/// concern splice carried into the body and whose line the Ruby family
+/// writes back (the module's instance methods then sit ahead of the
+/// class's own, reaching them through `super`).
+pub const CONCERN_PREPEND: u64 = 1 << 60;
+
 /// A value-only inherited call: non-Ruby targets retain their previous warning.
 pub const INHERITED_CLASS_BODY: u64 = 1 << 52;
 
@@ -154,6 +172,13 @@ pub const CONST_PATH: u64 = 1 << 25;
 /// and JRuby trees write it back where the source has it, among the
 /// class's methods; every other target drops it and reports it.
 pub const BODY_STATEMENT: u64 = 1 << 27;
+
+/// A library class or module body statement that calls a method on a
+/// constant the same body assigns (`SWATCHES.push(Swatch.new("teal"))`),
+/// making only calls the app answers (`ingest::body_statements`). Plain
+/// Ruby every Ruby-family tree runs, Spinel's too, so each writes it back
+/// where the source has it, among the constants it reads and writes.
+pub const CONSTANT_STATEMENT: u64 = 1 << 40;
 
 /// On a body statement or a constant's value: the source wrote it inside
 /// the class's own `class << self`, where Ruby runs it with the singleton
@@ -209,8 +234,24 @@ pub const GUARDED_NAME_ERROR: u64 = 1 << 55;
 pub const UNCALLED_DEFINER: u64 = 1 << 56;
 /// An integer literal wider than 64 bits, built from 32-bit limbs: the ruby family's Integer holds it, a fixed-width one does not.
 pub const WIDE_INTEGER_LITERAL: u64 = 1 << 57;
+/// The body ingest read an `ActiveRecord::Base.connected_to(role: :writing)` block as, the call dropped. An app that
+/// switches roles gets the call back (`ingest::database_ownership`): inside a reading block it is what lifts the guard.
+pub const ERASED_WRITING_SCOPE: u64 = 1 << 61;
+/// On an argument analyze typed as the relation a has_many read is (`analyze::relation_params`): the read the lowering seeds.
+pub const RELATION_ARGUMENT: u64 = 1 << 42;
+/// On an operator's receiver whose non-nil arm defines the operator (`Money? * 2`): Ruby raises only for nil.
+pub const NILABLE_OPERATOR_RECEIVER: u64 = 1 << 43;
+/// On a number operator's operand whose class defines `coerce` and the operator (`2.5 * money`): Ruby asks the
+/// operand to coerce, and its own operator answers.
+pub const COERCED_OPERAND: u64 = 1 << 44;
 /// On `x ||= v` where analyze typed the local `x` as never nil nor false: Ruby never assigns, so `v` is dead.
 pub const DEAD_OR_ASSIGN: u64 = 1 << 58;
+/// A class-body `include M` / `prepend M` standing for a file's top-level `X.include(M)` / `X.prepend(M)`: the
+/// opening of `X` it sits in waits for `X`'s declaration to give it its kind (`ingest::top_level_mixins`).
+pub const TOP_LEVEL_MIXIN: u64 = 1 << 62;
+/// A read of a platform's own constant (`Socket::SOL_TCP`) in a load-time branch its `Socket.const_defined?` guards:
+/// it runs only where the platform defines it (`ingest::platform_guards`).
+pub const PLATFORM_GUARDED_CONST: u64 = 1 << 63;
 
 /// On a route-helper call `lower::route_format_suffix` renamed for its
 /// literal `format:` (`widget_url(w, format: :json)` to
@@ -419,10 +460,18 @@ fn deserialize_cold<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Box
 
 // A field that grows `Expr` grows every tree about fourfold (see
 // `ExprCold`). Put rare data in `ExprCold` instead of raising these.
+// Every node is one `ExprNode` allocation, and the allocator (mimalloc)
+// rounds it up to a size class: 248 bytes take the 256 class, past 256 a
+// node takes 320 (296 took 320, 392 took 448). The largest variants are
+// `If` (three `Expr`s) and `OpAssign`; rare large payloads are boxed
+// (`Ty::Fn`, `BeginRescue`'s `else_branch` and `ensure`). `Ty` sits
+// inline in `Expr::ty`.
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(std::mem::size_of::<Expr>() <= 120);
+const _: () = assert!(std::mem::size_of::<Expr>() <= 80);
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(std::mem::size_of::<ExprNode>() <= 392);
+const _: () = assert!(std::mem::size_of::<ExprNode>() <= 256);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<crate::ty::Ty>() <= 32);
 
 fn is_zero_u64(v: &u64) -> bool {
     *v == 0
@@ -865,11 +914,15 @@ pub enum ExprNode {
     /// `RescueModifier` instead. An `implicit` begin arises when a
     /// `def` body contains trailing `rescue` clauses — same shape, no
     /// surface `begin` keyword.
+    ///
+    /// `else_branch` and `ensure` are boxed: inline they made this rare
+    /// variant (0.35% of nodes) the largest, and so the size of every
+    /// `ExprNode`.
     BeginRescue {
         body: Expr,
         rescues: Vec<RescueClause>,
-        else_branch: Option<Expr>,
-        ensure: Option<Expr>,
+        else_branch: Option<Box<Expr>>,
+        ensure: Option<Box<Expr>>,
         #[serde(default)]
         implicit: bool,
     },

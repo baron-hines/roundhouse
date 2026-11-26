@@ -635,8 +635,8 @@ fn every_runtime_method_body_is_fully_typed() {
                     // (`each_row`'s `row`). Dispatch answers the `Fn`'s
                     // return either way.
                     let ret_ty = match ty {
-                        Ty::Fn { block: Some(_), .. } => ty,
-                        Ty::Fn { ret, .. } => std::sync::Arc::unwrap_or_clone(ret),
+                        Ty::Fn(fn_ty) if fn_ty.block.is_some() => Ty::Fn(fn_ty),
+                        Ty::Fn(fn_ty) => std::sync::Arc::unwrap_or_clone(fn_ty.ret),
                         other => other,
                     };
                     (name, ret_ty)
@@ -836,7 +836,7 @@ fn every_runtime_method_body_concretely_typed() {
             let entry = class_registry.entry(short_id(&class_id)).or_default();
             for (name, ty) in methods {
                 let ret_ty = match ty {
-                    Ty::Fn { ret, .. } => std::sync::Arc::unwrap_or_clone(ret),
+                    Ty::Fn(fn_ty) => std::sync::Arc::unwrap_or_clone(fn_ty.ret),
                     other => other,
                 };
                 entry.instance_methods.insert(name, ret_ty);
@@ -1336,7 +1336,73 @@ fn every_runtime_method_body_concretely_typed() {
     // value that is Rails' Parameters or a typed params object; Rack::Utils.escape takes what OmniAuth's failure
     // redirect hands it; increment/decrement_counter read their options. Raise to 986, preserving the two-site
     // headroom.
-    const CEILING: usize = 986;
+    // MEASURED 985 on integer query casts (main 6b6dab7e2: 981): Relation's
+    // integer_list_predicate reads the elements of a hash condition's
+    // untyped Array (+4 in active_record/relation.rb); its typed helpers
+    // add none. Within the ceiling, which is unchanged.
+    // MEASURED 989 on relation async_count (main ca6fe1626: 986): Rails'
+    // `ActiveRecord::Promise` holds a count, a grouped count's Hash or a
+    // `then` block's value, a type parameter RBS here cannot declare, so
+    // its `value` and `then` read an untyped value (+3 in
+    // active_record/relation.rb; `analyze::promise` types the call sites).
+    // MEASURED 990 on scoping: `Relation#scoping` answers what its block
+    // gives (+3 in active_record/relation.rb), and `Model.unscoped { }`
+    // now runs its block through it (-2 in active_record/connection.rb).
+    // MEASURED 991 on partial-select reads (990): `read_attribute` answers
+    // nil for a column a partial `select` left out before it reads the
+    // untyped `self[name]`, so its body is a sequence ending in that read
+    // (+1 in active_record/connection.rb).
+    // MEASURED 993 on unscoped's block value (991): `Model.unscoped { }`
+    // pushes its bare relation and binds its own block's value rather than
+    // answering `scoping`'s, so the Spinel binary keeps it (+2 in
+    // active_record/connection.rb).
+    // MEASURED 996 on PostgreSQL array columns (main 6c9c58dc5: 991): a bulk
+    // write (`update_all`, `insert_all`, `upsert_all`) now passes each value
+    // through `Model._written_sql(column, value)`, which hands an Array to the
+    // model's `encode_written` and quotes the rest. Both take a column
+    // value of any type, as `escape_value` does, so their untyped `value`
+    // adds 5 sites (+5 in active_record/connection.rb); every other file is
+    // unchanged. Raise to 998, preserving the two-site headroom.
+    // MEASURED 1003 on relation predicate blocks (main e942cef18: 998):
+    // Relation's any?, none?, one?, many? and count take a block that
+    // decides over the loaded records, one block-result site each, as
+    // filter_map's (+5 in active_record/relation.rb); every other file is
+    // unchanged. Main had no headroom left, so the ceiling is the measure.
+    // MEASURED 1004 on routed connection handles (main 105a34827: 1003):
+    // `ActiveRecord::Base.with_connection` answers what its block gives
+    // (+1 in active_record/connection.rb), as `transaction` does. The
+    // handle, `lease_connection` and the Db slot calls are typed and add
+    // none; every other file is unchanged. The ceiling is the measure.
+    // MEASURED 1006 on a held `with_connection` (1004): its block runs
+    // inside the handle's slot and binds its value before the slot is
+    // left, so the Spinel binary keeps it, as `Model.unscoped { }` does.
+    // `result = yield handle` and the `begin ... ensure` holding it are
+    // the block's untyped value (+2 in active_record/connection.rb);
+    // `_hold_slot`, `_release_slot` and the handle are typed and add none.
+    // MEASURED 1006 on merging main 3362ae95e (main: 1003): the same three
+    // sites in active_record/connection.rb; every other file equals main's.
+    // MEASURED 1006 after separating handle holds from model routing:
+    // `Db.hold_slot` remains typed; no additional gradual sites.
+    // Raise to 1008, preserving the two-site headroom.
+    // MEASURED 1010 on PostgreSQL uuid casts (base 7d9513597: 1006):
+    // Relation#uuid_list_predicate reads the elements of a hash
+    // condition's untyped Array, as integer_list_predicate does (+4 in
+    // active_record/relation.rb). UuidCast.cast_text and
+    // uuid_value_predicate take a typed scalar and add none; every other
+    // file is unchanged. The ceiling is the measure.
+    // MEASURED 1012 on merging main 81b6491fc (main's ceiling 1008, its
+    // headroom used) with the uuid casts' +4, which add up; the unsaved
+    // record's `IS NULL` arm adds none here.
+    // MEASURED 1013 on responders' renderer constants (1012):
+    // `ActionController::MissingRenderer#initialize`'s `super` reaches
+    // LoadError's, which no runtime signature declares (+1 in
+    // action_controller/parameter_missing.rb); `Renderers::RENDERERS` adds
+    // none. The ceiling is the measure.
+    // MEASURED 1014 on ActiveStorage::Current.set (1013): `set` answers what
+    // its block gives (+1 in active_storage.rb), as `transaction` does; the
+    // thread-held url_options are read through `.to_s` and add none.
+    // The ceiling is the measure.
+    const CEILING: usize = 1014;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}"

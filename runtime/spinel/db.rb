@@ -39,7 +39,9 @@
 # `bind_text` is unblocked at the FFI layer (spinel #576 +
 # matz/spinel#686 doc fix).
 #
-# Module-level state is `@pools`, N independent DbPool shards of M opaque
+# Module-level state is `@slots`: one DbSlot per database and role the
+# app reaches (one, for an app on one database), each holding `pools`,
+# N independent DbPool shards of M opaque
 # dbh ptrs each (see `configure` for why it is sharded rather than one
 # opaque dbh ptrs). `Db.current_conn` reads Thread.current[:db_conn] when
 # set (request-scoped checkout) and falls back to the pool's first free
@@ -1197,13 +1199,22 @@ class DbPool
   # Pop a free connection index (LIFO), parking this green thread while
   # the pool is empty: `release` signals. (The lease used to spin on a
   # scheduler pause; a condition variable is the shape for threads.)
-  def lease
-    idx = 0
+  # With a `timeout`, -1 when none came free within it.
+  def lease(timeout = 0.0)
+    idx = -1
     @lock.synchronize do
-      while @free.length == 0
-        @cv.wait(@lock)
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+      expired = false
+      while @free.length == 0 && !expired
+        if timeout <= 0.0
+          @cv.wait(@lock)
+        elsif deadline > Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          @cv.wait(@lock, deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC))
+        else
+          expired = true
+        end
       end
-      idx = @free.delete_at(@free.length - 1)
+      idx = @free.delete_at(@free.length - 1) if !expired
     end
     idx
   end
@@ -1278,6 +1289,60 @@ class DbPool
   end
 end
 
+# The write permit of one database file, shared by every pool slot open
+# on that file. See `Db.acquire_permit`.
+class DbPermit
+  attr_reader :lock, :cv
+  attr_accessor :held, :checkpointing
+
+  def initialize
+    @lock = Mutex.new
+    @cv = ConditionVariable.new
+    @held = false
+    @checkpointing = false
+  end
+end
+
+# One pool slot: Rails' ConnectionPool for one shard and role. Two roles
+# on one file are two slots that share the file's write permit.
+# `replica` (`replica: true`) refuses writes whatever the scope says.
+class DbSlot
+  attr_reader :path, :pools, :permit, :replica
+  attr_accessor :closed
+
+  def initialize(path, pools, permit, replica)
+    @path = path
+    @pools = pools
+    @permit = permit
+    @replica = replica
+    @closed = false
+  end
+end
+
+# One `connected_to` block running on a thread. A nil role or shard
+# inherits; `global` is a block on ActiveRecord::Base itself; `slot` is
+# -1 when no pool is defined for it; `held` is the lease it set aside.
+# A parked frame holds a handle's lease without selecting its slot for models.
+class DbScope
+  attr_reader :global, :role, :shard, :prevent
+  attr_accessor :slot, :held, :from, :lease, :parked, :connection, :home, :pool
+
+  def initialize(global, role, shard, prevent)
+    @global = global
+    @role = role
+    @shard = shard
+    @prevent = prevent
+    @slot = 0
+    @held = nil
+    @from = 0
+    @lease = -1
+    @parked = false
+    @connection = nil
+    @home = nil
+    @pool = nil
+  end
+end
+
 # Temporal intrinsics (`ActiveSupport.parse_db_time` in the synthesized
 # column readers, `db_now` in fill_timestamps) — chained off Db, the one
 # require every persistence-touching bootstrap (main.rb AND the emitted
@@ -1296,7 +1361,9 @@ module Db
   # pool object (DbPool, below) keeps its connections in an INSTANCE-ivar
   # array, which spinel types as a concrete DbConn PtrArray (same shape as
   # DbConn#@entries) — preserving the object tag.
-  @pools = nil
+  # Slot 0 is the database `configure` opened (Rails' primary); `route`
+  # adds one per shard and role.
+  @slots = nil
   # Query-log capture (issue #27). `nil` ⇒ not capturing; an Array ⇒
   # accumulate the SQL each prepare/exec issues. Kept in parity with the
   # cruby shim (db_cruby.rb); see `capture_sql` below.
@@ -1309,11 +1376,14 @@ module Db
   @sql_trace = false
   # The write permit, the bounded wait for it, and the background
   # checkpointer — see `acquire_permit` and `checkpoint_in_background!`.
-  @permit_lock = Mutex.new
-  @permit_cv = ConditionVariable.new
-  @permit_held = false
   @write_permit_timeout = 5.0
-  @checkpoint_wanted = false
+  # Each file's permit, kept across `close`: a checkpoint loop outlives
+  # the pools it was started for, and must queue with the writers of a
+  # later `configure` on the same file.
+  @permits = {}
+  # Rails' `checkout_timeout`, for a thread that holds a lease and selects
+  # another pool: two that each hold what the other waits for raise.
+  @checkout_timeout = 5.0
   @db_path = ""
   CHECKPOINT_INTERVAL = 0.25
   CHECKPOINT_RESTART_FRAMES = 8192 # ~32 MB of 4 KB pages
@@ -1352,35 +1422,380 @@ module Db
     # Threads are assigned round-robin, so shards carry equal numbers of them;
     # sizing keeps at least 4 handles per shard, since a shard of one is a
     # mutex with extra steps.
+    # One permit per database file, keyed by its expanded path so that
+    # `data.sqlite3` and `./data.sqlite3` share it; the slot opens `path`
+    # as given.
+    key = File.expand_path(path)
+    @permits[key] = DbPermit.new if !@permits.key?(key)
+    @slots = [DbSlot.new(path, open_pools(path, n), @permits[key], false)]
+    @route_shards = [:default]
+    @route_roles = [:writing]
+    @route_slots = [0]
+    @default_shard = :default
+    @routed = false
+    @assign_lock = Mutex.new
+    @next_pool = 0
+    # >>> generated: database-routes
+    # <<< generated: database-routes
+  end
+
+  def self.open_pools(path, n)
     stripes = n / 4
     stripes = 1 if stripes < 1
     stripes = 8 if stripes > 8
-    @pools = []
+    pools = []
     per = n / stripes
     per = 1 if per < 1
     i = 0
     while i < stripes
-      @pools.push(DbPool.new(path, per))
+      pools.push(DbPool.new(path, per))
       i += 1
     end
-    @assign_lock = Mutex.new
-    @next_pool = 0
+    pools
+  end
+
+  def self.mkdir_parent(path)
+    begin
+      Dir.mkdir(path)
+    rescue Errno::EEXIST
+      raise unless Dir.exist?(path)
+    end
+    nil
+  end
+
+  # Register the pool of one shard and role: Rails' `connects_to`,
+  # resolved at build time. An empty `path` is the primary, slot 0.
+  # `schema` creates the tables, only for a writable configuration that
+  # names the app's schema file.
+  def self.route(shard, role, path, replica, schema, n)
+    index = 0
+    if path != ""
+      if schema && !replica
+        directory = File.dirname(path)
+        parent = directory.start_with?("/") ? "/" : ""
+        directory.split("/").each do |part|
+          if !part.empty?
+            parent += "/" if !parent.empty? && parent != "/"
+            parent += part
+            mkdir_parent(parent) unless Dir.exist?(parent)
+          end
+        end
+      end
+      key = File.expand_path(path)
+      @permits[key] = DbPermit.new if !@permits.key?(key)
+      @slots.push(DbSlot.new(path, open_pools(path, n), @permits[key], replica))
+      index = @slots.length - 1
+      if schema
+        conn = @slots[index].pools[0].first
+        Schema.statements.each { |sql| exec_raw(conn, ActiveRecord::Relation.inline_sql(sql)) }
+      end
+    end
+    known = false
+    i = 0
+    while i < @route_slots.length
+      if @route_shards[i] == shard && @route_roles[i] == role
+        @route_slots[i] = index
+        known = true
+      end
+      i += 1
+    end
+    if !known
+      @route_shards.push(shard)
+      @route_roles.push(role)
+      @route_slots.push(index)
+    end
+    @routed = true
+    nil
+  end
+
+  # The connection class's default shard; Base's own stays `:default`.
+  def self.default_shard
+    @default_shard
+  end
+
+  # This thread's `connected_to` blocks. A thread variable: its fibers
+  # share it and a new thread starts empty, as Rails' default `:thread`.
+  def self.scopes
+    stack = Thread.current.thread_variable_get(:db_scopes)
+    if stack.nil?
+      stack = [DbScope.new(true, nil, nil, false)]
+      stack.clear
+      Thread.current.thread_variable_set(:db_scopes, stack)
+    end
+    stack
+  end
+
+  # Rails' `current_role`, `current_shard`, `current_preventing_writes`.
+  # `base`: for Base itself, which a block on the connection class skips.
+  def self.scope_role(base)
+    stack = scopes
+    i = stack.length - 1
+    while i >= 0
+      role = stack[i].role
+      return role if !role.nil? && (stack[i].global || !base)
+      i -= 1
+    end
+    :writing
+  end
+
+  def self.scope_shard(base)
+    stack = scopes
+    i = stack.length - 1
+    while i >= 0
+      shard = stack[i].shard
+      return shard if !shard.nil? && (stack[i].global || !base)
+      i -= 1
+    end
+    base ? :default : @default_shard
+  end
+
+  def self.scope_prevent(base)
+    stack = scopes
+    i = stack.length - 1
+    while i >= 0
+      return stack[i].prevent if !stack[i].parked && (stack[i].global || !base)
+      i -= 1
+    end
+    false
+  end
+
+  # A held handle is available to its statements without changing the models' route.
+  def self.scope_slot
+    stack = scopes
+    i = stack.length - 1
+    while i >= 0
+      return stack[i].slot if !stack[i].parked
+      i -= 1
+    end
+    route_slot(@default_shard, :writing)
+  end
+
+  def self.held_connection(index)
+    conn = nil
+    scopes.each do |frame|
+      home = frame.home
+      next if !home.nil? && home.closed
+      conn = frame.held if frame.from == index && !frame.held.nil?
+      conn = frame.connection if frame.parked && frame.slot == index && !frame.connection.nil? && home == @slots[index]
+    end
+    conn
+  end
+
+  def self.hold_slot(index, base)
+    enter_slot(index, base)
+    frame = scopes[scopes.length - 1]
+    frame.connection = Thread.current[:db_conn]
+    frame.parked = true
+    Thread.current[:db_conn] = frame.held if frame.slot != frame.from
+    nil
+  end
+
+  # The slot the models reach now. No pool for the role and shard
+  # raises, as Rails does at the first query; never the primary instead.
+  def self.slot
+    return @slots[0] if !@routed
+    index = scope_slot
+    if index < 0
+      shard = scope_shard(false)
+      role = scope_role(false)
+      parts = []
+      parts.push("'" + shard.to_s + "' shard") if shard != :default
+      parts.push("'" + role.to_s + "' role") if role != :writing
+      raise ActiveRecord::ConnectionNotDefined, "No database connection defined" + (parts.empty? ? "" : " for " + parts.join(" and ")) + "."
+    end
+    @slots[index]
+  end
+
+  def self.route_slot(shard, role)
+    i = 0
+    while i < @route_slots.length
+      return @route_slots[i] if @route_shards[i] == shard && @route_roles[i] == role
+      i += 1
+    end
+    -1
+  end
+
+  # Rails' `connected_to` (`with_role_and_shard`). An explicit reading
+  # role turns the guard on. When the block selects another slot, the
+  # thread's lease on the outer one is set aside, so a query inside
+  # leases from the selected pool, or takes back the lease an outer block
+  # set aside there (a second lease would wait on this thread). A block
+  # that returns a relation is refused: Rails loads it there, and a
+  # loaded relation here does not keep its rows through `first`.
+  def self.connected_to(global, role, shard, prevent)
+    raise ArgumentError, "must provide a `shard` and/or `role`." if role.nil? && shard.nil?
+    stack = scopes
+    before = scope_slot
+    home = @slots.nil? || before < 0 ? nil : @slots[before]
+    frame = DbScope.new(global, role, shard, prevent || role == :reading)
+    frame.home = home
+    stack.push(frame)
+    @routed = true
+    frame.slot = route_slot(scope_shard(false), scope_role(false))
+    switched = frame.slot != before
+    outer = nil
+    reuse = nil
+    if switched
+      if _txn_depth > 0 || Thread.current[:db_txn_pin] == true || (in_lease? && transaction_open?)
+        stack.pop
+        raise NotImplementedError, "connected_to selects another database inside an open transaction; a transaction across databases is not supported yet"
+      end
+      outer = Thread.current[:db_conn]
+      frame.held = outer
+      frame.from = before
+      reuse = held_connection(frame.slot)
+      Thread.current[:db_conn] = reuse
+    end
+    error = nil
+    begin
+      if outer.nil? || frame.slot < 0 || !reuse.nil?
+        result = yield
+      else
+        with_connection(@checkout_timeout) do
+          result = yield
+          nil
+        end
+      end
+      if result.is_a?(ActiveRecord::Relation)
+        raise NotImplementedError, "connected_to returns a relation, which is not carried yet; load it in the block (to_a)"
+      end
+    rescue Exception => e
+      error = e
+    ensure
+      begin
+        # A transaction the block began and never ended goes no further.
+        exec("ROLLBACK") if switched && (Thread.current[:db_txn_pin] == true || (in_lease? && transaction_open?))
+      rescue StandardError => e
+        # Ignore a rollback failure only when SQLite already ended the transaction.
+        error = e if error.nil? && (Thread.current[:db_txn_pin] == true || (in_lease? && transaction_open?))
+      ensure
+        Thread.current[:db_conn] = (home.nil? || !home.closed) ? outer : nil if switched
+        stack.pop
+      end
+    end
+    raise error if !error.nil?
+    result
+  end
+
+  def self.checkout_timeout=(seconds)
+    @checkout_timeout = seconds
+  end
+
+  def self.checkout_expired
+    "could not obtain a connection from the pool within " + @checkout_timeout.to_s + " seconds; all pooled connections were in use"
+  end
+
+  # The slot a connection handle taken now stays on (Rails raises when
+  # no pool is defined). -1 on one database; -2 before `configure`: the
+  # class's default then, the pool a handle Rails hands out at boot is on.
+  def self.connection_slot(base)
+    return -2 if @slots.nil?
+    return -1 if !@routed
+    return route_slot(scope_shard(false), scope_role(false)) if !base && slot
+    index = route_slot(scope_shard(true), scope_role(true))
+    raise ActiveRecord::ConnectionNotDefined, "No database connection defined." if index < 0
+    index
+  end
+
+  # A handle's statement runs on its slot, between these two, leased as
+  # a block's queries are. The write guard is the handle's class's where
+  # the statement runs, as in Rails.
+  def self.enter_slot(index, base)
+    index = route_slot(base ? :default : @default_shard, :writing) if index < 0
+    stack = scopes
+    before = scope_slot
+    if index != before && (_txn_depth > 0 || Thread.current[:db_txn_pin] == true || (in_lease? && transaction_open?))
+      raise NotImplementedError, "a connection taken on another database is used inside an open transaction; a transaction across databases is not supported yet"
+    end
+    frame = DbScope.new(false, nil, nil, scope_prevent(base))
+    frame.slot = index
+    frame.from = before
+    stack.push(frame)
+    if index != before
+      frame.held = Thread.current[:db_conn]
+      reuse = nil
+      reuse = held_connection(index)
+      Thread.current[:db_conn] = reuse
+    end
+    frame.home = slot
+    # Leased also on a thread that holds none: the unleased fallback is the
+    # slot's first connection, which threads would share through a handle.
+    return nil if !Thread.current[:db_conn].nil? || !@routed
+    pool = pool_for_thread
+    frame.pool = pool
+    frame.lease = pool.lease(@checkout_timeout)
+    if frame.lease < 0
+      Thread.current[:db_conn] = frame.held
+      stack.pop
+      raise ActiveRecord::ConnectionTimeoutError, checkout_expired
+    end
+    Thread.current[:db_conn] = pool.conn(frame.lease)
+    nil
+  end
+
+  # Released and restored also when the connection's cleanup raises.
+  def self.leave_slot
+    stack = scopes
+    frame = stack[stack.length - 1]
+    parked = frame.parked
+    home = frame.home
+    closed = home.nil? || home.closed
+    pool = frame.pool
+    route_connection = Thread.current[:db_conn]
+    frame.parked = false
+    Thread.current[:db_conn] = frame.connection if parked && frame.lease >= 0 && !closed
+    begin
+      if frame.lease >= 0
+        begin
+          if !closed
+            conn = current_conn
+            release_abandoned_write(conn)
+            conn.release_all
+            conn.trim!
+          end
+        ensure
+          pool.release(frame.lease) if !pool.nil?
+        end
+      end
+    ensure
+      Thread.current[:db_conn] = frame.held if !closed && (frame.lease >= 0 || frame.slot != frame.from)
+      Thread.current[:db_conn] = route_connection if !closed && parked && frame.slot != frame.from
+      Thread.current[:db_conn] = nil if closed
+      stack.pop
+    end
+    nil
+  end
+
+  # Rails' write guard (`ensure_writes_are_allowed`), with its SQLite
+  # adapter's own read pattern: a guard against accidental writes, not a
+  # permission (a `WITH ... INSERT` passes, as in Rails).
+  READ_QUERY = /\A(?:[(\s]|--.*\n|\/\*(?:[^*]|\*[^\/])*\*\/)*(?:pragma|begin|commit|explain|release|rollback|savepoint|select|with)/i
+  OPEN_TRANSACTION = /\A(?:[(\s]|--.*\n|\/\*(?:[^*]|\*[^\/])*\*\/)*(?:begin|savepoint)\b/i
+  def self.refuse_write(sql)
+    return nil if !@routed
+    if sql.match?(OPEN_TRANSACTION) && scope_slot != route_slot(scope_shard(false), scope_role(false))
+      raise NotImplementedError, "BEGIN or SAVEPOINT on a connection outside the active model route is not supported yet"
+    end
+    return nil if !slot.replica && !scope_prevent(false)
+    return nil if sql.match?(READ_QUERY)
+    raise ActiveRecord::ReadOnlyError, "Write query attempted while in readonly mode: " + sql
   end
 
   # The shard this thread uses, chosen once and remembered. Round-robin
   # under a lock taken ONCE per thread — the thing being avoided is a lock
   # per request, not a lock ever.
   def self.pool_for_thread
+    pools = slot.pools
     pi = Thread.current[:db_pool]
-    return @pools[pi] if pi != nil
+    return pools[pi] if pi != nil
     n = 0
     @assign_lock.synchronize do
       n = @next_pool
       @next_pool = n + 1
     end
-    pi = n % @pools.length
+    pi = n % pools.length
     Thread.current[:db_pool] = pi
-    @pools[pi]
+    pools[pi]
   end
 
   # Replace this database's contents with those of the file at `src_path`,
@@ -1470,7 +1885,7 @@ module Db
   def self.current_conn
     c = Thread.current[:db_conn]
     return c if !c.nil?
-    @pools[0].first
+    slot.pools[0].first
   end
 
   # `ActiveRecord::Base.transaction`'s per-thread nesting depth
@@ -1533,6 +1948,25 @@ module Db
     tables
   end
 
+  # The relations whose `scoping { }` block runs on this thread,
+  # innermost last (relation.rb's `Relation.current_scope_for`). Nil
+  # until the first push, which seeds the list with its element, so the
+  # element type is the relation's without a placeholder relation.
+  def self._current_scopes
+    Thread.current[:ar_current_scopes]
+  end
+
+  def self._push_current_scope(scope)
+    scopes = Thread.current[:ar_current_scopes]
+    if scopes.nil?
+      scopes = [scope]
+      Thread.current[:ar_current_scopes] = scopes
+    else
+      scopes << scope
+    end
+    scopes
+  end
+
   # Request-scoped connection lease for the thread-per-connection
   # server. Leases a connection index (parking on the pool's condition
   # variable while none is free), binds its DbConn to this thread's
@@ -1587,7 +2021,7 @@ module Db
     nil
   end
 
-  def self.with_connection
+  def self.with_connection(timeout = 0.0)
     # Re-entrant: a nested lease, or one inside a transaction that a BEGIN
     # outside any lease pinned (`pin_transaction`), keeps the thread's
     # connection. A second lease would rebind it and, on release, unbind
@@ -1601,11 +2035,13 @@ module Db
       result = yield
       return result
     end
+    home = slot
     pool = pool_for_thread
-    idx = pool.lease
+    idx = pool.lease(timeout)
+    raise ActiveRecord::ConnectionTimeoutError, checkout_expired if idx < 0
     conn = pool.conn(idx)
     Thread.current[:db_conn] = conn
-    prepare_for_checkpointer(conn) if @checkpoint_wanted
+    prepare_for_checkpointer(conn) if home.permit.checkpointing
     # Rails wraps every request in the query cache; so does this lease.
     conn.qc_begin
     request_error = nil
@@ -1621,19 +2057,11 @@ module Db
       rescue StandardError => e
         cleanup_error = e
       end
-      # `Db.close` inside the lease drops `@pools` and closes `conn`.
+      # `Db.close` inside the lease closes every slot and with it `conn`.
       # Snapshot and rollback cleanup talk to SQLite, so skip them when
       # this pool is no longer the live one. The lease index still goes
       # back to the pool that issued it.
-      pool_live = false
-      if !@pools.nil?
-        pi = 0
-        while pi < @pools.length
-          pool_live = true if @pools[pi].equal?(pool)
-          pi += 1
-        end
-      end
-      if pool_live
+      if !home.closed
         begin
           if conn.snap_depth > 0
             conn.snap_depth = 1
@@ -1674,35 +2102,42 @@ module Db
     # A pin left set would `release(0)` on the pool `configure` opens next.
     Thread.current[:db_txn_pin] = false
     error = nil
-    if !@pools.nil?
+    if !@slots.nil?
+      pools = []
+      @slots.each do |s|
+        s.closed = true
+        s.pools.each { |pool| pools.push(pool) }
+        # Lease cleanup skips `release_abandoned_write` once this pool is
+        # gone. An open BEGIN would otherwise leave the permit held, and
+        # the next write waits out the permit timeout.
+        release_permit(s.permit)
+      end
       begin
         i = 0
-        while i < @pools.length
+        while i < pools.length
           begin
-            @pools[i].close_all
-            @pools[i].dump_stmt_stats("close", i) if DbConn::STMT_STATS
+            pools[i].close_all
+            pools[i].dump_stmt_stats("close", i) if DbConn::STMT_STATS
           rescue StandardError => e
             error = e if error.nil?
           end
           i += 1
         end
       ensure
-        @pools = nil
+        @slots = nil
       end
     end
-    # Lease cleanup skips `release_abandoned_write` once this pool is
-    # gone. An open BEGIN would otherwise leave `@permit_held` set, and
-    # the next write waits out the permit timeout.
-    release_permit
     raise error if !error.nil?
   end
 
   def self.dump_stmt_stats(phase = "snapshot")
-    return nil if !DbConn::STMT_STATS || @pools.nil?
-    i = 0
-    while i < @pools.length
-      @pools[i].dump_stmt_stats(phase, i)
-      i += 1
+    return nil if !DbConn::STMT_STATS || @slots.nil?
+    @slots.each do |s|
+      i = 0
+      while i < s.pools.length
+        s.pools[i].dump_stmt_stats(phase, i)
+        i += 1
+      end
     end
     nil
   end
@@ -1786,31 +2221,33 @@ module Db
     @write_permit_timeout = seconds
   end
 
-  def self.acquire_permit
+  # The permit is the file's (DbPermit): the one of the slot this thread
+  # is on, unless the checkpointer names its own.
+  def self.acquire_permit(permit = slot.permit)
     got = false
-    @permit_lock.synchronize do
+    permit.lock.synchronize do
       deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + @write_permit_timeout
       timed_out = false
-      while @permit_held && !timed_out
+      while permit.held && !timed_out
         remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
         if remaining <= 0
           timed_out = true
         else
-          @permit_cv.wait(@permit_lock, remaining)
+          permit.cv.wait(permit.lock, remaining)
         end
       end
       if !timed_out
-        @permit_held = true
+        permit.held = true
         got = true
       end
     end
     got
   end
 
-  def self.release_permit
-    @permit_lock.synchronize do
-      @permit_held = false
-      @permit_cv.signal
+  def self.release_permit(permit = slot.permit)
+    permit.lock.synchronize do
+      permit.held = false
+      permit.cv.signal
     end
     nil
   end
@@ -1834,17 +2271,20 @@ module Db
   # past CHECKPOINT_RESTART_FRAMES; each pooled connection turns its own
   # automatic checkpoint off at its next lease. The measured Spinel lane
   # is one process (WORKERS=1); with `--workers N` the parent starts this
-  # thread before prefork and children inherit `@checkpoint_wanted`
+  # thread before prefork and children inherit the permits' flags
   # without their own loop — do not paper over that with a flock (second
   # home); default does not hit it. Only a database file has a WAL to
   # checkpoint.
   def self.checkpoint_in_background!
-    return nil if @checkpoint_wanted
-    path = @db_path
-    return nil if path == "" || path == ":memory:" || path.start_with?("file:")
-    @checkpoint_wanted = true
-    Thread.new do
-      Db.checkpoint_loop(path)
+    # One loop per file; one opened after an earlier call gets its own.
+    @slots.each do |s|
+      path = s.path
+      permit = s.permit
+      next if permit.checkpointing || path == "" || path == ":memory:" || path.start_with?("file:")
+      permit.checkpointing = true
+      Thread.new do
+        Db.checkpoint_loop(path, permit)
+      end
     end
     nil
   end
@@ -1856,10 +2296,16 @@ module Db
     nil
   end
 
-  def self.checkpoint_loop(path)
-    rc = SQL.sqlite3_open_v2(path, SQL.ckpt_out, SQL::OPEN_URI_RWC, nil)
+  def self.checkpoint_loop(path, permit)
+    rc = 0
+    dbh = nil
+    # Each file's loop opens through the one out-buffer.
+    @prepare_lock.synchronize do
+      rc = SQL.sqlite3_open_v2(path, SQL.ckpt_out, SQL::OPEN_URI_RWC, nil)
+      dbh = SQL.read_ptr(SQL.ckpt_out)
+    end
     return 0 if rc != SQL::OK
-    conn = DbConn.new(SQL.read_ptr(SQL.ckpt_out))
+    conn = DbConn.new(dbh)
     SQL.sqlite3_exec(conn.dbh, "PRAGMA busy_timeout=100", nil, nil, nil)
     while true
       sleep(CHECKPOINT_INTERVAL)
@@ -1875,9 +2321,9 @@ module Db
       rescue StandardError
         nil
       end
-      if frames >= CHECKPOINT_RESTART_FRAMES && acquire_permit
+      if frames >= CHECKPOINT_RESTART_FRAMES && acquire_permit(permit)
         SQL.sqlite3_exec(conn.dbh, "PRAGMA wal_checkpoint(RESTART)", nil, nil, nil)
-        release_permit
+        release_permit(permit)
       end
     end
     0
@@ -1896,11 +2342,11 @@ module Db
     # transaction. A failed BEGIN releases the reservation: no
     # transaction opened, so there is nothing left to protect.
     if sql == "BEGIN" && !conn.in_txn? && !in_lease?
-      @pools[0].reserve(0)
+      slot.pools[0].reserve(0)
       begin
         write(conn, sql, false)
       rescue Exception => e
-        @pools[0].release(0)
+        slot.pools[0].release(0)
         raise e
       end
       Thread.current[:db_conn] = conn
@@ -1943,7 +2389,7 @@ module Db
   #
   # The pin ALSO claims a real lease on the pool (`DbPool#reserve`), not
   # just the thread-local binding: `current_conn`'s unleased fallback is
-  # always `@pools[0].first` (index 0), the exact connection this pins,
+  # always the slot's `pools[0].first` (index 0), the exact connection this pins,
   # so without a real reservation a `with_connection` lease on another
   # thread could check that same connection out from under this open,
   # unleased transaction — with pool_size 1 there is nowhere else for it
@@ -1959,11 +2405,11 @@ module Db
     if !conn.in_txn?
       if Thread.current[:db_txn_pin] == true
         Thread.current[:db_conn] = nil
-        @pools[0].release(0)
+        slot.pools[0].release(0)
       end
       Thread.current[:db_txn_pin] = false
     elsif !in_lease?
-      @pools[0].reserve(0)
+      slot.pools[0].reserve(0)
       Thread.current[:db_conn] = conn
       Thread.current[:db_txn_pin] = true
     end
@@ -2005,10 +2451,26 @@ module Db
   # exec's write path. `returning` reads the rows into a QcEntry and
   # returns it; otherwise nil.
   def self.write(conn, sql, returning)
+    refuse_write(sql)
     out = nil
     # Any exec is (per the Db contract) DDL or a write — Rails
     # invalidates the whole query cache on write; so do we.
     conn.qc_clear
+    # Every pool's on this thread, as Rails' `clear_query_caches_for_current_thread`:
+    # a connection a block set aside, a reader's on the same file among them,
+    # would otherwise replay a read from before this write.
+    if @routed
+      scopes.each do |f|
+        home = f.home
+        next if !home.nil? && home.closed
+        held = f.held
+        held.qc_clear if !held.nil?
+        end_snapshot(held) if !held.nil? && @slots[f.from].permit == slot.permit
+        parked = f.connection
+        parked.qc_clear if f.parked && !parked.nil?
+        end_snapshot(parked) if f.parked && !parked.nil? && @slots[f.slot].permit == slot.permit
+      end
+    end
     end_snapshot(conn)
     if conn.holds_permit
       # Inside this connection's own transaction: already permitted.
@@ -2121,6 +2583,7 @@ module Db
   # contain \x01 inside string literals (unmarked bind_literal values);
   # those bytes are data and must not be stripped or re-dispatched.
   def self.prepare_plain(sql)
+    refuse_write(sql)
     conn = current_conn
     handle = conn.qc_lookup(sql)
     if handle != 0
@@ -2149,6 +2612,7 @@ module Db
     sql = binds[0].to_s
     key = binds[1].to_s
     return prepare_plain(key) if binds.length <= 2
+    refuse_write(sql)
     conn = current_conn
     handle = conn.qc_lookup(key)
     if handle != 0
@@ -2184,6 +2648,7 @@ module Db
     # Keep shared cache keys string-typed even when the compiled program
     # has no transient call site from which Spinel can infer this argument.
     sql = sql.to_s
+    refuse_write(sql)
     conn = current_conn
     handle = conn.qc_lookup(sql, false)
     if handle != 0
@@ -2613,5 +3078,41 @@ module Db
   # Read a boolean column. SQLite returns 0/1 (integer), widen to bool.
   def self.column_bool(stmt, idx)
     column_int(stmt, idx) != 0
+  end
+end
+
+# Rails' role and shard switching (ActiveRecord::ConnectionHandling). A
+# block on Base applies to every class; one on the connection class
+# leaves Base's own role and shard alone.
+module ActiveRecord
+  class Base
+    def self.connected_to(role: nil, shard: nil, prevent_writes: false, &block)
+      Db.connected_to(self == ActiveRecord::Base, role, shard, prevent_writes, &block)
+    end
+
+    def self.while_preventing_writes(enabled = true, &block)
+      base = self == ActiveRecord::Base
+      Db.connected_to(base, Db.scope_role(base), nil, enabled, &block)
+    end
+
+    def self.connected_to?(role:, shard: :default)
+      current_role == role.to_sym && current_shard == shard.to_sym
+    end
+
+    def self.current_role
+      Db.scope_role(self == ActiveRecord::Base)
+    end
+
+    def self.current_shard
+      Db.scope_shard(self == ActiveRecord::Base)
+    end
+
+    def self.current_preventing_writes
+      Db.scope_prevent(self == ActiveRecord::Base)
+    end
+
+    def self.default_shard
+      self == ActiveRecord::Base ? :default : Db.default_shard
+    end
   end
 end

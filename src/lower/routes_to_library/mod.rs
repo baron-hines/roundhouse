@@ -24,7 +24,7 @@ use crate::ident::{ClassId, Symbol, VarId};
 use crate::lower::routes::{flatten_routes, flatten_routes_for_helpers, FlatRoute};
 use crate::lower::typing::{fn_sig, lit_str, lit_sym, with_ty};
 use crate::span::Span;
-use crate::ty::Ty;
+use crate::ty::{FnTy, Ty};
 
 /// Build the `Routes` dispatch module — `RouteTable.table -> Array<Route>`
 /// (one `Route` instance per concrete `(verb, pattern, controller,
@@ -230,7 +230,8 @@ fn route_defaults_function(defaults: &[Vec<(String, Literal)>]) -> LibraryFuncti
 
 fn dispatch_functions(app: &App, flat: Vec<(FlatRoute, Option<usize>)>, asks_guards: bool) -> Vec<LibraryFunction> {
     let mounts = super::rack_mounts::mounts(app);
-    if flat.is_empty() && mounts.is_empty() {
+    // Not for the Ruby-family router: its main.rb and test helper call `table` and `route_defaults` with no route too.
+    if flat.is_empty() && mounts.is_empty() && !asks_guards {
         return Vec::new();
     }
     let mut defaults = Vec::new();
@@ -616,7 +617,7 @@ fn lower_route_helpers(app: &App, hash_query: bool) -> Vec<LibraryFunction> {
     let helper_params: crate::det::HashMap<String, Vec<Ty>> = funcs
         .iter()
         .filter_map(|f| match &f.signature {
-            Some(Ty::Fn { params, .. }) => Some((f.name.as_str().to_string(), params.iter().map(|p| (*p.ty).clone()).collect())),
+            Some(Ty::Fn(fn_ty)) => Some((f.name.as_str().to_string(), fn_ty.params.iter().map(|p| (*p.ty).clone()).collect())),
             _ => None,
         })
         .collect();
@@ -711,7 +712,7 @@ pub fn guard_required_segments(funcs: &mut [LibraryFunction], app: &App) {
         }
         let Some((controller, action)) = targets.get(f.name.as_str()) else { continue };
         let param_tys: Vec<Ty> = match &f.signature {
-            Some(Ty::Fn { params, .. }) => params.iter().map(|p| (*p.ty).clone()).collect(),
+            Some(Ty::Fn(fn_ty)) => fn_ty.params.iter().map(|p| (*p.ty).clone()).collect(),
             _ => Vec::new(),
         };
         let required: Vec<(Symbol, Ty)> = f
@@ -872,7 +873,8 @@ pub fn lower_url_option_helpers(app: &App) -> Vec<LibraryFunction> {
 /// URL built from a Hash only known at run time (lobsters' moderation log
 /// pages through `link_to "Page 2", @moderation_params.merge(page: 2)`),
 /// as Rails' route generation answers it. The request's controller and
-/// action stand for the ones the Hash leaves out.
+/// action stand for the ones the Hash leaves out, but a Hash that names a
+/// controller, or a nil action, is the index (`action ||= "index"`).
 ///
 /// Rails' Journey: a candidate is a GET route of that controller#action
 /// whose every segment the Hash or the request's path parameters supply;
@@ -944,7 +946,8 @@ fn lower_dynamic_url_helper(app: &App, module_path: &[Symbol], flat: &[FlatRoute
          \x20 given = {{}}\n\
          \x20 params.each {{ |k, v| given[k.to_s] = v }}\n\
          \x20 c = given.key?(\"controller\") ? given.fetch(\"controller\", \"\").to_s : controller\n\
-         \x20 a = given.key?(\"action\") ? given.fetch(\"action\", \"\").to_s : action\n\
+         \x20 named = given.fetch(\"action\", nil)\n\
+         \x20 a = named.nil? ? (given.key?(\"controller\") || given.key?(\"action\") ? \"index\" : action) : named.to_s\n\
          \x20 key = c.gsub(\"::\", \"_\").gsub(\"/\", \"_\") + \"#\" + a\n\
          \x20 best = -1\n\
          \x20 path = \"\"\n\
@@ -983,8 +986,8 @@ fn lower_dynamic_url_helper(app: &App, module_path: &[Symbol], flat: &[FlatRoute
 
 /// Every url-options hash in a view: a Hash literal in the URL argument
 /// of `link_to`, `link_to_if` or `button_to`, whose keys are all Symbols
-/// and include both `controller` and `action`. Yields the remaining
-/// keys, sorted.
+/// and include `controller` (no `action` is the index). Yields the
+/// keys other than those two, sorted.
 ///
 /// The view lowerer resolves a url-options hash only in that URL
 /// argument (`emit_url_options_hash`), so this looks only there. A Hash
@@ -1023,7 +1026,7 @@ fn collect_url_options_in_url(url: &Expr, out: &mut Vec<Vec<String>>) {
             collect_url_options_in_url(else_branch, out);
         }
         ExprNode::Send { recv: Some(base), method, args, block: None, .. }
-            if method.as_str() == "merge" && args.len() == 1 =>
+            if method.as_str() == "merge" && args.len() == 1 && url_hash_names_action(base) =>
         {
             collect_url_options_in_url(base, out);
         }
@@ -1038,7 +1041,8 @@ fn collect_url_options_in_url(url: &Expr, out: &mut Vec<Vec<String>>) {
                 })
                 .collect();
             if let Some(keys) = keys {
-                if keys.iter().any(|k| k == "controller") && keys.iter().any(|k| k == "action") {
+                // No action is the controller's index (`emit_url_options_hash`).
+                if keys.iter().any(|k| k == "controller") {
                     let mut extras: Vec<String> = keys
                         .into_iter()
                         .filter(|k| k != "controller" && k != "action")
@@ -1049,6 +1053,25 @@ fn collect_url_options_in_url(url: &Expr, out: &mut Vec<Vec<String>>) {
             }
         }
         _ => {}
+    }
+}
+
+/// A url-options Hash literal with an `action:` key that is not a literal
+/// `nil`. Under a `.merge` the merged keys could name the action, so only
+/// such a base resolves there (`emit_url_options_hash`); any other is
+/// left to `path_for_params`.
+pub(crate) fn url_hash_names_action(e: &Expr) -> bool {
+    match &*e.node {
+        ExprNode::Hash { entries, .. } => entries.iter().any(|(k, v)| {
+            matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "action")
+                && !matches!(&*v.node, ExprNode::Lit { value: Literal::Nil })
+        }),
+        ExprNode::Send { recv: Some(base), method, args, block: None, .. }
+            if method.as_str() == "merge" && args.len() == 1 =>
+        {
+            url_hash_names_action(base)
+        }
+        _ => false,
     }
 }
 
@@ -1296,14 +1319,17 @@ fn model_overrides_to_param(controller: &str, helper_name: &str, app: &App) -> b
 /// String (roundhouse#90).
 fn named_model_overrides_to_param(resource: &str, app: &App) -> bool {
     let model_name = crate::naming::camelize(resource);
-    app.models.iter().any(|m| {
-        m.name.0.as_str() == model_name
-            && (m.body.iter().any(|item| matches!(
-                item,
-                crate::dialect::ModelBodyItem::Method { method, .. }
-                    if method.name.as_str() == "to_param"
-            )) || model_key_is_string(m, app))
-    })
+    app.models.iter().any(|m| m.name.0.as_str() == model_name && model_renders_own_param(m, app))
+}
+
+/// [`named_model_overrides_to_param`] for a model in hand, so a
+/// namespaced one (`Admin::Topic`) is not lost to the name's round trip.
+fn model_renders_own_param(m: &crate::dialect::Model, app: &App) -> bool {
+    m.body.iter().any(|item| matches!(
+        item,
+        crate::dialect::ModelBodyItem::Method { method, .. }
+            if method.name.as_str() == "to_param"
+    )) || model_key_is_string(m, app)
 }
 
 fn model_key_is_string(model: &crate::dialect::Model, app: &App) -> bool {
@@ -1744,8 +1770,9 @@ fn build_helper_function(
         .map(|p| p.name.clone())
         .collect();
     let mark_optional = |t: Ty| -> Ty {
-        let Ty::Fn { params, block, ret, effects } = t else { return t };
-        Ty::Fn {
+        let Ty::Fn(fn_ty) = t else { return t };
+        let FnTy { params, block, ret, effects } = *fn_ty;
+        Ty::Fn(Box::new(FnTy {
             params: params
                 .into_iter()
                 .map(|mut tp| {
@@ -1758,16 +1785,16 @@ fn build_helper_function(
             block,
             ret,
             effects,
-        }
+        }))
     };
     // Segment keywords ride with the query keywords: both are keyword
     // params in the `def`, and `fn_sig` types every param Required, so
     // declaring one positionally is a call spinel cannot make.
     query_sig.splice(0..0, segment_keyword_sig);
     let signature = match mark_optional(fn_sig(sig_params, Ty::Str)) {
-        Ty::Fn { mut params, block, ret, effects } if !query_sig.is_empty() => {
-            params.extend(query_sig);
-            Ty::Fn { params, block, ret, effects }
+        Ty::Fn(mut fn_ty) if !query_sig.is_empty() => {
+            fn_ty.params.extend(query_sig);
+            Ty::Fn(fn_ty)
         }
         other => other,
     };
@@ -1888,8 +1915,8 @@ fn string_segment_demand(
     let string_keyed: crate::det::HashSet<String> = app
         .models
         .iter()
+        .filter(|m| model_renders_own_param(m, app))
         .map(|m| m.name.0.as_str().to_string())
-        .filter(|name| named_model_overrides_to_param(&crate::naming::underscore(name), app))
         .collect();
     let mut collect = |e: &Expr| {
         fn walk(
@@ -1953,42 +1980,64 @@ fn string_segment_demand(
     // helper's own call sites — without it every node here is `ty: None`
     // and this walk finds nothing.
     for helper in &app.routes.direct_helpers {
-        route_for_string_segments(&helper.body, helpers, &mut out);
+        route_for_string_segments(&helper.body, helper.params.last(), helpers, &string_keyed, &mut out);
     }
     out
 }
 
-/// Record the segments a `route_for :target, arg…` fills with a String.
-/// Mirrors `direct::rewrite_route_for`'s reading of the same node — the
-/// symbol names the target, the trailing kwargs hash is the query half
-/// and never a segment.
+/// Record the segments a `route_for :target, arg…` fills with a String
+/// (or a record whose `to_param` is one). Reads the node as
+/// `direct::rewrite_route_for` does: the symbol, or each route an
+/// interpolated name can spell with exactly that many segments, names
+/// the target; the trailing keyword hash or forwarded `options` is
+/// never a segment.
 fn route_for_string_segments(
     e: &Expr,
+    options: Option<&Symbol>,
     helpers: &crate::det::HashMap<String, (Vec<String>, usize)>,
+    string_keyed: &crate::det::HashSet<String>,
     out: &mut crate::det::HashMap<String, crate::det::HashSet<String>>,
 ) {
     if let ExprNode::Send { recv: None, method, args, .. } = &*e.node {
         if method.as_str() == "route_for" && !args.is_empty() {
-            if let ExprNode::Lit { value: crate::expr::Literal::Sym { value: target } } =
-                &*args[0].node
-            {
-                let helper = format!("{}_path", target.as_str());
-                if let Some((segments, _)) = helpers.get(&helper) {
-                    for (i, arg) in args[1..]
-                        .iter()
-                        .filter(|a| !matches!(&*a.node, ExprNode::Hash { kwargs: true, .. }))
-                        .enumerate()
-                    {
-                        let Some(seg) = segments.get(i) else { break };
-                        if matches!(arg.ty.as_ref().map(Ty::peel_nilable), Some(Ty::Str)) {
-                            out.entry(helper.clone()).or_default().insert(seg.clone());
-                        }
+            let (positional, _, _) = direct::route_for_arguments(&args[1..], options);
+            let targets: Vec<String> = match &*args[0].node {
+                ExprNode::Lit { value: crate::expr::Literal::Sym { value: target } } => {
+                    vec![format!("{}_path", target.as_str())]
+                }
+                ExprNode::Lit { value: crate::expr::Literal::Str { value: target } } => vec![format!("{target}_path")],
+                ExprNode::StringInterp { parts } => helpers
+                    .iter()
+                    .filter(|(name, (segments, required))| {
+                        (*required..=segments.len()).contains(&positional.len())
+                            && name.strip_suffix("_path").is_some_and(|n| direct::spells(parts, n))
+                    })
+                    .map(|(name, _)| name.clone())
+                    .collect(),
+                _ => Vec::new(),
+            };
+            // A record (or a union of them) any of whose models renders a
+            // String `to_param`: the rewrite sends it `to_param`.
+            let string_record = |ty: Option<&Ty>| {
+                let keyed = |t: &Ty| matches!(t, Ty::Class { id, .. } if string_keyed.contains(id.0.as_str()));
+                match ty {
+                    Some(Ty::Union { variants }) => variants.iter().any(keyed),
+                    Some(t) => keyed(t),
+                    None => false,
+                }
+            };
+            for helper in targets {
+                let Some((segments, _)) = helpers.get(&helper) else { continue };
+                for (i, arg) in positional.iter().enumerate() {
+                    let Some(seg) = segments.get(i) else { break };
+                    if matches!(arg.ty.as_ref().map(Ty::peel_nilable), Some(Ty::Str)) || string_record(arg.ty.as_ref()) {
+                        out.entry(helper.clone()).or_default().insert(seg.clone());
                     }
                 }
             }
         }
     }
-    e.node.for_each_child(&mut |c| route_for_string_segments(c, helpers, out));
+    e.node.for_each_child(&mut |c| route_for_string_segments(c, options, helpers, string_keyed, out));
 }
 
 fn query_param_demand(

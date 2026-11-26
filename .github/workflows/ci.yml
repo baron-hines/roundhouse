@@ -66,6 +66,11 @@ env:
   # and tag the emitted spin.toml pins (src/project.rs); bump both together.
   SPINEL_REDIS_REPO: roundhouse-rb/spinel-redis
   SPINEL_REDIS_REF: v0.3.3
+  # The cache key of the recorded Spinel test seconds the plan balances and budgets shards on. Full validation keeps
+  # its own: it compiles each contract inside the whole blog's boot (ROUNDHOUSE_SPINEL_SLIM=0), so its seconds are not
+  # a push run's. Full validation falls back to spinel-timings- until it has saved its own. Neither key is a prefix of
+  # the other, so a push or PR run, which restores only spinel-timings-, never starts from Full validation's seconds.
+  SPINEL_TIMINGS_KEY: ${{ inputs.full && 'spinel-full-timings' || 'spinel-timings' }}
 
 jobs:
   plan:
@@ -86,6 +91,7 @@ jobs:
       publish: ${{ steps.plan.outputs.publish }}
       spinel-revision: ${{ steps.plan.outputs.spinel-revision }}
       spinel-tests: ${{ steps.plan.outputs.spinel-tests }}
+      spinel-gems: ${{ steps.plan.outputs.spinel-gems }}
       spinel-framework-shards: ${{ steps.plan.outputs.spinel-framework-shards }}
       spinel-timings: ${{ steps.plan.outputs.spinel-timings }}
     steps:
@@ -96,13 +102,16 @@ jobs:
           # fetched by the planner, not by cloning full history.
           fetch-depth: 2
       # The latest seconds spinel-timings saved; without them the plan falls back to ci-plan.py's tables.
+      # Full validation starts from the push runs' seconds until it has saved its own.
       - name: Restore recorded Spinel test seconds
         continue-on-error: true
         uses: actions/cache/restore@v6
         with:
           path: .ci-timings/spinel-timings.json
-          key: spinel-timings-${{ github.run_id }}
-          restore-keys: spinel-timings-
+          key: ${{ env.SPINEL_TIMINGS_KEY }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ env.SPINEL_TIMINGS_KEY }}-
+            spinel-timings-
       - name: Select required coverage from the event's actual tree
         id: plan
         env:
@@ -601,6 +610,17 @@ jobs:
           gem install --no-document --ignore-dependencies warden -v 1.2.9
           gem install --no-document --ignore-dependencies orm_adapter -v 0.5.0
           gem install --no-document --ignore-dependencies responders -v 3.1.1
+          # doorkeeper, compiled from source (tests/emit_and_run/doorkeeper.rs).
+          gem install --no-document --ignore-dependencies doorkeeper -v 5.8.2
+          # message_bus, compiled from source (tests/emit_and_run/message_bus.rs).
+          gem install --no-document --ignore-dependencies message_bus -v 5.0.0
+          # view_component, compiled from source (tests/emit_and_run/view_component.rs).
+          gem install --no-document --ignore-dependencies view_component -v 3.23.2
+          gem install --no-document --ignore-dependencies method_source -v 1.1.0
+          # aasm, compiled from source (tests/emit_and_run/aasm_source.rs).
+          gem install --no-document --ignore-dependencies aasm -v 5.5.1
+          # rails-settings-cached, compiled from source (tests/emit_and_run/rails_settings_cached.rs).
+          gem install --no-document --ignore-dependencies rails-settings-cached -v 2.9.6
           # simple_form, compiled from source (tests/emit_and_run/simple_form.rs).
           gem install --no-document --ignore-dependencies simple_form -v 5.4.1
           # OmniAuth for devise's :omniauthable, installed as the Ruby family loads it (tests/emit_and_run/devise.rs).
@@ -997,11 +1017,10 @@ jobs:
       shard-3: ${{ steps.result.outputs.shard-3 }}
       shard-4: ${{ steps.result.outputs.shard-4 }}
     runs-on: ubuntu-latest
-    # 30m: upstream's shards take 11-14m, but a fork's runners take about
-    # 1.7x that (a 20m bound cut a passing shard 2 there, fork run
-    # 38923600903). Still short of papering over a hung suite. The script
-    # stops its suites at 27m, so this bound only catches a slow setup.
-    timeout-minutes: 30
+    # The plan's, three minutes past the budget the script stops its suites
+    # at (ci-plan.py spinel_budget: 27m and 30m without recorded seconds),
+    # so this bound only catches a slow setup.
+    timeout-minutes: ${{ matrix.timeout_minutes }}
 
     continue-on-error: ${{ needs.plan.outputs.spinel-advisory == 'true' }}
     # spinel_pg_db runs the PostgreSQL Db shim against this server
@@ -1063,6 +1082,7 @@ jobs:
           ROUNDHOUSE_PG_TEST_REQUIRED: "1"
           CI_SPINEL_TIMINGS: ${{ needs.plan.outputs.spinel-timings }}
           CI_SPINEL_TIMINGS_OUT: ${{ runner.temp }}/spinel-timings/framework-${{ matrix.shard }}.jsonl
+          CI_SPINEL_FRAMEWORK_BUDGET: ${{ matrix.budget }}
         run: scripts/ci-spinel-framework.sh
       # Not !cancelled(): a job past its limit reads as cancelled, and its finished suites' seconds still count.
       - name: Upload recorded test seconds
@@ -1844,7 +1864,8 @@ jobs:
       shard-3: ${{ steps.result.outputs.shard-3 }}
       shard-4: ${{ steps.result.outputs.shard-4 }}
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # The plan's, a minute past this shard's deadline (24m and 25m without recorded seconds).
+    timeout-minutes: ${{ fromJSON(needs.spinel-toolchain-plan.outputs.budgets)[matrix.shard].timeout_minutes }}
 
     continue-on-error: ${{ needs.plan.outputs.spinel-advisory == 'true' }}
     env:
@@ -1856,7 +1877,9 @@ jobs:
     steps:
       # Not left to timeout-minutes: a job stopped there uploads no seconds, so the planner kept the shard as it was. Not earlier than a minute before it: shards that used to pass near 24 minutes would fail.
       - name: Set this shard's deadline
-        run: echo "CI_SPINEL_DEADLINE=$(( $(date +%s) + 1440 ))" >> "$GITHUB_ENV"
+        env:
+          BUDGET: ${{ fromJSON(needs.spinel-toolchain-plan.outputs.budgets)[matrix.shard].budget }}
+        run: echo "CI_SPINEL_DEADLINE=$(( $(date +%s) + BUDGET ))" >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
       # No setup-rust: the producer archive restores the test binaries.
       - uses: actions/download-artifact@v8
@@ -1921,6 +1944,13 @@ jobs:
           # addressable and its public_suffix, built natively (tests/spinel_toolchain/addressable.rs).
           gem install --no-document --ignore-dependencies public_suffix -v 7.0.5
           gem install --no-document --ignore-dependencies addressable -v 2.9.0
+          # view_component and method_source, built natively (tests/spinel_toolchain/view_component.rs).
+          gem install --no-document --ignore-dependencies view_component -v 3.23.2
+          gem install --no-document --ignore-dependencies method_source -v 1.1.0
+          # aasm, built natively, and what the CRuby tree its build boots to observe aasm needs (tests/spinel_toolchain/aasm.rs).
+          gem install --no-document --ignore-dependencies aasm -v 5.5.1
+          gem install --no-document --ignore-dependencies concurrent-ruby -v 1.3.8
+          gem install --no-document sqlite3 -v 2.10.0
       # One process per test, as many as libtest's threads, so each test's seconds are its own.
       - name: run spinel_toolchain ignored suite (${{ matrix.shard }})
         env:
@@ -1952,7 +1982,9 @@ jobs:
           sed -n 's/^now //p' "$RUNNER_TEMP/split.txt" | python3 scripts/ci-plan.py run-tests --kind toolchain --parallel "$(nproc)" -- "$SPINEL_TOOLCHAIN_BIN" --ignored --nocapture --exact &
           alone=$!
           left=$(( CI_SPINEL_DEADLINE - $(date +%s) ))
+          # Not run bare: the tests it builds for are charged a share of its CPU seconds, which the plan balances on.
           [ "$left" -le 0 ] || RH_SPINEL_BUNDLE_COLLECT="$RUNNER_TEMP/bundle-cases" RH_SPINEL_BUNDLE_OUT="$RUNNER_TEMP/spinel-bundles" \
+            python3 scripts/ci-plan.py cpu-of --out "$RUNNER_TEMP/spinel-bundles/cpu.json" -- \
             timeout "$left" "$SPINEL_TOOLCHAIN_BIN" --ignored --exact spinel_bundle_build --nocapture || true
           echo "bundled in $(( $(date +%s) - start ))s"
           status=0
@@ -1964,8 +1996,9 @@ jobs:
       # app entry, HTTP requests to the binary, and the model script
       # compiled natively. Filtered by name, so the ignored test named
       # after an open issue (#163) is not selected.
+      # Not any shard: spinel_toolchain_shard counts tiny_api's seconds on the last one (loads[-1]).
       - name: run tiny_api spinel_gate_ --ignored
-        if: ${{ !cancelled() && matrix.shard == 3 }}
+        if: ${{ !cancelled() && matrix.shard == 4 }}
         env:
           CI_SPINEL_TIMINGS_OUT: ${{ runner.temp }}/spinel-timings/toolchain-${{ matrix.shard }}.jsonl
         run: |
@@ -2055,6 +2088,7 @@ jobs:
     if: ${{ !cancelled() && contains(fromJSON(needs.plan.outputs.jobs), 'spinel-toolchain') && needs.generate-fixture.result == 'success' && needs.spinel-build.outputs.artifact-id != '' && needs.spinel-toolchain-build.outputs.artifact-id != '' }}
     outputs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      budgets: ${{ steps.budgets.outputs.budgets }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     continue-on-error: ${{ needs.plan.outputs.spinel-advisory == 'true' }}
@@ -2096,12 +2130,13 @@ jobs:
       - name: Collect and plan shared toolchain builds
         env:
           RUST_MIN_STACK: "33554432"
+          CI_SPINEL_GEMS: ${{ needs.plan.outputs.spinel-gems }}
         run: |
           test -x "$SPINEL_TOOLCHAIN_BIN"
           out="$RUNNER_TEMP/bundle-plan"
           mkdir -p "$out/bundle-all"
           "$SPINEL_TOOLCHAIN_BIN" --ignored --list --format terse | sed -n 's/: test$//p' \
-            | grep -vx -e spinel_bundle_build -e spinel_bundle_plan > "$out/tests.txt"
+            | grep -vx -e spinel_bundle_build -e spinel_bundle_plan | python3 scripts/ci-plan.py toolchain-tests > "$out/tests.txt"
           test -s "$out/tests.txt"
           start=$(date +%s)
           # Not checked: a collected test stops by failing, and one that is not collected is killed.
@@ -2111,6 +2146,12 @@ jobs:
             "$SPINEL_TOOLCHAIN_BIN" --ignored --exact spinel_bundle_plan
           python3 -c 'import json, sys; units = json.load(open(sys.argv[1])); assert units and all(units), units' "$out/bundle-plan.json"
           echo "collected $(ls "$out/bundle-all" | wc -l) cases into $(python3 -c 'import json, sys; print(len(json.load(open(sys.argv[1]))))' "$out/bundle-plan.json") units in $(( $(date +%s) - start ))s"
+      # From the same tests, units and seconds each shard plans its own tests with (`toolchain-shard`).
+      - name: Size each shard's deadline from the seconds it is planned with
+        id: budgets
+        env:
+          CI_SPINEL_TIMINGS: ${{ needs.plan.outputs.spinel-timings }}
+        run: python3 scripts/ci-plan.py toolchain-budgets --units "$RUNNER_TEMP/bundle-plan/bundle-plan.json" < "$RUNNER_TEMP/bundle-plan/tests.txt"
       - name: Upload the toolchain plan
         id: upload
         uses: actions/upload-artifact@v7
@@ -4200,8 +4241,10 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: .ci-timings/spinel-timings.json
-          key: spinel-timings-${{ github.run_id }}
-          restore-keys: spinel-timings-
+          key: ${{ env.SPINEL_TIMINGS_KEY }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ env.SPINEL_TIMINGS_KEY }}-
+            spinel-timings-
       - name: Collect this run's test seconds
         continue-on-error: true
         uses: actions/download-artifact@v8
@@ -4215,7 +4258,7 @@ jobs:
         uses: actions/cache/save@v6
         with:
           path: .ci-timings/spinel-timings.json
-          key: spinel-timings-${{ github.run_id }}-${{ github.run_attempt }}
+          key: ${{ env.SPINEL_TIMINGS_KEY }}-${{ github.run_id }}-${{ github.run_attempt }}
 
   archive-results:
     needs: [plan, build-site, campfire-archive-build, smoke, spinel-smoke, campfire-smoke, campfire-smoke-docker]

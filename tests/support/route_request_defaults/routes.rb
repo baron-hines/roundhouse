@@ -14,3 +14,5 @@
   get "/format_links", to: "defaults#format_links"
   get "/required/:number", to: "defaults#required", defaults: { number: 1 }
   get "/json_archive(/:year)", to: "defaults#json_archive", defaults: { year: 2024, format: "json" }
+  get "/loose" => "defaults#show", :text => "login"
+  get "/loose_kw", to: "defaults#show", text: "kw", number: 3, yes: true

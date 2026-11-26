@@ -13,7 +13,7 @@
 
 use crate::expr::{Expr, ExprNode};
 use crate::ident::{ClassId, Symbol};
-use crate::ty::Ty;
+use crate::ty::{FnTy, Ty};
 
 use super::{BodyTyper, ClassInfo, Ctx, union_many, union_of, unknown};
 
@@ -60,6 +60,12 @@ impl<'a> BodyTyper<'a> {
     /// twins) are schema-indexed APIs.  The generic ActiveRecord catalog
     /// can only describe their fallback shape, but a literal key and a
     /// concrete model receiver make the exact column type available.
+    ///
+    /// Only an ActiveRecord record's, or a graphql-ruby input object's
+    /// (whose `[]` reads the argument of the key's name): another class's
+    /// `[]` is its own method, whatever a method of the key's name answers.
+    /// A gem's `self[:dn].first`, with `[]` answering an Array, read `dn`'s
+    /// String.
     pub(super) fn column_attribute_access_ty(
         &self,
         recv_ty: Option<&Ty>,
@@ -75,7 +81,11 @@ impl<'a> BodyTyper<'a> {
             "[]=" | "write_attribute" if args.len() == 2 => &args[0],
             _ => return None,
         };
-        let methods = &self.classes().get(model)?.instance_methods;
+        let info = self.classes().get(model)?;
+        if !info.active_record_model && !info.reads_arguments_by_key {
+            return None;
+        }
+        let methods = &info.instance_methods;
         let entry = match &*key_arg.node {
             ExprNode::Lit { value: crate::expr::Literal::Sym { value } } => methods.get(value),
             ExprNode::Lit { value: crate::expr::Literal::Str { value } } => {
@@ -86,7 +96,7 @@ impl<'a> BodyTyper<'a> {
         // A reader declared as a method (an RBS or Sorbet signature, an
         // input object's argument) is its return type, not the method.
         Some(match entry {
-            Ty::Fn { ret, .. } => (**ret).clone(),
+            Ty::Fn(fn_ty) => (*fn_ty.ret).clone(),
             other => other.clone(),
         })
     }
@@ -176,7 +186,7 @@ impl<'a> BodyTyper<'a> {
                 let class = self.classes().get(current?)?;
                 if let Some(ty) = class.instance_methods.get(name) {
                     return Some(match ty {
-                        Ty::Fn { ret, .. } => ret.as_ref().clone(),
+                        Ty::Fn(fn_ty) => fn_ty.ret.as_ref().clone(),
                         value => value.clone(),
                     });
                 }
@@ -279,22 +289,64 @@ impl<'a> BodyTyper<'a> {
         if method.as_str() != "count" || !args.is_empty() || block.is_some() {
             return None;
         }
-        let group_args = Self::group_args_in_count_chain(recv?)?;
+        self.grouped_count_hash(recv?, recv_ty?)
+    }
+
+    /// The Hash a grouped count answers when `recv` is a grouped
+    /// relation chain; `None` when it is not grouped.
+    fn grouped_count_hash(&self, recv: &Expr, recv_ty: &Ty) -> Option<Ty> {
+        let group_args = Self::group_args_in_count_chain(recv)?;
         // The receiver of `count` is the `group(...)` result, so its
         // type names the model whose schema owns the grouped column.
-        // Both relation representations reach here: an inline
-        // `Model.where(...).group(...)` chain carries the Array shape,
-        // a scope or association read carries `Ty::Relation`.
-        let model = match recv_ty? {
-            Ty::Relation { of } => of,
-            Ty::Array { elem } => match &**elem {
-                Ty::Class { id, .. } => id,
-                _ => return None,
-            },
-            _ => return None,
-        };
+        let model = Self::relation_model(recv_ty)?;
         let key = self.grouped_key_ty(model, group_args).unwrap_or(Ty::Untyped);
         Some(Ty::Hash { key: std::sync::Arc::new(key), value: std::sync::Arc::new(Ty::Int) })
+    }
+
+    /// The model a relation-typed value is over. Both relation
+    /// representations reach here: an inline `Model.where(...)` chain
+    /// carries the Array shape, a scope or association read carries
+    /// `Ty::Relation`.
+    fn relation_model(ty: &Ty) -> Option<&ClassId> {
+        match ty {
+            Ty::Relation { of } => Some(of),
+            Ty::Array { elem } => match &**elem {
+                Ty::Class { id, .. } => Some(id),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// `relation.async_count(column)` — Rails' `count` as an
+    /// `ActiveRecord::Promise` of the count: an Integer, or the Hash a
+    /// grouped relation counts into, read as `grouped_count_ty` reads
+    /// it. The runtime's `Relation#async_count` picks the same two by
+    /// the relation's groups. A receiver whose chain cannot be read (a
+    /// local or a named scope may hold a grouped relation) counts into
+    /// either, so its value stays untyped, as `relation_extreme_ty`
+    /// leaves such a receiver's extrema.
+    pub(super) fn async_count_ty(
+        &self,
+        recv: Option<&Expr>,
+        recv_ty: Option<&Ty>,
+        method: &Symbol,
+        args: &[Expr],
+        block: Option<&Expr>,
+        instance_self: Option<&Ty>,
+    ) -> Option<Ty> {
+        if method.as_str() != "async_count" || args.len() > 1 || block.is_some() {
+            return None;
+        }
+        let recv_ty = recv_ty?;
+        let model = Self::relation_model(recv_ty)?;
+        let recv = recv?;
+        let count = match self.grouped_count_hash(recv, recv_ty) {
+            Some(hash) => hash,
+            None if self.direct_relation_chain(recv, model, instance_self) => Ty::Int,
+            None => Ty::Untyped,
+        };
+        Some(crate::analyze::promise::of(count))
     }
 
     fn group_args_in_count_chain(expr: &Expr) -> Option<&[Expr]> {
@@ -438,6 +490,70 @@ impl<'a> BodyTyper<'a> {
             }
             _ => false,
         }
+    }
+
+    /// Does the owner model itself HOLD `assoc` (`ClassInfo::held_has_many`)?
+    /// Only what `lower::scope_chain` rewrites: a model that declares the
+    /// held has_many itself (the rewrite looks the association up on the
+    /// owner's own model, not its ancestors), or a nilable union of that
+    /// one model.
+    fn held_has_many(&self, owner_ty: Option<&Ty>, assoc: &Symbol) -> bool {
+        let declares =
+            |id: &ClassId| self.classes().get(id).is_some_and(|cls| cls.held_has_many.contains(assoc));
+        match owner_ty {
+            Some(Ty::Class { id, .. }) => declares(id),
+            Some(Ty::Union { variants }) => {
+                let mut owners = variants.iter().filter_map(|v| match v {
+                    Ty::Class { id, .. } => Some(id),
+                    _ => None,
+                });
+                let Some(first) = owners.next() else { return false };
+                variants.iter().all(|v| matches!(v, Ty::Class { .. } | Ty::Nil))
+                    && owners.all(|id| id == first)
+                    && declares(first)
+            }
+            _ => false,
+        }
+    }
+
+    /// `owner.items.update(attrs)` — the collection proxy's bulk update
+    /// over the records a has_many holds. `lower::scope_chain` rewrites
+    /// it to the generated `__<name>_update`, which answers the records,
+    /// so the call types as the reader does. Only a has_many the owner
+    /// model HOLDS is rewritten, so only that case is typed here: any
+    /// other receiver keeps the Array dispatch and its "no known method"
+    /// refusal, which is what the emitted program would raise.
+    pub(super) fn assoc_bulk_update_ty(
+        &self,
+        recv: Option<&Expr>,
+        recv_ty: Option<&Ty>,
+        method: &Symbol,
+        args: &[Expr],
+        block: Option<&Expr>,
+        instance_self: Option<&Ty>,
+    ) -> Option<Ty> {
+        if method.as_str() != "update"
+            || block.is_some()
+            || !matches!(args, [arg] if matches!(&*arg.node, ExprNode::Hash { .. }))
+        {
+            return None;
+        }
+        let ExprNode::Send { recv: owner, method: assoc, args: assoc_args, block: None, .. } =
+            &*recv?.node
+        else {
+            return None;
+        };
+        if !assoc_args.is_empty() {
+            return None;
+        }
+        let owner_ty = match owner {
+            Some(owner) => owner.ty.as_ref(),
+            None => instance_self,
+        };
+        if !self.has_many_reader(owner_ty, assoc) || !self.held_has_many(owner_ty, assoc) {
+            return None;
+        }
+        recv_ty.cloned()
     }
 
     /// Build the Ctx used to analyze a block passed to `recv.method(...) { |p1, p2| ... }`.
@@ -643,6 +759,10 @@ impl<'a> BodyTyper<'a> {
         if !class_object_receiver && let Some(view) = self.enumerable_view(Some(recv_ty), method) {
             return self.block_params_for(Some(&view), method, false);
         }
+        // A Promise's `then` yields its value, not the Promise (Kernel's).
+        if method.as_str() == "then" && let Some(value) = crate::analyze::promise::value_of(recv_ty) {
+            return Some(vec![value.clone()]);
+        }
         if matches!(recv_ty, Ty::Class { id, .. } if id.0.as_str() == PARAM_VALUE) {
             return match method.as_str() {
                 "each_with_index" | "each_with_object" => Some(vec![param_value_ty(), Ty::Int]),
@@ -682,7 +802,18 @@ impl<'a> BodyTyper<'a> {
         // of the name answers a class-side call instead, and may yield
         // anything; a relation still runs Rails' batches.
         if matches!(method.as_str(), "find_each" | "find_in_batches" | "in_batches") {
-            let is_model = |id: &ClassId| self.classes().get(id).is_some_and(|c| c.table.is_some());
+            // An STI subclass is a library class on its parent's table, so the table is read up the chain.
+            let is_model = |id: &ClassId| {
+                let mut at = self.classes().get(id);
+                for _ in 0..32 {
+                    match at {
+                        Some(c) if c.table.is_some() => return true,
+                        Some(c) => at = c.parent.as_ref().and_then(|p| self.classes().get(p)),
+                        None => return false,
+                    }
+                }
+                false
+            };
             let of = match recv_ty {
                 Ty::Relation { of } => Some(of.clone()),
                 Ty::Array { elem } => match &**elem {
@@ -827,11 +958,12 @@ impl<'a> BodyTyper<'a> {
                         } else {
                             (&c.instance_methods, &c.class_methods)
                         };
-                        let return_seed = |ty: &Ty| !matches!(ty, Ty::Fn { .. });
+                        let return_seed = |ty: &Ty| !matches!(ty, Ty::Fn(_));
+                        let has_block = |ty: &Ty| matches!(ty, Ty::Fn(fn_ty) if fn_ty.block.is_some());
                         let sig = match (preferred.get(method), other.get(method)) {
-                            (Some(s @ Ty::Fn { block: Some(_), .. }), _) => Some(s),
-                            (pref, Some(s @ Ty::Fn { block: Some(_), .. }))
-                                if pref.map_or(true, return_seed) =>
+                            (Some(s), _) if has_block(s) => Some(s),
+                            (pref, Some(s))
+                                if has_block(s) && pref.map_or(true, return_seed) =>
                             {
                                 Some(s)
                             }
@@ -860,13 +992,16 @@ impl<'a> BodyTyper<'a> {
                                 // that registers the yielded type
                                 // itself has a non-`Fn` block and
                                 // takes the last arm.)
-                                Ty::Fn { block: Some(block_ty), .. } => match &**block_ty {
-                                    Ty::Fn { params, .. } => Some(
-                                        params
-                                            .iter()
-                                            .map(|p| p.ty.subst_self(&self_ty))
-                                            .collect(),
-                                    ),
+                                Ty::Fn(sig_fn) if let Some(block_ty) = &sig_fn.block => match &**block_ty {
+                                    Ty::Fn(fn_ty) => {
+                                        let FnTy { params, .. } = &**fn_ty;
+                                        Some(
+                                            params
+                                                .iter()
+                                                .map(|p| p.ty.subst_self(&self_ty))
+                                                .collect(),
+                                        )
+                                    },
                                     _ => Some(vec![block_ty.subst_self(&self_ty)]),
                                 },
                                 _ => None,
@@ -1139,7 +1274,8 @@ impl<'a> BodyTyper<'a> {
         // `<=>`) must present a concrete param type to the check
         // below, not a self type it cannot classify.
         let sig = sig.map(|s| s.subst_self(&Ty::Class { id: id.clone(), args: Vec::new().into() }));
-        let Some(Ty::Fn { params, .. }) = sig else { return };
+        let Some(Ty::Fn(fn_ty)) = sig else { return };
+        let FnTy { params, .. } = *fn_ty;
         let Some(last_param) = params.last() else { return };
         let last_kind_positional = matches!(
             last_param.kind,
@@ -1433,6 +1569,24 @@ impl<'a> BodyTyper<'a> {
             if ClassInfo::class_method_ownership_unknown(self.classes(), id, method) { return Ty::Untyped; }
             if let Some(ty) = ClassInfo::source_class_method_type(self.classes(), id, method) { return unwrap_fn_ret(ty); }
         }
+        // A typed Promise answers its value, and `then` a Promise of the
+        // block's value (`analyze::promise`).
+        if let Some(value) = recv_ty.and_then(crate::analyze::promise::value_of) {
+            match method.as_str() {
+                "value" if args.is_empty() => return value.clone(),
+                "then" => return crate::analyze::promise::of(block_ret.cloned().unwrap_or(Ty::Untyped)),
+                _ => {}
+            }
+        }
+        // A model class's own `create` / `create!` of an Array of attribute Hashes, unless the app defines it.
+        if !instance_receiver
+            && creates_rows(method, args)
+            && let Some(Ty::Class { id, .. }) = recv_ty
+            && self.is_model_class(recv_ty)
+            && !self.source_class_side(id, method)
+        {
+            return Ty::Array { elem: std::sync::Arc::new(Ty::Class { id: id.clone(), args: vec![].into() }) };
+        }
         let controller_writer = method.as_str() == "content_type="
             && recv_ty.is_some_and(|ty| self.controller_writer_receiver(ty));
         // Not the stdlib's String form too: the port reads `other.octets`, which a String lacks.
@@ -1461,6 +1615,22 @@ impl<'a> BodyTyper<'a> {
                 let as_hash = params_as_hash();
                 return self.dispatch(Some(&as_hash), method, block_ret, args);
             }
+        }
+        // An app class under a core collection (discourse's `class Enum < Hash`): what its own chain does not define is
+        // the core class's, over values the analysis does not follow.
+        // Not the class object's own calls (`Ordinal.name`), nor a method answering the receiver itself, which keeps its
+        // class (`freeze`, `tap`).
+        if let Some(Ty::Class { id, .. }) = recv_ty
+            && instance_receiver
+            && !matches!(method.as_str(), "freeze" | "itself" | "tap" | "dup" | "clone")
+            && let Some(core) = self.core_ancestor(id, method)
+        {
+            let as_core = match core {
+                "Hash" => Ty::Hash { key: std::sync::Arc::new(Ty::Untyped), value: std::sync::Arc::new(Ty::Untyped) },
+                "Array" => Ty::Array { elem: std::sync::Arc::new(Ty::Untyped) },
+                _ => Ty::Str,
+            };
+            return self.dispatch(Some(&as_core), method, block_ret, args);
         }
         // What `errors` does not answer itself it delegates to its Array of `ActiveModel::Error`, as Rails' Enumerable does.
         if let Some(Ty::Class { id, .. }) = recv_ty {
@@ -1566,6 +1736,30 @@ impl<'a> BodyTyper<'a> {
             return ty;
         }
         if matches!(method.as_str(), "try" | "try!") {
+            // A core value answers its own method too (Doorkeeper's `options.try(:dup)` on a Hash): `try` lowers to the
+            // direct call (`lower::try_guard`), which a typeless `try` left to fail its dispatch check.
+            let nilable = recv_ty.is_some_and(|t| t.clone().strip_nil() != *t);
+            let named = match args.first().map(|a| &*a.node) {
+                Some(ExprNode::Lit { value: crate::expr::Literal::Sym { value } }) => Some(value.clone()),
+                Some(ExprNode::Lit { value: crate::expr::Literal::Str { value } }) => Some(Symbol::from(value.as_str())),
+                _ => None,
+            };
+            // Only the name alone, and one that takes no block: an argument or a block changes what a core method
+            // answers (`first(2)`, `fetch { }`), and an iterator's blockless form is an Enumerator (`map`).
+            let alone = args.len() == 1
+                && block_ret.is_none()
+                && named.as_ref().is_some_and(|m| {
+                    matches!(m.as_str(), "dup" | "clone" | "freeze" | "to_s" | "to_a" | "to_h" | "size" | "length" | "empty?" | "first" | "last" | "keys" | "values" | "compact")
+                });
+            let core = match (recv_ty.map(|t| t.clone().strip_nil()), &named) {
+                (Some(Ty::Hash { key, value }), Some(m)) if alone => Some(hash_method(m, &key, &value, None, &[])),
+                (Some(Ty::Array { elem }), Some(m)) if alone => Some(array_method(m, &elem, None)),
+                (Some(Ty::Str), Some(m)) if alone => Some(str_method(m)),
+                _ => None,
+            };
+            if let Some(ty) = core.filter(|t| !matches!(t, Ty::Untyped) && !t.is_open()) {
+                return if nilable { union_of(ty, Ty::Nil) } else { ty };
+            }
             // A nullable receiver (`@user.try(:username)` with `@user:
             // User?`) answers the same: `nil.try` is nil, already in the
             // union below.
@@ -1666,9 +1860,9 @@ impl<'a> BodyTyper<'a> {
         // a `Ty::Fn` receiver claims this; anything else keeps its
         // own `call` (a callable app class, an untyped proc).
         if matches!(method.as_str(), "call" | "[]") {
-            if let Some(Ty::Fn { ret, .. }) = recv_ty {
+            if let Some(Ty::Fn(fn_ty)) = recv_ty {
                 // Not left a type variable: `call` is known, and what the body answers is the body's own sends' to report.
-                return match &**ret {
+                return match &*fn_ty.ret {
                     Ty::Var { .. } => Ty::Untyped,
                     ret => ret.clone(),
                 };
@@ -2313,6 +2507,13 @@ impl<'a> BodyTyper<'a> {
                 // through hash_method / array_method instead of falling
                 // back to the (no-op) class-method table. Element types
                 // start as Var; usage narrows them via flow-typing.
+                // A module has no `new`: `Module#new` is Class's alone. Only one the source defines nothing on: an app's module
+                // can answer the call itself (a `self.public_send` its literal-name dispatch reaches).
+                if method.as_str() == "new"
+                    && self.classes().get(id).is_some_and(|c| c.is_module && c.source_class_methods.is_empty() && c.source_instance_methods.is_empty())
+                {
+                    return unknown();
+                }
                 if method.as_str() == "new" {
                     match id.0.as_str() {
                         "Hash" => {
@@ -2667,7 +2868,7 @@ impl<'a> BodyTyper<'a> {
                                 )
                                 .is_none() =>
                             {
-                                return other.clone()
+                                return other.subst_self(&Ty::Class { id: id.clone(), args: vec![].into() })
                             }
                             _ => {}
                         }
@@ -2777,7 +2978,7 @@ impl<'a> BodyTyper<'a> {
                 if let Some(t) = self.column_projection(of, method, args) {
                     return t;
                 }
-                if counted_first_last(method, args) || array_find(method, args, block_ret) {
+                if counted_first_last(method, args) || array_find(method, args, block_ret) || creates_rows(method, args) {
                     return Ty::Array {
                         elem: std::sync::Arc::new(Ty::Class { id: of.clone(), args: vec![].into() }),
                     };
@@ -2883,7 +3084,8 @@ impl<'a> BodyTyper<'a> {
                             )
                             .is_none() =>
                         {
-                            return other.clone()
+                            // Not the stored `instance`: Rails' `scoping` runs it on the model, whose `new` builds one.
+                            return other.subst_self(&Ty::Class { id: of.clone(), args: vec![].into() })
                         }
                         _ => {}
                     }
@@ -2933,6 +3135,10 @@ impl<'a> BodyTyper<'a> {
                     && matches!(args.first().and_then(|a| a.ty.as_ref()), Some(t) if is_bigdecimal(t)) =>
             {
                 bigdecimal()
+            }
+            // Not the block form's receiver: without a block `n.times` is the Enumerator over 0...n (`8.times.map { … }`).
+            Some(Ty::Int) if method.as_str() == "times" && block_ret.is_none() && args.is_empty() => {
+                Ty::Array { elem: std::sync::Arc::new(Ty::Int) }
             }
             Some(Ty::Int) => int_method(method),
             Some(Ty::Float) => float_method(method, args),
@@ -3478,6 +3684,16 @@ fn sub_array_slice(method: &Symbol, args: &[crate::expr::Expr], elem: &Ty) -> Op
     })
 }
 
+/// `create` / `create!` given one Array (of attribute Hashes): Rails creates
+/// one record per Hash and answers the Array of them, on the class and on a
+/// relation alike (Persistence::ClassMethods#create!, Relation#create!:
+/// `attributes.collect { |attr| create!(attr, &block) }`).
+/// `lower::create_rows` rewrites the call to that `map`.
+pub(crate) fn creates_rows(method: &Symbol, args: &[crate::expr::Expr]) -> bool {
+    matches!(method.as_str(), "create" | "create!")
+        && matches!(args, [rows] if matches!(rows.ty, Some(Ty::Array { .. })))
+}
+
 /// `first(n)` / `last(n)` — the counted form. Ruby's `Array#first(n)`,
 /// Rails' `Relation#last(n)` and `Model.first(n)` all answer an Array of
 /// up to n elements, where the bare form answers one element or nil.
@@ -3840,7 +4056,7 @@ pub(super) fn array_method(method: &Symbol, elem: &Ty, block_ret: Option<&Ty>) -
                 value: std::sync::Arc::new(unknown()),
             },
         },
-        "to_a" => Ty::Array { elem: std::sync::Arc::new(elem.clone()) },
+        "to_a" | "to_ary" => Ty::Array { elem: std::sync::Arc::new(elem.clone()) },
         "join" => Ty::Str,
         // `[0, 0, 0].pack("CCC")` — binary packing (lobsters'
         // confidence_order byte strings).
@@ -3989,9 +4205,18 @@ pub(super) fn hash_method(
             },
             _ => Ty::Hash { key: std::sync::Arc::new(key.clone()), value: std::sync::Arc::new(value.clone()) },
         },
-        // The supported Rails subset is the non-mutating, one-argument,
-        // no-block form. Keep block conflicts and `deep_merge!` unresolved
-        // rather than claiming semantics the shared runtime does not provide.
+        // The supported Rails subset is the one-argument, no-block form. The
+        // mutating one answers the receiver, whose type it cannot widen: an
+        // argument whose keys or values the receiver's type does not already
+        // hold stays unresolved (refused in `analyze::body`).
+        "deep_merge!" if args.len() == 1 && block_ret.is_none() => match args[0].ty.as_ref() {
+            Some(Ty::Hash { key: other_key, value: other_value })
+                if union_of(key.clone(), (**other_key).clone()) == *key && union_of(value.clone(), (**other_value).clone()) == *value =>
+            {
+                Ty::Hash { key: std::sync::Arc::new(key.clone()), value: std::sync::Arc::new(value.clone()) }
+            }
+            _ => unknown(),
+        },
         "deep_merge" if args.len() == 1 && block_ret.is_none() => {
             match args[0].ty.as_ref() {
                 Some(Ty::Hash {
@@ -4203,6 +4428,8 @@ pub(super) fn str_method(method: &Symbol) -> Ty {
         // lower). Both answer a String whatever the width.
         | "rjust" | "ljust" | "center" => Ty::Str,
         "to_f" => Ty::Float,
+        // bigdecimal/util's loose parse, which `lower::bigdecimal` spells through the runtime.
+        "to_d" => Ty::Class { id: crate::ident::ClassId(Symbol::from("BigDecimal")), args: vec![].into() },
         "to_sym" | "intern" => Ty::Sym,
         // Case-insensitive comparison: `casecmp` returns -1/0/1 (Int),
         // `casecmp?` returns Bool.
@@ -4274,7 +4501,7 @@ pub(super) fn str_method(method: &Symbol) -> Ty {
         // Operators. `+` concats; `<<` mutates in place but still returns self.
         // `*` is repetition ("a" * 3); `%` is sprintf (returns Str). Comparisons
         // uniformly return Bool.
-        "+" | "<<" | "*" | "%" | "concat" => Ty::Str,
+        "+" | "<<" | "*" | "%" | "concat" | "prepend" => Ty::Str,
         "==" | "!=" | "<" | ">" | "<=" | ">=" | "<=>" | "eql?" | "equal?" => Ty::Bool,
         // ActiveSupport String extensions. Pluralization/inflection
         // methods all return Str; comparison-style return Bool. Match
@@ -4545,7 +4772,7 @@ fn gradual_array(ty: &Ty) -> bool {
     match ty {
         Ty::Untyped | Ty::Var { .. } => true,
         Ty::Array { elem } => matches!(elem.as_ref(), Ty::Untyped | Ty::Var { .. }),
-        Ty::Fn { ret, .. } => gradual_array(ret),
+        Ty::Fn(fn_ty) => gradual_array(&fn_ty.ret),
         _ => false,
     }
 }
@@ -4568,7 +4795,7 @@ pub(crate) const ENUMERABLE_METHODS: &[&str] = &[
 
 fn unwrap_fn_ret(ty: &Ty) -> Ty {
     match ty {
-        Ty::Fn { ret, .. } => (**ret).clone(),
+        Ty::Fn(fn_ty) => (*fn_ty.ret).clone(),
         other => other.clone(),
     }
 }
@@ -4858,10 +5085,12 @@ fn param_value_method(method: &Symbol, block_ret: Option<&Ty>) -> Option<Ty> {
         "key?" | "has_key?" | "include?" | "member?" | "present?" | "blank?" | "empty?" | "any?"
         | "all?" | "none?" | "nil?" | "is_a?" | "kind_of?" | "instance_of?" | "respond_to?" | "=="
         | "!=" | "===" | "equal?" | "eql?" => Ty::Bool,
+        // Rails' `to_h` answers a Hash with indifferent access whatever the Parameters held.
+        "to_h" | "to_unsafe_h" if block_ret.is_none() => crate::analyze::indifferent::of(pv()),
         "each" | "each_pair" | "each_value" | "each_key" | "each_with_index" | "reverse_each"
         | "select" | "filter" | "reject" | "compact" | "uniq" | "sort" | "sort_by" | "reverse"
-        | "merge" | "except" | "slice" | "permit" | "permit!" | "to_unsafe_h" | "to_h" | "require"
-        | "with_defaults" | "with_defaults!" | "reverse_merge" | "reverse_merge!" => pv(),
+        | "merge" | "except" | "slice" | "permit" | "permit!" | "require"
+        | "with_defaults" | "with_defaults!" | "reverse_merge" | "reverse_merge!" | "to_h" | "to_unsafe_h" => pv(),
         "map" | "collect" | "flat_map" | "filter_map" => {
             Ty::Array { elem: std::sync::Arc::new(block_ret.cloned().unwrap_or(Ty::Untyped)) }
         }
@@ -4869,6 +5098,8 @@ fn param_value_method(method: &Symbol, block_ret: Option<&Ty>) -> Option<Ty> {
         "values" | "to_a" => Ty::Array { elem: std::sync::Arc::new(pv()) },
         "size" | "length" | "count" | "to_i" => Ty::Int,
         "to_f" => Ty::Float,
+        // A String's or nil's, raising for another shape as Ruby does (`lower::bigdecimal`).
+        "to_d" => Ty::Class { id: crate::ident::ClassId(Symbol::from("BigDecimal")), args: vec![].into() },
         "to_s" | "join" => Ty::Str,
         "to_sym" => Ty::Sym,
         "tap" | "dup" | "freeze" => pv(),

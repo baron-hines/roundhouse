@@ -45,7 +45,8 @@ module ActiveRecord
     end
   
     # Rails' `errors[attribute]` asked with a name the lowering does not see (`object.errors[attribute_name]` in a
-    # gem's builder): the accumulator answers it from the details, an Integer index as the Array it is.
+    # gem's builder): the accumulator answers it from the details, an Integer index as the Array it is. So does
+    # `messages`, read from code the compiler does not lower (a spec's `errors.messages.dig(:title)`).
     class ErrorMessages < Array
       def initialize(record, messages)
         super(messages)
@@ -55,6 +56,10 @@ module ActiveRecord
       def [](*args)
         key = args.first
         args.size == 1 && (key.is_a?(Symbol) || key.is_a?(String)) ? @record.error_messages_for(key.to_s) : super
+      end
+
+      def messages
+        ActiveSupport.errors_messages(@record.error_details)
       end
     end
 

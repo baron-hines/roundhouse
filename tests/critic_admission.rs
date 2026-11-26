@@ -126,12 +126,17 @@ fn for_scope_is_not_a_block_scope() {
 }
 
 #[test]
+fn string_to_d_has_its_runtime() {
+    // `ActiveSupport.loose_to_d` (runtime/ruby/active_support_ext.rb), run by tests/emit_and_run/string_to_d.rs.
+    admits("\"1.5\".to_d");
+}
+
+#[test]
 fn registry_signatures_do_not_supply_missing_runtime() {
     for (body, name) in [
         ("ActiveRecord::Base.connected_to(role: :reading) { 7 }", "connected_to"),
         ("Benchmark.realtime { 1 }", "Benchmark"),
         ("\"2020-01-02\".to_date", "to_date"),
-        ("\"1.5\".to_d", "to_d"),
         ("{}.to_sentence", "to_sentence"),
     ] { refuses(body, name); }
 }
@@ -233,7 +238,9 @@ fn lambda_parameters_cannot_borrow_outer_class_identity() {
 #[test]
 fn dropped_block_capture_cannot_borrow_outer_identity() {
     refuses("k = Probe; [1].each { |&k| k.define_method(:x) { 1 } }", "block parameter capture");
-    refuses("k = Probe; f = ->(&k) { k.define_method(:x) { 1 } }; f.call", "block parameter capture");
+    // A lambda keeps its named block parameter: `k` there is the block, not the outer class, so `define_method` on it
+    // is refused for its receiver rather than run on `Probe`.
+    refuses("k = Probe; f = ->(&k) { k.define_method(:x) { 1 } }; f.call", "Module protocol");
 }
 
 #[test]

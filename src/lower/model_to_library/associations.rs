@@ -90,17 +90,16 @@ pub(crate) fn through_writer_join(
     }) else {
         return ThroughWriterJoin::NoJoin;
     };
-    let Some((join_class, owner_fk, thr_through, thr_as)) = model.associations().find_map(|a| match a {
-        Association::HasMany {
-            name: n,
-            target: jt,
-            foreign_key: jfk,
-            through: jthru,
-            as_interface,
-            ..
-        } if n == &thr_name => Some((jt.clone(), jfk.clone(), jthru.clone(), as_interface.clone())),
-        _ => None,
-    }) else {
+    // The last declaration of the name, which replaces an earlier one, as
+    // the reader reads it.
+    let Some((join_class, owner_fk, thr_through, thr_as)) =
+        model.associations().filter(|a| a.name() == &thr_name).last().and_then(|a| match a {
+            Association::HasMany { target: jt, foreign_key: jfk, through: jthru, as_interface, .. } => {
+                Some((jt.clone(), jfk.clone(), jthru.clone(), as_interface.clone()))
+            }
+            _ => None,
+        })
+    else {
         return ThroughWriterJoin::NoJoin;
     };
     // First hop already indirect (`through:` an association that is
@@ -159,7 +158,7 @@ pub(crate) fn through_writer_join(
 /// unsaved record's own `id` uses, read off the owner's attribute row
 /// so a uuid foreign key is never compared with, or reset to, an
 /// integer it can't hold (#90).
-fn fk_sentinel(model: &Model, foreign_key: &Symbol) -> Expr {
+pub(crate) fn fk_sentinel(model: &Model, foreign_key: &Symbol) -> Expr {
     let ty = model.attributes.fields.get(foreign_key);
     let is_str = match ty {
         Some(Ty::Str) => true,
@@ -169,31 +168,39 @@ fn fk_sentinel(model: &Model, foreign_key: &Symbol) -> Expr {
     if is_str { super::lit_str(String::new()) } else { lit_int(0) }
 }
 
-/// Push an `unsupported` error for a `has_many :through` whose source
-/// association has a scope (`has_many :bo_remarks, -> { where(...) }`).
-/// The through reader, preload and join apply only the scope of the
-/// through association itself, so they would return the rows that the
-/// source scope filters out. Returns true when it refused: the caller
-/// then synthesizes no reader.
+/// Push an `unsupported` error for a `has_many :through` or `has_one
+/// :through` whose source association has a scope (`has_many
+/// :bo_remarks, -> { where(...) }`). The through reader, preload and join
+/// apply only the scopes of the through association and its hop, so they
+/// would return the rows that the source scope filters out. Returns true
+/// when it refused: the caller then synthesizes no reader.
 fn refuse_scoped_through_source(
     model: &Model,
     models: &[Model],
     assoc: &Association,
     span: Span,
 ) -> bool {
-    let Association::HasMany { name, through: Some(thr_name), .. } = assoc else { return false };
+    let (Association::HasMany { name, through: Some(thr_name), .. } | Association::HasOne { name, through: Some(thr_name), .. }) =
+        assoc
+    else {
+        return false;
+    };
     let source = model
         .associations()
-        .find(|a| a.name() == thr_name)
+        .filter(|a| a.name() == thr_name)
+        .last()
         .and_then(|thr| match thr {
-            Association::HasMany { target, .. } | Association::HasOne { target, .. } => Some(target),
+            Association::HasMany { target, .. }
+            | Association::HasOne { target, .. }
+            | Association::BelongsTo { target, polymorphic: false, .. } => Some(target),
             _ => None,
         })
         .and_then(|thr_target| models.iter().find(|m| &m.name == thr_target))
         .and_then(|thr_model| thr_model.through_source(assoc));
     let Some(
         source @ (Association::HasMany { scope: Some(_), .. }
-        | Association::HasOne { scope: Some(_), .. }),
+        | Association::HasOne { scope: Some(_), .. }
+        | Association::BelongsTo { scope: Some(_), .. }),
     ) = source
     else {
         return false;
@@ -432,6 +439,7 @@ pub(super) fn push_association_methods(
                 polymorphic_targets,
                 foreign_type,
                 primary_key,
+                scope,
                 ..
             } if !polymorphic_targets.is_empty() => {
                 // Polymorphic: the reader dispatches on the type column
@@ -440,16 +448,22 @@ pub(super) fn push_association_methods(
                 let type_col = foreign_type
                     .clone()
                     .unwrap_or_else(|| Symbol::from(format!("{}_type", name.as_str())));
-                let assoc_pk = primary_key
-                    .clone()
-                    .unwrap_or_else(|| Symbol::from("id"));
+                // Each class is read and written by its own key, unless
+                // the declaration names one (`primary_key:`), as Rails'
+                // `association_primary_key(klass)` answers.
+                let key_of = |t: &ClassId| {
+                    crate::lower::scope_chain::association_primary_key(models, t, primary_key.as_ref())
+                };
+                let keys: Vec<Symbol> = polymorphic_targets.iter().map(key_of).collect();
+                let scope = belongs_to_scope(scope.as_ref(), &keys, runtime_relation, span, owner, name);
                 methods.push(synth_polymorphic_reader(
                     owner,
                     name,
                     polymorphic_targets,
                     foreign_key,
                     &type_col,
-                    &assoc_pk,
+                    key_of,
+                    &scope,
                 ));
                 let sentinel = fk_sentinel(model, foreign_key);
                 let writer_name = Symbol::from(format!("{}=", name.as_str()));
@@ -464,15 +478,17 @@ pub(super) fn push_association_methods(
                         polymorphic_targets,
                         foreign_key,
                         &type_col,
-                        &assoc_pk,
+                        key_of,
                         sentinel,
                         keeps_nil,
                         held_key(table, foreign_key),
                     ));
                 }
             }
-            // Unresolved polymorphic (`polymorphic: true` but no inverse
-            // `as:` filled `polymorphic_targets`): do **not** fall through
+            // Unresolved polymorphic (`polymorphic: true` with an empty
+            // `polymorphic_targets`, which ingest leaves only on the
+            // framework records it synthesizes after resolving, as
+            // ActionText::RichText's `record`): do **not** fall through
             // to the monomorphic synthesizer. The phantom target is often
             // `Record` (ActionText::RichText / Markdown), and emitting
             // `Record.find_by` is a boot-time `NameError` if the accessor
@@ -491,6 +507,7 @@ pub(super) fn push_association_methods(
                 foreign_key,
                 polymorphic: false,
                 primary_key,
+                scope,
                 ..
             } => {
                 let sentinel = fk_sentinel(model, foreign_key);
@@ -498,7 +515,8 @@ pub(super) fn push_association_methods(
                 // target's own primary key.
                 let assoc_pk =
                     crate::lower::scope_chain::association_primary_key(models, target, primary_key.as_ref());
-                methods.push(synth_belongs_to_reader(owner, name, target, foreign_key, &assoc_pk, sentinel.clone(), keeps_nil));
+                let scope = belongs_to_scope(scope.as_ref(), std::slice::from_ref(&assoc_pk), runtime_relation, span, owner, name);
+                methods.push(synth_belongs_to_reader(owner, name, target, foreign_key, &assoc_pk, sentinel.clone(), keeps_nil, &scope));
                 // Rails provides the writer alongside the reader
                 // (`comment.story = obj` stores the foreign key). A
                 // custom writer in the model body must win (Rails: the
@@ -527,11 +545,32 @@ pub(super) fn push_association_methods(
                 as_interface,
                 scope,
                 autosave,
+                through,
                 ..
             } => {
                 if crate::lower::assoc_primary_key::refuse(model, models, assoc, span) {
                     continue;
                 }
+                if refuse_scoped_through_source(model, models, assoc, span) {
+                    continue;
+                }
+                // The autosave below writes the owner's key on the target,
+                // where a through association keeps it on the hop.
+                let autosave = if *autosave && through.is_some() {
+                    crate::emit::diagnostics::push(crate::diagnostic::Diagnostic::unsupported(
+                        span,
+                        None,
+                        "through_autosave",
+                        format!(
+                            "`{}.{name}`: `autosave: true` on a has_one :through is not supported: \
+                             its save would write the owner's key on the target, not on the hop",
+                            model.name.0
+                        ),
+                    ));
+                    &false
+                } else {
+                    autosave
+                };
                 let owner_key = assoc.owner_key();
                 methods.push(synth_has_one_reader(
                     owner,
@@ -782,6 +821,11 @@ fn reroot_unscoping(body: &mut Expr, target: &ClassId, foreign_key: &Symbol) {
                 walk(recv, target, foreign_key)
             }
             ExprNode::Send { recv: Some(recv), .. } => walk(recv, target, foreign_key),
+            // A held association's reader merges its query's rows with the
+            // records it holds: `_merge_target(<query>, @__held_<name>)`.
+            ExprNode::Send { recv: None, method, args, .. } if method.as_str() == "_merge_target" => {
+                args.first_mut().is_some_and(|query| walk(query, target, foreign_key))
+            }
             ExprNode::Seq { exprs } => exprs.iter_mut().any(|x| walk(x, target, foreign_key)),
             _ => false,
         }
@@ -933,6 +977,37 @@ fn synth_has_many_reader(
         )
     } else {
         empty
+    };
+    // A model that holds what is created on, built on or pushed onto the
+    // association (`ingest::has_many_hold`) merges the rows with those
+    // held records, as Rails' `merge_target_lists` merges the query's
+    // rows into its memory: a record it already holds stands in for its
+    // row (same object, the row's values of the attributes it has not
+    // changed) and an unsaved one follows the rows. A pure read — the
+    // held list is only read here, so the method stays read-only. Only a
+    // reader that materializes its rows merges: a scoped association's
+    // reader answers a Relation (the scope's chain), which a merged Array
+    // would not be, so it keeps its rows as the query answered them.
+    let lazy_query = if held && scope.is_none() {
+        let span = Span::synthetic();
+        Expr::new(
+            span,
+            ExprNode::Send {
+                recv: None,
+                method: Symbol::from("_merge_target"),
+                args: vec![
+                    lazy_query,
+                    Expr::new(
+                        span,
+                        ExprNode::Ivar { name: Symbol::from(format!("__held_{name}")) },
+                    ),
+                ],
+                block: None,
+                parenthesized: true,
+            },
+        )
+    } else {
+        lazy_query
     };
     let body = match (unsaved_guard && !through).then(|| unsaved_owner_guard(owner_key, empty)) {
         Some(unsaved) => seq(vec![guard, unsaved, lazy_query]),
@@ -1666,6 +1741,20 @@ pub(in crate::lower::model_to_library) fn clear_loaded_flag_assigns(
                 value: lit_bool(false),
             },
         ));
+        // And what a has_many holds, built on or pushed onto it
+        // (`ingest::has_many_hold`): Rails' reload resets the target, the
+        // unsaved records with it.
+        if matches!(assoc, Association::HasMany { .. })
+            && model.methods().any(|m| m.name.as_str() == format!("__hold_{}", name.as_str()))
+        {
+            out.push(Expr::new(
+                Span::synthetic(),
+                ExprNode::Assign {
+                    target: LValue::Ivar { name: Symbol::from(format!("__held_{}", name.as_str())) },
+                    value: Expr::new(Span::synthetic(), ExprNode::Lit { value: crate::expr::Literal::Nil }),
+                },
+            ));
+        }
     }
     out
 }
@@ -1743,6 +1832,126 @@ fn synth_preload_setter(owner: &ClassId, name: &Symbol, target: &ClassId) -> Met
     )
 }
 
+/// How a `belongs_to`'s scope reaches its reader.
+enum BelongsToScope<'a> {
+    None,
+    /// Hash `where`s only (`-> { where(active: true) }`): their entries.
+    Conditions(Vec<(Expr, Expr)>),
+    /// Anything else, chained after the key on the runtime Relation.
+    Chain(&'a Expr),
+}
+
+/// How a `belongs_to`'s scope reaches its reader, monomorphic or
+/// polymorphic. A scope of hash `where`s joins the key in `find_by`, which
+/// folds to SQL on every target, when each names its own column: a
+/// repeated one (`where(id: 1)` on the key, or `where(kind: "a").where(kind:
+/// "b")`) would be one keyword argument, where Rails applies both. Any
+/// other scope chains on the runtime Relation, which a strict target lacks:
+/// there the reader finds by the key alone, the reported gap. `keys` are
+/// the columns the reader finds by: one, or each polymorphic class's.
+fn belongs_to_scope<'a>(
+    scope: Option<&'a Expr>,
+    keys: &[Symbol],
+    runtime_relation: super::RuntimeRelation,
+    span: Span,
+    owner: &ClassId,
+    name: &Symbol,
+) -> BelongsToScope<'a> {
+    match scope.map(|scope| (scope, hash_where_entries(scope))) {
+        None => BelongsToScope::None,
+        Some((_, Some(entries))) if distinct_columns(&entries, keys) => BelongsToScope::Conditions(entries),
+        Some((scope, _)) if runtime_relation == super::RuntimeRelation::Present => BelongsToScope::Chain(scope),
+        Some(_) => {
+            let kind = crate::diagnostic::DiagnosticKind::LowerResidue {
+                pass: Symbol::from("belongs_to_reader"),
+                construct: Symbol::from("belongs_to"),
+                reason: Symbol::from("scope"),
+            };
+            crate::emit::diagnostics::push(crate::diagnostic::Diagnostic {
+                span,
+                severity: crate::diagnostic::Diagnostic::default_severity(&kind),
+                kind,
+                message: format!(
+                    "`belongs_to :{name}`'s scope is not applied: only hash `where`s on \
+                     distinct columns fold to SQL, and this target has no runtime Relation \
+                     to run the rest on, so `{owner}#{name}` finds by the key alone",
+                    name = name.as_str(),
+                    owner = owner.0.as_str(),
+                ),
+            });
+            BelongsToScope::None
+        }
+    }
+}
+
+/// The target row a `belongs_to` reads once its key is set:
+/// `Author.find_by(id: @author_id)`, with a hash scope's conditions after
+/// the key (`find_by(id: @author_id, active: true)`), or any other scope
+/// chained after it on the runtime Relation
+/// (`Author.where(id: @author_id).unscope(where: :archived).first`), which
+/// starts from the target's default scope as Rails' association scope does.
+fn scoped_find(target: &ClassId, foreign_key: &Symbol, assoc_pk: &Symbol, scope: &BelongsToScope<'_>) -> Expr {
+    let key = || Expr::new(Span::synthetic(), ExprNode::Ivar { name: foreign_key.clone() });
+    let send = |recv: Expr, method: &str, args: Vec<Expr>| {
+        Expr::new(
+            Span::synthetic(),
+            ExprNode::Send {
+                recv: Some(recv),
+                method: Symbol::from(method),
+                parenthesized: !args.is_empty(),
+                args,
+                block: None,
+            },
+        )
+    };
+    let mut entries = vec![(lit_sym(assoc_pk.clone()), key())];
+    match scope {
+        BelongsToScope::Chain(scope) => {
+            let keyed = send(class_const(target), "where", vec![Expr::new(Span::synthetic(), ExprNode::Hash { entries, kwargs: true })]);
+            send(graft_scope(scope, keyed), "first", vec![])
+        }
+        BelongsToScope::Conditions(conditions) => {
+            entries.extend(conditions.iter().cloned());
+            send(class_const(target), "find_by", vec![Expr::new(Span::synthetic(), ExprNode::Hash { entries, kwargs: true })])
+        }
+        BelongsToScope::None => {
+            send(class_const(target), "find_by", vec![Expr::new(Span::synthetic(), ExprNode::Hash { entries, kwargs: true })])
+        }
+    }
+}
+
+/// The entries of a scope that is only hash `where`s with symbol keys
+/// (`where(active: true).where(kind: "a")`), in order.
+fn hash_where_entries(scope: &Expr) -> Option<Vec<(Expr, Expr)>> {
+    let ExprNode::Send { recv, method, args, block: None, .. } = &*scope.node else { return None };
+    if method.as_str() != "where" {
+        return None;
+    }
+    let [arg] = args.as_slice() else { return None };
+    let ExprNode::Hash { entries, .. } = &*arg.node else { return None };
+    if entries.is_empty() || !entries.iter().all(|(k, _)| matches!(&*k.node, ExprNode::Lit { value: crate::expr::Literal::Sym { .. } })) {
+        return None;
+    }
+    let mut out = match recv {
+        None => Vec::new(),
+        Some(inner) => hash_where_entries(inner)?,
+    };
+    out.extend(entries.iter().cloned());
+    Some(out)
+}
+
+/// No two of a hash scope's columns are the same, nor is any a key
+/// `find_by` reads by (`keys`): each stays its own keyword argument.
+fn distinct_columns(entries: &[(Expr, Expr)], keys: &[Symbol]) -> bool {
+    let mut seen = std::collections::BTreeSet::new();
+    entries.iter().all(|(k, _)| match &*k.node {
+        ExprNode::Lit { value: crate::expr::Literal::Sym { value } } => {
+            !keys.contains(value) && seen.insert(value.as_str().to_string())
+        }
+        _ => false,
+    })
+}
+
 fn synth_belongs_to_reader(
     owner: &ClassId,
     name: &Symbol,
@@ -1751,10 +1960,12 @@ fn synth_belongs_to_reader(
     assoc_pk: &Symbol,
     sentinel: Expr,
     keeps_nil: bool,
+    scope: &BelongsToScope<'_>,
 ) -> MethodDef {
     // def article
     //   @article_id == 0 ? nil : Article.find_by(id: @article_id)
     // end
+    // with the scope as `scoped_find` applies it.
     // (`== ""` when the referenced key is a string — `fk_sentinel`.)
     let cond = Expr::new(
         Span::synthetic(),
@@ -1794,35 +2005,12 @@ fn synth_belongs_to_reader(
         cond
     };
 
-    let find_by = Expr::new(
-        Span::synthetic(),
-        ExprNode::Send {
-            recv: Some(class_const(target)),
-            method: Symbol::from("find_by"),
-            args: vec![Expr::new(
-                Span::synthetic(),
-                ExprNode::Hash {
-                    entries: vec![(
-                        lit_sym(assoc_pk.clone()),
-                        Expr::new(
-                            Span::synthetic(),
-                            ExprNode::Ivar { name: foreign_key.clone() },
-                        ),
-                    )],
-                    kwargs: true,
-                },
-            )],
-            block: None,
-            parenthesized: true,
-        },
-    );
-
     let body = Expr::new(
         Span::synthetic(),
         ExprNode::If {
             cond,
             then_branch: nil_lit(),
-            else_branch: find_by,
+            else_branch: scoped_find(target, foreign_key, assoc_pk, scope),
         },
     );
 
@@ -1861,7 +2049,8 @@ fn synth_polymorphic_reader(
     targets: &[ClassId],
     foreign_key: &Symbol,
     type_col: &Symbol,
-    assoc_pk: &Symbol,
+    assoc_pk: impl Fn(&ClassId) -> Symbol,
+    scope: &BelongsToScope<'_>,
 ) -> MethodDef {
     // def notifiable
     //   case @notifiable_type
@@ -1873,30 +2062,8 @@ fn synth_polymorphic_reader(
     //
     // Rails stores the implementor's class name in the type column; the
     // target set was resolved at ingest from `types:` / inverse `as:`.
-    let find_by = |t: &ClassId| {
-        Expr::new(
-            Span::synthetic(),
-            ExprNode::Send {
-                recv: Some(class_const(t)),
-                method: Symbol::from("find_by"),
-                args: vec![Expr::new(
-                    Span::synthetic(),
-                    ExprNode::Hash {
-                        entries: vec![(
-                            lit_sym(assoc_pk.clone()),
-                            Expr::new(
-                                Span::synthetic(),
-                                ExprNode::Ivar { name: foreign_key.clone() },
-                            ),
-                        )],
-                        kwargs: true,
-                    },
-                )],
-                block: None,
-                parenthesized: true,
-            },
-        )
-    };
+    // Each arm reads through the association's scope, as Rails builds
+    // the polymorphic reader's query on the class the type column names.
     let mut arms: Vec<crate::expr::Arm> = targets
         .iter()
         .map(|t| crate::expr::Arm {
@@ -1904,7 +2071,7 @@ fn synth_polymorphic_reader(
                 value: Literal::Str { value: t.0.as_str().to_string() },
             },
             guard: None,
-            body: find_by(t),
+            body: scoped_find(t, foreign_key, &assoc_pk(t), scope),
         })
         .collect();
     arms.push(crate::expr::Arm {
@@ -1977,7 +2144,7 @@ fn synth_polymorphic_writer(
     targets: &[ClassId],
     foreign_key: &Symbol,
     type_col: &Symbol,
-    assoc_pk: &Symbol,
+    assoc_pk: impl Fn(&ClassId) -> Symbol,
     sentinel: Expr,
     keeps_nil: bool,
     key_held: bool,
@@ -1997,7 +2164,9 @@ fn synth_polymorphic_writer(
     //
     // Both halves of the (type, id) pair, mirroring the plain writer's
     // `@fk == 0` nil sentinel. The class-pattern `when` keeps the type
-    // string a compile-time constant per arm (no `.class.name`).
+    // string a compile-time constant per arm (no `.class.name`). When the
+    // classes are keyed by different columns, each arm reads its own:
+    // `when Ticket then @subject_id = value.code; @subject_type = "Ticket"`.
     let value = Symbol::from("value");
     let type_col = type_col.clone();
     let assign = |target_ivar: &Symbol, v: Expr| {
@@ -2026,19 +2195,30 @@ fn synth_polymorphic_writer(
             parenthesized: false,
         },
     );
-    let id_read = Expr::new(
-        Span::synthetic(),
-        ExprNode::Send {
-            recv: Some(var_ref(value.clone())),
-            method: assoc_pk.clone(),
-            args: vec![],
-            block: None,
-            parenthesized: false,
-        },
-    );
-    let type_switch = polymorphic_type_switch(var_ref(value.clone()), targets, |t| {
-        assign(&type_col, lit_str(t.0.as_str()))
-    }, None);
+    let key_read = |key: Symbol| {
+        Expr::new(
+            Span::synthetic(),
+            ExprNode::Send {
+                recv: Some(var_ref(value.clone())),
+                method: key,
+                args: vec![],
+                block: None,
+                parenthesized: false,
+            },
+        )
+    };
+    let shared_key = targets.first().map(&assoc_pk).filter(|first| targets.iter().all(|t| assoc_pk(t) == *first));
+    let assign_present = match shared_key {
+        Some(key) => {
+            let type_switch = polymorphic_type_switch(var_ref(value.clone()), targets, |t| {
+                assign(&type_col, lit_str(t.0.as_str()))
+            }, None);
+            seq(vec![assign(foreign_key, key_read(key)), type_switch])
+        }
+        None => polymorphic_type_switch(var_ref(value.clone()), targets, |t| {
+            seq(vec![assign(foreign_key, key_read(assoc_pk(t))), assign(&type_col, lit_str(t.0.as_str()))])
+        }, None),
+    };
     let body = Expr::new(
         Span::synthetic(),
         ExprNode::If {
@@ -2053,7 +2233,7 @@ fn synth_polymorphic_writer(
             } else {
                 seq(vec![assign(foreign_key, sentinel), assign(&type_col, lit_str(""))])
             },
-            else_branch: seq(vec![assign(foreign_key, id_read), type_switch]),
+            else_branch: assign_present,
         },
     );
 
@@ -2858,7 +3038,7 @@ mod tests {
                 &[ClassId(Symbol::from("Post"))],
                 &Symbol::from("subject_id"),
                 &Symbol::from("subject_type"),
-                &Symbol::from("id"),
+                |_: &ClassId| Symbol::from("id"),
                 lit_int(0),
                 false,
                 key_held,

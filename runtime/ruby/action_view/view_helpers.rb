@@ -32,6 +32,7 @@ module ActionView
     # TS/Crystal/Rust/Go/Spinel keep working.
     @slots = {}
     @broadcast_rendering = false
+    @hidden_autocomplete = false
 
     def self.reset_slots!
       @slots = {}
@@ -1007,7 +1008,7 @@ module ActionView
       form_attrs[:class] = (form_class || "button_to").to_s
       button_attrs = render_attrs({ type: "submit" }.merge(inner_opts))
       method_input = if !method.nil? && method.to_s != "post"
-                       %(<input type="hidden" name="_method" value="#{method}">)
+                       %(<input type="hidden" name="_method" value="#{method}"#{hidden_autocomplete_attr}>)
                      else
                        ""
                      end
@@ -1056,6 +1057,12 @@ module ActionView
     # `url_for_path`.
     def self.csp_meta_tag
       ""
+    end
+
+    # Not `Rails.application`'s nonce here: a strict target has no `Rails` in a view helper, so its tags carry none;
+    # the ruby family reopens this in `view_helpers_ext.rb`, as `csp_meta_tag`.
+    def self.content_security_policy_nonce
+      nil
     end
   
     def self.stylesheet_link_tag(name, opts = EMPTY_HTML_OPTS)
@@ -1309,6 +1316,22 @@ module ActionView
       "<#{n}#{render_attrs(opts.to_h)}>#{content_tag_pre(n)}#{html}</#{n}>"
     end
 
+    # `button_to url, opts do … end` whose options are computed (a `**opts` merge chain): Rails' form around a submit
+    # button that holds the block's captured markup, `method:` and `form_class:` read out of the options as the
+    # compile-time spelling reads them (`view_to_library::helpers::button_to_wrapper_markup`).
+    def self.button_to_html(url, html, opts = EMPTY_HTML_OPTS)
+      # Not a `reject` block: the strict targets emit none for a runtime Hash. `button_to`'s portable spelling.
+      method = opts.fetch(:method, "post").to_s
+      form_class = opts.fetch(:form_class, "button_to").to_s
+      attrs = opts.to_h.dup
+      attrs.delete(:method)
+      attrs.delete(:form_class)
+      # Rails' GET form carries neither a method override nor the token.
+      form_method = method == "get" ? "get" : "post"
+      token = method == "get" ? "" : csrf_token_hidden_input
+      "<form action=\"#{html_escape(url.to_s)}\" method=\"#{form_method}\" class=\"#{html_escape(form_class)}\">#{method_override_input(method)}<button type=\"submit\"#{render_attrs(attrs)}>#{html}</button>#{token}</form>"
+    end
+
     # Rails' `ensure_valid_html5_tag_name` (`/\A[a-zA-Z][^\s\/>]*\z/`):
     # a letter, then no whitespace, `/` or `>`, else ArgumentError, so a
     # dynamic name never writes past the tag. Bytes, not the Regexp (no
@@ -1373,12 +1396,15 @@ module ActionView
       end
       import_lines = pins.map { |p| "    \"#{p[:name]}\": \"#{p[:path]}\"" }.join(",\n")
       json = "{\n  \"imports\": {\n" + import_lines + "\n  }\n}"
+      # importmap-rails passes `nonce: request&.content_security_policy_nonce` to each tag; the tag helper drops a nil one.
+      nonce = content_security_policy_nonce
+      attr = nonce.nil? ? "" : %( nonce="#{nonce}")
       parts = []
-      parts << %(<script type="importmap" data-turbo-track="reload">) + json + %(</script>)
+      parts << %(<script type="importmap" data-turbo-track="reload") + attr + ">" + json + %(</script>)
       pins.each do |p|
-        parts << %(<link rel="modulepreload" href="#{p[:path]}">)
+        parts << %(<link rel="modulepreload" href="#{p[:path]}") + attr + ">"
       end
-      parts << %(<script type="module">import "#{entry}"</script>)
+      parts << %(<script type="module") + attr + %(>import "#{entry}"</script>)
       parts.join("\n")
     end
   
@@ -1452,7 +1478,18 @@ module ActionView
       return "" if @broadcast_rendering == true
       return "" if ActionController.forgery_switched_off
       return "" if token_fields_omitted?
-      %(<input type="hidden" name="authenticity_token" value="#{html_escape(form_authenticity_token)}">)
+      %(<input type="hidden" name="authenticity_token" value="#{html_escape(form_authenticity_token)}"#{hidden_autocomplete_attr}>)
+    end
+
+    # Rails' `autocomplete="off"` on a hidden input, which `load_defaults` 8.1 drops: a view of an app before it turns it
+    # on (`keep_hidden_autocomplete`, the lowered render's first call).
+    def self.hidden_autocomplete_attr
+      @hidden_autocomplete == true ? " autocomplete=\"off\"" : ""
+    end
+
+    def self.keep_hidden_autocomplete
+      @hidden_autocomplete = true
+      ""
     end
 
     # Strict non-Ruby targets do not emit Rails::Application. The Ruby
@@ -1530,7 +1567,7 @@ module ActionView
       if method_str == "get" || method_str == "post"
         ""
       else
-        %(<input type="hidden" name="_method" value="#{method_str}">)
+        %(<input type="hidden" name="_method" value="#{method_str}"#{hidden_autocomplete_attr}>)
       end
     end
 
@@ -2025,5 +2062,16 @@ module ActionView
         name == "sortable" || name == "truespeed" || name == "typemustmatch" ||
         name == "visible"
     end
+  end
+end
+
+# turbo-rails' helper modules, which a component includes for `turbo_frame_tag` / `turbo_stream_from` (maybe's
+# ApplicationComponent). Not their methods here: a template's calls are lowered where they are written, and a call
+# from Ruby code stays an unknown method.
+module Turbo
+  module FramesHelper
+  end
+
+  module StreamsHelper
   end
 end

@@ -99,7 +99,8 @@ pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
             let macro_name = match (&filter.kind, filter.prepend) {
                 (FilterKind::Before, true) => "prepend_before_action",
                 (FilterKind::Before, false) => "before_action",
-                (FilterKind::Around, _) => "around_action",
+                (FilterKind::Around, true) => "prepend_around_action",
+                (FilterKind::Around, false) => "around_action",
                 _ => "after_action",
             };
             let kind = DiagnosticKind::UndefinedFilterTarget {

@@ -17,7 +17,7 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // propagate through dispatch without bottoming out at Var.
     // `Rails.env` is the one we can type concretely as Str.
     let mut rails_cls = ClassInfo::default();
-    for m in ["application", "logger", "cache", "configuration", "public_path"] {
+    for m in ["logger", "cache"] {
         rails_cls.class_methods.insert(Symbol::from(m), Ty::Untyped);
     }
     // `Rails.env` is an ActiveSupport::StringInquirer (a String
@@ -42,13 +42,16 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     let error_reporter = class("ActiveSupport::ErrorReporter");
     rails_cls.class_methods.insert(Symbol::from("event"), event_reporter.clone());
     rails_cls.class_methods.insert(Symbol::from("error"), error_reporter.clone());
-    // `Rails.root` is a Pathname in Rails; both lanes answer it with
-    // runtime/ruby/rails.rb's `Rails::AppPath`, so a call it lacks is an error.
+    // `Rails.root` and `Rails.public_path` are Pathnames in Rails; both lanes
+    // answer them with runtime/ruby/rails.rb's `Rails::AppPath`, so a call it
+    // lacks is an error.
     let app_path = class("Rails::AppPath");
     rails_cls.class_methods.insert(Symbol::from("root"), app_path.clone());
+    rails_cls.class_methods.insert(Symbol::from("public_path"), app_path.clone());
+    register_application_surface(&mut rails_cls, classes);
     classes.insert(ClassId(Symbol::from("Rails")), rails_cls);
     register_stdlib_class(classes, "Rails::AppPath", &[], &[
-        ("join", app_path.clone()), ("+", app_path.clone()), ("expand_path", app_path.clone()),
+        ("join", app_path.clone()), ("+", app_path.clone()), ("expand_path", app_path.clone()), ("mkpath", app_path.clone()),
         ("to_s", Ty::Str), ("to_path", Ty::Str), ("read", Ty::Str),
         ("readlines", Ty::Array { elem: std::sync::Arc::new(Ty::Str) }), ("exist?", Ty::Bool),
     ]);
@@ -240,7 +243,7 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     let str_arr = || Ty::Array { elem: std::sync::Arc::new(Ty::Str) };
     register_stdlib_class(classes, "SecureRandom", &[
         ("hex", Ty::Str), ("base64", Ty::Str), ("urlsafe_base64", Ty::Str),
-        ("base58", Ty::Str), ("uuid", Ty::Str), ("alphanumeric", Ty::Str),
+        ("base58", Ty::Str), ("base36", Ty::Str), ("uuid", Ty::Str), ("alphanumeric", Ty::Str),
         ("random_bytes", Ty::Str), ("random_number", Ty::Untyped),
     ], &[]);
     // `Random` carries the same `Random::Formatter` surface as
@@ -272,6 +275,10 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("broadcast_replace_to", Ty::Nil), ("broadcast_update_to", Ty::Nil),
         ("broadcast_remove_to", Ty::Nil),
     ], &[]);
+    // turbo-rails' helper modules, which a component includes (maybe's ApplicationComponent); the runtime defines
+    // them empty, as a template's `turbo_frame_tag` is lowered where it is written.
+    register_stdlib_class(classes, "Turbo::FramesHelper", &[], &[]);
+    register_stdlib_class(classes, "Turbo::StreamsHelper", &[], &[]);
     // `ENV` — a Rails app's configuration seam, and the one stdlib
     // object whose values have a single concrete type: every entry is
     // a String. `fetch` narrows to that, which is right for the two
@@ -412,6 +419,11 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
             sanitize.instance_methods.entry(Symbol::from(m)).or_insert(Ty::Str);
         }
     }
+    // Kernel's module functions called on the module itself (Doorkeeper's `::Kernel.warn <<~WARNING`).
+    register_stdlib_class(classes, "Kernel", &[
+        ("warn", Ty::Nil), ("puts", Ty::Nil), ("print", Ty::Nil), ("format", Ty::Str), ("sprintf", Ty::Str),
+    ], &[]);
+    classes.entry(ClassId(Symbol::from("Kernel"))).or_default().is_module = true;
     register_stdlib_class(classes, "Math", &[
         ("sqrt", Ty::Float), ("cbrt", Ty::Float), ("log", Ty::Float),
         ("log2", Ty::Float), ("log10", Ty::Float), ("exp", Ty::Float),
@@ -725,12 +737,26 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("parse", Ty::Untyped),
     ], &[]);
     // `config_for`'s Hash: Rails' own class, in the ruby family's overlay
-    // (`ruby_overlay/runtime/active_support_ordered_options.rb`).
+    // (`ruby_overlay/runtime/active_support_ordered_options.rb`), and Spinel's Hash-holding one
+    // (`runtime/spinel/ordered_options_spinel.rb`). A name no method answers is a key, read through `method_missing`.
     let ordered_options = Ty::Class { id: ClassId(Symbol::from("ActiveSupport::OrderedOptions")), args: vec![].into() };
-    register_stdlib_class(classes, "ActiveSupport::OrderedOptions", &[
-        ("new", ordered_options.clone()),
-    ], &[
-        ("update", ordered_options),
+    register_stdlib_class(classes, "ActiveSupport::Gzip", &[
+        ("decompress", Ty::Str),
+        ("compress", Ty::Str),
+    ], &[]);
+    // Not a `new` of its own: one returning this class would type a subclass's `new` as this class too.
+    register_stdlib_class(classes, "ActiveSupport::OrderedOptions", &[], &[
+        ("update", ordered_options.clone()),
+        ("merge!", ordered_options),
+        ("[]", Ty::Untyped),
+        ("[]=", Ty::Untyped),
+        ("keys", Ty::Array { elem: std::sync::Arc::new(Ty::Untyped) }),
+        ("key?", Ty::Bool),
+        ("fetch", Ty::Untyped),
+        ("to_h", Ty::Hash { key: std::sync::Arc::new(Ty::Untyped), value: std::sync::Arc::new(Ty::Untyped) }),
+        ("empty?", Ty::Bool),
+        ("dig", Ty::Untyped),
+        ("method_missing", Ty::Untyped),
     ]);
     {
         let continuable = classes.entry(ClassId(Symbol::from("ActiveJob::Continuable"))).or_default();
@@ -805,6 +831,14 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("select_best_encoding", Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() }),
         ("unescape_path", Ty::Str),
     ], &[]);
+    // `Rack::BodyProxy`, ported into `runtime/ruby/rack_body_proxy.rb` (the rack gem's own on the ruby family): the
+    // body a middleware hands up, its block run once the server closes it.
+    let proxy = Ty::Class { id: ClassId(Symbol::from("Rack::BodyProxy")), args: vec![].into() };
+    register_stdlib_class(classes, "Rack::BodyProxy", &[("new", proxy.clone())], &[
+        ("each", proxy),
+        ("close", Ty::Nil),
+        ("closed?", Ty::Bool),
+    ]);
     // `Rack::Utils::HTTP_STATUS_CODES` — the status-code-to-reason-phrase
     // table every app can reach for (`Rack::Utils::HTTP_STATUS_CODES
     // [code]`, Mastodon's error-response helpers among them). A bare
@@ -829,6 +863,18 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
             Symbol::from("HTTP_STATUS_CODES"),
             Ty::Hash { key: std::sync::Arc::new(Ty::Int), value: std::sync::Arc::new(Ty::Str) },
         );
+    }
+    // rack's `lib/rack/constants.rb`, the env keys and header names a gem's middleware reads
+    // (message_bus's `env[Rack::RACK_SESSION_OPTIONS]`): rack's own on the ruby family, the port's
+    // (`runtime/ruby/rack_utils.rb`) elsewhere, both Strings. On `ClassInfo.constants` behind `gem_boundary`, as
+    // `Rack::Utils::HTTP_STATUS_CODES` is.
+    {
+        let info = classes.entry(ClassId(Symbol::from("Rack"))).or_default();
+        info.gem_boundary = true;
+        info.is_module = true;
+        for name in ["HTTP_HOST", "HTTP_PORT", "HTTPS", "PATH_INFO", "REQUEST_METHOD", "REQUEST_PATH", "SCRIPT_NAME", "QUERY_STRING", "SERVER_PROTOCOL", "SERVER_NAME", "SERVER_PORT", "HTTP_COOKIE", "CACHE_CONTROL", "CONTENT_LENGTH", "CONTENT_TYPE", "ETAG", "EXPIRES", "SET_COOKIE", "TRANSFER_ENCODING", "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "CONNECT", "LINK", "UNLINK", "TRACE", "RACK_VERSION", "RACK_TEMPFILES", "RACK_EARLY_HINTS", "RACK_ERRORS", "RACK_LOGGER", "RACK_INPUT", "RACK_SESSION", "RACK_SESSION_OPTIONS", "RACK_SHOWSTATUS_DETAIL", "RACK_URL_SCHEME", "RACK_HIJACK", "RACK_IS_HIJACK", "RACK_RECURSIVE_INCLUDE", "RACK_MULTIPART_BUFFER_SIZE", "RACK_MULTIPART_TEMPFILE_FACTORY", "RACK_RESPONSE_FINISHED", "RACK_PROTOCOL", "RACK_REQUEST_FORM_INPUT", "RACK_REQUEST_FORM_HASH", "RACK_REQUEST_FORM_PAIRS", "RACK_REQUEST_FORM_VARS", "RACK_REQUEST_FORM_ERROR", "RACK_REQUEST_COOKIE_HASH", "RACK_REQUEST_COOKIE_STRING", "RACK_REQUEST_QUERY_HASH", "RACK_REQUEST_QUERY_STRING", "RACK_METHODOVERRIDE_ORIGINAL_METHOD"] {
+            info.constants.insert(Symbol::from(name), Ty::Str);
+        }
     }
     register_stdlib_class(classes, "IPAddr", &[], &[
         ("ipv4?", Ty::Bool), ("ipv6?", Ty::Bool), ("ipv4_mapped?", Ty::Bool),
@@ -880,7 +926,9 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("[]", Ty::Untyped),
         ("[]=", Ty::Untyped),
         ("compute_if_absent", Ty::Untyped),
-        ("clear", concurrent_map),
+        ("clear", concurrent_map.clone()),
+        ("keys", Ty::Array { elem: std::sync::Arc::new(Ty::Untyped) }),
+        ("each_pair", concurrent_map),
     ]);
     // `Net::HTTP` — a real client on BOTH lanes: CRuby's own stdlib, and
     // spinel's `packages/net` (HTTPS included, since the openssl package
@@ -1020,11 +1068,25 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("Psych::AnchorNotDefined", "Psych::BadAlias"),
         // `rescue WeakRef::RefError` around a read of a collected referent.
         ("WeakRef::RefError", "StandardError"),
+        // (parented: a bare `rescue` must not catch these as it catches a StandardError)
+        ("ScriptError", "Exception"),
+        ("SyntaxError", "ScriptError"),
+        ("SystemExit", "Exception"),
+        ("SignalException", "Exception"),
+        ("Interrupt", "SignalException"),
+        ("NoMemoryError", "Exception"),
+        ("SecurityError", "Exception"),
+        ("SystemStackError", "Exception"),
+        ("Encoding::UndefinedConversionError", "EncodingError"),
+        ("Encoding::InvalidByteSequenceError", "EncodingError"),
+        ("Encoding::ConverterNotFoundError", "EncodingError"),
     ] {
         register_stdlib_class(classes, exc, &[], &exception_surface);
         classes.entry(ClassId(Symbol::from(exc))).or_default().parent =
             Some(ClassId(Symbol::from(parent)));
     }
+    register_stdlib_class(classes, "SystemExit", &[], &[("status", Ty::Int), ("success?", Ty::Bool)]);
+    register_stdlib_class(classes, "SignalException", &[], &[("signo", Ty::Int), ("signm", Ty::Str)]);
     // ECError aliases PKeyError; source may reopen either spelling with different returns.
     let gradual_errors: Vec<_> = exception_surface.iter().map(|(name, _)| (*name, Ty::Untyped)).collect();
     for (exc, parent) in [
@@ -1111,6 +1173,7 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("ActiveRecord::ConnectionNotEstablished", None),
         ("ActiveRecord::ConnectionFailed", None),
         ("ActiveRecord::ConnectionTimeoutError", None),
+        ("ActiveRecord::NoDatabaseError", None),
         ("ActiveRecord::Encryption::Errors::Decryption", None),
         ("ActiveRecord::Encryption::Errors::Configuration", None),
         ("ActiveJob::EnqueueError", None),
@@ -1132,6 +1195,10 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     let unknown_attribute = classes.entry(ClassId(Symbol::from("ActiveModel::UnknownAttributeError"))).or_default();
     unknown_attribute.parent = Some(ClassId(Symbol::from("NoMethodError")));
     unknown_attribute.instance_methods.insert(Symbol::from("record"), Ty::Untyped);
+    // A partial `select`'s left-out column, raised by its generated reader.
+    register_stdlib_class(classes, "ActiveModel::MissingAttributeError", &[], &exception_surface);
+    classes.entry(ClassId(Symbol::from("ActiveModel::MissingAttributeError"))).or_default().parent =
+        Some(ClassId(Symbol::from("NoMethodError")));
     register_stdlib_class(classes, "ActiveRecord::StaleObjectError", &[], &[("attempted_action", Ty::Untyped)]);
     classes.entry(ClassId(Symbol::from("ActiveRecord::StaleObjectError"))).or_default().parent =
         Some(ClassId(Symbol::from("ActiveRecord::ActiveRecordError")));
@@ -1199,7 +1266,8 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
             ("deserialize", Ty::Union { variants: vec![Ty::Bool, Ty::Nil].into() }),
         ]);
     }
-    // Not a typed store: a thread-local slot holds whatever the caller put there, so `[]` answers untyped.
+    // Not a typed store: `[]` and thread_variable_* hold whatever the
+    // caller put there, so their results are gradual.
     // `new` / `pass` / `kill` / `join` — `runtime/ruby/timeout.rb`'s wall-clock
     // port (Spinel lane) starts a worker and kills it past the deadline.
     let thread = Ty::Class { id: ClassId(Symbol::from("Thread")), args: vec![].into() };
@@ -1210,6 +1278,8 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     ], &[
         ("[]", Ty::Untyped),
         ("[]=", Ty::Untyped),
+        ("thread_variable_get", Ty::Untyped),
+        ("thread_variable_set", Ty::Untyped),
         ("kill", thread.clone()),
         ("join", thread.clone()),
     ]);
@@ -1371,6 +1441,20 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     register_stdlib_class(classes, "Zlib::Deflate", &[("new", Ty::SelfInstance)], &[
         ("deflate", Ty::Str), ("close", Ty::Nil),
     ]);
+    // `Zlib::Inflate.inflate(body)`: an HTTP client's deflate-encoded response.
+    register_stdlib_class(classes, "Zlib::Inflate", &[("inflate", Ty::Str)], &[]);
+    // A network client's names as it rescues, configures or checks a connection (excon, httpclient,
+    // redis-client): the openssl, socket and io/wait libraries' on the ruby family, spinel's packages and
+    // runtime there. Their methods are not modeled.
+    // `result.is_a?(BigDecimal)` (liquid's number filters) and `OpenSSL::BN` (a signature's integers): the
+    // bigdecimal and openssl libraries' classes on the ruby family, spinel's packages there.
+    for name in ["OpenSSL::X509::Certificate", "OpenSSL::PKey::RSA", "OpenSSL::SSL::SSLSocket", "OpenSSL::SSL::SSLContext", "OpenSSL::ASN1::ASN1Data", "OpenSSL::BN", "BigDecimal"] {
+        register_stdlib_class(classes, name, &[], &[]);
+    }
+    for name in ["OpenSSL::ASN1", "IO::WaitReadable", "IO::WaitWritable"] {
+        register_stdlib_class(classes, name, &[], &[]);
+        classes.entry(ClassId(Symbol::from(name))).or_default().is_module = true;
+    }
     register_stdlib_class(classes, "Zlib::GzipReader", &[("new", Ty::SelfInstance)], &[
         // Only argument-free reads are admitted by the body typer.
         ("read", Ty::Str),
@@ -1428,6 +1512,24 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("join", Ty::Str), ("shelljoin", Ty::Str),
         ("split", str_arr()), ("shellsplit", str_arr()), ("shellwords", str_arr()),
     ], &[]);
+    // Ruby's core modules a gem's process code reaches (a shutdown trap, a
+    // cache's Marshal round trip, a file probe); spinel's runtime answers them too.
+    register_stdlib_class(classes, "Signal", &[
+        ("trap", Ty::Untyped),
+        ("list", Ty::Hash { key: std::sync::Arc::new(Ty::Str), value: std::sync::Arc::new(Ty::Int) }),
+    ], &[]);
+    register_stdlib_class(classes, "FileTest", &[
+        ("exist?", Ty::Bool), ("file?", Ty::Bool), ("directory?", Ty::Bool),
+        ("zero?", Ty::Bool), ("empty?", Ty::Bool),
+    ], &[]);
+    // (`dump` untyped: given an IO it writes there and answers the IO, not the bytes)
+    register_stdlib_class(classes, "Marshal", &[("dump", Ty::Untyped), ("load", Ty::Untyped), ("restore", Ty::Untyped)], &[]);
+    for module in ["Signal", "FileTest", "Marshal"] {
+        classes.entry(ClassId(Symbol::from(module))).or_default().is_module = true;
+    }
+    register_stdlib_class(classes, "Fiber", &[
+        ("new", class("Fiber")), ("yield", Ty::Untyped), ("current", class("Fiber")),
+    ], &[("resume", Ty::Untyped), ("alive?", Ty::Bool)]);
     // CRuby's default gem; Spinel ships the same SpellChecker in its
     // did_you_mean package. The dictionary can contain Strings or Symbols.
     register_stdlib_class(classes, "DidYouMean::SpellChecker", &[
@@ -1471,7 +1573,7 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     ]);
     register_stdlib_class(classes, "OpenSSL::PKey::EC::Group", &[], &[("curve_name", Ty::Str)]);
     // `OpenSSL::HMAC.digest(OpenSSL::Digest.new("sha1"), key, data)`: rotp's one-time codes.
-    for name in ["OpenSSL::Digest", "OpenSSL::Digest::SHA1", "OpenSSL::Digest::SHA256", "OpenSSL::Digest::SHA384", "OpenSSL::Digest::SHA512"] {
+    for name in ["OpenSSL::Digest", "OpenSSL::Digest::SHA1", "OpenSSL::Digest::SHA256", "OpenSSL::Digest::SHA384", "OpenSSL::Digest::SHA512", "OpenSSL::Digest::MD5"] {
         let digest = Ty::Class { id: ClassId(Symbol::from(name)), args: vec![].into() };
         register_stdlib_class(classes, name, &[("new", if matches!(name, "OpenSSL::Digest::SHA384" | "OpenSSL::Digest::SHA512") { Ty::Untyped } else { digest })], &[
             ("name", Ty::Str), ("digest", Ty::Str), ("hexdigest", Ty::Str),
@@ -1598,6 +1700,8 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // stays untyped. `Find.find` answers nil with a block and an Enumerator
     // without one, so it stays untyped as `File.open` does.
     register_stdlib_class(classes, "Monitor", &[], &[]);
+    // `include MonitorMixin` (message_bus's `Synchronizer`): its `synchronize` is Monitor's, answering the block.
+    register_stdlib_class(classes, "MonitorMixin", &[], &[]);
     for name in ["ConditionVariable", "Thread::ConditionVariable"] {
         let condition_variable = Ty::Class { id: ClassId(Symbol::from(name)), args: vec![].into() };
         register_stdlib_class(classes, name, &[], &[
@@ -1712,6 +1816,7 @@ pub(crate) const BUILTIN_BLOCK_VALUE_METHODS: &[(&str, &str)] = &[
     ("Mutex", "synchronize"),
     ("Thread::Mutex", "synchronize"),
     ("Monitor", "synchronize"),
+    ("MonitorMixin", "synchronize"),
     ("ActiveSupport::Cache::MemoryStore", "fetch"),
     ("ActiveSupport::Cache::NullStore", "fetch"),
     ("ActiveSupport::Notifications", "subscribed"),
@@ -1726,6 +1831,38 @@ pub(crate) const BUILTIN_BLOCK_VALUE_METHODS: &[(&str, &str)] = &[
     ("RestClient", "head"),
     ("RestClient", "options"),
 ];
+
+/// The classes behind `Rails.application` and its `config`: open, so a name missing here answers untyped as before.
+pub(crate) const OPEN_FRAMEWORK_RECEIVERS: &[&str] = &["Rails::Application", "Rails::FrameworkConfig"];
+
+/// `Rails.application` and `Rails.application.config` (`Rails.configuration`), with what runtime/ruby/rails.rb answers
+/// on them typed. Open, not closed: an app's config takes keys of its own, which ingest lifts and `lower::config_reader`
+/// reads, and an application method the app adds (`class << Rails.application`) is its own.
+fn register_application_surface(rails_cls: &mut ClassInfo, classes: &mut HashMap<ClassId, ClassInfo>) {
+    let class = |name: &str| Ty::Class { id: ClassId(Symbol::from(name)), args: vec![].into() };
+    let config = class("Rails::FrameworkConfig");
+    rails_cls.class_methods.insert(Symbol::from("application"), class("Rails::Application"));
+    rails_cls.class_methods.insert(Symbol::from("configuration"), config.clone());
+    register_stdlib_class(classes, "Rails::Application", &[], &[("config", config), ("secret_key_base", Ty::Str)]);
+    register_stdlib_class(classes, "Rails::FrameworkConfig", &[], &[("action_dispatch", class("Rails::ActionDispatchOptions"))]);
+    for name in OPEN_FRAMEWORK_RECEIVERS {
+        classes.entry(ClassId(Symbol::from(*name))).or_default().open = true;
+    }
+    let rotations = class("ActiveSupport::Messages::RotationConfiguration");
+    register_stdlib_class(classes, "Rails::ActionDispatchOptions", &[], &[
+        ("cookies_rotations", rotations.clone()),
+        ("signed_cookie_salt", Ty::Str),
+        ("authenticated_encrypted_cookie_salt", Ty::Str),
+    ]);
+    let secrets = Ty::Array { elem: std::sync::Arc::new(Ty::Str) };
+    register_stdlib_class(classes, "ActiveSupport::Messages::RotationConfiguration", &[], &[
+        ("rotate", Ty::Nil), ("signed", secrets.clone()), ("encrypted", secrets),
+    ]);
+    register_stdlib_class(classes, "ActiveSupport::KeyGenerator", &[("new", class("ActiveSupport::KeyGenerator"))], &[("generate_key", Ty::Str)]);
+    register_stdlib_class(classes, "ActiveSupport::MessageEncryptor", &[("key_len", Ty::Int)], &[]);
+    // Read as a module, not the runtime's class: only `key_len` is served, so an encryptor of the app's own (`.new(key)`) is reported.
+    classes.entry(ClassId(Symbol::from("ActiveSupport::MessageEncryptor"))).or_default().is_module = true;
+}
 
 fn register_stdlib_class(
     classes: &mut HashMap<ClassId, ClassInfo>,

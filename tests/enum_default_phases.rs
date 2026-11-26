@@ -182,12 +182,13 @@ fn fixture_population_does_not_add_a_constructor_phase_argument() {
     let files = roundhouse::emit::ruby::emit_spinel(&app);
     let model = &files.iter().find(|f| f.path.ends_with("app/models/article.rb")).unwrap().content;
     let fixture = &files.iter().find(|f| f.path.ends_with("test/fixtures/articles.rb")).unwrap().content;
-    assert!(model.contains("def initialize(attrs = ActiveRecord::Base::EMPTY_ATTRS)"), "{model}");
+    // The second parameter is `lower::first_or_create`'s creation-block deferral, not a fixture phase.
+    assert!(model.contains("def initialize(attrs = ActiveRecord::Base::EMPTY_ATTRS, defer_initialize_callbacks = false)"), "{model}");
     assert!(!model.contains("schema_defaults"), "fixture policy must not enter initialize: {model}");
     // Retain the existing hook machinery and constructor-before-population
     // order. The insert itself is callback-free, as Rails' is; that the
     // constructor still runs `after_initialize` is the remaining gap.
-    assert!(model.contains("after_initialize if !(attrs.equal? ActiveRecord::Base::HYDRATE_ATTRS)"), "{model}");
+    assert!(model.contains("after_initialize if !((attrs.equal? ActiveRecord::Base::HYDRATE_ATTRS) || defer_initialize_callbacks)"), "{model}");
     let construction = fixture.find("instance = Article.new\n").expect("ordinary construction");
     let population = fixture.find("instance._write_severity_raw \"mild\"").expect("raw schema population");
     let save = fixture.find("instance._insert_row").expect("callback-free fixture insert");

@@ -1,0 +1,400 @@
+//! A class or module whose declared name starts with `::` is defined at
+//! the top level, wherever the declaration is written: `class ::Shelf::Box`
+//! inside `module Adapter` defines `Shelf::Box`, and a class declared in the
+//! body of `module ::Crate` is `Crate::<name>`. A rooted class or module
+//! in a model's body is top-level too, and a rooted class's bare
+//! superclass is still looked up in the module around it. The expected
+//! values are Ruby 4.0.7's (ActiveRecord 8.1.4.1's for the models).
+
+use super::emit_and_run;
+
+fn app() -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("app/models/shelf.rb", "module Shelf\nend\n")
+        .write("app/models/adapter.rb", r##"module Adapter
+  class ::Shelf::Box
+    def self.kind
+      "box"
+    end
+  end
+
+  module ::Crate
+    class Lid
+      def self.kind
+        "lid"
+      end
+    end
+  end
+
+  class Plug
+    def self.kind
+      "plug"
+    end
+  end
+end
+"##)
+        .write("db/schema.rb", "ActiveRecord::Schema.define do\nend\n")
+}
+
+const SCRIPT: &str = r##"Adapter
+answers = [
+  defined?(Shelf::Box), defined?(Adapter::Shelf), Shelf::Box.kind,
+  defined?(Crate::Lid), defined?(Adapter::Crate), Crate::Lid.kind,
+  Adapter::Plug.kind,
+]
+expected = ["constant", nil, "box", "constant", nil, "lid", "plug"]
+raise "rooted declarations: #{answers.inspect}" unless answers == expected
+puts "probe passed"
+"##;
+
+#[test]
+fn a_rooted_declaration_inside_a_module_is_defined_at_the_top_level() {
+    let run = app().run_ruby(SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn a_rooted_declaration_inside_a_module_is_defined_at_the_top_level_on_spinel() {
+    let run = app().run_spinel_with_db(SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
+
+fn model_body_app() -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n")
+        .write("app/models/account.rb", r##"class Account < ApplicationRecord
+  class ::Parser
+    def self.kind
+      "parser"
+    end
+  end
+
+  module ::Formats
+    def self.kind
+      "formats"
+    end
+  end
+end
+"##)
+        .write("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"accounts\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n")
+}
+
+const MODEL_BODY: &str = r##"Account
+got = [Parser.kind, Formats.kind, defined?(Account::Parser), defined?(Account::Formats)]
+expected = ["parser", "formats", nil, nil]
+raise "model body: #{got.inspect}" unless got == expected
+puts "probe passed"
+"##;
+
+#[test]
+fn a_rooted_declaration_in_a_model_body_is_defined_at_the_top_level() {
+    let run = model_body_app().run_ruby(MODEL_BODY);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
+
+fn superclass_app() -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n")
+        .write("app/models/ledger/record.rb", "module Ledger\n  class Record < ApplicationRecord\n    self.abstract_class = true\n  end\nend\n")
+        .write("app/models/entry.rb", "module Ledger\n  class ::Entry < Record\n  end\nend\n")
+        .write("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"entries\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n")
+}
+
+const SUPERCLASS: &str = r##"Entry.create!(name: "e")
+got = [Entry.superclass.name, Entry.table_name, Entry.count, Entry.first.name]
+expected = ["Ledger::Record", "entries", 1, "e"]
+raise "superclass: #{got.inspect}" unless got == expected
+puts "probe passed"
+"##;
+
+#[test]
+fn a_rooted_class_finds_its_superclass_in_the_module_around_it() {
+    let run = superclass_app().run_ruby(SUPERCLASS);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
+
+fn ledger_app() -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n")
+        .write("app/models/ledger/record.rb", "module Ledger\n  class Record < ApplicationRecord\n    self.abstract_class = true\n\n    def ledger_tag\n      \"ledger\"\n    end\n  end\nend\n")
+        .write("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"entries\", force: :cascade do |t|\n    t.string \"name\"\n  end\n\n  create_table \"things\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n")
+}
+
+const UNROOTED_IN_ROOTED: &str = r##"entry = Export::Entry.create!(name: "e")
+got = [Export::Entry.superclass.name, Export::Entry.table_name, entry.ledger_tag, Export::Entry.count, defined?(Ledger::Export)]
+expected = ["Ledger::Record", "entries", "ledger", 1, nil]
+raise "unrooted in rooted: #{got.inspect}" unless got == expected
+puts "probe passed"
+"##;
+
+#[test]
+fn a_class_in_a_rooted_module_finds_its_superclass_where_it_is_written() {
+    let app = ledger_app().write("app/models/export/entry.rb", "module Ledger\n  module ::Export\n    class Entry < Record\n    end\n  end\nend\n");
+    let run = app.run_ruby(UNROOTED_IN_ROOTED);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
+
+const ROOTED_ABSTRACT_BASE: &str = r##"thing = Thing.create!(name: "t")
+got = [Thing.superclass.name, RootBase.superclass.name, Thing.table_name, thing.ledger_tag, Thing.count]
+expected = ["RootBase", "Ledger::Record", "things", "ledger", 1]
+raise "rooted abstract base: #{got.inspect}" unless got == expected
+puts "probe passed"
+"##;
+
+#[test]
+fn a_rooted_abstract_base_reaches_the_base_in_the_module_around_it() {
+    let app = ledger_app()
+        .write("app/models/root_base.rb", "module Ledger\n  class ::RootBase < Record\n    self.abstract_class = true\n  end\nend\n")
+        .write("app/models/thing.rb", "class Thing < RootBase\nend\n");
+    let run = app.run_ruby(ROOTED_ABSTRACT_BASE);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
+
+fn controller_concern_app() -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n")
+        .write("app/controllers/rules_controller.rb", r##"class RulesController < ApplicationController
+  module ::AccessRules
+    extend ActiveSupport::Concern
+
+    included do
+      before_action :guard
+    end
+
+    private
+
+    def guard
+      @trace = "#{@trace}guard "
+    end
+  end
+
+  include AccessRules
+
+  def show
+    render plain: "trace=#{@trace}"
+  end
+end
+"##)
+        .write("config/routes.rb", "Rails.application.routes.draw do\n  get \"rules\", to: \"rules#show\"\nend\n")
+}
+
+const CONTROLLER_CONCERN: &str = r##"status, _headers, body = Main.run_rack("REQUEST_METHOD" => "GET", "PATH_INFO" => "/rules", "QUERY_STRING" => "", "rack.input" => StringIO.new(""))
+text = +""
+body.each { |part| text << part }
+got = [status, text, defined?(RulesController::AccessRules)]
+expected = [200, "trace=guard ", nil]
+raise "controller concern: #{got.inspect}" unless got == expected
+puts "probe passed"
+"##;
+
+#[test]
+fn a_rooted_concern_in_a_controller_body_runs_its_included_filters() {
+    let run = controller_concern_app().run_ruby(CONTROLLER_CONCERN);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
+
+fn prefixed_ledger_app() -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n")
+        .write("app/models/record.rb", "class Record < ApplicationRecord\n  self.abstract_class = true\n\n  def tag\n    \"top\"\n  end\nend\n")
+        .write("app/models/ledger/record.rb", "module Ledger\n  class Record < ApplicationRecord\n    self.abstract_class = true\n    self.table_name_prefix = \"ledger_\"\n\n    def tag\n      \"ledger\"\n    end\n  end\nend\n")
+        .write("app/models/export/record.rb", "module Export\n  class Record < ApplicationRecord\n    self.abstract_class = true\n\n    def tag\n      \"export\"\n    end\n  end\nend\n")
+        .write("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"things\", force: :cascade do |t|\n    t.string \"name\"\n  end\n\n  create_table \"ledger_entries\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n")
+}
+
+const ROOTED_SUPERCLASS: &str = r##"thing = Thing.create!(name: "t")
+got = [RootBase.superclass.name, Thing.table_name, thing.tag, Thing.count]
+expected = ["Record", "things", "top", 1]
+raise "rooted superclass: #{got.inspect}" unless got == expected
+puts "probe passed"
+"##;
+
+#[test]
+fn a_rooted_superclass_is_not_looked_up_in_the_module_around_it() {
+    let app = prefixed_ledger_app()
+        .write("app/models/root_base.rb", "module Ledger\n  class ::RootBase < ::Record\n    self.abstract_class = true\n  end\nend\n")
+        .write("app/models/thing.rb", "class Thing < RootBase\nend\n");
+    let run = app.run_ruby(ROOTED_SUPERCLASS);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
+
+const COMPACT_ROOTED_MODULE: &str = r##"entry = Export::Inner::Entry.create!(name: "e")
+got = [Export::Inner::Entry.superclass.name, Export::Inner::Entry.table_name, entry.tag, Export::Inner::Entry.count]
+expected = ["Ledger::Record", "ledger_entries", "ledger", 1]
+raise "compact rooted module: #{got.inspect}" unless got == expected
+puts "probe passed"
+"##;
+
+#[test]
+fn a_class_in_a_compact_rooted_module_looks_through_its_nesting_only() {
+    let app = prefixed_ledger_app()
+        .write("app/models/export/inner/entry.rb", "module Ledger\n  module ::Export::Inner\n    class Entry < Record\n    end\n  end\nend\n");
+    let run = app.run_ruby(COMPACT_ROOTED_MODULE);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
+
+fn enum_alias_app() -> emit_and_run::Overlay {
+    ledger_app()
+        .write("app/models/entry.rb", r##"module Ledger
+  class ::Entry < Record
+    enum :status, { draft: 0, posted: 1 }
+    alias final? posted?
+
+    class ::Stamp
+      def self.kind
+        "stamp"
+      end
+    end
+  end
+end
+"##)
+        .write("app/models/ledger/folio.rb", r##"module Ledger
+  class Folio < Record
+    enum :status, { draft: 0, posted: 1 }
+    alias final? posted?
+
+    class ::Seal
+      def self.kind
+        "seal"
+      end
+    end
+  end
+end
+"##)
+        .write("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"entries\", force: :cascade do |t|\n    t.string \"name\"\n    t.integer \"status\", default: 0\n  end\n\n  create_table \"folios\", force: :cascade do |t|\n    t.string \"name\"\n    t.integer \"status\", default: 0\n  end\nend\n")
+}
+
+const ENUM_ALIAS: &str = r##"e = Entry.create!(name: "e")
+f = Ledger::Folio.create!(name: "f")
+before = [e.final?, f.final?]
+e.posted!
+f.posted!
+got = [
+  [Entry.superclass.name, before[0], e.final?, Stamp.kind, defined?(Entry::Stamp), defined?(Ledger::Stamp)],
+  [Ledger::Folio.superclass.name, before[1], f.final?, Seal.kind, defined?(Ledger::Seal)],
+]
+expected = [
+  ["Ledger::Record", false, true, "stamp", nil, nil],
+  ["Ledger::Record", false, true, "seal", nil],
+]
+raise "enum alias: #{got.inspect}" unless got == expected
+puts "probe passed"
+"##;
+
+#[test]
+fn a_model_in_a_module_aliases_an_enum_predicate_beside_a_rooted_declaration() {
+    let run = enum_alias_app().run_ruby(ENUM_ALIAS);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
+
+const PLAIN_ROOTED_SUPERCLASS: &str = r##"got = [Tool.superclass.name, Gadget.superclass.name, Gadget.new.tag, Gadget.respond_to?(:create!), Gadget.respond_to?(:table_name)]
+expected = ["Record", "Tool", "plain", false, false]
+raise "plain rooted superclass: #{got.inspect}" unless got == expected
+puts "probe passed"
+"##;
+
+#[test]
+fn a_rooted_superclass_that_is_no_model_keeps_its_subclasses_plain() {
+    let app = ledger_app()
+        .write("app/models/record.rb", "class Record\n  def self.abstract_class=(value)\n    @abstract = value\n  end\n\n  def tag\n    \"plain\"\n  end\nend\n")
+        .write("app/models/tool.rb", "module Ledger\n  class ::Tool < ::Record\n    self.abstract_class = true\n  end\nend\n")
+        .write("app/models/gadget.rb", "class Gadget < Tool\nend\n");
+    let run = app.run_ruby(PLAIN_ROOTED_SUPERCLASS);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
+
+/// Review 6: a rooted class in a model body whose superclass is a
+/// `Struct.new(...)` expression. Its generated struct base is kept with
+/// it. ActiveRecord 8.1.4.1 gives `["A", "a", nil]`.
+fn struct_model_body_app() -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n")
+        .write("app/models/account.rb", r##"class Account < ApplicationRecord
+  class ::Parser < Struct.new(:raw)
+    def shout
+      raw.upcase
+    end
+  end
+end
+"##)
+        .write("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"accounts\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n")
+}
+
+const STRUCT_MODEL_BODY: &str = r##"Account
+parser = Parser.new("a")
+got = [parser.shout, parser.raw, defined?(Account::Parser)]
+raise "struct superclass: #{got.inspect}" unless got == ["A", "a", nil]
+puts "probe passed"
+"##;
+
+#[test]
+fn a_rooted_struct_subclass_in_a_model_body_keeps_its_struct_base() {
+    let run = struct_model_body_app().run_ruby(STRUCT_MODEL_BODY);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
+
+/// Review 6: a rooted subclass (`module Ledger; class ::Special < Item`)
+/// whose bare parent is a concrete model in the module around it. Ruby
+/// reads `Item` where the line is written, so it is `Ledger::Item`, and
+/// `Special` is its single-table-inheritance subclass. ActiveRecord 8.1.4.1
+/// gives `["Ledger::Item", "items", "Special", 1, "Special"]`.
+fn rooted_sti_app() -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n")
+        .write("app/models/ledger/item.rb", "module Ledger\n  class Item < ApplicationRecord\n  end\nend\n")
+        .write("app/models/special.rb", "module Ledger\n  class ::Special < Item\n  end\nend\n")
+        .write("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"items\", force: :cascade do |t|\n    t.string \"name\"\n    t.string \"type\"\n  end\nend\n")
+}
+
+const ROOTED_STI: &str = r##"special = Special.create!(name: "s")
+got = [Special.superclass.name, Special.table_name, special.type, Ledger::Item.count, Ledger::Item.first.class.name]
+raise "rooted STI: #{got.inspect}" unless got == ["Ledger::Item", "items", "Special", 1, "Special"]
+puts "probe passed"
+"##;
+
+#[test]
+fn a_rooted_subclass_of_a_model_in_the_module_around_it_is_that_models_subclass() {
+    let run = rooted_sti_app().run_ruby(ROOTED_STI);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}
+
+/// Review 6, what sits below that rooted subclass: `Special` only counts
+/// as a concrete model once `Item` is read as `Ledger::Item`, and that is
+/// what makes `Special::Part` take `Special`'s table singular as a prefix
+/// (a model nested in a concrete one does). ActiveRecord 8.1.4.1 gives
+/// `["Ledger::Item", "special_parts", 1]`.
+fn rooted_subclass_with_a_nested_model_app() -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n")
+        .write("app/models/ledger/item.rb", "module Ledger\n  class Item < ApplicationRecord\n  end\nend\n")
+        .write("app/models/special.rb", "module Ledger\n  class ::Special < Item\n    self.table_name = \"specials\"\n  end\nend\n")
+        .write("app/models/special/part.rb", "class Special::Part < ApplicationRecord\nend\n")
+        .write("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"items\", force: :cascade do |t|\n    t.string \"name\"\n  end\n  create_table \"specials\", force: :cascade do |t|\n    t.string \"name\"\n  end\n  create_table \"special_parts\", force: :cascade do |t|\n    t.string \"label\"\n  end\n  create_table \"parts\", force: :cascade do |t|\n    t.string \"label\"\n  end\nend\n")
+}
+
+const NESTED_IN_A_ROOTED_SUBCLASS: &str = r##"Special::Part.create!(label: "x")
+got = [Special.superclass.name, Special::Part.table_name, Special::Part.count]
+raise "nested in a rooted subclass: #{got.inspect}" unless got == ["Ledger::Item", "special_parts", 1]
+puts "probe passed"
+"##;
+
+#[test]
+fn a_model_nested_in_a_rooted_subclass_takes_its_table_prefix() {
+    let run = rooted_subclass_with_a_nested_model_app().run_ruby(NESTED_IN_A_ROOTED_SUBCLASS);
+    run.assert_passes();
+    assert!(run.stdout.contains("probe passed"), "{}", run.stdout);
+}

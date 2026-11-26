@@ -190,6 +190,7 @@ module ActionView
     def self.form_authenticity_token: () -> String
     def self.token_fields_omitted?: () -> bool
     def self.csp_meta_tag: () -> String
+    def self.content_security_policy_nonce: () -> String?
   
     # `name` is the asset stem (e.g., "application" → /assets/application.css).
     def self.stylesheet_link_tag: (String name, ?Hash[Symbol, untyped] opts) -> String
@@ -215,6 +216,7 @@ module ActionView
 
     def self.content_tag: (Symbol name, ?(String | Integer | nil) content, ?Hash[Symbol, untyped] opts) -> String
     def self.content_tag_html: (Symbol name, String html, ?Hash[Symbol, untyped] opts) -> String
+    def self.button_to_html: (String url, String html, ?Hash[Symbol, untyped] opts) -> String
     def self.content_tag_name: (String name) -> String
     def self.content_tag_pre: (String name) -> String
   
@@ -239,6 +241,8 @@ module ActionView
     # expansions. See view_helpers.rb for the runtime/macro split
     # rationale.
     def self.csrf_token_hidden_input: () -> String
+    def self.hidden_autocomplete_attr: () -> String
+    def self.keep_hidden_autocomplete: () -> String
     def self.cache_scope: () -> String
     def self.begin_broadcast_render: () -> String
     def self.broadcast_render: (String _armed, String html) -> String
@@ -299,5 +303,13 @@ module ActionView
     # attributes render `name="name"` when truthy and vanish when
     # false; `render_attrs` consults this per attribute name.
     def self.boolean_attr?: (String name) -> bool
+  end
+end
+
+module Turbo
+  module FramesHelper
+  end
+
+  module StreamsHelper
   end
 end
