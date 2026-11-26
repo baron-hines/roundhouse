@@ -730,3 +730,65 @@ fn a_hook_def_calling_super_is_copied_only_over_a_reopening() {
     let reopened = format!("{hook}\nmodule HookSuper\n  def label\n    \"ordinary\"\n  end\nend\n");
     lib_case(&[("hook_super", reopened.as_str())], &libs, "SuperHookParent", "\"hook:ordinary\"");
 }
+
+const READER_DEF_A: (&str, &str) = (
+    "reader_def_a",
+    "module ReaderDefA\n  extend ActiveSupport::Concern\n\n  included do\n    attr_reader :label\n    def label\n      \"hook\"\n    end\n  end\nend\n",
+);
+const READER_ONLY_B: (&str, &str) = ("reader_only_b", "module ReaderOnlyB\n  extend ActiveSupport::Concern\n\n  included do\n    attr_reader :label\n  end\nend\n");
+
+/// A later hook's reader replaces an earlier hook's def on the includer, as
+/// the def replaced its own block's reader (#2278).
+#[test]
+fn a_later_hooks_reader_stands_over_an_earlier_hooks_def() {
+    for (includes, body, want) in [
+        ("  include ReaderDefA\n  include ReaderOnlyB\n", "@label", "null"),
+        ("  include ReaderOnlyB\n  include ReaderDefA\n", "\"hook\"", "\"hook\""),
+    ] {
+        let libs = [("reader_pair_parent", format!("class ReaderPairParent < ApplicationController\n{includes}end\n"))];
+        let libs: Vec<(&str, &str)> = libs.iter().map(|(f, s)| (*f, s.as_str())).collect();
+        assert_eq!(lib_label_bodies(&[READER_DEF_A, READER_ONLY_B], &libs, "reader_pair_parent"), [body], "{includes:?}");
+        lib_case(&[READER_DEF_A, READER_ONLY_B], &libs, "ReaderPairParent", want);
+    }
+}
+
+/// ShadowX: a hook `label` ("x hook") that a reopening's ordinary `label`
+/// shadows on the module.
+fn shadow(x: &str) -> (String, String) {
+    let name = format!("Shadow{x}");
+    (
+        format!("shadow_{}", x.to_lowercase()),
+        format!("module {name}\n  extend ActiveSupport::Concern\n\n  included do\n    def label\n      \"{l} hook\"\n    end\n  end\nend\n\nmodule {name}\n  def label\n    \"{l} ordinary\"\n  end\nend\n", l = x.to_lowercase()),
+    )
+}
+
+/// The later opening's ShadowC runs its hook last, so its def stands, the
+/// only one on the class: an earlier opening's copy is not the class's own
+/// (#2278).
+#[test]
+fn a_later_openings_hook_replaces_an_earlier_openings_copy() {
+    let shadows: Vec<(String, String)> = ["A", "B", "C"].iter().map(|x| shadow(x)).collect();
+    let concerns: Vec<(&str, &str)> = shadows.iter().map(|(f, s)| (f.as_str(), s.as_str())).collect();
+    let libs = [
+        ("shadow_parent", "class ShadowParent < ApplicationController\n  include ShadowA\n  include ShadowB\nend\n"),
+        ("shadow_parent_again", "class ShadowParent < ApplicationController\n  include ShadowC\nend\n"),
+    ];
+    let mut app = emit_and_run::empty_app()
+        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::API\nend\n");
+    for (name, source) in &concerns {
+        app = app.write(&format!("app/controllers/concerns/{name}.rb"), source);
+    }
+    for (name, source) in &libs {
+        app = app.write(&format!("lib/{name}.rb"), source);
+    }
+    let (emitted, errors) = app.emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let mut bodies = Vec::new();
+    for file in ["shadow_parent", "shadow_parent_again"] {
+        let Ok(class) = std::fs::read_to_string(emitted.join(format!("app/models/{file}.rb"))) else { continue };
+        let lines: Vec<&str> = class.lines().filter(|l| !l.starts_with("#<SPINEL_SOURCE>")).map(str::trim).collect();
+        bodies.extend((0..lines.len()).filter(|&i| lines[i] == "def label").map(|i| lines[i + 1].to_string()));
+    }
+    assert_eq!(bodies, ["\"c hook\""]);
+    lib_case(&concerns, &libs, "ShadowParent", "\"c hook\"");
+}
