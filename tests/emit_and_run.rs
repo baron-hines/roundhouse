@@ -29,6 +29,8 @@ mod literal_send_untyped;
 mod duration_defined_units;
 #[path = "emit_and_run/form_field_attribute_order.rs"]
 mod form_field_attribute_order;
+#[path = "emit_and_run/nullable_column_to_s.rs"]
+mod nullable_column_to_s;
 #[path = "emit_and_run/find_or_create_block_before_hook.rs"]
 mod find_or_create_block_before_hook;
 #[path = "emit_and_run/eager_load_conditions.rs"]

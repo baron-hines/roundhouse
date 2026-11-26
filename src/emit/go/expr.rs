@@ -2196,19 +2196,21 @@ pub(super) fn emit_send(
                 ExprNode::Send { recv: Some(inner), method: m, args, .. }
                     if args.is_empty() && !recv_model_defines(inner, m.as_str()) =>
                 {
-                    nullable_column_go_ty(m.as_str()).or_else(|| recv_column_go_ty(inner, m.as_str()))
+                    // Not the bare name for a typed receiver: it finds the enclosing model's column of that name.
+                    if recv_model_id(inner).is_some() {
+                        recv_column_go_ty(inner, m.as_str())
+                    } else {
+                        nullable_column_go_ty(m.as_str())
+                    }
                 }
                 _ => None,
             };
             // Not DerefString for every pointer: it takes `*string`, and `nil.to_s` is "" whatever the column holds.
             match nilable_col.as_deref() {
                 Some("*string") => return format!("DerefString({recv_s})"),
+                Some("*float64") => return format!("func() string {{ if p := {recv_s}; p != nil {{ return RhFloatToS(*p) }}; return \"\" }}()"),
                 Some(ptr) if ptr.starts_with('*') => {
-                    let verb = match ptr {
-                        "*int64" => "%d",
-                        "*float64" => "%g",
-                        _ => "%v",
-                    };
+                    let verb = if ptr == "*int64" { "%d" } else { "%v" };
                     return format!("func() string {{ if p := {recv_s}; p != nil {{ return fmt.Sprintf(\"{verb}\", *p) }}; return \"\" }}()");
                 }
                 _ => {}
@@ -2216,7 +2218,7 @@ pub(super) fn emit_send(
             return match r.ty.as_ref() {
                 Some(Ty::Str | Ty::Sym) => recv_s,
                 Some(Ty::Int) => format!("fmt.Sprintf(\"%d\", {recv_s})"),
-                Some(Ty::Float) => format!("fmt.Sprintf(\"%g\", {recv_s})"),
+                Some(Ty::Float) => format!("RhFloatToS({recv_s})"),
                 _ => format!("fmt.Sprintf(\"%v\", {recv_s})"),
             };
         }
@@ -4735,8 +4737,16 @@ fn unbox_nullable_column(v: &Expr, v_s: &str, slot_go: &str) -> Option<String> {
 
 /// The Go pointer type of `column` on the model this receiver resolves
 /// to, when the schema declares it nullable.
+/// The model a receiver reads: its class, or the one class of a nilable read (`belongs_to`'s `Article | nil`).
+fn recv_model_id(recv: &Expr) -> Option<&crate::ClassId> {
+    match recv.ty.as_ref().and_then(union_non_nil_core)? {
+        Ty::Class { id, .. } => Some(id),
+        _ => None,
+    }
+}
+
 fn recv_column_go_ty(recv: &Expr, column: &str) -> Option<String> {
-    let Some(Ty::Class { id, .. }) = recv.ty.as_ref() else { return None };
+    let id = recv_model_id(recv)?;
     // Not a reader the model defines over the column: that method answers its own type, not the column's pointer.
     if recv_model_defines(recv, column) {
         return None;
