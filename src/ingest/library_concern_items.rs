@@ -72,8 +72,18 @@ pub(super) fn splice(app: &mut App) {
         // shadows it there: then this class takes the block's def as its own
         // (#2278). One the class writes itself stays; Ruby keeps it when it is
         // written below the `include`.
-        let mut hook_defs: Vec<MethodDef> = Vec::new();
-        for module in &includes {
+        // Not a module a superclass has already: Ruby's `include` adds nothing
+        // for it, and ActiveSupport runs no hook.
+        let inherited = inherited_modules(app, app.library_classes[i].parent.as_ref());
+        // The last hook def of each name per module, and whether the module's
+        // own def of the name shadows it.
+        let mut ran: Vec<(&MethodDef, bool)> = Vec::new();
+        let mut seen: Vec<&ClassId> = Vec::new();
+        for module in includes.iter().filter(|m| !inherited.contains(*m)) {
+            if seen.contains(&module) {
+                continue;
+            }
+            seen.push(module);
             let openings = || app.library_classes.iter().filter(|o| o.is_module && o.name == *module);
             let own: Vec<&Symbol> = openings()
                 .flat_map(|o| o.methods.iter().filter(move |m| m.receiver == MethodReceiver::Instance && !in_included_hook(o, m)))
@@ -84,11 +94,19 @@ pub(super) fn splice(app: &mut App) {
                 .flat_map(|o| o.methods.iter().filter(move |m| m.receiver == MethodReceiver::Instance && in_included_hook(o, m)))
                 .collect();
             for (at, def) in hooked.iter().enumerate() {
-                let replaced = hooked[at + 1..].iter().any(|later| later.name == def.name);
-                let written = app.library_classes[i].methods.iter().any(|m| m.receiver == MethodReceiver::Instance && m.name == def.name);
-                if !replaced && !written && own.contains(&&def.name) && !hook_defs.iter().any(|d| d.name == def.name) {
-                    hook_defs.push((*def).clone());
+                if !hooked[at + 1..].iter().any(|later| later.name == def.name) {
+                    ran.push((*def, own.contains(&&def.name)));
                 }
+            }
+        }
+        let mut hook_defs: Vec<MethodDef> = Vec::new();
+        for (def, shadowed) in &ran {
+            // Of two hooks that define the name, the one that runs last wins,
+            // an order not read here: those stay as the modules have them.
+            let alone = ran.iter().filter(|(d, _)| d.name == def.name).count() == 1;
+            let written = app.library_classes[i].methods.iter().any(|m| m.receiver == MethodReceiver::Instance && m.name == def.name);
+            if *shadowed && alone && !written {
+                hook_defs.push((*def).clone());
             }
         }
         let lc = &mut app.library_classes[i];
@@ -146,4 +164,37 @@ pub(super) fn in_included_hook(lc: &LibraryClass, m: &MethodDef) -> bool {
                 && call.span.start <= at.start
                 && at.end <= call.span.end
         })
+}
+
+/// The modules the classes above `parent` and `parent` itself include, with
+/// what those modules include in turn: a library class's or a controller's.
+fn inherited_modules(app: &App, parent: Option<&ClassId>) -> crate::det::HashSet<ClassId> {
+    let mut out: crate::det::HashSet<ClassId> = crate::det::HashSet::default();
+    let mut walked: Vec<ClassId> = Vec::new();
+    let mut next = parent.cloned();
+    while let Some(class) = next.take() {
+        if walked.contains(&class) {
+            break;
+        }
+        for lc in app.library_classes.iter().filter(|c| !c.is_module && c.name == class) {
+            out.extend(lc.includes.iter().cloned());
+            next = next.or_else(|| lc.parent.clone());
+        }
+        for controller in app.controllers.iter().filter(|c| c.name == class) {
+            out.extend(crate::analyze::controller_include_statements(controller).into_iter().flat_map(|(_, group)| group));
+            next = next.or_else(|| controller.parent.clone());
+        }
+        walked.push(class);
+    }
+    let mut queue: Vec<ClassId> = out.iter().cloned().collect();
+    while let Some(module) = queue.pop() {
+        for opening in app.library_classes.iter().filter(|o| o.is_module && o.name == module) {
+            for included in &opening.includes {
+                if out.insert(included.clone()) {
+                    queue.push(included.clone());
+                }
+            }
+        }
+    }
+    out
 }

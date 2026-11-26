@@ -528,3 +528,69 @@ puts "lib parent case passed"
         assert!(run.stdout.contains("lib parent case passed"), "{child_lines:?}: {}", run.stdout);
     }
 }
+
+/// SingleController under `parent`, a class from `libs`, with `concerns`;
+/// against Ruby's answer for `label`. The Spinel emit has no errors.
+fn lib_case(concerns: &[(&str, &str)], libs: &[(&str, &str)], parent: &str, want: &str) {
+    let app = || {
+        let mut app = emit_and_run::empty_app()
+            .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::API\nend\n");
+        for (file, source) in concerns {
+            app = app.write(&format!("app/controllers/concerns/{file}.rb"), source);
+        }
+        for (file, source) in libs {
+            app = app.write(&format!("lib/{file}.rb"), source);
+        }
+        app.write(
+            "app/controllers/single_controller.rb",
+            &format!("class SingleController < {parent}\n  def show\n    render json: {{ label: label }}\n  end\nend\n"),
+        )
+        .write("config/routes.rb", "Rails.application.routes.draw do\n  get \"/single\" => \"single#show\"\nend\n")
+    };
+    let (_, errors) = app().emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let run = app().run_ruby(&format!(
+        r##"status, _headers, body = begin
+  Main.run_rack("REQUEST_METHOD" => "GET", "PATH_INFO" => "/single", "QUERY_STRING" => "", "rack.input" => StringIO.new(""))
+rescue StandardError => e
+  [e.class.name, {{}}, [e.message[0, 100]]]
+end
+text = +""
+body.each {{ |part| text << part }}
+got = [status, text]
+want = [200, %({{"label":{want:?}}})]
+raise "got #{{got.inspect}}, want #{{want.inspect}}" unless got == want
+puts "lib case passed"
+"##
+    ));
+    run.assert_passes();
+    assert!(run.stdout.contains("lib case passed"), "{}", run.stdout);
+}
+
+/// BaseParent's hook ran and its own `label` replaced the hook's. The
+/// subclass's repeated include adds nothing and runs no hook, so BaseParent's
+/// `label` answers (#2278).
+#[test]
+fn a_lib_class_takes_no_hook_def_for_a_module_its_superclass_has() {
+    lib_case(
+        &[HOOK_REOPEN],
+        &[
+            ("base_parent", "class BaseParent < ApplicationController\n  include HookReopen\n\n  def label\n    \"base\"\n  end\nend\n"),
+            ("derived_parent", "class DerivedParent < BaseParent\n  include HookReopen\nend\n"),
+        ],
+        "DerivedParent",
+        "base",
+    );
+}
+
+/// HookOnly's hook runs after HookReopen's, so its `label` stands: the
+/// module lookup finds it already, ahead of HookReopen (#2278).
+#[test]
+fn a_lib_class_leaves_a_name_two_hooks_define_to_the_modules() {
+    lib_case(
+        &[HOOK_REOPEN, ("hook_only", "module HookOnly\n  extend ActiveSupport::Concern\n\n  included do\n    def label\n      \"b hook\"\n    end\n  end\nend\n")],
+        &[("pair_parent", "class PairParent < ApplicationController\n  include HookReopen\n  include HookOnly\nend\n")],
+        "PairParent",
+        "b hook",
+    );
+}
