@@ -850,7 +850,7 @@ fn fold_bulk(
             body: typed(span, ExprNode::Seq { exprs: vec![body, end] }, Ty::Nil),
             rescues: Vec::new(),
             else_branch: None,
-            ensure: Some(abort),
+            ensure: Some(Box::new(abort)),
             implicit: false,
         },
         Ty::Nil,
@@ -906,24 +906,24 @@ pub fn bulk_wrappers(async_: &MethodDef) -> Vec<MethodDef> {
     begin.name = Symbol::from("push_bulk_begin");
     begin.params = vec![crate::dialect::Param::positional(Symbol::from("limit"))];
     begin.body = nil.clone();
-    begin.signature = Some(Ty::Fn {
+    begin.signature = Some(Ty::Fn(Box::new(crate::ty::FnTy {
         params: vec![crate::ty::Param { name: Symbol::from("limit"), ty: Ty::Int.into(), kind: crate::ty::ParamKind::Required }]
             .into(),
         block: None,
         ret: std::sync::Arc::new(Ty::Nil),
         effects: crate::effect::EffectSet::pure(),
-    });
+    })));
     let no_args = |name: &str| {
         let mut m = async_.clone();
         m.name = Symbol::from(name);
         m.params = Vec::new();
         m.body = nil.clone();
-        m.signature = Some(Ty::Fn {
+        m.signature = Some(Ty::Fn(Box::new(crate::ty::FnTy {
             params: Vec::new().into(),
             block: None,
             ret: std::sync::Arc::new(Ty::Nil),
             effects: crate::effect::EffectSet::pure(),
-        });
+        })));
         m
     };
     vec![begin, no_args("push_bulk_end"), no_args("push_bulk_abort")]
@@ -982,7 +982,8 @@ pub fn perform_async_with(async_: &MethodDef) -> MethodDef {
         names.iter().map(|n| crate::dialect::Param::positional(Symbol::from(n.as_str()))).collect();
     params.extend(async_.params.iter().cloned());
     w.params = params;
-    if let Some(Ty::Fn { params: own, block, ret, effects }) = &async_.signature {
+    if let Some(Ty::Fn(f)) = &async_.signature {
+        let crate::ty::FnTy { params: own, block, ret, effects } = &**f;
         let mut all: Vec<crate::ty::Param> = names
             .iter()
             .zip(tys)
@@ -993,7 +994,7 @@ pub fn perform_async_with(async_: &MethodDef) -> MethodDef {
             })
             .collect();
         all.extend(own.iter().cloned());
-        w.signature = Some(Ty::Fn { params: all.into(), block: block.clone(), ret: ret.clone(), effects: effects.clone() });
+        w.signature = Some(Ty::Fn(Box::new(crate::ty::FnTy { params: all.into(), block: block.clone(), ret: ret.clone(), effects: effects.clone() })));
     }
     w
 }
@@ -1380,7 +1381,7 @@ pub fn apply_ruby(lcs: &mut [LibraryClass], app: &App) {
                 .map(|(i, p)| {
                     let mut v = Expr::new(span, ExprNode::Var { id: crate::ident::VarId(i as u32), name: p.name.clone() });
                     v.ty = match &m.signature {
-                        Some(Ty::Fn { params, .. }) => params.get(i).map(|tp| (*tp.ty).clone()),
+                        Some(Ty::Fn(f)) => f.params.get(i).map(|tp| (*tp.ty).clone()),
                         _ => None,
                     };
                     v
