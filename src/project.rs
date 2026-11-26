@@ -14045,6 +14045,30 @@ fn drop_facades_the_program_defines(files: &mut [(String, String)]) {
                 }
                 let end = (i + 1..lines.len()).find(|&j| lines[j] == "end").unwrap_or(lines.len() - 1);
                 keep[start..=end].iter_mut().for_each(|k| *k = false);
+                // Not the namespaces too: a gem's compound headers (`class SVG::Graph::Graph`) were written for the
+                // runtime anchor this file was, and a namespace with nothing of its own (svg-graph's `SVG::Graph`)
+                // has no other definition in the program.
+                // Only a module holding a declaration is a namespace: ROTP's `module Base32` façade is the gem's `class
+                // ROTP::Base32`, and an empty `module Base32` would contradict it.
+                let indent_of = |line: &str| line.len() - line.trim_start().len();
+                let declares = |line: &str| line.trim_start().starts_with("module ") || line.trim_start().starts_with("class ");
+                let mut open: Vec<usize> = Vec::new();
+                for j in i..=end {
+                    let line = lines[j];
+                    let indent = indent_of(line);
+                    let trimmed = line.trim_start();
+                    let is_module = trimmed.strip_prefix("module ").is_some_and(|rest| rest.chars().all(|c| c.is_alphanumeric() || c == '_'));
+                    if is_module && open.len() * 2 == indent {
+                        let close = (j + 1..=end).find(|&k| lines[k].trim_start() == "end" && indent_of(lines[k]) == indent).unwrap_or(end);
+                        if (j + 1..close).any(|k| declares(lines[k]) && indent_of(lines[k]) == indent + 2) {
+                            open.push(indent);
+                            keep[j] = true;
+                        }
+                    } else if trimmed == "end" && open.last() == Some(&indent) {
+                        open.pop();
+                        keep[j] = true;
+                    }
+                }
                 i = end + 1;
             } else {
                 i += 1;
@@ -17201,6 +17225,24 @@ mod tests {
     /// `require "bcrypt"`, its sidecar drops, the manifest declares the
     /// dependency, and the Makefile's binary build delegates to
     /// `spin build` (the raw $(SPINEL) lane can't resolve the package).
+    /// A gem compiled from source replaces its façade, but keeps the façade's
+    /// namespaces: the gem's compound `class SVG::Graph::Graph` headers were
+    /// written against them, and svg-graph declares nothing in `SVG::Graph`. A
+    /// module the façade only fills (ROTP's `Base32`, the gem's class) is not one.
+    #[test]
+    fn a_sourced_gem_keeps_its_facades_namespaces() {
+        let facade = "module GemFacade\nend\n\n# SVG — the stats graph.\nmodule SVG\n  module Graph\n    class TimeSeries\n      def initialize(_opts)\n        @opts = _opts\n      end\n    end\n  end\nend\n\nmodule ROTP\n  module Base32\n    def self.random\n      \"\"\n    end\n  end\nend\n\nmodule Mail\nend\n";
+        let gem = "#<SPINEL_SOURCE>lobsters/.roundhouse/source_gems/svg-graph-2.2.2/lib/SVG/Graph/Graph.rb:1\nclass SVG::Graph::Graph\nend\n";
+        let rotp = "#<SPINEL_SOURCE>lobsters/.roundhouse/source_gems/rotp-6.3.0/lib/rotp/base32.rb:1\nclass ROTP::Base32\nend\n";
+        let mut files = vec![
+            ("runtime/gem_facades.rb".to_string(), facade.to_string()),
+            ("app/models/svg/graph/graph.rb".to_string(), gem.to_string()),
+            ("app/models/rotp/base32.rb".to_string(), rotp.to_string()),
+        ];
+        drop_facades_the_program_defines(&mut files);
+        assert_eq!(files[0].1, "module GemFacade\nend\n\nmodule SVG\n  module Graph\n  end\nend\n\nmodule ROTP\nend\n\nmodule Mail\nend\n");
+    }
+
     #[test]
     fn spin_shape_swaps_bcrypt_facade_for_the_package() {
         let makefile = "SPINEL ?= spinel\n\
