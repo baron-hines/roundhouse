@@ -1192,8 +1192,10 @@ module ActionController
     # "relative" and sending them as the `Location` is the open redirect
     # this method exists to refuse — `redirect_to params[:back]` is the
     # shape, and the host half alone does not cover it. Anything else
-    # with no authority (a bare `foo`, a `#fragment`, `""`) Rails refuses
-    # too, so it is refused here.
+    # with no authority is refused too. Rails first joins a scheme-less
+    # string to the request URL, so it refuses a bare `foo` as host
+    # `hostfoo` but lets `#fragment` or `?q` through; here those are
+    # refused, the stricter side of that difference.
     def same_host_location(loc)
       host = ActionController.location_host(loc)
       req_host = request_host_for_redirect
