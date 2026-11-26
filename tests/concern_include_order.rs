@@ -876,3 +876,53 @@ fn a_prepend_runs_no_included_hook() {
     let lines = "  prepend DelegateOne\n  include PlainDef\n";
     single_case(&[delegate_one, PLAIN_DEF], lines, "label", "plain");
 }
+
+/// ShadowR's hook def is shadowed by its module's own `label`, but a hook
+/// that runs later declares `attr_reader :label`: that reader replaces the
+/// def on the includer, so Ruby gives nil. Run the other way round, the def
+/// replaces the reader (#2278).
+#[test]
+fn a_later_hooks_reader_stands_over_a_shadowed_hook_def() {
+    let shadow_r = ("shadow_r", "module ShadowR\n  extend ActiveSupport::Concern\n\n  included do\n    attr_reader :label\n    def label\n      \"hook\"\n    end\n  end\nend\n\nmodule ShadowR\n  def label\n    \"ordinary\"\n  end\nend\n");
+    for (includes, body, want) in [
+        ("  include ShadowR\n  include ReaderOnlyB\n", "@label", "null"),
+        ("  include ReaderOnlyB\n  include ShadowR\n", "\"hook\"", "\"hook\""),
+    ] {
+        let libs = [("shadow_reader_parent", format!("class ShadowReaderParent < ApplicationController\n{includes}end\n"))];
+        let libs: Vec<(&str, &str)> = libs.iter().map(|(f, s)| (*f, s.as_str())).collect();
+        assert_eq!(lib_label_bodies(&[shadow_r, READER_ONLY_B], &libs, "shadow_reader_parent"), [body], "{includes:?}");
+        lib_case(&[shadow_r, READER_ONLY_B], &libs, "ShadowReaderParent", want);
+    }
+}
+
+/// The later opening's LastHookOnly runs its hook after the earlier
+/// opening's ShadowB, so it wins although it needs no copy: ShadowB's copy
+/// on the earlier opening goes (#2278).
+#[test]
+fn a_later_openings_unshadowed_hook_retires_an_earlier_copy() {
+    let shadows: Vec<(String, String)> = ["A", "B"].iter().map(|x| shadow(x)).collect();
+    let mut concerns: Vec<(&str, &str)> = shadows.iter().map(|(f, s)| (f.as_str(), s.as_str())).collect();
+    concerns.push(LAST_HOOK_ONLY);
+    let libs = [
+        ("retire_parent", "class RetireParent < ApplicationController\n  include ShadowA\n  include ShadowB\nend\n"),
+        ("retire_parent_again", "class RetireParent < ApplicationController\n  include LastHookOnly\nend\n"),
+    ];
+    let mut app = emit_and_run::empty_app()
+        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::API\nend\n");
+    for (name, source) in &concerns {
+        app = app.write(&format!("app/controllers/concerns/{name}.rb"), source);
+    }
+    for (name, source) in &libs {
+        app = app.write(&format!("lib/{name}.rb"), source);
+    }
+    let (emitted, errors) = app.emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let mut bodies = Vec::new();
+    for (file, _) in &libs {
+        let Ok(class) = std::fs::read_to_string(emitted.join(format!("app/models/{file}.rb"))) else { continue };
+        let lines: Vec<&str> = class.lines().filter(|l| !l.starts_with("#<SPINEL_SOURCE>")).map(str::trim).collect();
+        bodies.extend((0..lines.len()).filter(|&i| lines[i] == "def label").map(|i| lines[i + 1].to_string()));
+    }
+    assert!(!bodies.contains(&"\"b hook\"".to_string()), "{bodies:?}");
+    lib_case(&concerns, &libs, "RetireParent", "\"last\"");
+}

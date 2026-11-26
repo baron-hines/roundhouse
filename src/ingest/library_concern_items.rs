@@ -130,6 +130,10 @@ pub(super) fn splice(app: &mut App) {
                 }
             }
         }
+        // Every name a hook run here defines: it runs after the hooks of the
+        // class's earlier openings, so their copies of the name give way,
+        // whether or not this one is copied.
+        let hook_names: Vec<Symbol> = ran.iter().map(|r| r.0.name.clone()).collect();
         let mut hook_defs: Vec<(MethodDef, bool)> = Vec::new();
         for (def, shadowed, module, reader) in &ran {
             // Of two hooks that define the name, the one that runs last wins.
@@ -145,14 +149,15 @@ pub(super) fn splice(app: &mut App) {
             // where the module's def would stand behind the reader. Not one
             // that calls `super` with no reopening: the module keeps the
             // hoisted copy of the same def, which `super` would run again.
-            // Nor when a hook that runs later declares a reader of the name,
-            // which replaces the def again, or one whose order isn't read.
+            // Neither, shadowed or not, when a hook that runs later declares a
+            // reader of the name, which replaces the def again, or one whose
+            // order isn't read: that reader stands.
             let later_reader = seen.iter().filter(|m| **m != *module && declares_hook_reader(app, m, &def.name)).any(|m| match (run_at(m), run_at(module)) {
                 (Some(other), Some(this)) => other > this,
                 _ => true,
             });
             let below_reader = *reader && !later_reader && !super::app::calls_super(&def.body);
-            if (*shadowed || below_reader) && last && !written {
+            if (*shadowed || below_reader) && last && !written && !later_reader {
                 hook_defs.push(((*def).clone(), *reader));
             }
         }
@@ -210,7 +215,7 @@ pub(super) fn splice(app: &mut App) {
             }
         }
         let class = lc.name.clone();
-        for name in pushed {
+        for name in hook_names {
             for (j, earlier) in copied.iter().filter(|(_, n)| *n == name) {
                 let other = &mut app.library_classes[*j];
                 if other.name == class {
@@ -218,8 +223,8 @@ pub(super) fn splice(app: &mut App) {
                 }
             }
             copied.retain(|(j, n)| !(*n == name && app.library_classes[*j].name == class));
-            copied.push((i, name));
         }
+        copied.extend(pushed.into_iter().map(|name| (i, name)));
     }
 }
 
