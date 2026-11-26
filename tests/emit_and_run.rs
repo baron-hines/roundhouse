@@ -594,6 +594,8 @@ mod float_round_digits;
 mod autoload_once_paths;
 #[path = "emit_and_run/config_require_relative.rs"]
 mod config_require_relative;
+#[path = "emit_and_run/active_storage_current.rs"]
+mod active_storage_current;
 #[path = "emit_and_run/defined_const_fold.rs"]
 mod defined_const_fold;
 #[path = "emit_and_run/job_payload.rs"]
