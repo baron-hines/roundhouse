@@ -43,6 +43,9 @@ struct CreationModel {
     fields: Option<crate::det::HashMap<Symbol, Ty>>,
     foreign_keys: crate::det::HashMap<Symbol, Symbol>,
     initialization_hook: bool,
+    /// The hook is only this model's own callbacks, which its synthesized
+    /// `initialize` lets a caller defer (`DEFER_INITIALIZE_CALLBACKS`).
+    deferred_hook: bool,
 }
 
 pub fn apply_first_or_create_lowering(app: &mut App) -> Vec<crate::diagnostic::Diagnostic> {
@@ -73,8 +76,15 @@ pub fn apply_first_or_create_lowering(app: &mut App) -> Vec<crate::diagnostic::D
                 ExprNode::Send { recv: None, method, .. } if method.as_str() == "after_initialize"),
             _ => false,
         }));
+        let own_hook = crate::lower::model_to_library::schema::model_declares_after_initialize(model);
+        let other_hook = model.body.iter().any(|item| matches!(item, crate::dialect::ModelBodyItem::Method { method, .. }
+            if method.receiver == crate::dialect::MethodReceiver::Instance && method.name.as_str() == "initialize"))
+            || std::iter::successors(model.parent.as_ref().and_then(|p| app.models.iter().find(|m| &m.name == p)), |model| {
+                model.parent.as_ref().and_then(|parent| app.models.iter().find(|m| &m.name == parent))
+            }).take(app.models.len()).any(crate::lower::model_to_library::schema::model_declares_after_initialize);
         (model.name.clone(), CreationModel {
             fields: (!unsupported_initializer).then_some(fields), foreign_keys, initialization_hook,
+            deferred_hook: own_hook && !other_hook,
         })
     }).collect();
     let mut diagnostics = Vec::new();
@@ -131,7 +141,7 @@ fn rewrite(expr: &mut Expr, models: &ModelColumns) {
                 ExprNode::Assign { target, value } => (value, Some(target.clone())),
                 _ => (&*e, None),
             };
-            let mut statements = inline_scoped_creation(send, model.clone(), &models[&model].foreign_keys);
+            let mut statements = inline_scoped_creation(send, model.clone(), &models[&model].foreign_keys, models[&model].deferred_hook);
             if let Some(target) = target {
                 let record = statements.pop().expect("record result");
                 statements.push(Expr::new(e.span, ExprNode::Assign { target, value: record }));
@@ -418,7 +428,7 @@ fn scoped_creation_refusal(e: &Expr, models: &ModelColumns) -> Option<String> {
     // Variable conditions too: the inlined block runs after `new` and before `save`, where Rails' does, as long as no
     // initialization callback would run between them (below), and a block body assigns no local (admission).
     if block.is_some() {
-        if model.initialization_hook {
+        if model.initialization_hook && !model.deferred_hook {
             return Some("creation block must run inside initialize before initialization callbacks; this factory calls new before the block".to_string());
         }
     }
@@ -483,6 +493,7 @@ fn inline_scoped_creation(
     e: &Expr,
     model_id: ClassId,
     foreign_keys: &crate::det::HashMap<Symbol, Symbol>,
+    deferred_hook: bool,
 ) -> Vec<Expr> {
     let span = e.span;
     let ExprNode::Send { recv: Some(recv), method, args, block, .. } = &*e.node else { unreachable!() };
@@ -535,7 +546,14 @@ fn inline_scoped_creation(
             (typed(Expr::new(span, ExprNode::Lit { value: Literal::Sym { value: key } }), Ty::Sym), value)
         }).collect(), kwargs: false,
     }), Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(value_ty) });
-    let mut initialize = vec![assign(record(), send(model, "new", vec![attributes], record_ty.clone()))];
+    // Not `new` with the block: Rails yields the record before its initialization callbacks, and a block cannot reach
+    // `new` on every target, so the callbacks wait for the block and run after it.
+    let defer = block.is_some() && deferred_hook;
+    let mut new_args = vec![attributes];
+    if defer {
+        new_args.push(typed(Expr::new(span, ExprNode::Lit { value: Literal::Bool { value: true } }), Ty::Bool));
+    }
+    let mut initialize = vec![assign(record(), send(model, "new", new_args, record_ty.clone()))];
     if let Some(block) = block {
         let ExprNode::Lambda { extra_params, params, body, .. } = &*block.node else { unreachable!() };
         if !extra_params.is_empty() {
@@ -548,6 +566,9 @@ fn inline_scoped_creation(
         rename_block_param(&mut block_body, block_id, &params[0], &block_name);
         initialize.push(assign(block_var, record()));
         initialize.push(block_body);
+    }
+    if defer {
+        initialize.push(send(record(), "after_initialize", vec![], Ty::Nil));
     }
     initialize.push(send(record(), if method.as_str().ends_with('!') { "save!" } else { "save" }, vec![], Ty::Bool));
     let branch = Expr::new(span, ExprNode::If {

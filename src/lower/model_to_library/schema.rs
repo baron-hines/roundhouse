@@ -3012,7 +3012,10 @@ fn synth_column_dirty_pred(owner: &ClassId, col: &Column, name: Symbol) -> Metho
 /// the hook-call tails in `synth_initialize` and the hydration
 /// factories, so hook-free models (the whole blog fixture) emit
 /// nothing new on any target.
-pub(super) fn model_declares_after_initialize(model: &Model) -> bool {
+/// The synthesized `initialize`'s second parameter, true when the caller runs the initialization callbacks itself.
+pub(crate) const DEFER_INITIALIZE_CALLBACKS: &str = "defer_initialize_callbacks";
+
+pub(crate) fn model_declares_after_initialize(model: &Model) -> bool {
     use crate::dialect::ModelBodyItem;
     model.body.iter().any(|item| match item {
         ModelBodyItem::Method { method, .. } => {
@@ -3832,7 +3835,8 @@ fn synth_initialize(
     // with `HYDRATE_ATTRS` (see `hydrate_attrs_const`): that record is
     // an empty shell until its columns land, and the factory fires the
     // hook itself once they have.
-    if model_declares_after_initialize(model) {
+    let defers = model_declares_after_initialize(model);
+    if defers {
         let hook = Expr::new(
             Span::synthetic(),
             ExprNode::Send {
@@ -3844,10 +3848,22 @@ fn synth_initialize(
             },
         );
         let hydrating = bool_send(var_ref(Symbol::from("attrs")), "equal?", hydrate_attrs_const());
+        // Not run here for a creation block: Rails yields the record to it before its initialization callbacks, and the
+        // block cannot be passed to `new` on every target, so `lower::first_or_create` runs it and then the hook.
+        let deferred = var_ref(Symbol::from(DEFER_INITIALIZE_CALLBACKS));
+        let cond = Expr::new(
+            Span::synthetic(),
+            ExprNode::BoolOp {
+                op: crate::expr::BoolOpKind::Or,
+                surface: crate::expr::BoolOpSurface::Symbol,
+                left: hydrating,
+                right: with_ty(deferred, Ty::Bool),
+            },
+        );
         stmts.push(Expr::new(
             Span::synthetic(),
             ExprNode::If {
-                cond: with_ty(no_arg_send(hydrating, "!"), Ty::Bool),
+                cond: with_ty(no_arg_send(with_ty(cond, Ty::Bool), "!"), Ty::Bool),
                 then_branch: hook,
                 else_branch: Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
             },
@@ -3866,10 +3882,17 @@ fn synth_initialize(
         ExprNode::Hash { entries: Vec::new(), kwargs: false },
     );
     let attrs_ty = Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Untyped) };
+    let mut sig_params = vec![crate::ty::Param {
+        name: attrs.clone(), ty: attrs_ty.into(), kind: crate::ty::ParamKind::Optional,
+    }];
+    let mut params = vec![Param::with_default(attrs.clone(), attrs_default)];
+    if defers {
+        let name = Symbol::from(DEFER_INITIALIZE_CALLBACKS);
+        sig_params.push(crate::ty::Param { name: name.clone(), ty: Ty::Bool.into(), kind: crate::ty::ParamKind::Optional });
+        params.push(Param::with_default(name, Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Bool { value: false } })));
+    }
     let signature = Ty::Fn(Box::new(FnTy {
-        params: vec![crate::ty::Param {
-            name: attrs.clone(), ty: attrs_ty.into(), kind: crate::ty::ParamKind::Optional,
-        }].into(),
+        params: sig_params.into(),
         block: None,
         ret: std::sync::Arc::new(Ty::Nil),
         effects: EffectSet::default(),
@@ -3881,7 +3904,7 @@ fn synth_initialize(
         name_span: crate::span::Span::synthetic(),
         name: Symbol::from("initialize"),
         receiver: MethodReceiver::Instance,
-        params: vec![Param::with_default(attrs.clone(), attrs_default)],
+        params,
         body: seq(stmts),
         signature: Some(signature),
         effects: EffectSet::default(),
