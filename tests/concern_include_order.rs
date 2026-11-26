@@ -793,3 +793,22 @@ fn a_concern_with_only_its_extend_is_still_not_a_library_class() {
     let classes = roundhouse::ingest::ingest_library_classes(looped.as_bytes(), "loop_only.rb").expect("ingest");
     assert_eq!(classes.iter().map(|c| c.name.0.as_str()).collect::<Vec<_>>(), ["LoopOnly"]);
 }
+
+/// An `alias` a concern's `class_eval` loop string writes names the body's
+/// own `def`, which the wrapped string doesn't define: it is not answered
+/// with an empty method of the name. `alias_method` stays unread and the
+/// keyword `alias` is refused, as before the string ran in the concern (#2278).
+#[test]
+fn a_loops_alias_of_the_concerns_def_copies_no_empty_method() {
+    let aliased = |file: &str, module: &str, string: &str| {
+        (file.to_string(), format!("module {module}\n  extend ActiveSupport::Concern\n\n  def value\n    \"real\"\n  end\n\n  %w[x].each {{ |m| class_eval \"{string}\" }}\nend\n"))
+    };
+    let (file, source) = aliased("alias_method_host", "AliasMethodHost", "alias_method :label, :value");
+    let controller = emitted_controller(&[(file.as_str(), source.as_str())], "  include AliasMethodHost\n", BuildTarget::Ruby);
+    assert!(!controller.contains("def label"), "{controller}");
+    let (file, source) = aliased("alias_keyword_host", "AliasKeywordHost", "alias label value");
+    let mut tree: std::collections::HashMap<std::path::PathBuf, Vec<u8>> = std::collections::HashMap::new();
+    tree.insert(format!("app/controllers/concerns/{file}.rb").into(), source.into_bytes());
+    let refused = roundhouse::ingest::ingest_app_from_tree(tree).map(|_| ()).expect_err("the keyword alias is refused");
+    assert!(format!("{refused:?}").contains("alias names a method this body has not defined"), "{refused:?}");
+}

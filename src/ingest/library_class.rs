@@ -3737,6 +3737,20 @@ fn walk_decl_body_with_visibility<'pr>(
     mode: DeclBodyMode,
     visibility: &Visibility,
 ) -> IngestResult<DeclBody> {
+    walk_decl_body_hosted(body, owner, file, mode, visibility, None)
+}
+
+/// `walk_decl_body_with_visibility` for a `class_eval` loop's string in a concern body (#2278): `host_defs` are
+/// that body's own `def` names, which the string's `included do` hoist treats as the body's, as it does for the
+/// body's own `included do`.
+fn walk_decl_body_hosted<'pr>(
+    body: Option<ruby_prism::Node<'pr>>,
+    owner: &ClassId,
+    file: &str,
+    mode: DeclBodyMode,
+    visibility: &Visibility,
+    host_defs: Option<&HashSet<String>>,
+) -> IngestResult<DeclBody> {
     let mut out = DeclBody::default();
     let mut class_attributes: HashSet<Symbol> = HashSet::default();
     let mut class_attr_defaults: IndexMap<Symbol, Expr> = IndexMap::new();
@@ -3868,6 +3882,7 @@ fn walk_decl_body_with_visibility<'pr>(
                 let def = definition.as_ref().unwrap_or(stmt).as_def_node()?;
                 def.receiver().is_none().then(|| constant_id_str(&def.name()).to_string())
             })
+            .chain(host_defs.into_iter().flatten().cloned())
             .collect()
     });
     let concern_class_defs: Option<HashSet<String>> = concern_direct_defs.as_ref().map(|_| {
@@ -4978,30 +4993,41 @@ fn walk_decl_body_with_visibility<'pr>(
     let mut from_eval: Vec<usize> = Vec::new();
     for ((start, end), source) in evaled {
         // In a body that extends ActiveSupport::Concern the string runs there too, so its `included do` is the
-        // concern's hook (#2278): the wrapper extends it as well, and its empty `def`s of the body's own names let
-        // the hoist keep a colliding hook def in the block, as it does for the body's own `included do`. Neither
-        // the `extend` nor those `def`s is the string's.
-        let prefix = match &concern_direct_defs {
+        // concern's hook (#2278): the wrapper extends it as well, and its body is walked with this body's own `def`
+        // names (`walk_decl_body_hosted`), so the hoist keeps a colliding hook def in the block, as it does for
+        // this body's own `included do`. The wrapper's `extend` is not the string's.
+        let (includes, unknown_calls, methods) = match &concern_direct_defs {
             Some(direct) => {
-                let mut names: Vec<&String> = direct.iter().collect();
-                names.sort();
-                let stubs: String = names.iter().map(|name| format!("def {name}(*)\nend\n")).collect();
-                format!("class RoundhouseClassEval\nextend ActiveSupport::Concern\n{stubs}")
+                let prefix = "class RoundhouseClassEval\nextend ActiveSupport::Concern\n";
+                let wrapped = format!("{prefix}{source}\nend\n");
+                let (walked, _) = super::prism::scope(|| -> IngestResult<Option<DeclBody>> {
+                    let parsed = super::prism::parse(wrapped.as_bytes(), file);
+                    let root = parsed.node();
+                    let Some(class) = root.as_program_node().and_then(|p| p.statements().body().iter().find_map(|s| s.as_class_node())) else {
+                        return Ok(None);
+                    };
+                    let owner = ClassId(Symbol::from("RoundhouseClassEval"));
+                    let visibility = Visibility::resolve_library_carrying(class.body().as_ref(), file, None, Some(&owner))?;
+                    walk_decl_body_hosted(class.body(), &owner, file, DeclBodyMode::Instance, &visibility, Some(direct)).map(Some)
+                });
+                let Some(mut walked) = walked? else { continue };
+                // As a class body's are: its `@x = …` statements are not class-body calls.
+                take_class_ivar_initializers(&mut walked.unknown_calls);
+                walked.unknown_calls.retain(|call| call.span.is_synthetic() || call.span.start >= prefix.len() as u32);
+                (walked.includes, walked.unknown_calls, walked.methods)
             }
-            None => "class RoundhouseClassEval\n".to_string(),
+            None => {
+                let wrapped = format!("class RoundhouseClassEval\n{source}\nend\n");
+                let (parsed, _) = super::prism::scope(|| super::ingest_library_classes(wrapped.as_bytes(), file));
+                let mut classes = parsed?;
+                let Some(class) = classes.pop() else { continue };
+                (class.includes, class.unknown_calls, class.methods)
+            }
         };
-        let prefix_end = prefix.len() as u32;
-        let wrapped = format!("{prefix}{source}\nend\n");
-        let (parsed, _) = super::prism::scope(|| super::ingest_library_classes(wrapped.as_bytes(), file));
-        let mut classes = parsed?;
-        let Some(mut class) = classes.pop() else { continue };
-        class.unknown_calls.retain(|call| call.span.is_synthetic() || call.span.start >= prefix_end);
-        class.methods.retain(|m| m.name_span.is_synthetic() || m.name_span.start >= prefix_end);
         // The string's `included` blocks, at their offsets in it, and a span inside the loop's own for them and the
         // defs hoisted out of them: a `def` the string writes beside the block stays at the loop's span, which the
         // block's no longer holds, so it is not read as the hook's (`in_included_hook`).
-        let hooks: Vec<Span> = class
-            .unknown_calls
+        let hooks: Vec<Span> = unknown_calls
             .iter()
             .filter(|call| {
                 concern_direct_defs.is_some()
@@ -5023,7 +5049,7 @@ fn walk_decl_body_with_visibility<'pr>(
         } else {
             out.includes.len()
         };
-        for include in &class.includes {
+        for include in &includes {
             if spanned {
                 out.includes.insert(at, include.clone());
                 out.include_spans.insert(at, at_loop);
@@ -5040,13 +5066,13 @@ fn walk_decl_body_with_visibility<'pr>(
             }
             e.node.for_each_child_mut(&mut mark_constants);
         }
-        out.unknown_calls.extend(class.unknown_calls.iter().map(|call| {
+        out.unknown_calls.extend(unknown_calls.iter().map(|call| {
             let mut call = call.clone();
             call.span = if in_hook(call.span) { at_hook } else { at_loop };
             mark_constants(&mut call);
             call
         }));
-        for mut method in class.methods {
+        for mut method in methods {
             mark_constants(&mut method.body);
             for param in &mut method.params {
                 if let Some(default) = param.default.as_mut() {
