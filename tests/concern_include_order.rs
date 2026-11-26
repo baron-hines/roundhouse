@@ -689,6 +689,11 @@ fn a_concern_the_superclass_has_is_not_prepended_again() {
     assert_eq!(label, "\"n\"");
     let label = parent_case(&[PLAIN_M, PREP_N], "  include PlainM\n", "  prepend PlainM\n  include PrepN\n", "plain m");
     assert_eq!(label, "\"plain m\"");
+    // HookM's hook ran on the superclass and defined `label` there, below
+    // the child's PrepN: `[Single, PrepN, PrepParent, HookM]`.
+    let hook_m = ("hook_m", "module HookM\n  extend ActiveSupport::Concern\n\n  included do\n    def label\n      \"hook\"\n    end\n  end\nend\n");
+    let label = parent_case(&[hook_m, PREP_N], "  include HookM\n", "  prepend HookM\n  include PrepN\n", "n");
+    assert_eq!(label, "\"n\"");
 }
 
 /// A prepend runs the concern's `prepended do`, not its `included do`, so
