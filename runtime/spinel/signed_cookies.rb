@@ -1,4 +1,5 @@
 # frozen_string_literal: true
+require "json"
 # The cookies the two ruby-family dispatchers write for themselves — the
 # session and the flash messages — signed, so a client can read them but
 # not forge them. A value that does not verify (edited, plaintext, signed
@@ -18,7 +19,8 @@
 # * SIGNED, NOT ENCRYPTED. Rails' cookie store encrypts (AES-256-GCM,
 #   the "authenticated encrypted cookie" salt), so a client cannot read
 #   its own session either. Here it can: the session payload is base64
-#   of the url-encoded `k=v` pairs, the flash payload the message text.
+#   of the url-encoded `k=v` pairs. String flash payloads are message
+#   text; other flash values use JSON and a separate signing purpose.
 #   Integrity is HMAC; confidentiality is a named residual until an
 #   AES-GCM CookieStore lands in this runtime. Dispatch now emits
 #   `Secure` on HTTPS and `SameSite=Lax` on the session/flash cookies.
@@ -61,6 +63,30 @@ module ActionDispatch
   class Session
     def self.from_signed_cookie(raw, name)
       Session.from_cookie(SignedCookie.verified(raw, name))
+    end
+
+    # Not the shared codec's `to_s`: Rails' cookie store keeps each value as JSON, so Devise's `[[id], salt]` reads back as an Array.
+    def to_cookie
+      ks = to_h.keys
+      ks.map { |k| "#{Session.cookie_encode(k)}=#{Session.cookie_encode(JSON.generate(self[k]))}" }.join("&")
+    end
+
+    def self.from_cookie(raw)
+      session = Session.new
+      raw.to_s.split("&").each do |pair|
+        parts = pair.to_s.split("=")
+        k = parts.length > 0 ? Session.cookie_decode(parts[0].to_s) : ""
+        v = parts.length > 1 ? Session.cookie_decode(parts[1].to_s) : ""
+        session[k] = Session.json_value(v) unless k.empty?
+      end
+      session
+    end
+
+    # Not a 500 for a cookie of the earlier shape, whose values were their `to_s`: that text is the value.
+    def self.json_value(text)
+      JSON.parse(text)
+    rescue JSON::ParserError
+      text
     end
 
     # `plain` is `Session#to_cookie`'s encoding. The dispatchers compare

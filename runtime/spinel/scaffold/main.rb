@@ -204,18 +204,13 @@ module Main
     path.start_with?("/assets/") || path == "/icon.png" || path == "/icon.svg"
   end
 
-  # Rails' ActionDispatch::Static: a GET/HEAD for a file that exists
-  # under public/ (robots.txt, the error pages) is served ahead of the
-  # routes. Only a path whose last segment names a file (has an
-  # extension) is looked up, so a route like `/rooms` never stats the
-  # disk; the `..` guard is static_asset?'s.
-  def self.public_file?(verb, path)
-    return false unless verb == "GET" || verb == "HEAD"
-    return false if path.include?("..")
-    slash = path.rindex("/")
-    return false if slash.nil?
-    return false unless path[slash + 1, path.length].to_s.include?(".")
-    Sock.sphttp_filesize("public" + path) >= 0
+  # Rails' ActionDispatch::Static: a GET/HEAD for a file under public/
+  # (robots.txt, the error pages, a page `caches_page` wrote) is served
+  # ahead of the routes, by FileHandler's lookup (runtime/public_files.rb).
+  # The URL path of the file to send, or "" for none.
+  def self.public_file(verb, path)
+    return "" unless verb == "GET" || verb == "HEAD"
+    ActionController::PublicFiles.lookup(path)
   end
 
   # Resolve a (pre-validated) static URL to its on-disk path under
@@ -303,7 +298,7 @@ module Main
 
   # Tep::Server callback. Routes, runs the controller, copies
   # status/body/location back, and persists per-request flash via
-  # cookies (flash_notice / flash_alert) so a `redirect_to … notice:`
+  # cookies (one flash_<key> each) so a `redirect_to … notice:`
   # shows once on the redirect target and is then swept — matching the
   # cookie-backed Rack path in ruby_overlay/main.rb. Session is still a
   # fresh per-request object (not yet cookie-persisted), same as Rack.
@@ -358,12 +353,28 @@ module Main
   # included. They sit behind ActionDispatch::Static, so a file sent
   # from static/ or public/ carries neither, and the /cable upgrade is
   # left as Action Cable answers it.
+  #
+  # A gem's middleware (runtime/request_hooks.rb) sits outside all of it,
+  # where its Railtie inserts it: at position 0.
   def self.dispatch(req, res)
+    unless RequestHooks.request_begin(req, res)
+      Main.dispatch_app(req, res)
+    end
+    RequestHooks.request_end(req, res)
+    nil
+  end
+
+  def self.dispatch_app(req, res)
     started = ActionDispatch::Runtime.clock_time
-    Main.dispatch_request(req, res)
+    request_obj = ActionDispatch::Request.new
+    request_obj.request_id = ActionDispatch::RequestId.make(req.req_headers.fetch("x-request-id", ""))
+    # Not for an asset: Rails' Static answers it above the session middleware, with no cookie verified.
+    Main.restore_session(req, request_obj) unless Main.static_asset?(req.path)
+    GemMiddleware.dispatch(req, res, request_obj)
+    Main.persist_session(res, request_obj)
     return nil if res.file_path.length > 0 || res.upgrading_ws
     res.headers[ActionDispatch::RequestId::HEADER] =
-      ActionDispatch::RequestId.make(req.req_headers.fetch("x-request-id", ""))
+      request_obj.request_id.to_s
     # Rack::Runtime leaves a value the app set itself.
     unless res.headers.keys.any? { |k| k.downcase == "x-runtime" }
       res.headers[ActionDispatch::Runtime::HEADER] = ActionDispatch::Runtime.header_value(started)
@@ -371,9 +382,41 @@ module Main
     nil
   end
 
+  # Cookie-carried session: restore the whole session from the session
+  # cookie (url-encoded k=v pairs; empty when absent or garbled).
+  # Persisted after the action only when the encoding changed — an
+  # action that leaves the session untouched emits no Set-Cookie.
+  #
+  # The NAME comes from `Rails.application.session_cookie_key`, not a
+  # literal: apps declare it via `config.session_store :cookie_store,
+  # key: "..."`, which ingest lifts onto the Rails::Application reopen
+  # (framework default "_session" when they don't). App code reads the
+  # same accessor, and the two must agree — lobsters'
+  # `remove_unknown_cookies` deletes every cookie whose key isn't the
+  # configured one, so a literal here would clear the session on every
+  # request.
+  #
+  # SIGNED (runtime/signed_cookies.rb): a value that does not verify
+  # restores as an empty session. `roundhouse.session.in` is the
+  # restored session's PLAIN encoding — what the persist step compares
+  # against, so an untouched session writes no Set-Cookie and a
+  # rejected one is not rewritten until the action changes it.
+  #
+  # Not in `dispatch_request` beside the controller: Rails' session
+  # middleware sits above Warden's and the routes, which read it first.
+  def self.restore_session(req, request_obj)
+    session_cookie = Rails.application.session_cookie_key
+    restored = ActionDispatch::Session.from_signed_cookie(
+      req.cookies.fetch(session_cookie, ""), session_cookie)
+    request_obj.session = restored
+    request_obj.env["rack.session"] = restored
+    request_obj.env["roundhouse.session.in"] = restored.to_cookie
+    nil
+  end
+
   # Serve static files or dispatch the complete request path through Router,
   # preserving literal suffix routes while negotiating the response format.
-  def self.dispatch_request(req, res)
+  def self.dispatch_request(req, res, request_obj)
     ActionView::ViewHelpers.reset_slots!
     Broadcasts.reset_log!
     # Under RH_SQL_TRACE the request line brackets its queries, so a
@@ -400,8 +443,9 @@ module Main
       Main.serve_static(req.path, res)
       return
     end
-    if Main.public_file?(req.verb, req.path)
-      Main.serve_static(req.path, res, "public")
+    public_path = Main.public_file(req.verb, req.path)
+    unless public_path.empty?
+      Main.serve_static(public_path, res, "public")
       return
     end
 
@@ -432,7 +476,40 @@ module Main
       end
     end
 
-    matched = ActionDispatch::Router.match(verb, request_path, Main.route_table)
+    # A request constraint reads the request before its route is chosen
+    # (`RouteTable.match_asking`), so what it can ask is filled in first.
+    request_obj.request_method = verb
+    request_obj.path = request_path
+    request_obj.remote_ip = req.remote_host
+    request_obj.host = req.req_headers.fetch("host", "localhost")
+    # `request.headers` follows Rails' HTTP-to-CGI env mapping. Copy all
+    # parsed headers, not just those the dispatcher itself reads: cache
+    # validators, `Accept-Encoding`, and `Turbo-Frame` are consumed by
+    # application code after dispatch. Write directly into the RBS-pinned
+    # env field so each value keeps its poly-hash representation. This
+    # includes `X-Forwarded-Proto`, CSRF/origin/fetch metadata, auth, and
+    # content type; keeping one mapping avoids a drifting header allowlist.
+    req.req_headers.each do |name, value|
+      request_obj.env[ActionDispatch::Http::Headers.env_name_from_header(name)] = value
+    end
+    request_obj.env["roundhouse.listener"] = req.listener_transport
+    # config.assume_ssl: TLS ends at a proxy that forwards plain http.
+    # Rails' AssumeSSL marks the request https before the action, so
+    # secure cookies and absolute redirects use https.
+    if AppEnvironment.serving_assume_ssl?
+      request_obj.env["HTTPS"] = "on"
+      request_obj.env["HTTP_X_FORWARDED_PROTO"] = "https"
+      request_obj.env["rack.url_scheme"] = "https"
+    end
+    last_segment = request_path.split("/").last.to_s
+    extension = last_segment.include?(".") ? last_segment.split(".").last.to_s : ""
+    request_obj.format = ActionDispatch::MimeNegotiation.format_name(
+      extension,
+      req.req_headers.fetch("accept", ""),
+      req.req_headers.fetch("x-requested-with", ""),
+      req.req_headers.fetch("content-type", "")
+    )
+    matched = RouteTable.match_asking(verb, request_path, Main.route_table, request_obj)
     if matched.nil?
       # No route: the format is the `?format=` param, a trusted Accept,
       # or the path's extension (Main.render_not_found).
@@ -499,11 +576,11 @@ module Main
     controller.params = params
     controller.path_parameters = matched.path_params
     Main.nest_upload_parts(controller.params, req.upload_parts) if req.upload_parts.length > 0
+    RouteTable.route_defaults(matched.defaults, params, matched.path_params)
     # Typed request object + per-request context statics. Helpers are
     # module functions with no controller in scope; the emit rewrites
     # their bare `request` reads to `ActionController::Current.request`
     # and the layout reaches flash through `Current.controller`.
-    request_obj = ActionDispatch::Request.new
     request_obj.request_method = verb
     request_obj.path = request_path
     qm = req.raw_path.index("?")
@@ -530,26 +607,8 @@ module Main
     # StrStrHash and the `request_obj.env = env` assignment warns on the
     # StrStr->StrPoly mismatch. Writing Strings into the poly field in place
     # is a valid poly-member write and never constructs the competing hash.
+    request_obj.env["REQUEST_METHOD"] = verb
     user_agent = req.req_headers.fetch("user-agent", "")
-    # `request.headers` follows Rails' HTTP-to-CGI env mapping. Copy all
-    # parsed headers, not just those the dispatcher itself reads: cache
-    # validators, `Accept-Encoding`, and `Turbo-Frame` are consumed by
-    # application code after dispatch. Write directly into the RBS-pinned
-    # env field so each value keeps its poly-hash representation. This
-    # includes `X-Forwarded-Proto`, CSRF/origin/fetch metadata, auth, and
-    # content type; keeping one mapping avoids a drifting header allowlist.
-    req.req_headers.each do |name, value|
-      request_obj.env[ActionDispatch::Http::Headers.env_name_from_header(name)] = value
-    end
-    request_obj.env["roundhouse.listener"] = req.listener_transport
-    # config.assume_ssl: TLS ends at a proxy that forwards plain http.
-    # Rails' AssumeSSL marks the request https before the action, so
-    # secure cookies and absolute redirects use https.
-    if AppEnvironment.serving_assume_ssl?
-      request_obj.env["HTTPS"] = "on"
-      request_obj.env["HTTP_X_FORWARDED_PROTO"] = "https"
-      request_obj.env["rack.url_scheme"] = "https"
-    end
     # `user_agent` is ALSO a separate reader slot. The overlay twin's
     # `user_agent` reads `@env["HTTP_USER_AGENT"]`; the shared runtime's
     # (`runtime/ruby/action_dispatch/request.rb`) returns `@user_agent`,
@@ -574,49 +633,31 @@ module Main
     controller.query_string = request_obj.query_string
     ActionController::Current.request = request_obj
     ActionController::Current.controller = controller
-    # Cookie-carried session: restore the whole session from the session
-    # cookie (url-encoded k=v pairs; empty when absent or garbled).
-    # Persisted below only when the encoding changed — an action that
-    # leaves the session untouched emits no Set-Cookie.
-    #
-    # The NAME comes from `Rails.application.session_cookie_key`, not a
-    # literal: apps declare it via `config.session_store :cookie_store,
-    # key: "..."`, which ingest lifts onto the Rails::Application reopen
-    # (framework default "_session" when they don't). App code reads the
-    # same accessor, and the two must agree — lobsters'
-    # `remove_unknown_cookies` deletes every cookie whose key isn't the
-    # configured one, so a literal here would clear the session on every
-    # request.
-    session_cookie = Rails.application.session_cookie_key
-    # SIGNED (runtime/signed_cookies.rb): a value that does not
-    # verify restores as an empty session. `session_in` is the restored
-    # session's PLAIN encoding — what the persist step below compares
-    # against, so an untouched session writes no Set-Cookie and a
-    # rejected one is not rewritten until the action changes it.
-    restored = ActionDispatch::Session.from_signed_cookie(
-      req.cookies.fetch(session_cookie, ""), session_cookie)
-    session_in = restored.to_cookie
-    controller.assign_http_session(restored)
+    controller.assign_http_session(request_obj.session)
     # Controller-level cookie access (`cookies[:k]` reads, `cookies[:k] = v`
     # records writes surfaced as Set-Cookie below). The inbound jar is the
     # request's parsed cookies (String-keyed Tep.str_hash); the CookieJar
     # normalizes keys so Symbol-constant indexing (`cookies[:tag_filters]`)
     # resolves. Same shared ActionController::CookieJar the CRuby overlay uses.
     controller.cookies = ActionController::CookieJar.new(req.cookies)
+    controller.cookies = controller.request.adopt_cookie_jar(controller.cookies)
     # Inbound flash: each message rides its own SIGNED cookie
-    # (flash_notice / flash_alert; runtime/signed_cookies.rb) — one that
+    # (flash_<key>; runtime/signed_cookies.rb) — one that
     # does not verify reads as no message, so a client cannot make the
     # next page show text of its choosing. Load
     # through the constructor (NOT flash[:k]=) so to_persisted's show-once
     # diff sees them as carried-in (value == @notice_was) and sweeps them.
-    # `fetch(name, "")` avoids a missing-key raise; a flash message is
-    # never empty, so non-empty == present.
-    inbound_flash = Tep.str_hash
-    cin = ActionDispatch::SignedCookie.verified(req.cookies.fetch("flash_notice", ""), "flash_notice")
-    inbound_flash["notice"] = cin if cin.length > 0
-    ain = ActionDispatch::SignedCookie.verified(req.cookies.fetch("flash_alert", ""), "flash_alert")
-    inbound_flash["alert"] = ain if ain.length > 0
-    controller.flash = ActionDispatch::Flash.new(inbound_flash)
+    inbound_flash = ActionDispatch::Flash.new
+    # Every `flash_<key>` cookie, not only notice/alert: lobsters' layout shows `flash[:error]` / `[:success]`.
+    req.cookies.each do |cname, cvalue|
+      if cname.start_with?("flash_")
+        ActionDispatch::Flash.cookie_flashes(cvalue, cname).each do |key, value|
+          inbound_flash[key] = value
+        end
+      end
+    end
+    controller.flash = ActionDispatch::Flash.new(inbound_flash.to_h)
+    request_obj.flash = controller.flash
     controller.request_format = request_format
     controller.accepts_any_format = Main.accepts_any_format?(req.req_headers.fetch("accept", ""))
     # Rails' `Vary: Accept` on a render whose format came from the Accept
@@ -629,7 +670,13 @@ module Main
       controller.params.key?("format") || !matched.req_format.nil?)
 
     begin
-      controller.process_action(matched.action)
+      # Not the class name built per request: only a start_processing / process_action listener reads it.
+      processing = ActiveSupport::Notifications.process_listening? ? ActiveSupport::Notifications.start_processing(controller.class.name, matched.action.to_s) : 0.0
+      begin
+        controller.process_action(matched.action)
+      ensure
+        ActiveSupport::Notifications.process_action(controller.class.name, matched.action.to_s, processing) unless processing == 0.0
+      end
     rescue ActiveRecord::RecordNotFound, ActionController::RoutingError, AbstractController::ActionNotFound
       # The routed format (extension, route default) is the `format`
       # param; an html one may still name `?format=`.
@@ -652,6 +699,23 @@ module Main
       res.status = 422
       res.body = "<h1>422 Unprocessable Content</h1>"
       return
+    rescue ActionController::UnknownFormat
+      # Rails' rescue_responses answer it with 406; the default app ships no public/406.html, so the body is empty.
+      res.status = 406
+      res.body = ""
+      return
+    end
+
+    Main.write_response(controller, req, res, request_obj, request_format)
+  end
+
+  # What the action left on the controller, written to the response: the routed action's and an endpoint's
+  # (`Main.run_endpoint`) alike.
+  def self.write_response(controller, req, res, request_obj, request_format)
+    socket = request_obj.env["roundhouse.websocket"]
+    if socket.is_a?(Faye::WebSocket)
+      res.start_websocket(socket.accept_key, socket.driver)
+      return
     end
 
     # Compose `Cache-Control` from whatever `response.cache_control`
@@ -663,7 +727,7 @@ module Main
     # before the status, body and headers are copied below, since a 304
     # changes all three.
     controller.commit_cache_control!
-    controller.commit_conditional_get!(req.verb, req.req_headers.fetch("if-none-match", ""))
+    controller.commit_conditional_get!(req.verb, req.req_headers.fetch("if-none-match", ""), req.req_headers.fetch("if-modified-since", ""))
     controller.commit_default_headers!
 
     res.status = controller.status
@@ -711,21 +775,21 @@ module Main
     end
 
     # Outbound flash: persist messages set THIS request for the NEXT one.
-    # `to_persisted` returns only notice/alert that differ from the
-    # carried-in value (show-once); clear any inbound cookie that wasn't
-    # re-persisted so a consumed flash doesn't stick on the next nav.
+    # `to_persisted` returns only the entries this request set (show-once);
+    # clear any inbound cookie that wasn't re-persisted so a consumed flash
+    # doesn't stick on the next nav.
     persisted = controller.flash.to_persisted
-    pn = persisted.fetch("notice", "")
-    if pn.length > 0
-      Main.set_flash_cookie(res, "flash_notice", ActionDispatch::SignedCookie.sign(pn, "flash_notice"), request_obj.ssl?)
-    elsif req.cookies.fetch("flash_notice", "").length > 0
-      Main.clear_flash_cookie(res, "flash_notice")
+    persisted.each do |kind, pv|
+      if !pv.is_a?(String) || pv.length > 0
+        fname = "flash_" + kind
+        Main.set_flash_cookie(res, fname, ActionDispatch::Flash.signed_cookie(pv, fname), request_obj.ssl?)
+      end
     end
-    pa = persisted.fetch("alert", "")
-    if pa.length > 0
-      Main.set_flash_cookie(res, "flash_alert", ActionDispatch::SignedCookie.sign(pa, "flash_alert"), request_obj.ssl?)
-    elsif req.cookies.fetch("flash_alert", "").length > 0
-      Main.clear_flash_cookie(res, "flash_alert")
+    req.cookies.each do |cname, cvalue|
+      if cname.start_with?("flash_") && cvalue.length > 0
+        value = persisted.fetch(cname[6, cname.length - 6], "")
+        Main.clear_flash_cookie(res, cname) if value.is_a?(String) && value.empty?
+      end
     end
 
     # Outbound cookies: serialize whatever the action recorded via
@@ -747,20 +811,65 @@ module Main
       # `cookies.permanent` — without it the cookie ends with the browser.
       exp = jar.flag_expires(cname)
       copts["Expires"] = exp if exp.length > 0
+      copts["Max-Age"] = "0" if jar.deleted?(cname)
       res.set_cookie(cname, out_cookies[cname], copts)
       ci += 1
     end
+  end
 
-    # Session persistence: re-encode whatever the action (or a lazy
-    # CSRF token generated during the layout render above) left in the
-    # session; Set-Cookie only on change. An emptied session
-    # (reset_session) clears the cookie. Runs after the render so
-    # lazily-created tokens are captured, and on redirects too (login
-    # sets `session[:u]` then 302s).
-    # `request.session_options[:skip] = true` (lobsters'
-    # `clear_session_cookie`) leaves the cookie alone, as Rails'
-    # session middleware skips its commit.
-    session_out = controller.session.to_cookie
+  # Rails' `Controller.action(name)` endpoint (Devise's FailureApp, and the action its recall names), run on the
+  # request the routes were given: the controller is set up as a routed one is, with the request's own params,
+  # and its answer is written where a routed action's is.
+  def self.run_endpoint(req, res, request_obj, controller, action)
+    controller.params = request_obj.params
+    controller.request = request_obj
+    controller.query_string = request_obj.query_string
+    ActionController::Current.request = request_obj
+    ActionController::Current.controller = controller
+    controller.assign_http_session(request_obj.session)
+    controller.cookies = ActionController::CookieJar.new(req.cookies)
+    controller.cookies = controller.request.adopt_cookie_jar(controller.cookies)
+    inbound_flash = ActionDispatch::Flash.new
+    req.cookies.each do |cname, cvalue|
+      if cname.start_with?("flash_")
+        ActionDispatch::Flash.cookie_flashes(cvalue, cname).each do |key, value|
+          inbound_flash[key] = value
+        end
+      end
+    end
+    # Not a new Flash when the request already holds one: Rails' flash is the request's, so the routes' controller and an endpoint it reaches (Devise's recall after `flash.now[:alert] =`) share it.
+    held_flash = request_obj.flash
+    flash = held_flash.nil? ? ActionDispatch::Flash.new(inbound_flash.to_h) : held_flash
+    controller.flash = flash
+    # Not read back from the controller: Devise's FailureApp delegates `flash` to the request, which holds none yet.
+    request_obj.flash = flash
+    request_format = request_obj.format.to_sym == :json ? :json : :html
+    controller.request_format = request_format
+    controller.process_action(action)
+    rack = controller.rack_response
+    if rack.nil?
+      Main.write_response(controller, req, res, request_obj, request_format)
+    else
+      # Not written again from the controller: the Rack response it was handed is its answer, the body and headers already the shared `res`'s.
+      res.status = rack[0].to_i
+      res.body = rack[2].join
+    end
+    nil
+  end
+
+  # Session persistence: re-encode whatever the action (or a lazy
+  # CSRF token generated during the layout render) left in the
+  # session; Set-Cookie only on change. An emptied session
+  # (reset_session) clears the cookie. Runs on redirects too (login
+  # sets `session[:u]` then 302s).
+  # `request.session_options[:skip] = true` (lobsters'
+  # `clear_session_cookie`) leaves the cookie alone, as Rails'
+  # session middleware skips its commit.
+  # Not at the end of `dispatch_request`: Rails commits above the gems' middleware, so what one writes or answers itself counts.
+  def self.persist_session(res, request_obj)
+    session_cookie = Rails.application.session_cookie_key
+    session_in = request_obj.env.fetch("roundhouse.session.in", "").to_s
+    session_out = request_obj.session.to_cookie
     if session_out != session_in && !request_obj.session_skip?
       if session_out == ""
         Main.clear_flash_cookie(res, session_cookie)
@@ -769,6 +878,7 @@ module Main
           ActionDispatch::Session.signed_cookie(session_out, session_cookie), request_obj.ssl?)
       end
     end
+    nil
   end
 
   # Flash cookies are HttpOnly + Path=/; the read side is server-only

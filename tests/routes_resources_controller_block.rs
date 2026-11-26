@@ -5,6 +5,8 @@
 //! controller named after the resource. A nested `resources` keeps its
 //! own controller, and path and helper names are unchanged.
 
+#[path = "support/prerequisite.rs"]
+mod prerequisite;
 #[path = "support/emit_and_run.rs"]
 #[allow(dead_code)]
 mod emit_and_run;
@@ -76,7 +78,7 @@ fn block_verbs_dispatch_to_the_resources_controller() {
 #[test]
 fn rails_routes_the_table() {
     if !Command::new("ruby").args(["-raction_controller", "-e", "1"]).status().is_ok_and(|s| s.success()) {
-        eprintln!("skipping: ruby with the actionpack gem not available");
+        prerequisite::missing("ruby with the actionpack gem not available");
         return;
     }
     let script = format!(

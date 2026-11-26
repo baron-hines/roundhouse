@@ -11,6 +11,8 @@
 //!    Any `super`, a prepend, an `initialize` from a concern's
 //!    `included do` or `define_method` keeps the refusal.
 
+#[path = "support/scratch.rs"]
+mod scratch;
 #[path = "support/emit_and_run.rs"]
 #[allow(dead_code)]
 mod emit_and_run;
@@ -44,7 +46,14 @@ fn emit(helper_body: &str, init: &str, extra: &str) -> (String, Vec<String>) {
 fn assert_bound(helper_body: &str, init: &str, extra: &str) {
     let (caller, errors) = emit(helper_body, init, extra);
     assert!(!errors.iter().any(|e| e.contains(REFUSAL)), "{errors:#?}");
-    assert!(caller.contains("Req.new(:get, \"u\", true)"), "{caller}");
+    assert!(caller.contains("Req.new(:get, \"u\", allow_local: true)"), "{caller}");
+    let run = emit_and_run::real_blog()
+        .write("app/lib/kit/helper.rb", &helper(helper_body))
+        .write("app/lib/kit/req.rb", &req(init, extra))
+        .write("app/lib/kit/caller.rb", CALLER)
+        .run_ruby("Dir[File.join(__dir__, 'app/models/kit/*.rb')].sort.each { |file| require file }\np Kit::Caller.new.go\n");
+    run.assert_passes();
+    assert_eq!(run.stdout, "[:get, \"u\", true]\n");
 }
 
 fn assert_refused(helper_body: &str, init: &str, extra: &str) {
@@ -131,8 +140,7 @@ fn an_initialize_from_a_concerns_included_do_keeps_the_refusal() {
 fn an_own_initialize_shadows_a_source_mixins_on_ruby() {
     const MIXIN: &str = "module Kit\n  module Supplier\n    def initialize(*args, **kw)\n      @x = [:mixin]\n    end\n  end\nend\n";
     const REQ: &str = "module Kit\n  class Req\n    include Supplier\n\n    def initialize(verb, url, allow_local: false)\n      @x = [verb, url, allow_local]\n    end\n\n    def describe\n      @x\n    end\n  end\nend\n";
-    let dir = std::env::temp_dir().join(format!("roundhouse-ctor-mixins-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch::dir("roundhouse-ctor-mixins");
     for (name, src) in [("mixin.rb", MIXIN), ("req.rb", REQ), ("caller.rb", CALLER)] {
         std::fs::write(dir.join(name), src).unwrap();
     }

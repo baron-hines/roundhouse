@@ -51,7 +51,8 @@ fn a_run_time_subclass_parses_to_itself() {
          raise \"unit #{w.unit}\" unless w.unit == \"lb\" && w.value == 3\n\
          puts \"ok\"\n",
     );
-    assert!(run.success && run.stdout.contains("ok"), "{}\n{}", run.stdout, run.stderr);
+    run.assert_passes();
+    assert!(run.stdout.contains("ok"), "{}\n{}", run.stdout, run.stderr);
 }
 
 /// measured's gem shape: `class << self` forwards with Forwardable's hash
@@ -103,5 +104,6 @@ fn a_gem_built_class_keeps_its_forwarded_class_methods() {
         "{:#?}",
         run.errors
     );
-    assert!(run.success && run.stdout.contains("1 tests passed"), "{}\n{}", run.stdout, run.stderr);
+    run.assert_passes();
+    assert!(run.stdout.contains("1 tests passed"), "{}\n{}", run.stdout, run.stderr);
 }

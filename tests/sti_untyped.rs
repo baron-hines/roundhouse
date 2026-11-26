@@ -10,14 +10,14 @@
 //!
 //!     ruby tests/sti_untyped/oracle.rb
 
+#[path = "support/scratch.rs"]
+mod scratch;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("roundhouse-sti-untyped-{name}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
+    let dir = scratch::dir(&format!("roundhouse-sti-untyped-{name}"));
     dir
 }
 
@@ -69,7 +69,7 @@ fn app(src: &Path, columns: &str, probe: &str) {
 
 fn survey(src: &Path, out: &Path) -> String {
     let run = Command::new(env!("CARGO_BIN_EXE_roundhouse"))
-        .args(["--target", "ruby", "--allow-unsupported", "--survey", "-o"])
+        .args(["--target", "rust", "--allow-unsupported", "--survey", "-o"])
         .arg(out)
         .arg(src)
         .output()
@@ -251,6 +251,21 @@ fn a_finder_in_a_test_is_reported() {
         stderr.lines().any(|l| l.contains("feature_test.rb") && l.contains("`Feature.find_by` on a subclass")),
         "{stderr}"
     );
+    fs::remove_dir_all(&src).unwrap();
+    fs::remove_dir_all(&out).unwrap();
+}
+
+#[test]
+fn ruby_finders_no_longer_report_base_class_hydration() {
+    let src = scratch("ruby-plain-src");
+    let out = scratch("ruby-plain-out");
+    app(&src, "", PROBE);
+    let run = Command::new(env!("CARGO_BIN_EXE_roundhouse"))
+        .args(["--target", "ruby", "--allow-unsupported", "--survey", "-o"])
+        .arg(&out).arg(&src).output().unwrap();
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success(), "{stderr}");
+    assert!(!stderr.contains("this build loads them as"), "{stderr}");
     fs::remove_dir_all(&src).unwrap();
     fs::remove_dir_all(&out).unwrap();
 }

@@ -60,7 +60,11 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
     let mut files: Vec<EmittedFile> = Vec::new();
     files.push(file("Gemfile", GEMFILE));
     files.push(file("config.ru", CONFIG_RU));
-    files.push(file("db.rb", DB_RB));
+    // Sequel's SQLite connection makes LIKE case-sensitive unless told not
+    // to; Rails' leaves SQLite's default. A SQLite application's LIKE, its
+    // CHECKs included, keeps Rails' reading. Any other app's file is unchanged.
+    let sqlite = app.schema.expression_dialect == crate::schema::generated::GeneratedExpressionDialect::Sqlite;
+    files.push(file("db.rb", &if sqlite { DB_RB.replacen("__dir__)))", "__dir__)), case_sensitive_like: false)", 1) } else { DB_RB.to_string() }));
     files.extend(emit_migrations(app));
     files.extend(emit_models(app));
     files.push(emit_app_rb(app));
@@ -140,14 +144,16 @@ fn emit_migrations(app: &App) -> Vec<EmittedFile> {
 /// the DB-level cascade is the idiomatic equivalent (and what the
 /// reviewed exemplar does).
 fn migration_for(app: &App, table: &Table) -> String {
+    let ruby_str = crate::emit::ruby::expr::ruby_str_literal;
     let fk_cols: Vec<&str> = table
         .foreign_keys
         .iter()
-        .map(|fk| fk.from_column.as_str())
+        .filter(|fk| fk.from_columns.len() == 1)
+        .map(|fk| fk.from_columns[0].as_str())
         .collect();
     let mut lines: Vec<String> = Vec::new();
     for col in &table.columns {
-        if col.primary_key {
+        if col.primary_key && table.primary_key_columns.is_empty() {
             lines.push(format!("      primary_key :{}", col.name));
             continue;
         }
@@ -155,9 +161,20 @@ fn migration_for(app: &App, table: &Table) -> String {
             let fk = table
                 .foreign_keys
                 .iter()
-                .find(|fk| fk.from_column == col.name)
+                .find(|fk| fk.from_columns.as_slice() == std::slice::from_ref(&col.name))
                 .unwrap();
             let mut l = format!("      foreign_key :{}, :{}", col.name, fk.to_table);
+            // Without `key:`, Sequel references the target's primary key, so
+            // `key:` is left out only when that key is exactly `id`.
+            let target_key_is_id = app.schema.tables.get(&fk.to_table.0).is_some_and(|t| if t.primary_key_columns.is_empty() {
+                t.columns.iter().filter(|c| c.primary_key).map(|c| c.name.as_str()).eq(["id"])
+            } else {
+                t.primary_key_columns.iter().map(|c| c.as_str()).eq(["id"])
+            });
+            if !target_key_is_id || fk.to_columns.len() != 1 || fk.to_columns[0].as_str() != "id" {
+                l.push_str(&format!(", key: [{}]", fk.to_columns.iter().map(|c| crate::emit::ruby::expr::ruby_sym_literal(c.as_str())).collect::<Vec<_>>().join(", ")));
+            }
+            if let Some(timing) = fk.deferrable { l.push_str(&format!(", deferrable: :{}", if timing == crate::schema::Deferrable::Deferred { "deferred" } else { "immediate" })); }
             if !col.nullable {
                 l.push_str(", null: false");
             }
@@ -172,12 +189,33 @@ fn migration_for(app: &App, table: &Table) -> String {
         if !col.nullable {
             l.push_str(", null: false");
         }
+        if let Some(sql) = &col.default_expression {
+            l.push_str(&format!(", default: Sequel.lit({})", crate::emit::ruby::expr::ruby_str_literal(sql)));
+        }
         lines.push(l);
+    }
+    let list = |keys: &[crate::Symbol]| keys.iter().map(|c| crate::emit::ruby::expr::ruby_sym_literal(c.as_str())).collect::<Vec<_>>().join(", ");
+    if !table.primary_key_columns.is_empty() {
+        // Identifier expressions keep Sequel from imposing NOT NULL on SQLite's
+        // composite key columns. PostgreSQL enforces its own PK nullability.
+        let keys = table.primary_key_columns.iter().map(|c| format!("Sequel.identifier({})", crate::emit::ruby::expr::ruby_sym_literal(c.as_str()))).collect::<Vec<_>>().join(", ");
+        lines.push(format!("      primary_key [{keys}]"));
+    }
+    for fk in table.foreign_keys.iter().filter(|fk| fk.from_columns.len() > 1) {
+        let mut line = format!("      foreign_key [{}], {}, key: [{}]", list(&fk.from_columns), crate::emit::ruby::expr::ruby_sym_literal(fk.to_table.0.as_str()), list(&fk.to_columns));
+        if let Some(timing) = fk.deferrable { line.push_str(&format!(", deferrable: :{}", if timing == crate::schema::Deferrable::Deferred { "deferred" } else { "immediate" })); }
+        for (key, action) in [("on_delete", &fk.on_delete), ("on_update", &fk.on_update)] {
+            let action = match action { crate::schema::ReferentialAction::Cascade => "cascade", crate::schema::ReferentialAction::SetNull => "set_null", crate::schema::ReferentialAction::Restrict => "restrict", crate::schema::ReferentialAction::SetDefault => "set_default", _ => continue };
+            line.push_str(&format!(", {key}: :{action}"));
+        }
+        lines.push(line);
     }
     for idx in &table.indexes {
         // The FK line above doesn't auto-index; keep the schema's
         // explicit indexes (minus any on the primary key).
-        let cols = if idx.columns.len() == 1 {
+        let cols = if let Some(expression) = &idx.expression {
+            format!("Sequel.lit({})", ruby_str(expression))
+        } else if idx.columns.len() == 1 {
             format!(":{}", idx.columns[0])
         } else {
             format!(
@@ -186,7 +224,13 @@ fn migration_for(app: &App, table: &Table) -> String {
             )
         };
         let unique = if idx.unique { ", unique: true" } else { "" };
-        lines.push(format!("      index {cols}{unique}"));
+        let name = idx.expression.as_ref().map(|_| format!(", name: {}", ruby_str(idx.name.as_str()))).unwrap_or_default();
+        let predicate = idx.predicate.as_ref().filter(|sql| crate::emit::shared::schema_sql::sqlite_reads_predicate_alike(sql, table, app.schema.expression_dialect)).map(|sql| format!(", where: Sequel.lit({})", ruby_str(sql))).unwrap_or_default();
+        lines.push(format!("      index {cols}{unique}{name}{predicate}"));
+    }
+    for check in &table.check_constraints {
+        let name = check.name.as_ref().map(|n| ruby_str(n)).unwrap_or_else(|| "nil".into());
+        lines.push(format!("      constraint({name}, Sequel.lit({}))", ruby_str(&check.expression)));
     }
     format!(
         "Sequel.migration do\n  change do\n    create_table(:{}) do\n{}\n    end\n  end\nend\n",
@@ -231,12 +275,12 @@ fn sequel_column_type(ty: &ColumnType) -> (&'static str, &'static str) {
         ColumnType::DateTime => ("DateTime", ""),
         ColumnType::Time => ("Time", ""),
         ColumnType::Binary => ("File", ""),
-        // No 1:1 Sequel generic type; store as text and note the source type.
-        ColumnType::Json => ("String", ", text: true # was json"),
-        ColumnType::Jsonb => ("String", ", text: true # was jsonb"),
-        ColumnType::Uuid => ("String", ", fixed: true, size: 36 # was uuid"),
-        ColumnType::Interval => ("String", ", text: true # was interval"),
-        ColumnType::Reference { .. } => ("Integer", " # was t.references"),
+        // No 1:1 Sequel generic type; store as text.
+        ColumnType::Json => ("String", ", text: true"),
+        ColumnType::Jsonb => ("String", ", text: true"),
+        ColumnType::Uuid => ("String", ", fixed: true, size: 36"),
+        ColumnType::Interval => ("String", ", text: true"),
+        ColumnType::Reference { .. } => ("Integer", ""),
     }
 }
 
@@ -299,8 +343,9 @@ fn model_for(model: &Model, schema: &Schema) -> String {
 
     let mut validate_lines: Vec<String> = Vec::new();
     let mut presence: Vec<String> = Vec::new();
+    let ordered_presence = model.validations().any(|v| v.prepend);
 
-    for item in &model.body {
+    for item in model.validation_order() {
         match item {
             ModelBodyItem::Association { assoc, .. } => {
                 lines.push(format!("  {}", association_line(assoc)));
@@ -338,7 +383,7 @@ fn model_for(model: &Model, schema: &Schema) -> String {
                     .unwrap_or_default();
                 for rule in &validation.rules {
                     match rule {
-                        ValidationRule::Presence if !custom.is_empty() => {
+                        ValidationRule::Presence if ordered_presence || !custom.is_empty() => {
                             validate_lines.push(format!("    validates_presence :{}{custom}", validation.attribute));
                         }
                         ValidationRule::Presence => {
@@ -2191,7 +2236,7 @@ mod tests {
             .split('/')
             .filter_map(|s| s.strip_prefix(':').map(|p| p.to_string()))
             .collect();
-        FlatRoute {
+        FlatRoute { request_defaults: Vec::new(),
             method,
             source_path: path.to_string(),
             path: path.to_string(),
@@ -2199,6 +2244,7 @@ mod tests {
             action: Symbol::from(action),
             as_name: String::new(),
             required_params: params.len(),
+            required_path: None,
             path_params: params,
             named: false,
             helpers_enabled: false,
@@ -2208,6 +2254,9 @@ mod tests {
             constraints: vec![],
             seg_patterns: vec![],
             refused: None,
+            format_required: false,
+            mount_root: false,
+            guards: Vec::new(),
         }
     }
 

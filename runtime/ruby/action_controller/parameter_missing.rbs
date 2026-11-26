@@ -19,10 +19,22 @@ module ActionController
   class UnknownFormat < StandardError
   end
 
+  class MissingRenderer < LoadError
+    def initialize: (Symbol format) -> void
+  end
+
+  module Renderers
+    RENDERERS: Set[Symbol]
+  end
+
   class RoutingError < StandardError
     @failures: Array[String]
     def initialize: (String message, ?Array[String] failures) -> void
     def failures: () -> Array[String]
+  end
+
+  class UrlGenerationError < StandardError
+    def self.missing_segments: (String controller, String action, Array[String] names, Array[String?] values) -> UrlGenerationError
   end
 end
 

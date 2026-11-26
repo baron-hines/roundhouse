@@ -1,3 +1,5 @@
+#[path = "../support/scratch.rs"]
+mod scratch;
 use super::emit_and_run;
 
 /// `default_scope { where(col: <expr>) if <cond> }`: a scope whose values
@@ -209,8 +211,7 @@ puts "dynamic default scope guards passed"
 /// keeps the model-DSL warning on every target.
 #[test]
 fn the_cli_reports_a_dynamic_default_scope_only_where_it_is_not_applied() {
-    let root = std::env::temp_dir().join(format!("roundhouse-default-scope-dyn-cli-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = scratch::dir("roundhouse-default-scope-dyn-cli");
     for (path, body) in [
         ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n"),
         ("app/models/current.rb", "class Current < ActiveSupport::CurrentAttributes\n  attribute :account_id #: Integer\nend\n"),
@@ -429,6 +430,47 @@ got << [Widget.pluck(:name), Widget.new.region]
 want = [[1, nil, 5, nil, 1], [["w0"], nil, "us"], [["weu"], "eu"]]
 raise "seed: #{got.inspect}" unless got == want
 puts "dynamic default scope seeding passed"
+"#,
+        )
+        .assert_passes();
+}
+
+/// An integer enum on a model whose dynamic scope seeds `new`: the
+/// constructor's label has to reach the enum helper as a String, given
+/// as a Symbol, a String, a String-keyed Hash or the stored value, and
+/// `nil` stays `nil` on a nullable column. The constructor's lookups
+/// carry no type here, and a `Cast` hint on them emitted no `to_s`, so
+/// a Symbol label raised `TypeError` (#2062). Rails 8.1.4 answers
+/// `["archived", ["archived", "w"], "archived", "archived", nil, 7,
+/// "archived", 1]`.
+#[test]
+fn an_enum_label_given_to_new_under_a_dynamic_scope_like_rails() {
+    emit_and_run::empty_app()
+        .write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n")
+        .write(
+            "db/schema.rb",
+            "ActiveRecord::Schema.define do\n  create_table \"widgets\", force: :cascade do |t|\n    t.string \"name\"\n    t.integer \"status\"\n    t.integer \"account_id\"\n  end\nend\n",
+        )
+        .write("app/models/current.rb", "class Current < ActiveSupport::CurrentAttributes\n  attribute :account_id\nend\n")
+        .write(
+            "app/models/widget.rb",
+            "class Widget < ApplicationRecord\n  default_scope { where(account_id: Current.account_id) }\n  enum :status, %i[draft archived].freeze\nend\n",
+        )
+        .run_ruby(
+            r#"Current.account_id = 7
+got = [
+  Widget.new(status: :archived).status,
+  [Widget.new("status" => :archived, "name" => "w").then { |w| [w.status, w.name] }],
+  Widget.new(status: "archived").status,
+  Widget.new(status: 1).status,
+  Widget.new(status: nil).status,
+  Widget.new(status: :archived).account_id,
+]
+c = Widget.create!(status: :archived, name: "c")
+got << Widget.find(c.id).status << Widget.archived.count
+want = ["archived", [["archived", "w"]], "archived", "archived", nil, 7, "archived", 1]
+raise "enum new: #{got.inspect}" unless got == want
+puts "dynamic default scope enum label passed"
 "#,
         )
         .assert_passes();

@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
-const ROOTS: [&str; 2] = ["runtime/ruby", "runtime/spinel"];
+const ROOTS: [&str; 3] = ["runtime/ruby", "runtime/spinel", "runtime/gems"];
 
 fn ruby_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display())) {

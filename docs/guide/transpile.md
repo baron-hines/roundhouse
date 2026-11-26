@@ -92,10 +92,11 @@ rather than dropping the callback or evaluating its producer per item.
 Existing literal blocks, local block variables and bound-method
 references retain their target-specific support and limitations.
 
-Roundhouse currently refuses generated enum `*_before_type_cast` readers.
-Rails returns the original input after an unsaved assignment and stored data
-after persistence; the compiler has only the stored enum slot. Negative enum
-scopes are supported. Source-defined readers keep their ordinary behavior.
+Generated enum `*_before_type_cast` readers run on the ruby family and
+Spinel. As in Rails, they return the original input after an unsaved assignment
+and stored data after persistence. Other targets refuse them, since they have
+only the stored enum slot. Negative enum scopes are supported. Source-defined
+readers keep their ordinary behavior.
 
 ## Apps that aren't fully covered yet
 
@@ -201,6 +202,13 @@ by someone who has only the output. If you find yourself patching the
 emitted code, that is a bug report: either a construct roundhouse
 should lower and doesn't, or a translation it gets wrong — and the
 [compare oracle](verifying.md) is how to show the second kind.
+
+Some files outside `app/` are read when the app is transpiled, not when
+the output runs. One example is the YAML file that `config_for(:name)`
+reads (`config/<name>.yml`). The output keeps the file's text with its
+ERB compiled, so a change to that file needs a new transpile. The `ruby`
+and `jruby` targets run `config_for` on their runtime, and `futamura`
+runs it on Rails itself. The other targets report it as unsupported.
 
 ## Which target
 

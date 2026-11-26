@@ -160,16 +160,9 @@ pub enum ReturnKind {
     /// Returns `Bool`. Example: `Model.exists?`, `#save`,
     /// `#valid?`, `#persisted?`.
     Bool,
-    /// Returns `Hash<Sym, Str>`. Example: `#attributes` on an
-    /// ActiveRecord instance — the canonical schema-derived
-    /// attribute dictionary. Specific rather than generic because
-    /// this one shape is what the Rails dialect emits; if/when
-    /// another Hash shape enters the catalog, generalize to a
-    /// `HashOf(PrimKind, PrimKind)` variant.
-    HashSymStr,
-    /// Returns `Hash<Str, untyped>`. Example:
-    /// `#attributes_before_type_cast` — each column's raw stored value,
-    /// String-keyed as Rails keys it.
+    /// Returns `Hash<Str, untyped>`. Example: `#attributes` and
+    /// `#attributes_before_type_cast` — each column's value (cast or
+    /// raw stored), String-keyed as Rails keys it.
     HashStrUntyped,
     /// Returns `Array<Sym>`. Example: `.schema_column_names` on
     /// an ActiveRecord class — the schema column list the lowerer
@@ -752,12 +745,21 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         chain: ChainKind::NotApplicable,
         return_kind: Some(ReturnKind::Int),
     },
+    // The Ruby-family runtime's single-row inserts answer Rails'
+    // `ActiveRecord::Result`, as `insert_all!` does.
     CatalogedMethod {
         name: "insert",
         receiver: ReceiverContext::Class,
         effect: EffectClass::DbWrite,
         chain: ChainKind::NotApplicable,
-        return_kind: None,
+        return_kind: Some(ReturnKind::ClassRef("ActiveRecord::Result")),
+    },
+    CatalogedMethod {
+        name: "insert!",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::ClassRef("ActiveRecord::Result")),
     },
     // The one bulk write with a return type, because it is the one
     // with a LOWERING: `scope_chain` inlines `Model.insert_all(rows)`
@@ -785,22 +787,21 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         chain: ChainKind::NotApplicable,
         return_kind: Some(ReturnKind::ClassRef("ActiveRecord::Result")),
     },
-    // The runtime's `upsert_all` answers the affected-row count, not
-    // Rails' `ActiveRecord::Result` (ledgered in docs/pipeline/runtime.md
-    // beside `insert_all`'s); typed as what the emitted code returns.
+    // The runtime's `upsert_all` answers Rails' `ActiveRecord::Result`,
+    // its `affected_rows` the count.
     CatalogedMethod {
         name: "upsert",
         receiver: ReceiverContext::Class,
         effect: EffectClass::DbWrite,
         chain: ChainKind::NotApplicable,
-        return_kind: Some(ReturnKind::Int),
+        return_kind: Some(ReturnKind::ClassRef("ActiveRecord::Result")),
     },
     CatalogedMethod {
         name: "upsert_all",
         receiver: ReceiverContext::Class,
         effect: EffectClass::DbWrite,
         chain: ChainKind::NotApplicable,
-        return_kind: Some(ReturnKind::Int),
+        return_kind: Some(ReturnKind::ClassRef("ActiveRecord::Result")),
     },
     CatalogedMethod {
         name: "touch_all",
@@ -958,6 +959,14 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         chain: ChainKind::NotApplicable,
         return_kind: Some(ReturnKind::Bool),
     },
+    // `#validate!` runs them and raises on failure (`RecordInvalid` on a record, `ValidationError` on a tableless one).
+    CatalogedMethod {
+        name: "validate!",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::Pure,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::Bool),
+    },
     CatalogedMethod {
         name: "persisted?",
         receiver: ReceiverContext::Instance,
@@ -987,7 +996,7 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         return_kind: Some(ReturnKind::Bool),
     },
     // ---- Instance-method accessors (state / metadata) ----
-    // `#attributes` returns Hash<Sym, Str>; `#errors` returns the
+    // `#attributes` returns Hash<Str, untyped>; `#errors` returns the
     // per-instance ActiveModel::Errors collection. Both pure
     // (no DB hit); both structural rather than expression-
     // dispatchable.
@@ -996,10 +1005,25 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         receiver: ReceiverContext::Instance,
         effect: EffectClass::Pure,
         chain: ChainKind::NotApplicable,
-        return_kind: Some(ReturnKind::HashSymStr),
+        return_kind: Some(ReturnKind::HashStrUntyped),
     },
     CatalogedMethod {
         name: "attributes_before_type_cast",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::Pure,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::HashStrUntyped),
+    },
+    // Every attribute by its reader (`synth_serializable_hash`), and the record as JSON reads it (runtime `as_json`).
+    CatalogedMethod {
+        name: "serializable_hash",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::Pure,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::HashStrUntyped),
+    },
+    CatalogedMethod {
+        name: "as_json",
         receiver: ReceiverContext::Instance,
         effect: EffectClass::Pure,
         chain: ChainKind::NotApplicable,
@@ -1068,6 +1092,16 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         effect: EffectClass::Pure,
         chain: ChainKind::NotApplicable,
         return_kind: Some(ReturnKind::Str),
+    },
+    // `record.slice(:id, :name)`: the named attributes, String-keyed as
+    // Rails' indifferent Hash keys them. `lower::record_slice` grounds a
+    // typed site into reader calls; the ruby family answers the rest.
+    CatalogedMethod {
+        name: "slice",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::Pure,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::HashStrUntyped),
     },
     CatalogedMethod {
         name: "[]",
@@ -2157,7 +2191,7 @@ mod tests {
             "save", "save!", "create", "create!", "update", "update!",
             "update_all", "destroy", "destroy!", "destroy_all",
             "delete", "delete_all", "increment!", "decrement!",
-            "touch", "touch_all", "insert", "insert_all",
+            "touch", "touch_all", "insert", "insert!", "insert_all",
             "upsert", "upsert_all",
         ] {
             let found: Vec<_> = lookup_any(m)

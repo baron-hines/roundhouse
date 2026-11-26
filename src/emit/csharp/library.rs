@@ -25,7 +25,7 @@ use std::path::PathBuf;
 use crate::dialect::{AccessorKind, LibraryClass, MethodDef, MethodReceiver};
 use crate::emit::EmittedFile;
 use crate::expr::{Expr, ExprNode, LValue, Literal};
-use crate::ty::Ty;
+use crate::ty::{FnTy, Ty};
 
 use super::expr::{
     begin_method, emit_expr, emit_stmt, hoisted_decls, register_method_params, set_current_class,
@@ -365,13 +365,15 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
                 if temporal_cols.contains(&camel(m.name.as_str())) {
                     continue;
                 }
-                if let Some(Ty::Fn { ret, .. }) = m.signature.as_ref() {
+                if let Some(Ty::Fn(fn_ty)) = m.signature.as_ref() {
+                    let FnTy { ret, .. } = &**fn_ty;
                     prop_types.entry(camel(m.name.as_str())).or_insert_with(|| (**ret).clone());
                 }
             }
             AccessorKind::AttributeWriter => {
                 let base = m.name.as_str().trim_end_matches('=');
-                if let Some(Ty::Fn { params, .. }) = m.signature.as_ref() {
+                if let Some(Ty::Fn(fn_ty)) = m.signature.as_ref() {
+                    let FnTy { params, .. } = &**fn_ty;
                     if let Some(p) = params.first() {
                         prop_types.entry(camel(base)).or_insert_with(|| (*p.ty).clone());
                     }
@@ -484,7 +486,7 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
     for m in &temporal_sorted {
         let getter = pascal_of_camel(&camel(m.name.as_str()));
         let ret = match m.signature.as_ref() {
-            Some(Ty::Fn { ret, .. }) => (**ret).clone(),
+            Some(Ty::Fn(fn_ty)) => (*fn_ty.ret).clone(),
             _ => Ty::Time,
         };
         out.push_str(&format!(
@@ -499,9 +501,12 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
 
     // Property/type registries for body emit. Renamed (private) ivars are
     // excluded — a self-send of that name resolves to the method, not a prop.
+    // The temporal computed getters are props too (`CreatedAt`, not
+    // `CreatedAt()`).
     let instance_props: HashSet<String> = prop_types
         .keys()
         .chain(body_ivars.keys())
+        .chain(temporal_cols.iter())
         .chain(inherited_props.iter())
         .filter(|n| !ivar_renames.contains_key(*n))
         .cloned()
@@ -900,7 +905,7 @@ fn emit_indexer(modifier: &str, getter: Option<&MethodDef>, setter: Option<&Meth
         getter
             .or(setter)
             .and_then(|m| match m.signature.as_ref() {
-                Some(Ty::Fn { params, .. }) => params.first().map(|p| csharp_ty(&p.ty)),
+                Some(Ty::Fn(fn_ty)) => fn_ty.params.first().map(|p| csharp_ty(&p.ty)),
                 _ => None,
             })
             .unwrap_or_else(|| "string".to_string())
@@ -910,7 +915,7 @@ fn emit_indexer(modifier: &str, getter: Option<&MethodDef>, setter: Option<&Meth
     } else {
         getter
             .and_then(|m| match m.signature.as_ref() {
-                Some(Ty::Fn { ret, .. }) => Some(csharp_ty(ret)),
+                Some(Ty::Fn(fn_ty)) => Some(csharp_ty(&fn_ty.ret)),
                 _ => None,
             })
             .unwrap_or_else(|| "object?".to_string())
@@ -995,7 +1000,7 @@ fn emit_method(m: &MethodDef, modifier: &str) -> String {
     // A `yield`ing method takes an explicit block parameter.
     if body_has_yield(&m.body) {
         let bt = match m.signature.as_ref() {
-            Some(Ty::Fn { block: Some(b), .. }) => csharp_ty(b),
+            Some(Ty::Fn(fn_ty)) if let Some(b) = &fn_ty.block => csharp_ty(b),
             _ => "Action<object?>".to_string(),
         };
         params.push(format!("{bt} block"));
@@ -1003,7 +1008,7 @@ fn emit_method(m: &MethodDef, modifier: &str) -> String {
 
     // Not void for a method without a signature: an app method's answer is its body's type
     let ret_ty = match m.signature.as_ref() {
-        Some(Ty::Fn { ret, .. }) => Some((**ret).clone()),
+        Some(Ty::Fn(fn_ty)) => Some((*fn_ty.ret).clone()),
         _ if m.name.as_str() == "initialize" => None,
         // Not untyped when the body's type is open: a statement-only tail would then leave a value method with no return
         _ => m.body.ty.clone().filter(|t| !t.is_open()),
@@ -1047,7 +1052,7 @@ fn emit_method(m: &MethodDef, modifier: &str) -> String {
 /// non-constant defaults (`attrs = {}` → `attrs ??= new …()`).
 fn render_params(m: &MethodDef) -> (Vec<String>, Vec<String>) {
     let sig_params = match m.signature.as_ref() {
-        Some(Ty::Fn { params, .. }) => Some(params),
+        Some(Ty::Fn(fn_ty)) => Some(&fn_ty.params),
         _ => None,
     };
     let mut decls = Vec::new();
@@ -1169,7 +1174,7 @@ fn wrap_return(e: &Expr) -> String {
             return format!("return new() {{ {} }};", els.join(", "));
         }
         ExprNode::BeginRescue { body, rescues, else_branch, ensure, .. } => {
-            return super::expr::emit_begin_rescue(body, rescues, else_branch.as_ref(), ensure.as_ref(), &wrap_return);
+            return super::expr::emit_begin_rescue(body, rescues, else_branch.as_deref(), ensure.as_deref(), &wrap_return);
         }
         // A value-position `if` → return from each branch (C# has no
         // block-valued `if`). Empty branches return the type default.
@@ -1190,6 +1195,25 @@ fn wrap_return(e: &Expr) -> String {
                 indent4(&then),
                 indent4(&els)
             );
+        }
+        // Not the assignment alone: Ruby's assignment answers the value, and a value method must return it
+        // The assigned value, not the variable read back: a local or an ivar's
+        // property can be typed wider than the method's return (`long? x` after
+        // `x = nil`, `object?`).
+        ExprNode::Assign { target: crate::expr::LValue::Var { .. } | crate::expr::LValue::Ivar { .. }, value } => {
+            if matches!(&*value.node, ExprNode::Lit { value: Literal::Nil }) {
+                return format!("{}\nreturn default;", emit_stmt(e));
+            }
+            let held = Expr::new(value.span, ExprNode::Var { id: crate::ident::VarId(0), name: crate::ident::Symbol::from("__rh_ret") });
+            let store = Expr::new(e.span, ExprNode::Assign { target: match &*e.node {
+                ExprNode::Assign { target, .. } => target.clone(),
+                _ => unreachable!(),
+            }, value: held });
+            let held = emit_expr(match &*store.node {
+                ExprNode::Assign { value, .. } => value,
+                _ => unreachable!(),
+            });
+            return format!("var {held} = {};\n{}\nreturn {held};", emit_expr(value), emit_stmt(&store));
         }
         _ => {}
     }
@@ -1331,12 +1355,14 @@ fn class_accessor_props(methods: &[MethodDef]) -> BTreeMap<String, Ty> {
         }
         match m.kind {
             AccessorKind::AttributeReader => {
-                if let Some(Ty::Fn { ret, .. }) = m.signature.as_ref() {
+                if let Some(Ty::Fn(fn_ty)) = m.signature.as_ref() {
+                    let FnTy { ret, .. } = &**fn_ty;
                     props.entry(camel(m.name.as_str())).or_insert_with(|| (**ret).clone());
                 }
             }
             AccessorKind::AttributeWriter => {
-                if let Some(Ty::Fn { params, .. }) = m.signature.as_ref() {
+                if let Some(Ty::Fn(fn_ty)) = m.signature.as_ref() {
+                    let FnTy { params, .. } = &**fn_ty;
                     if let Some(p) = params.first() {
                         let base = m.name.as_str().trim_end_matches('=');
                         props.entry(camel(base)).or_insert_with(|| (*p.ty).clone());
@@ -1371,9 +1397,10 @@ fn is_empty_body(e: &Expr) -> bool {
 fn infer_body_ivar_types(methods: &[MethodDef]) -> BTreeMap<String, Ty> {
     let mut out: BTreeMap<String, Ty> = BTreeMap::new();
     for m in methods {
-        if let (Some(ivar), Some(Ty::Fn { ret, .. })) =
+        if let (Some(ivar), Some(Ty::Fn(fn_ty))) =
             (body_returns_ivar(&m.body), m.signature.as_ref())
         {
+            let FnTy { ret, .. } = &**fn_ty;
             if !matches!(&**ret, Ty::Nil) {
                 out.entry(ivar).or_insert_with(|| (**ret).clone());
             }
@@ -1449,7 +1476,7 @@ fn signature_ret_is_time(sig: Option<&Ty>) -> bool {
             _ => false,
         }
     }
-    matches!(sig, Some(Ty::Fn { ret, .. }) if is_time(ret))
+    matches!(sig, Some(Ty::Fn(fn_ty)) if is_time(&fn_ty.ret))
 }
 
 /// Render an auto-property with a default initializer (C# requires non-null

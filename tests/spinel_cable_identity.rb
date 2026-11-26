@@ -42,6 +42,8 @@ end
 load "#{root}/runtime/spinel/message_digest_cruby.rb"
 load "#{root}/runtime/ruby/action_controller/message_verifier.rb"
 load "#{root}/runtime/ruby/action_controller/cookies.rb"
+load "#{root}/runtime/ruby/action_dispatch/request.rb"
+load "#{root}/runtime/spinel/param_builder.rb"
 
 # THE TRANSPORT IS STUBBED TO LOAD, NOT TO RUN — the same rule
 # `spinel_cable_channel.rb` follows. `cable.rb` subclasses
@@ -99,7 +101,14 @@ end
 # `Main.dispatch` hands `ActionController::CookieJar` for a controller.
 # The WebSocket upgrade is an ordinary HTTP GET, so it is the same jar
 # over the same header.
-FakeReq = Struct.new(:cookies)
+FakeReq = Struct.new(:cookies) do
+  def verb = "GET"
+  def path = "/cable"
+  def raw_query = "token=probe"
+  def remote_host = "192.0.2.7"
+  def listener_transport = "unix"
+  def req_headers = { "host" => "example.test", "x-probe" => "present" }
+end
 
 def req_with(cookie_value)
   FakeReq.new(cookie_value.nil? ? {} : { "session_token" => cookie_value })
@@ -137,6 +146,11 @@ module ApplicationCable
     include Authentication::SessionLookup
 
     def connect
+      raise "missing listener" unless request.env["roundhouse.listener"] == "unix"
+      raise "missing path" unless request.path == "/cable"
+      raise "missing header" unless request.headers["X-Probe"] == "present"
+      raise "missing params" unless request.params["token"] == "probe"
+      raise "missing remote_ip" unless request.remote_ip == "192.0.2.7"
       self.current_user = find_verified_user
     end
 

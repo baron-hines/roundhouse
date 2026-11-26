@@ -39,7 +39,7 @@ use super::util::{map_expr, map_expr_mut};
 /// `partial: "users/sidebars/rooms/shared", locals: { room: room }` →
 /// `Views::Users::Sidebars::Rooms.shared(room)`, bound against the
 /// partial's DEF-SITE contract: the record by the partial's record-arg
-/// convention, closure ivars as `@<name>` (a same-named local wins),
+/// convention, closure ivars as `@<name>` (never a same-named local),
 /// extras from `locals:` (nil-filled, trailing-trimmed).
 ///
 /// Shared by the render rewrite and the broadcast rewrite — a broadcast
@@ -54,7 +54,7 @@ pub(super) fn partial_view_call(
     locals: &[(Symbol, Expr)],
     module_name: Option<&str>,
     partials: &super::PartialMap,
-    request: Option<(Option<&str>, &str)>,
+    request: Option<(Option<&str>, &str, bool)>,
     span: Span,
 ) -> Option<Expr> {
     partial_view_call_with_record(partial, locals, None, module_name, partials, request, span)
@@ -75,7 +75,7 @@ pub(super) fn partial_view_call_with_record(
     record_override: Option<&Expr>,
     module_name: Option<&str>,
     partials: &super::PartialMap,
-    request: Option<(Option<&str>, &str)>,
+    request: Option<(Option<&str>, &str, bool)>,
     span: Span,
 ) -> Option<Expr> {
     let (module_dir, base_name) = match partial.rsplit_once('/') {
@@ -103,11 +103,11 @@ pub(super) fn partial_view_call_with_record(
         .or_else(|| record_override.cloned())
         .unwrap_or_else(|| nil_expr(span))];
     for n in &contract.closure {
-        view_args.push(lookup(n).unwrap_or_else(|| ivar(n.as_str(), span)));
+        view_args.push(ivar(n.as_str(), span));
     }
     // An action's render passes its own action, controller and path parameters, as a view's call passes them to a partial.
     let request_value = |name: &str| -> Option<Expr> {
-        let (action, controller) = request?;
+        let (action, controller, overlaid) = request?;
         // Not over a strict partial's own declared default (`action_name: "fallback"`).
         if contract.declared.iter().any(|d| d == name) {
             return None;
@@ -129,8 +129,16 @@ pub(super) fn partial_view_call_with_record(
                     ExprNode::Send { recv: None, method: Symbol::from("controller_path"), args: vec![], block: None, parenthesized: false },
                 ),
             }),
-            "path_parameters" => Some(ivar("path_parameters", span)),
-            _ => None,
+            "path_parameters" => Some(view_path_parameters(overlaid, span)),
+            // The request's flash, as the action's own view gets it
+            // (`flash_lookup`): a `render partial: "shared/flash"` in a
+            // turbo-stream response reads `notice`. By slot
+            // (`flash_slot_of`): the partial may spell it `notice_`, and
+            // a `local_assigns[:notice_]` it reads is no slot. A
+            // strict-locals partial takes no flash.
+            _ => crate::lower::view_to_library::flash_slot_of(&contract.extras, name)
+                .filter(|_| !contract.keyword_extras)
+                .map(|slot| flash_lookup(span, slot)),
         }
     };
     view_args.extend(contract.extras_args(lookup, request_value, None, || nil_expr(span), span));
@@ -138,7 +146,7 @@ pub(super) fn partial_view_call_with_record(
         span,
         ExprNode::Send {
             recv: Some(const_path(&["Views", &module_dir], span)),
-            method: crate::lower::view::view_method_name(&stem),
+            method: contract.method.clone(),
             args: view_args,
             block: None,
             parenthesized: true,
@@ -156,10 +164,13 @@ pub(super) fn rewrite_render_to_views(
     current_action: &str,
     // An action's own body, whose name is the request's action; a helper's is not.
     is_action: bool,
+    preserve_named_layout: bool,
     // The Views modules of every controller that INHERITS this one —
     // where a template this controller lacks may still live. See the
     // `subclass_template_hook` arm below.
     inheritor_modules: &[String],
+    // Whether the controller has `route_param_recall::OVERLAY`, which its views take as the request's path parameters.
+    overlaid: bool,
 ) -> Expr {
     // A controller with no Views module of its own (ApplicationController)
     // still renders: `allow_browser`'s fallback is `render template:
@@ -184,12 +195,35 @@ pub(super) fn rewrite_render_to_views(
             // produces the bare `Views::X.y(...)` call, which IS a
             // string. Trailing options (`layout: false`) are dropped.
             let to_string = method.as_str() == "render_to_string";
+            // Only the application layout and literal Boolean selectors
+            // are honored by this template path. Preserve every other
+            // explicit selector, including nil and computed expressions,
+            // instead of silently substituting the application layout.
+            // JSON and inline responses do not select a template.
+            if preserve_named_layout && args.iter().any(|arg| {
+                matches!(&*arg.node, ExprNode::Hash { entries, kwargs: true }
+                    if entries.iter().any(|(key, value)| {
+                        matches!(&*key.node, ExprNode::Lit { value: Literal::Sym { value } }
+                            if value.as_str() == "layout")
+                            && !(matches!(&*value.node, ExprNode::Lit { value: Literal::Str { value } }
+                                    if value == "application")
+                                || matches!(&*value.node, ExprNode::Lit { value: Literal::Bool { .. } }))
+                    }))
+            }) && !args.iter().any(|arg| {
+                matches!(&*arg.node, ExprNode::Hash { entries, kwargs: true }
+                    if entries.iter().any(|(key, _)| {
+                        matches!(&*key.node, ExprNode::Lit { value: Literal::Sym { value } }
+                            if matches!(value.as_str(), "json" | "plain" | "html" | "body"))
+                    }))
+            }) {
+                return None;
+            }
             // Controller-side partial render: `render partial:
             // "commentbox", layout: false, content_type: …, locals:
             // {comment: c}` (lobsters' reply). Bind against the
             // partial's def-site contract: record by the partial's
-            // record-arg convention, closure ivars as `@<name>` (a
-            // same-named local wins), extras from locals (nil-filled,
+            // record-arg convention, closure ivars as `@<name>` (never
+            // a same-named local), extras from locals (nil-filled,
             // trailing-trimmed). `layout:` drops (Rails renders
             // partials without one); other kwargs (content_type:,
             // status:) ride the render.
@@ -228,7 +262,7 @@ pub(super) fn rewrite_render_to_views(
                 }
                 if let Some(pname) = partial_name {
                     let view_call =
-                        partial_view_call(&pname, &locals_entries, module_name, partials, Some((is_action.then_some(current_action.as_str()), controller_name.as_str())), e.span)?;
+                        partial_view_call(&pname, &locals_entries, module_name, partials, Some((is_action.then_some(current_action.as_str()), controller_name.as_str(), overlaid)), e.span)?;
                     if to_string {
                         return Some(view_call);
                     }
@@ -302,7 +336,7 @@ pub(super) fn rewrite_render_to_views(
                         }
                     }
                     let view_call =
-                        partial_view_call(tname, &locals_entries, module_name, partials, Some((is_action.then_some(current_action.as_str()), controller_name.as_str())), e.span)?;
+                        partial_view_call(tname, &locals_entries, module_name, partials, Some((is_action.then_some(current_action.as_str()), controller_name.as_str(), overlaid)), e.span)?;
                     let mut new_args = vec![view_call];
                     if !rest.is_empty() {
                         new_args.push(Expr::new(e.span, ExprNode::Hash { entries: rest, kwargs: true }));
@@ -363,6 +397,12 @@ pub(super) fn rewrite_render_to_views(
                 }
                 ExprNode::Hash { entries, kwargs: true } => {
                     let mut name: Option<Symbol> = None;
+                    let callback = entries.iter().find_map(|(key, value)| {
+                        matches!(&*key.node, ExprNode::Lit { value: Literal::Sym { value } }
+                            if value.as_str() == "callback").then_some(value)
+                    });
+                    let jsonp = callback.is_some_and(|value| matches!(&*value.node,
+                        ExprNode::Lit { value: Literal::Str { value } } if !value.trim().is_empty()));
                     // `template:` / `action:` naming a value only the
                     // running program knows (`render(template: template)`
                     // with `template` a local).
@@ -426,8 +466,15 @@ pub(super) fn rewrite_render_to_views(
                             // "application/json"`, the writer's text.
                             "json" => {
                                 // Not encoded again: Rails' json renderer sends a String as it is (`json.to_json unless json.kind_of?(String)`); `json_render_encode`'s other callers encode one.
-                                let encoded = if matches!(v.ty.as_ref(), Some(Ty::Str)) { v.clone() } else { json_render_body(v) };
-                                body = Some((encoded, Some("application/json")))
+                                let mut encoded = if matches!(v.ty.as_ref(), Some(Ty::Str)) { v.clone() } else { json_render_body(v, jsonp) };
+                                if jsonp {
+                                    encoded = Expr::new(v.span, ExprNode::Send {
+                                        recv: Some(Expr::new(v.span, ExprNode::Const { path: vec![Symbol::from("JsonBuilder")] })),
+                                        method: Symbol::from("jsonp"), args: vec![encoded, callback.unwrap().clone()],
+                                        block: None, parenthesized: true,
+                                    });
+                                }
+                                body = Some((encoded, Some(if jsonp { "text/javascript" } else { "application/json" })))
                             }
                             // The flattener's dispatch marker, read by
                             // `render_kwargs_have_format` above.
@@ -435,7 +482,40 @@ pub(super) fn rewrite_render_to_views(
                             _ => rest.push((k.clone(), v.clone())),
                         }
                     }
-                    if body.as_ref().is_some_and(|(_, ct)| *ct == Some("application/json")) {
+                    if entries.iter().any(|(key, _)| matches!(&*key.node,
+                        ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "json"))
+                    {
+                        if jsonp {
+                            for (key, value) in &mut rest {
+                                if matches!(&*key.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "content_type") {
+                                    match &*value.node {
+                                        ExprNode::Lit { value: Literal::Str { value: mime } }
+                                            if mime == "application/json" || mime.strip_prefix("application/json;")
+                                                .is_some_and(|parameters| parameters.trim_start().starts_with("charset=")) => {
+                                            // Rails replaces the exact JSON media type, preserving
+                                            // its existing charset. Non-charset parameters remain
+                                            // part of Rails' media type and pass through unchanged.
+                                            let suffix = &mime["application/json".len()..];
+                                            *value = str_lit(value.span, &format!("text/javascript{suffix}"));
+                                        }
+                                        ExprNode::Lit { value: Literal::Str { .. } } => {}
+                                        _ => {
+                                            let mut d = crate::lower::residue_diagnostic("controller_render", "jsonp_content_type", value.span,
+                                                "jsonp_content_type_not_modelled", "JSONP content_type must be a literal media type".into());
+                                            d.severity = crate::diagnostic::Severity::Error;
+                                            crate::emit::diagnostics::push(d);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Literal blank callbacks do not wrap a response.
+                        // Nonliteral callback options retain previous handling.
+                        if callback.is_none_or(|v| matches!(&*v.node,
+                            ExprNode::Lit { value: Literal::Str { .. } | Literal::Nil | Literal::Bool { value: false } })) {
+                            rest.retain(|(key, _)| !matches!(&*key.node,
+                                ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "callback"));
+                        }
                         refuse_serializer_options(&mut rest);
                     }
                     if name.is_none() {
@@ -817,13 +897,33 @@ pub(super) fn rewrite_render_to_views(
                 view_args.push(flash_lookup(e.span, "notice"));
                 view_args.push(flash_lookup(e.span, "alert"));
                 if pass_action_name {
-                    view_args.push(str_lit(e.span, &current_action));
+                    view_args.push(if is_action {
+                        str_lit(e.span, &current_action)
+                    } else {
+                        Expr::new(e.span, ExprNode::Send {
+                            recv: Some(Expr::new(e.span, ExprNode::SelfRef)),
+                            method: Symbol::from("action_name"),
+                            args: vec![],
+                            block: None,
+                            parenthesized: true,
+                        })
+                    });
                 }
                 if pass_controller_name {
-                    view_args.push(str_lit(e.span, &controller_name));
+                    view_args.push(if is_action {
+                        str_lit(e.span, &controller_name)
+                    } else {
+                        Expr::new(e.span, ExprNode::Send {
+                            recv: Some(Expr::new(e.span, ExprNode::SelfRef)),
+                            method: Symbol::from("controller_name"),
+                            args: vec![],
+                            block: None,
+                            parenthesized: true,
+                        })
+                    });
                 }
                 if pass_path_parameters {
-                    view_args.push(ivar("path_parameters", e.span));
+                    view_args.push(view_path_parameters(overlaid, e.span));
                 }
             }
             // Digit-leading stems (`about/404`) carry a `_` prefix on the
@@ -964,7 +1064,7 @@ fn strip_format_kwarg(arg: &Expr) -> Option<Expr> {
 /// append the entry to it; otherwise push a fresh kwarg Hash with
 /// just this entry. The runtime's `render(body, status:, content_type:)`
 /// expects ONE kwargs hash, not multiple.
-/// `ActionController::JsonRender.encode(<value>)` — the runtime JSON
+/// `ActionController::JsonRender.encode_escaped(<value>)` — the runtime JSON
 /// encoder behind inline `render json: <expr>` whose value neither
 /// `as_json_poro` nor the primitive-collection path handles. The ruby family
 /// answers it via runtime/spinel/action_controller_json_render.rb
@@ -1057,13 +1157,40 @@ fn refuse_serializer_options(rest: &mut Vec<(Expr, Expr)>) {
 }
 
 /// `json_render_encode`, with a value that may be a String at run time sent as it is (`JsonRender.body`).
-fn json_render_body(value: &Expr) -> Expr {
+fn json_render_body(value: &Expr, jsonp: bool) -> Expr {
     let mut encoded = json_render_encode(value);
+    if let ExprNode::Send { method, .. } = &mut *encoded.node
+        && method.as_str() == "encode_escaped"
+    {
+        *method = Symbol::from("encode");
+    }
+    if let ExprNode::Send { method, args, .. } = &mut *encoded.node
+        && method.as_str() == "escape_html_entities"
+    {
+        *method = Symbol::from("escape_json_response");
+        if jsonp {
+            args.push(Expr::new(value.span, ExprNode::Lit { value: Literal::Bool { value: true } }));
+        }
+    }
     if may_be_str(value.ty.as_ref())
         && let ExprNode::Send { method, .. } = &mut *encoded.node
         && method.as_str() == "encode"
     {
         *method = Symbol::from("body");
+    }
+    if jsonp && let ExprNode::Send { method, .. } = &mut *encoded.node {
+        match method.as_str() {
+            "encode" => *method = Symbol::from("encode_for_callback"),
+            "body" => *method = Symbol::from("body_for_callback"),
+            _ => {}
+        }
+    }
+    if !jsonp && let ExprNode::Send { method, args, .. } = &mut *encoded.node
+        && matches!(method.as_str(), "encode" | "body" | "escape_json_response")
+    {
+        args.push(Expr::new(value.span, ExprNode::Send {
+            recv: None, method: Symbol::from("json_render_escape"), args: vec![], block: None, parenthesized: true,
+        }));
     }
     encoded
 }
@@ -1099,7 +1226,7 @@ pub(super) fn json_render_encode(value: &Expr) -> Expr {
         value.span,
         ExprNode::Send {
             recv: Some(recv),
-            method: Symbol::from(if primitive_collection { "generate" } else { "encode" }),
+            method: Symbol::from(if primitive_collection { "generate" } else { "encode_escaped" }),
             args: vec![if primitive_collection { crate::lower::to_json::finite_floats(value.clone()) } else { value.clone() }],
             block: None,
             parenthesized: true,
@@ -2302,12 +2429,36 @@ pub(super) fn rewrite_request_format(expr: &Expr) -> Expr {
 pub(super) fn rewrite_params(expr: &Expr) -> Expr {
     map_expr(expr, &|e| match &*e.node {
         // `params.expect(...)` — recognized first so the recv is still
-        // the bare `params` Send, not the @params ivar (which would lose
-        // the recognition pattern).
+        // the original params receiver, before recursive rewrites change it.
         ExprNode::Send { recv: Some(recv), method, args, block, parenthesized }
-            if method.as_str() == "expect" && is_bare_params(recv) =>
+            if method.as_str() == "expect"
+                && is_bare_params(recv) =>
         {
             Some(rewrite_expect(args, block.as_ref(), *parenthesized, e.span))
+        }
+        ExprNode::Send { recv: Some(recv), method, args, .. }
+            if method.as_str() == "expect"
+                && matches!(&*recv.node, ExprNode::Ivar { name } if name.as_str() == "params") =>
+        {
+            let [arg] = args.as_slice() else { return None };
+            let ExprNode::Hash { entries, .. } = &*arg.node else { return None };
+            params_expect_array(entries, e.span)
+        }
+        // Not left to the emitter's typed key coercion: a guard or filter body spliced in after analysis reaches it with `@params` typed as the controller's ivar, not the String-keyed store.
+        ExprNode::Send { recv: Some(recv), method, args, block: None, parenthesized }
+            if method.as_str() == "[]" && args.len() == 1 && is_bare_params(recv) && sym_arg(&args[0]).is_some() =>
+        {
+            let key = sym_arg(&args[0])?;
+            Some(Expr::new(
+                e.span,
+                ExprNode::Send {
+                    recv: Some(Expr::new(recv.span, ExprNode::Ivar { name: Symbol::from("params") })),
+                    method: method.clone(),
+                    args: vec![Expr::new(args[0].span, ExprNode::Lit { value: Literal::Str { value: key } })],
+                    block: None,
+                    parenthesized: *parenthesized,
+                },
+            ))
         }
         // Bare `params` (no recv, no args, no block) → `@params`.
         ExprNode::Send { recv: None, method, args, block: None, .. }
@@ -2504,6 +2655,7 @@ fn sym_or_str_arg(arg: &Expr) -> Option<String> {
 
 pub(super) fn rewrite_redirect_to(
     expr: &Expr,
+    shadowed: &HashSet<Symbol>,
     route_helpers: &crate::det::HashMap<String, Vec<bool>>,
 ) -> Expr {
     map_expr(expr, &|e| match &*e.node {
@@ -2512,7 +2664,7 @@ pub(super) fn rewrite_redirect_to(
         {
             // Two recognized first-arg shapes:
             //   - `@x` (Ivar) → wrap as `RouteHelpers.<x>_path(@x.id)`.
-            //   - `<x>_path` (no-recv Send ending in _path) → prefix
+            //   - Unshadowed `<x>_path` (no-recv Send) → prefix
             //     with RouteHelpers so all redirect_to call sites
             //     render uniformly with the parenthesized form.
             //
@@ -2546,7 +2698,7 @@ pub(super) fn rewrite_redirect_to(
                     )
                 }
                 ExprNode::Send { recv: None, method: m, args: m_args, block: m_block, parenthesized }
-                    if m.as_str().ends_with("_path") =>
+                    if m.as_str().ends_with("_path") && !shadowed.contains(m) =>
                 {
                     Expr::new(
                         first.span,
@@ -2771,7 +2923,7 @@ fn strip_url_helpers_receiver(expr: &Expr) -> Expr {
         if !is_rails_url_helpers_chain(r) {
             return None;
         }
-        Some(Expr::new(
+        let mut bare = Expr::new(
             e.span,
             ExprNode::Send {
                 recv: None,
@@ -2780,7 +2932,16 @@ fn strip_url_helpers_receiver(expr: &Expr) -> Expr {
                 block: block.as_ref().map(strip_url_helpers_receiver),
                 parenthesized: *parenthesized,
             },
-        ))
+        );
+        // Not left to `route_url_options`: it ran while the receiver was on, and its chained form is the library emit's.
+        // Only with a `host:`: without one it would drop a `protocol:` that `url_from_path` cannot take.
+        let names_host = args.last().is_some_and(|a| matches!(&*a.node, ExprNode::Hash { entries, .. }
+            if entries.iter().any(|(k, _)| matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "host"))));
+        if names_host {
+            let helper: crate::det::HashSet<String> = std::iter::once(method.as_str().to_string()).collect();
+            crate::lower::route_url_options::rewrite_node(&mut bare, &helper);
+        }
+        Some(bare)
     })
 }
 
@@ -2883,7 +3044,10 @@ fn rewrite_route_helpers_with(
                 .map(|(i, arg)| {
                     let id_segment =
                         shape.map_or(true, |s| s.get(i).copied().unwrap_or(true));
-                    let needs_id = id_segment && match &*arg.node {
+                    // Not a value typed as a scalar: a call answering a
+                    // String or an Integer is its own `to_param`
+                    // (`shelf_path(Links.locale_for(user), 4)`).
+                    let needs_id = id_segment && !types_to_a_scalar(arg) && match &*arg.node {
                         ExprNode::Ivar { .. } => true,
                         ExprNode::Send { recv: Some(r), method, .. }
                             if method.as_str() != "id" =>
@@ -3063,17 +3227,22 @@ fn params_option_value(arg: &Expr) -> Option<&Expr> {
 /// body-typer. A route helper's segment parameter is an id; an argument
 /// that types to a class is a record standing where its id belongs.
 /// Idempotent — a projected argument types `Integer`, not a class.
-pub fn project_route_helper_ids(expr: &Expr) -> Expr {
-    map_expr(expr, &project_route_helper_ids_node)
+///
+/// `direct_helpers` (`routes::direct_helper_names`) are the app's
+/// `direct` helpers: a block that receives its options hash as written
+/// (`options[:preview]`, where `"false"` would be truthy), so a scalar
+/// under one of their keys is left as it is.
+pub fn project_route_helper_ids(expr: &Expr, direct_helpers: &crate::det::HashSet<String>) -> Expr {
+    map_expr(expr, &|e: &Expr| project_route_helper_ids_node(e, direct_helpers))
 }
 
 /// In-place twin. Returns whether any argument was projected so the
 /// test lowerer can skip a follow-up typing pass.
-pub fn project_route_helper_ids_in_place(expr: &mut Expr) -> bool {
-    map_expr_mut(expr, &project_route_helper_ids_node)
+pub fn project_route_helper_ids_in_place(expr: &mut Expr, direct_helpers: &crate::det::HashSet<String>) -> bool {
+    map_expr_mut(expr, &|e: &Expr| project_route_helper_ids_node(e, direct_helpers))
 }
 
-fn project_route_helper_ids_node(e: &Expr) -> Option<Expr> {
+fn project_route_helper_ids_node(e: &Expr, direct_helpers: &crate::det::HashSet<String>) -> Option<Expr> {
     let ExprNode::Send { recv: Some(r), method, args, block, parenthesized } = &*e.node else {
         return None;
     };
@@ -3085,10 +3254,17 @@ fn project_route_helper_ids_node(e: &Expr) -> Option<Expr> {
     if !(method.as_str().ends_with("_path") || method.as_str().ends_with("_url")) {
         return None;
     }
-    if !args.iter().any(arg_carries_a_model) && !args.iter().any(query_carries_an_int) {
+    let direct = direct_helpers.contains(method.as_str());
+    if !args.iter().any(arg_carries_a_model) && (direct || !args.iter().any(query_carries_a_scalar)) {
         return None;
     }
-    let projected: Vec<Expr> = args.iter().map(project_arg).collect();
+    // A helper call nested in an argument (`next: inner_path(flag: true)`)
+    // is projected first: the walk doesn't revisit a replacement, so once
+    // this call is rebuilt the nested one would keep its own options.
+    let projected: Vec<Expr> = args
+        .iter()
+        .map(|a| project_arg(&project_route_helper_ids(a, direct_helpers), direct))
+        .collect();
     Some(Expr::new(
         e.span,
         ExprNode::Send {
@@ -3099,6 +3275,21 @@ fn project_route_helper_ids_node(e: &Expr) -> Option<Expr> {
             parenthesized: *parenthesized,
         },
     ))
+}
+
+/// Is `arg` typed as a String, Symbol, number or boolean (or a union of
+/// them, nil included)? Rails renders such a value with its own
+/// `to_param`; it has no `id`.
+fn types_to_a_scalar(arg: &Expr) -> bool {
+    use crate::ty::Ty;
+    fn scalar(t: &Ty) -> bool {
+        match t {
+            Ty::Str | Ty::Sym | Ty::Int | Ty::Float | Ty::Bool | Ty::Nil => true,
+            Ty::Union { variants } => variants.iter().all(scalar),
+            _ => false,
+        }
+    }
+    arg.ty.as_ref().is_some_and(scalar)
 }
 
 /// A route-helper argument with every model instance in it projected
@@ -3113,9 +3304,10 @@ fn project_route_helper_ids_node(e: &Expr) -> Option<Expr> {
 /// at all — campfire's `messages_controller_test` pages this way twice.
 ///
 /// Only the VALUES move. A key is a Symbol by construction.
-fn project_arg(a: &Expr) -> Expr {
+fn project_arg(a: &Expr, direct: bool) -> Expr {
+    let query_text = |k: &Expr, v: &Expr| !direct && query_text_in_slot(k, v);
     if let ExprNode::Hash { entries, kwargs } = &*a.node {
-        if entries.iter().any(|(k, v)| records_a_model(v) || int_in_query_slot(k, v)) {
+        if entries.iter().any(|(k, v)| records_a_model(v) || query_text(k, v)) {
             // `to_param`, not `id`: a query value is a String on the
             // wire and the helper's option is typed `String?` (the
             // name-based rule in `routes_to_library::param_ty` — only
@@ -3130,7 +3322,7 @@ fn project_arg(a: &Expr) -> Expr {
                 .map(|(k, v)| {
                     let v = if records_a_model(v) {
                         to_s_of(id_of(v))
-                    } else if int_in_query_slot(k, v) {
+                    } else if query_text(k, v) {
                         to_s_of(v.clone())
                     } else {
                         v.clone()
@@ -3142,31 +3334,69 @@ fn project_arg(a: &Expr) -> Expr {
         }
         return a.clone();
     }
-    if records_a_model(a) {
+    // A `direct` helper's block is given the record itself; its own
+    // `route_for` takes the id where a segment wants one.
+    if records_a_model(a) && !direct {
         return id_of(a);
     }
     a.clone()
 }
 
-/// An Integer-typed value under a query key the helper types
+/// How a scalar under a query key reaches a helper that types the key
 /// `String?` — every key but `id` / `*_id` (Integer segments) and
-/// `format`.
-pub(crate) fn int_in_query_slot(k: &Expr, v: &Expr) -> bool {
+/// `format`. Rails writes a query value with `to_param`, which on a
+/// scalar is its `to_s` (`featured: true` is `?featured=true`, `ratio:
+/// 1.5` is `?ratio=1.5`), and leaves a nil value out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum QueryScalar {
+    /// An Integer, Float or boolean: its `to_s`.
+    Text,
+    /// One of those or nil: its `to_s` when it isn't nil, so the helper
+    /// still leaves the key out for a nil.
+    TextOrNil,
+}
+
+pub(crate) fn scalar_in_query_slot(k: &Expr, v: &Expr) -> Option<QueryScalar> {
     let ExprNode::Lit { value: crate::expr::Literal::Sym { value: key } } = &*k.node else {
-        return false;
+        return None;
     };
     let key = key.as_str();
     if key == "id" || key.ends_with("_id") || key == "format" {
-        return false;
+        return None;
     }
-    matches!(v.ty, Some(crate::ty::Ty::Int))
+    scalar_value(v)
 }
 
-/// Is there an Integer in a String-typed query slot anywhere
+/// What a scalar value needs to reach a `String?` query slot: its
+/// `to_s`, or its `to_s` with nil kept. `None` for anything else.
+pub(crate) fn scalar_value(v: &Expr) -> Option<QueryScalar> {
+    use crate::ty::Ty;
+    let scalar = |t: &Ty| matches!(t, Ty::Int | Ty::Float | Ty::Bool);
+    match v.ty.as_ref()? {
+        t if scalar(t) => Some(QueryScalar::Text),
+        Ty::Union { variants }
+            if variants.contains(&Ty::Nil)
+                && variants.iter().any(|t| scalar(t))
+                && variants.iter().all(|t| scalar(t) || *t == Ty::Nil) =>
+        {
+            Some(QueryScalar::TextOrNil)
+        }
+        _ => None,
+    }
+}
+
+/// A value under a query key that `project_arg` turns into its `to_s`.
+/// A test body has no fresh local to keep a nil in, so only a value
+/// that can't be nil counts here.
+fn query_text_in_slot(k: &Expr, v: &Expr) -> bool {
+    scalar_in_query_slot(k, v) == Some(QueryScalar::Text)
+}
+
+/// Is there a scalar in a String-typed query slot anywhere
 /// `project_arg` would reach?
-fn query_carries_an_int(a: &Expr) -> bool {
+fn query_carries_a_scalar(a: &Expr) -> bool {
     match &*a.node {
-        ExprNode::Hash { entries, .. } => entries.iter().any(|(k, v)| int_in_query_slot(k, v)),
+        ExprNode::Hash { entries, .. } => entries.iter().any(|(k, v)| query_text_in_slot(k, v)),
         _ => false,
     }
 }
@@ -3270,6 +3500,7 @@ fn is_bare_params(e: &Expr) -> bool {
 /// Lower `params.expect(...)` based on its argument shape:
 /// - `params.expect(:id)` → `@params[:id].to_i`
 /// - `params.expect(post: [:title, :body])` → `@params.require(:post).permit(:title, :body)`
+/// - `params.expect(posts: [[:title]])` → `Params.expect_array(...)`
 ///
 /// Anything else (no args, multi-arg, unrecognized arg shape) is left
 /// as `@params.expect(args...)` so we don't silently drop an idiom we
@@ -3288,6 +3519,9 @@ fn rewrite_expect(
         }
         // Single-keyword-hash form → @params.require(:k).permit(:f1, :f2, ...)
         if let ExprNode::Hash { entries, .. } = &*arg.node {
+            if let Some(array) = params_expect_array(entries, span) {
+                return array;
+            }
             if let Some(pair) = single_resource_hash(entries) {
                 return params_require_permit(pair.0, pair.1, span);
             }
@@ -3367,6 +3601,54 @@ fn params_index_to_i(sym: &Symbol, span: Span) -> Expr {
     )
 }
 
+fn params_expect_array(entries: &[(Expr, Expr)], span: Span) -> Option<Expr> {
+    use crate::lower::typing::with_ty;
+    use crate::ty::Ty;
+    let [(key, value)] = entries else { return None };
+    let name = |expr: &Expr| match &*expr.node {
+        ExprNode::Lit { value: Literal::Sym { value } } => Some(value.as_str().to_string()),
+        ExprNode::Lit { value: Literal::Str { value } } => Some(value.clone()),
+        _ => None,
+    };
+    let key = name(key)?;
+    let ExprNode::Array { elements, .. } = &*value.node else { return None };
+    let [inner] = elements.as_slice() else { return None };
+    let ExprNode::Array { elements, .. } = &*inner.node else { return None };
+    let mut fields = Vec::new();
+    let mut scalar_arrays = Vec::new();
+    for field in elements {
+        if let Some(field) = name(field) {
+            fields.push(field);
+        } else if let ExprNode::Hash { entries, .. } = &*field.node {
+            for (key, filter) in entries {
+                let ExprNode::Array { elements, .. } = &*filter.node else { return None };
+                if !elements.is_empty() { return None; }
+                scalar_arrays.push(name(key)?);
+            }
+        } else {
+            return None;
+        }
+    }
+    let string = |value: String| with_ty(
+        Expr::new(span, ExprNode::Lit { value: Literal::Str { value } }), Ty::Str,
+    );
+    let strings = |values: Vec<String>| with_ty(
+        Expr::new(span, ExprNode::Array { elements: values.into_iter().map(string).collect(), style: ArrayStyle::Brackets }),
+        Ty::Array { elem: Ty::Str.into() },
+    );
+    let hash_ty = Ty::Hash {
+        key: Ty::Str.into(),
+        value: Ty::Class { id: crate::ident::ClassId(Symbol::from("Roundhouse::ParamValue")), args: vec![].into() }.into(),
+    };
+    Some(with_ty(Expr::new(span, ExprNode::Send {
+        recv: Some(const_path(&["Params"], span)),
+        method: Symbol::from("expect_array"),
+        args: vec![with_ty(ivar("params", span), hash_ty.clone()), string(key), strings(fields), strings(scalar_arrays)],
+        block: None,
+        parenthesized: true,
+    }), Ty::Array { elem: hash_ty.into() }))
+}
+
 /// `@params.require(:resource).permit(:f1, :f2, ...)` — the strong-
 /// params chain spinel's runtime implements. Returns None at the call
 /// site if the entries don't match the single-resource shape.
@@ -3442,6 +3724,17 @@ fn params_require_permit(resource: Symbol, fields: Vec<Symbol>, span: Span) -> E
 
 fn nil_expr(span: Span) -> Expr {
     Expr::new(span, ExprNode::Lit { value: Literal::Nil })
+}
+
+/// The path parameters an action hands its views: the request's, with
+/// `default_url_options`' segments laid over them when the controller
+/// has the `route_param_recall::OVERLAY` method.
+fn view_path_parameters(overlaid: bool, span: Span) -> Expr {
+    if !overlaid {
+        return ivar("path_parameters", span);
+    }
+    let method = Symbol::from(crate::lower::route_param_recall::OVERLAY);
+    Expr::new(span, ExprNode::Send { recv: None, method, args: vec![], block: None, parenthesized: false })
 }
 
 fn ivar(name: &str, span: Span) -> Expr {

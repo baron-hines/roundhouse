@@ -5,6 +5,8 @@
 //! as a PATH gem of `Gemfile.lock`. A test the compiler does not pass yet
 //! is ignored with the group of behavior it waits on (`fork spec: ...`).
 
+#[path = "support/scratch.rs"]
+mod scratch;
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
@@ -27,7 +29,7 @@ const FILES: &[(&str, &str)] = &[
     ("lib/paygate/gateways/bogus.rb", "module Paygate\n  class BogusGateway < Base\n    CODE = :ok\n  end\nend\n"),
     (
         "lib/paygate/gateways/card_net.rb",
-        "require \"set\"\n\nmodule Paygate\n  class CardNetGateway < Base\n    APPROVED, DECLINED = 1, \"declined\"\n    SEEN = Set.new([APPROVED])\n\n    def self.codes = [APPROVED, DECLINED, SEEN.include?(1)]\n  end\nend\n",
+        "require \"set\"\n\nmodule Paygate\n  class CardNetGateway < Base\n    APPROVED,\n      DECLINED = 1, \"DECLINED\"\n    SEEN = Set.new([APPROVED])\n\n    def self.codes = [APPROVED, DECLINED, SEEN.include?(1)]\n  end\nend\n",
     ),
 ];
 
@@ -38,11 +40,10 @@ p Paygate::Base.all
 p Paygate.autoload?(:BogusGateway)
 "#;
 
-const EXPECTED: &str = "[]\n:ok\n[1, \"declined\", true]\n[\"Paygate::BogusGateway\", \"Paygate::CardNetGateway\"]\nnil\n";
+const EXPECTED: &str = "[]\n:ok\n[1, \"DECLINED\", true]\n[\"Paygate::BogusGateway\", \"Paygate::CardNetGateway\"]\nnil\n";
 
 fn native() -> String {
-    let dir = std::env::temp_dir().join(format!("rh_gem_glob_autoload_native_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = scratch::dir("rh_gem_glob_autoload_native");
     for (path, text) in FILES {
         let file = dir.join(path);
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -73,11 +74,10 @@ fn overlay() -> emit_and_run::Overlay {
 }
 
 #[test]
-#[ignore = "fork spec: autoload"]
 fn a_gem_glob_autoload_loop_registers_each_constant_as_native() {
     assert_eq!(native(), EXPECTED, "native control");
     let run = overlay().run_ruby(SCRIPT);
-    assert!(run.success, "emitted tree failed in {}\n{}\n{}", run.emitted.display(), run.stdout, run.stderr);
+    run.assert_passes();
     assert_eq!(run.stdout, EXPECTED, "{}", run.stderr);
     assert!(!run.stderr.contains("file_statement_not_carried"), "{}", run.stderr);
 }
@@ -85,7 +85,7 @@ fn a_gem_glob_autoload_loop_registers_each_constant_as_native() {
 fn global_write_overlay() -> emit_and_run::Overlay {
     emit_and_run::empty_app()
         .write("roundhouse.yml", "")
-        .write("Gemfile.lock", "PATH\n  remote: vendor/gems/payoff-1.0.0\n  specs:\n    payoff (1.0.0)\n\nGEM\n  remote: https://rubygems.org/\n  specs:\n\nDEPENDENCIES\n  paygate!\n")
+        .write("Gemfile.lock", "PATH\n  remote: vendor/gems/paygate-1.0.0\n  specs:\n    paygate (1.0.0)\n\nGEM\n  remote: https://rubygems.org/\n  specs:\n\nDEPENDENCIES\n  paygate!\n")
         .write("config/application.rb", "require \"paygate\"\n")
         .write(
             "vendor/gems/paygate-1.0.0/lib/paygate.rb",
@@ -94,7 +94,6 @@ fn global_write_overlay() -> emit_and_run::Overlay {
 }
 
 #[test]
-#[ignore = "fork spec: autoload"]
 fn a_module_body_global_write_runs_in_place() {
     // A global write in a module body is a body statement: the Ruby
     // family writes it back where it stands (it was dropped and reported
@@ -106,13 +105,30 @@ fn a_module_body_global_write_runs_in_place() {
 }
 
 #[test]
-#[ignore = "fork spec: autoload"]
 fn a_strict_target_refuses_the_module_body_global_write_by_name() {
     let (_tree, errors) = global_write_overlay().emit(BuildTarget::Spinel);
     assert!(
         errors.iter().any(|e| e.contains("class body statement") && e.contains("$paygate_loaded = true")),
         "{errors:#?}"
     );
+}
+
+#[test]
+fn a_multiple_constant_write_whose_value_calls_a_method_is_refused() {
+    // Ruby evaluates `pick` before it assigns `A`, so `pick` sees `A`
+    // undefined; writing the pairs one by one would let it see `A`.
+    // A value that runs code is not carried, and the constants it would
+    // have written are reported, not written out of order.
+    let (_tree, errors) = emit_and_run::empty_app()
+        .write("roundhouse.yml", "")
+        .write("Gemfile.lock", "PATH\n  remote: vendor/gems/paygate-1.0.0\n  specs:\n    paygate (1.0.0)\n\nGEM\n  remote: https://rubygems.org/\n  specs:\n\nDEPENDENCIES\n  paygate!\n")
+        .write("config/application.rb", "require \"paygate\"\n")
+        .write(
+            "vendor/gems/paygate-1.0.0/lib/paygate.rb",
+            "module Paygate\n  def self.pick = const_defined?(:A, false) ? :seen : :unseen\n  A, B = pick, 2\n  def self.codes = [A, B]\nend\n",
+        )
+        .emit(BuildTarget::Ruby);
+    assert!(errors.iter().any(|e| e.contains("constant not supported") && e.contains("Paygate::A")), "{errors:#?}");
 }
 
 const SYM_FILES: &[(&str, &str)] = &[
@@ -136,10 +152,8 @@ p Payoff::Integrations::Mollie::API.host
 const SYM_EXPECTED: &str = "[:BitPay, :Mollie, :Paypal]\n\"https://paypal.test\"\n:crypto\nnil\n\"api.mollie.test\"\n";
 
 #[test]
-#[ignore = "fork spec: autoload"]
 fn a_gem_glob_autoload_loop_naming_symbols_registers_each_constant_as_native() {
-    let dir = std::env::temp_dir().join(format!("rh_gem_glob_autoload_sym_native_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = scratch::dir("rh_gem_glob_autoload_sym_native");
     for (path, text) in SYM_FILES {
         let file = dir.join(path);
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -158,13 +172,13 @@ fn a_gem_glob_autoload_loop_naming_symbols_registers_each_constant_as_native() {
 
     let mut overlay = emit_and_run::empty_app()
         .write("roundhouse.yml", "")
-        .write("Gemfile.lock", "GEM\n  remote: https://rubygems.org/\n  specs:\n\nDEPENDENCIES\n  payoff!\n")
+        .write("Gemfile.lock", "PATH\n  remote: vendor/gems/payoff-1.0.0\n  specs:\n    payoff (1.0.0)\n\nGEM\n  remote: https://rubygems.org/\n  specs:\n\nDEPENDENCIES\n  payoff!\n")
         .write("config/application.rb", "require \"payoff\"\n");
     for (path, text) in SYM_FILES {
         overlay = overlay.write(&format!("vendor/gems/payoff-1.0.0/{path}"), text);
     }
     let run = overlay.run_ruby(SYM_SCRIPT);
-    assert!(run.success, "emitted tree failed in {}\n{}\n{}", run.emitted.display(), run.stdout, run.stderr);
+    run.assert_passes();
     assert_eq!(run.stdout, SYM_EXPECTED, "{}", run.stderr);
     assert!(!run.stderr.contains("file_statement_not_carried"), "{}", run.stderr);
 }

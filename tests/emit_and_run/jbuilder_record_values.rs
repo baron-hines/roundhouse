@@ -359,14 +359,15 @@ end
 expected = '{"thing":{"name":"alpha"}}'
 actual = render_action(w.id)
 raise actual.inspect unless actual == expected
-begin
+refused = begin
   actual = render_action(g.id)
+  false
 rescue => e
   raise e unless e.message.include?("of a class other than Widget")
-  puts "a one-target polymorphic reader checks the row's class"
-  exit
+  true
 end
-raise "rendered a Gadget row with the Widget partial: #{actual}"
+raise "rendered a Gadget row with the Widget partial: #{actual}" unless refused
+puts "a one-target polymorphic reader checks the row's class"
 "#;
     emit_and_run::empty_app()
         .write("db/schema.rb", schema)

@@ -7,12 +7,12 @@
 
 use ruby_prism::Node;
 
-use crate::dialect::{AccessorKind, MethodDef, MethodReceiver, MethodVisibility, Test, TestModule};
+use crate::dialect::{AccessorKind, LibraryClass, MethodDef, MethodReceiver, MethodVisibility, Test, TestModule};
 use crate::effect::EffectSet;
 use crate::expr::{Expr, ExprNode, LValue, Literal};
 use crate::ident::VarId;
 use crate::span::Span;
-use crate::ty::Ty;
+use crate::ty::{FnTy, Ty};
 use crate::{ClassId, Symbol};
 
 use super::expr::ingest_expr;
@@ -139,10 +139,13 @@ fn ingest_test_class(
     }
     if let Some(class_body) = class.body() {
         for stmt in flatten_statements(class_body) {
-            class_body_statement(&stmt, file, &mut acc, &name, 0)?;
+            if !class_body_statement(&stmt, file, &mut acc, &name, 0)? {
+                report_dropped_statement(&stmt, file, &name);
+            }
         }
     }
     let ClassBody { tests, setup, mut inner_classes, mut helpers, constants, includes, teardowns, target, .. } = acc;
+    let body_classes = inner_classes.iter().map(|c| c.name.clone()).collect();
 
     // ActiveSupport runs `teardown do … end` blocks after every test,
     // passed or failed, after the class's own `def teardown` and in
@@ -233,7 +236,7 @@ fn ingest_test_class(
                         body: blocks,
                         rescues: Vec::new(),
                         else_branch: None,
-                        ensure: Some(fallback_super),
+                        ensure: Some(Box::new(fallback_super)),
                         implicit: false,
                     },
                 );
@@ -250,7 +253,7 @@ fn ingest_test_class(
                             ),
                             rescues: Vec::new(),
                             else_branch: None,
-                            ensure: Some(blocks_then_super),
+                            ensure: Some(Box::new(blocks_then_super)),
                             implicit: true,
                         },
                     ),
@@ -269,7 +272,7 @@ fn ingest_test_class(
                         body: blocks,
                         rescues: Vec::new(),
                         else_branch: None,
-                        ensure: Some(super_call()),
+                        ensure: Some(Box::new(super_call())),
                         implicit: true,
                     },
                 ),
@@ -320,10 +323,36 @@ fn ingest_test_class(
         tests,
         setup,
         inner_classes,
+        body_classes,
         helpers,
         constants,
         includes,
     })
+}
+
+/// A test class body statement the ingest does not model, ledgered by
+/// name: the emitted class goes without it (`INPUT[:accent] = ACCENT`
+/// between two constants, so a later constant built from `INPUT` misses
+/// the key).
+/// A bare `private` is not one: the helpers below it are called from the
+/// class's own tests either way.
+fn report_dropped_statement(stmt: &Node, file: &str, class: &ClassId) {
+    let construct = match stmt.as_call_node() {
+        Some(call) => constant_id_str(&call.name()).to_string(),
+        None => "statement".to_string(),
+    };
+    let bare_marker = stmt.as_call_node().is_some_and(|call| call.receiver().is_none() && call.arguments().is_none());
+    if bare_marker && matches!(construct.as_str(), "private" | "protected" | "public") {
+        return;
+    }
+    let line = String::from_utf8_lossy(stmt.location().as_slice()).lines().next().unwrap_or("").to_string();
+    super::prism::push(crate::lower::residue_diagnostic(
+        "test_class_body",
+        &construct,
+        super::util::node_span(stmt, file),
+        "not modelled",
+        format!("`{line}` in the body of test class `{}` is not modelled and is dropped", class.0.as_str()),
+    ));
 }
 
 /// `self.use_transactional_tests = false` (or `true`) as
@@ -363,12 +392,12 @@ fn transactional_tests_method(stmt: &Node) -> Option<MethodDef> {
         block_param: None,
         name_span: Span::synthetic(),
         body,
-        signature: Some(Ty::Fn {
+        signature: Some(Ty::Fn(Box::new(FnTy {
             params: Vec::new().into(),
             block: None,
             ret: std::sync::Arc::new(Ty::Bool),
             effects: EffectSet::pure(),
-        }),
+        }))),
         effects: EffectSet::pure(),
         enclosing_class: None,
         kind: AccessorKind::Method,
@@ -633,7 +662,7 @@ fn class_body_statement(
         acc.teardowns.push(body);
         return Ok(true);
     }
-    if let Some(body) = ingest_setup_declaration(&stmt, file)? {
+    if let Some(body) = ingest_setup_hoisting(&stmt, file, Some(&mut acc.inner_classes))? {
         // Multiple setup hooks compose in source order — append
         // by wrapping in a Seq. Rare in practice; first wins
         // when stored as Option, so accumulate.
@@ -661,6 +690,13 @@ fn class_body_statement(
     // hoist them to file scope above the lowered test class.
     if let Some(inner) = stmt.as_class_node() {
         let lc = library_class_from_node(&inner, file)?;
+        // Not a second definition beside a setup's hoisted one: Ruby runs the body before setup, so setup's wins.
+        if acc.inner_classes.iter().any(|c| c.name == lc.name) {
+            return Err(IngestError::Unsupported {
+                file: file.into(),
+                message: format!("class `{}` is defined twice in the test class", lc.name.0),
+            });
+        }
         acc.inner_classes.push(lc);
         return Ok(true);
     }
@@ -936,6 +972,29 @@ fn ingest_setup_declaration(
     stmt: &Node<'_>,
     file: &str,
 ) -> IngestResult<Option<Expr>> {
+    ingest_setup_hoisting(stmt, file, None)
+}
+
+/// A class whose body only declares (`include`, `extend`, `attr_*`, `def`): one `setup do` may define, since running
+/// it again reopens the same class to the same effect. Ruby puts it in the test class's lexical scope, as the class
+/// body's own inline classes are.
+fn static_class_body(class: &ruby_prism::ClassNode<'_>) -> bool {
+    let Some(body) = class.body() else { return true };
+    flatten_statements(body).iter().all(|stmt| {
+        stmt.as_def_node().is_some()
+            || stmt.as_call_node().is_some_and(|call| {
+                call.receiver().is_none()
+                    && call.block().is_none()
+                    && matches!(constant_id_str(&call.name()).as_ref(), "include" | "extend" | "attr_reader" | "attr_writer" | "attr_accessor")
+            })
+    })
+}
+
+fn ingest_setup_hoisting(
+    stmt: &Node<'_>,
+    file: &str,
+    mut hoisted: Option<&mut Vec<LibraryClass>>,
+) -> IngestResult<Option<Expr>> {
     // `setup do ... end` form.
     if let Some(call) = stmt.as_call_node() {
         if call.receiver().is_some() {
@@ -947,7 +1006,29 @@ fn ingest_setup_declaration(
         if let Some(block_ref) = call.block() {
             if let Some(block) = block_ref.as_block_node() {
                 let body = match block.body() {
-                    Some(body_node) => ingest_expr(&body_node, file)?,
+                    Some(body_node) => match hoisted.as_deref_mut() {
+                        // maybe's `setup do class MockProcessor; include PlaidAccount::TypeMappable; end … end`.
+                        Some(sink) => {
+                            let mut exprs = Vec::new();
+                            for inner in flatten_statements(body_node) {
+                                match inner.as_class_node() {
+                                    // Not a second definition of a class one already holds: run in order, the two
+                                    // would redefine its methods between them.
+                                    Some(class) if static_class_body(&class) && {
+                                        let lc = library_class_from_node(&class, file)?;
+                                        let fresh = !sink.iter().any(|c| c.name == lc.name);
+                                        if fresh {
+                                            sink.push(lc);
+                                        }
+                                        fresh
+                                    } => {}
+                                    _ => exprs.push(ingest_expr(&inner, file)?),
+                                }
+                            }
+                            Expr::new(Span::synthetic(), ExprNode::Seq { exprs })
+                        }
+                        None => ingest_expr(&body_node, file)?,
+                    },
                     None => Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] }),
                 };
                 return Ok(Some(body));

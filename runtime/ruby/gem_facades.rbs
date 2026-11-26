@@ -131,11 +131,3 @@ module Sentry
   def self.capture_exception: (untyped exception, ?extra: untyped) -> nil
   def self.capture_message: (String message, ?extra: untyped) -> nil
 end
-
-module Rack
-  class MiniProfiler
-    def self.authorize_request: () -> bool
-    def self.deauthorize_request: () -> nil
-    def self.request_authorized?: () -> bool?
-  end
-end

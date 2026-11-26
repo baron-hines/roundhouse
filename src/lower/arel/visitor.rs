@@ -42,8 +42,36 @@ struct Bind {
 /// One shaped-read site gets one id so `__rh_value_0` from two reads in
 /// the same method cannot collide under Spinel's pinned local types.
 fn next_read_id() -> usize {
-    static NEXT: AtomicUsize = AtomicUsize::new(1);
-    NEXT.fetch_add(1, Ordering::Relaxed)
+    DRAWN_HERE.with(|n| n.set(n.get() + 1));
+    NEXT_READ_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+static NEXT_READ_ID: AtomicUsize = AtomicUsize::new(1);
+
+/// Read ids handed out so far. A lowering whose output is cached and
+/// replayed (`model_to_library::request_finder_registry`) reads this
+/// before and after it runs and calls [`skip_read_ids`] with the
+/// difference on a hit, so the ids every later lowering takes are the
+/// ones it would have taken had the cached one run again.
+pub(crate) fn read_ids_taken() -> usize {
+    NEXT_READ_ID.load(Ordering::Relaxed)
+}
+
+/// A skip moves the counter on in lowering order as a draw does, so it
+/// counts as drawn here too.
+pub(crate) fn skip_read_ids(count: usize) {
+    DRAWN_HERE.with(|n| n.set(n.get() + count));
+    NEXT_READ_ID.fetch_add(count, Ordering::Relaxed);
+}
+
+thread_local! {
+    static DRAWN_HERE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Read ids drawn on this thread. Work handed to a worker thread must
+/// draw none: the ids follow the order reads are lowered in.
+pub(crate) fn read_ids_drawn_here() -> usize {
+    DRAWN_HERE.with(std::cell::Cell::get)
 }
 
 fn bind_local(kind: &str, i: usize, read_id: usize) -> Symbol {
@@ -127,6 +155,10 @@ fn emit_bind_calls(stmt: &Symbol, binds: &[Bind], read_id: usize) -> Vec<Expr> {
             ValueType::IntOpt => "bind_int_opt",
             ValueType::StrOpt => "bind_text_opt",
             ValueType::BoolOpt => "bind_bool_opt",
+            // The binders that run (the ruby family's) pick the storage
+            // class from the value's encoding, as for text.
+            ValueType::Binary => "bind_text",
+            ValueType::BinaryOpt => "bind_text_opt",
             ValueType::FloatOpt => unreachable!("unserialized float in bind path"),
         };
         let position = if shaped {
@@ -173,22 +205,30 @@ impl SqliteVisitor {
     /// Execute an insert that returns selected columns from that same
     /// statement. Generated-column persistence uses this to hydrate the
     /// database-owned values without a second, post-commit SELECT.
+    /// `returning_key` is None for a table with no key to return (a keyless
+    /// table on PostgreSQL, which has no rowid): the first column is then
+    /// the integer 0, so the columns after it keep their places.
     pub(crate) fn visit_insert_returning(
         &self,
         ins: &Insert,
         schema: &Schema,
-        returning_key: &Symbol,
+        returning_key: Option<&Symbol>,
         key_is_integer: bool,
         returning_columns: &[Symbol],
     ) -> Expr {
-        let key_ident = crate::naming::sql_ident(returning_key.as_str());
         // Spinel snapshots SQLite integer cells through sqlite3_column_int
         // (32-bit). Return integer keys as text so the shared result capture
         // does not truncate them before the adapter parses them back.
-        let key_projection = if key_is_integer {
-            format!("CAST({key_ident} AS TEXT)")
-        } else {
-            key_ident
+        let key_projection = match returning_key {
+            None => "0".to_string(),
+            Some(key) => {
+                let key_ident = crate::naming::sql_ident(key.as_str());
+                if key_is_integer {
+                    format!("CAST({key_ident} AS TEXT)")
+                } else {
+                    key_ident
+                }
+            }
         };
         let mut projection = vec![key_projection];
         projection.extend(
@@ -958,6 +998,76 @@ fn visit_update(upd: &Update, schema: &Schema) -> Expr {
     db_call(&db, "exec", vec![concat_chain(segments)])
 }
 
+/// The partial-write form of `visit_update`, for the targets whose
+/// runtime tracks pending changes (Rails' `partial_updates`): the
+/// UPDATE sets only the columns named in `cols` (an `Array[String]`
+/// local the caller assigns), and runs nothing when none is named.
+///
+/// ```ruby
+/// sets = ""
+/// sets = sets + ", name = " + Db.escape_string_opt(@name) if cols.include?("name")
+/// # …one line per column…
+/// Db.exec("UPDATE t SET " + sets[2, sets.length - 2] + " WHERE …") unless sets.empty?
+/// ```
+///
+/// `sets` grows by `+`, never `<<`: a String mutated in place through a
+/// second name is a shape Spinel refuses.
+pub fn visit_partial_update(upd: &Update, schema: &Schema, cols: &Symbol, sets: &Symbol) -> Expr {
+    let table = lookup_table(schema, &upd.table.0);
+    let db = ClassId(Symbol::from(DB_MOD));
+    let sets_ref = || {
+        let mut e = Expr::new(Span::synthetic(), ExprNode::Var { id: VarId(0), name: sets.clone() });
+        e.ty = Some(Ty::Str);
+        e
+    };
+    let assign_sets = |value: Expr| {
+        let mut e = Expr::new(
+            Span::synthetic(),
+            ExprNode::Assign { target: LValue::Var { id: VarId(0), name: sets.clone() }, value },
+        );
+        e.ty = Some(Ty::Str);
+        e
+    };
+    let mut stmts = vec![assign_sets(lit_str(String::new()))];
+    for a in &upd.assignments {
+        let column = a.column.as_str();
+        let grown = concat_chain(vec![
+            sets_ref(),
+            lit_str(format!(", {} = ", crate::naming::sql_ident(column))),
+            escape_value(&db, &a.value),
+        ]);
+        let cols_ref = Expr::new(Span::synthetic(), ExprNode::Var { id: VarId(0), name: cols.clone() });
+        let mut named = send_to(cols_ref, "include?", vec![lit_str(column.to_string())], true);
+        named.ty = Some(Ty::Bool);
+        stmts.push(Expr::new(
+            Span::synthetic(),
+            ExprNode::If { cond: named, then_branch: assign_sets(grown), else_branch: nil_lit() },
+        ));
+    }
+    let mut len = send_to(sets_ref(), "length", vec![], false);
+    len.ty = Some(Ty::Int);
+    let mut rest_len = send_to(len, "-", vec![lit_int(2)], false);
+    rest_len.ty = Some(Ty::Int);
+    let mut list = send_to(sets_ref(), "[]", vec![lit_int(2), rest_len], false);
+    list.ty = Some(Ty::Str);
+    let mut segments: Vec<Expr> = vec![
+        lit_str(format!("UPDATE {} SET ", crate::naming::sql_ident(upd.table.0.as_str()))),
+        list,
+    ];
+    // Exec path — inline WHERE, as in `visit_update`.
+    push_where_segments(&mut segments, upd.conditions.as_ref(), table, false, &mut Vec::new(), next_read_id());
+    let write = db_call(&db, "exec", vec![concat_chain(segments)]);
+    let mut empty = send_to(sets_ref(), "empty?", vec![], false);
+    empty.ty = Some(Ty::Bool);
+    stmts.push(Expr::new(
+        Span::synthetic(),
+        ExprNode::If { cond: empty, then_branch: nil_lit(), else_branch: write },
+    ));
+    let mut body = seq(stmts);
+    body.ty = Some(Ty::Nil);
+    body
+}
+
 fn visit_delete(del: &Delete, schema: &Schema) -> Expr {
     let table = lookup_table(schema, &del.table.0);
     let db = ClassId(Symbol::from(DB_MOD));
@@ -1121,6 +1231,19 @@ fn push_predicate_segments(
             segments.push(lit_str(format!("{} = ", crate::naming::sql_ident(col.column.as_str()))));
             push_value_segment(segments, val, param, binds);
         }
+        Predicate::NullSafeEq(col, val) => {
+            segments.push(lit_str(format!("{} {} ", crate::naming::sql_ident(col.column.as_str()), Dialect::current().null_safe_eq())));
+            push_value_segment(segments, val, param, binds);
+        }
+        Predicate::NotEq(col, val) => {
+            segments.push(lit_str(format!("{} != ", crate::naming::sql_ident(col.column.as_str()))));
+            push_value_segment(segments, val, param, binds);
+        }
+        Predicate::LowerEq(col, val) => {
+            segments.push(lit_str(format!("LOWER({}) = LOWER(", crate::naming::sql_ident(col.column.as_str()))));
+            push_value_segment(segments, val, param, binds);
+            segments.push(lit_str(")".to_string()));
+        }
         Predicate::And(l, r) => {
             push_predicate_segments(segments, l, param, binds, read_id);
             segments.push(lit_str(" AND ".to_string()));
@@ -1153,7 +1276,7 @@ fn push_value_segment(segments: &mut Vec<Expr>, val: &Value, param: bool, binds:
             segments.push(lit_str("?".to_string()));
             binds.push(Bind { expr: expr.clone(), ty: *ty, nullable_column: None, parameterized: true });
         }
-        Value::Runtime { .. } => segments.push(escape_value(&db, val)),
+        Value::Runtime { .. } | Value::SqlDefault { .. } => segments.push(escape_value(&db, val)),
     }
 }
 
@@ -1162,6 +1285,11 @@ fn push_value_segment(segments: &mut Vec<Expr>, val: &Value, param: bool, binds:
 /// `push_value_segment` instead.
 fn escape_value(db: &ClassId, val: &Value) -> Expr {
     match val {
+        Value::SqlDefault { expr, ty, sql } => Expr::new(Span::synthetic(), ExprNode::If {
+            cond: send_to(expr.clone(), "nil?", vec![], true),
+            then_branch: lit_str(format!("({sql})")),
+            else_branch: escape_value(db, &Value::Runtime { expr: expr.clone(), ty: *ty }),
+        }),
         Value::Runtime { expr, ty } => {
             let method = match ty {
                 ValueType::Int => "escape_int",
@@ -1174,6 +1302,8 @@ fn escape_value(db: &ClassId, val: &Value) -> Expr {
                 ValueType::StrOpt => "escape_string_opt",
                 ValueType::FloatOpt => "escape_float_opt",
                 ValueType::BoolOpt => "escape_bool_opt",
+                ValueType::Binary => "escape_binary",
+                ValueType::BinaryOpt => "escape_binary_opt",
             };
             db_call(db, method, vec![expr.clone()])
         }
@@ -1396,33 +1526,43 @@ mod tests {
                         col_type: ColumnType::Integer,
                         nullable: false,
                         default: None,
+                        default_expression: None,
+                        legacy_default_persistence: false,
                         primary_key: true,
                         generated: None,
                         generated_text_compatible: None,
                         generated_int4_compatible: None,
                         array: false,
                         array_stored: false,
+                        unset_until_assigned: false,
+                        collated: false,
                     },
                     Column {
                         name: Symbol::from("title"),
                         col_type: ColumnType::Text,
                         nullable: false,
                         default: None,
+                        default_expression: None,
+                        legacy_default_persistence: false,
                         primary_key: false,
                         generated: None,
                         generated_text_compatible: None,
                         generated_int4_compatible: None,
                         array: false,
                         array_stored: false,
+                        unset_until_assigned: false,
+                        collated: false,
                     },
                 ],
                 indexes: vec![],
                 foreign_keys: vec![],
+                check_constraints: Vec::new(),
                 virtual_module: None,
                 known_keyless: false,
+                primary_key_columns: Vec::new(),
             },
         );
-        (Schema { tables }, ClassId(Symbol::from("Article")))
+        (Schema { tables, ..Default::default() }, ClassId(Symbol::from("Article")))
     }
 
     fn id_col() -> ColRef {

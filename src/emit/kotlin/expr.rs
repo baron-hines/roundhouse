@@ -819,8 +819,8 @@ fn children(e: &Expr) -> Vec<&Expr> {
         ExprNode::BeginRescue { body, rescues, else_branch, ensure, .. } => {
             v.push(body);
             v.extend(rescues.iter().map(|r| &r.body));
-            v.extend(else_branch.iter());
-            v.extend(ensure.iter());
+            v.extend(else_branch.as_deref());
+            v.extend(ensure.as_deref());
         }
         _ => {}
     }
@@ -1014,7 +1014,7 @@ fn emit_node(n: &ExprNode, e: &Expr) -> String {
         }
         ExprNode::Next { .. } if LOOP_DEPTH.with(|l| l.get()) > 0 => "continue".to_string(),
         ExprNode::BeginRescue { body, rescues, else_branch, ensure, .. } => {
-            emit_begin_rescue(body, rescues, else_branch.as_ref(), ensure.as_ref())
+            emit_begin_rescue(body, rescues, else_branch.as_deref(), ensure.as_deref())
         }
         other => crate::emit::diagnostics::report_unsupported(e.span, "kotlin", other.kind_str(), "no Kotlin form for this construct here"),
     }
@@ -1331,6 +1331,34 @@ pub(super) fn emit_return_value(e: &Expr) -> String {
     emit_expr(e)
 }
 
+/// A value method's tail `If`, as the `return`ed Kotlin `if` expression.
+/// Ruby's missing (nil) arm is Kotlin's `null` — an `if` used as a value
+/// needs its `else` — and a `{}`/`[]` literal arm drops its type
+/// arguments so the declared return type drives inference, as a bare
+/// return-position literal does (`c ? { k: true } : {}` would otherwise
+/// type one arm `<String, Any?>` against a `<String, Boolean>` return).
+pub(super) fn emit_if_return_value(cond: &Expr, then_branch: &Expr, else_branch: &Expr) -> String {
+    let c = emit_expr(cond);
+    let (mut then_nn, mut else_nn) = (Vec::new(), Vec::new());
+    guarded_nonnull(cond, &mut then_nn, &mut else_nn);
+    let then = with_nonnull(&then_nn, || indent(&emit_value_arm(then_branch)));
+    let els = if is_empty_branch(else_branch) {
+        indent("null")
+    } else {
+        with_nonnull(&else_nn, || indent(&emit_value_arm(else_branch)))
+    };
+    format!("if ({c}) {{\n{then}\n}} else {{\n{els}\n}}")
+}
+
+fn emit_value_arm(e: &Expr) -> String {
+    match &*e.node {
+        ExprNode::Hash { entries, .. } if entries.is_empty() => "mutableMapOf()".to_string(),
+        ExprNode::Array { elements, .. } if elements.is_empty() => "mutableListOf()".to_string(),
+        ExprNode::If { cond, then_branch, else_branch } => emit_if_return_value(cond, then_branch, else_branch),
+        _ => emit_return_value(e),
+    }
+}
+
 fn emit_array(elements: &[Expr], e: &Expr) -> String {
     if elements.is_empty() {
         // Use the annotated element type when present, else Any?.
@@ -1467,6 +1495,10 @@ fn emit_assign(target: &LValue, value: &Expr) -> String {
         _ => emit_expr(value),
     };
     match target {
+        // `_ = x`: Ruby's discard, which evaluates `x` and keeps nothing.
+        // Kotlin reserves `_` as a name, and an expression statement
+        // already evaluates its value and drops it.
+        LValue::Var { name, .. } if name.as_str() == "_" => val,
         LValue::Var { name, .. } => {
             let n = camel(name.as_str());
             let already = DECLARED.with(|d| d.borrow().contains(&n));
@@ -1915,6 +1947,25 @@ fn emit_send(
                 "Array" => format!("{rs} is List<*>"),
                 other => format!("{rs} is {}", type_name(other)),
             };
+        }
+    }
+
+    // `recv.gsub(regexp, "literal")` → `regexp.replace(recv, "literal")`.
+    // Only for a Regexp pattern (a String needle is not a `Regex`
+    // receiver), and only for a literal with no `\`: a Ruby `\1`/`\0`
+    // back-reference keeps the previous path rather than coming out as
+    // literal text. Kotlin reads `$` as a group reference, so a literal
+    // holding one goes through `Regex.escapeReplacement`.
+    if method == "gsub" && args.len() == 2 {
+        if let (Some(r), ExprNode::Lit { value: Literal::Str { value: repl } }) = (recv, &*args[1].node) {
+            if !repl.contains('\\') && crate::emit::shared::regex_literal::is_regexp_pattern(&args[0]) {
+                let repl_s = if repl.contains('$') {
+                    format!("Regex.escapeReplacement({})", args_s[1])
+                } else {
+                    args_s[1].clone()
+                };
+                return format!("{}.replace({}, {repl_s})", args_s[0], emit_expr(r));
+            }
         }
     }
 
@@ -2529,5 +2580,77 @@ pub(super) fn kotlin_exception_class(name: &str) -> String {
         "ArgumentError" => "IllegalArgumentException".to_string(),
         "IndexError" => "IndexOutOfBoundsException".to_string(),
         other => type_name(other),
+    }
+}
+
+#[cfg(test)]
+mod gsub_string_replacement_tests {
+    use super::emit_expr;
+    use crate::expr::{Expr, ExprNode, Literal};
+    use crate::ident::{ClassId, Symbol, VarId};
+    use crate::span::Span;
+    use crate::ty::Ty;
+
+    fn node(n: ExprNode) -> Expr {
+        Expr::new(Span::synthetic(), n)
+    }
+
+    /// A pattern constant, typed `Regexp` as the analyzer types one.
+    fn regexp_const() -> Expr {
+        let mut e = node(ExprNode::Const { path: vec![Symbol::from("PATTERN")] });
+        e.ty = Some(Ty::Class { id: ClassId(Symbol::from("Regexp")), args: vec![].into() });
+        e
+    }
+
+    fn regex_lit() -> Expr {
+        node(ExprNode::Lit { value: Literal::Regex { pattern: "[ab]".into(), flags: "".into() } })
+    }
+
+    /// A String-typed variable used as the pattern (a needle, not a Regex).
+    fn string_var() -> Expr {
+        let mut e = node(ExprNode::Var { id: VarId(1), name: Symbol::from("needle") });
+        e.ty = Some(Ty::Str);
+        e
+    }
+
+    fn gsub_with(pattern: Expr, repl: &str) -> Expr {
+        node(ExprNode::Send {
+            recv: Some(node(ExprNode::Var { id: VarId(0), name: Symbol::from("name") })),
+            method: Symbol::from("gsub"),
+            args: vec![pattern, node(ExprNode::Lit { value: Literal::Str { value: repl.to_string() } })],
+            block: None,
+            parenthesized: true,
+        })
+    }
+
+    fn gsub(repl: &str) -> Expr {
+        gsub_with(regexp_const(), repl)
+    }
+
+    /// A String replacement is the replacement, not a table to look the
+    /// match up in (`("_")[it.value]` does not compile).
+    #[test]
+    fn a_string_replacement_is_passed_to_regex_replace() {
+        assert_eq!(emit_expr(&gsub("_")), "PATTERN.replace(name, \"_\")");
+        assert!(emit_expr(&gsub_with(regex_lit(), "_")).ends_with(".replace(name, \"_\")"));
+    }
+
+    /// `$` is a group reference to `Regex.replace`.
+    #[test]
+    fn a_replacement_with_a_dollar_is_escaped() {
+        assert!(emit_expr(&gsub("$")).starts_with("PATTERN.replace(name, Regex.escapeReplacement("));
+    }
+
+    /// A String-typed pattern is a needle: not this arm.
+    #[test]
+    fn a_string_pattern_does_not_take_the_regex_arm() {
+        assert!(!emit_expr(&gsub_with(string_var(), "_")).contains("needle.replace(name, \"_\")"));
+    }
+
+    /// A Ruby back-reference (`\\1`) keeps the previous path.
+    #[test]
+    fn a_back_reference_does_not_take_the_regex_arm() {
+        let out = emit_expr(&gsub("(\\1)"));
+        assert!(!out.contains("PATTERN.replace(name, "), "{out}");
     }
 }

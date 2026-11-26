@@ -119,6 +119,16 @@ every = a.list([
 push("EveryArgumentJob", "default", 0.0, every)
 show("every Phase 1 argument type")
 
+# Keyword arguments: one trailing Hash marked `_aj_ruby2_keywords`, as
+# `lower::job_payload` writes it; an optional keyword at its default is
+# left out, as Rails leaves out one the caller omits.
+push("KeywordJob", "default", 0.0, a.list([a.record("gid://depot/Car/9"),
+  a.keywords(["count", "label"], [a.int(2), a.str("custom")])]))
+show("keyword arguments")
+push("KeywordJob", "default", 0.0, a.list([a.record("gid://depot/Car/10"),
+  a.keywords(["count", ""], [a.int(3), ""])]))
+show("an omitted optional keyword")
+
 # The after-commit hold: nothing is pushed while the transaction is
 # open, everything at COMMIT in order, nothing after a ROLLBACK.
 ActiveJob.transaction_began
@@ -144,8 +154,9 @@ check("redacted password", SidekiqPush.redacted_url("redis://app:hunter2@cache:6
 check("redacted bare password", SidekiqPush.redacted_url("redis://:hunter2@cache") == "redis://:REDACTED@cache", SidekiqPush.redacted_url("redis://:hunter2@cache"))
 check("no password to redact", SidekiqPush.redacted_url("redis://cache:6379/0") == "redis://cache:6379/0", SidekiqPush.redacted_url("redis://cache:6379/0"))
 
-# configure_client's settings, read from the environment. An app that
-# gives none (this registry's `""`) falls back to REDIS_URL.
+# configure_client's settings, read from the environment. A URL that
+# comes out empty (this registry's `""`) raises: REDIS_URL is not a
+# fallback.
 ENV["SK_TEST_SET"] = "redis://set:6379/1"
 ENV.delete("SK_TEST_UNSET")
 check("ENV[] setting", SidekiqPush.setting("SK_TEST_SET") == "redis://set:6379/1", SidekiqPush.setting("SK_TEST_SET"))
@@ -161,7 +172,13 @@ end
 check("ENV.fetch without default raises", raised, "no KeyError")
 ENV["REDIS_PROVIDER"] = ""
 ENV["REDIS_URL"] = "redis://fallback:6379/3"
-check("no configure_client url: falls back", SidekiqPush.resolve_url == "redis://fallback:6379/3", SidekiqPush.resolve_url)
+raised = false
+begin
+  SidekiqPush.resolve_url
+rescue ArgumentError
+  raised = true
+end
+check("an empty configure_client url: raises, REDIS_URL is no fallback", raised, "no ArgumentError")
 check("no configure_client password", SidekiqPush.password == "", SidekiqPush.password)
 
 SidekiqPush.stop_recording

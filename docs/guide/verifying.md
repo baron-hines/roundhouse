@@ -70,11 +70,12 @@ compare matrix runs:
 bin/rh compare rust          # any server target; ruby / spinel too
 ```
 
-`scripts/campfire-compare` is the Campfire half: the same walk on
-both lanes, plus the piece no page compare can carry — the Turbo
-Stream frames that arrive over `/cable` are captured on both sides and
-diffed after the same normalization. Both scripts are readable and
-short; adapting one to your app is mostly replacing the path list.
+`scripts/campfire-compare` is the Campfire half: the same walk on each
+lane, plus the piece no page compare can carry — the Turbo Stream frames
+that arrive over `/cable` are captured on both sides and diffed after the
+same normalization. Ruby and Spinel are the lanes it gates; `--target
+rust` is wired for the Rust pilot, but Campfire does not yet emit a Rust
+project that builds, so that lane stops before it serves.
 
 `scripts/campfire-http-shape` compares what surrounds the page: the
 status and headers of 71 requests (pages, Turbo Streams, JSON, assets,

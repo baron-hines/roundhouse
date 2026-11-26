@@ -20,6 +20,7 @@ module Sock
   ffi_func :sp_net_listen,                [:int, :int],       :int
   ffi_func :sp_net_accept,                [:int],             :int
   ffi_func :sp_net_accept_nb,             [:int],             :int
+  ffi_func :sp_net_peer_ip,               [:int],             :str
   ffi_func :sp_net_set_nonblock,          [:int],             :int
   ffi_func :sp_net_close,                 [:int],             :int
   ffi_func :sp_net_write_str,             [:int, :str],       :int
@@ -186,4 +187,11 @@ module Crypto
   # derivation; do NOT use it for anything else (collision-broken).
   ffi_func :sp_crypto_sha1_hex,             [:str],             :str
   ffi_func :sp_crypto_websocket_accept,     [:str],             :str
+end
+
+# shutdown wakes a parked receiver without releasing its fd number. The
+# threaded server remains the only owner that closes the descriptor.
+module TepSocketControl
+  ffi_lib "c"
+  ffi_func :shutdown, [:int, :int], :int
 end

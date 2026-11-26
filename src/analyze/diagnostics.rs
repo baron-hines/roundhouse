@@ -58,21 +58,59 @@ fn attribute_macro_refusals(app: &App) -> Vec<Diagnostic> {
 /// each such call is refused here — as is an expanded field given an
 /// option its Rails `render` rewrites and the lowering would pass
 /// through as a plain attribute.
+fn descends_from_form_builder(app: &App, id: &crate::ident::ClassId) -> bool {
+    let mut current = id.clone();
+    for _ in 0..32 {
+        let Some(parent) = app.library_classes.iter().filter(|c| c.name == current).find_map(|c| c.parent.clone()) else { return false };
+        if parent.0.as_str().trim_start_matches("::") == "ActionView::Helpers::FormBuilder" {
+            return true;
+        }
+        current = parent;
+    }
+    false
+}
+
 fn unlowered_form_builder_calls(app: &App) -> Vec<Diagnostic> {
-    fn visit(expr: &Expr, out: &mut Vec<Diagnostic>) {
+    type Overrides = crate::det::HashMap<String, crate::det::HashSet<String>>;
+    fn visit(app: &App, overrides: &Overrides, expr: &Expr, out: &mut Vec<Diagnostic>) {
+        let overridden = |id: &crate::ident::ClassId, m: &str| overrides.get(id.0.as_str()).is_some_and(|o| o.contains(m));
+        // A builder class of the app's or a gem's own (`builder: MoneyFormBuilder`): a method the lowering does not
+        // expand runs on Rails' builder at request time, which the Ruby family's overlay carries and no other tree.
+        if let ExprNode::Send { recv: Some(r), method, .. } = &*expr.node
+            && !expr.span.is_synthetic()
+            && let Some(Ty::Class { id, .. }) = &r.ty
+            && id.0.as_str() != "ActionView::Helpers::FormBuilder"
+            && descends_from_form_builder(app, id)
+            && method.as_str() != "object"
+            && (crate::lower::classify_form_builder_method(method.as_str()).is_none() || overridden(id, method.as_str()))
+        {
+            out.push(Diagnostic::unsupported(
+                expr.span,
+                None,
+                "custom form builder method",
+                format!("`form.{}` is {}'s own method, which runs on Rails' FormBuilder at request time, carried by the Ruby family's runtime only", method.as_str(), id.0.as_str()),
+            ));
+        }
         if let ExprNode::Send { recv: Some(r), method, args, .. } = &*expr.node
             && !expr.span.is_synthetic()
-            && matches!(&r.ty, Some(Ty::Class { id, .. }) if id.0.as_str() == "ActionView::Helpers::FormBuilder")
+            && let Some(Ty::Class { id, .. }) = &r.ty
+            // A builder subclass's stock fields are expanded as the base's; its own methods are reported above.
+            && (id.0.as_str() == "ActionView::Helpers::FormBuilder" || descends_from_form_builder(app, id))
             && !FORM_BUILDER_HANDLED_ELSEWHERE.contains(&method.as_str())
         {
+            let base = id.0.as_str() == "ActionView::Helpers::FormBuilder";
             let m = method.as_str();
-            if crate::lower::classify_form_builder_method(m).is_none() {
+            if crate::lower::classify_form_builder_method(m).is_none() || overridden(id, m) {
+                if !base {
+                    expr.node.for_each_child(&mut |child| visit(app, overrides, child, out));
+                    return;
+                }
                 out.push(Diagnostic::unsupported(
                     expr.span,
                     None,
                     "form builder method",
                     format!(
-                        "`form.{m}` has no lowering (the form lowering expands label, text_field, text_area, password_field, hidden_field, email_field, url_field, number_field, range_field, search_field, telephone_field/phone_field, check_box, radio_button, select, file_field, rich_text_area, button, submit and fields_for), so the call reaches no method at render"
+                        "`form.{m}` has no lowering (the form lowering expands label, text_field, text_area, password_field, hidden_field, email_field, url_field, number_field, range_field, search_field, telephone_field/phone_field, color_field, datetime_local_field, check_box, radio_button, select, file_field, rich_text_area, button, submit and fields_for), so the call reaches no method at render"
                     ),
                 ));
             } else if let Some(opt) = rewritten_option(m, args) {
@@ -84,17 +122,29 @@ fn unlowered_form_builder_calls(app: &App) -> Vec<Diagnostic> {
                         "`form.{m}` with `{opt}:` is not modeled: Rails' field rewrites that option when it renders, and the lowering would write it as a plain attribute"
                     ),
                 ));
+            } else if m == "datetime_local_field"
+                && let Some(reason) = datetime_local_refusal(app, r.ty.as_ref(), args)
+            {
+                out.push(Diagnostic::unsupported(
+                    expr.span,
+                    None,
+                    "form builder field",
+                    format!("`form.datetime_local_field`: {reason}"),
+                ));
             }
         }
-        expr.node.for_each_child(&mut |child| visit(child, out));
+        expr.node.for_each_child(&mut |child| visit(app, overrides, child, out));
     }
     /// The option of `method`'s call that Rails' `Tags::*#render`
     /// rewrites: `NumberField` (and `RangeField`) turn `in:`/`within:`
-    /// into `min`/`max`; `SearchField` expands `autosave:`/`onsearch:`.
+    /// into `min`/`max`; `SearchField` expands `autosave:`/`onsearch:`;
+    /// `DatetimeLocalField` reparses `min:`/`max:` and reads
+    /// `include_seconds:`.
     fn rewritten_option(method: &str, args: &[Expr]) -> Option<&'static str> {
         let rewritten: &[&'static str] = match method {
             "number_field" | "range_field" => &["in", "within"],
             "search_field" => &["autosave", "onsearch"],
+            "datetime_local_field" => &["min", "max", "include_seconds"],
             _ => return None,
         };
         let (_, opts) = crate::lower::classify_form_builder_args(args);
@@ -107,9 +157,797 @@ fn unlowered_form_builder_calls(app: &App) -> Vec<Diagnostic> {
             rewritten.iter().find(|o| **o == key).copied()
         })
     }
+    // A `fields_for` block's builder is the outer form's class in Rails, though the analysis types one inside another as
+    // the base: carry the class in, and report an override called on it as the outer level's is.
+    fn nested(expr: &Expr, overrides: &Overrides, scope: &[(Symbol, crate::ident::ClassId)], out: &mut Vec<Diagnostic>) {
+        // A block that binds a name again (`others.each do |child|`) hides the builder of that name inside it.
+        if let ExprNode::Lambda { params, body, .. } = &*expr.node
+            && scope.iter().any(|(n, _)| params.contains(n))
+        {
+            let inner: Vec<_> = scope.iter().filter(|(n, _)| !params.contains(n)).cloned().collect();
+            nested(body, overrides, &inner, out);
+            return;
+        }
+        let class_of = |r: &Expr| -> Option<crate::ident::ClassId> {
+            match &*r.node {
+                ExprNode::Var { name, .. } => scope.iter().rev().find(|(n, _)| n == name).map(|(_, c)| c.clone()),
+                _ => None,
+            }
+            .or_else(|| match &r.ty {
+                Some(Ty::Class { id, .. }) if overrides.contains_key(id.0.as_str()) => Some(id.clone()),
+                _ => None,
+            })
+        };
+        if let ExprNode::Send { recv: Some(r), method, block, .. } = &*expr.node
+            && let Some(class) = class_of(r)
+        {
+            let typed_as_it = matches!(&r.ty, Some(Ty::Class { id, .. }) if *id == class);
+            if !typed_as_it && !expr.span.is_synthetic() && overrides.get(class.0.as_str()).is_some_and(|o| o.contains(method.as_str())) {
+                out.push(Diagnostic::unsupported(
+                    expr.span,
+                    None,
+                    "custom form builder method",
+                    format!("`form.{}` is {}'s own method, which runs on Rails' FormBuilder at request time, carried by the Ruby family's runtime only", method.as_str(), class.0.as_str()),
+                ));
+            }
+            if method.as_str() == "fields_for"
+                && let Some(b) = block
+                && let ExprNode::Lambda { params, body, .. } = &*b.node
+                && let Some(param) = params.first()
+            {
+                let mut inner = scope.to_vec();
+                inner.push((param.clone(), class));
+                nested(body, overrides, &inner, out);
+                if let ExprNode::Send { recv, args, .. } = &*expr.node {
+                    for e in recv.iter().chain(args.iter()) {
+                        nested(e, overrides, scope, out);
+                    }
+                }
+                return;
+            }
+        }
+        expr.node.for_each_child(&mut |c| nested(c, overrides, scope, out));
+    }
+    // Rails adds the persisted child's hidden id unless the body wrote it at render; one written only under a
+    // condition is known then, and the lowering decides at compile time.
+    fn conditional_hidden_id(e: &Expr, param: &Symbol, under: bool) -> bool {
+        if let ExprNode::Send { recv: Some(r), method, args, .. } = &*e.node
+            && under
+            && method.as_str() == "hidden_field"
+            && matches!(&*r.node, ExprNode::Var { name, .. } if name == param)
+            && matches!(args.first().map(|a| &*a.node), Some(ExprNode::Lit { value: crate::expr::Literal::Sym { value } }) if value.as_str() == "id")
+        {
+            return true;
+        }
+        let branch = under || matches!(&*e.node, ExprNode::If { .. } | ExprNode::Case { .. } | ExprNode::While { .. } | ExprNode::BoolOp { .. } | ExprNode::Lambda { .. });
+        let mut found = false;
+        e.node.for_each_child(&mut |c| found |= conditional_hidden_id(c, param, branch));
+        found
+    }
+    fn nested_attributes_fields(nested: &crate::det::HashMap<(String, String), bool>, expr: &Expr, out: &mut Vec<Diagnostic>) {
+        if let ExprNode::Send { recv: Some(r), method, args, block: Some(b), .. } = &*expr.node
+            && method.as_str() == "fields_for"
+            && let Some(Ty::Class { args: tyargs, .. }) = &r.ty
+            && let [Ty::Class { id: model, .. }] = tyargs.as_slice()
+            && let Some(ExprNode::Lit { value: crate::expr::Literal::Sym { value: assoc } }) = args.first().map(|a| &*a.node)
+            && nested.contains_key(&(model.0.as_str().to_string(), assoc.as_str().to_string()))
+            && let ExprNode::Lambda { params, body, .. } = &*b.node
+            && let Some(param) = params.first()
+            && conditional_hidden_id(body, param, false)
+        {
+            out.push(Diagnostic::unsupported(
+                expr.span,
+                None,
+                "fields_for nested attributes",
+                format!("`fields_for :{}` writes the record's hidden id only under a condition: Rails adds it unless the body wrote it at render, which the lowering decides at compile time", assoc.as_str()),
+            ));
+        }
+        expr.node.for_each_child(&mut |c| nested_attributes_fields(nested, c, out));
+    }
+    // A `fields_for` builder handed to a partial: the partial calls the object, which only the Ruby family's overlay builds.
+    fn nested_builder_renders(expr: &Expr, params: &[Symbol], out: &mut Vec<Diagnostic>) {
+        if let ExprNode::Lambda { params: own, body, .. } = &*expr.node
+            && params.iter().any(|p| own.contains(p))
+        {
+            let inner: Vec<_> = params.iter().filter(|p| !own.contains(p)).cloned().collect();
+            nested_builder_renders(body, &inner, out);
+            return;
+        }
+        if let ExprNode::Send { method, block: Some(b), .. } = &*expr.node
+            && method.as_str() == "fields_for"
+            && let ExprNode::Lambda { params: own, body, .. } = &*b.node
+            && let Some(param) = own.first()
+        {
+            let mut inner = params.to_vec();
+            inner.push(param.clone());
+            nested_builder_renders(body, &inner, out);
+            if let ExprNode::Send { recv, args, .. } = &*expr.node {
+                for e in recv.iter().chain(args.iter()) {
+                    nested_builder_renders(e, params, out);
+                }
+            }
+            return;
+        }
+        if let ExprNode::Send { recv: None, method, args, .. } = &*expr.node
+            && method.as_str() == "render"
+            && !expr.span.is_synthetic()
+        {
+            fn hands(e: &Expr, params: &[Symbol]) -> bool {
+                match &*e.node {
+                    ExprNode::Var { name, .. } => params.contains(name),
+                    ExprNode::Hash { entries, .. } => entries.iter().any(|(_, v)| hands(v, params)),
+                    _ => false,
+                }
+            }
+            if args.iter().any(|a| hands(a, params)) {
+                // The Ruby family builds Rails' FormBuilder for it, which no other tree carries.
+                out.push(Diagnostic::unsupported(
+                    expr.span,
+                    None,
+                    "custom form builder method",
+                    "a `fields_for` builder handed to a partial is Rails' FormBuilder object at request time, carried by the Ruby family's runtime only".to_string(),
+                ));
+            }
+        }
+        expr.node.for_each_child(&mut |c| nested_builder_renders(c, params, out));
+    }
+    let mut out = Vec::new();
+    let overrides = crate::lower::view::form_builder_overrides(app);
+    let nested_attributes = crate::lower::view::nested_attribute_associations(app);
+    for view in &app.views {
+        visit(app, &overrides, &view.body, &mut out);
+        nested(&view.body, &overrides, &[], &mut out);
+        nested_builder_renders(&view.body, &[], &mut out);
+        nested_attributes_fields(&nested_attributes, &view.body, &mut out);
+    }
+    out
+}
+
+/// Why the lowering can't write Rails' value for a `datetime_local_field`
+/// call, if it can't. Rails (`Tags::DatetimeField#render`, actionview
+/// 8.1.4) writes a String `value:` as given and formats any other value
+/// as `%Y-%m-%dT%T`; with no `value:` it formats the record's. The
+/// lowering formats a datetime or date column's stored text, which is the
+/// zone's wall time only when the app's zone is UTC, and writes a string
+/// column's value as given. `min:`/`max:`/`include_seconds:` are refused
+/// with the other rewritten options.
+fn datetime_local_refusal(app: &App, builder: Option<&Ty>, args: &[Expr]) -> Option<String> {
+    use crate::expr::Literal;
+    use crate::schema::ColumnType;
+    let (field, opts) = crate::lower::classify_form_builder_args(args);
+    let value = opts.unwrap_or_default().iter().find_map(|(k, v)| {
+        matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "value").then_some(v)
+    });
+    if let Some(v) = value {
+        return (!matches!(&*v.node, ExprNode::Lit { value: Literal::Str { .. } | Literal::Nil }))
+            .then(|| "a `value:` that is not a String literal (or nil) is formatted by Rails at render, which the lowering doesn't model".to_string());
+    }
+    let field = field?;
+    let model = match builder {
+        Some(Ty::Class { args, .. }) => match args.as_slice() {
+            [Ty::Class { id, .. }] => app.models.iter().find(|m| m.name.0 == id.0),
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(model) = model else {
+        return Some(format!("the form's record isn't a known model, so the type of `{field}` that decides Rails' value is unknown"));
+    };
+    let column = app.schema.tables.get(&model.table.0).and_then(|t| t.columns.iter().find(|c| c.name.as_str() == field));
+    match column.map(|c| &c.col_type) {
+        Some(ColumnType::DateTime) if crate::emit::ruby::app_presents_time_zoned(app) => Some(format!(
+            "`{field}` is shown in the app's `config.time_zone`, and the lowering writes the stored UTC time"
+        )),
+        Some(ColumnType::DateTime | ColumnType::Date | ColumnType::String { .. } | ColumnType::Text) => None,
+        Some(_) => Some(format!("`{field}` is not a datetime, date or string column, so its value isn't one the lowering formats")),
+        None => Some(format!("`{field}` is not a column of {}, so its value isn't one the lowering formats", model.name.0)),
+    }
+}
+
+/// The `form.datetime_local_field` calls whose value is a datetime or
+/// date column's, read from the record (no `value:`): what
+/// `ViewHelpers.datetime_local_value_attr` formats from the column's
+/// text. `project::report_datetime_local_reads` refuses them on the
+/// targets whose runtime reads the column as anything else.
+pub(crate) fn datetime_local_time_reads(app: &App) -> Vec<crate::span::Span> {
+    fn visit(app: &App, expr: &Expr, out: &mut Vec<crate::span::Span>) {
+        if let ExprNode::Send { recv: Some(r), method, args, .. } = &*expr.node
+            && !expr.span.is_synthetic()
+            && method.as_str() == "datetime_local_field"
+            && let Some(Ty::Class { id, args: model, .. }) = &r.ty
+            && id.0.as_str() == "ActionView::Helpers::FormBuilder"
+        {
+            let (field, opts) = crate::lower::classify_form_builder_args(args);
+            let has_value = opts.unwrap_or_default().iter().any(|(k, _)| {
+                matches!(&*k.node, ExprNode::Lit { value: crate::expr::Literal::Sym { value } } if value.as_str() == "value")
+            });
+            let column = match (field, model.as_slice()) {
+                (Some(field), [Ty::Class { id, .. }]) => app
+                    .models
+                    .iter()
+                    .find(|m| m.name.0 == id.0)
+                    .and_then(|m| app.schema.tables.get(&m.table.0))
+                    .and_then(|t| t.columns.iter().find(|c| c.name.as_str() == field)),
+                _ => None,
+            };
+            if !has_value
+                && column.is_some_and(|c| matches!(c.col_type, crate::schema::ColumnType::DateTime | crate::schema::ColumnType::Date))
+            {
+                out.push(expr.span);
+            }
+        }
+        expr.node.for_each_child(&mut |child| visit(app, child, out));
+    }
     let mut out = Vec::new();
     for view in &app.views {
-        visit(&view.body, &mut out);
+        visit(app, &view.body, &mut out);
+    }
+    out
+}
+
+/// A `render … do … end` in a view. The view lowering captures the block
+/// into a String and passes it as the partial's yielded body
+/// (`render "x" do`, `render layout: "x" do`), which is Rails' answer only
+/// when the partial yields once, at its top level: Rails runs the block at
+/// each `yield` (a partial yielding twice renders `1|2`). The body rides
+/// the partial's record slot, so a partial with strict locals, or one
+/// reading (or passed) its dir-convention record local, would see the
+/// body there. Those are refused, as is any other block-form render
+/// (`render partial: "x", locals: … do` raises in Rails).
+/// A view's `render partial: <computed>` (maybe's `render partial: permitted_import_configuration_path(@import)`): the
+/// lowering dispatches a runtime name only over the pool a controller assigns an ivar, so this one was emitted as a bare
+/// `render(…)` in the view's module, which has no such method, and the page raised.
+fn unmodeled_computed_partial_renders(app: &App) -> Vec<Diagnostic> {
+    use crate::lower::view::classify_render_partial;
+    fn computed(args: &[Expr]) -> bool {
+        let Some(ExprNode::Hash { entries, .. }) = args.first().map(|a| &*a.node) else { return false };
+        entries.iter().any(|(k, v)| {
+            matches!(&*k.node, ExprNode::Lit { value: crate::expr::Literal::Sym { value } } if value.as_str() == "partial")
+                && !matches!(&*v.node, ExprNode::Lit { .. } | ExprNode::Var { .. } | ExprNode::Ivar { .. })
+        })
+    }
+    fn visit(e: &Expr, unreachable: bool, out: &mut Vec<Diagnostic>) {
+        if let ExprNode::Send { recv: None, method, args, block: None, .. } = &*e.node
+            && method.as_str() == "render"
+            && !e.span.is_synthetic()
+            && computed(args)
+            && classify_render_partial(None, method.as_str(), args, None, &|_| true, &|_| true).is_none()
+        {
+            let why = "the partial's name is computed when the page renders, and the lowering dispatches a runtime name only over the partials a controller assigns an ivar";
+            let mut d = Diagnostic::unsupported(e.span, None, "render of a computed partial", why);
+            // A template no request reaches keeps it as a warning, as the other render reports do.
+            if unreachable {
+                d.severity = crate::diagnostic::Severity::Warning;
+            }
+            out.push(d);
+        }
+        e.node.for_each_child(&mut |c| visit(c, unreachable, out));
+    }
+    let mut out = Vec::new();
+    for view in &app.views {
+        visit(&view.body, app.unreachable_views.contains(&view.name), &mut out);
+    }
+    out
+}
+
+/// A view's `render` of an object (`render(Widget.new)`) that is not known to render itself: Rails asks the object to
+/// (`render_in(view_context)`), which only `lower::renderable` models, for an object typed as answering it. Left alone it was emitted as a bare `render(…)` in the
+/// view's module, which has no such method, so it raised when the page rendered.
+fn unmodeled_object_renders(app: &App) -> Vec<Diagnostic> {
+    use crate::lower::view::classify_render_partial;
+    fn visit(app: &App, e: &Expr, out: &mut Vec<Diagnostic>) {
+        if let ExprNode::Send { recv: None, method, args, block: None, .. } = &*e.node
+            && method.as_str() == "render"
+            && crate::lower::renderable::rendered_object(app, e).is_none()
+            && !e.span.is_synthetic()
+            && let Some(first) = args.first()
+            && matches!(&*first.node, ExprNode::Send { .. } | ExprNode::Const { .. })
+            && classify_render_partial(None, method.as_str(), args, None, &|_| true, &|_| false).is_none()
+        {
+            let why = "Rails asks the object to render itself (`render_in(view_context)`), and this object is not known to answer it";
+            out.push(Diagnostic::unsupported(e.span, None, "render of an object", why));
+        }
+        e.node.for_each_child(&mut |c| visit(app, c, out));
+    }
+    let mut out = Vec::new();
+    for view in &app.views {
+        visit(app, &view.body, &mut out);
+    }
+    out
+}
+
+fn unmodeled_block_renders(app: &App) -> Vec<Diagnostic> {
+    use crate::lower::view::{classify_render_partial, RenderPartial};
+    // Bare `yield`s, and whether any sits inside a loop: a `while`, or the
+    // block of a method that runs it per element. A block run once
+    // (`form_with … do |form|`, `content_tag … do`) yields once.
+    fn yields(e: &Expr, nested: bool, count: &mut usize, in_block: &mut bool) {
+        if let ExprNode::Yield { args } = &*e.node
+            && args.is_empty()
+        {
+            *count += 1;
+            *in_block |= nested;
+        }
+        let iterates = match &*e.node {
+            ExprNode::While { .. } => true,
+            ExprNode::Send { method, block: Some(_), .. } => matches!(
+                method.as_str(),
+                "each" | "each_with_index" | "each_with_object" | "each_slice" | "each_cons" | "each_pair"
+                    | "each_key" | "each_value" | "map" | "collect" | "flat_map" | "filter_map" | "select"
+                    | "filter" | "reject" | "times" | "upto" | "downto" | "step" | "loop" | "sum" | "inject"
+                    | "reduce" | "group_by" | "partition" | "sort_by" | "min_by" | "max_by" | "find_each"
+                    | "find_in_batches" | "in_batches" | "cycle" | "zip"
+            ),
+            _ => false,
+        };
+        let nested = nested || iterates;
+        e.node.for_each_child(&mut |c| yields(c, nested, count, in_block));
+    }
+    let carrying = crate::lower::view_to_library::yield_carrying_partials(app);
+    let reason = |e: &Expr, caller_dir: &str| -> Option<&'static str> {
+        let ExprNode::Send { recv, method, args, block: Some(block), .. } = &*e.node else { return None };
+        // Not an object that renders itself: the lowering hands the block to its `render_in` (a component's slots).
+        if method.as_str() != "render" || recv.is_some() || crate::lower::renderable::rendered_object(app, e).is_some() {
+            return None;
+        }
+        let Some(RenderPartial::LayoutBlock { layout, locals, block }) =
+            classify_render_partial(recv.as_ref(), method.as_str(), args, Some(block), &|_| true, &|_| false)
+        else {
+            return Some("only `render \"partial\"[, locals] do … end` and `render layout: \"partial\" do … end` are modeled (Rails raises for `render partial: …, locals: … do`)");
+        };
+        if let ExprNode::Lambda { params, rest_param, extra_params, block_param, .. } = &*block.node
+            && (!params.is_empty() || rest_param.is_some() || !extra_params.is_empty() || block_param.is_some())
+        {
+            return Some("a block with parameters is not modeled; the partial's `yield` passes it none");
+        }
+        let (dir, base) = match layout.rsplit_once('/') {
+            Some((d, b)) => (d.to_string(), b.to_string()),
+            None => (caller_dir.to_string(), layout.to_string()),
+        };
+        let full = format!("{dir}/_{base}");
+        let partial = app.views.iter().find(|v| v.name.as_str() == full)?;
+        if partial.strict_locals.is_some() {
+            return Some("the partial declares strict locals, and the yielded body would take its first local's slot");
+        }
+        let (mut count, mut in_block) = (0, false);
+        yields(&partial.body, false, &mut count, &mut in_block);
+        if count != 1 || in_block {
+            return Some("the partial does not yield exactly once at its top level; Rails runs the block at each `yield`, which a captured string doesn't");
+        }
+        // The lowering's own answer (its effective record local, every
+        // format of the partial): a partial outside it reads that local.
+        let Some(record) = carrying.get(partial.name.as_str()) else {
+            return Some("the partial's yielded body rides its record local, which this partial (or another format of it) also reads");
+        };
+        let passed = locals.is_some_and(|ls| {
+            ls.iter().any(|(k, _)| matches!(&*k.node, ExprNode::Lit { value: crate::expr::Literal::Sym { value } } if value.as_str() == record.as_str()))
+        });
+        if passed {
+            return Some("the partial's yielded body rides its record local, which this render also passes");
+        }
+        None
+    };
+    fn visit(e: &Expr, caller_dir: &str, reason: &dyn Fn(&Expr, &str) -> Option<&'static str>, out: &mut Vec<Diagnostic>) {
+        if !e.span.is_synthetic()
+            && let Some(why) = reason(e, caller_dir)
+        {
+            out.push(Diagnostic::unsupported(e.span, None, "render with a block", why));
+        }
+        e.node.for_each_child(&mut |c| visit(c, caller_dir, reason, out));
+    }
+    let mut out = Vec::new();
+    for view in &app.views {
+        let dir = view.name.as_str().rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        visit(&view.body, dir, &reason, &mut out);
+    }
+    out
+}
+
+/// A `current_page?` that `ingest::current_page` left as written: Rails
+/// answers it through `url_for(options)` (an options hash, or
+/// `check_parameters:`/`method:`), which the runtime does not model.
+fn unlowered_current_page(app: &App) -> Vec<Diagnostic> {
+    // The app's own `current_page?` is a call like any other: a body it
+    // answers is left out of `for_each_view_context_body`.
+    fn visit(expr: &Expr, out: &mut Vec<Diagnostic>) {
+        if let ExprNode::Send { recv: None, method, .. } = &*expr.node
+            && method.as_str() == "current_page?"
+            && !expr.span.is_synthetic()
+        {
+            let reason = "only a path or URL argument is modeled (not an options hash, a splat, `check_parameters:` or `method:`)";
+            out.push(Diagnostic::unsupported(expr.span, None, "current_page?", reason));
+        }
+        // `ingest::current_page` rewrites before types: a path analysis
+        // can't type as a String (a record, which Rails passes to
+        // `url_for`; a Hash; a value that may be nil) would reach the
+        // runtime's `path.bytes`.
+        if let ExprNode::Send { recv: Some(r), method, args, .. } = &*expr.node
+            && method.as_str() == "current_page_match?"
+            && matches!(&*r.node, ExprNode::Const { path } if path.len() == 2 && path[0].as_str() == "ActionView" && path[1].as_str() == "ViewHelpers")
+            && args.get(4).is_some_and(|path| !matches!(path.ty, Some(crate::ty::Ty::Str)))
+            && !expr.span.is_synthetic()
+        {
+            let reason = "its argument is not known to be a String path or URL; a record or an options hash goes through Rails' `url_for`, which is not modeled";
+            out.push(Diagnostic::unsupported(expr.span, None, "current_page?", reason));
+        }
+        expr.node.for_each_child(&mut |child| visit(child, out));
+    }
+    let mut out = Vec::new();
+    crate::ingest::current_page::for_each_view_context_body(app, &mut |body| visit(body, &mut out));
+    out
+}
+
+/// `stylesheet_link_tag` in an `app/helpers` method that
+/// `tag_builder::rewrite_stylesheet_link_tag` leaves as written: a Symbol
+/// name (a stylesheet group a view expands from its stylesheet list, which
+/// a helper doesn't have) or arguments other than a name and an optional
+/// literal options hash. Nothing answers the bare call in a helper module.
+/// An app's own `stylesheet_link_tag` is a call like any other.
+fn helper_stylesheet_link_tags(app: &App) -> Vec<Diagnostic> {
+    if crate::lower::tag_builder::app_defines_stylesheet_link_tag(app) {
+        return Vec::new();
+    }
+    fn visit(expr: &Expr, out: &mut Vec<Diagnostic>) {
+        if let ExprNode::Send { recv: None, method, args, block, .. } = &*expr.node
+            && method.as_str() == "stylesheet_link_tag"
+            && !expr.span.is_synthetic()
+        {
+            let opaque = |e: &Expr| {
+                matches!(
+                    &*e.node,
+                    ExprNode::Splat { .. }
+                        | ExprNode::KeywordSplat { .. }
+                        | ExprNode::ForwardArgs
+                        | ExprNode::ForwardKeywords
+                        | ExprNode::ForwardKeywordsWithPairs { .. }
+                )
+            };
+            let shape_ok = match &args[..] {
+                [n] => !opaque(n) && !matches!(&*n.node, ExprNode::Hash { .. }),
+                [n, o] => {
+                    !opaque(n)
+                        && matches!(&*o.node, ExprNode::Hash { entries, .. } if !entries.iter().any(|(k, v)| opaque(k) || opaque(v)))
+                }
+                _ => false,
+            };
+            let symbol = args.first().is_some_and(|n| matches!(&*n.node, ExprNode::Lit { value: crate::expr::Literal::Sym { .. } }));
+            // A block: Rails' helper takes none, and the lowering leaves it.
+            if !shape_ok || symbol || block.is_some() {
+                let reason = if symbol {
+                    "in a helper method, a Symbol names a stylesheet group (`:app`, `:all`) that only a view expands; pass the stylesheet's name"
+                } else {
+                    "in a helper method, only a stylesheet name and an optional literal options hash are modeled"
+                };
+                out.push(Diagnostic::unsupported(expr.span, None, "stylesheet_link_tag", reason));
+            }
+        }
+        expr.node.for_each_child(&mut |child| visit(child, out));
+    }
+    let mut out = Vec::new();
+    // A helper including an app module with its own `stylesheet_link_tag`
+    // calls that one, which the lowering leaves as written.
+    let own = crate::lower::tag_builder::helpers_including(app, "stylesheet_link_tag");
+    for lc in app.library_classes.iter().filter(|lc| app.helper_modules.contains(&lc.name) && !own.contains(&lc.name)) {
+        for method in &lc.methods {
+            for default in method.params.iter().filter_map(|p| p.default.as_ref()) {
+                visit(default, &mut out);
+            }
+            visit(&method.body, &mut out);
+        }
+    }
+    out
+}
+
+/// A `time_tag` that `ingest::time_tag` left as written, with the reason
+/// its `lowering` gives (no text argument and no block, whose text Rails
+/// makes with `I18n.l(t, format: …)`, or a shape it does not model).
+/// Nothing else answers the call, so it is refused rather than reaching
+/// the emit.
+fn unlowered_time_tags(app: &App) -> Vec<Diagnostic> {
+    // The app's own `time_tag` is a call like any other.
+    if crate::ingest::time_tag::app_defines_time_tag(app) {
+        return Vec::new();
+    }
+    fn visit(expr: &Expr, unreachable: bool, out: &mut Vec<Diagnostic>) {
+        if !expr.span.is_synthetic()
+            && let Some(Err(reason)) = crate::ingest::time_tag::lowering(expr)
+        {
+            let mut d = Diagnostic::unsupported(expr.span, None, "time_tag", reason);
+            if unreachable {
+                d.severity = crate::diagnostic::Severity::Warning;
+            }
+            out.push(d);
+        }
+        expr.node.for_each_child(&mut |child| visit(child, unreachable, out));
+    }
+    let mut out = Vec::new();
+    // A template no request reaches keeps its errors as warnings, found by
+    // its name: its body's own span can be synthetic (a Jbuilder template's
+    // leading `return if …` guard), which the downgrade below misses (#1689).
+    for view in &app.views {
+        visit(&view.body, app.unreachable_views.contains(&view.name), &mut out);
+    }
+    for lc in &app.library_classes {
+        for method in &lc.methods {
+            visit(&method.body, false, &mut out);
+        }
+    }
+    out
+}
+
+/// `joins(:assoc)` (or a left join) of an association whose scope renders
+/// no ON clause here (`AssocRegistry::join_scope_unrenderable`: an enum
+/// Symbol, `where.not`, a SQL string, an Array or a Range): the lowering
+/// can't write its join, and the runtime would raise on it. Rails puts the
+/// scope in the ON clause, so joining without it would answer rows the
+/// scope excludes. Refused where it is written instead.
+fn unrenderable_association_joins(app: &App) -> Vec<Diagnostic> {
+    let registry = crate::lower::scope_chain::build_assoc_registry(&app.models);
+    if !app.models.iter().any(|m| {
+        m.associations().any(|a| registry.join_scope_unrenderable(&m.name, a.name()))
+    }) {
+        return Vec::new();
+    }
+    let model_of = |recv: &Expr| -> Option<ClassId> {
+        match (&*recv.node, recv.ty.as_ref()) {
+            (_, Some(Ty::Relation { of })) => Some(of.clone()),
+            // A query chain types as an Array of its model (`ty.rs`).
+            (_, Some(Ty::Array { elem })) => match &**elem {
+                Ty::Class { id, .. } if app.models.iter().any(|m| &m.name == id) => Some(id.clone()),
+                _ => None,
+            },
+            (ExprNode::Const { path }, _) => {
+                let name = path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>().join("::");
+                app.models.iter().find(|m| m.name.0.as_str() == name).map(|m| m.name.clone())
+            }
+            _ => None,
+        }
+    };
+    let mut out = Vec::new();
+    fn visit(
+        expr: &Expr,
+        model_of: &dyn Fn(Option<&Expr>) -> Option<ClassId>,
+        registry: &crate::lower::scope_chain::AssocRegistry,
+        out: &mut Vec<Diagnostic>,
+    ) {
+        if let ExprNode::Send { recv, method, args, .. } = &*expr.node
+            && matches!(method.as_str(), "joins" | "joins!" | "left_joins" | "left_outer_joins" | "left_outer_joins!")
+            && let Some(model) = model_of(recv.as_ref())
+        {
+            // Each association a join spec names, with the model it is
+            // declared on: a nested hash's associations are the
+            // preceding association target's (`joins(trees: :branches)`).
+            fn names<'e>(
+                model: &ClassId,
+                spec: &'e Expr,
+                registry: &crate::lower::scope_chain::AssocRegistry,
+                out: &mut Vec<(ClassId, &'e Expr)>,
+            ) {
+                match &*spec.node {
+                    ExprNode::Array { elements, .. } => {
+                        elements.iter().for_each(|e| names(model, e, registry, out))
+                    }
+                    ExprNode::Hash { entries, .. } => {
+                        for (k, v) in entries {
+                            names(model, k, registry, out);
+                            if let ExprNode::Lit { value: crate::expr::Literal::Sym { value } } = &*k.node
+                                && let Some(target) = registry.assoc_target(model, value)
+                            {
+                                names(target, v, registry, out);
+                            }
+                        }
+                    }
+                    _ => out.push((model.clone(), spec)),
+                }
+            }
+            let mut named: Vec<(ClassId, &Expr)> = Vec::new();
+            args.iter().for_each(|arg| names(&model, arg, registry, &mut named));
+            for (model, name) in named {
+                if let ExprNode::Lit { value: crate::expr::Literal::Sym { value } } = &*name.node
+                    && registry.join_scope_unrenderable(&model, value)
+                {
+                    out.push(Diagnostic::unsupported(
+                        name.span,
+                        None,
+                        "association join",
+                        format!(
+                            "`{}(:{})`: the association's scope doesn't render as SQL here (only hash `where`s of \
+                             literals do), so its join can't carry the scope in its ON clause, as Rails' does",
+                            method.as_str(),
+                            value.as_str(),
+                        ),
+                    ));
+                }
+            }
+        }
+        expr.node.for_each_child(&mut |child| visit(child, model_of, registry, out));
+    }
+    // An explicit receiver: a model constant or a query chain.
+    let explicit = |recv: Option<&Expr>| match recv {
+        Some(r) if !matches!(&*r.node, ExprNode::SelfRef) => model_of(r),
+        _ => None,
+    };
+    crate::lower::for_each_emit_body_ref(app, &mut |body| visit(body, &explicit, &registry, &mut out));
+    // A model's scopes and class methods: a bare or `self.` join there is
+    // on that model (`scope :shady, -> { joins(:shady_trees) }`), and an
+    // explicit receiver resolves as anywhere else.
+    for model in &app.models {
+        let own = |recv: Option<&Expr>| match recv {
+            None => Some(model.name.clone()),
+            Some(r) if matches!(&*r.node, ExprNode::SelfRef) => Some(model.name.clone()),
+            Some(r) => model_of(r),
+        };
+        for scope in model.scopes() {
+            visit(&scope.body, &own, &registry, &mut out);
+        }
+        for method in model.methods().filter(|m| m.receiver == crate::dialect::MethodReceiver::Class) {
+            visit(&method.body, &own, &registry, &mut out);
+        }
+    }
+    // A body both walks reach reports its join once.
+    let mut seen = crate::det::HashSet::default();
+    out.retain(|d| seen.insert((d.span, d.message.clone())));
+    out
+}
+
+/// A `simple_format` the view lowering leaves as written: any form but
+/// `sanitize: false` in a template (`lower::view::simple_format_form`
+/// gives the reason), and every call in a library class, which nothing
+/// lowers (an `include ActionView::Helpers::TextHelper` there doesn't
+/// define it, #1824). No runtime defines the bare call, so it is refused
+/// rather than reaching the emit. The app's own `simple_format` is a call
+/// like any other.
+fn unlowered_simple_format(app: &App) -> Vec<Diagnostic> {
+    let name = Symbol::from("simple_format");
+    if app.helper_method_index.contains_key(&name) || app.view_visible_controller_methods.contains(&name) {
+        return Vec::new();
+    }
+    fn visit(expr: &Expr, site: Option<bool>, out: &mut Vec<Diagnostic>) {
+        if !expr.span.is_synthetic()
+            && let ExprNode::Send { recv: None, method, args, .. } = &*expr.node
+            && method.as_str() == "simple_format"
+        {
+            // `Some(unreachable)` for a template, `None` for a library class.
+            let reason = match site {
+                Some(_) => crate::lower::view::simple_format_form(args).err(),
+                None => Some("a library class's `simple_format` is not lowered (only a template's `sanitize: false` form is)"),
+            };
+            if let Some(reason) = reason {
+                let mut d = Diagnostic::unsupported(expr.span, None, "simple_format", reason);
+                if site == Some(true) {
+                    d.severity = crate::diagnostic::Severity::Warning;
+                }
+                out.push(d);
+            }
+        }
+        expr.node.for_each_child(&mut |child| visit(child, site, out));
+    }
+    let mut out = Vec::new();
+    for view in &app.views {
+        visit(&view.body, Some(app.unreachable_views.contains(&view.name)), &mut out);
+    }
+    for lc in &app.library_classes {
+        for method in &lc.methods {
+            visit(&method.body, None, &mut out);
+        }
+    }
+    out
+}
+
+/// A call to `pluralize`, `content_tag` or `simple_format` where a
+/// controller's `helper_method` of that name isn't served, in every
+/// template, by one controller's class-side clone. That is, the name's
+/// `helper_method_index` entry is missing, is an app helper's (whose
+/// insert overwrites a clone), or is a controller that isn't every app
+/// controller or an ancestor of it. The clone doesn't serve every template
+/// either when another controller, or a module that isn't an app helper
+/// (a concern), defines the name, or another controller marks it with
+/// `helper_method`. Rails' `helper_method` calls the method on the
+/// controller that renders the template, so a subclass's override wins in
+/// its templates, with or without its own `helper_method`. Rails calls the
+/// controller's method in the templates that controller and its
+/// subclasses render, and the app helper's or ActionView's in the others.
+/// Which controller renders a template isn't decided statically (`render
+/// template:` reaches any of them), so the call is refused rather than
+/// routed one way for every template.
+/// A `link_to_if` / `link_to_unless` block parameter shadowing a template
+/// local that only an earlier nested body (an `if` branch, a `case` arm)
+/// assigned: Ruby keeps that local after the block, and the lowering's
+/// save and restore would read it where a compiled target's scope doesn't
+/// have it, so the block isn't lowered
+/// (`lower::view_to_library::link_to_if_params_shadowing_nested_locals`).
+fn link_to_if_params_shadowing_nested_locals(app: &App) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for view in &app.views {
+        for (span, method) in crate::lower::view_to_library::link_to_if_params_shadowing_nested_locals(&view.body) {
+            if span.is_synthetic() {
+                continue;
+            }
+            let mut d = Diagnostic::unsupported(
+                span,
+                None,
+                method.as_str(),
+                "a `link_to_if`/`link_to_unless` block parameter shadows a template local assigned in an earlier nested block; not modeled".to_string(),
+            );
+            if app.unreachable_views.contains(&view.name) {
+                d.severity = crate::diagnostic::Severity::Warning;
+            }
+            out.push(d);
+        }
+    }
+    out
+}
+
+fn controller_shadowed_view_helpers(app: &App) -> Vec<Diagnostic> {
+    // `owner` is `controller` or one of its ancestors.
+    let descends = |controller: &crate::dialect::Controller, owner: &ClassId| {
+        let mut current = Some(controller);
+        let mut seen = crate::det::HashSet::default();
+        while let Some(c) = current {
+            if c.name == *owner {
+                return true;
+            }
+            if !seen.insert(c.name.0.as_str()) {
+                break;
+            }
+            current = c.parent.as_ref().and_then(|p| app.controllers.iter().find(|o| o.name == *p));
+        }
+        false
+    };
+    let names: Vec<&str> = ["pluralize", "content_tag", "simple_format"]
+        .into_iter()
+        .filter(|n| {
+            let name = Symbol::from(*n);
+            let overridden = |owner: &ClassId| {
+                app.controllers.iter().filter(|c| c.name != *owner).any(|c| {
+                    c.actions().any(|a| a.name == name)
+                        || crate::lower::controller_to_library::helper_method_marked_names(c).contains(&name)
+                }) || app.library_classes.iter().any(|lc| {
+                    lc.is_module
+                        && !app.helper_modules.contains(&lc.name)
+                        && lc.methods.iter().any(|m| m.name == name && matches!(m.receiver, crate::dialect::MethodReceiver::Instance))
+                })
+            };
+            let everywhere = app.helper_method_index.get(&name).is_some_and(|owner| {
+                app.controllers.iter().any(|c| c.name == *owner)
+                    && app.controllers.iter().all(|c| descends(c, owner))
+                    && !overridden(owner)
+            });
+            app.view_visible_controller_methods.contains(&name) && !everywhere
+        })
+        .collect();
+    if names.is_empty() {
+        return Vec::new();
+    }
+    fn visit(expr: &Expr, names: &[&str], unreachable: bool, out: &mut Vec<Diagnostic>) {
+        if !expr.span.is_synthetic()
+            && let ExprNode::Send { recv: None, method, .. } = &*expr.node
+            && names.contains(&method.as_str())
+        {
+            let mut d = Diagnostic::unsupported(
+                expr.span,
+                None,
+                method.as_str(),
+                format!(
+                    "a controller's `helper_method :{0}` is called in the templates that controller renders, and an app helper's or ActionView's `{0}` in the others; which controller renders a template isn't decided statically",
+                    method.as_str()
+                ),
+            );
+            if unreachable {
+                d.severity = crate::diagnostic::Severity::Warning;
+            }
+            out.push(d);
+        }
+        expr.node.for_each_child(&mut |child| visit(child, names, unreachable, out));
+    }
+    let mut out = Vec::new();
+    for view in &app.views {
+        visit(&view.body, &names, app.unreachable_views.contains(&view.name), &mut out);
+    }
+    for lc in &app.library_classes {
+        for method in &lc.methods {
+            visit(&method.body, &names, false, &mut out);
+        }
     }
     out
 }
@@ -117,6 +955,35 @@ fn unlowered_form_builder_calls(app: &App) -> Vec<Diagnostic> {
 /// Builder methods the view lowering serves outside
 /// `classify_form_builder_method`.
 const FORM_BUILDER_HANDLED_ELSEWHERE: &[&str] = &["object"];
+
+/// A `delegated_type` ingest did not expand (`ingest::delegated_type`
+/// fails closed on an option it does not model, or a `types:` list it
+/// cannot read). The statement survives as an unknown call that no
+/// target emits, so the polymorphic `belongs_to`, its required check
+/// and every generated reader would vanish without a word.
+fn unexpanded_delegated_types(app: &App) -> Vec<Diagnostic> {
+    let mut out: Vec<Diagnostic> = Vec::new();
+    for model in &app.models {
+        for item in &model.body {
+            let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { continue };
+            // `self.delegated_type` too, which the expansion does not take.
+            let ExprNode::Send { recv, method, .. } = &*expr.node else { continue };
+            if recv.as_ref().is_some_and(|r| !matches!(&*r.node, ExprNode::SelfRef)) {
+                continue;
+            }
+            if method.as_str() != "delegated_type" || out.iter().any(|d| d.span == expr.span) {
+                continue;
+            }
+            out.push(Diagnostic::unsupported(
+                expr.span,
+                None,
+                "delegated_type",
+                "not a receiverless call whose options and `types:` list the expansion models (a literal or constant list of class names; `foreign_key`, `foreign_type`, `primary_key`, `optional`, `touch`, `default`, `dependent: :destroy`), so no target defines the association or its readers",
+            ));
+        }
+    }
+    out
+}
 
 fn devise_refusals(app: &App) -> Vec<Diagnostic> {
     let mut out = Vec::new();
@@ -328,22 +1195,32 @@ fn diagnose_controller_output_collisions(app: &App, out: &mut Vec<Diagnostic>) {
     }
 }
 
-/// [`diagnose`] plus the missing-preload coverage triple, for report
-/// skins that state the denominator (#64: "0 findings" must be
-/// distinguishable from "couldn't check").
-pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
+/// What [`diagnose_with_coverage`] collects before the forwarding, private-call,
+/// filter-target and preload passes: the diagnostics in the order they are reported.
+fn diagnose_head(app: &App) -> Vec<Diagnostic> {
     let mut out = app.routes.diagnostics.clone();
     diagnose_controller_output_collisions(app, &mut out);
+    // A `default_url_options` whose path segments the route helpers do not take.
+    out.extend(crate::lower::route_param_recall::diagnose(app));
     // Only validated synthesized Alba serializers, with per-constructor
     // evidence; this does not widen the general library diagnostic policy.
     out.extend(super::alba::diagnose(app));
+    out.extend(unmodeled_block_renders(app));
+    out.extend(unmodeled_object_renders(app));
+    out.extend(unmodeled_computed_partial_renders(app));
     out.extend(crate::gems::extension_gem_refusals(app, None));
     // graphql-ruby object types: their bodies, and each `null: false`
     // field's resolved value.
     out.extend(super::graphql::diagnose(app, diagnose_expr));
-    out.extend(super::enum_raw_input::diagnose(app));
     out.extend(super::data::diagnose(app));
     out.extend(super::database_identity::diagnose(app));
+    out.extend(crate::lower::model_to_library::encrypts_diagnostics(app));
+    out.extend(crate::lower::model_to_library::unrolled_loop_diagnostics(app));
+    out.extend(route_guard_untyped_sends(app));
+    // A support file the class ingest left out, at what failed it.
+    out.extend(app.ingest_drops.iter().map(|drop| Diagnostic::ingest_unsupported(drop.span, drop.message.clone())));
+    out.extend(conditional_declarations_reopened(app));
+    out.extend(unsettled_conditional_writes(app));
     // Constructor refusals must also reach executable class constants and
     // parameter defaults, which the ordinary method diagnostic policy omits.
     fn collect_storage_constructors(expr: &Expr, out: &mut Vec<Diagnostic>) {
@@ -384,7 +1261,11 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
             if let Some(DiagnosticKind::Unsupported { target, construct, detail }) = &expr.diagnostic()
                 && construct.as_str() != crate::diagnostic::CONSTRUCTOR_KEYWORD_ARGUMENTS
             {
-                out.push(Diagnostic::unsupported(expr.span, target.clone(), construct.as_str(), detail.clone()));
+                let mut d = Diagnostic::unsupported(expr.span, target.clone(), construct.as_str(), detail.clone());
+                if expr.decisions & crate::expr::UNCALLED_DEFINER != 0 {
+                    d.severity = crate::diagnostic::Severity::Warning;
+                }
+                out.push(d);
             }
         }
         // Not dropped with the policy's other misses: the typer stamps it only in place of an Object-extension refusal.
@@ -402,7 +1283,12 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
     // this pass covers executable support methods and initializers.
     for class in app.library_classes.iter().chain(app.rails_application.iter()) {
         for method in &class.methods {
-            collect_constants(&method.body, &mut out);
+            if class.name.0.as_str() == crate::ingest::puma_boot::CLASS {
+                diagnose_expr_in(&method.body, &mut out, false);
+                unchecked_boot_calls(&method.body, method.name_span, &mut out);
+            } else {
+                collect_constants(&method.body, &mut out);
+            }
             for param in &method.params {
                 if let Some(default) = &param.default { collect_constants(default, &mut out); }
             }
@@ -426,7 +1312,25 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
     }
     out.extend(attribute_macro_refusals(app));
     out.extend(unlowered_form_builder_calls(app));
+    out.extend(unlowered_current_page(app));
+    out.extend(helper_stylesheet_link_tags(app));
+    out.extend(unlowered_time_tags(app));
+    out.extend(unrenderable_association_joins(app));
+    out.extend(unlowered_simple_format(app));
+    out.extend(controller_shadowed_view_helpers(app));
+    out.extend(link_to_if_params_shadowing_nested_locals(app));
     out.extend(devise_refusals(app));
+    out.extend(unexpanded_delegated_types(app));
+    // A `direct` helper's `route_for` that names no route stays a call
+    // to a method nothing defines.
+    out.extend(crate::lower::routes_to_library::direct::unresolved_route_for_calls(app).into_iter().map(|span| {
+        Diagnostic::unsupported(
+            span,
+            None,
+            "route_for",
+            "in a `direct` helper, a name that is not a literal, or an interpolation spelling no named route that takes these arguments, so no target can call it",
+        )
+    }));
     out.extend(overridden_synthesized_accessors(app));
     out.extend(runtime_defined_surfaces(app));
     // A filter's return value is Rails' to discard (`around_action
@@ -472,6 +1376,42 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
         Some(taken) => out.extend(taken.iter().cloned()),
         None => out.extend(diagnose_helper_modules(app)),
     }
+    out.extend(app.unknown_association_targets.iter().cloned());
+    // A pagy before 43's initializer settings pagy9.rb does not carry: the emitted app would paginate without them.
+    if let Some(major) = crate::ingest::pagy_locked_major(app).filter(|m| *m < 9)
+        && let Some(lock) = app.gem_lock.as_ref()
+    {
+        let version = lock.version_of("pagy").unwrap_or_default();
+        out.push(Diagnostic::unsupported(
+            crate::span::Span::synthetic(),
+            None,
+            "pagy",
+            format!("pagy {version} (major {major}) is not modeled: only 9 (runtime pagy9.rb) and 43 (pagy.rb) are"),
+        ));
+    }
+    if app.gem_lock.as_ref().is_some_and(|lock| lock.has("pagy")) && crate::ingest::pagy_locked_before_43(app) {
+        for (span, what) in &app.pagy.unmodeled {
+            out.push(Diagnostic::unsupported(*span, None, "pagy", format!("{what} is not modeled; the emitted app paginates without it")));
+        }
+    }
+    out.extend(app.gem_middleware_refusals.iter().cloned());
+    out.extend(app.included_hoist_conflicts.iter().cloned());
+    out.extend(app.superclass_refusals.iter().cloned());
+    out.extend(app.gem_route_gaps.iter().cloned());
+    // after_initialize bodies are the app's own code run at boot
+    // (`ingest::after_initialize`): checked like a model method, not under
+    // the library policy, so a call with no runtime behind it is an error.
+    if app.runs_after_initialize {
+        for class in app.library_classes.iter().filter(|c| c.name.0.as_str() == crate::app::AFTER_INITIALIZE_RUNNER) {
+            for method in &class.methods {
+                diagnose_expr(&method.body, &mut out);
+                // `run` is generated; only the callbacks carry the app's spans.
+                if !method.name_span.is_synthetic() {
+                    unchecked_callback_calls(&method.body, &mut out);
+                }
+            }
+        }
+    }
     for class in &app.library_classes {
         for initializer in &class.class_ivar_initializers {
             diagnose_expr(initializer, &mut out);
@@ -480,14 +1420,98 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
     if let Some(seeds) = &app.seeds {
         diagnose_expr(seeds, &mut out);
     }
-    out.extend(super::forwarding::diagnose(app));
-    out.extend(super::private_calls::diagnose(app));
-    out.extend(super::filter_targets::diagnose(app));
+    for stmt in &app.boot_program {
+        diagnose_expr(stmt, &mut out);
+    }
+    unresolved_test_constants(app, &mut out);
+    out
+}
 
-    // Static N+1 pass (#64): missing-preload warnings over the typed
-    // query chains, same-procedure and through the controller→view
-    // ivar channel.
-    let (preload_diags, coverage) = preload::missing_preload_report(app);
+/// A test that names a member of a Ruby core or standard-library
+/// namespace that neither Ruby nor the app defines: `Digest::BLAKE3`,
+/// which a gem adds to `Digest` and the app does not declare to
+/// Roundhouse. The tests are emitted with the app, so the reference
+/// reaches the emitted project, where nothing defines it: a strict
+/// target's test build fails on it, and a Ruby one raises `NameError`.
+/// It is the error the app's own code gets for the same constant.
+///
+/// Deliberately narrow. A test body's per-expression constant
+/// diagnostics also fire on names that resolve another way: a class the
+/// test declares inside its own body, a model an RSpec example reaches,
+/// a test-framework class (`Rack::Test::UploadedFile`) the lowering
+/// supplies, a core class the analyzer does not model (`TCPServer`). So
+/// only a path whose first segment is a Ruby namespace, but which is not
+/// itself a Ruby constant or a class of the app, is reported.
+fn unresolved_test_constants(app: &App, out: &mut Vec<Diagnostic>) {
+    use crate::emit::audit::CORE_CONSTANTS;
+    let app_classes: Vec<&str> = app
+        .models
+        .iter()
+        .map(|m| m.name.0.as_str())
+        .chain(app.controllers.iter().map(|c| c.name.0.as_str()))
+        .chain(app.library_classes.iter().map(|c| c.name.0.as_str()))
+        .chain(app.test_modules.iter().flat_map(|t| t.inner_classes.iter().map(|c| c.name.0.as_str())))
+        .collect();
+    let reported = |path: &[Symbol]| -> bool {
+        let segments: Vec<&str> = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect();
+        let [first, _, ..] = segments.as_slice() else { return false };
+        let name = segments.join("::");
+        CORE_CONSTANTS.contains(first)
+            && !CORE_CONSTANTS.contains(&name.as_str())
+            && !app_classes.iter().any(|c| *c == name || c.ends_with(&format!("::{name}")))
+    };
+    fn walk(expr: &Expr, reported: &dyn Fn(&[Symbol]) -> bool, out: &mut Vec<Diagnostic>) {
+        if let ExprNode::Const { path } = &*expr.node
+            && let Some(DiagnosticKind::Unsupported { construct, .. }) = &expr.diagnostic()
+            && construct.as_str() == "constant"
+        {
+            if reported(path) {
+                diagnose_expr(expr, out);
+            }
+            return;
+        }
+        expr.node.for_each_child(&mut |c| walk(c, reported, out));
+    }
+    for module in &app.test_modules {
+        for test in &module.tests {
+            walk(&test.body, &reported, out);
+        }
+        if let Some(setup) = &module.setup {
+            walk(setup, &reported, out);
+        }
+        for helper in &module.helpers {
+            walk(&helper.body, &reported, out);
+        }
+    }
+}
+
+/// [`diagnose`] plus the missing-preload coverage triple, for report
+/// skins that state the denominator (#64: "0 findings" must be
+/// distinguishable from "couldn't check").
+pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
+    // The passes after the head read the app alone, as the head does, so they run beside it
+    // and their findings follow the head's, in this order.
+    let (mut out, (forwarding, (private_calls, filter_targets), (preload_diags, coverage))) = super::parallel::join(
+        || diagnose_head(app),
+        || {
+            let (forwarding, (private_calls_and_filters, preload)) = super::parallel::join(
+                || super::forwarding::diagnose(app),
+                || {
+                    super::parallel::join(
+                        || (super::private_calls::diagnose(app), super::filter_targets::diagnose(app)),
+                        // Static N+1 pass (#64): missing-preload warnings over the typed
+                        // query chains, same-procedure and through the controller→view
+                        // ivar channel.
+                        || preload::missing_preload_report(app),
+                    )
+                },
+            );
+            (forwarding, private_calls_and_filters, preload)
+        },
+    );
+    out.extend(forwarding);
+    out.extend(private_calls);
+    out.extend(filter_targets);
     out.extend(preload_diags);
     unshipped_gem_helpers(app, &mut out);
     let refused_gem_sites: crate::det::HashSet<_> = out.iter().filter_map(|diagnostic| {
@@ -626,16 +1650,150 @@ pub fn diagnose_helper_modules(app: &App) -> Vec<Diagnostic> {
     helper_out
 }
 
+/// A `<stem>_url` call that names no `protocol:` of its own, for a route whose `protocol:` would pick it
+/// (`root to: …, protocol: …`): the emitted helper builds the request's protocol instead. A call naming its own
+/// protocol, and every `_path`, take nothing from the option. Run at ingest (`ingest::app`), before the lowering
+/// rewrites a `_url(host:)` call into a string.
+pub(crate) fn route_protocol_urls(app: &App) -> Vec<Diagnostic> {
+    if app.routes.url_protocols.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    crate::lower::for_each_emit_body_ref(app, &mut |body| {
+        fn visit(e: &Expr, protocols: &[(String, crate::span::Span)], out: &mut Vec<Diagnostic>) {
+            if let ExprNode::Send { recv, method, args, .. } = &*e.node
+                && recv.as_ref().is_none_or(crate::lower::controller_to_library::rewrites::is_rails_url_helpers_chain)
+                && let Some((stem, _)) = protocols.iter().find(|(stem, _)| method.as_str().strip_suffix("_url") == Some(stem.as_str()))
+                && !args.iter().any(|a| matches!(&*a.node, ExprNode::Hash { entries, .. }
+                    if entries.iter().any(|(k, _)| matches!(&*k.node, ExprNode::Lit { value: crate::expr::Literal::Sym { value } } if value.as_str() == "protocol"))))
+                && !e.span.is_synthetic()
+            {
+                out.push(Diagnostic::unsupported(
+                    e.span,
+                    None,
+                    "route protocol",
+                    format!("`{}` takes its protocol from the `{stem}` route's `protocol:`, which is not modeled; pass `protocol:` here", method.as_str()),
+                ));
+            }
+            e.node.for_each_child(&mut |c| visit(c, protocols, out));
+        }
+        visit(body, &app.routes.url_protocols, &mut out);
+    });
+    out
+}
+
+/// A call in an `after_initialize` body that nothing checks: its receiver
+/// is the gradual escape or untyped, or an implicit-self call is
+/// unresolved. In a model method such a call is a warning; a carried
+/// callback runs at boot with no caller to rescue it, so the callback is
+/// carried only when every call resolves and this is an error. One report
+/// per chain: `a.b.c` on an untyped `a` names `b`, the first unchecked link.
+fn unchecked_callback_calls(expr: &Expr, out: &mut Vec<Diagnostic>) {
+    fn unchecked(expr: &Expr) -> bool {
+        match &*expr.node {
+            ExprNode::Send { recv: Some(r), .. } => {
+                matches!(r.ty, Some(Ty::Untyped)) || is_unknown_ty(r.ty.as_ref()) || open_framework_miss(r, expr)
+            }
+            ExprNode::Send { recv: None, .. } => is_unknown_ty(expr.ty.as_ref()),
+            _ => false,
+        }
+    }
+    // Typed on the receiver, yet unchecked: the open class answers a name it does not model untyped, and nothing runs it.
+    fn open_framework_miss(recv: &Expr, call: &Expr) -> bool {
+        matches!(&recv.ty, Some(Ty::Class { id, .. }) if crate::analyze::registry::stdlib::OPEN_FRAMEWORK_RECEIVERS.contains(&id.0.as_str()))
+            && matches!(call.ty, Some(Ty::Untyped))
+    }
+    if let ExprNode::Send { recv, method, .. } = &*expr.node {
+        let link_of_reported_chain = recv.as_ref().is_some_and(|r| unchecked(r));
+        if unchecked(expr) && !link_of_reported_chain && expr.diagnostic().is_none() && !expr.span.is_synthetic() {
+            let why = match recv.as_ref().map(|r| (r, &r.ty)) {
+                Some((r, Some(Ty::Class { id, .. }))) if open_framework_miss(r, expr) => format!("`{}` does not model it", id.0.as_str()),
+                _ => "it has no typed receiver".to_string(),
+            };
+            out.push(Diagnostic::unsupported(
+                expr.span,
+                None,
+                "after_initialize callback call",
+                format!("`{}`: {why}, so nothing checks that the emitted program answers it at boot", method.as_str()),
+            ));
+        }
+    }
+    expr.node.for_each_child(&mut |child| unchecked_callback_calls(child, out));
+}
+
 /// A type is "unknown" if it's `None` or `Ty::Var(n)` (a placeholder the
 /// analyzer set for positions it couldn't resolve). `Ty::Untyped` —
 /// the gradual escape — counts as *known*: the author signed that
 /// position out of checking.
-fn is_unknown_ty(ty: Option<&Ty>) -> bool {
+/// A request constraint the Ruby-family router asks (`lower::route_guards`) runs every request its
+/// path matches, so a call in it on a value the analyzer cannot type (`request.env["warden"].send(…)`)
+/// is an error there, not an unchecked send: answered at runtime, it would raise instead of refusing.
+fn route_guard_untyped_sends(app: &App) -> Vec<Diagnostic> {
+    // `placed`: the nearest enclosing span the source has; a desugared send (`h[k] += 1`) has none of its own.
+    fn visit(expr: &Expr, placed: crate::span::Span, out: &mut Vec<Diagnostic>) {
+        let placed = if expr.span.is_synthetic() { placed } else { expr.span };
+        // The call's own type unknown too: a method the receiver's class does not answer (`format.json?`).
+        // Not one every object answers (`params["id"].nil?`): that cannot raise, whatever the value is.
+        if let ExprNode::Send { recv: Some(r), method, .. } = &*expr.node
+            && !matches!(method.as_str(), "nil?" | "==" | "!=" | "!" | "equal?" | "is_a?" | "kind_of?" | "instance_of?" | "respond_to?" | "to_s" | "inspect" | "frozen?" | "hash" | "class")
+            && (gradual(r.ty.as_ref()) || is_unknown_ty(r.ty.as_ref()) || is_unknown_ty(expr.ty.as_ref()))
+            && expr.diagnostic().is_none()
+        {
+            out.push(Diagnostic::unsupported(
+                placed,
+                None,
+                "request constraint",
+                format!("`{method}` is called on a value the request constraint cannot type, so the router could not ask it"),
+            ));
+        }
+        expr.node.for_each_child(&mut |child| visit(child, placed, out));
+    }
+    let mut out = Vec::new();
+    for class in app.library_classes.iter().filter(|c| c.name.0.as_str() == crate::lower::route_guards::GUARD_CLASS) {
+        for method in &class.methods {
+            // One per constraint, its first such call: the rest follow from the same value.
+            let mut found = Vec::new();
+            visit(&method.body, method.body.span, &mut found);
+            out.extend(found.into_iter().next());
+        }
+    }
+    out
+}
+
+/// Not `Untyped` alone: a Hash read of an untyped value is `untyped | nil`, still nothing the router can check.
+fn gradual(ty: Option<&Ty>) -> bool {
+    match ty {
+        Some(Ty::Untyped) => true,
+        Some(Ty::Union { variants }) => variants.iter().any(|v| gradual(Some(v))),
+        _ => false,
+    }
+}
+
+pub(crate) fn is_unknown_ty(ty: Option<&Ty>) -> bool {
     match ty {
         None => true,
         Some(Ty::Var { .. }) => true,
         _ => false,
     }
+}
+
+fn unchecked_boot_calls(expr: &Expr, source: crate::span::Span, out: &mut Vec<Diagnostic>) {
+    if let ExprNode::Send { recv, method, .. } = &*expr.node {
+        let unchecked = match recv {
+            Some(receiver) => is_unknown_ty(receiver.ty.as_ref()) || matches!(receiver.ty, Some(Ty::Untyped)),
+            None => is_unknown_ty(expr.ty.as_ref()) || matches!(expr.ty, Some(Ty::Untyped)),
+        };
+        if unchecked && expr.diagnostic().is_none() {
+            let span = if expr.span.file.0 == 0 { source } else { expr.span };
+            out.push(Diagnostic::unsupported(
+                span,
+                None,
+                "Puma boot callback call",
+                format!("`{method}` in config/puma.rb has no resolved receiver or method"),
+            ));
+        }
+    }
+    expr.node.for_each_child(&mut |child| unchecked_boot_calls(child, source, out));
 }
 
 /// A send whose explicit receiver the analysis could not type.
@@ -668,7 +1826,7 @@ pub struct UnknownReceiverSend {
 /// True when `method` is registered on the receiver's class (either
 /// side), walking parents and includes. A registered method that returns
 /// `Ty::Var` still counts as resolved for the unknown-receiver ledger.
-fn method_registered_on(
+pub(crate) fn method_registered_on(
     classes: &HashMap<ClassId, ClassInfo>,
     ty: Option<&Ty>,
     method: &Symbol,
@@ -779,6 +1937,20 @@ fn diagnose_expr(expr: &Expr, out: &mut Vec<Diagnostic>) {
 /// same `I18n.with_locale` twice (the call, then the body `Seq` that
 /// takes its tail's type) and once more for nothing. Every other
 /// diagnostic is position-independent and reported regardless.
+fn core_value_lacks(ty: &Ty, method: &str) -> bool {
+    let class = match ty {
+        Ty::Str => "String",
+        Ty::Int => "Integer",
+        Ty::Float => "Float",
+        Ty::Sym => "Symbol",
+        Ty::Array { .. } => "Array",
+        Ty::Hash { .. } => "Hash",
+        _ => return false,
+    };
+    !crate::lower::core_method_names::defined_by_every_object(method)
+        && !crate::lower::core_method_names::core_value_definers(method).contains(&class)
+}
+
 fn diagnose_expr_in(expr: &Expr, out: &mut Vec<Diagnostic>, value_used: bool) {
     // Diagnostic annotations set by the body-typer during analyze.
     // These are the IR-carried path: detection happens once at the
@@ -826,6 +1998,8 @@ fn diagnose_expr_in(expr: &Expr, out: &mut Vec<Diagnostic>, value_used: bool) {
             DiagnosticKind::MissingPreload { association, .. } => {
                 format!("query does not preload :{}", association.as_str())
             }
+            // From `App::ingest_drops`, never an `Expr.diagnostic`.
+            DiagnosticKind::IngestUnsupported { .. } => Diagnostic::stub_text(kind),
             // Produced by `lower::apply_post_analyze_lowerings` as
             // returned lists, never as `Expr.diagnostic` annotations;
             // handled defensively so the match stays exhaustive.
@@ -858,10 +2032,14 @@ fn diagnose_expr_in(expr: &Expr, out: &mut Vec<Diagnostic>, value_used: bool) {
             let severity = match kind {
                 // Not an error where some operand arm takes it: Ruby raises for the others, which the ruby family runs as written and a strict target reports or checks (`lower::nil_operand`)
                 DiagnosticKind::IncompatibleBinop { op, lhs_ty, rhs_ty }
-                    if crate::analyze::body::some_operands_take_it(op.as_str(), lhs_ty, rhs_ty) =>
+                    if crate::analyze::body::some_operands_take_it(op.as_str(), lhs_ty, rhs_ty)
+                        // Not with a nil operand, which the receiver's own operator does not take either.
+                        || (matches!(&*expr.node, ExprNode::Send { recv: Some(r), .. } if r.decisions & crate::expr::NILABLE_OPERATOR_RECEIVER != 0)
+                            && !matches!(rhs_ty, Ty::Nil)) =>
                 {
                     crate::diagnostic::Severity::Warning
                 }
+                DiagnosticKind::Unsupported { .. } if expr.decisions & crate::expr::UNCALLED_DEFINER != 0 => crate::diagnostic::Severity::Warning,
                 _ => Diagnostic::default_severity(kind),
             };
             out.push(Diagnostic { span: expr.span, kind: kind.clone(), severity, message });
@@ -898,6 +2076,24 @@ fn diagnose_expr_in(expr: &Expr, out: &mut Vec<Diagnostic>, value_used: bool) {
         });
     }
 
+    if expr.decisions & crate::expr::SINGLETON_NAME_ERROR != 0 {
+        out.push(crate::lower::residue_diagnostic(
+            "singleton_constant",
+            "constant",
+            expr.span,
+            "ruby_name_error",
+            "a bare constant in `class << self` that only the class's ancestors define: Ruby raises NameError there, and so does this".to_string(),
+        ));
+    }
+    if expr.decisions & crate::expr::GUARDED_NAME_ERROR != 0 {
+        out.push(crate::lower::residue_diagnostic(
+            "guarded_constant",
+            "constant",
+            expr.span,
+            "ruby_name_error",
+            "a constant no gem of the app, Ruby or the app defines, read where the code rescues or tests for its absence: Ruby raises NameError there, and so does this".to_string(),
+        ));
+    }
     match &*expr.node {
         ExprNode::Ivar { name } => {
             if is_unknown_ty(expr.ty.as_ref()) {
@@ -911,7 +2107,20 @@ fn diagnose_expr_in(expr: &Expr, out: &mut Vec<Diagnostic>, value_used: bool) {
             }
         }
         ExprNode::Send { recv: Some(r), method, .. } => {
-            if !is_unknown_ty(r.ty.as_ref()) && is_unknown_ty(expr.ty.as_ref()) {
+            // A resolved content-type writer can answer an unresolved RHS.
+            // Its result warning is already carried by the typer; it is not
+            // evidence that the receiver lacks the writer.
+            let unresolved_assignment = method.as_str() == "content_type="
+                && matches!(expr.diagnostic(), Some(DiagnosticKind::UnresolvedType { expr_kind, .. })
+                    if expr_kind.as_str() == "assignment result");
+            // Not every untyped send: one a lowering built after analysis carries no type at all (`None`), and reading that
+            // as a failed dispatch reported `String#to_s` at emit, never at check; only a core value missing the method is.
+            let failed = match &expr.ty {
+                Some(Ty::Var { .. }) => true,
+                None => r.ty.as_ref().is_some_and(|t| core_value_lacks(t, method.as_str())),
+                _ => false,
+            };
+            if !is_unknown_ty(r.ty.as_ref()) && failed && !unresolved_assignment {
                 let recv_ty = r.ty.clone().unwrap_or_else(|| Ty::Var { var: crate::ident::TyVar(0) });
                 let kind = DiagnosticKind::SendDispatchFailed {
                     method: method.clone(),
@@ -1148,4 +2357,92 @@ fn diagnose_expr_in(expr: &Expr, out: &mut Vec<Diagnostic>, value_used: bool) {
         | ExprNode::Defined { .. }
         | ExprNode::SelfRef => {}
     }
+}
+
+/// A write through the class's own writer in a load-time conditional whose
+/// branch is not settled at compile time: the emitted conditional selects
+/// methods only, so the write would run in no branch.
+fn unsettled_conditional_writes(app: &App) -> Vec<Diagnostic> {
+    fn writes<'a>(conditional: &'a crate::dialect::ConditionalDefinitions, out: &mut Vec<&'a Expr>) {
+        for arm in &conditional.arms {
+            // Not a branch's `include` / `require` / visibility marker: the emitted conditional writes those in it.
+            out.extend(arm.statements.iter().filter(|st| !matches!(&*st.node,
+                ExprNode::Send { recv: None, method, .. } if matches!(method.as_str(), "include" | "require" | "private" | "public" | "protected"))));
+            for nested in &arm.nested {
+                writes(nested, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for lc in &app.library_classes {
+        for conditional in &lc.conditional_definitions {
+            let mut found = Vec::new();
+            writes(conditional, &mut found);
+            for write in found {
+                out.push(Diagnostic::unsupported(
+                    write.span,
+                    None,
+                    "load-time conditional",
+                    "a class setting written in a load-time conditional whose branch is not known when compiling is not modeled".to_string(),
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// A class or module declared in a load-time conditional that another
+/// support file also declares, unconditionally. The IR holds one class
+/// per name, so the two bodies merge and the emitted tree writes the
+/// merged class inside the conditional's branch: when the branch does
+/// not run, what the other file defines is missing too, where Ruby still
+/// defines it. Reported at the conditional declaration, naming the other
+/// file. A reopening in the same file is not detected here.
+fn conditional_declarations_reopened(app: &App) -> Vec<Diagnostic> {
+    fn declarations(conditional: &crate::dialect::ConditionalDefinitions, out: &mut Vec<(crate::ident::ClassId, u32)>) {
+        for arm in &conditional.arms {
+            out.extend(arm.declarations.iter().map(|d| (d.name.clone(), d.start)));
+            for nested in &arm.nested {
+                declarations(nested, out);
+            }
+        }
+    }
+    let source_of = |file: crate::span::FileId| -> Option<&str> {
+        app.sources.get((file.0 as usize).checked_sub(1)?).map(|s| s.path.as_str())
+    };
+    let relative = |path: &str| -> String {
+        path.strip_prefix(app.root.as_str()).map(|p| p.trim_start_matches('/')).unwrap_or(path).to_string()
+    };
+    let mut out = Vec::new();
+    for lc in &app.library_classes {
+        for conditional in &lc.conditional_definitions {
+            let Some(own) = source_of(conditional.span.file) else { continue };
+            let mut declared = Vec::new();
+            declarations(conditional, &mut declared);
+            for (name, start) in declared {
+                let others: Vec<String> = app
+                    .library_class_files
+                    .iter()
+                    .filter(|(source, names)| source != own && names.contains(&name))
+                    .map(|(source, _)| relative(source))
+                    .collect();
+                if others.is_empty() {
+                    continue;
+                }
+                let span = crate::span::Span { file: conditional.span.file, start, end: start + 1 };
+                out.push(Diagnostic::unsupported(
+                    span,
+                    None,
+                    "conditional declaration reopened elsewhere",
+                    format!(
+                        "`{}` is declared in a load-time conditional here and unconditionally in {}; the emitted tree writes the merged class inside the conditional's branch, so when the branch does not run what {} defines is missing as well, which is not modeled",
+                        name.0.as_str(),
+                        others.join(", "),
+                        if others.len() == 1 { "that file" } else { "those files" },
+                    ),
+                ));
+            }
+        }
+    }
+    out
 }

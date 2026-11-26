@@ -49,13 +49,7 @@ fn a_plain_require_of_an_autoloaded_gem_program_defines_its_constant_without_a_w
         "require \"err-kit\" unless defined?(ErrKit::Validator)\nputs ErrKit::Validator.new.check\n",
         &[("RUBYOPT", "-w")],
     );
-    assert!(
-        run.success,
-        "emitted tree failed in {}\n=== stdout ===\n{}\n=== stderr ===\n{}",
-        run.emitted.display(),
-        run.stdout,
-        run.stderr
-    );
+    run.assert_passes();
     assert_eq!(run.stdout.lines().last(), Some("data"), "{}", run.stderr);
     assert!(!run.stderr.contains("to define"), "autoload warning in the emitted boot\n{}", run.stderr);
 }

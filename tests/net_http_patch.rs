@@ -1,11 +1,13 @@
 //! Net::HTTP::Patch and Net HTTP exception classes resolve (stdlib surface).
 
+#[path = "support/scratch.rs"]
+mod scratch;
 use roundhouse::analyze::{diagnose, Analyzer, Severity};
 use roundhouse::ingest::ingest_app;
 
 #[test]
 fn net_http_patch_and_error_classes_check_clean() {
-    let root = std::env::temp_dir().join(format!("roundhouse-net-http-{}", std::process::id()));
+    let root = scratch::dir("roundhouse-net-http");
     for (path, source) in [
         (
             "db/schema.rb",
@@ -49,19 +51,12 @@ fn net_http_patch_and_error_classes_check_clean() {
 }
 
 #[test]
-fn cruby_only_http_header_syntax_error_stays_refused() {
-    // `Net::HTTPBadResponse` is registered on main (Lobsters / Sponge) and
-    // Spinel-ledgers via `unavailable_class_module_construct`. Header
-    // syntax stays an honest constant gap until Spinel grows it
-    // (invariant 6) — Jumpstart Pro still names it in NET_HTTP_ERRORS.
-    let root = std::env::temp_dir().join(format!(
-        "roundhouse-net-http-cruby-only-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
+fn http_exception_class_values_check_clean() {
+    // Both Ruby and Spinel now provide these exception classes.
+    let root = scratch::dir(&format!("roundhouse-net-http-cruby-only-{}", std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
-    ));
+            .as_nanos()));
     for (path, source) in [
         (
             "db/schema.rb",
@@ -98,12 +93,8 @@ fn cruby_only_http_header_syntax_error_stays_refused() {
         .map(|d| d.message.clone())
         .collect();
     assert!(
-        !errors.iter().any(|e| e.contains("HTTPBadResponse")),
-        "Net::HTTPBadResponse is registered (main) + Spinel-ledgers:\n{errors:#?}"
-    );
-    assert!(
-        errors.iter().any(|e| e.contains("HTTPHeaderSyntaxError")),
-        "CRuby-only Net::HTTPHeaderSyntaxError must stay refused:\n{errors:#?}"
+        errors.is_empty(),
+        "Net HTTP exception class values must resolve:\n{errors:#?}"
     );
     std::fs::remove_dir_all(root).ok();
 }

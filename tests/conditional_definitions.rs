@@ -4,6 +4,8 @@
 //! Ported from the Shopify/roundhouse-1 fork's tests, with the gem written
 //! as a PATH gem of `Gemfile.lock`. A test the compiler does not pass yet
 //! is ignored with the group of behavior it waits on (`fork spec: ...`).
+#[path = "support/scratch.rs"]
+mod scratch;
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
@@ -76,7 +78,7 @@ end
 "#,
         )
         .run_ruby("p Sampling.diagnostic_sampling\np CacheStore.new.report\n");
-    assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+    run.assert_passes();
     assert_eq!(run.stdout, "\"other\"\n[\"development\", \"lenient\", \"other\", true, true, true]\n");
 }
 
@@ -121,12 +123,11 @@ end
 "#,
         )
         .run_ruby("p Connection.new.report\n");
-    assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+    run.assert_passes();
     assert_eq!(run.stdout, "[:TLS1_2, nil, false, false, false, \"s\"]\n");
 }
 
 fn app(root: &Path, files: &[(&str, &str)]) {
-    let _ = std::fs::remove_dir_all(root);
     for (path, text) in [
         ("db/schema.rb", "ActiveRecord::Schema.define do\nend\n"),
         ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n"),
@@ -146,9 +147,8 @@ fn check(root: &Path) -> String {
 }
 
 #[test]
-#[ignore = "fork spec: conditional declarations"]
 fn a_branch_that_changes_visibility_stays_refused_by_name() {
-    let root = std::env::temp_dir().join(format!("roundhouse-conditional-definitions-{}", std::process::id()));
+    let root = scratch::dir("roundhouse-conditional-definitions");
     app(
         &root,
         &[
@@ -251,7 +251,7 @@ end
              p [Shop.sharded_table?, Shop.sharded_hook, Shop.tracked_hook]\n\
              p Sharded::ClassMethods.singleton_methods\n",
         );
-    assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+    run.assert_passes();
     assert_eq!(
         run.stdout,
         "[true, \"extended Widget\", \"tracked Widget\"]\n[true, \"extended Shop\", \"tracked Shop\"]\n[:extended]\n"
@@ -316,8 +316,7 @@ end
     const SCRIPT: &str = "p Widget.new.report\n";
     const EXPECTED: &str = "[\"7.1+\", \"8.1+\", \"8.2+\", \"after nested\", false, true, \"s\"]\n";
 
-    let root = std::env::temp_dir().join(format!("roundhouse-nested-conditional-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = scratch::dir("roundhouse-nested-conditional");
     std::fs::create_dir_all(root.join("lib")).unwrap();
     std::fs::write(root.join("lib/vc.rb"), GEM).unwrap();
     std::fs::write(root.join("widget.rb"), WIDGET).unwrap();
@@ -341,6 +340,21 @@ end
         .write("vendor/gems/vc-1.0.0/lib/vc.rb", GEM)
         .write("lib/widget.rb", WIDGET)
         .run_ruby(SCRIPT);
-    assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+    run.assert_passes();
     assert_eq!(run.stdout, EXPECTED, "{}", run.stderr);
+}
+
+/// Spinel compiles a load-time `if` around `def`s, but not one whose name a builtin or another def also answers
+/// (`to_s`, or a method the parent defines): only that one is reported on its tree. Two separate conditionals of one
+/// name (`tone`) compile, the later branch that ran answering, as Ruby does.
+#[test]
+fn spinel_reports_only_a_conditional_def_another_method_answers() {
+    let (_emitted, errors) = emit_and_run::empty_app()
+        .write(
+            "lib/greeter.rb",
+            "class GreeterBase\n  def shout = \"base\"\nend\n\nclass Greeter < GreeterBase\n  if Rails.env.production?\n    def mode = \"production\"\n  else\n    def mode = \"other\"\n  end\n\n  if Rails.env.test?\n    def to_s = \"test\"\n  end\n\n  unless Rails.env.development?\n    def shout = \"loud\"\n  end\n\n  if Rails.env.production?\n    def tone = \"a\"\n  end\n\n  if Rails.env.test?\n    def tone = \"b\"\n  end\nend\n",
+        )
+        .emit(roundhouse::project::BuildTarget::Spinel);
+    let refused: Vec<_> = errors.iter().filter(|e| e.contains("conditional_definition")).collect();
+    assert_eq!(refused.len(), 2, "{errors:#?}");
 }

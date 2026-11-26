@@ -159,6 +159,10 @@ pub fn try_build_arel_with_assocs(
     // registry; method must be one of the base AR shapes we recognize.
     let class_id = const_to_class_id(recv, registry)?;
     let info = registry.get(&class_id)?;
+    if method.as_str() == "find_by" && (ClassInfo::source_class_method(registry, &class_id, method)
+        || ClassInfo::class_method_ownership_unknown(registry, &class_id, method)) {
+        return None;
+    }
     // A default scope is applied by the runtime Relation when it is
     // built; SQL composed here would read the rows it hides.
     if info.default_scoped {
@@ -663,6 +667,7 @@ fn value_type_for(col_type: &ColumnType) -> ValueType {
         | ColumnType::BigInt
         | ColumnType::Reference { .. } => ValueType::Int,
         ColumnType::Boolean => ValueType::Bool,
+        ColumnType::Binary => ValueType::Binary,
         _ => ValueType::Str,
     }
 }
@@ -692,45 +697,59 @@ mod tests {
                         col_type: ColumnType::Integer,
                         nullable: false,
                         default: None,
+                        default_expression: None,
+                        legacy_default_persistence: false,
                         primary_key: true,
                         generated: None,
                         generated_text_compatible: None,
                         generated_int4_compatible: None,
                         array: false,
                         array_stored: false,
+                        unset_until_assigned: false,
+                        collated: false,
                     },
                     Column {
                         name: Symbol::from("article_id"),
                         col_type: ColumnType::Integer,
                         nullable: false,
                         default: None,
+                        default_expression: None,
+                        legacy_default_persistence: false,
                         primary_key: false,
                         generated: None,
                         generated_text_compatible: None,
                         generated_int4_compatible: None,
                         array: false,
                         array_stored: false,
+                        unset_until_assigned: false,
+                        collated: false,
                     },
                     Column {
                         name: Symbol::from("body"),
                         col_type: ColumnType::Text,
                         nullable: false,
                         default: None,
+                        default_expression: None,
+                        legacy_default_persistence: false,
                         primary_key: false,
                         generated: None,
                         generated_text_compatible: None,
                         generated_int4_compatible: None,
                         array: false,
                         array_stored: false,
+                        unset_until_assigned: false,
+                        collated: false,
                     },
                 ],
                 indexes: vec![],
                 foreign_keys: vec![],
+                check_constraints: Vec::new(),
                 virtual_module: None,
                 known_keyless: false,
+                primary_key_columns: Vec::new(),
             },
         );
-        let schema = Schema { tables };
+        let schema = Schema { tables, ..Default::default() };
 
         let mut registry = HashMap::default();
         let mut comment_info = ClassInfo::default();

@@ -277,7 +277,7 @@ fn settle_representable_writers(
             let ty = registry
                 .get(&lc.name)
                 .and_then(|info| match info.instance_methods.get(&Symbol::from(reader.as_str())) {
-                    Some(Ty::Fn { ret, .. }) => Some((**ret).clone()),
+                    Some(Ty::Fn(fn_ty)) => Some((*fn_ty.ret).clone()),
                     _ => None,
                 })
                 .or_else(|| lc.methods.iter().find(|m| m.name.as_str() == reader).and_then(|m| m.body.ty.clone()));
@@ -464,7 +464,7 @@ fn settle_ams_writers(app: &mut App, registry: &HashMap<ClassId, ClassInfo>) -> 
             let ty = registry
                 .get(&lc.name)
                 .and_then(|info| match info.instance_methods.get(&Symbol::from(reader.as_str())) {
-                    Some(Ty::Fn { ret, .. }) => Some((**ret).clone()),
+                    Some(Ty::Fn(fn_ty)) => Some((*fn_ty.ret).clone()),
                     _ => None,
                 })
                 .or_else(|| body.and_then(|b| b.ty.clone()));
@@ -556,7 +556,9 @@ fn rewrite_render_json_serializer(e: &Expr, serializers: &HashSet<ClassId>) -> O
         }
         let ExprNode::Send { recv: Some(c), method: new, .. } = &*r.node else { return None };
         let ExprNode::Const { path } = &*c.node else { return None };
-        let id = ClassId(Symbol::from(path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::")));
+        // A rooted `::S` (the rewrite keeps the root as written) is the
+        // serializer `S`: the ClassId has no leading empty segment.
+        let id = ClassId(Symbol::from(path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::")));
         (new.as_str() == "new" && serializers.contains(&id)).then(|| r.clone())
     };
     if let Some(r) = instance(value) {
@@ -870,7 +872,7 @@ fn declared_as_json_writer(
                     }
                 }
                 let ty = match info.instance_methods.get(name) {
-                    Some(Ty::Fn { ret, .. }) => (**ret).clone(),
+                    Some(Ty::Fn(fn_ty)) => (*fn_ty.ret).clone(),
                     _ => info
                         .attributes
                         .fields

@@ -3,109 +3,299 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Roundhouse</title>
-  <link rel="stylesheet" href="style.css">
+  <title>Roundhouse: Rails is the specification, deployment is a build flag</title>
+  <meta name="description" content="Roundhouse reads a Rails app the way Rails does and writes it back out as plain code: Ruby, one native binary through Spinel, or Go, Rust, TypeScript and six more.">
+  <link rel="icon" href="logo-on-dark.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="brand.css">
+  <link rel="stylesheet" href="home.css">
+  <script defer src="home.js"></script>
 </head>
-<body class="landing">
-  <main class="landing-main">
-    <img src="logo-on-dark.svg" alt="Roundhouse logo" class="logo">
-    <h1>Roundhouse</h1>
-    <p class="tagline">Rails is the specification; deployment is a build flag.</p>
+<body class="home">
+  <svg width="0" height="0" class="sprite" aria-hidden="true">
+    <defs>
+      <symbol id="icon-external" viewBox="0 0 24 24"><path d="M14 3h7v7M21 3 10 14M10 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-5"/></symbol>
+      <symbol id="icon-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></symbol>
+      <symbol id="icon-check" viewBox="0 0 24 24"><path d="m5 12 5 5L20 7"/></symbol>
+      <symbol id="icon-right" viewBox="0 0 24 24"><path d="M4 12h16m-6-6 6 6-6 6"/></symbol>
+      <symbol id="icon-spark" viewBox="0 0 24 24"><path d="m12 3 2.6 6.4L21 12l-6.4 2.6L12 21l-2.6-6.4L3 12l6.4-2.6Z"/></symbol>
+      <symbol id="icon-code" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 8h18m-12 4-3 2 3 2m6-4 3 2-3 2"/></symbol>
+      <symbol id="icon-play" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="m10 8 6 4-6 4Z"/></symbol>
+      <symbol id="icon-studio" viewBox="0 0 24 24"><path d="M4 7h16M4 17h16M8 4v6m8 4v6"/><circle cx="8" cy="7" r="2"/><circle cx="16" cy="17" r="2"/></symbol>
+      <symbol id="icon-fractal" viewBox="0 0 24 24"><path d="m12 2 10 18H2Zm0 0v12m-10 6 10-6 10 6M7 11h10m-10 0 5 9 5-9"/></symbol>
+      <symbol id="icon-files" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Zm0 0v6h6M8 12h8m-8 4h6"/></symbol>
+      <symbol id="icon-chart" viewBox="0 0 24 24"><path d="M4 3v17h17M8 16v-5m5 5V6m5 10V9"/></symbol>
+      <symbol id="icon-github" viewBox="0 0 24 24"><path d="M9 19c-4.5 1.5-4.5-2.5-6-3m12 6v-3.9c.1-1-.3-1.9-1-2.5 3.3-.4 6.8-1.6 6.8-7.3A5.7 5.7 0 0 0 19.3 4c.2-.8.2-1.7-.1-2.5 0 0-1.2-.4-4 1.5a13.7 13.7 0 0 0-7.2 0C5.2 1.1 4 1.5 4 1.5c-.3.8-.3 1.7-.1 2.5a5.7 5.7 0 0 0-1.5 4.3c0 5.7 3.5 6.9 6.8 7.3-.7.6-1.1 1.5-1 2.5V22"/></symbol>
+    </defs>
+  </svg>
 
-    <p class="blurb">
-      Roundhouse ingests a Ruby on Rails application into a typed intermediate
-      representation and emits equivalent projects in C#, Crystal, Elixir, Go,
-      Kotlin, Python, Rust, Swift, and TypeScript — plus a Ruby round-trip
-      that runs under CRuby, JRuby, or Spinel. Four real apps demonstrate it,
-      each proving something different:
-    </p>
+  <a class="skip" href="#main">Skip to content</a>
 
-    <div class="app-cards">
-      <a class="app-card blog" href="apps/blog.html">
-        <h2>Blog</h2>
-        <div class="role">Correctness</div>
-        <p>The reference app, small enough to support fully. It's the
-          conformance oracle: every target compiles clean, passes its tests,
-          and matches live Rails.</p>
-        <span class="go">Reference app →</span>
+  <div class="wrap">
+    <header class="site-header">
+      <a class="brand" href="./" aria-label="Roundhouse home">
+        <img src="logo-on-dark.svg" alt="" width="32" height="32">Roundhouse
       </a>
-      <a class="app-card lobsters" href="apps/lobsters.html">
-        <h2>Lobsters</h2>
-        <div class="role">Real-world coverage</div>
-        <p>A real production app — and Ruby's own YJIT benchmark. The proving
-          lane: most of it transpiles, and the gaps show up as live
-          diagnostics.</p>
-        <span class="go">Proving lane →</span>
-      </a>
-      <a class="app-card campfire" href="apps/campfire.html">
-        <h2>Campfire</h2>
-        <div class="role">Live and interactive</div>
-        <p>Basecamp's chat app — the one that pushes instead of just
-          responding. Action Cable channels, model-side broadcasts,
-          turbo_stream: the axis the other three don't test.</p>
-        <span class="go">The live axis →</span>
-      </a>
-      <a class="app-card mastodon" href="apps/mastodon.html">
-        <h2>Mastodon</h2>
-        <div class="role">Scale</div>
-        <p>The moonshot — one of the largest Rails apps, its whole-app types
-          analyzed in ~2s in a browser tab. Work in progress, with the gaps
-          shown.</p>
-        <span class="go">The moonshot →</span>
-      </a>
+      <nav class="site-nav" aria-label="Site">
+        <a href="ide/">IDE</a>
+        <a href="playground/">Playground</a>
+        <a href="studio/">Studio</a>
+        <a href="progress/">Progress</a>
+        <a href="docs/guide/">Docs</a>
+        <a class="nav-git" href="https://github.com/roundhouse-rb/roundhouse">GitHub <svg class="icon"><use href="#icon-external"/></svg></a>
+      </nav>
+    </header>
+  </div>
+
+  <main id="main">
+    <div class="hero">
+      <div class="wrap hero-body">
+        <div class="hero-copy">
+          <p class="eyebrow"><svg class="icon spark"><use href="#icon-spark"/></svg>A compiler for Rails apps</p>
+          <h1>Rails is the specification<br><span>Deployment is a build flag</span></h1>
+          <p class="lede">Roundhouse reads a Rails app the way Rails does and writes it back out as plain code: Ruby, one native binary through Spinel, or Go, Rust, TypeScript and six more.</p>
+          <div class="actions">
+            <a class="button primary" href="ide/">Inspect your app <svg class="icon"><use href="#icon-right"/></svg></a>
+            <a class="button" href="playground/">Try the playground <svg class="icon"><use href="#icon-right"/></svg></a>
+          </div>
+          <p class="status">Open source and early. Not ready for production yet; the demos show how far it gets.</p>
+        </div>
+
+        <figure class="stage">
+          <img src="roundhouse-workshop.webp" width="1668" height="943"
+               srcset="roundhouse-workshop-960.webp 960w, roundhouse-workshop.webp 1668w"
+               sizes="(min-width: 960px) 62vw, 100vw"
+               alt="A line drawing of a roundhouse: a locomotive arrives on red rails at a turntable, and builders, a Go gopher, a Rust crab and a crystal locomotive work in the bays around it.">
+          <figcaption><a class="gap-sign" href="progress/#gaps" title="See the measured gaps, and where to help"><span class="roundel" aria-hidden="true"></span>Mind the implementation gap<span class="go" aria-hidden="true">→</span></a></figcaption>
+        </figure>
+
+<section class="workshop" aria-labelledby="workshop-title">
+  <p class="label" id="workshop-title">Inside the workshop <a href="progress/">All progress <span aria-hidden="true">→</span></a></p>
+  <ul>
+    <li><a href="progress/#gaps" data-morsel="specs"><b hidden></b><span>How Lobsters’ own tests fare on the compiled app</span><small hidden></small></a></li>
+    <li><a href="progress/#gaps" data-morsel="triage"><b hidden></b><span>Failures waiting for a first look</span><small hidden></small></a></li>
+    <li><a href="progress/#activity" data-morsel="merged"><b hidden></b><span>Who’s building, week by week</span><small hidden></small></a></li>
+    <li><a href="progress/#activity" data-morsel="firsts"><b hidden></b><span>The newest contributors</span><small hidden></small></a></li>
+  </ul>
+</section>
+
+        <div class="apps">
+          <p class="label">Four apps, each proving something different</p>
+          <ul>
+            <li style="--app: var(--rh-blog)"><a href="apps/blog.html">
+              <b>Blog</b><span class="role">The reference app</span>
+              <span class="blurb">Small enough to support completely. Every target compiles, passes its tests and matches live Rails.</span>
+            </a></li>
+            <li style="--app: var(--rh-lobsters)"><a href="apps/lobsters.html">
+              <b>Lobsters</b><span class="role">The proving lane</span>
+              <span class="blurb">A real, community-run app. Most of it transpiles; what doesn’t yet shows up as diagnostics you can read.</span>
+            </a></li>
+            <li style="--app: var(--rh-campfire)"><a href="apps/campfire.html">
+              <b>Campfire</b><span class="role">The live axis</span>
+              <span class="blurb">Basecamp’s chat app. It runs: two tabs, one room, one live message over Action Cable.</span>
+            </a></li>
+            <li style="--app: var(--rh-mastodon)"><a href="apps/mastodon.html">
+              <b>Mastodon</b><span class="role">The moonshot</span>
+              <span class="blurb">One of the largest Rails apps. Types in about two seconds in a browser tab; it doesn’t run yet.</span>
+            </a></li>
+          </ul>
+        </div>
+      </div>
     </div>
 
-    <nav class="landing-nav">
-      <a href="docs/guide/">Guide</a>
-      <a href="playground/">Playground</a>
-      <a href="ide/">IDE</a>
-      <a href="studio/">Studio</a>
-      <a href="fractal/">Fractal</a>
-      <a href="browse/">Browse output</a>
-      <a href="bench/">Benchmarks</a>
-      <a href="https://github.com/rubys/roundhouse">GitHub</a>
-    </nav>
-
-    <section class="overview">
-      <p>
-        The emitted projects compile clean and pass their tests. Correctness
-        is a conformance oracle: the same URL fetched from Rails and from
-        each target must produce the same response — enforced by emitted
-        unit tests, a differential compare gate against live Rails, and
-        end-to-end browser tests.
-      </p>
-      <p>
-        No annotations are involved: <code>has_many :comments</code> is a
-        type declaration, and whole-program inference recovers the types
-        Rails' conventions already imply. That inference is a product in its
-        own right — an LSP server, an MCP server, and the
-        <a href="ide/">in-browser IDE</a> answer <em>what's the type here,
-        can this be nil?</em> on unannotated Rails apps, with no app boot
-        and no database: queries answer in milliseconds, and a whole-app
-        pass over Mastodon takes about two seconds, in a browser tab. Point
-        the IDE at a checkout of your own (<em>open folder…</em>) and the
-        same pass runs over it — read from your disk, never uploaded.
-      </p>
-      <p>
-        It's also the performance story: every decision that can't differ
-        between requests is made once, at transpile time. The emitted Ruby
-        serves ~10× the requests of stock Rails on the same CRuby+YJIT,
-        ~74× under JRuby, and the compiled targets go further — ratios from
-        a CPU-bound microbenchmark; caveats in the posts below.
-      </p>
-      <ul class="reading">
-        <li><a href="https://intertwingly.net/blog/2026/06/27/Conformance-vs-Comprehension.html">Conformance vs Comprehension</a> — the project and its oracle</li>
-        <li><a href="https://intertwingly.net/blog/2026/06/25/Live-Types-for-Rails.html">Live Types for Rails</a> — the inference as a live type checker</li>
-        <li><a href="https://intertwingly.net/blog/2026/07/06/An-IDE-You-Dont-Install.html">An IDE You Don't Install</a> — Mastodon analyzed in a browser tab</li>
-        <li><a href="https://intertwingly.net/blog/2026/06/11/The-Ruby-JRuby-Was-Built-to-Run.html">The Ruby JRuby Was Built to Run</a> — the 2×2 performance experiment</li>
-        <li><a href="https://intertwingly.net/blog/2026/05/25/Numbers-Without-Conclusions.html">Numbers Without Conclusions</a> — benchmark methodology and honest caveats</li>
-      </ul>
+    <section class="why" aria-labelledby="why-title">
+      <div class="wrap two-col">
+        <div>
+          <p class="eyebrow">Why bother</p>
+          <h2 id="why-title">Success shouldn’t mean a rewrite.</h2>
+        </div>
+        <div class="prose">
+          <p>Rails gets a small team to a working product fast, and CRuby on Puma serves it well for years. Then success brings constraints nobody planned for: a cloud bill that grows with every worker, users far from your region, places CRuby can’t run at all. The usual answer is a rewrite, and it’s an expensive one.</p>
+          <p>Roundhouse keeps Rails as the source of truth and turns the runtime into a choice you make at build time. You keep the conventions too, and they count for more now that agents write much of the code: <code>resources :posts</code> stands in for the routes of seven actions and their URL helpers, which no one, person or model, has to write or read. Rails to build with, and native speed to run on if Spinel gets all the way there.</p>
+          <p><a class="pill" href="https://github.com/roundhouse-rb/roundhouse/blob/main/WHY.md">The longer argument</a></p>
+        </div>
+      </div>
     </section>
 
-    <p class="footnote">
-      Successor to <a href="https://github.com/rubys/railcar">railcar</a>.
-      Dual-licensed MIT / Apache-2.0.
-    </p>
+    <section class="targets" aria-labelledby="targets-title">
+      <div class="wrap">
+        <div class="targets-head">
+          <h2 class="eyebrow" id="targets-title">Ten targets, one source</h2>
+          <a class="mono-link" href="browse/">Browse the output <svg class="icon"><use href="#icon-right"/></svg></a>
+        </div>
+        <ol class="target-grid">
+          <li style="--lang: var(--rh-lang-ruby)"><span class="dot"></span>Ruby</li>
+          <li style="--lang: var(--rh-lang-rust)"><span class="dot"></span>Rust</li>
+          <li style="--lang: var(--rh-lang-go)"><span class="dot"></span>Go</li>
+          <li style="--lang: var(--rh-lang-typescript)"><span class="dot"></span>TypeScript</li>
+          <li style="--lang: var(--rh-lang-elixir)"><span class="dot"></span>Elixir</li>
+          <li style="--lang: var(--rh-lang-crystal)"><span class="dot"></span>Crystal</li>
+          <li style="--lang: var(--rh-lang-python)"><span class="dot"></span>Python</li>
+          <li style="--lang: var(--rh-lang-csharp)"><span class="dot"></span>C#</li>
+          <li style="--lang: var(--rh-lang-kotlin)"><span class="dot"></span>Kotlin</li>
+          <li style="--lang: var(--rh-lang-swift)"><span class="dot"></span>Swift</li>
+        </ol>
+        <p class="targets-note">Ruby output runs on CRuby, JRuby or <a href="#spinel">Spinel</a>. How much of each app comes through varies, and the app pages show exactly where it stops.</p>
+      </div>
+    </section>
+
+    <div class="wrap">
+      <section class="section two-col" aria-labelledby="types-title">
+        <div>
+          <p class="eyebrow">Types without annotations</p>
+          <h2 id="types-title">Rails was already typed.</h2>
+          <div class="prose">
+            <p><code>has_many :comments</code> is a type declaration nobody wrote down. Roundhouse reads the whole app and works out the rest: which class an association returns, what a column deserializes to, whether a <code>find_by</code> can come back nil.</p>
+            <p>No boot, no database, no annotations. The same analysis runs in your terminal, your editor, your agent and a browser IDE that never uploads your code.</p>
+          </div>
+          <p class="pills"><a class="pill" href="ide/">Open your app in the IDE</a><a class="pill" href="docs/guide/check.html">roundhouse check</a></p>
+        </div>
+        <div class="terminal">
+          <div class="terminal-head"><span>app/models/post.rb</span><span>Ruby</span></div>
+<pre><span class="dim">class</span> Post &lt; ApplicationRecord
+  <span class="key">has_many</span> :comments
+<span class="dim">end</span>
+
+<span class="dim"># Post#comments returns Comment records.</span>
+<span class="dim"># Nobody had to write that down.</span></pre>
+          <div class="terminal-foot">CLI · LSP · MCP · browser IDE<br>One engine underneath all four.</div>
+        </div>
+      </section>
+
+      <section class="spinel-feature" id="spinel" aria-labelledby="spinel-title">
+        <div class="two-col spinel-head">
+          <div>
+            <p class="eyebrow">Native Ruby, through Spinel</p>
+            <h2 id="spinel-title">Stay in Ruby.<br><span>Ship one binary.</span></h2>
+          </div>
+          <div class="prose">
+            <p>Spinel is Matz’s ahead-of-time Ruby compiler. It reads a whole program, turns it into C and builds one executable, with no interpreter.</p>
+            <p>Roundhouse’s Ruby output is Ruby that Spinel can compile, because the metaprogramming is already gone; the result is one binary with, by default, a SQLite file beside it. Of the compiled targets it behaves most like Rails, since it runs Roundhouse’s framework runtime itself rather than a translation of it. Campfire runs this way today, and OCRAN does the whole compile in one command: <code>ocran --roundhouse path/to/app</code>.</p>
+            <p class="pills"><a class="pill" href="docs/guide/spinel.html">Compile with Spinel</a><a class="pill" href="https://github.com/matz/spinel">Spinel on GitHub ↗</a></p>
+          </div>
+        </div>
+
+        <div class="route">
+          <ol class="tube-line" aria-label="Compilation route">
+            <li class="roundhouse"><span class="stop"></span><span class="names"><b>Rails app</b><small>Your app’s source</small></span></li>
+            <li class="roundhouse"><span class="stop"></span><span class="names"><b>Roundhouse</b><small>Lowers Rails, infers types</small></span></li>
+            <li class="interchange"><span class="stop"></span><span class="names"><b>Plain Ruby</b><small>No runtime metaprogramming</small></span></li>
+            <li class="spinel"><span class="stop"></span><span class="names"><b>Spinel</b><small>Whole program, compiled to C</small></span></li>
+            <li class="spinel"><span class="stop"></span><span class="names"><b>Native binary</b><small>Runs without Ruby installed</small></span></li>
+          </ol>
+          <p class="tube-legend"><span class="key roundhouse">Roundhouse line</span><span class="key spinel">Spinel line</span></p>
+        </div>
+
+        <div class="spinel-foot">
+          <p class="note"><b>Not every app compiles yet.</b> Spinel has to see the code at build time, so arbitrary runtime metaprogramming is out. The goal for the end of 2026 is Mastodon on Spinel.</p>
+          <a class="read-card" href="https://st0012.dev/spinel/">
+            <span class="kicker">Further reading</span><b>How Spinel works</b><span class="by">Stan Lo · contributor’s introduction</span><span class="go" aria-hidden="true">↗</span>
+          </a>
+        </div>
+      </section>
+
+      <section class="section" aria-labelledby="oracle-title">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">How we know it works</p>
+            <h2 id="oracle-title">Rails is the oracle.</h2>
+          </div>
+          <p>We send the same request to Rails and to the generated app, and the responses have to match, DOM node for DOM node, JSON value for value.</p>
+        </div>
+        <div class="layers">
+          <article><p class="eyebrow">01</p><h3>Emitted tests</h3><p>Every target ships with its own test suite, and it has to pass.</p></article>
+          <article><p class="eyebrow">02</p><h3>A live comparison</h3><p>Requests go to Rails and to the generated app, and the responses are compared after normalization.</p></article>
+          <article><p class="eyebrow">03</p><h3>The browser, too</h3><p>Turbo updates and Action Cable get end-to-end browser tests, because a static diff can’t see them.</p></article>
+        </div>
+        <div class="two-col speed">
+          <div>
+            <h2>Faster, even in Ruby.</h2>
+            <div class="prose">
+              <p>Lowering Rails to plain Ruby pays off on CRuby too. On the reference blog, with the same interpreter, YJIT and Puma, the generated Ruby serves <span data-bench="range">2.7× to 5.4×</span> the requests per second of stock Rails, depending on the endpoint. On the JVM the gap on <code>/articles</code> is <span data-bench="jvm_articles">11.2×</span>.</p>
+            </div>
+            <p class="pills"><a class="pill" href="bench/">Benchmarks and methodology</a></p>
+          </div>
+          <div>
+            <div class="stats">
+              <p class="stat"><span data-bench="articles">5.0×</span><small>/articles · CRuby + YJIT</small></p>
+              <p class="stat"><span data-bench="jvm_articles">11.2×</span><small>/articles · JRuby</small></p>
+            </div>
+            <p class="footnote">Bench environment captured <span data-bench="date">2026-11-01</span>, one reference app on one machine. CRuby: the same Ruby, YJIT and Puma on both sides. JRuby: the generated Ruby against stock Rails 8.0 on the JVM.</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="section get-started" aria-labelledby="try-title">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Get started</p>
+            <h2 id="try-title">Check your app.</h2>
+          </div>
+          <div class="aside">
+            <p>Install the snapshot binary and run <code>roundhouse check</code> on any Rails checkout. Nothing boots and nothing is uploaded. Snapshots cover macOS on Apple silicon and Linux x86-64, with untested macOS Intel and Windows builds alongside; anywhere else, build from source with Cargo.</p>
+            <p class="pills"><a class="pill" href="docs/guide/install.html">Install guide</a><a class="pill" href="docs/guide/">Read the docs</a></p>
+          </div>
+        </div>
+        <div class="terminal install">
+          <div class="terminal-head"><span>Terminal</span><span>sh</span></div>
+          <div class="cmds">
+            <div class="cmd">
+<pre><span class="prompt" aria-hidden="true">$ </span><span class="cmd-text">curl <span class="nw">--proto '=https'</span> <span class="nw">--tlsv1.2</span> <span class="nw">-LsSf</span> https://github.com/<wbr>roundhouse-rb/<wbr>roundhouse/<wbr>releases/<wbr>latest/<wbr>download/<wbr>roundhouse-installer.sh <span class="nw">| sh</span></span></pre>
+              <button class="copy-btn" type="button" data-copy="curl --proto '=https' --tlsv1.2 -LsSf https://github.com/roundhouse-rb/roundhouse/releases/latest/download/roundhouse-installer.sh | sh" aria-label="Copy the install command" title="Copy" hidden><svg class="icon"><use href="#icon-copy"/></svg><span class="sr-only" aria-live="polite">Copy</span></button>
+            </div>
+            <div class="cmd">
+<pre><span class="prompt" aria-hidden="true">$ </span><span class="cmd-text">roundhouse check <span class="nw">--continue</span> /path/<wbr>to/<wbr>your/<wbr>rails/<wbr>app</span></pre>
+              <button class="copy-btn" type="button" data-copy="roundhouse check --continue /path/to/your/rails/app" aria-label="Copy the check command" title="Copy" hidden><svg class="icon"><use href="#icon-copy"/></svg><span class="sr-only" aria-live="polite">Copy</span></button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" aria-labelledby="blog-title">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">From Sam’s blog</p>
+            <h2 id="blog-title">Written up as it happens.</h2>
+          </div>
+          <p>Sam Ruby writes about the project as it goes: what was tried, what the numbers say and why the design turned out this way. <a href="https://intertwingly.net/blog/">All posts</a></p>
+        </div>
+        <div class="reading">
+          <a href="https://intertwingly.net/blog/2026/10/25/Benchmarking-Campfire-with-Many-Users.html">Benchmarking Campfire with Many Users <span class="date">2026-10-25</span></a>
+          <a href="https://intertwingly.net/blog/2026/10/12/Whole-Routes-in-a-Box.html">Whole Routes in a Box <span class="date">2026-10-12</span></a>
+          <a href="https://intertwingly.net/blog/2026/10/11/What-a-JIT-Cant-Know.html">What a JIT Can’t Know <span class="date">2026-10-11</span></a>
+          <a href="https://intertwingly.net/blog/2026/09/30/Rust-is-the-answer-to-the-wrong-question.html">Rust Is the Answer to the Wrong Question <span class="date">2026-09-30</span></a>
+          <a href="https://intertwingly.net/blog/2026/09/18/Roundhouse-Released.html">Roundhouse Released <span class="date">2026-09-18</span></a>
+          <a href="https://intertwingly.net/blog/2026/09/17/Spinel-at-Your-Fingertips.html">Spinel at Your Fingertips <span class="date">2026-09-17</span></a>
+        </div>
+      </section>
+
+      <section class="closing" aria-labelledby="closing-title">
+        <p class="eyebrow">Open source</p>
+        <h2 id="closing-title">Our chat room runs on Spinel.</h2>
+        <p class="copy">Contributors talk in Campfire, compiled by Roundhouse and running on Spinel, so everyone in it is also testing it.</p>
+        <p class="copy">A pull request doesn’t need a conversation first. Open one, or an issue, and ask for an invite.</p>
+        <p class="copy welcome" data-morsel="welcome" hidden></p>
+        <div class="actions">
+          <a class="button primary" href="progress/#gaps">See where it breaks <svg class="icon"><use href="#icon-right"/></svg></a>
+          <a class="button" href="https://github.com/roundhouse-rb/roundhouse#contributing">Contribute on GitHub <svg class="icon"><use href="#icon-external"/></svg></a>
+        </div>
+        <nav class="tools" aria-label="Project tools">
+          <a href="ide/"><svg class="icon"><use href="#icon-code"/></svg><span>IDE</span></a>
+          <a href="playground/"><svg class="icon"><use href="#icon-play"/></svg><span>Playground</span></a>
+          <a href="studio/"><svg class="icon"><use href="#icon-studio"/></svg><span>Studio</span></a>
+          <a href="fractal/"><svg class="icon"><use href="#icon-fractal"/></svg><span>Fractal</span></a>
+          <a href="browse/"><svg class="icon"><use href="#icon-files"/></svg><span>Output</span></a>
+          <a href="bench/"><svg class="icon"><use href="#icon-chart"/></svg><span>Benchmarks</span></a>
+          <a href="https://github.com/roundhouse-rb/roundhouse"><svg class="icon"><use href="#icon-github"/></svg><span>GitHub</span></a>
+        </nav>
+      </section>
+    </div>
   </main>
+
+  <div class="wrap">
+    <footer class="site-footer">
+      <span>Roundhouse, by Sam Ruby and <a href="https://github.com/roundhouse-rb/roundhouse/graphs/contributors">contributors</a>. <a href="https://github.com/roundhouse-rb/roundhouse/pulls">Pull requests welcome</a>.</span>
+      <span>Successor to <a href="https://github.com/rubys/railcar">railcar</a> · MIT / Apache-2.0 · Drawing includes the Go gopher, designed by Renée French (<a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>)</span>
+    </footer>
+  </div>
 </body>
 </html>

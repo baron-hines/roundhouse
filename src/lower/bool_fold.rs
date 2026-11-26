@@ -11,6 +11,10 @@
 //! discarded side could never run — and deletes the dead code for every
 //! target at once.
 //!
+//! So does `x ||= v` over a local analyze typed as never nil nor false
+//! (`expr::DEAD_OR_ASSIGN`): Warden's `strategy ||= Class.new(Base)`,
+//! whose every caller passes the class, folds to `strategy`.
+//!
 //! Only a LITERAL false/true left operand folds; the value-preserving
 //! rewrites for the other polarity (`true && x` → `x`) are left alone —
 //! they don't remove dead code, and the surviving `x` keeps the source
@@ -28,6 +32,14 @@ fn fold(e: &mut Expr) {
     // Children first, so a chain folds outward: `(false && a) && b`
     // becomes `false && b` and then `false`.
     e.node.for_each_child_mut(&mut fold);
+    if e.decisions & crate::expr::DEAD_OR_ASSIGN != 0
+        && let ExprNode::OpAssign { target: crate::expr::LValue::Var { id, name }, .. } = &*e.node
+    {
+        let ty = e.ty.clone();
+        *e = Expr::new(e.span, ExprNode::Var { id: *id, name: name.clone() });
+        e.ty = ty;
+        return;
+    }
     let ExprNode::BoolOp { op, left, .. } = &*e.node else { return };
     let ExprNode::Lit { value: Literal::Bool { value } } = &*left.node else { return };
     let dead_rhs = match op {

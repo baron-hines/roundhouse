@@ -1,8 +1,10 @@
 # frozen_string_literal: true
 # Pushing ActiveJob payloads to Redis the way Sidekiq 8.1's ActiveJob
 # adapter does, for an app on `config.active_job.queue_adapter =
-# :sidekiq`. A Ruby Sidekiq process, in a Rails app with the same job
-# classes and database, then runs the jobs.
+# :sidekiq`. The same build's worker role (`./app sidekiq`, or
+# `ruby sidekiq.rb`; runtime/spinel/sidekiq/sidekiq_worker.rb) runs the
+# jobs, or a Ruby Sidekiq process in a Rails app with the same job
+# classes and database does.
 #
 # THE BYTES ARE SIDEKIQ'S. The ActiveJob payload (`Payload.build_at`)
 # goes inside Sidekiq's job envelope, with the keys in the order
@@ -26,14 +28,15 @@
 # does only under `:sidekiq`.
 #
 # The Redis URL is the app's own `Sidekiq.configure_client` `url:`
-# (`JobRegistry.sidekiq_redis_url`) when it gives one. Only without it
-# does the push fall back to Sidekiq's `ENV[ENV["REDIS_PROVIDER"]]`,
-# then `REDIS_URL`, then `redis://localhost:6379/0`. A `password:` from
-# the same block overrides one in the URL, as redis-rb's option does.
-# Both are read at the first push in each process. Errors reach the
-# caller, as in Rails: a down Redis makes `perform_later` raise.
+# (`JobRegistry.sidekiq_redis_url`), and nothing else: ingest refuses a
+# tree on `:sidekiq` that gives none, so there is no fallback to
+# `REDIS_PROVIDER`, `REDIS_URL` or localhost. A `url:` read from an
+# environment variable that is unset or empty at run time raises at the
+# first push. A `password:` from the same block overrides one in the
+# URL, as redis-rb's option does. Both are read at the first push in
+# each process. Errors reach the caller, as in Rails: a down Redis makes
+# `perform_later` raise.
 module SidekiqPush
-  DEFAULT_URL = "redis://localhost:6379/0"
   URL = [""]
   URL_PID = [0]
 
@@ -71,10 +74,13 @@ module SidekiqPush
 
   # One job, given its ActiveJob payload. `at` is the scheduled epoch in
   # seconds, 0.0 when the job isn't scheduled. A time that has already
-  # passed is pushed at once, as Sidekiq's `Setter#at` does.
+  # passed is pushed at once, as Sidekiq's `Setter#at` does. The job's
+  # `sidekiq_options` go where Sidekiq writes them: `retry` in place,
+  # the rest after `queue`.
   def self.enqueue(job_class, queue, at, aj_json)
-    head = "{\"retry\":true" +
+    head = "{\"retry\":" + JobRegistry.sidekiq_retry(job_class) +
       ",\"queue\":" + ActiveJob::Arguments.str(queue) +
+      JobRegistry.sidekiq_extra(job_class) +
       ",\"wrapped\":" + ActiveJob::Arguments.str(job_class) +
       ",\"args\":[" + aj_json + "]" +
       ",\"class\":\"Sidekiq::ActiveJob::Wrapper\"" +
@@ -169,8 +175,7 @@ module SidekiqPush
     Process.clock_gettime(Process::CLOCK_REALTIME, :millisecond)
   end
 
-  # The app's `configure_client` URL, else Sidekiq's
-  # `determine_redis_provider`, else its default.
+  # The app's `configure_client` URL.
   def self.url
     if URL_PID[0] != Process.pid
       URL[0] = resolve_url
@@ -181,25 +186,66 @@ module SidekiqPush
 
   def self.resolve_url
     configured = JobRegistry.sidekiq_redis_url
-    if configured != ""
-      return configured
+    if configured == ""
+      raise ArgumentError.new("Sidekiq.configure_client's Redis url: is empty (is the environment variable it reads set?); there is no fallback to REDIS_PROVIDER, REDIS_URL or localhost")
     end
-    provider = ENV["REDIS_PROVIDER"].to_s
-    if provider.include?(":")
-      raise ArgumentError.new("REDIS_PROVIDER should be set to the name of the variable which contains the Redis URL, not a URL itself")
-    end
-    named = provider == "" ? "" : ENV[provider].to_s
-    if named != ""
-      return named
-    end
-    env = ENV["REDIS_URL"].to_s
-    env == "" ? DEFAULT_URL : env
+    configured
   end
 
   # The app's `configure_client` `password:`, `""` for none (the URL's
   # own password, if any, then stands).
   def self.password
     JobRegistry.sidekiq_redis_password
+  end
+
+  # The app's `configure_client` `username:`, `""` for none (the URL's
+  # own user, if any, then stands).
+  def self.username
+    JobRegistry.sidekiq_redis_username
+  end
+
+  # The app's `configure_client` `db:`, -1 for none (the URL's database
+  # then stands).
+  def self.db
+    JobRegistry.sidekiq_redis_db
+  end
+
+  # The connect and read timeouts, in seconds: the app's `timeout:`,
+  # `connect_timeout:` and `read_timeout:`, or Sidekiq's 3.
+  def self.connect_timeout
+    JobRegistry.sidekiq_redis_connect_timeout
+  end
+
+  def self.read_timeout
+    JobRegistry.sidekiq_redis_read_timeout
+  end
+
+  # The seconds to wait before each retry after a connection error, from
+  # the app's `reconnect_attempts:`, or Sidekiq's one immediate retry.
+  def self.reconnect_delays
+    delays = []
+    JobRegistry.sidekiq_redis_reconnect_delays.split(" ").each do |word|
+      delays.push(word.to_f)
+    end
+    delays
+  end
+
+  # A `db:` read from the environment: its Integer, or -1 when the
+  # variable is unset or empty, so the URL's database stands as it does
+  # for redis-client's nil `db:`. Anything else raises, as redis-client's
+  # `Integer(db)` does.
+  def self.db_setting(value)
+    if value == ""
+      return -1
+    end
+    i = 0
+    while i < value.length
+      if !"0123456789".include?(value[i])
+        raise ArgumentError.new("db: must be an Integer, got: \"" + value + "\" (Sidekiq.configure_client's Redis setting)")
+      end
+      i += 1
+    end
+    value.to_i
   end
 
   # A `configure_client` setting read from the environment, for the
@@ -247,7 +293,7 @@ module SidekiqPush
   # The boot line a server on `:sidekiq` logs. It doesn't connect:
   # Sidekiq's client connects at the first push too.
   def self.announce
-    warn "[job] queue_adapter :sidekiq: jobs are pushed to " + redacted_url(url) + "; run them with a Sidekiq process"
+    warn "[job] queue_adapter :sidekiq: jobs are pushed to " + redacted_url(url) + "; run them with this build's sidekiq role or a Sidekiq process"
     nil
   end
 

@@ -15,21 +15,26 @@
 //! ledgered as residue (see `fold_set_chains`).
 //!
 //! Job classes are those whose parent chain (within the ingested set)
-//! reaches ActiveJob::Base. Same guards as the mailer twin
-//! (`mailer_class_side`): positional forwarding only — kwarg or block
-//! `perform`s stay unwrapped on the residue ledger.
+//! reaches ActiveJob::Base. On a target with native keywords (the Ruby
+//! family), a `perform` with keywords gets a wrapper with its own
+//! parameter list that forwards each keyword by name
+//! (`new.perform(article, count: count)`); elsewhere it stays unwrapped
+//! on the residue ledger. A `**rest` keyword, a block,
+//! `...` forwarding or a keyword default that isn't a literal stays
+//! unwrapped on the residue ledger, and each call to the missing
+//! entry point is an error.
 //!
 //! Structural pass on `app.library_classes` (where `app/jobs/*.rb`
 //! ingest); runs on the post-analyze hook so every target's tree
 //! carries the wrappers.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::app::App;
 use crate::diagnostic::Diagnostic;
 use crate::expr::{Expr, ExprNode};
 use crate::ident::Symbol;
-use crate::ty::Ty;
+use crate::ty::{FnTy, Ty};
 
 pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
@@ -79,14 +84,33 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
     // (`lower::job_payload`). `at` is the epoch in seconds as a Float,
     // 0.0 for none; `queue` a String, "" for the job's own.
     let sidekiq = app.queue_adapter.as_deref() == Some("sidekiq");
+    // Not dropped under solid_queue: `SolidQueue::Queue#clear` reads the queue a job was put on.
+    let solid_queue = app.queue_adapter.as_deref() == Some("solid_queue");
+    let own_queues: crate::det::HashMap<String, String> = app
+        .library_classes
+        .iter()
+        .filter(|lc| jobs.contains(lc.name.0.as_str()))
+        .map(|lc| (lc.name.0.as_str().to_string(), super::job_payload::queue_name(app, lc)))
+        .collect();
     let mut unfolded: BTreeSet<String> = BTreeSet::new();
     let mut folded: Vec<crate::span::Span> = Vec::new();
     let mut delayed: Vec<crate::span::Span> = Vec::new();
     let mut scheduled = SetFolds::default();
     super::for_each_hook_body(app, &mut |body| {
-        fold_set_chains(body, &jobs, &mut unfolded, &mut folded, sidekiq.then_some(&mut scheduled));
+        fold_set_chains(body, &jobs, &mut unfolded, &mut folded, (sidekiq || solid_queue).then_some(&mut scheduled));
         fold_delayed_enqueues(body, &delay_folds, &mut delayed);
     });
+    for span in scheduled.waits.iter().filter(|_| !sidekiq) {
+        diags.push(crate::lower::residue_diagnostic(
+            "job_class_side",
+            "job-set-options",
+            *span,
+            "in-process queue",
+            "`set(wait:/wait_until:)` is dropped: the in-process queue runs its jobs in order, \
+             with no scheduled time"
+                .to_string(),
+        ));
+    }
     for span in &scheduled.priority {
         diags.push(crate::lower::residue_diagnostic(
             "job_class_side",
@@ -98,7 +122,10 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
                 .to_string(),
         ));
     }
-    for span in &scheduled.rejected {
+    for span in scheduled.rejected.iter().filter(|_| !sidekiq) {
+        folded.push(*span);
+    }
+    for span in scheduled.rejected.iter().filter(|_| sidekiq) {
         let mut d = crate::lower::residue_diagnostic(
             "job_class_side",
             "job-set-options",
@@ -134,7 +161,17 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
 
     // The jobs given a synthesized `perform_later`: the ones
     // `lower::job_payload` can plan a payload for.
+    let mut own_entries: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for lc in &app.library_classes {
+        own_entries.entry(lc.name.0.as_str().into()).or_default().extend(lc.methods.iter()
+            .filter(|m| m.receiver == crate::dialect::MethodReceiver::Class).map(|m| m.name.as_str().to_string()));
+    }
+    let adapters: BTreeMap<_, _> = jobs.iter().map(|name| (name.clone(), super::job_payload::job_adapter(app, name))).collect();
     let mut payload_jobs: BTreeSet<String> = BTreeSet::new();
+    let native_keywords = app.native_library_keywords;
+    // Jobs refused a wrapper: their `perform_later` / `perform_now`
+    // call sites call nothing, so each is an error below.
+    let mut refused: std::collections::BTreeMap<String, BTreeSet<String>> = std::collections::BTreeMap::new();
     for lc in app.library_classes.iter_mut() {
         let is_worker = workers.contains(lc.name.0.as_str());
         if !is_worker && !jobs.contains(lc.name.0.as_str()) {
@@ -187,12 +224,8 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
             }
         }
         let entries: &[&str] = if is_worker { &["perform_async"] } else { &["perform_later", "perform_now"] };
-        let class_side: BTreeSet<&str> = lc
-            .methods
-            .iter()
-            .filter(|m| m.receiver == crate::dialect::MethodReceiver::Class)
-            .map(|m| m.name.as_str())
-            .collect();
+        let class_side = &own_entries[lc.name.0.as_str()];
+        let adapter = adapters.get(lc.name.0.as_str()).and_then(|a| a.as_deref());
         let Some(perform) = lc
             .methods
             .iter()
@@ -204,25 +237,64 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
         else {
             continue;
         };
+        // The entries a refused job is left without (one it defines
+        // itself stays callable).
+        let missing: BTreeSet<String> = entries
+            .iter()
+            .chain(if is_worker { [].iter() } else { ["perform_later_with"].iter() })
+            .filter(|e| !class_side.contains(**e))
+            .map(|e| e.to_string())
+            .collect();
+        let own_name = lc.name.0.as_str().to_string();
         if perform.params.iter().any(|p| p.forwarding) {
             diags.push(Diagnostic::unsupported(perform.name_span, None, "full forwarding job wrapper",
                 "the generated job wrapper cannot preserve a full forwarding packet"));
+            refused.insert(own_name, missing);
             continue;
         }
-        if perform.params.iter().any(|p| p.keyword) {
+        // Not on a target whose keywords are trailing positionals: there a required keyword has no slot a caller can name.
+        // A job's named keywords forward by name (`count: count`), as
+        // ActiveJob's do; a `**rest` keyword bundle and a worker's
+        // keywords don't. Sidekiq passes a worker its JSON args
+        // positionally, so a worker has no keywords to forward.
+        if perform.params.iter().any(|p| p.keyword && (!native_keywords || p.rest || is_worker)) {
             diags.push(residue(&perform, "keyword parameters do not forward positionally"));
+            // Only where a job's keywords forward at all: elsewhere a
+            // keyword job is unwrapped on the ledger as before.
+            if native_keywords && !is_worker {
+                refused.insert(own_name, missing);
+            }
+            continue;
+        }
+        // The wrapper repeats `perform`'s parameter list, defaults
+        // included, so a default is evaluated when the job is enqueued
+        // and on the class: right only for a literal, which reads the
+        // same wherever and whenever it is evaluated. `label: Time.now`
+        // or `label: default_label` would be evaluated at the wrong time
+        // or not resolve at all.
+        if perform.params.iter().any(|p| {
+            p.keyword && p.default.as_ref().is_some_and(|d| !matches!(&*d.node, ExprNode::Lit { .. }))
+        }) {
+            diags.push(residue(&perform, "a keyword default that isn't a literal is evaluated by perform, not the wrapper"));
+            refused.insert(own_name, missing);
             continue;
         }
         if perform.block_param.is_some() {
             diags.push(residue(&perform, "the wrapper cannot forward a block"));
+            if !is_worker {
+                refused.insert(own_name, missing);
+            }
             continue;
         }
 
         let (param_tys, ret_ty): (Vec<Option<Ty>>, Option<Ty>) = match &perform.signature {
-            Some(Ty::Fn { params, ret, .. }) if params.len() == perform.params.len() => (
-                params.iter().map(|p| Some((*p.ty).clone())).collect(),
-                Some((**ret).clone()),
-            ),
+            Some(Ty::Fn(fn_ty)) if fn_ty.params.len() == perform.params.len() => {
+                let FnTy { params, ret, .. } = &**fn_ty;
+                (
+                    params.iter().map(|p| Some((*p.ty).clone())).collect(),
+                    Some((**ret).clone()),
+                )
+            },
             _ => (vec![None; perform.params.len()], None),
         };
 
@@ -232,12 +304,13 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
             if class_side.contains(entry) {
                 continue;
             }
-            let args: Vec<Expr> = perform
+            let mut keywords: Vec<(Expr, Expr)> = Vec::new();
+            let mut args: Vec<Expr> = perform
                 .params
                 .iter()
                 .zip(param_tys.iter())
                 .enumerate()
-                .map(|(i, (p, ty))| {
+                .filter_map(|(i, (p, ty))| {
                     let mut v = Expr::new(
                         span,
                         ExprNode::Var {
@@ -246,13 +319,23 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
                         },
                     );
                     v.ty = ty.clone();
+                    if p.keyword {
+                        let mut key = Expr::new(span, ExprNode::Lit { value: crate::expr::Literal::Sym { value: p.name.clone() } });
+                        key.ty = Some(Ty::Sym);
+                        keywords.push((key, v));
+                        return None;
+                    }
                     if p.rest {
                         v.ty = Some(Ty::Array { elem: std::sync::Arc::new(ty.clone().unwrap_or(Ty::Untyped)) });
-                        return Expr::new(span, ExprNode::Splat { value: v });
+                        return Some(Expr::new(span, ExprNode::Splat { value: v }));
                     }
-                    v
+                    Some(v)
                 })
                 .collect();
+            // `new.perform(article, count: count, label: label)`.
+            if !keywords.is_empty() {
+                args.push(Expr::new(span, ExprNode::Hash { entries: keywords, kwargs: true }));
+            }
             let mut new_call = Expr::new(
                 span,
                 ExprNode::Send {
@@ -364,12 +447,21 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
                 // parameter `^() -> nil` so the runtime file types
                 // fully, and RBS has no syntax for naming a block.
                 let held_block = block.clone();
+                let mut own_queue = Expr::new(
+                    span,
+                    ExprNode::Lit {
+                        value: crate::expr::Literal::Str {
+                            value: own_queues.get(lc.name.0.as_str()).cloned().unwrap_or_else(|| "default".to_string()),
+                        },
+                    },
+                );
+                own_queue.ty = Some(Ty::Str);
                 let mut enqueue = Expr::new(
                     span,
                     ExprNode::Send {
                         recv: Some(active_job(span)),
-                        method: Symbol::from("enqueue"),
-                        args: vec![block],
+                        method: Symbol::from("enqueue_on"),
+                        args: vec![own_queue, block],
                         block: None,
                         parenthesized: true,
                     },
@@ -387,6 +479,7 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
                     },
                 );
                 drained.ty = Some(Ty::Bool);
+                if adapter == Some("inline") { drained.node = Box::new(ExprNode::Lit { value: crate::expr::Literal::Bool { value: false } }); }
                 let mut queued_or_inline = Expr::new(
                     span,
                     ExprNode::If {
@@ -419,6 +512,7 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
                     },
                 );
                 cond.ty = Some(Ty::Bool);
+                if let Some("inline" | "test") = adapter { cond.node = Box::new(ExprNode::Lit { value: crate::expr::Literal::Bool { value: adapter == Some("inline") } }); }
                 // Under `enqueue_only` the work is HELD rather than
                 // dropped, so a blockless `perform_enqueued_jobs` can run
                 // it later, as Rails' `:test` adapter can
@@ -477,9 +571,10 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
             w.body = body;
             // Not `perform`'s signature whole: the enqueueing wrapper answers nil, whatever `perform` returns.
             if matches!(entry, "perform_later" | "perform_async")
-                && let Some(Ty::Fn { params, block, effects, .. }) = &perform.signature
+                && let Some(Ty::Fn(fn_ty)) = &perform.signature
             {
-                w.signature = Some(Ty::Fn { params: params.clone(), block: block.clone(), ret: std::sync::Arc::new(Ty::Nil), effects: effects.clone() });
+                let FnTy { params, block, effects, .. } = &**fn_ty;
+                w.signature = Some(Ty::Fn(Box::new(FnTy { params: params.clone(), block: block.clone(), ret: std::sync::Arc::new(Ty::Nil), effects: effects.clone() })));
             }
             wrappers.push(w);
         }
@@ -496,7 +591,7 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
             w.name = Symbol::from("set");
             w.receiver = crate::dialect::MethodReceiver::Class;
             w.params = vec![crate::dialect::Param::positional(Symbol::from("options"))];
-            w.signature = Some(Ty::Fn {
+            w.signature = Some(Ty::Fn(Box::new(FnTy {
                 params: vec![crate::ty::Param {
                     name: Symbol::from("options"),
                     ty: Ty::Untyped.into(),
@@ -505,7 +600,7 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
                 block: None,
                 ret: std::sync::Arc::new(Ty::Untyped),
                 effects: crate::effect::EffectSet::pure(),
-            });
+            })));
             w.body = body;
             wrappers.push(w);
             diags.push(residue(
@@ -528,7 +623,40 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
         lc.methods.extend(wrappers);
     }
     app.job_plans = super::job_payload::plan_jobs(app, &jobs, &payload_jobs);
+    if !refused.is_empty() {
+        crate::lower::for_each_hook_body_ref(app, &mut |body| refused_call_sites(body, &refused, &mut diags));
+    }
     diags
+}
+
+/// An error at each `Job.perform_later` / `perform_now` (or folded
+/// `perform_later_with`) of a job refused a wrapper: the declaration's
+/// warning says why, and this says the call has nothing to call.
+fn refused_call_sites(
+    e: &Expr,
+    refused: &std::collections::BTreeMap<String, BTreeSet<String>>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    if let ExprNode::Send { recv: Some(r), method, .. } = &*e.node
+        && matches!(method.as_str(), "perform_later" | "perform_now" | "perform_later_with")
+        && let ExprNode::Const { path } = &*r.node
+    {
+        let name = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+        let name = name.trim_start_matches("::");
+        if refused.get(name).is_some_and(|missing| missing.contains(method.as_str())) {
+            diags.push(Diagnostic::unsupported(
+                e.span,
+                None,
+                "call to a job without a generated wrapper",
+                format!(
+                    "`{name}.{}`: `{name}#perform` takes a `**` keyword rest, a block, `...`, or a keyword default that isn't a literal, so `{name}` gets no `{}`",
+                    method.as_str(),
+                    method.as_str()
+                ),
+            ));
+        }
+    }
+    e.node.for_each_child(&mut |c| refused_call_sites(c, refused, diags));
 }
 
 /// What the `:sidekiq` fold did: the jobs a `set(...)` was folded into
@@ -538,6 +666,7 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
 struct SetFolds {
     jobs: BTreeSet<String>,
     priority: Vec<crate::span::Span>,
+    waits: Vec<crate::span::Span>,
     rejected: Vec<crate::span::Span>,
 }
 
@@ -566,6 +695,9 @@ fn set_options(args: &[Expr], span: crate::span::Span, folds: &mut SetFolds) -> 
     let mut queue = typed(ExprNode::Lit { value: crate::expr::Literal::Str { value: String::new() } }, Ty::Str);
     for (k, v) in entries {
         let ExprNode::Lit { value: crate::expr::Literal::Sym { value: key } } = &*k.node else { return None };
+        if matches!(key.as_str(), "wait" | "wait_until") {
+            folds.waits.push(k.span);
+        }
         match key.as_str() {
             // `wait_until:` wins over `wait:` whichever comes first,
             // as Rails' `set` reads them.
@@ -623,15 +755,44 @@ fn perform_later_with(later: &crate::dialect::MethodDef) -> crate::dialect::Meth
     ];
     params.extend(later.params.iter().cloned());
     w.params = params;
-    if let Some(Ty::Fn { params: tys, block, ret, effects }) = &later.signature {
+    if let Some(Ty::Fn(fn_ty)) = &later.signature {
+        let FnTy { params: tys, block, ret, effects } = &**fn_ty;
         let mut all = vec![
             crate::ty::Param { name: at, ty: Ty::Float.into(), kind: crate::ty::ParamKind::Required },
-            crate::ty::Param { name: queue, ty: Ty::Str.into(), kind: crate::ty::ParamKind::Required },
+            crate::ty::Param { name: queue.clone(), ty: Ty::Str.into(), kind: crate::ty::ParamKind::Required },
         ];
         all.extend(tys.iter().cloned());
-        w.signature = Some(Ty::Fn { params: all.into(), block: block.clone(), ret: ret.clone(), effects: effects.clone() });
+        w.signature = Some(Ty::Fn(Box::new(FnTy { params: all.into(), block: block.clone(), ret: ret.clone(), effects: effects.clone() })));
     }
+    queue_from_param(&mut w.body, &queue);
     w
+}
+
+fn queue_from_param(e: &mut Expr, queue: &Symbol) {
+    if let ExprNode::Send { recv: Some(r), method, args, .. } = &mut *e.node
+        && method.as_str() == "enqueue_on"
+        && matches!(&*r.node, ExprNode::Const { path } if path.len() == 1 && path[0].as_str() == "ActiveJob")
+        && let Some(own) = args.first_mut()
+        && matches!(&*own.node, ExprNode::Lit { value: crate::expr::Literal::Str { .. } })
+    {
+        let span = own.span;
+        let mut named = Expr::new(span, ExprNode::Var { id: crate::ident::VarId(1), name: queue.clone() });
+        named.ty = Some(Ty::Str);
+        let mut pick = Expr::new(
+            span,
+            ExprNode::Send {
+                recv: Some(Expr::new(span, ExprNode::Const { path: vec![Symbol::from("ActiveJob")] })),
+                method: Symbol::from("queue_or"),
+                args: vec![named, own.clone()],
+                block: None,
+                parenthesized: true,
+            },
+        );
+        pick.ty = Some(Ty::Str);
+        *own = pick;
+        return;
+    }
+    e.node.for_each_child_mut(&mut |c| queue_from_param(c, queue));
 }
 
 /// Fold `Job.set(…).perform_later(args)` / `.perform_now(args)` to the

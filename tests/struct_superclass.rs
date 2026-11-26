@@ -79,12 +79,10 @@ fn the_named_base_carries_the_positional_constructor_super_calls() {
     assert!(base.contains("def width=(value)"), "{base}");
 }
 
-/// The keyword-init form means a DIFFERENT constructor, so recognizing
-/// it as the positional one would build a class whose `new` takes the
-/// wrong arguments. Declined — the parent stays unresolved, which is
-/// the state that was already ledgered rather than a new wrong answer.
+/// The keyword-init form is a keyword constructor: the base built for it takes its members by keyword
+/// (rails-settings-cached's `Fields::Base`), not positionally.
 #[test]
-fn the_keyword_init_form_is_not_claimed() {
+fn the_keyword_init_form_takes_keywords() {
     let files = emitted(
         r#"class Sound
   class Image < Struct.new(:asset_path, keyword_init: true)
@@ -93,8 +91,8 @@ end
 "#,
     );
     let image = find(&files, "sound.rb");
-    assert!(!image.contains("ImageStruct"), "{image}");
-    assert!(files.iter().all(|(p, _)| !p.ends_with("image_struct.rb")), "{files:?}");
+    assert!(image.contains("def initialize(asset_path: nil)"), "{image}");
+    assert!(image.contains("class Image < Sound::ImageStruct"), "{image}");
 }
 
 fn diagnostics(files: &[(&str, &str)]) -> Vec<String> {

@@ -72,7 +72,7 @@ use crate::dialect::{MethodDef, Model};
 use crate::expr::{Expr, ExprNode, LValue, Literal};
 use crate::ident::{ClassId, Symbol, VarId};
 use crate::span::Span;
-use crate::ty::Ty;
+use crate::ty::{FnTy, Ty};
 
 use super::controller_to_library::params::{
     collect_specs, helper_spec_map, model_from_params_name, params_source_class, ParamsSpec,
@@ -336,7 +336,7 @@ fn including_models(app: &App) -> HashMap<ClassId, Vec<Symbol>> {
 
 fn scan_bindings(app: &App, specs: &ParamsSpecs) -> HashMap<BindKey, Binding> {
     let mut seen: HashMap<BindKey, SiteShapes> = HashMap::default();
-    let assocs = crate::lower::scope_chain::build_assoc_registry(&app.models);
+    let assocs = crate::lower::scope_chain::build_assoc_registry_for_app(app);
     let assoc = AssocCtx { assocs: &assocs };
 
     // EVERY call site has to be seen, not just the ones that could bind
@@ -519,6 +519,18 @@ fn uses_as_hash(body: &Expr, name: &Symbol, ar_hash_api: bool) -> bool {
                 method,
                 ..
             } if matches!(method.as_str(), "delete" | "[]=") && reads_name(r) => {
+                found = true;
+            }
+            // The same `delete`, written by `params_permit` as the read of either key Parameters answer.
+            ExprNode::Send {
+                recv: Some(r),
+                method,
+                args,
+                ..
+            } if method.as_str() == "indifferent_delete"
+                && matches!(&*r.node, ExprNode::Const { path } if path.last().is_some_and(|p| p.as_str() == "Params"))
+                && args.first().is_some_and(&reads_name) =>
+            {
                 found = true;
             }
             ExprNode::Assign {
@@ -913,7 +925,7 @@ fn convert_attrs_call_sites(
     if !bindings.values().any(|b| matches!(b, Binding::Attrs(_))) {
         return;
     }
-    let assocs = crate::lower::scope_chain::build_assoc_registry(&app.models);
+    let assocs = crate::lower::scope_chain::build_assoc_registry_for_app(app);
     let assoc = AssocCtx { assocs: &assocs };
     for controller in &mut app.controllers {
         let actions: Vec<crate::dialect::Action> = controller.actions().cloned().collect();
@@ -1035,12 +1047,7 @@ fn stamp_attr_hash_params(method: &mut MethodDef, indices: &[usize]) {
         value: std::sync::Arc::new(Ty::Untyped),
     };
     let (mut params, block, ret, effects) = match method.signature.clone() {
-        Some(Ty::Fn {
-            params,
-            block,
-            ret,
-            effects,
-        }) => (params, block, ret, effects),
+        Some(Ty::Fn(fn_ty)) => { let FnTy { params, block, ret, effects } = *fn_ty; (params, block, ret, effects) }
         _ => (
             method
                 .params
@@ -1061,12 +1068,12 @@ fn stamp_attr_hash_params(method: &mut MethodDef, indices: &[usize]) {
             p.ty = hash_ty.clone().into();
         }
     }
-    method.signature = Some(Ty::Fn {
+    method.signature = Some(Ty::Fn(Box::new(FnTy {
         params,
         block,
         ret,
         effects,
-    });
+    })));
 }
 
 fn stamp_param_types(method: &mut MethodDef, bound: &[(usize, Symbol, &ParamsSpec)]) {
@@ -1075,12 +1082,7 @@ fn stamp_param_types(method: &mut MethodDef, bound: &[(usize, Symbol, &ParamsSpe
     // rather than declining — the whole point is that this parameter's
     // type is now known.
     let (mut params, block, ret, effects) = match method.signature.clone() {
-        Some(Ty::Fn {
-            params,
-            block,
-            ret,
-            effects,
-        }) => (params, block, ret, effects),
+        Some(Ty::Fn(fn_ty)) => { let FnTy { params, block, ret, effects } = *fn_ty; (params, block, ret, effects) }
         _ => (
             method
                 .params
@@ -1104,12 +1106,12 @@ fn stamp_param_types(method: &mut MethodDef, bound: &[(usize, Symbol, &ParamsSpe
             }.into();
         }
     }
-    method.signature = Some(Ty::Fn {
+    method.signature = Some(Ty::Fn(Box::new(FnTy {
         params,
         block,
         ret,
         effects,
-    });
+    })));
 }
 
 /// Offer each STATEMENT in `body` to `f`, which may rewrite it and push

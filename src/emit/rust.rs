@@ -287,6 +287,14 @@ use crate::session::Session;
 /// progress): adds per-file application code emit through the
 /// `lower_*_to_library_classes` lowerers + the shared
 /// `library::emit_library_class` consumer.
+/// The instance methods the model shim in [`emit`] writes into every
+/// Rust model (by their Ruby names), for `respond_to?` answered at emit
+/// time (`expr::send::model_respond_to`). Keep in step with the shim.
+pub(crate) const MODEL_SHIM_INSTANCE_METHODS: &[&str] = &[
+    "errors", "save", "save!", "destroy", "destroy!", "valid?", "persisted?", "reload", "saved_changes",
+    "id_previously_changed?", "attribute_previously_was",
+];
+
 pub fn emit(app: &App) -> Vec<EmittedFile> {
     // Wedge 2b: route-bearing apps get a real `src/main.rs` that
     // boots tokio + axum and calls `server::start(router::router(),
@@ -538,9 +546,10 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
         Vec<crate::dialect::LibraryClass>,
         crate::det::HashMap<crate::ident::ClassId, crate::analyze::ClassInfo>,
     ) = if !app.models.is_empty() {
-        let (mut lcs, registry) = crate::lower::lower_models_with_registry_and_params(
+        let (mut lcs, registry) = crate::lower::lower_models_with_registry_params_and_views(
             &app.models,
             &app.schema,
+            &app.views,
             vec![],
             &params_specs,
         );
@@ -734,7 +743,7 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
     // parens, str_color, last_use.)
     if !model_lcs.is_empty() {
         for lc in &model_lcs {
-            let stem = crate::naming::snake_case(lc.name.0.as_str());
+            let stem = rust_model_stem(lc.name.0.as_str());
             let body = match library::emit_library_class(lc) {
                 Ok(s) => s,
                 Err(e) => {
@@ -815,11 +824,109 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
             } else {
                 ""
             };
+            // A model gets `validate` only with validations and
+            // `fill_timestamps` only with timestamp columns; with neither
+            // there is nothing to run, as `ActiveRecord::Base`'s would.
+            let validate_call = if has_method("validate") { "self.validate();\n" } else { "" };
+            let fill_timestamps_call = if has_method("fill_timestamps") { "self.fill_timestamps(true);\n" } else { "" };
             let destroy_body = format!(
                 "{before}self._adapter_delete();{after}",
                 before = if has_before_destroy { "self.before_destroy(); " } else { "" },
                 after = after_destroy_commit,
             );
+            // The class and instance methods every other target inherits
+            // from the transpiled `ActiveRecord::Base` (`create!`,
+            // `valid?`, `destroy!`, `find_by`) — Rust models do not
+            // inherit it, so a test or class method calling one failed to
+            // compile (E0599). Each is skipped where the model already
+            // defines the name, so a lowered or hand-written one wins.
+            let shim_extras = {
+                let name = rust_struct_name(lc.name.0.as_str());
+                let mut extras = String::new();
+                if !has_method("create!") {
+                    extras.push_str(&format!(
+                        "pub fn create_bang<K: ToString, V: Into<serde_json::Value>>(attrs: std::collections::HashMap<K, V>) -> {name} {{ let mut m = Self::new(attrs.into_iter().map(|(k, v)| (k.to_string(), v.into())).collect()); m.save_bang() }}\n"
+                    ));
+                }
+                // Rails' `valid?`: clear, run the validations, answer
+                // whether none failed — `save`'s first half.
+                if !has_method("valid?") {
+                    extras.push_str(&format!(
+                        "pub fn valid_pred(&mut self) -> bool {{\ncrate::errors_ext::validation_errors_clear();\n{validate_call}crate::errors_ext::validation_errors_is_empty()\n}}\n"
+                    ));
+                }
+                // No abort channel on the strict targets, so the bang
+                // form is `destroy` (as `ActiveRecord::Base#destroy!`),
+                // answering the record as `save_bang` does.
+                if !has_method("destroy!") {
+                    extras.push_str("pub fn destroy_bang(&mut self) -> Self { self.destroy(); self.clone() }\n");
+                }
+                // `find_by(col: value, …)`: equality per condition (`IS
+                // NULL` for nil), ANDed, first row. The keys are the
+                // source's literal attribute names; values are quoted
+                // through `Db`, never spliced.
+                if !has_method("find_by") {
+                    // A `t.binary` column compares through
+                    // `escape_binary`, as the lowered writes store it.
+                    let binary: Vec<String> = app
+                        .models
+                        .iter()
+                        .find(|m| m.name == lc.name)
+                        .and_then(|m| app.schema.tables.get(&m.table.0))
+                        .map(|t| {
+                            t.columns
+                                .iter()
+                                .filter(|c| c.col_type == crate::schema::ColumnType::Binary)
+                                .map(|c| format!("{:?}", c.name.as_str()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let binary_arm = if binary.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            "serde_json::Value::String(bytes) if [{}].contains(&k.as_ref()) => format!(\"{{column}} = {{}}\", crate::db::Db::escape_binary(&bytes)),\n",
+                            binary.join(", ")
+                        )
+                    };
+                    extras.push_str(&format!(
+                        "pub fn find_by<K: AsRef<str>, V: Into<serde_json::Value>>(conditions: std::collections::HashMap<K, V>) -> Option<{name}> {{\n\
+                         let mut clauses: Vec<String> = conditions.into_iter().map(|(k, v)| {{\n\
+                         let column = format!(\"\\\"{{}}\\\".\\\"{{}}\\\"\", Self::table_name(), k.as_ref().replace('\"', \"\"));\n\
+                         match v.into() {{\n\
+                         serde_json::Value::Null => format!(\"{{column}} IS NULL\"),\n\
+                         serde_json::Value::Bool(b) => format!(\"{{column}} = {{}}\", crate::db::Db::escape_bool(b)),\n\
+                         serde_json::Value::Number(n) => format!(\"{{column}} = {{n}}\"),\n\
+                         {binary_arm}serde_json::Value::String(text) => format!(\"{{column}} = {{}}\", crate::db::Db::escape_string(&text)),\n\
+                         other => format!(\"{{column}} = {{}}\", crate::db::Db::escape_string(&other.to_string())),\n\
+                         }}\n\
+                         }}).collect();\n\
+                         clauses.sort();\n\
+                         let filter = if clauses.is_empty() {{ String::new() }} else {{ format!(\" WHERE {{}}\", clauses.join(\" AND \")) }};\n\
+                         Self::_hydrate_all(&format!(\"SELECT {{}} FROM \\\"{{}}\\\"{{}} LIMIT 1\", Self::_columns_sql(), Self::table_name(), filter)).into_iter().next()\n\
+                         }}\n"
+                    ));
+                }
+                extras
+            };
+            // Active Record equality: the same model and the same saved
+            // id (a new record equals no other). Ruby's identity half
+            // (`super`, so a new record equals itself) has no Rust
+            // counterpart: the emitted operands are clones, so an
+            // address compare never sees the same record twice.
+            // `assert_equal record, other.association` and
+            // `other.association == record` compare against the reader's
+            // Option, in either order.
+            let shim_eq = if has_method("==") {
+                String::new()
+            } else {
+                let name = rust_struct_name(lc.name.0.as_str());
+                format!(
+                    "impl PartialEq for {name} {{ fn eq(&self, other: &Self) -> bool {{ self.id != 0 && self.id == other.id }} }}\n\
+                     impl PartialEq<Option<{name}>> for {name} {{ fn eq(&self, other: &Option<{name}>) -> bool {{ other.as_ref().is_some_and(|o| self == o) }} }}\n\
+                     impl PartialEq<{name}> for Option<{name}> {{ fn eq(&self, other: &{name}) -> bool {{ self.as_ref().is_some_and(|s| s == other) }} }}\n"
+                )
+            };
             let ar_shim = if needs_ar_shim {
                 // `destroy` and `exists` are paired in:
                 //   - Article#dependent_destroy: `c.destroy()` over the
@@ -886,9 +993,10 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
                         pub fn error_details(&self) -> Vec<crate::active_record_base::ErrorDetail> {{ crate::errors_ext::validation_error_details_snapshot().iter().map(|(a, k, m, f, s, o)| crate::active_record_base::ErrorDetail::new(a, k, m, f, *s, *o)).collect() }}\n\
                         pub fn push_error_detail(error: crate::active_record_base::ErrorDetail) {{ crate::errors_ext::validation_error_details_push(error.attribute(), error.kind(), error.message(), error.full_message(), error.symbolic(), error.optionless()) }}\n\
                         pub fn error_messages_for(&self, attribute: &str) -> Vec<String> {{ crate::errors_ext::validation_error_details_snapshot().into_iter().filter(|(a, _, _, _, _, _)| a == attribute).map(|(_, _, m, _, _, _)| m).collect() }}\n\
+                        pub fn error_full_messages_for(&self, attribute: &str) -> Vec<String> {{ crate::errors_ext::validation_error_details_snapshot().into_iter().filter(|(a, _, _, _, _, _)| a == attribute).map(|(_, _, _, f, _, _)| f).collect() }}\n\
                         pub fn save(&mut self) -> bool {{\n\
                             crate::errors_ext::validation_errors_clear();\n\
-                            self.validate();\n\
+                            {validate_call}\
                             if !crate::errors_ext::validation_errors_is_empty() {{ return false; }}\n\
                             self.save_after_validation()\n\
                         }}\n\
@@ -899,7 +1007,7 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
                             true\n\
                         }}\n\
                         pub fn _insert_row(&mut self) -> bool {{\n\
-                            self.fill_timestamps(true);\n\
+                            {fill_timestamps_call}\
                             self.id = self._adapter_insert();\n\
                             true\n\
                         }}\n\
@@ -920,11 +1028,16 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
                         pub fn attribute_previously_was(&self, name: &str) -> serde_json::Value {{ let _ = name; serde_json::Value::Null }}\n\
                         pub fn _note_hydrated(&self) {{}}\n\
                         pub fn create(attrs: std::collections::HashMap<String, serde_json::Value>) -> {name} {{ let mut m = Self::new(attrs); m.save(); m }}\n\
-                    }}\n",
-                    name = lc.name.0.as_str(),
+                        {shim_extras}}}\n{shim_eq}",
+                    // The struct, not the class: `impl Admin::Note` names no type.
+                    name = rust_struct_name(lc.name.0.as_str()),
                     destroy_body = destroy_body,
                     after_create_commit = after_create_commit,
                     after_update_commit = after_update_commit,
+                    validate_call = validate_call,
+                    fill_timestamps_call = fill_timestamps_call,
+                    shim_extras = shim_extras,
+                    shim_eq = shim_eq,
                 )
             } else {
                 String::new()
@@ -1301,6 +1414,7 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
             &app.models,
             test_extras,
             &crate::lower::routes::helper_id_segments(app),
+            &crate::lower::routes::direct_helper_names(app),
         );
 
         let mut test_entries: Vec<(String, String)> = Vec::new();
@@ -1479,6 +1593,15 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
     // runs. The stubs cost nothing when the real ones were emitted:
     // this only fills a gap, last-write-wins dedupe below is untouched.
     if files.iter().any(|f| f.path.starts_with("src/tests")) {
+        // With a schema, `setup()` still has a database to bring up: an
+        // app whose tests build their own records (`Model.create!` in
+        // the body, no `test/fixtures/`) otherwise runs every query
+        // against a connection with no tables. Same entry point as the
+        // fixture-carrying form, with no fixtures to load.
+        let has_schema = files.iter().any(|f| f.path == PathBuf::from("src/schema_sql.rs"));
+        if has_schema && !files.iter().any(|f| f.path == PathBuf::from("src/fixtures/mod.rs")) {
+            files.push(emit_fixtures_mod_rs(&[]));
+        }
         let mut stub = |path: &str, content: &str| {
             if !files.iter().any(|f| f.path == PathBuf::from(path)) {
                 files.push(EmittedFile {
@@ -1489,16 +1612,25 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
         };
         stub("src/models/mod.rs", "// Generated by Roundhouse (rust2). No models in this app.\n");
         stub("src/views/mod.rs", "// Generated by Roundhouse (rust2). No views in this app.\n");
-        // A no-op `setup()`: with no fixtures there is no schema to
+        // A no-op `setup()`: with no schema there is no database to
         // create and nothing to load, but the call site is emitted
         // unconditionally, so the function has to exist.
         stub(
             "src/fixtures/mod.rs",
             "// Generated by Roundhouse (rust2). No fixtures in this app.\n\
              \n/// Per-test entry point. No-op here — this app declares no\n\
-             /// fixtures, so there is no schema to create and nothing to load.\n\
+             /// schema, so there is no database to create and nothing to load.\n\
              pub fn setup() {}\n",
         );
+    }
+
+    // `Digest::BLAKE3` (`expr::send::ops::try_stdlib_class_method`) is
+    // the one bridge whose crate is not in every tree: declared only
+    // where an emitted body calls it.
+    if files.iter().any(|f| f.content.contains("blake3::hash(")) {
+        if let Some(cargo) = files.iter_mut().find(|f| f.path == PathBuf::from("Cargo.toml")) {
+            cargo.content = cargo.content.replacen("chrono = {", "blake3 = \"1\"\nchrono = {", 1);
+        }
     }
 
     // src/lib.rs — declares the modules emitted above (hand-written +
@@ -1914,7 +2046,7 @@ fn render_route_helpers_bare_wrappers(lc: &crate::dialect::LibraryClass) -> Stri
             continue;
         }
         let sig_params: &[crate::ty::Param] = match m.signature.as_ref() {
-            Some(crate::ty::Ty::Fn { params, .. }) => params,
+            Some(crate::ty::Ty::Fn(fn_ty)) => &fn_ty.params,
             _ => &[],
         };
         let params: Vec<String> = m
@@ -2180,6 +2312,19 @@ fn emit_lib_rs(emitted: &[EmittedFile]) -> EmittedFile {
     }
 }
 
+/// A model's module stem under `src/models/`: the snake-cased name with a
+/// namespace's `::` as `_` (`Admin::Note` → `admin_note`), since a Rust
+/// module name is one identifier.
+pub(crate) fn rust_model_stem(name: &str) -> String {
+    crate::naming::snake_case(name).replace("::", "_")
+}
+
+/// The struct a model's file declares: the last segment of its name
+/// (`Admin::Note` → `Note`).
+pub(crate) fn rust_struct_name(name: &str) -> &str {
+    name.rsplit("::").next().unwrap_or(name)
+}
+
 /// `src/models/mod.rs` aggregator — declares each emitted model
 /// file as `pub mod <stem>;` so `app::models::Article` etc. resolve
 /// from outside the directory.
@@ -2187,12 +2332,7 @@ fn emit_models_mod_rs(lcs: &[crate::dialect::LibraryClass]) -> EmittedFile {
     let mut lines = vec!["// Generated by Roundhouse (rust2).".to_string(), String::new()];
     let mut entries: Vec<(String, String)> = lcs
         .iter()
-        .map(|lc| {
-            (
-                crate::naming::snake_case(lc.name.0.as_str()),
-                lc.name.0.as_str().to_string(),
-            )
-        })
+        .map(|lc| (rust_model_stem(lc.name.0.as_str()), rust_struct_name(lc.name.0.as_str()).to_string()))
         .collect();
     entries.sort();
     entries.dedup();
@@ -2346,16 +2486,18 @@ fn collect_global_class_methods(
 ) -> EmitCtx {
     use crate::dialect::LibraryClass;
     use crate::ident::Symbol;
-    use crate::ty::{Param, ParamKind, Ty};
+    use crate::ty::{FnTy, Param, ParamKind, Ty};
 
     fn collect_one(
         lc: &LibraryClass,
         out: &mut GlobalMethodsMap,
         out_defaults: &mut GlobalDefaultsMap,
         out_mutating: &mut crate::det::HashSet<String>,
+        out_instance: &mut crate::det::HashMap<String, crate::det::HashSet<String>>,
     ) {
         let raw = lc.name.0.as_str();
         let class_name = raw.rsplit("::").next().unwrap_or(raw).to_string();
+        let instance_entry = out_instance.entry(class_name.clone()).or_default();
         let entry = out.entry(class_name.clone()).or_default();
         let defaults_entry = out_defaults.entry(class_name).or_default();
         // Collect ALL methods (Class + Instance), since constructor
@@ -2369,12 +2511,18 @@ fn collect_global_class_methods(
             if m.mutates_self {
                 out_mutating.insert(m.name.as_str().to_string());
             }
+            if matches!(m.receiver, crate::dialect::MethodReceiver::Instance) {
+                instance_entry.insert(m.name.as_str().to_string());
+            }
             let params: Vec<Param> = match m.signature.as_ref() {
-                Some(Ty::Fn { params, .. }) => params
-                    .iter()
-                    .filter(|p| !matches!(p.kind, ParamKind::Block | ParamKind::KeywordRest))
-                    .cloned()
-                    .collect(),
+                Some(Ty::Fn(fn_ty)) => {
+                    let FnTy { params, .. } = &**fn_ty;
+                    params
+                        .iter()
+                        .filter(|p| !matches!(p.kind, ParamKind::Block | ParamKind::KeywordRest))
+                        .cloned()
+                        .collect()
+                },
                 _ => m
                     .params
                     .iter()
@@ -2418,23 +2566,25 @@ fn collect_global_class_methods(
     let mut out: GlobalMethodsMap = crate::det::HashMap::default();
     let mut out_defaults: GlobalDefaultsMap = crate::det::HashMap::default();
     let mut out_mutating: crate::det::HashSet<String> = crate::det::HashSet::default();
+    let mut out_instance: crate::det::HashMap<String, crate::det::HashSet<String>> =
+        crate::det::HashMap::default();
     for lc in model_lcs {
-        collect_one(lc, &mut out, &mut out_defaults, &mut out_mutating);
+        collect_one(lc, &mut out, &mut out_defaults, &mut out_mutating, &mut out_instance);
     }
     if let Some(lc) = route_helpers_lc {
-        collect_one(lc, &mut out, &mut out_defaults, &mut out_mutating);
+        collect_one(lc, &mut out, &mut out_defaults, &mut out_mutating, &mut out_instance);
     }
     if let Some(lc) = importmap_lc {
-        collect_one(lc, &mut out, &mut out_defaults, &mut out_mutating);
+        collect_one(lc, &mut out, &mut out_defaults, &mut out_mutating, &mut out_instance);
     }
     for lc in view_lcs {
-        collect_one(lc, &mut out, &mut out_defaults, &mut out_mutating);
+        collect_one(lc, &mut out, &mut out_defaults, &mut out_mutating, &mut out_instance);
     }
     for lc in controller_lcs {
-        collect_one(lc, &mut out, &mut out_defaults, &mut out_mutating);
+        collect_one(lc, &mut out, &mut out_defaults, &mut out_mutating, &mut out_instance);
     }
     for lc in fixture_lcs {
-        collect_one(lc, &mut out, &mut out_defaults, &mut out_mutating);
+        collect_one(lc, &mut out, &mut out_defaults, &mut out_mutating, &mut out_instance);
     }
     // Framework runtime LCs (ViewHelpers, JsonBuilder, Inflector,
     // Router, ActiveRecord::Base, ActionController::Base) — parsed
@@ -2446,12 +2596,13 @@ fn collect_global_class_methods(
     // arity-only `Untyped` fallback) and the coerce_arg_for_param_ty
     // families fire.
     for lc in runtime_lcs {
-        collect_one(lc, &mut out, &mut out_defaults, &mut out_mutating);
+        collect_one(lc, &mut out, &mut out_defaults, &mut out_mutating, &mut out_instance);
     }
     EmitCtx {
         global_class_methods: out,
         global_class_method_defaults: out_defaults,
         global_mutating_methods: out_mutating,
+        global_instance_methods: out_instance,
         ..EmitCtx::default()
     }
 }

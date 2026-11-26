@@ -12,6 +12,8 @@
 //! Elixir join as their emit_method gains the single standalone-fn
 //! entry point. Each addition is ~5 lines in this file.
 
+#[path = "support/scratch.rs"]
+mod scratch;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -97,11 +99,7 @@ fn active_support_squish_bang_emits_for_rust() {
         "ActiveSupport.squish! must emit a mutating Rust function:\n{emitted}"
     );
 
-    let scratch = std::env::temp_dir().join(format!(
-        "roundhouse-runtime-rust-squish-bang-{}",
-        std::process::id()
-    ));
-    fs::create_dir_all(&scratch).expect("create generated Rust scratch directory");
+    let scratch = scratch::dir("roundhouse-runtime-rust-squish-bang");
     let source = format!(
         r#"{emitted}
 #[test]
@@ -637,8 +635,8 @@ fn every_runtime_method_body_is_fully_typed() {
                     // (`each_row`'s `row`). Dispatch answers the `Fn`'s
                     // return either way.
                     let ret_ty = match ty {
-                        Ty::Fn { block: Some(_), .. } => ty,
-                        Ty::Fn { ret, .. } => std::sync::Arc::unwrap_or_clone(ret),
+                        Ty::Fn(fn_ty) if fn_ty.block.is_some() => Ty::Fn(fn_ty),
+                        Ty::Fn(fn_ty) => std::sync::Arc::unwrap_or_clone(fn_ty.ret),
                         other => other,
                     };
                     (name, ret_ty)
@@ -838,7 +836,7 @@ fn every_runtime_method_body_concretely_typed() {
             let entry = class_registry.entry(short_id(&class_id)).or_default();
             for (name, ty) in methods {
                 let ret_ty = match ty {
-                    Ty::Fn { ret, .. } => std::sync::Arc::unwrap_or_clone(ret),
+                    Ty::Fn(fn_ty) => std::sync::Arc::unwrap_or_clone(fn_ty.ret),
                     other => other,
                 };
                 entry.instance_methods.insert(name, ret_ty);
@@ -1265,7 +1263,146 @@ fn every_runtime_method_body_concretely_typed() {
     // the same counter measures 901 on main and 904 with assignment.
     // Only Base#assign_attributes (+1) and UnknownAttributeError#initialize
     // (+2) differ; every other method's count is unchanged.
-    const CEILING: usize = 904;
+    // MEASURED 893 on 2026-10-30: ActiveSupport::Notifications keeps typed
+    // Subscriber records, not `[pattern, listener]` Arrays, so publish and
+    // listening? read them typed; only the listener itself stays gradual.
+    // MEASURED 899 on 2026-10-30 (CI run 41007832906): 893 was taken while
+    // the rbs named Subscriber unqualified, which resolved to a missing
+    // ActiveSupport::Subscriber; Subscriber#notify's listener calls count.
+    // MEASURED 916 on 2026-10-30 (on 904): the bulk writes' rows are
+    // attribute Hashes whose values are whatever the app passes, so the
+    // String-keyed copy `upsert_all` and the new `insert_all` family make
+    // of them, and the values they escape, read untyped, as does a
+    // RETURNING row's value off `Db.column_value` (+10 in
+    // active_record/connection.rb); a `where` bind that may be a Relation
+    // is read untyped before its `to_sql` or its escape (+2 in
+    // active_record/relation.rb).
+    // MEASURED 911 on 2026-10-30 after merging main dfd6a874 (899): the
+    // same bulk-write and Relation-bind sites, +12 on main's count.
+    // MEASURED 918 on 2026-10-30 (on 911): a hash condition's boolean is
+    // cast through its column's type (`column_bound_value`), reading the
+    // condition's value and the model's column types untyped (+7 in
+    // active_record/relation.rb).
+    // MEASURED 919 on 2026-10-31 (on 918): the ruby-family `Base#slice`
+    // parses a temporal column's stored text into the Time its reader
+    // answers, reading the untyped `[]` value a second time (+1 in
+    // active_record/connection.rb), as `_as_json_only` does.
+    // MEASURED 920 on 2026-10-31 (on 919): Result#map adds one gradual
+    // yield result in active_record/connection.rb. Its row is a typed
+    // Hash[String, untyped]; the generic block result has no caller in
+    // this probe. Existing methods have unchanged per-method counts.
+    // MEASURED 921 on 2026-11-04 (on 920): `I18nHost.config_name` reads
+    // the thread's config name out of `Thread.current`, untyped as
+    // `locale_name`'s read beside it is (+1 in i18n_host.rb).
+    // MEASURED 924 on 2026-11-04 (on 921): `Type::Value#serialize`
+    // takes any value, as Rails' does, and reads it three times
+    // (+3 in active_record/types.rb).
+    // MEASURED 929 on 2026-11-04 (exact main 7868dd14: 924):
+    // ActiveSupport.blank? follows Object's optional empty? protocol and
+    // String's encoding fallback. Its deliberately untyped argument adds
+    // 5 sites; all other files and method bodies are unchanged
+    // (+5 in active_support_ext.rb).
+    // MEASURED 937 on 2026-11-05 (main 9b89fd5d4: 927): Relation's
+    // filter_map, flat_map and each_with_index add one block-result site
+    // each; reduce adds seven generic accumulator/block-result sites,
+    // exactly as inject does. Existing methods' counts are unchanged.
+    // Add the ten new sites to 929, preserving its two-site headroom.
+    // MEASURED 944 on 2026-11-05 (exact main 310f2e61: 937):
+    // deep_stringify_keys adds 6 sites and deep_stringify_keys_value adds 5.
+    // Built-in Hash case narrowing removes 2 each from deep_dup and
+    // JSON.jsonable; every other method's count is unchanged.
+    // Add the net 7 sites to 939, preserving its two-site headroom.
+    // MEASURED 947 on 2026-11-08 (main db5fa1edd is within 946): partial
+    // writes' new bodies in active_record/connection.rb read the record's
+    // untyped attribute values (`_attributes_snapshot` copies each Array
+    // value; `update_columns` names each column it writes). No other
+    // runtime file's sites change. Raise to 949, preserving the two-site
+    // headroom.
+    // MEASURED 948 on main d534fc3d (947): composite group-count keys
+    // add one gradual site in relation.rb; other files are unchanged.
+    // Raise by one to preserve the existing two-site headroom.
+    // MEASURED 956 on devise-helpers (main f189962ad: 948):
+    // ActiveSupport.extract_options! takes any Array, so its untyped list
+    // argument adds 8 sites in active_support_ext.rb; other files are
+    // unchanged. Raise to 958, preserving the two-site headroom.
+    // MEASURED 959 on devise-boot (main eed6a083f: 956): Params.indifferent_read
+    // reads a value that is Rails' Parameters or a Symbol-keyed Hash, which only
+    // the run time tells apart. Raise to 961, preserving the two-site headroom.
+    // MEASURED 963 on devise-recoverable (devise-boot: 959 + 2): KeyGenerator reads
+    // `hash_digest_class` out of its open options Hash, and Credentials#fetch answers
+    // what its block gives. Raise to 965, preserving the two-site headroom.
+    // MEASURED 984 on devise-lockable (main 963): Devise's remember cookie reads back the JSON Rails' signed
+    // cookies hold, a value of any shape (action_controller/cookies.rb); Params.indifferent_read/delete take a
+    // value that is Rails' Parameters or a typed params object; Rack::Utils.escape takes what OmniAuth's failure
+    // redirect hands it; increment/decrement_counter read their options. Raise to 986, preserving the two-site
+    // headroom.
+    // MEASURED 985 on integer query casts (main 6b6dab7e2: 981): Relation's
+    // integer_list_predicate reads the elements of a hash condition's
+    // untyped Array (+4 in active_record/relation.rb); its typed helpers
+    // add none. Within the ceiling, which is unchanged.
+    // MEASURED 989 on relation async_count (main ca6fe1626: 986): Rails'
+    // `ActiveRecord::Promise` holds a count, a grouped count's Hash or a
+    // `then` block's value, a type parameter RBS here cannot declare, so
+    // its `value` and `then` read an untyped value (+3 in
+    // active_record/relation.rb; `analyze::promise` types the call sites).
+    // MEASURED 990 on scoping: `Relation#scoping` answers what its block
+    // gives (+3 in active_record/relation.rb), and `Model.unscoped { }`
+    // now runs its block through it (-2 in active_record/connection.rb).
+    // MEASURED 991 on partial-select reads (990): `read_attribute` answers
+    // nil for a column a partial `select` left out before it reads the
+    // untyped `self[name]`, so its body is a sequence ending in that read
+    // (+1 in active_record/connection.rb).
+    // MEASURED 993 on unscoped's block value (991): `Model.unscoped { }`
+    // pushes its bare relation and binds its own block's value rather than
+    // answering `scoping`'s, so the Spinel binary keeps it (+2 in
+    // active_record/connection.rb).
+    // MEASURED 996 on PostgreSQL array columns (main 6c9c58dc5: 991): a bulk
+    // write (`update_all`, `insert_all`, `upsert_all`) now passes each value
+    // through `Model._written_sql(column, value)`, which hands an Array to the
+    // model's `encode_written` and quotes the rest. Both take a column
+    // value of any type, as `escape_value` does, so their untyped `value`
+    // adds 5 sites (+5 in active_record/connection.rb); every other file is
+    // unchanged. Raise to 998, preserving the two-site headroom.
+    // MEASURED 1003 on relation predicate blocks (main e942cef18: 998):
+    // Relation's any?, none?, one?, many? and count take a block that
+    // decides over the loaded records, one block-result site each, as
+    // filter_map's (+5 in active_record/relation.rb); every other file is
+    // unchanged. Main had no headroom left, so the ceiling is the measure.
+    // MEASURED 1004 on routed connection handles (main 105a34827: 1003):
+    // `ActiveRecord::Base.with_connection` answers what its block gives
+    // (+1 in active_record/connection.rb), as `transaction` does. The
+    // handle, `lease_connection` and the Db slot calls are typed and add
+    // none; every other file is unchanged. The ceiling is the measure.
+    // MEASURED 1006 on a held `with_connection` (1004): its block runs
+    // inside the handle's slot and binds its value before the slot is
+    // left, so the Spinel binary keeps it, as `Model.unscoped { }` does.
+    // `result = yield handle` and the `begin ... ensure` holding it are
+    // the block's untyped value (+2 in active_record/connection.rb);
+    // `_hold_slot`, `_release_slot` and the handle are typed and add none.
+    // MEASURED 1006 on merging main 3362ae95e (main: 1003): the same three
+    // sites in active_record/connection.rb; every other file equals main's.
+    // MEASURED 1006 after separating handle holds from model routing:
+    // `Db.hold_slot` remains typed; no additional gradual sites.
+    // Raise to 1008, preserving the two-site headroom.
+    // MEASURED 1010 on PostgreSQL uuid casts (base 7d9513597: 1006):
+    // Relation#uuid_list_predicate reads the elements of a hash
+    // condition's untyped Array, as integer_list_predicate does (+4 in
+    // active_record/relation.rb). UuidCast.cast_text and
+    // uuid_value_predicate take a typed scalar and add none; every other
+    // file is unchanged. The ceiling is the measure.
+    // MEASURED 1012 on merging main 81b6491fc (main's ceiling 1008, its
+    // headroom used) with the uuid casts' +4, which add up; the unsaved
+    // record's `IS NULL` arm adds none here.
+    // MEASURED 1013 on responders' renderer constants (1012):
+    // `ActionController::MissingRenderer#initialize`'s `super` reaches
+    // LoadError's, which no runtime signature declares (+1 in
+    // action_controller/parameter_missing.rb); `Renderers::RENDERERS` adds
+    // none. The ceiling is the measure.
+    // MEASURED 1014 on ActiveStorage::Current.set (1013): `set` answers what
+    // its block gives (+1 in active_storage.rb), as `transaction` does; the
+    // thread-held url_options are read through `.to_s` and add none.
+    // The ceiling is the measure.
+    const CEILING: usize = 1014;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}"

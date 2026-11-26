@@ -699,6 +699,20 @@ module Cable
       @subscriptions[stream] || []
     end
 
+    def stop_streams(channel)
+      identifier_json = channel.identifier
+      Reactor.post do
+        next unless @channels[identifier_json].equal?(channel)
+
+        @subscriptions.each_value { |list| list.delete(identifier_json) }
+        @subscriptions.each do |stream, list|
+          Registry.unsubscribe(stream, self) if list.empty?
+        end
+        @subscriptions.delete_if { |_stream, list| list.empty? }
+      end
+      nil
+    end
+
     # websocket-driver's output sink (via EnvAdapter). Registering write
     # interest here is what schedules the flush; nothing writes to the
     # socket outside on_writable.
@@ -978,6 +992,9 @@ module Cable
 
     jar = ActionController::CookieJar.new(CgiIo.parse_cookies(env["HTTP_COOKIE"]))
     connection = ActionCable::Connection.build(jar)
+    params = {}
+    CgiIo.parse_form_into(env.fetch("QUERY_STRING", ""), params)
+    connection.request = ActionDispatch::Request.for(env, params)
     connection.connect
     connection
   rescue ActionCable::Connection::Authorization::UnauthorizedError

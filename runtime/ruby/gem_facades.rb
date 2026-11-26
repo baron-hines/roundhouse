@@ -532,29 +532,6 @@ module Sentry
   end
 end
 
-# rack-mini-profiler's request gate, as the gem (4.0) writes it: a flag on
-# the current thread that the profiler middleware reads. The middleware
-# itself (timing, the injected panel, /mini-profiler-resources) is not
-# here, so an authorized request renders the page without the panel —
-# ledgered in docs/pipeline/runtime.md. lobsters authorizes every
-# moderator's request; without the constant each of their pages was a
-# NameError 500.
-module Rack
-  class MiniProfiler
-    def self.authorize_request
-      Thread.current[:mp_authorized] = true
-    end
-
-    def self.deauthorize_request
-      Thread.current[:mp_authorized] = nil
-    end
-
-    def self.request_authorized?
-      Thread.current[:mp_authorized]
-    end
-  end
-end
-
 # OpenTelemetry façade lives in its own file, same reason the swappable
 # ones do (whole-file grain) even though this one never swaps for a real
 # gem on any target — see runtime/ruby/open_telemetry_facade.rb.

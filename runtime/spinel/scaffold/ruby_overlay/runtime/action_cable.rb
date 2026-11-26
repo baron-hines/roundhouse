@@ -441,6 +441,12 @@ module ActionCable
         nil
       end
 
+      def stop_all_streams
+        @connection.stop_streams(self) unless @connection.nil?
+        @streams.clear
+        nil
+      end
+
       def transmit(data)
         @connection.transmit({ identifier: @identifier, message: data })
         nil
@@ -675,9 +681,15 @@ module ActionCable
       # controllers use. Handing it a real signed jar is what makes
       # `connect` the app's code rather than a reimplementation of it.
       attr_reader :cookies
+      attr_writer :request
+
+      def request
+        @request ||= ActionDispatch::Request.for({})
+      end
 
       def initialize(cookies)
         @cookies = cookies
+        @request = nil
       end
 
       # Rails' Base does not define `connect`; a subclass that wants
@@ -705,6 +717,12 @@ module ActionCable
       # the socket, and so does this: what a test asserts is what the
       # socket was told.
       attr_accessor :transport
+
+      def stop_streams(channel)
+        live = @transport
+        live.stop_streams(channel) unless live.nil?
+        nil
+      end
 
       def transmit(data)
         @transport.transmit(data) unless @transport.nil?

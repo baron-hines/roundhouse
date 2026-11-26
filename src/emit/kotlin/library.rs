@@ -19,10 +19,10 @@ use std::path::PathBuf;
 use crate::dialect::{AccessorKind, LibraryClass, MethodDef, MethodReceiver};
 use crate::emit::EmittedFile;
 use crate::expr::{Expr, ExprNode, LValue};
-use crate::ty::Ty;
+use crate::ty::{FnTy, Ty};
 
 use super::expr::{
-    begin_method, emit_expr, hoisted_decls, register_method_param_tys, register_method_params,
+    begin_method, emit_expr, emit_if_return_value, hoisted_decls, register_method_param_tys, register_method_params,
     set_current_class, set_instance_prop_types, set_instance_props, set_param_names,
     set_return_label, set_returns_unit,
 };
@@ -173,7 +173,22 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
         // `INSTANCE_PROPS` so body references read as properties.
         let ivars = emit_object_body_ivars(&lc.methods, &accessor_props);
         out.push_str(&ivars);
-        if !accessor_props.is_empty() || !ivars.is_empty() {
+        // A view module's hoisted helper calls (`hoist_pure_helper_constants`:
+        // the layout's stylesheet links and importmap tags) are built on
+        // first read and shared by every request after, like the Ruby
+        // emit's class constants. `lazy` (synchronized) rather than an
+        // eager `val`, so no object's initializer depends on the order in
+        // which the JVM happens to load ViewHelpers and Importmap. Views
+        // only (`Views::<Dir>`, and the bare `Views` a top-level template
+        // lowers to): a runtime module's constants are already emitted at
+        // file scope by the runtime-unit path.
+        let view_name = lc.name.0.as_str();
+        let view_constants: &[(crate::ident::Symbol, Expr)] =
+            if view_name == "Views" || view_name.starts_with("Views::") { &lc.constants } else { &[] };
+        for (name, value) in view_constants {
+            out.push_str(&format!("    val {} by lazy {{ {} }}\n", name.as_str(), emit_expr(value)));
+        }
+        if !accessor_props.is_empty() || !ivars.is_empty() || !view_constants.is_empty() {
             out.push('\n');
         }
         for m in &lc.methods {
@@ -209,7 +224,7 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
             let name = camel(m.name.as_str());
             if temporal_names.insert(name.clone()) {
                 let ret = match m.signature.as_ref() {
-                    Some(Ty::Fn { ret, .. }) => (**ret).clone(),
+                    Some(Ty::Fn(fn_ty)) => (*fn_ty.ret).clone(),
                     _ => Ty::Time,
                 };
                 temporal_readers.push((name, ret, m.body.clone()));
@@ -227,14 +242,16 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
                 if temporal_names.contains(&camel(m.name.as_str())) {
                     continue;
                 }
-                if let Some(Ty::Fn { ret, .. }) = m.signature.as_ref() {
+                if let Some(Ty::Fn(fn_ty)) = m.signature.as_ref() {
+                    let FnTy { ret, .. } = &**fn_ty;
                     prop_types
                         .entry(camel(m.name.as_str()))
                         .or_insert_with(|| (**ret).clone());
                 }
             }
             AccessorKind::AttributeWriter => {
-                if let Some(Ty::Fn { params, .. }) = m.signature.as_ref() {
+                if let Some(Ty::Fn(fn_ty)) = m.signature.as_ref() {
+                    let FnTy { params, .. } = &**fn_ty;
                     if let Some(p) = params.first() {
                         // writer name is `foo=`; strip the `=`.
                         let base = m.name.as_str().trim_end_matches('=');
@@ -377,12 +394,14 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
         out.push('\n');
     }
 
-    // The class's property names (accessor-backed + body ivars), so a
-    // `self.x` zero-arg send in a body emits as a property read; everything
-    // else gets `()`. Active for the rest of this function's method emit.
+    // The class's property names (accessor-backed + body ivars + the
+    // temporal computed getters), so a `self.x` zero-arg send in a body
+    // emits as a property read; everything else gets `()`. Active for the
+    // rest of this function's method emit.
     let instance_props: HashSet<String> = prop_types
         .keys()
         .chain(body_ivars.keys())
+        .chain(temporal_names.iter())
         .chain(inherited_props.iter())
         .cloned()
         .collect();
@@ -706,9 +725,10 @@ fn register_params_for(receiver: &str, methods: &[MethodDef]) {
 /// Keyword, rest, and block params are not positional arguments.
 fn positional_signature_tys(m: &MethodDef) -> Vec<Ty> {
     use crate::ty::ParamKind;
-    let Some(Ty::Fn { params, .. }) = m.signature.as_ref() else {
+    let Some(Ty::Fn(fn_ty)) = m.signature.as_ref() else {
         return Vec::new();
     };
+    let FnTy { params, .. } = &**fn_ty;
     params
         .iter()
         .filter(|p| matches!(p.kind, ParamKind::Required | ParamKind::Optional))
@@ -826,7 +846,7 @@ fn emit_method(m: &MethodDef, modifier: &str) -> String {
     // block slot.
     if body_has_yield(&m.body) {
         let bt = match m.signature.as_ref() {
-            Some(Ty::Fn { block: Some(b), .. }) => kotlin_ty(b),
+            Some(Ty::Fn(fn_ty)) if let Some(b) = &fn_ty.block => kotlin_ty(b),
             _ => "(Any?) -> Unit".to_string(),
         };
         params.push(format!("block: {bt}"));
@@ -835,7 +855,7 @@ fn emit_method(m: &MethodDef, modifier: &str) -> String {
     // Return type.
     // Not Unit for a method without a signature: an app method's answer is its body's type
     let ret_ty = match m.signature.as_ref() {
-        Some(Ty::Fn { ret, .. }) => Some((**ret).clone()),
+        Some(Ty::Fn(fn_ty)) => Some((*fn_ty.ret).clone()),
         _ if m.name.as_str() == "initialize" => None,
         _ => m.body.ty.clone().filter(|t| !t.is_open()),
     };
@@ -885,7 +905,7 @@ fn emit_method(m: &MethodDef, modifier: &str) -> String {
 /// back to `Any?` where the signature is missing.
 fn method_params(m: &MethodDef) -> Vec<String> {
     let sig_params = match m.signature.as_ref() {
-        Some(Ty::Fn { params, .. }) => Some(params),
+        Some(Ty::Fn(fn_ty)) => Some(&fn_ty.params),
         _ => None,
     };
     m.params
@@ -957,6 +977,9 @@ fn wrap_return(e: &Expr) -> String {
         // non-issue for a return value.
         ExprNode::Hash { .. } => {
             return format!("return {}", super::expr::emit_return_value(e));
+        }
+        ExprNode::If { cond, then_branch, else_branch } => {
+            return format!("return {}", emit_if_return_value(cond, then_branch, else_branch));
         }
         _ => {}
     }
@@ -1090,8 +1113,8 @@ fn expr_children(e: &Expr) -> Vec<&Expr> {
         ExprNode::BeginRescue { body, rescues, else_branch, ensure, .. } => {
             v.push(body);
             v.extend(rescues.iter().map(|r| &r.body));
-            v.extend(else_branch.iter());
-            v.extend(ensure.iter());
+            v.extend(else_branch.as_deref());
+            v.extend(ensure.as_deref());
         }
         _ => {}
     }
@@ -1127,12 +1150,14 @@ fn class_accessor_props(methods: &[MethodDef]) -> BTreeMap<String, Ty> {
         }
         match m.kind {
             AccessorKind::AttributeReader => {
-                if let Some(Ty::Fn { ret, .. }) = m.signature.as_ref() {
+                if let Some(Ty::Fn(fn_ty)) = m.signature.as_ref() {
+                    let FnTy { ret, .. } = &**fn_ty;
                     props.entry(camel(m.name.as_str())).or_insert_with(|| (**ret).clone());
                 }
             }
             AccessorKind::AttributeWriter => {
-                if let Some(Ty::Fn { params, .. }) = m.signature.as_ref() {
+                if let Some(Ty::Fn(fn_ty)) = m.signature.as_ref() {
+                    let FnTy { params, .. } = &**fn_ty;
                     if let Some(p) = params.first() {
                         let base = m.name.as_str().trim_end_matches('=');
                         props.entry(camel(base)).or_insert_with(|| (*p.ty).clone());
@@ -1206,9 +1231,10 @@ fn infer_body_ivar_types(methods: &[MethodDef]) -> BTreeMap<String, Ty> {
 
     // Signal 1: reader methods returning exactly an ivar.
     for m in methods {
-        if let (Some(ivar), Some(Ty::Fn { ret, .. })) =
+        if let (Some(ivar), Some(Ty::Fn(fn_ty))) =
             (body_returns_ivar(&m.body), m.signature.as_ref())
         {
+            let FnTy { ret, .. } = &**fn_ty;
             if !matches!(&**ret, Ty::Nil) {
                 out.entry(ivar).or_insert_with(|| (**ret).clone());
             }
@@ -1359,7 +1385,7 @@ fn signature_ret_is_time(sig: Option<&Ty>) -> bool {
             _ => false,
         }
     }
-    matches!(sig, Some(Ty::Fn { ret, .. }) if is_time(ret))
+    matches!(sig, Some(Ty::Fn(fn_ty)) if is_time(&fn_ty.ret))
 }
 
 /// Default initializer for a property type (Kotlin requires properties

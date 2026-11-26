@@ -318,7 +318,7 @@ module Dom
     chunk = target_chunk(selector)
     negated = negated_attrs(chunk)
     chunk = without_negations(chunk)
-    base = chunk.split("[")[0].to_s
+    base = selector_base(chunk)
     want_tag = selector_tag(base)
     want_id = selector_id(base)
     want_classes = selector_classes(base)
@@ -459,7 +459,7 @@ module Dom
   # attribute or in text — which costs candidates, not correctness:
   # a false candidate fails the class check that follows.
   def self.fragment_for(selector)
-    base = target_chunk(selector).split("[")[0].to_s
+    base = selector_base(without_negations(target_chunk(selector)))
     tag = selector_tag(base)
     id = selector_id(base)
     classes = selector_classes(base)
@@ -537,7 +537,7 @@ module Dom
              else value.end_with?(want) || value.end_with?(escaped)
              end
     end
-    tag.include?(pred) || tag.include?(pred.gsub(">", "&gt;").gsub("<", "&lt;"))
+    tag.include?(pred) || tag.include?(pred.gsub(">", "&gt;").gsub("<", "&lt;").gsub("'", "&#39;"))
   end
 
   # Whether a start tag carries the attribute a predicate names: a
@@ -550,16 +550,13 @@ module Dom
 
   def self.selector_attrs(chunk)
     out = []
-    parts = chunk.split("[")
-    i = 1
-    while i < parts.length
-      pred = parts[i].to_s.split("]")[0].to_s
+    selector_preds(chunk).each do |pred|
       eq = pred.index("=")
       if eq.nil?
         out << pred
       else
         name = pred[0, eq].to_s
-        value = pred[eq + 1, pred.length].to_s.gsub("'", "").gsub("\"", "")
+        value = selector_value(pred[eq + 1, pred.length].to_s)
         # `*=` / `^=` / `$=` — substring, prefix and suffix matches
         # (campfire's `img[src*='install-edge']`). Kept as the operator
         # spelled out, which `attr_matches?` reads; `=` stays the literal
@@ -571,9 +568,76 @@ module Dom
           out << %(#{name}="#{value}")
         end
       end
+    end
+    out
+  end
+
+  # Not `split("[")`: a quoted value can hold brackets (`[name='filter[q]']`) and an id can follow a predicate; a pseudo-class (`:checked`) is not checked, as before.
+  def self.selector_value(raw)
+    q = raw[0, 1].to_s
+    raw = raw[1, raw.length - 2].to_s if raw.length >= 2 && (q == "'" || q == "\"") && raw[-1, 1].to_s == q
+    out = ""
+    i = 0
+    while i < raw.length
+      c = raw[i, 1].to_s
+      if c == "\\" && i + 1 < raw.length
+        i += 1
+        c = raw[i, 1].to_s
+      end
+      out = out + c
       i += 1
     end
     out
+  end
+
+  def self.selector_base(chunk)
+    selector_split(chunk)[0].to_s
+  end
+
+  def self.selector_preds(chunk)
+    parts = selector_split(chunk)
+    parts[1, parts.length].to_a
+  end
+
+  def self.selector_split(chunk)
+    base = ""
+    preds = []
+    pred = ""
+    inside = false
+    pseudo = false
+    quote = ""
+    i = 0
+    while i < chunk.length
+      c = chunk[i, 1].to_s
+      if !inside
+        if c == "["
+          inside = true
+          pseudo = false
+          pred = ""
+        elsif c == ":"
+          pseudo = true
+        elsif !pseudo || c == "#" || c == "."
+          pseudo = false
+          base = base + c
+        end
+      elsif quote != "" && c == "\\"
+        pred = pred + chunk[i, 2].to_s
+        i += 1
+      elsif quote != ""
+        quote = "" if c == quote
+        pred = pred + c
+      elsif c == "'" || c == "\""
+        quote = c
+        pred = pred + c
+      elsif c == "]"
+        preds << pred
+        inside = false
+      else
+        pred = pred + c
+      end
+      i += 1
+    end
+    [base] + preds
   end
 
   # The three parts of one compound selector chunk. Split by hand rather
@@ -873,6 +937,12 @@ class ActionResponse
     out["content-type"] = @content_type
     out["location"] = @location unless @location.nil?
     out
+  end
+
+  # Rails' `response.header`, `alias_method :header, :headers` on
+  # ActionDispatch::Response.
+  def header
+    headers
   end
 
   # Rails' `response.cache_control` — the mixed Hash Rails hands back,
@@ -1198,7 +1268,7 @@ class TestBase
   # read until `travel_back` (the block's end, or the next test's
   # setup) answers the same whole second.
   def freeze_time
-    ActiveSupport.freeze(ActiveSupport.now.to_i)
+    ActiveSupport.freeze_clock(ActiveSupport.now.to_i)
     return unless block_given?
     begin
       yield
@@ -1514,7 +1584,10 @@ module ActionDispatch
         request_path = request_path.partition("?")[0].partition("#")[0]
         request_path = "/" + request_path unless request_path.start_with?("/")
         table = ([RouteTable.root] + RouteTable.table + ActiveStorage::Routes.table).reject { |route| route.controller == :roundhouse_redirects }
-        matched = ActionDispatch::Router.match(verb, request_path, table)
+        # Rails asks a route's request constraints with a mock request (`Rack::MockRequest.env_for`).
+        asked = ActionDispatch::Request.for({ "HTTP_HOST" => "example.org", "REQUEST_METHOD" => verb, "PATH_INFO" => request_path }, {})
+        asked.format = ActionDispatch::MimeNegotiation.format_name(request_path.split("/").last.to_s.include?(".") ? request_path.split("/").last.to_s.split(".").last.to_s : "", "", "", "")
+        matched = RouteTable.match_asking(verb, request_path, table, asked)
         matched = nil if request_path != "/" && request_path.end_with?("/")
         raise "No route matches #{path.inspect}" if matched.nil?
         controller = RouteTable::CONTROLLER_PATHS[matched.controller] || ActiveStorage::Routes::CONTROLLER_PATHS[matched.controller] || matched.controller.to_s
@@ -1531,6 +1604,9 @@ module ActionDispatch
         # is one of the route's defaults, which Rails recognizes too.
         format = matched.req_format.to_s if format.empty? && !matched.req_format.nil?
         recognized["format"] = format unless format.empty?
+        defaults = {}
+        RouteTable.route_defaults(matched.defaults, defaults, matched.path_params)
+        defaults.each { |name, value| recognized[name] = value.is_a?(String) ? ActionDispatch::Router.percent_bytes(value.bytes).pack("C*") : value }
         recognized
       end
 
@@ -1607,6 +1683,12 @@ module ActionDispatch
           end
           names = generation_segment_names(route.pattern)
           next unless names.all? { |name| given.key?(name) }
+          defaults = {}
+          RouteTable.route_defaults(route.defaults, defaults, {})
+          trailing = names.last.to_s
+          if (!route.req_format.nil? || !given.key?("format")) && defaults.key?(trailing) && defaults[trailing].to_s == given[trailing]
+            next if routes.any? { |short| short.defaults == route.defaults && short.controller == route.controller && short.action == route.action && route.pattern.start_with?(short.pattern + "/") && generation_segment_names(short.pattern) == names[0, names.length - 1] }
+          end
           path = generated_route_path(route, given)
           bare = route.req_format.nil? && given.key?("format") ? path.delete_suffix("." + given["format"].to_s) : path
           next if ActionDispatch::Router.match_pattern(route.pattern, bare, route.int_params + "", route.seg_constraints + "").nil?
@@ -1674,6 +1756,9 @@ module ActionDispatch
       def generated_query_keys(route, options)
         used = generation_segment_names(route.pattern) + ["controller", "action"]
         used << "format" if !route.req_format.nil? || route.pattern != "/"
+        defaults = {}
+        RouteTable.route_defaults(route.defaults, defaults, {})
+        used.concat(defaults.keys)
         options.keys.reject { |key| used.include?(key) }
       end
     end
@@ -2269,8 +2354,8 @@ module RequestDispatch
 
   # The last request's flash, as Rails' integration tests read it
   # (`assert_equal "✓", flash[:notice]` after an unfollowed redirect).
-  # The dispatch already keeps it in `@__flash` to carry into the next
-  # request; this is its reader.
+  # The dispatch keeps it in `@__flash` and carries what it set into the
+  # next request; this is its reader.
   def flash
     @__flash = ActionDispatch::Flash.new if @__flash.nil?
     @__flash
@@ -2376,16 +2461,63 @@ module RequestDispatch
       override = (params[:_method] || params["_method"]).to_s.upcase
       method = override if override == "PUT" || override == "PATCH" || override == "DELETE"
     end
-    matched = ActionDispatch::Router.match(
-      method, match_path, [RouteTable.root] + RouteTable.table + ActiveStorage::Routes.table
+    # What a request constraint asks before its route is chosen (`RouteTable.match_asking`).
+    asked_env = { "HTTP_HOST" => host, "REMOTE_ADDR" => "127.0.0.1" }
+    headers.each { |k, v| asked_env[env_key(k.to_s)] = v.to_s }
+    asked_env["HTTPS"] = "on" if https?
+    asked = ActionDispatch::Request.for(asked_env, {})
+    last_segment = match_path.split("/").last.to_s
+    asked.format = ActionDispatch::MimeNegotiation.format_name(
+      last_segment.include?(".") ? last_segment.split(".").last.to_s : "",
+      asked_env.fetch("HTTP_ACCEPT", "").to_s,
+      asked_env.fetch("HTTP_X_REQUESTED_WITH", "").to_s,
+      as == :json ? "application/json" : ""
     )
-    raise "No route matches #{method} #{path}" if matched.nil?
-    controller = case matched.controller
-                 when :articles then ArticlesController.new
-                 when :comments then CommentsController.new
-                 else ActiveStorage::Routes.instantiate_controller(matched.controller)
-                 end
-    run_controller(controller, matched.action, matched.path_params, matched.req_format, method, wire_method, path, query, params, headers, as)
+    # Through the gem middleware's stack, as Rails' integration tests run the request: what a
+    # middleware sets in the env (`env["warden"]`) is the request's, and one may answer it itself.
+    rack_env = {}
+    asked_env.each { |k, v| rack_env[k] = v }
+    rack_env["REQUEST_METHOD"] = method
+    rack_env["PATH_INFO"] = match_path
+    rack_env["QUERY_STRING"] = query.to_s
+    rack_env["rack.session"] = @__session ||= ActionDispatch::Session.new
+    asked.session = @__session
+    @__routed = false
+    @__rack_env = nil
+    answered = GemMiddleware.around(rack_env) do |env|
+      @__routed = true
+      @__rack_env = env
+      env.each { |k, v| asked.env[k] = v }
+      # Not left at the test's own: a middleware above may have put another session in its place.
+      @__session = asked.session = env["rack.session"] if env["rack.session"].is_a?(ActionDispatch::Session)
+      matched = RouteTable.match_asking(
+        method, match_path, [RouteTable.root] + RouteTable.table + ActiveStorage::Routes.table, asked
+      )
+      raise "No route matches #{method} #{path}" if matched.nil?
+      controller = case matched.controller
+                   when :articles then ArticlesController.new
+                   when :comments then CommentsController.new
+                   else ActiveStorage::Routes.instantiate_controller(matched.controller)
+                   end
+      run_controller(controller, matched.action, matched.path_params, matched.req_format, method, wire_method, path, query, params, headers, as, matched.defaults)
+      [@__response.status, @__response.headers, [@__response.body.to_s]]
+    end
+    return @__response if @__routed
+    # A middleware answered before the routes (a throttle's 429): its Rack response is the test's.
+    status, answer_headers, chunks = answered
+    text = +""
+    chunks.each { |chunk| text << chunk.to_s }
+    @__response = ActionResponse.new(
+      status: status.to_i,
+      body: text,
+      location: answer_headers["Location"] || answer_headers["location"],
+      flash: ActionDispatch::Flash.new,
+      cookies: ActionController::CookieJar.new({}),
+      content_type: (answer_headers["Content-Type"] || answer_headers["content-type"] || "text/html").to_s,
+      headers: answer_headers,
+    )
+    @response = @__response
+    @__response
   end
 
   # The request through `controller`, once the route is known: the
@@ -2393,7 +2525,7 @@ module RequestDispatch
   # the action run inside a connection lease, and the response kept.
   # `dispatch_request` comes here after the router matched the path;
   # ActionController::TestCase#process with the controller it holds.
-  def run_controller(controller, action, path_params, req_format, method, wire_method, path, query, params, headers, as)
+  def run_controller(controller, action, path_params, req_format, method, wire_method, path, query, params, headers, as, defaults = -1)
     # Test fixtures pass Symbol-keyed nested hashes (`{article: {title:
     # ...}}`); the wire-level request body is String-keyed at runtime.
     # Stringify recursively so the harness shape matches what the
@@ -2444,10 +2576,13 @@ module RequestDispatch
     end
     # Rails' `params.merge!(path_parameters)`: the route's own segments win over both.
     path_params.each { |k, v| merged[k.to_s] = v }
+    RouteTable.route_defaults(defaults, merged, path_params)
     controller.params  = merged
     controller.path_parameters = path_params
     controller.session = @__session ||= ActionDispatch::Session.new
-    controller.flash   = @__flash   ||= ActionDispatch::Flash.new
+    # Not the last request's Flash itself: Rails carries only what it set (`to_persisted`), so a shown message is gone on the next page.
+    carried = @__flash
+    controller.flash = ActionDispatch::Flash.new(carried.nil? ? nil : carried.to_persisted)
     # The inbound jar is the browser's whole state — what the test has
     # accumulated from earlier responses PLUS anything it seeded itself,
     # which is exactly `to_h`. A fresh jar per request, so `pending`
@@ -2504,6 +2639,9 @@ module RequestDispatch
     env["PATH_INFO"]      = request_path
     env["QUERY_STRING"]   = request_query
     controller.request = ActionDispatch::Request.for(env, merged)
+    controller.request.session = controller.session
+    # What the gem middleware set in the Rack env (`env["warden"]`), the controller's request env too.
+    @__rack_env&.each { |k, v| controller.request.env[k] = v unless controller.request.env.key?(k) }
     controller.request.body = request_body
     # Body params alone — what ParamsWrapper copies from. Production
     # dispatchers fill this from the parsed JSON body; the harness
@@ -2877,7 +3015,13 @@ module RequestDispatch
     end
     nodes = Dom.select(Dom.parse(body), selector)
     options = content_or_opts.is_a?(Hash) ? content_or_opts : opts
-    if options.is_a?(Hash) && options[:count] == 0
+    # rails-dom-testing's equality `false` or `0` is `count: 0`
+    # (`HTMLSelector#equality_tests`); `true` is presence, below. A `0`
+    # is not one while the selector still holds a `?`: Rails substitutes
+    # a number there (`SubstitutionContext`), which only a String gets
+    # above. `false` is never substituted.
+    none = content_or_opts == false || (content_or_opts == 0 && !selector.to_s.include?("?"))
+    if none || (options.is_a?(Hash) && options[:count] == 0)
       raise "expected no #{selector.inspect} in response body" unless nodes.empty?
       return
     end

@@ -4,6 +4,8 @@
 //! runtime's `Arel` shim answers the same ancestry as Rails' `arel` gem.
 //! Skipped when CRuby or the activerecord gem is missing.
 
+#[path = "support/prerequisite.rs"]
+mod prerequisite;
 use std::path::Path;
 use std::process::Command;
 
@@ -27,7 +29,7 @@ fn bind_error_has_rails_arel_ancestry_and_is_rescued_as_an_arel_error() {
         &format!("begin; require \"active_support\"; require \"active_record\"; require \"arel\"; rescue LoadError; puts \"SKIP\"; exit 0; end\n{ANCESTRY}"),
     );
     if native.contains("SKIP") {
-        eprintln!("skipping: the activerecord gem is not installed");
+        prerequisite::missing("the activerecord gem is not installed");
         return;
     }
     assert!(native.contains("ArelError"), "native Rails arel failed\n{native}\n{native_err}");

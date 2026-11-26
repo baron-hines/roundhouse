@@ -95,8 +95,9 @@ in `src/project.rs`. Shape notes worth knowing:
   PostgreSQL: on Spinel through the pure-Ruby spinel-pg driver (no
   libpq), on CRuby through the pg gem. The few places the two drivers
   differ go through `PgDriver` (`pg_driver.rb`, and
-  `pg_driver_cruby.rb`, which CRuby gets as `pg_driver.rb`). No target
-  selects it yet. `tests/spinel_pg_db.rs` compiles it with Spinel, and
+  `pg_driver_cruby.rb`, which CRuby gets as `pg_driver.rb`). The Ruby
+  and Spinel targets select it for an app whose `config/database.yml`
+  names postgresql (`project::apply_postgresql_tree`). `tests/spinel_pg_db.rs` compiles it with Spinel, and
   `tests/db_contract.rs` runs it on CRuby, each against a live server
   (`ROUNDHOUSE_PG_TEST_URL`).
   - `Db.exec_returning` answers the returned rows.
@@ -106,6 +107,10 @@ in `src/project.rs`. Shape notes worth knowing:
     class through `runtime/spinel/pg_errors.rb`.
   - A transaction keeps its connection, and a lease that ends inside
     one rolls it back.
+  - `Db.configure(url, schema_search_path: "a,b")` sets `search_path` on
+    every connection the pool opens, as Rails' `schema_search_path` does;
+    the Spinel tree's test helper puts each test process in its own schema
+    this way.
   - The pool is sharded per thread, as `runtime/spinel/db.rb`'s is.
     `Db.prepare` runs through a named statement cached per connection
     (at most 128, closed on the server when evicted); finalizing a read
@@ -477,6 +482,55 @@ The fix, when it is worth making, belongs in the writer — one cast per
 string column, at the one site that already knows the type — and it
 changes what every reader sees, so it is a change to make deliberately
 rather than as a side effect.
+
+### A `t.binary` column is bytes in a String, through its own Db pair
+
+A binary column reads through `Db.column_binary` (`_opt` when nullable)
+and writes through `Db.escape_binary`, and the Arel and adapter lowerings
+type its values `ValueType::Binary`. A digest such as
+`Digest::BLAKE3.digest(content)` is the usual tenant, and it can hold a
+NUL byte, which no quoted SQL literal carries.
+
+**Why a pair of its own.** In the Ruby family a String carries its
+encoding, so the SQLite shims' `escape_string` already writes an `X'…'`
+literal for a value that holds a NUL or is non-ASCII BINARY, and they
+alias the binary pair to the text pair. Rust's `String` is UTF-8 with no
+encoding tag. There the pair is real: a binary value is held one char
+per byte (U+0000–U+00FF), `escape_binary` writes `X'…'` for any NUL or
+high byte, and `column_binary` reads a BLOB back the same way. `find_by`
+on a binary column escapes through the same method, so a lookup by
+digest matches the bytes the INSERT stored. Spinel binds parameters, so
+`Binary` binds through `bind_text`.
+
+The other shims treat a value as its UTF-8 bytes (none of them emits
+`Digest::BLAKE3`). Crystal, C#, Elixir, Go, Kotlin and Python write
+`X'…'` when the value holds a NUL, since a NUL inside a quoted literal
+ends the SQL text (Python's sqlite3 refuses it outright), and the text
+literal otherwise. Go and Elixir, whose strings can hold bytes that are
+not UTF-8, also write `X'…'` for those, and Python for the surrogate
+escapes its reader decodes them to. Crystal, C# and Python decode a BLOB
+cell, which their drivers hand back as bytes, as UTF-8. On PostgreSQL
+(`db_pg.rb`) the column is `bytea`: `escape_binary` writes bytea's hex
+input format, `'\x…'`, and `column_binary` decodes the text result
+format, hex or (under `bytea_output = escape`) the escape format, into
+an ASCII-8BIT string, as Rails reads it.
+
+**Known gaps.**
+- **JRuby** reads a binary column through JDBC `getString`, which
+  decodes the BLOB as UTF-8, so bytes that are not valid UTF-8 (most
+  digests) do not round-trip. Writes are correct (`X'…'`).
+- **Rust `Digest::BLAKE3`** hashes its argument's UTF-8 bytes. A value
+  read back from a binary column is one char per byte, so one holding a
+  byte at or above 0x80 hashes differently from CRuby, which hashes the
+  raw bytes. Hashing text, the usual case and what the pinned test
+  exercises, agrees.
+
+**`Digest::BLAKE3`** is typed in the stdlib registry next to MD5/SHA1/
+SHA256, and it exists only where a runtime has it: CRuby, from the digest
+gem 3.3.0 or later (an emitted Gemfile that uses it declares the gem), and
+Rust, from the `blake3` crate (declared in Cargo.toml only when a body
+calls it). Every other target refuses the call with an error
+(`project.rs::report_digest_blake3`). Pinned by `tests/binary_digest.rs`.
 
 ### An absent UNSIGNED cookie reads as `""`, not `nil`
 
@@ -893,6 +947,23 @@ of the RETURNING columns (the primary key when `returning:` is left
 out, SQLite's default), whose `rows` are Arrays of values. Only a
 literal column list lowers; anything else declines.
 
+**The other forms are one statement.** A call the lowering declines
+(`insert_all(rows, unique_by: …)`, `insert(attrs)`, `insert!(attrs)`,
+`insert_all!` with `returning:` SQL or `record_timestamps:`) reaches
+`connection.rb`'s Ruby-family `insert_all` family: one multi-row
+`INSERT`, `ON CONFLICT … DO NOTHING` for the skipping forms (on the
+`unique_by:` columns, or the columns of the unique index it names),
+`RETURNING` the primary key unless `returning:` says otherwise, and
+Rails' `ActiveRecord::Result` as its value.
+
+**A supplied integer key is written, on the Ruby family.** The per-row
+inlining writes through `_adapter_insert`, which leaves an integer key
+to the database and reads it back. Under the Ruby family's runtime
+(`RuntimeRelation::Present`) that method writes the key too when the
+record holds one (`@id.to_i != 0`): `create(id: 900)`, an `insert_all`
+row's `id:`, or the key column of a table that has no database default
+for it. A strict target still leaves every integer key to the database.
+
 **What it costs.** N statements instead of one, plus, for `insert_all`,
 one SELECT per row for the conflict check.
 
@@ -907,16 +978,21 @@ UNKNOWN method name does, so campfire's `Membership.insert_all(…)`
 reported `no known method insert_all on Class { Membership }` while the
 emitted code was the inlined loop, correct all along.
 
-### `upsert` / `upsert_all` answer the affected-row count
+### `upsert` / `upsert_all` answer an `ActiveRecord::Result`
 
 `runtime/ruby/active_record/connection.rb`'s `upsert_all` issues one
-`INSERT … ON CONFLICT (target) DO UPDATE SET …` and answers the
-affected-row count, where Rails answers an `ActiveRecord::Result`; the
-catalog types the call `Integer`, what the emitted code returns.
-Timestamps are stamped as Rails 8.1's SQLite adapter stamps them
-(`STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW')`, `updated_at` moved only when
-an assigned column changed). No strict runtime transpiles
-`connection.rb`; the call is reported there.
+`INSERT … ON CONFLICT (target) DO UPDATE SET …` and answers Rails'
+`ActiveRecord::Result`, empty, its `affected_rows` the count. The target
+is `unique_by:`'s columns, or those of the unique index it names
+(`_unique_index_columns`, synthesized per model), else the primary key;
+`update_only:` narrows the SET to the columns it names. Timestamps are
+stamped with the database's clock as Rails 8.1 stamps them (SQLite's
+`STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW')`, PostgreSQL's `CURRENT_TIMESTAMP`
+in UTC), `updated_at` moved only when an assigned column changed.
+`returning:` is not supported: given rows, `upsert_all` (and `upsert`,
+which calls it) raises `NotImplementedError` where Rails answers the
+returned columns. No strict runtime transpiles `connection.rb`; the call
+is reported there.
 
 ### A failed statement raises Rails' class, and SQLite enforces foreign keys
 
@@ -1310,7 +1386,7 @@ raising façade on spinel (`runtime/ruby/rqrcode_facade.rb`, the
 write-path rule every gem façade follows) and the real gem on CRuby and
 JRuby. It is now real on spinel too: when an app names `RQRCode`,
 `spin_shape` swaps the façade file for `require "rqrcode"` and declares
-the spinel-rqrcode spin package (github.com/rubys/spinel-rqrcode;
+the spinel-rqrcode spin package (github.com/roundhouse-rb/spinel-rqrcode;
 matz/spin-index#8 is the registration, so the manifest uses the git form
 until it merges), the same seam bcrypt and ruby-vips use.
 
@@ -1451,13 +1527,15 @@ Two residues, both smaller than they look:
   touch each run inside `Model.transaction`, an exception from their
   callbacks rolls the whole write back, and a ROLLBACK drops the held
   commit callbacks.
-* **The update hook is unguarded.** Rails registers its touch with
-  `if: :saved_changes?` and skips the parent when the child's save
-  changed nothing. This runtime's `save` issues an unconditional
-  UPDATE, so there is no no-op save for the guard to catch and the
-  condition would never be false. A save that writes the same bytes
-  therefore moves the parent's `updated_at` where Rails leaves it —
-  which busts a cache entry early rather than serving a stale one.
+* **The update hook asks `_wrote_on_update?`.** Rails registers its
+  touch with `if: :saved_changes?` and skips the parent when the
+  child's save changed nothing. On the Ruby family a save with nothing
+  pending writes nothing, and `_wrote_on_update?` answers from
+  `saved_changes`, so the parent is left alone as in Rails. A strict
+  target's `save` writes the whole row every time and answers true, so
+  there a save that writes the same bytes still moves the parent's
+  `updated_at` — which busts a cache entry early rather than serving a
+  stale one.
 
 Rails also SKIPS the create and destroy registrations when the
 association carries a `counter_cache:` (the counter update touches on
@@ -1776,7 +1854,7 @@ broadcast had already gone out. `scripts/campfire-cable-walk` splices
 header. What this runtime does not have is the third option Rails
 actually uses: enqueue now, run elsewhere, later.
 
-### Queued jobs are serialized payloads, durable only under `:sidekiq`
+### Queued jobs are serialized payloads
 
 On the ruby, jruby and spinel lanes, a served app's `perform_later`
 queues an ActiveJob-format JSON payload: the `job.serialize` hash of
@@ -1787,10 +1865,27 @@ and a record deleted in between raises
 `ActiveJob::DeserializationError`, which `discard_on` drops. The codecs
 come from the job's `perform_later` call sites, and
 `tests/active_job_payload.rs` holds the format to Rails' own output.
+On the Ruby family (ruby, jruby, spinel), a `perform` with named
+keywords (`def perform(car, count:, label: "x")`) gets wrappers with
+the same parameter list, and its keywords go
+into one trailing Hash marked `_aj_ruby2_keywords`, as ActiveJob writes
+them, and come back by name. An optional keyword whose value equals
+its literal default is left out, as Rails leaves out a keyword the
+caller omits, and reads back as that default; with every keyword left
+out there is no Hash at all, as Rails writes none, and a missing key
+or Hash reads as the default (`keyword_given?`). Two known differences
+from Rails: the keys are written in `perform`'s order, not the call
+site's, and a caller that passes the default explicitly gets no key
+where Rails would write one; `perform` receives the same values either
+way. A `**` splat at a call site keeps the job's Proc (an error under
+`:sidekiq`). A `perform` with a `**rest` keyword, a block, `...`, or a
+keyword default that isn't a literal (which only `perform` can
+evaluate, at run time) gets no wrapper, and each call to its
+`perform_later` or `perform_now` is an error.
 
 **What is still missing.**
 
-- **Durability, unless the app is on Sidekiq.** By default the payloads
+- **Durability requires a durable adapter.** By default the payloads
   sit in a process-local Array. Nothing is retried (`retry_on` is
   inert), nothing is scheduled (`set(wait:)` is dropped), and nothing
   survives a restart. An app whose `ApplicationJob` sets
@@ -1799,23 +1894,101 @@ come from the job's `perform_later` call sites, and
   envelope (`runtime/spinel/sidekiq_push.rb`, `sidekiq_redis.rb`):
   `SADD queues` and `LPUSH queue:<name>`, or `ZADD schedule` for a
   literal `set(wait:)` or `set(wait_until:)` that lands in the future.
-  A pushed job is run by a Ruby Sidekiq process; there is no in-binary
-  worker yet. Redis comes
-  from `Sidekiq.configure_client`'s `url:` and `password:`, then
-  `REDIS_PROVIDER`, then `REDIS_URL`. The connection is one per
-  process, with 1-second connect and read timeouts, and a dropped
-  connection is retried once. A non-literal `set(...)` is an error
+  Redis comes from `Sidekiq.configure_client`'s `config.redis = { … }`:
+  an app on `:sidekiq` without a `url:` there is an error, with no
+  fallback to `REDIS_PROVIDER`, `REDIS_URL` or localhost. `password:`,
+  `username:` and `db:` override the URL's (each a String literal,
+  `ENV["NAME"]` or `ENV.fetch("NAME"[, "default"])`, `db:` an Integer
+  literal too). `timeout:` (or `network_timeout:`), `connect_timeout:`
+  and `read_timeout:` are literal seconds, 3 when the app gives none, as
+  Sidekiq passes it. `reconnect_attempts:` is an Integer or an Array of
+  delays, as redis-client reads it: a refused or dropped connection, the
+  first one included, is retried that many times, once without a wait
+  when the app gives none (or `false`, which Sidekiq's `||= 1` keeps).
+  On ruby and jruby redis-rb also retries once inside a command. The
+  connection is one per process. A key that would connect somewhere, or
+  some way, the app didn't ask for is an error on `:sidekiq`: TLS
+  (`ssl:`, `ssl_params:`), Sentinel (`sentinels:`, `role:`, `name:`),
+  `id:` (spinel-redis sends no `CLIENT SETNAME`; `id: nil` is fine),
+  `path:`, `host:`, `port:`, `namespace:`, `nodes:`, `protocol: 2`, and
+  a value of an honored key in a form ingest doesn't read. The pool's
+  `size:`, `pool_timeout:` and `pool_name:`, `driver:`, `write_timeout:`
+  and `logger:` change nothing here and are warnings. A job
+  held for COMMIT is dropped when an `after_commit` callback raises, as
+  Rails drops it, and the caller sees the callback's error. A non-literal `set(...)` is an error
   under `:sidekiq`, and `set(priority:)` is dropped with a warning.
   This holds on ruby, jruby and spinel; the other targets warn
   (`sidekiq-adapter-not-honored`) and run the jobs in process. A pushed
-  job carries `"retry":true`, so Sidekiq retries it with its own
-  defaults; Active Job's `retry_on`, TLS (`rediss://`) and per-job
-  adapters are still missing.
+  job carries `"retry":true`, or the job's literal `sidekiq_options`
+  (`retry`, `retry_queue`, `retry_for`, `dead`), where Sidekiq writes
+  them. TLS (`rediss://`) and per-job durable adapters are still missing.
+  A literal Symbol or String `inline`/`test` setter on the exact job class
+  selects immediate/held dispatch, including that class's reopenings.
+  This exemption does not resolve inherited, constant, computed or runtime
+  adapter changes. It models dispatch, not Rails' inline/test serialization:
+  an Object argument can still execute/be held where Rails raises SerializationError.
+  An app carrying Solid Queue's record models uses its SQL runner:
+  payloads go to `solid_queue_jobs`, and the drain claims those records.
+- **The worker role has no heartbeat.** The same build runs the pushed
+  jobs as `./app sidekiq` (spinel) or `ruby sidekiq.rb` (ruby, jruby),
+  a Sidekiq 8.1 server process with BasicFetch
+  (`runtime/spinel/sidekiq/sidekiq_worker.rb`); a Ruby Sidekiq process
+  on the Rails app can run them too. `-c`, `-q` and `-t` win over
+  config/sidekiq.yml's literal `:concurrency:`, `:queues:` and
+  `:timeout:` (its `production:` section merged over the top level),
+  which win over `RAILS_MAX_THREADS` and the defaults (5, `default`,
+  25). TSTP quiets it, and TERM or INT waits up to the timeout and
+  pushes unfinished jobs back. A job that raises takes Sidekiq's retry
+  rules: `retry: false` drops it; otherwise it goes to the retry set
+  with Sidekiq's error fields and backoff (`count**4 + 15` seconds plus
+  jitter) until its `retry` limit (`:max_retries:`, 25 by default) or
+  `retry_for` runs out, then to the dead set (trimmed by
+  `:dead_max_jobs:` and `:dead_timeout_in_seconds:`), unless it says
+  `dead: false`. A scheduler thread moves due jobs from `retry`, then
+  `schedule`, back onto their queues with Sidekiq's Lua pop (`EVALSHA`,
+  so spinel needs spinel-redis with scripting) every
+  `:poll_interval_average:` or 5 s per Sidekiq process, randomized as
+  Sidekiq randomizes it. Before Sidekiq's rules, an error goes to the
+  job's `retry_on` and `discard_on` handlers, searched as Active Job
+  searches them (the job's own, last declared first, then its
+  ancestors'): `discard_on` drops the job, and `retry_on` pushes it
+  again with Active Job's counters (`executions`,
+  `exception_executions`, `provider_job_id`) after its wait (a literal
+  number or Duration, or `:polynomially_longer`, plus `jitter:` or the
+  job's `retry_jitter`, which `load_defaults` 6.1 sets to 0.15) to its
+  `queue:` and `priority:`, until its `attempts:` are used up and the
+  error goes on to Sidekiq's rules. A handler with a block, a computed
+  option or an exception class the tree doesn't define is an error
+  (`job-handler-unsupported`) at its call; `after_discard` is dropped
+  with a warning. The heartbeat Sidekiq's Web UI
+  reads (and the process count the scheduler scales by) is still
+  missing. Under
+  config/cable.yml's `adapter: redis`, every process's broadcasts go
+  out as `PUBLISH <channel_prefix>:<stream>`, as Action Cable's Redis
+  adapter sends them, and each server process delivers what it
+  receives through one `PSUBSCRIBE <channel_prefix>:*` connection
+  (`runtime/spinel/sidekiq/redis_cable.rb`). On any other cable
+  adapter a job's broadcasts in the worker reach no browser, with a
+  warning. `broadcasts_to`'s create and update broadcasts are pushed
+  as `Turbo::Streams::ActionBroadcastJob` with turbo-rails' arguments,
+  and the worker renders and sends them (`lower::broadcast_job`); the
+  destroy broadcast runs at once, as in Rails. An STI model's
+  `broadcasts_to`, or one whose stream or `target:` isn't a String,
+  stays inline with a `broadcast-later-inline` warning.
 - **Some argument types.** A job whose call sites pass a Hash, a Date,
   an untyped value, or nothing typed at all keeps its closure, with a
   `job-closure-fallback` warning naming the parameter. Lobsters'
   `ResticJob`, `WalCheckpointJob` and `MastodonSyncListJob` are the
-  corpus cases.
+  corpus cases. Under `:sidekiq` or Solid Queue's SQL runner, this is
+  an error instead: a closure cannot reach the durable store. It names
+  the job and unsupported payload at the enqueue call or a literal
+  recurring task's class declaration. Under SQL-backed Solid Queue an
+  unused enqueue wrapper, including a `perform_now`-only job, needs no
+  durable payload. Sidekiq still refuses it at the job declaration.
+  Omitted default arguments and mixed primitive types at one argument
+  position are also refused: the existing payload writer cannot encode
+  those shapes, although Rails can. The in-process adapter keeps its
+  closure behavior. No new serializers are supplied here.
 - **One queue in process.** `queue_name` is recorded, but every entry
   drains in arrival order. Under `:sidekiq` it names the Redis queue.
 - **The test adapter keeps closures.** `assert_enqueued_with` still
@@ -1873,6 +2046,34 @@ the state set, because `begin`/`ensure` is not available in this file
 (see the note on `Model.connection` in base.rb — the rescue-carrying
 surface lives in the ruby-family `connection.rb` reopen). The push and
 the pop are symmetric on every path that returns.
+
+### A select alias is a reader only where the `select` names it in source
+
+Rails reads every extra column of a result set back as an attribute:
+after `select("count(*) AS times, title")` each record answers
+`record.times`. `ingest::select_aliases` finds the `AS` names of a
+`select` whose argument is a string literal (interpolations count as
+values, never as names) and whose model is known: a chain of query
+methods rooted at a model constant, the implicit self of a model's class
+method or scope, or an association scope (its target). The model lowerer
+gives each such alias a reader (`model_to_library::select_aliases`), and
+`instantiate` keeps the row when it carries one. A name a column, an
+association, a method or `Base` already answers gets no reader; a name
+an `attribute :name, :type` declares takes the selected value through
+its casting writer, as Rails' attribute set does (lobsters' `Vote#count`
+and `#usernames` read nil before).
+
+Where the two differ:
+
+- A `select` built at run time, or reached through a receiver the pass
+  cannot place (a local, an association reader), gives no reader; the
+  read stays the `no known method` error it was.
+- An alias written without `AS` (`count(*) times`) is not read.
+- A reader answers the driver's value untyped, and raises Rails'
+  `NoMethodError` on a record whose query did not select it.
+- The strict targets have no runtime Relation to load a custom `select`
+  with, so each alias is an error there
+  (`select_alias_gaps_for_target`).
 
 ### A `has_many :through` reader is a live Relation — only here
 
@@ -2202,7 +2403,18 @@ keeps `count:`, `format`, `inclusion` and `numericality` keep
 picks the details on that attribute and answers their messages, so the
 read is exact under any `errors.format`, and `:base` is an attribute
 like any other. The form builder's `field_with_errors` wrapper asks the
-same question with `any?`.
+same question with `any?`. A field known only at run time — a block
+parameter, a method's parameter, a local — reads the same when its type
+is a Symbol or a String: `errors[field]` and `errors.messages_for(field)`
+are `error_messages_for(...)` and `errors.full_messages_for(field)` is
+`error_full_messages_for(...)`, a Symbol field turned into the String
+the reader takes (a String is passed as it is). Such a field, and a
+String literal, are read so only on a model's errors: an app's own
+`errors` (a Hash keyed by String, say) answers `[]` itself. A field of
+any other type, an untyped local say, is not grounded, because nothing
+proves which String it would read: `messages_for` and
+`full_messages_for` report an error, and `errors[field]` stays a dynamic
+`[]` with its residue warning.
 
 `errors.to_hash` groups the same details by attribute:
 `ActiveSupport.errors_to_hash(error_details)`, in the order of each
@@ -2214,13 +2426,24 @@ no detail, so `to_hash` leaves it out; Rails' Errors has no `<<`.
 `[:field]`, `key?` or the emptiness questions, is
 `ActiveSupport.errors_messages(error_details)`: the same Hash with
 Rails' `[]` default, frozen. `errors.attribute_names` is
-`errors_attribute_names`, each attribute once, frozen. Both are gaps on
-a strict target as `to_hash` is, except under `render json:`, which
+`errors_attribute_names`, each attribute once, frozen.
+`errors.group_by_attribute` is
+`ActiveSupport.errors_group_by_attribute(error_details)`: the same
+grouping, but a plain Hash with no default and not frozen, as
+`Enumerable#group_by` answers it. Each of those helpers is a gap on a
+strict target as `to_hash` is, except under `render json:`, which
 writes `Base#errors_json` on every target. `errors.include?`, `key?`
 and `has_key?` ask `error_messages_for(...).any?`, so they reach every
 target; a field that is not a Symbol or String literal is an error,
 because the accumulator's own `include?` would ask its full messages
 and answer false.
+
+`errors.to_a` is Rails' alias for `full_messages`, which is what
+`errors` already holds here, so every target reads a `dup` of the
+accumulator: Rails builds a new Array on each call, so a kept answer
+does not grow with later errors. `errors.objects` is the `ActiveModel::Error`s
+Rails collects, which is `error_details`: the lowering reads it as that
+field, and what it yields reads as an iteration's does.
 
 Iterating `errors` (`each`, `map`, `collect`, `select`, `filter`,
 `reject`, `find`, `detect`, `all?`, `first`, and `any?`, `none?` and
@@ -2235,9 +2458,13 @@ error on that field with that Symbol type, and with a String type asks
 the field's messages, as Rails does. `errors.where(:field, :type)` is
 the `error_details` on that field, of that type when one is given, so
 what it answers reads like an iteration's. `errors.delete(:field)` is
-`ActiveSupport.errors_delete(errors, error_details, "field")`, which
-drops the field's entries from both, index for index, and answers their
-messages or nil; like `to_hash`, it is a gap on a strict target. Without a block, `any?`, `none?` and `count` keep
+`ActiveSupport.errors_delete(errors, error_details, "field", false,
+nil)`, which drops the field's entries from both, index for index, and
+answers their messages or nil; given a type, `errors.delete(:field,
+:type)`, it drops only the entries of that type — a Symbol, or the
+String a message was added with, which Rails' `Error#type` answers for
+such an error — and answers their messages, or nil when none matched.
+Like `to_hash`, it is a gap on a strict target. Without a block, `any?`, `none?` and `count` keep
 asking the full messages, which answer the same.
 
 `errors.details` is `ActiveSupport.errors_details(error_details)`, the
@@ -2262,10 +2489,27 @@ attribute is humanized, as `human_attribute_name` falls back to.
 once each, or an `import` with options beyond a Symbol `attribute:`,
 is an error. Both helpers are gaps on a strict target.
 
+`errors.copy!(other)` drops the record's own errors and takes copies of
+the other's, its full messages named as the copying model names them,
+by the same rules: `ActiveSupport.errors_copy` clears both arrays and
+imports each of the other's details as `merge!` does, so what the record
+holds is its own, and dropping one from either leaves the other whole.
+Copying a record's own errors is a no-op, as Rails' `deep_dup` of them
+is, and `copy!` is a gap on a strict target as `merge!` is. Only
+another record's `errors` is grounded: Rails' `copy!` takes an `Errors`,
+and given a record it keeps that record's `Errors` where its Array goes.
+A copy keeps the message the other model's lookup chose; Rails looks it
+up again for the copying model, so a model-scoped locale message for
+the copier is not used.
+
 A `belongs_to` checks its record where it is declared, among the
 `validates`, so its error lists in Rails' order, and its type is
 `:blank`: Rails validates the association's presence with `message:
-:required`, which picks the text and leaves the type.
+:required`, which picks the text and leaves the type. The check reads
+the association, as Rails does, so a record assigned in memory counts
+once the writer has kept it; a polymorphic one is checked through its
+reader alone, since the class to query is the row's `<assoc>_type` and
+the runtime's unsaved key is 0 rather than nil.
 
 Every one of these rewrites matches an `errors` send as its receiver,
 which `&.` hides behind a local (`(t = record.errors) && t.m`).
@@ -2285,8 +2529,9 @@ compile in Rust or Go. The class sits in `active_record/base.rb` so
 `Base`'s own bodies type against it.
 
 **What it costs.** A message pushed by anything other than those two
-lowerings has no detail beside it. `errors.delete` with a type is not
-modeled, nor are the option values `details` would answer; an
+lowerings has no detail beside it. `errors.delete` with options
+(`delete(:field, :type, count: 2)`) is not modeled, nor are the option
+values `details` would answer; an
 `errors <<` written by hand pushes a message no field claims. A dotted
 attribute (`comments.body`) is named by humanizing it, where Rails
 looks under the association's namespace first. `errors.add` reads its record twice
@@ -2988,22 +3233,36 @@ Three gaps remain, all on spinel's side:
   each message was added on, as `errors[:field]`'s are (see above).
   A form over a record that is not one of the app's models (a form
   object, say) is not wrapped, even when it has errors.
-- **`config.after_initialize` blocks do not run at boot.** campfire has
-  two: `Room::MessagesCount.ensure!` (its counter triggers, which
-  `schema.rb` cannot dump) and starting the WAL checkpointer outside
-  tests. The test suite gets the first through its `load_fixtures`
-  override, which is read; a served tree gets neither.
+- **`config.after_initialize` blocks run at boot only in the spellings
+  `ingest::after_initialize` reads**: a block with no parameters that
+  reads no local around it, at the top of an initializer, in
+  `config/application.rb`'s class body, or inside
+  `Rails.application.configure`. Each entry runs them once it has opened
+  the database and set up the job drain, before it serves or works off a
+  job. campfire's two (`Room::MessagesCount.ensure!` and starting the WAL
+  checkpointer outside tests) run this way. Hooks inside an initializer's
+  top-level `if defined?(Rails::Server)`, with no `else` and nothing else
+  in its body, run from the entries that serve (the Spinel server and
+  `config.ru`), as Rails runs them under `rails server` only. A block
+  under any other guard or in any other spelling is not run, and the
+  initializer ledger reports it.
 - **`Rails.application.env_config` holds what is set and is consulted
   for nothing**: a forgery failure always renders the 422 that
   `action_dispatch.show_exceptions = :rescuable` asks for.
-- **`save` writes the whole row; only `touch` writes what changed.**
-  Rails' partial writes UPDATE the changed columns; this runtime's
-  `_adapter_update` writes every column the record loaded. A bare
-  `touch` (and so `belongs_to … touch: true`) UPDATEs `updated_at`
-  alone (`_adapter_touch`), which is what keeps campfire's
-  trigger-maintained `rooms.messages_count` correct when a message
-  touches its room. A `save`/`update` of a record loaded before a
-  trigger moved one of its columns still writes the stale value back.
+- **`save` writes what changed on ruby, jruby and spinel; the other
+  targets write the whole row.** On the ruby-family targets,
+  `_adapter_update` UPDATEs only the columns with a pending change, as
+  Rails' partial writes do, and a save with nothing pending runs no
+  UPDATE and leaves `updated_at` alone. `update_columns` and
+  `update_column` write only the columns they name. So two jobs the
+  Sidekiq worker runs at once on one record each keep their change when
+  they change different columns, and a column a database trigger moved
+  (campfire's `rooms.messages_count`) is written back only when the
+  record changed it too. A record with no Dirty baseline (one the
+  runtime didn't load or save) writes every column. The strict targets
+  track no pending changes, so their `_adapter_update` still writes every
+  column the record loaded; a bare `touch` UPDATEs `updated_at` alone
+  (`_adapter_touch`) everywhere.
 
 ### `HashWithIndifferentAccess` is a String-keyed Hash; a call converts its keys at the site
 
@@ -3103,6 +3362,50 @@ flattening: same name, same arity, same namespace.
 does — the one caller is an app test helper, and those run on the ruby
 family. A target that needs it wants the module split, not this file
 copied.
+
+### `ActiveRecord::Base#slice`: lowered where typed, runtime otherwise
+
+Rails' `record.slice(:id, :name)` answers the named attributes in a
+HashWithIndifferentAccess. Roundhouse answers a String-keyed Hash two
+ways.
+
+**Typed sites, every target.** `src/lower/record_slice.rs` rewrites a
+`slice` whose receiver types as a model (or is the implicit `self` of
+an instance method of a model or of one of its concerns; a class
+method's or scope's bare `slice` is not a record's and keeps the call;
+the strict targets do not mix a
+model concern's methods into the model yet, so a concern's lowered
+`slice` builds on the ruby family only) and whose names are literals into a Hash literal of reader
+calls: `a.slice(:id, :title)` becomes `{"id" => a.id, "title" =>
+a.title}`, typed `Hash[String, <union of the readers>]`. A name given
+twice is one entry, as Rails' indifferent Hash keeps one key, and a
+bare `slice` reads through an explicit `self`, so a local of the same
+name does not answer for the attribute. The receiver
+is evaluated once: a receiver with effects read more than once is bound
+in a `Let` under a name unique to the site. A receiver with effects
+sliced with NO names (`Article.find(id).slice`) keeps the call, with an
+`effectful-no-names` lower-residue warning, and does not build on a
+strict target. That is an accepted gap: the call always answers `{}`,
+and binding a receiver nothing reads does not compile in Go. A name the model has no reader for leaves the call
+as written with a `record-slice` lower-residue warning, as does a name
+known only at run time (`slice(name)`, a `dynamic-names` warning); the
+ruby family answers both from the runtime, a strict target does not
+build them. A model that defines its own `slice` keeps it.
+
+**Untyped sites, ruby family only.** A receiver the analyzer cannot
+type keeps the call, which `runtime/ruby/active_record/connection.rb`
+answers beside `read_attribute`, reading each name, Symbol or String
+and flattened as Rails flattens them, through the `[]` column indexer.
+That indexer answers a temporal column's stored text, so `slice` parses
+it into the Time the reader (and the typed path) answers. Rails reads through `public_send`, so a model method
+that is not a column (`slice(:id, :avatar_url)`) is a
+`NotImplementedError` there, not a nil. It is not in `base.rb` for the
+reason `read_attribute` is not: the strict targets have no untyped
+`self[name]` to build the Hash from. A strict target given an untyped
+receiver emits the call as written and fails to build.
+
+Pinned by `tests/emit_and_run/record_slice.rs` (CRuby and Spinel) and
+the `real_blog_record_slice_runs` probe in each strict toolchain suite.
 
 ### `assert_select`'s block does not scope its nested assertions
 
@@ -3267,6 +3570,54 @@ with `Journey::Router::Utils.escape_fragment`, which leaves `/`, `?` and
 use, which percent-encodes them. Every anchor the corpus writes is a
 slug, a tag or a `dom_id`, so nothing can tell the difference today.
 
+### `default_url_options` gives a route helper its segments, in the shapes we read
+
+A URL-tenant app writes `scope ":blog"` and answers `{ path_params: {
+blog: current_blog } }` from `default_url_options`. Rails'
+`handle_positional_args` (actionpack 8.1.4, `route_set.rb:290`) then
+binds fewer positionals than the route has segments to the segments
+those options leave open, so `post_path(@post)` is `/acme/posts/1`; a
+segment the call names (`post_path(@post, blog: "x")`) is never a
+positional's, with or without the options. `lower::route_param_recall`
+binds the call the same way, and gives the controller a
+`url_options_path_parameters` method: the request's path parameters
+with the options' segments laid over them, which the call reads and the
+controller hands its views in place of the request's. It is evaluated
+per call, in the controller, as Rails evaluates `url_options`.
+
+It reads a Hash literal (`path_params:` a Hash literal too), `super`,
+`merge` of those, and `if cond` around one with no segments on the
+other branch, and a `compact`, `reject`, `slice`, … of one that gives
+no segment; each controller its own definition or the one it inherits.
+A `def default_url_options(options = {})` is read as Rails'
+`url_options` calls it, with no arguments: a read of an optional param
+is its default when that is a literal. A required param raises there,
+and a bare `super` passes the optional ones on to Base's
+`default_url_options`, which takes none, so Rails raises for both; they
+are unread, as is a read of any other param.
+Any other shape, a record value, and a value or guard that reads the
+method's own context (`super`, `yield`, `binding`, `__method__`) keeps
+the helpers' positional binding, and `check` warns at its `def`. A nil
+value leaves its segment out of the overlay, so every call needing it
+raises, as Rails raises for a nil segment (a `KeyError` here, a
+`UrlGenerationError` there); an empty String builds `//`, as Rails'
+does. Where it differs from Rails:
+
+* **A plain key is not also a query.** `{ blog: current_blog }` fills
+  the segment, but Rails also appends it to a route without one
+  (`health_path` is `/health?blog=acme`), and we do not.
+* **A false guard reads the request's segment.** Under `if
+  current_blog`, a call Rails would bind from the first segment, and
+  raise for, reads the request's `:blog`; when the guard reads the same
+  parameter it is absent too, and the read raises.
+* **Without the options, a short call with an options Hash** still
+  binds the Hash to a segment: `edit_post_path(@post, tab: "x")` builds
+  `/1/posts/{tab: "x"}/edit` where Rails raises for the missing `:id`.
+* **The views of a controller's own directory** take its options, and
+  every other view (a layout, `shared/`) ApplicationController's.
+  App helper modules, `url_for(@post)`, `polymorphic_path`,
+  `redirect_to @post` and mailers do not take the segments yet.
+
 ### An exception reported to Sentry reaches stderr, and loses its detail
 
 `Sentry.capture_exception` is a façade in `runtime/ruby/gem_facades.rb`
@@ -3296,21 +3647,158 @@ Rails with the gem installed and no `SENTRY_DSN` also transmits
 nothing, so the *delivery* half of this is not a divergence for an
 unconfigured deployment; the lost detail is.
 
-### rack-mini-profiler authorizes a request, and no profiler runs
+### A gem's Rack middleware: rack-attack on CRuby, and on Spinel once matz/spinel#11154 lands
 
-`Rack::MiniProfiler.authorize_request`, `deauthorize_request` and
-`request_authorized?` are the gem's own three bodies, a flag on
-`Thread.current`, in `runtime/ruby/gem_facades.rb` on the Spinel tree;
-the CRuby tree loads the real gem. lobsters authorizes every moderator's
-request, and without the constant each of their pages was a 500.
+A gem compiled from source (`ingest::auto_source_gems`) that is a Rack
+middleware runs where Rails runs it. Four general pieces carry it, none of
+them about rack-attack itself:
 
-**The middleware is not on either tree.** Nothing times the request,
-records its SQL, injects the panel into the page or serves
-`/mini-profiler-resources`. An authorized page is the page Rails renders
-minus the profiler's `<script>`, and the `__profilin` cookie is never
-set. The flame graph and memory views need CRuby internals and have no
-Spinel counterpart; request, SQL and render timing could be built on
-the runtime's own call sites.
+- **Its initializer settings run.** A `config/initializers/` statement
+  whose holder is an unknown gem (`Rack::Attack.throttle(...)`) names that
+  gem's constant, which brings the gem in from source
+  (`App::boot_gem_constants`); once it is in, the statement joins the boot
+  program (`ingest::boot_program`) on both ruby-family trees, as the app's
+  own statements do.
+- **Its Railtie's `app.middleware.use(Klass)` is read**
+  (`ingest::railtie_middleware`, `App::gem_middlewares`). `use` appends, so
+  the middleware sits inside Rails' RequestId and Runtime and before the
+  routes: a response it answers itself (rack-attack's 429) carries
+  `X-Request-Id` and `X-Runtime`. CRuby stacks the real gem's class in
+  `Main.run_rack` (`runtime/spinel/scaffold/ruby_overlay/runtime/gem_middleware.rb`, written over per app); Spinel
+  builds the request's Rack env (`project::spinel_gem_middleware`) and runs
+  the stack from `Main.dispatch_app`, with the routes at its bottom. The
+  Spinel stack is built per request where Rails builds it once: the app at
+  its bottom holds that request's objects. A middleware that keeps state in
+  its own instance would see a fresh one each time. An insertion with
+  arguments, or by `insert_before` / `insert_after`, is reported
+  unsupported.
+- **The Rack pieces Rails has loaded before any gem exist first.**
+  `ActionDispatch::Journey::Router::Utils.normalize_path`
+  (`runtime/spinel/action_dispatch_journey.rb`) is required ahead of the
+  gems on both trees, as rack-attack's `PathNormalizer` tests for it while
+  it loads. On Spinel, rack 3.2's `Rack::Request` (`runtime/spinel/rack_request.rb`:
+  `ip` with its trusted-proxy and `Forwarded` / `X-Forwarded-For` reading,
+  the path and method reads) and the holding half of `SimpleDelegator`
+  (`runtime/spinel/delegate_spinel.rb`) stand in; the ruby family loads
+  rack's and Ruby's own instead. SimpleDelegator's forwarding is not
+  there: it sends by a run-time name, which Spinel does not compile, so a
+  call that needs it stays a refusal.
+- **The Spinel server records the peer.** `REMOTE_ADDR`, and so
+  `Rack::Request#ip` and `request.remote_ip`, is the connection's address
+  (`sp_net_peer_ip`, matz/spinel#11147); a UNIX-socket connection has none.
+
+The rest is the gem's own code. `Forwardable`'s `def_delegators` becomes
+forwarding methods with the target's parameters (`ingest::forwardable`).
+A constant the gem reads that no locked gem could define is Ruby's
+NameError where it runs, and `defined?(C) && …` / `if defined?(C)` guard
+like `return unless defined?(C)` (`ingest::absence_guards`). A gem class
+whose class method answers false without such a constant
+(rack-attack's `DalliProxy.handle?`) and that nothing else names is never
+instantiated, so its instance methods are left out of the Spinel tree.
+
+**Not yet on Spinel:** `Rack::Attack::Cache#store=`'s `proxy.new(store)`
+reads a Class out of `BaseProxy`'s `@@proxies`, and Spinel's class sets
+cannot yet tell the nil an element read adds from a builtin Class object,
+so the call reaches `String.new` and refuses the store (matz/spinel#11154).
+With that, the rest of the app compiles. Integration tests of the emitted
+harness call the router directly, so the middleware is not in their path
+on either tree; Rails' integration tests go through it.
+
+### rack-mini-profiler: the panel, request, SQL and render timings on Spinel, nothing on CRuby
+
+On the Spinel tree the gem is a package, `runtime/gems/rack_mini_profiler/`
+(registered by `src/gems/rack_mini_profiler.rs`, shipped when
+`Gemfile.lock` pins the gem). It ports the gem 4.0.0's middleware over
+the framework's gem-agnostic request hooks (`runtime/spinel/request_hooks.rb`,
+run by `Main.dispatch` outside everything else, where the Railtie inserts
+the middleware) and vendors the gem's `includes.js`, `includes.css` and
+`vendor.js`. Its Railtie's production setup applies (`:allow_authorized`,
+the file store under `tmp/miniprofiler`), and the app's literal
+`Rack::MiniProfiler.config.<x> = …` lines in `config/initializers/` are
+replayed after it loads. Compared on the wire against the real gem: the
+injected `<script>`, `X-MiniProfiler-Ids`, the `__profilin` cookie (its
+tokens, `dp`, `bt`), `/mini-profiler-resources/results` (JSON and the
+share page, client timings included), the asset routes, `?pp=help` and
+the disabled-tool answers.
+
+SQL and render timings come the way the Railtie gets them: it subscribes
+(`monotonic_subscribe`) to `sql.active_record`, `start_processing` /
+`process_action.action_controller` and `render_template` /
+`render_partial.action_view`, and builds the gem's tree from them —
+`Executing: <controller>#<action>`, each `Rendering: <dir>/<file>` node
+taking the earlier siblings and queries that fall inside its window, SQL
+`formatted_command_string`s HTML-escaped, `sql_count`,
+`cached_sql_count`, `duration_milliseconds_in_sql`. Against the real gem
+fed the CRuby tree's events on lobsters (`/`, `/newest`, a story page,
+`/comments`, `/about`): the same nodes, depths, key order and number
+types, and the same statements. Which node a query or a partial lands
+under follows the gem's window test over whole-millisecond start times,
+so on a page served in about a millisecond it varies from run to run, for
+the real gem as for this one.
+
+What differs:
+
+- **A query has no backtrace and no row count.** `stack_trace_snippet`
+  is `null` (the gem filters `Kernel.caller`; a Spinel binary keeps no
+  Ruby call stack), and `row_count` / `class_name` stay `0` / `null`:
+  the gem fills them from `instantiation.active_record`, which nothing
+  here publishes yet.
+- **A query's duration is the SQLite shim's own time** for the statement,
+  its prepare and every step, published when the statement is done; the
+  `name` is always `"SQL"` (Rails says `Story Load` and so on). The other
+  shims (CRuby, PostgreSQL, JRuby) still publish a zero-length event as
+  the statement starts, and no query-cache hits.
+- **The tools that read CRuby's heap or stack are not there.** The
+  Railtie turns on `enable_advanced_debugging_tools` in development; this
+  tree keeps it off, so `profile-gc`, `profile-memory`, `env` and
+  `analyze-memory` answer the gem's "disabled" message in every
+  environment. `flamegraph` answers the gem's "install stackprof" message,
+  and `trace-exceptions` is not recognized (it needs TracePoint).
+- **Only the three files the panel loads are served** from
+  `/mini-profiler-resources/`; the gem's other `html/` files (speedscope,
+  the templates) are a 404.
+- **The user key over a UNIX socket is empty.** The gem keys unviewed
+  results by `Rack::Request#ip`, the address the Spinel server reads off
+  each connection (`sp_net_peer_ip`); a UNIX-socket connection has none,
+  so its clients share one list.
+- **A response the gem sends without a Content-Type** (the results 404)
+  gets the server's `text/html; charset=utf-8`.
+- **The CSP nonce attribute is empty**, as on the CRuby tree; Rails fills
+  it when the layout generated one.
+- **The share page escapes what the gem writes raw.** Its `<title>` is
+  HTML-escaped and the page JSON in its `<script>` is `json_escape`d
+  (`<`, `>`, `&` as `\u003c` …): the Spinel server accepts a raw `<` in
+  the request line, which Puma refuses, so request data could otherwise
+  close the script. The browser reads the same values; the bytes differ
+  wherever the data holds one of those characters.
+- Only literal initializer settings are replayed, and only those the
+  package's `Config` has a writer for (`config_setters` in
+  `src/gems/rack_mini_profiler.rs`). Any other literal setting is an
+  `unsupported (spinel)` error at emit and stays an unconsumed-initializer
+  warning; a computed one is only the warning.
+- A Gemfile line with `require: false` keeps the package out, as Bundler
+  would keep the gem's Railtie from loading.
+
+**The middleware is not on the CRuby tree.** It loads the real gem for
+the `authorize_request` gate only, so an authorized page there renders
+without the panel.
+
+### `ActiveSupport::Notifications`: which events the runtime publishes
+
+`sql.active_record` (every statement; on the Spinel SQLite shim timed and
+published when done, a query-cache hit as `cached: true`),
+`start_processing` / `process_action.action_controller` (both
+dispatchers, around the action), and `render_template` /
+`render_partial` / `render_layout` / `render_collection.action_view`
+(`lower::view_instrumentation` brackets each lowered view, and a `render
+collection` loop reports once with its `count` and not per item, as
+Rails' collection renderer does). Identifiers are `app/views/…` relative
+paths where Rails gives absolute ones. Each instrumented path first reads
+a flag `subscribe` keeps, so with no subscriber a statement, a step or a
+view pays one read. Not published: `instantiation.active_record`,
+`render_collection` for a `cached:` collection (its items report as
+partials), jbuilder templates, and the payloads' other keys (`binds`,
+`row_count`, `status`, `view_runtime`, …).
 
 ### `ActionText::ContentHelper.allowed_attributes` answers the list, not `nil`
 

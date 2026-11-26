@@ -23,6 +23,8 @@
 //! db_pg_lane.rb shows the one hook it must define.
 #![allow(dead_code)]
 
+#[path = "scratch.rs"]
+mod scratch;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -127,7 +129,7 @@ pub const LANES: &[Lane] = &[
         ],
         include_env: Some(("SPINEL_PG_DIR", "a spinel-pg checkout")),
         lane_file: Some("tests/db_contract/db_pg_lane.rb"),
-        lane_checks: 118,
+        lane_checks: 120,
     },
     Lane {
         name: "db_pg_cruby",
@@ -144,7 +146,7 @@ pub const LANES: &[Lane] = &[
         rbs: &[],
         include_env: None,
         lane_file: Some("tests/db_contract/db_pg_lane.rb"),
-        lane_checks: 118,
+        lane_checks: 120,
     },
 ];
 
@@ -271,8 +273,7 @@ pub fn run_lane(lane: &Lane) {
     let base = option_env!("CARGO_TARGET_TMPDIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    let dir = base.join(format!("roundhouse-{test}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = scratch::dir_in(&base, &format!("roundhouse-{test}"));
     std::fs::create_dir_all(dir.join("sig")).unwrap();
     let _cleanup = ScratchDir(dir.clone());
 
@@ -323,6 +324,9 @@ pub fn run_lane(lane: &Lane) {
             )
         }
         Runtime::Spinel => {
+            if std::env::var_os("RH_SPINEL_BUNDLE_COLLECT").is_some() {
+                panic!("spinel bundle collect: not bundled");
+            }
             let compiler = std::env::var("SPINEL").unwrap_or_else(|_| "spinel".into());
             let mut compile = Command::new(compiler);
             if let Some(include) = &include {

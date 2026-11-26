@@ -3,6 +3,7 @@ module ActiveSupport
   # Literal substring delete — one pattern (String#remove multi-arg
   # stays dynamic; lowering grounds only the single-arg form).
   def self.remove: (String text, String pattern) -> String
+  def self.strip_heredoc: (String text) -> String
   def self.demodulize: (String text) -> String
   # Regular-suffix singularize only (see runtime body).
   def self.singularize: (String text) -> String
@@ -18,8 +19,12 @@ module ActiveSupport
   def self.foreign_key: (String? text) -> String
 
   module Inflector
+    def self.pluralize: (String | Symbol word) -> String
+    def self.singularize: (String | Symbol word) -> String
+    def self.singular_tail: (String s, Integer drop, String rest) -> String
     # Default Rails 8.1.4 behavior without configured acronym tables.
     def self.camelize: (String text, ?bool uppercase_first_letter) -> String
+    def self.underscore: (String text) -> String
     def self.dasherize: (String text) -> String
     # Singular from the regular-suffix ActiveSupport.singularize.
     def self.classify: (String table_name) -> String
