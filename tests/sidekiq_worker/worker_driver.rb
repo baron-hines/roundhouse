@@ -251,10 +251,107 @@ module JobRegistry
     false
   end
 
+  # What `sidekiq_native::perform_native_source` writes for NativeWorker
+  # (`perform(id, tags = [], opts = {})`, Integer, Array of Strings, Hash of mixed scalars).
+  def self.native_read_native_worker_1_0(v, where)
+    SidekiqEnvelope.native_array(v, where)
+    out = [""]
+    out.clear
+    v.each { |x| out << SidekiqEnvelope.native_str(x, where) }
+    out
+  end
+
+  # What `sidekiq_native::retry_hooks_source` writes for HookWorker's two blocks.
+  def self.native_retry_in(worker, count, exception, msg)
+    case worker
+    when "HookWorker"
+      SidekiqEnvelope.retry_in_choice(HookWorker.__sidekiq_retry_in(count, exception, msg))
+    else
+      0
+    end
+  rescue Exception
+    0
+  end
+
+  def self.native_retries_exhausted(worker, msg, exception)
+    case worker
+    when "HookWorker"
+      HookWorker.__sidekiq_retries_exhausted(msg, exception) == :discard
+    else
+      false
+    end
+  rescue StandardError
+    false
+  end
+
+  def self.perform_native(worker, args, jid)
+    case worker
+    when "HookWorker"
+      HookWorker.new.perform(SidekiqEnvelope.native_int(args[0], "HookWorker#perform argument 0 (`id`)"))
+      true
+    when "NativeWorker"
+      n = SidekiqEnvelope.native_args(args)
+      if n == 1
+        w = NativeWorker.new
+        w.jid = jid
+        w.perform(SidekiqEnvelope.native_int(args[0], "NativeWorker#perform argument 0 (`id`)"))
+      elsif n == 2
+        w = NativeWorker.new
+        w.jid = jid
+        w.perform(SidekiqEnvelope.native_int(args[0], "NativeWorker#perform argument 0 (`id`)"), native_read_native_worker_1_0(args[1], "NativeWorker#perform argument 1 (`tags`)"))
+      elsif n == 3
+        w = NativeWorker.new
+        w.jid = jid
+        w.perform(SidekiqEnvelope.native_int(args[0], "NativeWorker#perform argument 0 (`id`)"), native_read_native_worker_1_0(args[1], "NativeWorker#perform argument 1 (`tags`)"), SidekiqEnvelope.native_scalar_hash(args[2], "NativeWorker#perform argument 2 (`opts`)"))
+      else
+        raise ArgumentError, "wrong number of arguments (given " + n.to_s + ", expected 1..3)"
+      end
+      true
+    else
+      false
+    end
+  end
+
   # The app's `Sidekiq.configure_client` `url:`, which a tree on
   # :sidekiq must give: the worker has no localhost fallback.
   def self.sidekiq_redis_url
     "redis://localhost:6379/0"
+  end
+end
+
+class NativeWorker
+  RAN = [""]
+
+  def jid
+    @jid
+  end
+
+  def jid=(value)
+    @jid = value
+  end
+
+  def perform(id, tags = [], opts = {})
+    RAN << id.to_s + " " + tags.join(",") + " " + opts.length.to_s + " " + jid[0, 4]
+    nil
+  end
+end
+
+# `sidekiq_retry_in` and `sidekiq_retries_exhausted`, as `take_retry_blocks` writes them.
+class HookWorker
+  NOTES = [""]
+
+  def self.__sidekiq_retry_in(count, exception, msg)
+    NOTES << "retry_in " + count.to_s + " " + exception.message + " " + msg["retry_count"].to_s
+    :discard
+  end
+
+  def self.__sidekiq_retries_exhausted(msg, exception)
+    NOTES << "exhausted " + msg["error_class"].to_s + " " + exception.message
+    :discard
+  end
+
+  def perform(id)
+    raise ArgumentError, "hook " + id.to_s
   end
 end
 
@@ -295,6 +392,15 @@ SidekiqWorker.parse(["sidekiq", "-q", "high", "-q", "low", "-c", "1", "-t", "1"]
 popped.each { |raw| SidekiqRedis::SCRIPT.push("queue:high\t" + raw) }
 SidekiqRedis::SCRIPT.push("queue:low\t" + JSON.generate({ "retry" => true, "queue" => "low", "class" => "HardWorker", "args" => [1], "jid" => "aaaaaaaaaaaaaaaaaaaaaaaa" }))
 SidekiqRedis::SCRIPT.push("queue:low\t" + JSON.generate({ "retry" => false, "queue" => "low", "class" => "HardWorker", "args" => [2], "jid" => "bbbbbbbbbbbbbbbbbbbbbbbb" }))
+NativeWorker::RAN.clear
+SidekiqRedis::SCRIPT.push("queue:low\t" + JSON.generate({ "retry" => false, "queue" => "low", "class" => "NativeWorker", "args" => [7], "jid" => "dddddddddddddddddddddddd" }))
+SidekiqRedis::SCRIPT.push("queue:low\t" + JSON.generate({ "retry" => false, "queue" => "low", "class" => "NativeWorker", "args" => [8, ["a", "b"], { "k" => "v", "n" => 1 }], "jid" => "eeeeeeeeeeeeeeeeeeeeeeee" }))
+HookWorker::NOTES.clear
+# retry: 3 asks `sidekiq_retry_in`, which discards; retry: 0 is exhausted at once and its block discards: neither writes.
+SidekiqRedis::SCRIPT.push("queue:low\t" + JSON.generate({ "retry" => 3, "queue" => "low", "class" => "HookWorker", "args" => [1], "jid" => "1111111111111111111111aa" }))
+SidekiqRedis::SCRIPT.push("queue:low\t" + JSON.generate({ "retry" => 0, "queue" => "low", "class" => "HookWorker", "args" => [2], "jid" => "1111111111111111111111bb" }))
+# A String where `id` is an Integer fails the job (dropped: retry false) and runs nothing.
+SidekiqRedis::SCRIPT.push("queue:low\t" + JSON.generate({ "retry" => false, "queue" => "low", "class" => "NativeWorker", "args" => ["9"], "jid" => "ffffffffffffffffffffffff" }))
 # Malformed envelopes fail their job, not the processor.
 SidekiqRedis::SCRIPT.push("queue:low\tnull")
 SidekiqRedis::SCRIPT.push("queue:low\t" + JSON.generate({ "retry" => true, "queue" => "low", "class" => "Sidekiq::ActiveJob::Wrapper", "wrapped" => "NoArgsJob", "jid" => "cccccccccccccccccccccccc" }))
@@ -311,6 +417,8 @@ Process.kill("TERM", Process.pid)
 SidekiqWorker.supervise
 SidekiqWorker::THREADS.each { |t| t.join }
 check("all processors stopped", SidekiqWorker.running == 0, SidekiqWorker.running.to_s)
+check("retry hooks see the job as it will be written", HookWorker::NOTES == ["retry_in 0 hook 1 0", "exhausted ArgumentError hook 2"], HookWorker::NOTES.join(" / "))
+check("native jobs run with as many arguments as they carry", NativeWorker::RAN == ["7  0 dddd", "8 a,b 2 eeee"], NativeWorker::RAN.join(" / "))
 check("each job starts with an empty broadcast log", Broadcasts::STALE[0] == 0 && Broadcasts::SENT[0] > 1,
   Broadcasts::STALE[0].to_s + " of " + Broadcasts::SENT[0].to_s + " stale")
 SidekiqRedis.take_log.each { |line| puts line }

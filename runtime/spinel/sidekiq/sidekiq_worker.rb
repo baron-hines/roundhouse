@@ -22,11 +22,11 @@
 # and drops repeats, so a heavier queue comes first more often, as
 # Sidekiq's `queues_cmd` does.
 #
-# RUNNING A JOB. Only ActiveJob jobs (`Sidekiq::ActiveJob::Wrapper` and
-# its older alias) can run here; the payload goes to
-# `ActiveJob.perform_parsed`. A job that raises, a job class this binary
-# doesn't have, and a native Sidekiq job all fail the way Sidekiq fails
-# them, through Sidekiq's retry rules (`fail_job`): `retry: false` drops
+# RUNNING A JOB. An ActiveJob job (`Sidekiq::ActiveJob::Wrapper` and its
+# older alias) goes to `ActiveJob.perform_parsed`; a native Sidekiq job to
+# `JobRegistry.perform_native`, which knows the app's workers by literal
+# name. A job that raises and a job class this binary doesn't have fail
+# the way Sidekiq fails them, through Sidekiq's retry rules (`fail_job`): `retry: false` drops
 # the job; otherwise the failure is recorded on it
 # (`SidekiqEnvelope.with_error`) and it goes to the retry set, scored
 # `count**4 + 15` seconds plus jitter from now, until its `retry` limit
@@ -436,7 +436,7 @@ module SidekiqWorker
     end
     label = describe_env(env)
     unless SidekiqEnvelope.active_job?(env)
-      fail_job(env, raw, queue, label, "NameError", "uninitialized constant " + SidekiqEnvelope.klass(env), started)
+      run_native(env, raw, queue, label, started)
       return nil
     end
     log("INFO", label + " start")
@@ -468,6 +468,80 @@ module SidekiqWorker
       fail_job(env, raw, queue, label, e.class.name, e.message, started)
     end
     nil
+  end
+
+  # A native Sidekiq job: the class's `perform` with the job's `args`, as
+  # Sidekiq's processor calls it. Logged `start` before the class is looked
+  # up, as Sidekiq's job logger wraps its `const_get`, so a class this app
+  # doesn't have fails as its NameError after a `start` line.
+  def self.run_native(env, raw, queue, label, started)
+    log("INFO", label + " start")
+    Broadcasts.reset_log!
+    begin
+      klass = SidekiqEnvelope.klass(env)
+      jid = SidekiqEnvelope.jid(env)
+      ran = Db.with_connection { JobRegistry.perform_native(klass, env["args"], jid) }
+      if ran
+        log("INFO", label + " done: " + elapsed(started) + " sec")
+      else
+        fail_job(env, raw, queue, label, "NameError", "uninitialized constant " + klass, started)
+      end
+    rescue StandardError => e
+      fail_native(env, raw, queue, label, e, started)
+    rescue Exception => e
+      # Not a shutdown: JobRetry#global retries any other Exception, with no worker for the hooks.
+      raise e if e.is_a?(SignalException) || e.is_a?(SystemExit)
+      fail_job(env, raw, queue, label, e.class.name.to_s, e.message, started)
+    end
+    nil
+  end
+
+  # `fail_job` for a native job, with its worker's `sidekiq_retry_in` and
+  # `sidekiq_retries_exhausted` hooks in the places `JobRetry` calls them:
+  # both see the job as it will be written, error fields and all.
+  def self.fail_native(env, raw, queue, label, e, started)
+    error_class = e.class.name.to_s
+    log("WARN", label + " fail: " + elapsed(started) + " sec: " + error_class + ": " + e.message)
+    unless SidekiqEnvelope.retries?(env)
+      log("INFO", label + " dropped: retry is off")
+      return nil
+    end
+    now = now_ms
+    count = SidekiqEnvelope.next_retry_count(env)
+    failed = SidekiqEnvelope.with_error(raw, queue, error_class, e.message, now)
+    worker = SidekiqEnvelope.klass(env)
+    # One message through both hooks, as JobRetry passes its msg: what a hook changes is what gets written.
+    msg = JSON.parse(failed)
+    if SidekiqEnvelope.exhausted?(env, count, max_retries, now)
+      exhaust_native(worker, failed, msg, e, label)
+      return nil
+    end
+    choice = JobRegistry.native_retry_in(worker, count, e, msg)
+    if choice == -1
+      log("INFO", label + " discarded: sidekiq_retry_in")
+    elsif choice == -2
+      exhaust_native(worker, failed, msg, e, label)
+    else
+      delay = choice > 0 ? choice : count**4 + 15
+      write_retry(Time.now.to_f + delay + rand(10 * (count + 1)), as_changed(failed, msg))
+    end
+    nil
+  end
+
+  def self.exhaust_native(worker, failed, msg, e, label)
+    discarded = JobRegistry.native_retries_exhausted(worker, msg, e)
+    if discarded || SidekiqEnvelope.discard_when_exhausted?(msg)
+      log("INFO", label + " discarded: retries exhausted")
+    else
+      write_dead(as_changed(failed, msg))
+    end
+    nil
+  end
+
+  # `failed`'s own bytes unless a hook changed the message: those are Sidekiq's, key for key.
+  def self.as_changed(failed, msg)
+    now = JSON.generate(msg)
+    now == JSON.generate(JSON.parse(failed)) ? failed : now
   end
 
   # Sidekiq's retry rules for a job that failed (`JobRetry#process_retry`).

@@ -180,6 +180,9 @@ pub struct App {
     /// A superclass expression read off a configured object that did not fold to a constant.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub superclass_refusals: Vec<crate::diagnostic::Diagnostic>,
+    /// A CurrentAttributes `attribute` option the lowering cannot reproduce (`ingest::current_attributes`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub current_attribute_refusals: Vec<crate::diagnostic::Diagnostic>,
     /// Routes a gem's routing method draws that are left out (`ingest::gem_hooks::omits_on_failure`), at the call.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gem_route_gaps: Vec<crate::diagnostic::Diagnostic>,
@@ -387,6 +390,13 @@ pub struct App {
     /// `project::apply_job_registry`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub job_plans: Vec<crate::lower::job_payload::JobPlan>,
+    /// Under `queue_adapter :sidekiq`, how each native Sidekiq worker's
+    /// arguments are written to its envelope, and the envelope's head
+    /// from its `sidekiq_options`, or why it can't be pushed. Worked out
+    /// by [`crate::lower::sidekiq_native::plan_workers`]; read by the
+    /// Ruby emitter's enqueue rewrite and by `project::apply_job_registry`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub native_plans: Vec<crate::lower::sidekiq_native::NativePlan>,
     /// The ActiveJob queue adapter the app configures, as a name
     /// (`config.active_job.queue_adapter = :sidekiq` gives `"sidekiq"`).
     /// Read at ingest from `config/application.rb`, then
@@ -1170,6 +1180,21 @@ pub struct ImportmapPin {
 }
 
 impl App {
+    /// Each of the app's classes and its superclass, a leading `::`
+    /// dropped. A subclass of a model with no table of its own is a
+    /// library class (chatwoot's `SuperAdmin < User`, campfire's
+    /// `Rooms::Open < Room`), so both lists are walked.
+    pub fn class_parents(&self) -> HashMap<&str, Option<&str>> {
+        fn parent(p: &Option<ClassId>) -> Option<&str> {
+            p.as_ref().map(|p| p.0.as_str().trim_start_matches("::"))
+        }
+        self.models
+            .iter()
+            .map(|m| (m.name.0.as_str(), parent(&m.parent)))
+            .chain(self.library_classes.iter().map(|c| (c.name.0.as_str(), parent(&c.parent))))
+            .collect()
+    }
+
     /// Drop the spare capacity ingest leaves in the unit collections.
     ///
     /// Building a tree by pushing leaves every `Vec` and `String` in it
@@ -1410,6 +1435,7 @@ impl App {
             gem_middleware_refusals: Vec::new(),
             included_hoist_conflicts: Vec::new(),
             superclass_refusals: Vec::new(),
+            current_attribute_refusals: Vec::new(),
             gem_route_gaps: Vec::new(),
             generated_route_helpers: Vec::new(),
             importmap: None,
@@ -1436,6 +1462,7 @@ impl App {
             global_id_locate_models: BTreeSet::new(),
             global_id_locate_signed_models: BTreeSet::new(),
             job_plans: Vec::new(),
+            native_plans: Vec::new(),
             queue_adapter: None,
             sidekiq_redis: SidekiqRedisConfig::default(),
             sidekiq_worker: SidekiqWorkerDefaults::default(),
@@ -1867,5 +1894,19 @@ fn extends_active_support_concern(lc: &crate::dialect::LibraryClass) -> bool {
                 matches!(&*arg.node, crate::expr::ExprNode::Const { path }
                     if path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>() == ["ActiveSupport", "Concern"])
             })
+    })
+}
+
+/// A class's superclasses in [`App::class_parents`], nearest first. The
+/// first parent that is no app class (`ApplicationRecord`'s
+/// `ActiveRecord::Base`) is the last one yielded, and a cycle ends the
+/// walk instead of looping.
+pub fn class_ancestors<'a>(parents: &'a HashMap<&'a str, Option<&'a str>>, class: &str) -> impl Iterator<Item = &'a str> {
+    let mut seen: crate::det::HashSet<&str> = crate::det::HashSet::default();
+    let mut current = parents.get(class).copied().flatten();
+    std::iter::from_fn(move || {
+        let name = current.filter(|name| seen.insert(name))?;
+        current = parents.get(name).copied().flatten();
+        Some(name)
     })
 }

@@ -15,7 +15,7 @@
 
 use crate::expr::{Expr, ExprNode, InterpPart, LValue, Literal};
 use crate::ident::{Symbol, VarId};
-use crate::naming::{singularize, snake_case};
+use crate::naming::{last_segment, singularize, snake_case};
 use crate::span::Span;
 
 use super::attr_parts::append_attr_parts;
@@ -1123,17 +1123,45 @@ fn classify_form_with_components(
     // `form_with model: @mod_note` posts to `mod_notes_path` in Rails,
     // and the directory's `user_path` exists too.
     // Then the analyzer's model for the view ivar (`@users` recorded as User where the binding's own type is a collection).
-    let typed_class = match model.ty.as_ref().map(crate::ty::Ty::peel_nilable) {
-        Some(crate::ty::Ty::Class { id, .. }) => Some(id.0.as_str().rsplit("::").next().unwrap_or_default().to_string()),
+    let typed_full = match model.ty.as_ref().map(crate::ty::Ty::peel_nilable) {
+        Some(crate::ty::Ty::Class { id, .. }) => Some(id.0.as_str().to_string()),
         _ => None,
     }
     .or_else(|| record_local_name(&model).and_then(|name| ctx.ivar_models.get(&name).cloned()));
-    if let Some(name) = typed_class.clone().or_else(|| record_local_name(&model)) {
+    let typed_class = typed_full.as_deref().map(|full| last_segment(full).to_string());
+    // The record's local's name is the fallback route. A typed record
+    // takes it only when the directory names no route and its class IS
+    // that local's model: campfire's `rooms/layouts/_form` is handed a
+    // `Rooms::Open < Room` as `room`, and neither `opens_path` nor
+    // `rooms_layouts_path` is a route where `rooms_path` is, while
+    // `rooms/directs/new`'s `Rooms::Direct` keeps its directory's
+    // `rooms_directs_path`. A `Post` handed as `user` posting to
+    // `users_path` would be silently wrong where the unrouted `posts_path`
+    // fails loudly. An untyped record has only its name to go by, and it
+    // wins over the directory as it always has (`posts/_form` handed a
+    // `user` posts to `users_path`); the partial's own emission, which
+    // serves every render, types campfire's `room` as nothing.
+    let known = |n: &str| ctx.route_helper_names.contains(&format!("{n}_path"));
+    let directory_known = known(&plural_owned) || known(&singularize(&plural_owned));
+    let by_local = record_local_name(&model).filter(|local| match typed_full.as_deref() {
+        None => true,
+        Some(full) => !directory_known && {
+            let local = singularize(&snake_case(local));
+            ctx.model_lineage.get(full).is_some_and(|lineage| lineage.contains(&local))
+        },
+    });
+    for name in typed_class.clone().into_iter().chain(by_local) {
         let rec_singular = singularize(&snake_case(&name));
         let rec_plural = crate::naming::pluralize_snake(&rec_singular);
-        let known = |n: &str| ctx.route_helper_names.contains(&format!("{n}_path"));
-        if rec_plural != plural_owned && (known(&rec_plural) || known(&rec_singular)) {
+        // The class naming the directory proves nothing when the directory
+        // is no route (`opens/_form` handed a `Rooms::Open` `room`): the
+        // local still gets its look.
+        if rec_plural == plural_owned {
+            continue;
+        }
+        if known(&rec_plural) || known(&rec_singular) {
             plural_owned = rec_plural;
+            break;
         }
     }
     let plural = plural_owned.as_str();
@@ -1876,6 +1904,7 @@ mod tests {
             model_singulars: Rc::new(
                 model_singulars.iter().map(|s| s.to_string()).collect::<HashSet<_>>(),
             ),
+            model_lineage: Default::default(),
             slug_models: Default::default(),
             sti_route_stems: Default::default(),
             bool_readers: Default::default(),
