@@ -721,7 +721,11 @@ fn untyped_subexpressions_baseline() {
     // `Db.connection_slot(true) == -2` and `Db.query_cache_enabled?`
     // (+3 in active_record/connection.rb), which read as untyped on this
     // RBS-less probe, as the other `Db` results do.
-    const CEILING: usize = 1474;
+    // MEASURED 1482 on carrying `references` through `or!`, `and!` and
+    // `merge!` (1473): each hands its untyped `other` to
+    // `merge_reference_names!`, whose body reads that `other`, as the rest
+    // of those methods already do (+9 in active_record/relation.rb).
+    const CEILING: usize = 1482;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ledger: \

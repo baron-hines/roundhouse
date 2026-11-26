@@ -709,7 +709,7 @@ fn strip_host_options(
         !matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } }
             if HOST_ONLY_OPTIONS.contains(&value.as_str()) && value.as_str() != "protocol" && value.as_str() != "port")
     });
-    if own_url_options && !chained && host.is_none() && !only_path && only_protocol {
+    if own_url_options && !chained && host.is_none() && !only_path && only_protocol && method.as_str().ends_with("_url") {
         return None;
     }
     entries.retain(|(k, _)| {

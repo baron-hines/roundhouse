@@ -642,10 +642,10 @@ module ActiveRecord
     end
 
     def or!(other)
-      return self if other.null_relation?
       own_lists
       unload_records
       merge_reference_names!(other)
+      return self if other.null_relation?
       mine = @wheres.length > 0 ? @wheres.join(" AND ") : "1=1"
       other_wheres = other.where_clauses
       theirs = other_wheres.length > 0 ? other_wheres.join(" AND ") : "1=1"
