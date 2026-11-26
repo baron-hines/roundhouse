@@ -148,6 +148,17 @@ module SidekiqEnvelope
     message[0, ERROR_MESSAGE_LIMIT]
   end
 
+  # What a `sidekiq_retry_in` block's answer means, as `JobRetry#delay_for`
+  # reads it: -2 for `:kill`, -1 for `:discard`, a positive number of
+  # seconds, or 0 for Sidekiq's default delay.
+  def self.retry_in_choice(rv)
+    return -2 if rv == :kill
+    return -1 if rv == :discard
+    n = 0
+    n = rv.to_i if rv.is_a?(Integer) || rv.is_a?(Float) || rv.is_a?(String) || rv.nil?
+    n > 0 ? n : 0
+  end
+
   # ---- A native job's arguments, read back for `JobRegistry.perform_native`
 
   # Raise rather than coerce like ActiveJob::Arguments' readers (`"x".to_i`): a coerced value is one nobody pushed.

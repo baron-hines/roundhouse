@@ -8145,6 +8145,7 @@ fn apply_job_registry(files: &mut [(String, String)], app: &App) {
     let native = if needs_redis(app) {
         crate::lower::sidekiq_native::registry_source(&app.native_plans)
             + &crate::lower::sidekiq_native::perform_native_source(&app.native_plans)
+            + &crate::lower::sidekiq_native::retry_hooks_source(app, &app.native_plans)
     } else {
         String::new()
     };

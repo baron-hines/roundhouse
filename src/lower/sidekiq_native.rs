@@ -1512,6 +1512,139 @@ pub fn registry_source(plans: &[NativePlan]) -> String {
     s
 }
 
+/// The class methods a worker's `sidekiq_retry_in` and
+/// `sidekiq_retries_exhausted` blocks become, which the registry's
+/// `native_retry_in` / `native_retries_exhausted` call as Sidekiq's
+/// `JobRetry` calls the blocks.
+pub const RETRY_IN: &str = "__sidekiq_retry_in";
+pub const RETRIES_EXHAUSTED: &str = "__sidekiq_retries_exhausted";
+
+/// Takes `sidekiq_retry_in do |count, exception, msg| … end` and
+/// `sidekiq_retries_exhausted do |msg, exception| … end` out of the class
+/// body as `self.__sidekiq_retry_in(count, exception, msg)` and
+/// `self.__sidekiq_retries_exhausted(msg, exception)`. Sidekiq calls each
+/// block with every argument and a block ignores the ones it doesn't name,
+/// so a missing name is filled; `next` leaves the block, so it returns
+/// from the method. Answers the calls it can't take (no block, or one with
+/// a rest, keyword or block parameter), which stay unsupported.
+pub fn take_retry_blocks(lc: &mut LibraryClass) -> Vec<Expr> {
+    let mut refused = Vec::new();
+    let mut methods = Vec::new();
+    lc.unknown_calls.retain(|call| {
+        let ExprNode::Send { recv: None, method, args, block, .. } = &*call.node else { return true };
+        let (name, fill): (&str, &[&str]) = match method.as_str() {
+            "sidekiq_retry_in" => (RETRY_IN, &["count", "exception", "msg"]),
+            "sidekiq_retries_exhausted" => (RETRIES_EXHAUSTED, &["msg", "exception"]),
+            _ => return true,
+        };
+        let taken = match block.as_ref().map(|b| &*b.node) {
+            Some(ExprNode::Lambda { params, rest_param: None, extra_params, block_param: None, body, .. })
+                if args.is_empty() && extra_params.is_empty() && params.len() <= fill.len() =>
+            {
+                let own: Vec<String> = params.iter().map(|p| p.as_str().to_string()).collect();
+                let names: Vec<Symbol> = (0..fill.len())
+                    .map(|i| match params.get(i) {
+                        Some(p) => p.clone(),
+                        None => Symbol::from(super::job_payload::fresh_name(&format!("_{}", fill[i]), &own.iter().map(String::as_str).collect::<Vec<_>>()).as_str()),
+                    })
+                    .collect();
+                let mut body = body.clone();
+                next_to_return(&mut body);
+                Some(MethodDef {
+                    visibility: crate::dialect::MethodVisibility::Public,
+                    unsupported_formals: None,
+                    has_anonymous_block: false,
+                    name_span: call.span,
+                    name: Symbol::from(name),
+                    receiver: MethodReceiver::Class,
+                    params: names.into_iter().map(crate::dialect::Param::positional).collect(),
+                    body,
+                    signature: None,
+                    effects: crate::effect::EffectSet::default(),
+                    enclosing_class: Some(lc.name.0.clone()),
+                    kind: crate::dialect::AccessorKind::Method,
+                    is_async: false,
+                    mutates_self: false,
+                    block_param: None,
+                })
+            }
+            _ => None,
+        };
+        match taken {
+            Some(m) => methods.push(m),
+            None => refused.push(call.clone()),
+        }
+        false
+    });
+    lc.methods.retain(|m| !(m.receiver == MethodReceiver::Class && methods.iter().any(|n| n.name == m.name)));
+    lc.methods.extend(methods);
+    refused
+}
+
+/// A `next` in the block's own body, outside any block nested in it.
+fn next_to_return(e: &mut Expr) {
+    if let ExprNode::Next { value } = &mut *e.node {
+        let value = value.take().unwrap_or_else(|| Expr::new(e.span, ExprNode::Lit { value: Literal::Nil }));
+        *e.node = ExprNode::Return { value };
+        return;
+    }
+    if matches!(&*e.node, ExprNode::Lambda { .. }) {
+        return;
+    }
+    e.node.for_each_child_mut(&mut next_to_return);
+}
+
+/// The worker's own or nearest ancestor's `name` hook, as Sidekiq's
+/// `sidekiq_retry_in_block` is inherited.
+fn retry_hook(app: &App, worker: &str, name: &str) -> Option<String> {
+    let by_name = |n: &str| app.library_classes.iter().find(|lc| lc.name.0.as_str() == n);
+    let mut cur = by_name(worker);
+    for _ in 0..32 {
+        let lc = cur?;
+        if lc.methods.iter().any(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == name) {
+            return Some(lc.name.0.as_str().to_string());
+        }
+        cur = lc.parent.as_ref().and_then(|p| by_name(p.0.as_str()));
+    }
+    None
+}
+
+/// `JobRegistry.native_retry_in(worker, count, exception, msg)` and
+/// `native_retries_exhausted(worker, msg, exception)`: the worker's hook,
+/// or Sidekiq's default (0, the default delay; false, to the morgue). A
+/// hook that raises falls back to the default, as `JobRetry` rescues it.
+pub fn retry_hooks_source(app: &App, plans: &[NativePlan]) -> String {
+    let mut retry_in = String::new();
+    let mut exhausted = String::new();
+    for plan in plans.iter().filter(|p| p.is_payload() && unreadable(p).is_none()) {
+        if let Some(owner) = retry_hook(app, &plan.worker, RETRY_IN) {
+            retry_in.push_str(&format!(
+                "    when {}\n      SidekiqEnvelope.retry_in_choice({owner}.{RETRY_IN}(count, exception, msg))\n",
+                ruby_str(&plan.worker)
+            ));
+        }
+        if let Some(owner) = retry_hook(app, &plan.worker, RETRIES_EXHAUSTED) {
+            exhausted.push_str(&format!(
+                "    when {}\n      {owner}.{RETRIES_EXHAUSTED}(msg, exception) == :discard\n",
+                ruby_str(&plan.worker)
+            ));
+        }
+    }
+    // `delay_for` rescues Exception, `retries_exhausted` StandardError.
+    let wrap = |arms: &str, default: &str, rescued: &str| {
+        if arms.is_empty() {
+            format!("    {default}\n")
+        } else {
+            format!("    case worker\n{arms}    else\n      {default}\n    end\n  rescue {rescued}\n    {default}\n")
+        }
+    };
+    format!(
+        "  def self.native_retry_in(worker, count, exception, msg)\n{}  end\n\n  def self.native_retries_exhausted(worker, msg, exception)\n{}  end\n\n",
+        wrap(&retry_in, "0", "Exception"),
+        wrap(&exhausted, "false", "StandardError"),
+    )
+}
+
 /// `JobRegistry.perform_native(worker, args, jid)`, which the worker runs
 /// for a popped job that isn't ActiveJob's: one `when` per planned worker,
 /// spelled as a literal class (a name from the wire is never turned into

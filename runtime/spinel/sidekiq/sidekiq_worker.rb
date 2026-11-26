@@ -487,7 +487,47 @@ module SidekiqWorker
         fail_job(env, raw, queue, label, "NameError", "uninitialized constant " + klass, started)
       end
     rescue StandardError => e
-      fail_job(env, raw, queue, label, e.class.name, e.message, started)
+      fail_native(env, raw, queue, label, e, started)
+    end
+    nil
+  end
+
+  # `fail_job` for a native job, with its worker's `sidekiq_retry_in` and
+  # `sidekiq_retries_exhausted` hooks in the places `JobRetry` calls them:
+  # both see the job as it will be written, error fields and all.
+  def self.fail_native(env, raw, queue, label, e, started)
+    error_class = e.class.name.to_s
+    log("WARN", label + " fail: " + elapsed(started) + " sec: " + error_class + ": " + e.message)
+    unless SidekiqEnvelope.retries?(env)
+      log("INFO", label + " dropped: retry is off")
+      return nil
+    end
+    now = now_ms
+    count = SidekiqEnvelope.next_retry_count(env)
+    failed = SidekiqEnvelope.with_error(raw, queue, error_class, e.message, now)
+    worker = SidekiqEnvelope.klass(env)
+    if SidekiqEnvelope.exhausted?(env, count, max_retries, now)
+      exhaust_native(env, worker, failed, e, label)
+      return nil
+    end
+    choice = JobRegistry.native_retry_in(worker, count, e, JSON.parse(failed))
+    if choice == -1
+      log("INFO", label + " discarded: sidekiq_retry_in")
+    elsif choice == -2
+      exhaust_native(env, worker, failed, e, label)
+    else
+      delay = choice > 0 ? choice : count**4 + 15
+      write_retry(Time.now.to_f + delay + rand(10 * (count + 1)), failed)
+    end
+    nil
+  end
+
+  def self.exhaust_native(env, worker, failed, e, label)
+    discarded = JobRegistry.native_retries_exhausted(worker, JSON.parse(failed), e)
+    if discarded || SidekiqEnvelope.discard_when_exhausted?(env)
+      log("INFO", label + " discarded: retries exhausted")
+    else
+      write_dead(failed)
     end
     nil
   end

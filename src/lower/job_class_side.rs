@@ -238,6 +238,12 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
             // dead include and options.
             if !has_perform.contains(lc.name.0.as_str()) {
                 lc.includes.retain(|inc| !SIDEKIQ_MODULES.contains(&inc.0.as_str()));
+                // A base's retry blocks are its subclasses' too, as Sidekiq inherits them.
+                if sidekiq {
+                    for call in super::sidekiq_native::take_retry_blocks(lc) {
+                        diags.push(retry_block_error(lc.name.0.as_str(), call.span));
+                    }
+                }
                 lc.unknown_calls.retain(|call| {
                     !matches!(&*call.node, ExprNode::Send { recv: None, method, .. }
                         if SIDEKIQ_CLASS_MACROS.contains(&method.as_str()))
@@ -256,32 +262,20 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
                 continue;
             }
             lc.includes.retain(|inc| !SIDEKIQ_MODULES.contains(&inc.0.as_str()));
+            if sidekiq {
+                for call in super::sidekiq_native::take_retry_blocks(lc) {
+                    diags.push(retry_block_error(lc.name.0.as_str(), call.span));
+                }
+            }
             let before = lc.unknown_calls.len();
-            let retry_blocks = lc.unknown_calls.iter().any(|call| {
-                matches!(&*call.node, ExprNode::Send { recv: None, method, .. }
-                    if matches!(method.as_str(), "sidekiq_retry_in" | "sidekiq_retries_exhausted"))
-            });
             lc.unknown_calls.retain(|call| {
                 !matches!(&*call.node, ExprNode::Send { recv: None, method, .. }
                     if SIDEKIQ_CLASS_MACROS.contains(&method.as_str()))
             });
             // Under `:sidekiq` the literal options are carried into the
-            // envelope (`sidekiq_native::options` warns for the rest);
-            // only the retry blocks are still dropped.
-            if sidekiq {
-                if retry_blocks {
-                    diags.push(crate::lower::residue_diagnostic(
-                        "job_class_side",
-                        "worker-options",
-                        crate::span::Span::synthetic(),
-                        "retry blocks not lowered",
-                        format!(
-                            "job_class_side: `{}` — sidekiq_retry_in / sidekiq_retries_exhausted blocks are dropped; a failed job takes Sidekiq's default retry schedule",
-                            lc.name.0.as_str()
-                        ),
-                    ));
-                }
-            } else if lc.unknown_calls.len() != before {
+            // envelope (`sidekiq_native::options` warns for the rest), and
+            // the retry blocks are class methods the worker calls.
+            if !sidekiq && lc.unknown_calls.len() != before {
                 diags.push(crate::lower::residue_diagnostic(
                     "job_class_side",
                     "worker-options",
@@ -947,6 +941,22 @@ fn fold_set_chains(
         }
     }
     e.node.for_each_child_mut(&mut |c| fold_set_chains(c, jobs, unfolded, folded, sidekiq.as_deref_mut()));
+}
+
+/// A retry block `take_retry_blocks` couldn't take: dropped, the worker's
+/// failed jobs would take Sidekiq's default schedule, which is not the app's.
+fn retry_block_error(worker: &str, span: crate::span::Span) -> Diagnostic {
+    let mut d = crate::lower::residue_diagnostic(
+        "job_class_side",
+        "worker-retry-block",
+        span,
+        "retry block not lowered",
+        format!(
+            "job_class_side: `{worker}` — this sidekiq_retry_in / sidekiq_retries_exhausted takes no block Roundhouse can call (a rest, keyword or block parameter, or no block); its failed jobs would take Sidekiq's default handling"
+        ),
+    );
+    d.severity = crate::diagnostic::Severity::Error;
+    d
 }
 
 /// The modules whose `include` makes a class a Sidekiq worker.
