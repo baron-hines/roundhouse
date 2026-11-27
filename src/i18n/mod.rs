@@ -806,6 +806,11 @@ impl Catalog {
         if !self.plain_subtree(key) {
             return None;
         }
+        // Not only inside the subtree: a dotted key above it (`"a.b"` beside `a: { b: }`) merges two mappings at `key`.
+        let ancestors = key.match_indices('.').map(|(i, _)| &key[..i]);
+        if ancestors.into_iter().any(|p| self.order.get(p).is_some_and(|children| children.iter().any(|c| c.contains('.')))) {
+            return None;
+        }
         let mut out = String::new();
         node(self, key, separators, &mut out)?;
         Some(out)
@@ -1521,6 +1526,9 @@ mod tests {
         // A dotted key collides with the nested path it flattens to: not folded.
         let c = catalog(&[("config/locales/en.yml", "en:\n  js:\n    \"a.b\": \"flat\"\n    a:\n      b: \"nested\"\n")]);
         assert_eq!(c.subtree_json("js", false), None);
+        // And above the requested node: `js.a.b` is two mappings merged.
+        let c = catalog(&[("config/locales/en.yml", "en:\n  js:\n    \"a.b\":\n      extra: \"flat\"\n    a:\n      b:\n        ok: \"nested\"\n")]);
+        assert_eq!(c.subtree_json("js.a.b", false), None);
     }
 
     #[test]
