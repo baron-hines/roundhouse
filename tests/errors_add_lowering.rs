@@ -181,3 +181,80 @@ end
     );
     assert!(diags.is_empty(), "{diags:?}");
 }
+
+#[test]
+fn a_record_that_is_not_a_plain_read_stays_residue() {
+    // The message and its error are two pushes; a receiver call would run once per push.
+    let (out, diags) = lower_and_emit(
+        r#"
+class Draft
+  def flag
+    Draft.latest.errors.add(:title, "is odd")
+    Draft.latest.errors.clear
+  end
+end
+"#,
+    );
+    assert!(out.contains(r#"Draft.latest.errors.add(:title, "is odd")"#), "{out}");
+    assert!(out.contains("Draft.latest.errors.clear"), "{out}");
+    assert_eq!(diags.len(), 2, "{diags:?}");
+}
+
+#[test]
+fn each_push_records_the_error_rails_keeps() {
+    let (out, diags) = lower_and_emit(
+        r#"
+class Draft
+  def validate_body(why)
+    errors.add(:title, :taken)
+    errors.add(:title, why)
+  end
+end
+"#,
+    );
+    assert!(
+        out.contains(r#"error_details << ActiveRecord::ErrorDetail.new("title", "taken", "has already been taken", "Title has already been taken", true, true)"#),
+        "a Symbol message is the error type:\n{out}"
+    );
+    assert!(
+        out.contains(r#"error_details << ActiveRecord::ErrorDetail.new("title", why, why, "Title #{why}", false, true)"#),
+        "a String message is its own type:\n{out}"
+    );
+    assert!(diags.is_empty(), "{diags:?}");
+}
+
+#[test]
+fn a_message_that_is_not_a_plain_read_stays_residue() {
+    // The full text and the record each read the message; a call would run twice.
+    let (out, diags) = lower_and_emit(
+        r#"
+class Draft
+  def validate_body(record)
+    errors.add(:title, reason_for(record))
+    errors.add(:body, next_message)
+  end
+end
+"#,
+    );
+    assert!(out.contains("errors.add(:title, reason_for(record))"), "{out}");
+    assert!(out.contains("errors.add(:body, next_message)"), "{out}");
+    assert_eq!(diags.len(), 2, "{diags:?}");
+}
+
+// Review of #1381 (4372485562): an app built outside ingest has no
+// catalog of its own, and a run-time `errors.add` bakes Rails' English
+// messages for the kind, as the literal path does, rather than none
+// ("translation missing: errors.messages.blank" at run time).
+#[test]
+fn a_runtime_errors_add_bakes_rails_english_without_an_app_catalog() {
+    let (out, _diags) = lower_and_emit(
+        r#"
+class BlankChecker
+  def self.check(record, attribute)
+    record.errors.add(attribute, :blank)
+  end
+end
+"#,
+    );
+    assert!(out.contains("can't be blank"), "Rails' message for :blank is baked:\n{out}");
+}

@@ -1,0 +1,9 @@
+# the search page's what/order combinations
+GET /search?q=hello&what=stories&order=newest
+GET /search?q=hello&what=stories&order=relevance
+GET /search?q=hello&what=stories&order=score
+GET /search?q=hello&what=comments&order=newest
+GET /search?q=hello&what=comments&order=score
+GET /search?q=tag:ruby&what=stories&order=newest
+GET /search?q=domain:example.com&what=stories&order=newest
+GET /search?q=title:hello&what=stories&order=newest

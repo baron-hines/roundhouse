@@ -1,6 +1,8 @@
 //! Full forwarding has a positional/keyword/block contract, not a naming convention.
 //! Native controls deliberately distinguish all three from plausible miscompiles.
 
+#[path = "support/scratch.rs"]
+mod scratch;
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
@@ -451,10 +453,9 @@ fn mixed_anonymous_keyword_pairs_round_trip_as_an_ordered_group() {
 #[test]
 fn flattened_and_unknown_contracts_remain_errors_through_lowering() {
     for source in [
-        "class Probe\n def call(...)\n target(...)\n end\n def target(a, b, factor: 2)\n (a-b)*factor\n end\nend",
-        "class Probe\n def call(...)\n self.target(...)\n end\n def target(a, b, **kw)\n (a-b)*kw[:factor]\n end\nend",
-        "class Parent\n def call(a, b, factor: 2)\n (a-b)*factor\n end\nend\nclass Child < Parent\n def call(...)\n super\n end\nend",
-        "module Mixed\n def call(a, b, factor: 2)\n (a-b)*factor\n end\nend\nclass Parent\n def call(a,b,factor:)\n (a-b)*factor\n end\nend\nclass Child < Parent\n include Mixed\n def call(...)\n super(...)\n end\nend",
+        // Optional keywords, `**kw`, implicit `super`, and an included
+        // module's optional keywords are restored; see
+        // tests/service_call_forwarding.rs. An unknown callee is not.
         "class Probe\n def call(...)\n absent(...)\n end\nend",
     ] {
         let native = Command::new("ruby")
@@ -497,6 +498,12 @@ fn keyword_target_gates_distinguish_ordinary_super_from_full_forwarding() {
                     if construct.as_str() == "keyword splat in ordinary super"
                         || construct.as_str() == "keyword splat into full argument forwarding")
             }).collect();
+            if target == BuildTarget::Spinel
+                && expected == "keyword splat into full argument forwarding"
+            {
+                assert!(gates.is_empty(), "{diagnostics:?}");
+                continue;
+            }
             assert_eq!(gates.len(), 1, "{target:?}: {source}: {diagnostics:?}");
             let gate = gates[0];
             assert_eq!(gate.severity, Severity::Error);
@@ -518,8 +525,7 @@ fn source_archive_copies_unrepresented_formals_without_a_transpile_error() {
     for formal in ["(a,b)", "**nil"] {
         let source = format!("class Probe; def call({formal}); 7; end; end\n");
         let app = analyzed(&source);
-        let fixture = std::env::temp_dir().join(format!("roundhouse-source-archive-{}-{}", std::process::id(), formal.len()));
-        std::fs::create_dir(&fixture).unwrap();
+        let fixture = scratch::dir(&format!("roundhouse-source-archive-{}", formal.len()));
         std::fs::write(fixture.join("probe.rb"), &source).unwrap();
         for target in [BuildTarget::Blog, BuildTarget::Ruby] {
             let (files, diagnostics) = roundhouse::emit::diagnostics::scope(|| {
@@ -548,7 +554,6 @@ fn declaration_only_forwarders_are_gated_on_unverified_targets() {
     for target in [
         BuildTarget::Rust,
         BuildTarget::Typescript,
-        BuildTarget::Spinel,
         BuildTarget::Roda,
     ] {
         let (files, diags) = roundhouse::emit::diagnostics::scope(|| {
@@ -589,7 +594,6 @@ fn controller_declarations_are_kept_and_test_entry_declarations_are_rejected() {
 fn anonymous_keyword_forwarding_refuses_unverified_keyword_abis() {
     for source in [
         "class Probe; def call(__fwd_kwargs, **); missing(__fwd_kwargs, **); end; end",
-        "class Probe; def target(**options); options; end; def call(**); target(**); end; end",
         "class Probe; def target; 7; end; def call(**); target(**); end; end",
     ] {
         let mut app = analyzed(source);
@@ -667,47 +671,58 @@ fn an_unforwarded_anonymous_rest_is_a_represented_formal() {
 
 /// A nested `def` binds its own parameters, so a bare `*` inside it
 /// forwards its own rest and does not make the outer `*` forwarded.
+///
+/// The nested `def` itself is refused (`nested def`, no IR node carries
+/// it): the one error is that refusal, not a forwarding one. This test
+/// used to run the emit too, and passed only because ingest dropped the
+/// nested `def` without a word; `Probe.new.nested` was never there.
 #[test]
 fn a_nested_def_forwarding_its_own_rest_leaves_the_outer_rest_represented() {
     let source = "class Probe; def target(*); def nested(*) = inner(*); 7; end; def inner(*a) = a.size; end";
-    let script = "puts Probe.new.target; puts Probe.new.target(1, 2, 3)";
+    let errors: Vec<String> = diagnose(&analyzed(source))
+        .into_iter()
+        .filter(|d| d.severity == Severity::Error)
+        .map(|d| d.message)
+        .collect();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("nested def"), "{errors:?}");
+}
+
+/// A body that forwards the anonymous rest (`g(*)`) binds it to the same
+/// generated name as an unforwarded one, and its bare splats read that
+/// name. Refused as `AnonymousRest` before; with `--allow-unsupported` it
+/// emitted `def f(**, &__blk)` / `g(*nil, **, &__blk)`, so a method that
+/// forwards `(*, **, &)` took no positional argument and every call raised
+/// "wrong number of arguments (given 1, expected 0)".
+#[test]
+fn a_forwarded_anonymous_rest_binds_a_generated_name_and_forwards() {
+    let source = "class Base; def read(value, scale = 1, **opts, &blk); [value, scale, opts, blk&.call]; end; end; \
+class Probe < Base; def read(*, **, &); inner(*, **, &); end; def inner(*a, **o, &b); [a, o, b&.call]; end; end; \
+class Wrapper < Base; def read(*, **, &); super; end; end; \
+class Sub; def self.pass(*); new.count(*); end; def count(*a); a.size; end; end";
+    let script = "p Probe.new.read(1, 2, k: 3) { :blk }; p Probe.new.read; p Wrapper.new.read(5, 6, z: 1) { :b }; p Sub.pass(1, 2, 3)";
     let native = Command::new("ruby")
         .args(["-e", &format!("{source}; {script}")])
         .output()
         .unwrap();
-    assert!(native.status.success());
-    assert_eq!(String::from_utf8_lossy(&native.stdout), "7\n7\n");
-    let errors: Vec<_> = diagnose(&analyzed(source))
+    assert!(native.status.success(), "{}", String::from_utf8_lossy(&native.stderr));
+    let expected = String::from_utf8_lossy(&native.stdout).into_owned();
+    assert_eq!(expected, "[[1, 2], {k: 3}, :blk]\n[[], {}, nil]\n[5, 6, {z: 1}, :b]\n3\n");
+    let app = analyzed(source);
+    let errors: Vec<_> = diagnose(&app)
         .into_iter()
-        .filter(|d| d.severity == Severity::Error)
+        .filter(|d| d.severity == Severity::Error && d.message.contains("anonymous positional rest"))
         .collect();
     assert!(errors.is_empty(), "{errors:?}");
     let run = emit_and_run::real_blog()
         .write("app/lib/probe.rb", source)
         .run_ruby(script);
     run.assert_passes();
-    assert_eq!(run.stdout, "7\n7\n");
-}
-
-/// A body that forwards the anonymous rest (`g(*)`) keeps the recorded
-/// fact: the bare splat would ingest as `*nil`, and forwarding it is not
-/// modeled yet.
-#[test]
-fn a_forwarded_anonymous_rest_stays_unsupported() {
-    let source = "class Probe; def target(*); inner(*); end; def inner(*a); a.size; end; end";
-    let app = analyzed(source);
-    let errors: Vec<_> = diagnose(&app)
-        .into_iter()
-        .filter(|d| d.severity == Severity::Error)
-        .collect();
-    assert!(
-        errors.iter().any(|d| d.message.contains("anonymous positional rest")),
-        "{errors:?}"
-    );
+    assert_eq!(run.stdout, expected);
 }
 
 #[test]
-fn custom_new_is_not_admitted_as_the_initializer_contract() {
+fn custom_new_keeps_its_own_keyword_contract() {
     let source = "class Factory; def self.new(factor: 2); factor; end; def initialize; end; end; class Probe; def call(...); Factory.new(...); end; end";
     let native = Command::new("ruby")
         .args(["-e", &format!("{source}; puts Probe.new.call(factor: 3)")])
@@ -715,13 +730,34 @@ fn custom_new_is_not_admitted_as_the_initializer_contract() {
         .unwrap();
     assert!(native.status.success());
     assert_eq!(String::from_utf8_lossy(&native.stdout), "3\n");
-    let errors: Vec<_> = diagnose(&analyzed(source))
+    let app = analyzed(source);
+    let errors: Vec<_> = diagnose(&app)
         .into_iter()
         .filter(|d| d.severity == Severity::Error)
         .collect();
+    assert!(errors.is_empty(), "{errors:?}");
+    let factory = app
+        .library_classes
+        .iter()
+        .find(|class| class.name.0.as_str() == "Factory")
+        .unwrap();
+    let constructor = factory
+        .methods
+        .iter()
+        .find(|method| method.name.as_str() == "new" && method.receiver == roundhouse::dialect::MethodReceiver::Class)
+        .unwrap();
     assert!(
-        errors.iter().any(|d| d.message.contains("flattened")),
-        "{errors:?}"
+        constructor.params.iter().any(|param| param.keyword && param.name.as_str() == "factor"),
+        "custom new keeps factor:"
+    );
+    let initialize = factory
+        .methods
+        .iter()
+        .find(|method| method.name.as_str() == "initialize")
+        .unwrap();
+    assert!(
+        initialize.params.iter().all(|param| !param.keyword),
+        "initialize is not given the custom new contract"
     );
 }
 
@@ -802,7 +838,7 @@ fn model_formal_rejection_survives_body_rewriting() {
         .unwrap();
     assert_eq!(declaration.unsupported_formals, expected);
     assert!(
-        declaration.body.diagnostic.is_none(),
+        declaration.body.diagnostic().is_none(),
         "formal provenance is not a body annotation"
     );
     let (_, emission) = roundhouse::emit::diagnostics::scope(|| {
@@ -962,38 +998,45 @@ fn native_result(source: &str, script: &str, expected: &str) {
 }
 
 #[test]
-fn anonymous_block_and_virtual_destination_losses_are_refused() {
-    for (source, script, expected, refusal) in [
-        (
-            "class Probe; def self.leaf; yield; end; def self.target(&); __blk=7; leaf(&); end; def self.call(...); target(...); end; end",
-            "puts Probe.call {23}",
-            "23\n",
-            "anonymous block",
-        ),
+fn anonymous_block_destination_is_refused() {
+    let source = "class Probe; def self.leaf; yield; end; def self.target(&); __blk=7; leaf(&); end; def self.call(...); target(...); end; end";
+    let script = "puts Probe.call {23}";
+    native_result(source, script, "23\n");
+    let run = emit_and_run::real_blog()
+        .write("app/lib/probe.rb", source)
+        .run_ruby(script);
+    assert!(
+        run.errors.iter().any(|e| e.contains("anonymous block")),
+        "anonymous block: {:?}; actual={}; stderr={}",
+        run.errors,
+        run.stdout,
+        run.stderr
+    );
+}
+
+#[test]
+fn anonymous_forwarding_preserves_an_override_keyword_default() {
+    // The override's default differs from the required keyword on the
+    // method `...` lexically calls. Restoring both source contracts lets
+    // Ruby bind the packet, so this is a run, not a subclass-contract refusal.
+    for (source, script, expected) in [
         (
             "class Parent; def call(...); target(...); end; def target(a,b,factor:); (a-b)*factor; end; end; class Child < Parent; def target(a,b,factor:2); (a-b)*factor; end; end",
             "puts Child.new.call(11,4,factor:3)",
             "21\n",
-            "subclass contract",
         ),
         (
             "module Relay; def call(...); target(...); end; def target(a,b,factor:); (a-b)*factor; end; end; class Child; include Relay; def target(a,b,factor:2); (a-b)*factor; end; end",
             "puts Child.new.call(11,4,factor:3)",
             "21\n",
-            "subclass contract",
         ),
     ] {
         native_result(source, script, expected);
         let run = emit_and_run::real_blog()
             .write("app/lib/probe.rb", source)
             .run_ruby(script);
-        assert!(
-            run.errors.iter().any(|e| e.contains(refusal)),
-            "{refusal}: {:?}; actual={}; stderr={}",
-            run.errors,
-            run.stdout,
-            run.stderr
-        );
+        run.assert_passes();
+        assert_eq!(run.stdout, expected, "stderr={}", run.stderr);
     }
 }
 
@@ -1162,4 +1205,62 @@ end
         forwards.is_empty(),
         "extend-module super(...) must not residual: {forwards:?}"
     );
+}
+
+
+#[test]
+fn spinel_preserves_verified_full_forwarding_declarations_and_calls() {
+    use roundhouse::project::{BuildTarget, target_files};
+    let source = "class Probe; def self.call(...); 17; end; def self.run; options={value:7}; call(**options); end; end";
+    let mut app = analyzed(source);
+    roundhouse::session::analyze_and_lower_for(&mut app, BuildTarget::Spinel);
+    let (files, diagnostics) = roundhouse::emit::diagnostics::scope(|| {
+        target_files(&app, roundhouse::fixtures::real_blog(), BuildTarget::Spinel)
+    });
+    assert!(diagnostics.iter().all(|d| d.severity != Severity::Error), "{diagnostics:?}");
+    let files = files.expect("native project");
+    let output = files.iter().find(|(p, _)| p == "app/models/probe.rb").unwrap().1.as_str();
+    assert!(output.contains("def self.call(...)"), "{output}");
+    assert!(output.contains("call(**options)"), "{output}");
+}
+
+
+#[test]
+fn spinel_keeps_full_forwarding_to_an_unrepresented_super_refused() {
+    use roundhouse::project::{BuildTarget, target_files};
+    let source = "class ErrorPacket < StandardError; def initialize(...); super(...); end; end";
+    let mut app = analyzed(source);
+    roundhouse::session::analyze_and_lower_for(&mut app, BuildTarget::Spinel);
+    let (_, diagnostics) = roundhouse::emit::diagnostics::scope(|| {
+        target_files(&app, roundhouse::fixtures::real_blog(), BuildTarget::Spinel)
+    });
+    assert!(diagnostics.iter().any(|d| d.severity == Severity::Error
+        && d.message.contains("full argument forwarding")), "{diagnostics:?}");
+}
+
+
+#[test]
+fn spinel_refuses_unrepresented_super_in_a_default() {
+    use roundhouse::project::{BuildTarget, target_files};
+    let app = analyzed("class ErrorPacket < StandardError; def initialize(message = super, ...); end; end");
+    let (_, diagnostics) = roundhouse::emit::diagnostics::scope(|| {
+        target_files(&app, roundhouse::fixtures::real_blog(), BuildTarget::Spinel)
+    });
+    assert!(diagnostics.iter().any(|d| d.severity == Severity::Error
+        && d.message.contains("full argument forwarding")), "{diagnostics:?}");
+}
+
+#[test]
+fn spinel_refuses_unrepresented_super_in_a_controller() {
+    use roundhouse::project::{BuildTarget, target_files};
+    let mut app = ingest_app_from_tree(HashMap::from([(
+        PathBuf::from("app/controllers/packet_controller.rb"),
+        b"class PacketController < ActionController::Base; def show(...); super; end; end".to_vec(),
+    )])).unwrap();
+    Analyzer::new(&app).analyze(&mut app);
+    let (_, diagnostics) = roundhouse::emit::diagnostics::scope(|| {
+        target_files(&app, roundhouse::fixtures::real_blog(), BuildTarget::Spinel)
+    });
+    assert!(diagnostics.iter().any(|d| d.severity == Severity::Error
+        && d.message.contains("full argument forwarding")), "{diagnostics:?}");
 }

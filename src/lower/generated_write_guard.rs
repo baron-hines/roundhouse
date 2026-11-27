@@ -8,7 +8,7 @@
 //! boundary explicit with a source-located unsupported diagnostic. Normal
 //! `save`/`update` assignments remain allowed and retain generated filtering.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::app::App;
 use crate::diagnostic::Diagnostic;
@@ -251,7 +251,7 @@ fn rewrite(
                 value: Literal::Nil,
             },
         );
-        stub.diagnostic = Some(diagnostic.kind.clone());
+        stub.set_diagnostic(Some(diagnostic.kind.clone()));
         *expr = stub;
         diagnostics.push(diagnostic);
         return;
@@ -449,7 +449,7 @@ fn model_from_ty(ty: Option<&Ty>, generated: &GeneratedColumns) -> Vec<ClassId> 
             _ => {}
         }
     }
-    let mut out = HashSet::new();
+    let mut out = HashSet::default();
     if let Some(ty) = ty {
         collect(ty, generated, &mut out);
     }

@@ -31,7 +31,8 @@ use crate::dialect::{LibraryClass, LibraryFunction};
 use crate::expr::{Expr, ExprNode, LValue};
 use crate::ident::{ClassId, Symbol};
 use crate::ty::Ty;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
+use crate::det::{HashMap, HashSet};
 
 /// A method-call target: (class that owns/defines or inherits the
 /// method, method name). The same method name on different classes
@@ -128,7 +129,7 @@ impl Reachability {
         // cross-references where the typer carries only the
         // simple name, we fall back to "every class with this
         // name" and pick the first that has the method.
-        let mut registry: HashMap<ClassId, Vec<&LibraryClass>> = HashMap::new();
+        let mut registry: HashMap<ClassId, Vec<&LibraryClass>> = HashMap::default();
         for lc in app_classes {
             registry.entry(lc.name.clone()).or_default().push(lc);
         }
@@ -136,15 +137,29 @@ impl Reachability {
             registry.entry(alias.clone()).or_default().push(lc);
         }
 
-        let mut reachable: HashSet<MethodId> = HashSet::new();
-        let mut reachable_names: HashSet<Symbol> = HashSet::new();
+        let mut reachable: HashSet<MethodId> = HashSet::default();
+        let mut reachable_names: HashSet<Symbol> = HashSet::default();
         let mut queue: VecDeque<MethodId> = VecDeque::new();
 
+        // A name reachable anywhere keeps every runtime method by that
+        // name (`filter_runtime_class`'s conservative fallback), so each
+        // of those bodies is walked too, though not marked precisely
+        // reachable. Walking only the precise ones kept `Session#to_h`
+        // (by its name, from a params class's `to_h`) and dropped the
+        // `to_hash` it calls: a TypeScript `this.to_hash()` with no
+        // method behind it.
+        let registry_ref = &registry;
         let record = |target: MethodId,
                       q: &mut VecDeque<MethodId>,
                       set: &mut HashSet<MethodId>,
                       names: &mut HashSet<Symbol>| {
-            names.insert(target.1.clone());
+            if names.insert(target.1.clone()) {
+                for lc in registry_ref.values().flatten() {
+                    if lc.methods.iter().any(|m| m.name == target.1) {
+                        q.push_back((lc.name.clone(), target.1.clone()));
+                    }
+                }
+            }
             if set.insert(target.clone()) {
                 q.push_back(target);
             }
@@ -208,7 +223,7 @@ impl Reachability {
         for (cls, method) in extra_roots {
             let recv_ty = Ty::Class {
                 id: cls.clone(),
-                args: vec![],
+                args: vec![].into(),
             };
             for target in resolve_targets(Some(&recv_ty), method, &registry) {
                 record(target, &mut queue, &mut reachable, &mut reachable_names);
@@ -216,7 +231,11 @@ impl Reachability {
         }
 
         // Fixed-point: pop, look up method body, walk its Sends.
+        let mut walked: HashSet<MethodId> = HashSet::default();
         while let Some((cls, m)) = queue.pop_front() {
+            if !walked.insert((cls.clone(), m.clone())) {
+                continue;
+            }
             let resolved = lookup_method(&registry, &cls, &m);
             if let Some((_owner, def)) = resolved {
                 walk_sends(&def.body, &mut |recv_ty, method_name| {
@@ -390,8 +409,8 @@ fn walk_inheritance_for_method(
     registry: &HashMap<ClassId, Vec<&LibraryClass>>,
     method: &Symbol,
 ) -> Option<ClassId> {
-    let mut visited: std::collections::HashSet<ClassId> =
-        std::collections::HashSet::new();
+    let mut visited: crate::det::HashSet<ClassId> =
+        crate::det::HashSet::default();
     let mut stack: Vec<&LibraryClass> = vec![start];
     while let Some(lc) = stack.pop() {
         if !visited.insert(lc.name.clone()) {
@@ -430,8 +449,8 @@ fn lookup_method<'a>(
     // includes) looking for the method. First match wins.
     let candidates = registry.get(class)?;
     for start in candidates {
-        let mut visited: std::collections::HashSet<ClassId> =
-            std::collections::HashSet::new();
+        let mut visited: crate::det::HashSet<ClassId> =
+            crate::det::HashSet::default();
         let mut stack: Vec<&LibraryClass> = vec![*start];
         while let Some(lc) = stack.pop() {
             if !visited.insert(lc.name.clone()) {
@@ -484,7 +503,7 @@ fn lookup_method<'a>(
 /// untyped `record.update!(...)` keeps `update!` on every model).
 pub fn filter_synthesized_model_methods(
     class: &LibraryClass,
-    shakeable: &std::collections::HashSet<Symbol>,
+    shakeable: &crate::det::HashSet<Symbol>,
     reach: &Reachability,
 ) -> LibraryClass {
     let mut filtered = class.clone();
@@ -582,5 +601,37 @@ mod tests {
         assert_eq!(seen[4].0, Some(Ty::Int));
         assert!(seen.iter().enumerate().filter(|(i, _)| !matches!(i, 0 | 4))
             .all(|(_, (ty, _))| ty.is_none()));
+    }
+
+    /// `Session#to_h` survives because some reachable class's `to_h`
+    /// does (the filter's by-name fallback), so the `to_hash` it calls
+    /// must survive too. The app reaches only `PostParams#to_h`,
+    /// precisely: the walk used to stop there and drop `to_hash`.
+    #[test]
+    fn a_method_kept_by_its_name_keeps_what_it_calls() {
+        let class = |src: &str| {
+            crate::ingest::ingest_library_class(src.as_bytes(), "runtime/ruby/x.rb").unwrap().unwrap()
+        };
+        let mut app = class("class Caller\n  def go(x)\n    x.to_h\n  end\nend\n");
+        fn type_receiver(e: &mut Expr) {
+            e.node.for_each_child_mut(&mut type_receiver);
+            if let ExprNode::Send { recv: Some(r), method, .. } = &mut *e.node {
+                if method.as_str() == "to_h" {
+                    r.ty = Some(Ty::Class { id: ClassId(Symbol::from("PostParams")), args: vec![].into() });
+                }
+            }
+        }
+        for m in &mut app.methods {
+            type_receiver(&mut m.body);
+        }
+        let params = class("class PostParams\n  def to_h\n    {}\n  end\nend\n");
+        let session = class(
+            "class Session\n  def to_h\n    to_hash\n  end\n\n  def to_hash\n    {}\n  end\n\n  def unused\n    1\n  end\nend\n",
+        );
+        let aliases = [(params.name.clone(), &params), (session.name.clone(), &session)];
+        let reach = Reachability::from_app_roots(&[app], &aliases, &[], &[]);
+        let kept: Vec<String> =
+            filter_runtime_class(&session, &reach).methods.iter().map(|m| m.name.as_str().to_owned()).collect();
+        assert_eq!(kept, ["to_h", "to_hash"]);
     }
 }

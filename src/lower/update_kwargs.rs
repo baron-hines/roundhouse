@@ -26,7 +26,7 @@
 //! Runs on the post-analyze hook (`apply_post_analyze_lowerings`) so
 //! every target consumes the inlined form.
 
-use std::collections::HashSet;
+use crate::det::HashSet;
 
 use crate::app::App;
 use crate::diagnostic::Diagnostic;
@@ -219,10 +219,11 @@ fn rewrite(expr: &mut Expr, models: &HashSet<ClassId>, diags: &mut Vec<Diagnosti
                     variants: vec![
                         recv_ty.unwrap_or(Ty::Bool),
                         Ty::Nil,
-                    ],
+                    ]
+                    .into(),
                 })
             } else {
-                Some(Ty::Union { variants: vec![Ty::Bool, Ty::Nil] })
+                Some(Ty::Union { variants: vec![Ty::Bool, Ty::Nil].into() })
             };
         }
     }

@@ -6,13 +6,10 @@
 //! [`Ctx`]s where the variable's type has been narrowed to reflect
 //! what the condition guarantees.
 //!
-//! Today's predicates cover the nil / class-check family. Negation
-//! is recognized (`!x.nil?`). Multi-clause conditions
-//! (`x.nil? && y.nil?`), guard-clause early returns, and `case`/`when`
-//! narrowing are not yet implemented — each can slot in here when a
-//! case forces them.
+//! Built-in Hash `case` arms reuse the class-check predicate. Literal
+//! patterns and exclusions from earlier case arms are not refined.
 //!
-//! Called from the `If` arm in the body-typer's `compute` match.
+//! Called from the `If` and `Case` arms in the body-typer's `compute` match.
 
 use crate::expr::{BoolOpKind, Expr, ExprNode, LValue, Literal};
 use crate::ident::{ClassId, Symbol};
@@ -52,12 +49,14 @@ pub(super) fn member_key(local: &Symbol, attr: &Symbol) -> Symbol {
 pub(super) struct Probe<'a> {
     pub reader: &'a dyn Fn(&Symbol) -> Option<Ty>,
     pub member: &'a dyn Fn(&Symbol, &Symbol) -> Option<Ty>,
+    /// The condition sits in a class method, where `self` is the class.
+    pub class_side: bool,
 }
 
 impl<'a> Probe<'a> {
     /// Locals and `self` readers only (no member reads).
     pub fn without_members(reader: &'a dyn Fn(&Symbol) -> Option<Ty>) -> Self {
-        Probe { reader, member: &|_, _| None }
+        Probe { reader, member: &|_, _| None, class_side: false }
     }
 }
 
@@ -148,7 +147,7 @@ pub(super) fn extract_narrowing_with(cond: &Expr, probe: &Probe) -> Option<Narro
                 }
                 ("is_a?" | "kind_of?" | "instance_of?", [arg]) => {
                     let key = var_key(target)?;
-                    let ty = const_to_ty(arg)?;
+                    let ty = const_to_ty(arg).or_else(|| self_class_arg(arg).filter(|_| probe.class_side))?;
                     Some(NarrowPred::IsA(key, ty))
                 }
                 // `if x.attr`: a bare read of a stable member is a truthiness
@@ -267,6 +266,33 @@ fn var_key(e: &Expr, probe: &Probe) -> Option<VarKey> {
     }
 }
 
+/// `x.is_a?(self)` in a class method, as fugit's `Cron.parse` opens with
+/// `return s if s.is_a?(self)`: the class the method's `self` is.
+fn self_class_arg(e: &Expr) -> Option<Ty> {
+    let (ExprNode::SelfRef, Some(ty @ Ty::Class { id, .. })) = (&*e.node, &e.ty) else { return None };
+    // Not inside `Class.new`/`Module.new`: `self` there is the class being built, which its type does not name.
+    if matches!(id.0.as_str(), "Class" | "Module") {
+        return None;
+    }
+    // Not the nominal class as typed: a class method reopened on `Array` narrows to the structural Array, as `is_a?(Array)` does; `Store::String` stays nominal.
+    if id.0.as_str().contains("::") {
+        return Some(ty.clone());
+    }
+    Some(class_name_to_ty(&id.0, true, std::slice::from_ref(&id.0)))
+}
+
+pub(super) fn extract_case_hash_narrowing(
+    scrutinee: &Expr,
+    class: &Expr,
+    probe: &Probe,
+) -> Option<NarrowPred> {
+    let ty = const_to_ty(class)?;
+    if !matches!(ty, Ty::Hash { .. }) {
+        return None;
+    }
+    Some(NarrowPred::IsA(var_key(scrutinee, probe)?, ty))
+}
+
 fn is_nil_lit(e: &Expr) -> bool {
     matches!(&*e.node, ExprNode::Lit { value: Literal::Nil })
 }
@@ -284,12 +310,17 @@ fn const_to_ty(e: &Expr) -> Option<Ty> {
     };
     let name = path.last()?;
     let core = path.len() == 1 || (path.len() == 2 && path[0].as_str().is_empty());
-    Some(match name.as_str() {
+    Some(class_name_to_ty(name, core, path))
+}
+
+/// The type an `is_a?` against the class named `name` narrows to.
+fn class_name_to_ty(name: &Symbol, core: bool, path: &[Symbol]) -> Ty {
+    match name.as_str() {
         "Integer" => Ty::Int,
         // `Numeric` covers Int and Float in Ruby's hierarchy. Union
         // both so subsequent dispatch resolves either via int_method
         // or as Float (universal methods cover the overlap).
-        "Numeric" => Ty::Union { variants: vec![Ty::Int, Ty::Float] },
+        "Numeric" => Ty::Union { variants: vec![Ty::Int, Ty::Float].into() },
         "Float" => Ty::Float,
         "String" => Ty::Str,
         "Symbol" => Ty::Sym,
@@ -303,10 +334,10 @@ fn const_to_ty(e: &Expr) -> Option<Ty> {
         // tells us "this is a Hash of *some* shape," and downstream
         // dispatch should propagate that gradualness rather than
         // leave block params as Var.
-        "Array" if core => Ty::Array { elem: Box::new(Ty::Untyped) },
+        "Array" if core => Ty::Array { elem: std::sync::Arc::new(Ty::Untyped) },
         "Hash" if core => Ty::Hash {
-            key: Box::new(Ty::Untyped),
-            value: Box::new(Ty::Untyped),
+            key: std::sync::Arc::new(Ty::Untyped),
+            value: std::sync::Arc::new(Ty::Untyped),
         },
         _ => Ty::Class {
             id: ClassId(Symbol::from(
@@ -316,23 +347,57 @@ fn const_to_ty(e: &Expr) -> Option<Ty> {
                     .collect::<Vec<_>>()
                     .join("::"),
             )),
-            args: vec![],
+            args: vec![].into(),
         },
-    })
+    }
 }
 
 pub(super) fn apply_narrowing(ctx: &Ctx, pred: &NarrowPred, then_branch: bool) -> Ctx {
     let mut new_ctx = ctx.clone();
+    narrowings(pred, then_branch, &mut |key, narrow| {
+        narrow_binding(&mut new_ctx, key, |current| narrow(current))
+    });
+    if let NarrowPred::IsA(VarKey::Local(name), Ty::Class { id, .. }) | NarrowPred::IsNotA(VarKey::Local(name), Ty::Class { id, .. }) = pred
+        && matches!(pred, NarrowPred::IsA(..)) == then_branch
+        && matches!(id.0.as_str(), "Class" | "Module")
+    {
+        new_ctx.query_class_objects.insert(name.clone());
+    }
+    new_ctx
+}
+
+/// The locals `pred` narrows on one side of its condition, each from the
+/// type `current` gives it (or an earlier narrowing in the same compound).
+/// Names `current` does not know are left out.
+pub(super) fn narrow_locals(
+    pred: &NarrowPred,
+    then_branch: bool,
+    current: &dyn Fn(&Symbol) -> Option<Ty>,
+) -> crate::det::HashMap<Symbol, Ty> {
+    let mut out = crate::det::HashMap::default();
+    narrowings(pred, then_branch, &mut |key, narrow| {
+        if let VarKey::Local(name) = key {
+            if let Some(ty) = out.get(name).cloned().or_else(|| current(name)) {
+                out.insert(name.clone(), narrow(&ty));
+            }
+        }
+    });
+    out
+}
+
+/// Each variable `pred` narrows on one side, in order, with the function
+/// from its type before to its type after.
+fn narrowings(pred: &NarrowPred, then_branch: bool, f: &mut dyn FnMut(&VarKey, &dyn Fn(&Ty) -> Ty)) {
     match pred {
         NarrowPred::Compound { if_true, if_false } => {
             for p in if then_branch { if_true } else { if_false } {
-                new_ctx = apply_narrowing(&new_ctx, p, true);
+                narrowings(p, true, f);
             }
         }
         NarrowPred::IsNil(k) | NarrowPred::IsNotNil(k) => {
             let is_is_nil = matches!(pred, NarrowPred::IsNil(_));
             let narrow_to_nil = is_is_nil == then_branch;
-            narrow_binding(&mut new_ctx, k, |current| {
+            f(k, &|current| {
                 if narrow_to_nil {
                     Ty::Nil
                 } else {
@@ -343,7 +408,7 @@ pub(super) fn apply_narrowing(ctx: &Ctx, pred: &NarrowPred, then_branch: bool) -
         NarrowPred::IsA(k, ty) | NarrowPred::IsNotA(k, ty) => {
             let is_is_a = matches!(pred, NarrowPred::IsA(_, _));
             let narrow_to_ty = is_is_a == then_branch;
-            narrow_binding(&mut new_ctx, k, |current| {
+            f(k, &|current| {
                 if narrow_to_ty {
                     intersect_with(current, ty)
                 } else {
@@ -354,7 +419,7 @@ pub(super) fn apply_narrowing(ctx: &Ctx, pred: &NarrowPred, then_branch: bool) -
         NarrowPred::IsPresent(k) | NarrowPred::IsBlank(k) => {
             let is_present = matches!(pred, NarrowPred::IsPresent(_));
             if is_present == then_branch {
-                narrow_binding(&mut new_ctx, k, |current| remove_nil(current));
+                f(k, &remove_nil);
             }
         }
         NarrowPred::IsTruthy(k) | NarrowPred::IsFalsy(k) => {
@@ -368,11 +433,10 @@ pub(super) fn apply_narrowing(ctx: &Ctx, pred: &NarrowPred, then_branch: bool) -
             let is_is_truthy = matches!(pred, NarrowPred::IsTruthy(_));
             let narrow_to_truthy = is_is_truthy == then_branch;
             if narrow_to_truthy {
-                narrow_binding(&mut new_ctx, k, |current| remove_nil(current));
+                f(k, &remove_nil);
             }
         }
     }
-    new_ctx
 }
 
 fn narrow_binding<F: FnOnce(&Ty) -> Ty>(ctx: &mut Ctx, key: &VarKey, f: F) {
@@ -440,7 +504,7 @@ pub(crate) fn remove_nil(ty: &Ty) -> Ty {
             match kept.len() {
                 0 => Ty::Nil,
                 1 => kept.into_iter().next().unwrap(),
-                _ => Ty::Union { variants: kept },
+                _ => Ty::Union { variants: kept.into() },
             }
         }
         // Not a union — if the type is bare Nil, the "non-nil" branch
@@ -479,10 +543,10 @@ fn intersect_with(current: &Ty, narrower: &Ty) -> Ty {
 fn intersect_variant(current: &Ty, narrower: &Ty) -> Option<Ty> {
     match (current, narrower) {
         (Ty::Class { id, .. }, Ty::Array { .. }) if id.0.as_str() == super::send::PARAM_VALUE => {
-            Some(Ty::Array { elem: Box::new(super::send::param_value_ty()) })
+            Some(Ty::Array { elem: std::sync::Arc::new(super::send::param_value_ty()) })
         }
         (Ty::Class { id, .. }, Ty::Hash { .. }) if id.0.as_str() == super::send::PARAM_VALUE => {
-            Some(Ty::Hash { key: Box::new(Ty::Str), value: Box::new(super::send::param_value_ty()) })
+            Some(Ty::Hash { key: std::sync::Arc::new(Ty::Str), value: std::sync::Arc::new(super::send::param_value_ty()) })
         }
         (Ty::Untyped | Ty::Var { .. }, Ty::Array { .. } | Ty::Hash { .. }) => {
             Some(narrower.clone())
@@ -493,6 +557,14 @@ fn intersect_variant(current: &Ty, narrower: &Ty) -> Option<Ty> {
 }
 
 /// Remove variants matching `ty` from a union (for `is_a?` else-branch).
+/// Whether `pred` is a lone `x.is_a?(K)` that `x`'s single known type already answers yes.
+pub(super) fn is_a_settled(pred: &NarrowPred, ctx: &Ctx) -> bool {
+    let NarrowPred::IsA(VarKey::Local(name), ty) = pred else { return false };
+    ctx.local_bindings.get(name).is_some_and(|current| {
+        !matches!(current, Ty::Union { .. } | Ty::Var { .. } | Ty::Untyped) && ty_compatible(current, ty)
+    })
+}
+
 fn remove_variant(current: &Ty, ty: &Ty) -> Ty {
     match current {
         Ty::Union { variants } => {
@@ -504,7 +576,7 @@ fn remove_variant(current: &Ty, ty: &Ty) -> Ty {
             match kept.len() {
                 0 => current.clone(),
                 1 => kept.into_iter().next().unwrap(),
-                _ => Ty::Union { variants: kept },
+                _ => Ty::Union { variants: kept.into() },
             }
         }
         _ => current.clone(),
@@ -522,6 +594,8 @@ fn ty_compatible(a: &Ty, b: &Ty) -> bool {
             (a, b),
             (Ty::Array { .. }, Ty::Array { .. }) | (Ty::Hash { .. }, Ty::Hash { .. })
         )
+        || matches!((a, b), (Ty::Fn(_), Ty::Class { id, .. }) if id.0.as_str() == "Proc")
+        || matches!((a, b), (Ty::Class { id: x, .. }, Ty::Class { id: y, args }) if x == y && args.is_empty())
 }
 
 /// Forget every narrowed `x.attr` read whose local `x` the given expressions
@@ -534,7 +608,7 @@ pub(super) fn drop_unstable_members(ctx: &mut Ctx, scope: &[&Expr]) {
     if !ctx.local_bindings.keys().any(|k| k.as_str().contains('.')) {
         return;
     }
-    let mut touched: std::collections::HashSet<Symbol> = Default::default();
+    let mut touched: crate::det::HashSet<Symbol> = Default::default();
     for e in scope {
         collect_touched_locals(e, &mut touched);
     }
@@ -551,8 +625,8 @@ pub(super) fn drop_unstable_members(ctx: &mut Ctx, scope: &[&Expr]) {
 /// Locals that `e` rebinds (assignment, block/let parameter, pattern or rescue
 /// binding) or writes through (`x.attr = v`, `x.reload`, `x.update(…)`,
 /// any bang method).
-fn collect_touched_locals(e: &Expr, out: &mut std::collections::HashSet<Symbol>) {
-    fn lvalue(t: &LValue, out: &mut std::collections::HashSet<Symbol>) {
+fn collect_touched_locals(e: &Expr, out: &mut crate::det::HashSet<Symbol>) {
+    fn lvalue(t: &LValue, out: &mut crate::det::HashSet<Symbol>) {
         if let LValue::Var { name, .. } = t {
             out.insert(name.clone());
         }

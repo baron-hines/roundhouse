@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # CRuby-only ActiveSupport::Duration.
 #
 # Rails adds duration builders to Integer/Numeric (`70.days`, `1.week`) plus
@@ -24,6 +25,10 @@ module ActiveSupport
 
     def initialize(seconds)
       @seconds = seconds
+    end
+
+    def self.time_operand(value)
+      value.is_a?(Duration) ? value.seconds : value
     end
 
     def self.seconds(n) = new(n)
@@ -56,6 +61,10 @@ module ActiveSupport
 
     def to_i = @seconds.to_i
     def to_f = @seconds.to_f
+    # Rails' Duration hands Numeric's rounding to its value (Doorkeeper's `Duration.seconds(expires).round(0)`).
+    def round(*args, **kwargs) = @seconds.round(*args, **kwargs)
+    def floor(*args, **kwargs) = @seconds.floor(*args, **kwargs)
+    def ceil(*args, **kwargs) = @seconds.ceil(*args, **kwargs)
     # Numeric predicates (Rails delegates them to the value; net/http
     # asks `zero?` of a timeout).
     def zero? = @seconds.zero?
@@ -66,6 +75,7 @@ module ActiveSupport
     # (lobsters embeds durations in cache keys).
     def to_s = @seconds.to_s
     def seconds = @seconds
+    def value = @seconds
 
     # Rails parity: a Duration IS its seconds count for equality, so
     # `1.year == 31556952` is true and `assert_equal 1.year, n` passes

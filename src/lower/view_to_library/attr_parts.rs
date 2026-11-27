@@ -4,7 +4,7 @@
 //! ` <name>="<escaped_value>"` segment appended to the running
 //! `Vec<InterpPart>`. Nested `data:/aria:` hashes flatten to kebab-
 //! cased compound names (`data-turbo-confirm="..."`); class-array
-//! opts collapse via `simplify_class_array_pub` (re-exported from
+//! opts resolve via `simplify_class_array_pub` (re-exported from
 //! `form_builder` to keep one implementation).
 
 use crate::expr::{Expr, ExprNode, InterpPart, Literal};
@@ -18,9 +18,8 @@ use super::{lit_str, send, view_helpers_call};
 /// Non-Symbol keys are skipped (no real fixture exercises them).
 ///
 /// `simplify_class_array` is applied to `class:` entries so
-/// Rails-style `["base", {cond: pred, ...}]` arrays collapse to
-/// `"base <first_key>"` literal — same byte-for-byte behavior as
-/// the prior runtime FormBuilder + the prior runtime render_attrs.
+/// Rails-style `["base", {cond: pred, ...}]` arrays render as Rails'
+/// `build_tag_values` does.
 pub(crate) fn append_attr_parts(parts: &mut Vec<InterpPart>, opts: &[(Expr, Expr)]) {
     for (k, v) in opts {
         let ExprNode::Lit { value: Literal::Sym { value: key } } = &*k.node else {
@@ -110,15 +109,23 @@ pub(crate) fn append_attr_parts(parts: &mut Vec<InterpPart>, opts: &[(Expr, Expr
 /// content: <config read>`, and with no key configured Rails renders
 /// `<meta name="vapid-public-key">` where the unguarded emit said
 /// `content=""` — the room-page comparator's find. Same guard shape as
-/// the nested-`data:` conditional form_builder's loop already carries
-/// (an `If` inside an `InterpPart::Expr`, proven on every lane).
+/// the nested-`data:` conditional form_builder's loop already carries.
+///
+/// ONE EVALUATION. The rule is `ActionView::ViewHelpers.tag_attr(key,
+/// value)`, a call, rather than an inline `if value.nil? … value.to_s`:
+/// that spelled the value expression twice, so it ran twice. campfire's
+/// layout passes `href: fresh_account_logo_path`, which reads
+/// `Current.account` (`Account.first`) and formats its `updated_at`, and
+/// the page called it four times for Rails' two.
 pub(crate) fn push_escaped_attr(parts: &mut Vec<InterpPart>, key: &str, value: &Expr) {
     let open = InterpPart::Text { value: format!(" {key}=\"") };
     let escaped = InterpPart::Expr {
         expr: view_helpers_call("html_escape", vec![lit_str_coerce(value.clone())]),
     };
     let close = InterpPart::Text { value: "\"".to_string() };
-    if matches!(
+    // `class_names` always answers a String, and a nil guard would evaluate its hash twice
+    let never_nil = matches!(&*value.node, ExprNode::Send { method, .. } if method.as_str() == "class_names");
+    if never_nil || matches!(
         &*value.node,
         ExprNode::Lit { .. } | ExprNode::StringInterp { .. }
     ) {
@@ -128,14 +135,7 @@ pub(crate) fn push_escaped_attr(parts: &mut Vec<InterpPart>, key: &str, value: &
         return;
     }
     parts.push(InterpPart::Expr {
-        expr: Expr::new(
-            Span::synthetic(),
-            ExprNode::If {
-                cond: send(Some(value.clone()), "nil?", Vec::new(), None, false),
-                then_branch: lit_str(String::new()),
-                else_branch: string_interp(vec![open, escaped, close]),
-            },
-        ),
+        expr: view_helpers_call("tag_attr", vec![lit_str(key.to_string()), value.clone()]),
     });
 }
 

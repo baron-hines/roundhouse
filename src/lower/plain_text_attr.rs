@@ -134,6 +134,7 @@ pub fn synthesize_record_model(app: &mut App) {
             name: Symbol::from("record"),
             target: ClassId(Symbol::from("Record")),
             foreign_key: Symbol::from("record_id"),
+            foreign_key_explicit: false,
             optional: false,
             polymorphic: true,
             polymorphic_targets: Vec::new(),
@@ -141,6 +142,7 @@ pub fn synthesize_record_model(app: &mut App) {
             touch: None,
             foreign_type: None,
             primary_key: None,
+            scope: None,
         },
         leading_comments: Vec::new(),
         leading_blank_line: false,
@@ -148,6 +150,8 @@ pub fn synthesize_record_model(app: &mut App) {
     }];
     app.models.push(Model {
         sti_subclass_names: Vec::new(),
+        mixin_sends: Vec::new(),
+        select_aliases: Vec::new(),
         i18n: Default::default(),
         name: class,
         parent: Some(ClassId(Symbol::from("ApplicationRecord"))),
@@ -202,8 +206,8 @@ fn push_owner_methods(methods: &mut Vec<MethodDef>, model: &Model, attr: &Symbol
     let builder = Symbol::from(format!("build_markdown_{}", attr.as_str()));
     let cache = Symbol::from(format!("__markdown_{}", attr.as_str()));
     let loaded = Symbol::from(format!("__markdown_{}_loaded", attr.as_str()));
-    let record_ty = Ty::Class { id: record_class(), args: vec![] };
-    let maybe_record = Ty::Union { variants: vec![record_ty.clone(), Ty::Nil] };
+    let record_ty = Ty::Class { id: record_class(), args: vec![].into() };
+    let maybe_record = Ty::Union { variants: vec![record_ty.clone(), Ty::Nil].into() };
     let push = super::model_to_library::push_synth_instance_method;
 
     push(

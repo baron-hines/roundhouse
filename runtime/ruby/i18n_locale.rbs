@@ -1,6 +1,49 @@
 module I18n
+  class ArgumentError < ::ArgumentError
+  end
+
+  self.@site_table: Hash[String, Integer]
+  self.@leaf_table: Hash[String, String]
+  self.@node_table: Hash[String, bool]
+  self.@leaf_order: Array[String]
+  self.@empty_table: Hash[String, bool]
+  self.@chain_table: Hash[String, Array[String]]
+  self.@entry_list: Array[Array[String]]
+  self.@rule_table: Hash[String, Array[String]]
+  self.@opaque_table: Hash[String, Array[String]]
+  self.@table_loaded: bool
+  self.@catalog_loaded: bool
+  class InvalidLocale < ArgumentError
+  end
+
+  class Config
+    @locale_name: String
+    def initialize: (?String locale_name) -> void
+    def locale_name: () -> String
+    def default_locale: () -> Symbol
+    def available_locales: () -> Array[Symbol]
+  end
+
   def self.default_locale: () -> Symbol
+  def self.available_locales: () -> Array[Symbol]
+  def self.locale_available?: (String | Symbol | nil locale) -> bool
+  def self.available_named: (String name) -> Symbol?
+  def self.thread_locale_name: () -> String
   def self.locale: () -> Symbol
+  def self.locale=: (String | Symbol | nil value) -> String
+  def self.checked_locale: (String | Symbol | nil value) -> Symbol
+  def self.locale_name: (String | Symbol | nil value) -> String
+  def self.enter_locale: (String | Symbol | nil value) -> String?
+  def self.leave_locale: (String? previous) -> nil
+  def self.running_in?: (String envs) -> bool
+  def self.app_default_locale: () -> Symbol
+  def self.app_available_locales: () -> Array[Symbol]
+  def self.config: () -> I18n::Config
+  def self.config=: (I18n::Config value) -> I18n::Config
+  def self.config_named: (String name, String locale_name) -> I18n::Config
+  def self.config_name_of: (I18n::Config config) -> String
+  def self.config_default_locale: () -> Symbol
+  def self.config_available_locales: () -> Array[Symbol]
 
   class MissingTranslationData < ArgumentError
   end
@@ -9,5 +52,50 @@ module I18n
   def self.subtree_translation: (String key) -> String
   def self.missing_raises: (bool raises, String flipped) -> bool
   def self.missing_translation: (String key, bool raises) -> String
+  def self.missing_translation_among: (String key, String rest, bool raises) -> String
   def self.missing_translation_tag: (String key, String details, bool raises) -> String
+  class MissingInterpolationArgument < ArgumentError
+  end
+
+  class InvalidPluralizationData < ArgumentError
+  end
+
+  def self.translate_runtime: (untyped key, Hash[Symbol, untyped] options, String lazy_scope, bool in_view, bool raises) -> String
+  def self.scope_text: (untyped scope) -> String
+  def self.html_safe_key?: (String key) -> bool
+  def self.runtime_lookup: (String loc, String full, untyped count) -> String?
+  def self.plural_form: (Hash[String, String] leaves, String loc, String node, untyped count) -> String
+  def self.plural_rule: (String loc) -> Array[String]?
+  def self.plural_category: (Array[String] rule, untyped count) -> String
+  def self.plural_key: (Array[String] rule, Hash[String, Float] ops) -> String
+  def self.plural_bool: (Array[String] rule, Hash[String, Float] ops) -> bool
+  def self.plural_num: (Array[String] rule, Hash[String, Float] ops) -> Float
+  def self.plural_step: () -> Integer
+  def self.runtime_rules: () -> Hash[String, Array[String]]
+  def self.runtime_opaque: () -> Hash[String, Array[String]]
+  def self.opaque_fields: (String full, Hash[Symbol, untyped] options) -> Array[String]
+  def self.translate_items: (String full, Hash[Symbol, untyped] options) -> Array[String | Symbol]
+  def self.translate_strings: (String full, Hash[Symbol, untyped] options) -> Array[String]
+  def self.translate_symbols: (String full, Hash[Symbol, untyped] options) -> Array[Symbol]
+  def self.translate_integer: (String full, Hash[Symbol, untyped] options) -> Integer
+  def self.translate_float: (String full, Hash[Symbol, untyped] options) -> Float
+  def self.translate_boolean: (String full, Hash[Symbol, untyped] options) -> bool
+  def self.translate_tree: (String full, Hash[Symbol, untyped] options) -> Hash[Symbol, untyped]
+  def self.insert_tree: (Hash[Symbol, untyped] tree, Array[String] path, String value) -> nil
+  def self.runtime_chain: (String loc) -> Array[String]
+  def self.interpolate_runtime: (String text, Hash[Symbol, untyped] options, bool html) -> String
+  def self.runtime_leaves: () -> Hash[String, String]
+  def self.runtime_nodes: () -> Hash[String, bool]
+  def self.runtime_order: () -> Array[String]
+  def self.runtime_empties: () -> Hash[String, bool]
+  def self.insert_empty: (Hash[Symbol, untyped] tree, Array[String] path) -> nil
+  def self.runtime_chains: () -> Hash[String, Array[String]]
+  def self.translate_site: (String id, String loc, String key, (Integer | Float)? count, Array[String] names, Array[String] values, String details, bool raises, bool in_view, bool escape_plain) -> String
+  def self.site_entry: (String id, String loc, String key) -> Array[String]
+  def self.site_entry_in: (String id, String loc, String key) -> Integer?
+  def self.render_template: (String template, (Integer | Float)? count, Array[String] names, Array[String] values, bool html) -> String
+  def self.translation_table: () -> Hash[String, Integer]
+  def self.translation_entries: () -> Array[Array[String]]
+  def self.load_translation_table: () -> nil
+  def self.load_runtime_catalog: () -> nil
 end

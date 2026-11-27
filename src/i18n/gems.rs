@@ -17,19 +17,23 @@ use crate::vfs::Vfs;
 /// Gems that are not engines but add locale files themselves, with the
 /// files' paths under the gem's root (`config/locales/*.yml` style
 /// globs: one `*` within a directory, or `**` for any depth).
-pub const NON_ENGINE_LOCALES: &[(&str, &[&str])] = &[];
+pub const NON_ENGINE_LOCALES: &[(&str, &[&str])] = &[("rails-i18n", &["rails/locale/*.yml"])];
 
 /// `(path, source)` for every gem locale file, in load order: in-repo
-/// `PATH` gems, then installed gems, each in lockfile order.
-pub fn gem_locale_files<V: Vfs + ?Sized>(vfs: &V, app_dir: &Path, lock: &Lockfile, in_repo: &[PathBuf]) -> Vec<(String, String)> {
+/// `PATH` gems, then installed gems, each in lockfile order; and each
+/// gem of [`NON_ENGINE_LOCALES`] the lockfile names but no gem root has.
+pub fn gem_locale_files<V: Vfs + ?Sized>(vfs: &V, app_dir: &Path, lock: &Lockfile, in_repo: &[PathBuf]) -> (Vec<(String, String)>, Vec<String>) {
     let roots = gem_roots(vfs, app_dir);
     let mut dirs: Vec<(String, PathBuf)> = in_repo.iter().map(|d| (d.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), d.clone())).collect();
+    let mut missing = Vec::new();
     for (name, version) in &lock.specs {
         if lock.is_in_repo(name) {
             continue;
         }
-        if let Some(dir) = installed_gem(vfs, &roots, name, version) {
-            dirs.push((name.clone(), dir));
+        match installed_gem_locked(vfs, &roots, lock, name, version) {
+            Some(dir) => dirs.push((name.clone(), dir)),
+            None if NON_ENGINE_LOCALES.iter().any(|(gem, _)| gem == name) => missing.push(format!("{name} {version}")),
+            None => {}
         }
     }
     let mut files = Vec::new();
@@ -47,11 +51,11 @@ pub fn gem_locale_files<V: Vfs + ?Sized>(vfs: &V, app_dir: &Path, lock: &Lockfil
             }
         }
     }
-    files
+    (files, missing)
 }
 
 /// Where Bundler installs gems for this app, most specific first.
-fn gem_roots<V: Vfs + ?Sized>(vfs: &V, app_dir: &Path) -> Vec<PathBuf> {
+pub(crate) fn gem_roots<V: Vfs + ?Sized>(vfs: &V, app_dir: &Path) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     let configured = vfs
         .read_to_string(&app_dir.join(".bundle/config"))
@@ -74,7 +78,7 @@ fn gem_roots<V: Vfs + ?Sized>(vfs: &V, app_dir: &Path) -> Vec<PathBuf> {
 }
 
 /// `<root>/gems/<name>-<version>`, or a platform build of it (`-x86_64-linux`).
-fn installed_gem<V: Vfs + ?Sized>(vfs: &V, roots: &[PathBuf], name: &str, version: &str) -> Option<PathBuf> {
+pub(crate) fn installed_gem<V: Vfs + ?Sized>(vfs: &V, roots: &[PathBuf], name: &str, version: &str) -> Option<PathBuf> {
     let exact = format!("{name}-{version}");
     roots.iter().find_map(|root| {
         let gems = root.join("gems");
@@ -90,6 +94,42 @@ fn installed_gem<V: Vfs + ?Sized>(vfs: &V, roots: &[PathBuf], name: &str, versio
             .collect();
         builds.sort();
         builds.into_iter().next()
+    })
+}
+
+/// [`installed_gem`], or for a gem `lock` takes from Git, Bundler's checkout of it (`<root>/bundler/gems/<repo>-<rev>`),
+/// at the checkout's top or where its `<name>.gemspec` sits a level or two down (a repository of several gems).
+pub(crate) fn installed_gem_locked<V: Vfs + ?Sized>(
+    vfs: &V,
+    roots: &[PathBuf],
+    lock: &crate::gems::Lockfile,
+    name: &str,
+    version: &str,
+) -> Option<PathBuf> {
+    let Some(git) = lock.git_source_of(name) else { return installed_gem(vfs, roots, name, version) };
+    let gemspec = format!("{name}.gemspec");
+    roots.iter().find_map(|root| {
+        let checkout = root.join("bundler/gems").join(git.checkout_dir());
+        if !vfs.is_dir(&checkout) {
+            return None;
+        }
+        if vfs.exists(&checkout.join(&gemspec)) {
+            return Some(checkout);
+        }
+        let mut level = vec![checkout];
+        for _ in 0..2 {
+            let mut next = Vec::new();
+            for dir in level {
+                for entry in vfs.read_dir(&dir).ok()?.into_iter().filter(|p| vfs.is_dir(p)) {
+                    if vfs.exists(&entry.join(&gemspec)) {
+                        return Some(entry);
+                    }
+                    next.push(entry);
+                }
+            }
+            level = next;
+        }
+        None
     })
 }
 
@@ -155,9 +195,32 @@ mod tests {
         write(&app, &format!("{gems}/plain-2.0/lib/plain.rb"), "module Plain\nend\n");
         write(&app, &format!("{gems}/plain-2.0/config/locales/en.yml"), "en:\n  plain: x\n");
         let lock = Lockfile::parse("GEM\n  remote: https://rubygems.org/\n  specs:\n    admin (1.0)\n    plain (2.0)\n    absent (3.0)\n\nDEPENDENCIES\n  admin\n  plain\n  absent\n");
-        let files = gem_locale_files(&crate::vfs::FsVfs::new(), &app, &lock, &[]);
+        let (files, missing) = gem_locale_files(&crate::vfs::FsVfs::new(), &app, &lock, &[]);
+        assert!(missing.is_empty(), "{missing:?}");
         let names: Vec<String> = files.iter().map(|(p, _)| p.rsplit("/gems/").next().unwrap().to_string()).collect();
         assert_eq!(names, vec!["admin-1.0/config/locales/en.yml", "admin-1.0/config/locales/nested/fr.yml"]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_git_gem_is_found_in_bundlers_checkout() {
+        let root = std::env::temp_dir().join(format!("rh_git_gem_{}", std::process::id()));
+        let app = root.join("app");
+        write(&app, ".bundle/config", "---\nBUNDLE_PATH: \"vendor/bundle\"\n");
+        let checkouts = "vendor/bundle/ruby/3.4.0/bundler/gems";
+        write(&app, &format!("{checkouts}/icons-rails-272e5fb8418e/icons-rails.gemspec"), "");
+        write(&app, &format!("{checkouts}/kit-0123456789ab/kit-core/kit-core.gemspec"), "");
+        let lock = Lockfile::parse(
+            "GIT\n  remote: https://github.com/acme/icons-rails.git\n  revision: 272e5fb8418ea458da3995d6abe0ba0ceee9c9f0\n  specs:\n    icons-rails (0.2.0)\n\nGIT\n  remote: https://github.com/acme/kit.git\n  revision: 0123456789abcdef0123456789abcdef01234567\n  specs:\n    kit-core (1.0)\n\nGEM\n  remote: https://rubygems.org/\n  specs:\n\nDEPENDENCIES\n  icons-rails!\n  kit-core!\n",
+        );
+        let vfs = crate::vfs::FsVfs::new();
+        let roots = gem_roots(&vfs, &app);
+        let found = |name: &str, version: &str| {
+            installed_gem_locked(&vfs, &roots, &lock, name, version).map(|p| p.strip_prefix(app.join(checkouts)).unwrap().to_path_buf())
+        };
+        assert_eq!(found("icons-rails", "0.2.0"), Some(PathBuf::from("icons-rails-272e5fb8418e")));
+        assert_eq!(found("kit-core", "1.0"), Some(PathBuf::from("kit-0123456789ab/kit-core")));
+        assert_eq!(installed_gem_locked(&vfs, &roots, &lock, "absent", "1.0"), None);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

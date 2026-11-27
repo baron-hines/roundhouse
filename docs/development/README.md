@@ -11,18 +11,20 @@ Install Rust through rustup; the selected toolchain is
 `rust-version`. Keep the stack budgets in [`.cargo/config.toml`](../../.cargo/config.toml).
 Toolchain upgrades need native and browser/WASM verification.
 
-Use the MRI line in [`.ruby-version`](../../.ruby-version). CI selects its
-latest patch through `env.MRI_RUBY` in the workflow; `bin/rh doctor` reads
+Use the MRI version in [`.ruby-version`](../../.ruby-version). CI pins the same
+patch through `env.MRI_RUBY` in the workflow; `bin/rh doctor` reads
 the local minimum from that file. Git and Ruby run `bin/rh verify --plan`; execution
 also needs Cargo. Python 3 is optional for its hosted-coverage preview.
 The default suite loads Ruby gems as well as Rust code. Prepare them and
 the generated fixtures:
 
 ```sh
-gem install rails rails-html-sanitizer sqlite3 bcrypt rack minitest rake --no-document
-gem install activerecord -v '~> 8.1.0' --no-document
+gem install rails -v 8.1.4 --no-document
+gem install rails-html-sanitizer sqlite3 bcrypt rack minitest rake --no-document
+gem install activerecord -v 8.1.4 --no-document
+gem install sequel -v 5.99.0 --no-document
 (cd runtime/spinel/scaffold && bundle install)   # framework_tests_ruby runs through this bundle
-bin/rh fixture
+bin/rh fixture --rails 8.1.4
 (cd fixtures && ../scripts/create-store store)
 bin/rh doctor
 cargo build --locked
@@ -39,7 +41,8 @@ test readiness. Fixture generation uses Rails and can change with its release.
    the fix from a plausible wrong implementation, not just a no-crash case.
 3. Iterate with [focused tests](testing.md), inspecting [IR/output](debugging.md)
    when needed. Removing an error diagnostic requires emitted execution coverage.
-4. Run the default `cargo test` suite before committing; use
+4. Run the complete default suite before committing. Use `bin/rh verify --all`
+   for concurrent execution, or `cargo test` without Nextest. Use
    `cargo test --all-targets` at milestones. A focused pass is not full CI.
 
 For a PR, include the repro, regression test, and what you actually verified.
@@ -59,6 +62,7 @@ reported, not described as passing; request [broader CI](../ci/README.md) when n
 | Run the emitted Ruby app | `bin/rh dev ruby` (also `test ruby`, `run ruby`) |
 | Compare against Rails | `bin/rh compare <target>` |
 | Benchmark / build the complete site | `bin/rh bench` / `bin/rh site` |
+| Time each route against a reference, in pairs | [`scripts/bench-paired`](benchmarking.md) |
 
 `bin/rh clean <target>` removes that emitted build; `bin/rh clean fixture`
 removes real-blog, not Store. Neither is a Cargo-cache cleanup command.

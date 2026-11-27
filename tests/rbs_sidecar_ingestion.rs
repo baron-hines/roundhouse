@@ -3,17 +3,17 @@
 //! Covers the file-system scan + RBS parse + namespace-preserving
 //! merge path end-to-end.
 
+#[path = "support/scratch.rs"]
+mod scratch;
 use std::fs;
 use std::path::Path;
 
 use roundhouse::ident::{ClassId, Symbol};
 use roundhouse::ingest::ingest_app;
-use roundhouse::ty::Ty;
+use roundhouse::ty::{FnTy, Ty};
 
 fn scratch_dir(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("roundhouse-rbs-sidecar-{name}"));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).expect("create scratch dir");
+    let dir = scratch::dir(&format!("roundhouse-rbs-sidecar-{name}"));
     dir
 }
 
@@ -72,9 +72,10 @@ end
 
     // Method types round-trip through ingest unchanged.
     let full_name = &article_methods[&Symbol::from("full_name")];
-    let Ty::Fn { ret, .. } = full_name else {
+    let Ty::Fn(fn_ty) = full_name else {
         panic!("expected Ty::Fn");
     };
+    let FnTy { ret, .. } = &**fn_ty;
     assert_eq!(**ret, Ty::Str);
 }
 

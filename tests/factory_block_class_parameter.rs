@@ -3,6 +3,8 @@
 //! nothing, so the block is the plain class body. A parameter the block
 //! reads, or any other parameter list, stays a named refusal.
 
+#[path = "support/scratch.rs"]
+mod scratch;
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
@@ -37,8 +39,7 @@ fn an_unread_class_parameter_on_a_factory_block_is_the_plain_body() {
 
 #[test]
 fn a_read_class_parameter_stays_a_named_refusal() {
-    let root = std::env::temp_dir().join(format!("roundhouse-factory-param-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = scratch::dir("roundhouse-factory-param");
     for (path, text) in [
         ("db/schema.rb", "ActiveRecord::Schema.define do\nend\n"),
         ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n"),
@@ -51,5 +52,5 @@ fn a_read_class_parameter_stays_a_named_refusal() {
     let output = Command::new(env!("CARGO_BIN_EXE_roundhouse")).arg("check").arg("--continue").arg(&root).output().unwrap();
     let _ = std::fs::remove_dir_all(&root);
     let text = String::from_utf8_lossy(&output.stderr);
-    assert!(text.contains("Data.define blocks support only instance methods"), "{text}");
+    assert!(text.contains("Data.define blocks support only methods, delegates and static visibility declarations"), "{text}");
 }

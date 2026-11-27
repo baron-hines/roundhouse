@@ -1,0 +1,6 @@
+# a user requests a hat; the hat pages around it
+GET /hats
+GET /hat_requests/new
+POST /hat_requests hat_request[hat]=Replay+Project+Member&hat_request[link]=https://example.com/team&hat_request[comment]=Requested+by+the+replay
+GET /hat_requests
+GET /hats

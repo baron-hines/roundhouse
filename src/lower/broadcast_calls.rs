@@ -23,7 +23,7 @@
 //! the qualified name to know which associations exist and whose partial
 //! the payload renders. A concern nested under a model can only belong to
 //! that model — the lexical nesting IS the ownership, which
-//! `qualify_relative_includes` already relies on.
+//! the Rubydex-resolved includes already rely on.
 
 use crate::app::App;
 use crate::dialect::{ControllerBodyItem, Model, ModelBodyItem};
@@ -37,19 +37,20 @@ pub(crate) fn apply_broadcast_calls_lowering(app: &mut App) {
     // The rewrite reads the owner while its methods are being replaced,
     // so it works from a snapshot. Models are small and this runs once.
     let owners: Vec<Model> = app.models.clone();
+    let stems = crate::lower::view_to_library::PartialStems::of(&app.views);
 
     for model in &mut app.models {
         let Some(owner) = owners.iter().find(|m| m.name == model.name) else { continue };
         for item in &mut model.body {
             let ModelBodyItem::Method { method, .. } = item else { continue };
-            method.body = rewrite_rails_broadcast_calls(method.body.clone(), owner);
+            method.body = rewrite_rails_broadcast_calls(method.body.clone(), owner, &stems);
         }
     }
 
     for lc in &mut app.library_classes {
         let Some(owner) = enclosing_model(&lc.name, &owners) else { continue };
         for method in &mut lc.methods {
-            method.body = rewrite_rails_broadcast_calls(method.body.clone(), owner);
+            method.body = rewrite_rails_broadcast_calls(method.body.clone(), owner, &stems);
         }
     }
 

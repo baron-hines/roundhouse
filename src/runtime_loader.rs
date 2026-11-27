@@ -316,6 +316,28 @@ pub struct RuntimeUnit {
 /// to one `runtime/ruby/<x>.rb` file we want to emit as a TS file
 /// in the output project.
 const TYPESCRIPT_RUNTIME: &[RuntimeEntry] = &[
+    runtime_entry! {
+        stem: "active_support_inflections",
+        namespace: "",
+        out_path: "src/active_support_inflections.ts",
+        mode: Mode::Library,
+        imports: NO_IMPORTS,
+        prelude: NO_PRELUDE,
+        extra_roots: NO_EXTRA_ROOTS,
+    },
+    runtime_entry! {
+        stem: "i18n_locale",
+        namespace: "",
+        out_path: "src/i18n_locale.ts",
+        mode: Mode::Library,
+        imports: &[
+            ("I18nHost", "./i18n_host.js"),
+            ("ViewHelpers", "./view_helpers.js"),
+            ("ActiveSupport", "./active_support_inflections.js"),
+        ],
+        prelude: NO_PRELUDE,
+        extra_roots: NO_EXTRA_ROOTS,
+    },
     // HashWithIndifferentAccess no longer transpiled to typed targets
     // per Phase 2.5(b). @flash / @session moved to per-app
     // ActionDispatch::Flash / ActionDispatch::Session structs with
@@ -470,6 +492,24 @@ const TYPESCRIPT_RUNTIME: &[RuntimeEntry] = &[
 /// (Module mode, no dependencies); expanded as the Crystal target
 /// proves out additional surface area.
 const CRYSTAL_RUNTIME: &[RuntimeEntry] = &[
+    runtime_entry! {
+        stem: "active_support_inflections",
+        namespace: "",
+        out_path: "src/active_support_inflections.cr",
+        mode: Mode::Library,
+        imports: NO_IMPORTS,
+        prelude: NO_PRELUDE,
+        extra_roots: NO_EXTRA_ROOTS,
+    },
+    runtime_entry! {
+        stem: "i18n_locale",
+        namespace: "",
+        out_path: "src/i18n_locale.cr",
+        mode: Mode::Library,
+        imports: NO_IMPORTS,
+        prelude: NO_PRELUDE,
+        extra_roots: NO_EXTRA_ROOTS,
+    },
     // HWIA dropped per Phase 2.5(b); flash/session moved to typed
     // ActionDispatch structs.
     runtime_entry! {
@@ -583,6 +623,24 @@ where
 /// dependency order matching Crystal's RUNTIME_ORDER. Phase 3 layers
 /// hand-written primitive runtime (`runtime/rust/`) on top.
 const RUST_RUNTIME: &[RuntimeEntry] = &[
+    runtime_entry! {
+        stem: "active_support_inflections",
+        namespace: "",
+        out_path: "src/active_support_inflections.rs",
+        mode: Mode::Library,
+        imports: NO_IMPORTS,
+        prelude: NO_PRELUDE,
+        extra_roots: NO_EXTRA_ROOTS,
+    },
+    runtime_entry! {
+        stem: "i18n_locale",
+        namespace: "",
+        out_path: "src/i18n_locale.rs",
+        mode: Mode::Library,
+        imports: &[("I18nHost", "i18n_host"), ("raise", "errors_ext"), ("NotImplementedError", "errors_ext"), ("ArgumentError", "errors_ext"), ("ViewHelpers", "view_helpers"), ("ActiveSupport", "active_support_inflections"), ("RubyToS", "http")],
+        prelude: NO_PRELUDE,
+        extra_roots: NO_EXTRA_ROOTS,
+    },
     runtime_entry! {
         stem: "inflector",
         namespace: "",
@@ -772,6 +830,68 @@ where
 /// `comment_prefix` selects the target's line-comment marker (TS:
 /// `//`, Crystal: `#`). The header lines are prefixed with this so
 /// the generated file's first lines are valid in the target language.
+pub const I18N_CATALOG_METHODS: &[&str] = &[
+    "translate_runtime", "translate_tree", "opaque_fields", "translate_items", "translate_strings",
+    "translate_symbols", "translate_integer", "translate_float", "translate_boolean", "insert_empty",
+    "insert_tree", "scope_text", "html_safe_key?", "runtime_lookup", "plural_form", "plural_rule",
+    "plural_category", "plural_key", "plural_bool", "plural_num", "plural_step", "runtime_chain",
+    "interpolate_runtime", "runtime_leaves", "runtime_nodes", "runtime_order", "runtime_empties", "runtime_chains",
+    "runtime_rules", "runtime_opaque", "load_runtime_catalog",
+];
+
+// Not a target field: the runtimes that carry the catalog are the TypeScript and Crystal trees, named by what they write
+const I18N_CATALOG_OUT: &[&str] = &[".ts", ".cr"];
+
+thread_local! {
+    // Not a parameter of each `*_units`: every emitter builds its own transform, and the locales are the app's
+    static APP_LOCALES: std::cell::RefCell<Option<(String, Vec<String>)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The app locales this thread holds, for a worker on another thread.
+pub(crate) fn app_locales_snapshot() -> Option<(String, Vec<String>)> {
+    APP_LOCALES.with(|l| l.borrow().clone())
+}
+
+/// Hold `locales` on this thread, for good: for a worker thread that ends
+/// with its work.
+pub(crate) fn install_app_locales(locales: Option<(String, Vec<String>)>) {
+    APP_LOCALES.with(|l| *l.borrow_mut() = locales);
+}
+
+pub fn with_app_locales<R>(app: &crate::App, f: impl FnOnce() -> R) -> R {
+    let catalog = app.i18n.or_rails_default();
+    let prev = APP_LOCALES.with(|l| l.replace(Some((catalog.locale.clone(), catalog.locales()))));
+    let out = f();
+    APP_LOCALES.with(|l| *l.borrow_mut() = prev);
+    out
+}
+
+// Not `project::apply_i18n_locales`' text splice: this runtime is transpiled from the parsed source, not copied
+fn splice_app_locales(classes: &mut [LibraryClass], default: &str, available: &[String]) {
+    use crate::expr::{Expr, ExprNode, Literal};
+    let sym = |name: &str| {
+        let mut e = Expr::new(crate::span::Span::synthetic(), ExprNode::Lit { value: Literal::Sym { value: crate::ident::Symbol::from(name) } });
+        e.ty = Some(crate::ty::Ty::Sym);
+        e
+    };
+    for class in classes.iter_mut().filter(|c| c.name.0.as_str() == "I18n") {
+        for method in &mut class.methods {
+            match method.name.as_str() {
+                "app_default_locale" => method.body = sym(default),
+                "app_available_locales" => {
+                    let mut list = Expr::new(
+                        crate::span::Span::synthetic(),
+                        ExprNode::Array { elements: available.iter().map(|l| sym(l)).collect(), style: Default::default() },
+                    );
+                    list.ty = Some(crate::ty::Ty::Array { elem: std::sync::Arc::new(crate::ty::Ty::Sym) });
+                    method.body = list;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 fn transpile_entry<F>(
     entry: &RuntimeEntry,
     target: &TargetEmit,
@@ -806,11 +926,31 @@ where
             (body, Vec::new(), methods)
         }
         Mode::Library => {
-            let classes = parse_library_with_rbs(
+            // Not trimmed after the transform: a functional target's transform splits a loop into helpers the trim would drop
+            let mut classes = parse_library_with_rbs(
                 entry.rb_src.as_bytes(),
                 entry.rbs_src,
                 entry.rb_path,
             )?;
+            // Not the whole file: the I18n core reaches titleize (a missing key's span) and nothing else in it
+            if entry.rb_path == "runtime/ruby/active_support_inflections.rb" && !I18N_CATALOG_OUT.iter().any(|ext| entry.out_path.ends_with(ext)) {
+                classes.retain(|c| c.name.0.as_str() == "ActiveSupport");
+                for class in classes.iter_mut() {
+                    class.methods.retain(|m| matches!(m.name.as_str(), "underscore" | "humanize" | "titleize"));
+                }
+            }
+            if entry.rb_path == "runtime/ruby/i18n_locale.rb" && !I18N_CATALOG_OUT.iter().any(|ext| entry.out_path.ends_with(ext)) {
+                for class in classes.iter_mut().filter(|c| c.name.0.as_str() == "I18n") {
+                    class.methods.retain(|m| !I18N_CATALOG_METHODS.contains(&m.name.as_str()));
+                }
+            }
+            if entry.rb_path == "runtime/ruby/i18n_locale.rb" {
+                APP_LOCALES.with(|l| {
+                    if let Some((default, available)) = &*l.borrow() {
+                        splice_app_locales(&mut classes, default, available);
+                    }
+                });
+            }
             let classes = transform(entry.out_path, classes);
             // Module-level constants (`HTML_ESCAPES = { ... }.freeze`
             // in `view_helpers.rb`, etc.) emit as top-level
@@ -936,6 +1076,24 @@ fn kotlin_wrap_namespace(_namespace: &str, body: &str) -> String {
 }
 
 const KOTLIN_RUNTIME: &[RuntimeEntry] = &[
+    runtime_entry! {
+        stem: "active_support_inflections",
+        namespace: "",
+        out_path: "src/main/kotlin/ActiveSupportInflections.kt",
+        mode: Mode::Library,
+        imports: NO_IMPORTS,
+        prelude: NO_PRELUDE,
+        extra_roots: NO_EXTRA_ROOTS,
+    },
+    runtime_entry! {
+        stem: "i18n_locale",
+        namespace: "",
+        out_path: "src/main/kotlin/I18nLocale.kt",
+        mode: Mode::Library,
+        imports: NO_IMPORTS,
+        prelude: NO_PRELUDE,
+        extra_roots: NO_EXTRA_ROOTS,
+    },
     runtime_entry! {
         stem: "inflector",
         namespace: "",
@@ -1153,6 +1311,24 @@ fn csharp_wrap_namespace(_namespace: &str, body: &str) -> String {
 
 const CSHARP_RUNTIME: &[RuntimeEntry] = &[
     runtime_entry! {
+        stem: "active_support_inflections",
+        namespace: "",
+        out_path: "app/runtime/ActiveSupportInflections.cs",
+        mode: Mode::Library,
+        imports: NO_IMPORTS,
+        prelude: NO_PRELUDE,
+        extra_roots: NO_EXTRA_ROOTS,
+    },
+    runtime_entry! {
+        stem: "i18n_locale",
+        namespace: "",
+        out_path: "app/runtime/I18nLocale.cs",
+        mode: Mode::Library,
+        imports: NO_IMPORTS,
+        prelude: NO_PRELUDE,
+        extra_roots: NO_EXTRA_ROOTS,
+    },
+    runtime_entry! {
         stem: "inflector",
         namespace: "",
         out_path: "app/runtime/Inflector.cs",
@@ -1301,6 +1477,24 @@ fn swift_wrap_namespace(_namespace: &str, body: &str) -> String {
 }
 
 const SWIFT_RUNTIME: &[RuntimeEntry] = &[
+    runtime_entry! {
+        stem: "active_support_inflections",
+        namespace: "",
+        out_path: "Sources/App/ActiveSupportInflections.swift",
+        mode: Mode::Library,
+        imports: NO_IMPORTS,
+        prelude: NO_PRELUDE,
+        extra_roots: NO_EXTRA_ROOTS,
+    },
+    runtime_entry! {
+        stem: "i18n_locale",
+        namespace: "",
+        out_path: "Sources/App/I18nLocale.swift",
+        mode: Mode::Library,
+        imports: NO_IMPORTS,
+        prelude: NO_PRELUDE,
+        extra_roots: NO_EXTRA_ROOTS,
+    },
     runtime_entry! {
         stem: "inflector",
         namespace: "",
@@ -1535,6 +1729,24 @@ const GO_RUNTIME: &[RuntimeEntry] = &[
         extra_roots: NO_EXTRA_ROOTS,
     },
     runtime_entry! {
+        stem: "active_support_inflections",
+        namespace: "",
+        out_path: "app/active_support_inflections.go",
+        mode: Mode::Library,
+        imports: NO_IMPORTS,
+        prelude: GO_PRELUDE,
+        extra_roots: NO_EXTRA_ROOTS,
+    },
+    runtime_entry! {
+        stem: "i18n_locale",
+        namespace: "",
+        out_path: "app/i18n_locale.go",
+        mode: Mode::Library,
+        imports: NO_IMPORTS,
+        prelude: GO_PRELUDE,
+        extra_roots: NO_EXTRA_ROOTS,
+    },
+    runtime_entry! {
         stem: "action_controller/base",
         namespace: "",
         out_path: "app/action_controller_base.go",
@@ -1687,6 +1899,24 @@ fn elixir_wrap_namespace(_namespace: &str, body: &str) -> String {
 /// as the body walker grows to cover while-loop→recursion and instance
 /// mutation-threading.
 const ELIXIR_RUNTIME: &[RuntimeEntry] = &[
+    runtime_entry! {
+        stem: "active_support_inflections",
+        namespace: "",
+        out_path: "lib/v2/active_support_inflections.ex",
+        mode: Mode::Library,
+        imports: NO_IMPORTS,
+        prelude: NO_PRELUDE,
+        extra_roots: NO_EXTRA_ROOTS,
+    },
+    runtime_entry! {
+        stem: "i18n_locale",
+        namespace: "",
+        out_path: "lib/v2/i18n_locale.ex",
+        mode: Mode::Library,
+        imports: NO_IMPORTS,
+        prelude: NO_PRELUDE,
+        extra_roots: NO_EXTRA_ROOTS,
+    },
     runtime_entry! {
         stem: "inflector",
         namespace: "",
@@ -1852,10 +2082,113 @@ fn py_format_constant(name: &str, value: &Expr) -> String {
 }
 
 /// Python resolves cross-file refs through `from app.x import Y` (like
-/// TS through imports); bodies emit flat at module top, so namespace
-/// wrapping is a no-op.
+/// TS through imports); bodies emit flat at module top, so there is no
+/// namespace to wrap. The shared dump still prints constants and then
+/// classes, which Crystal and TypeScript need and Python does not:
+/// a method looks a global up when it is called, but a constant
+/// initializer runs at import. `SLOT = [Config()]` therefore has to
+/// follow `class Config`. A default argument is also evaluated while the
+/// class body runs, so `opts = EMPTY_HTML_OPTS` has to see that
+/// constant *before* the class. Move only the constants whose value
+/// names a class in this file; leave the rest ahead of the class. A
+/// file with no class (module mode) is left as emitted.
 fn py_wrap_namespace(_namespace: &str, body: &str) -> String {
-    body.to_string()
+    let class_at = if body.starts_with("class ") {
+        0
+    } else {
+        match body.find("\nclass ") {
+            Some(i) => i + 1,
+            None => return body.to_string(),
+        }
+    };
+    if class_at == 0 {
+        return body.to_string();
+    }
+    let constants = body[..class_at].trim_end_matches(|c: char| c == '\n' || c == '\r');
+    if constants.is_empty() {
+        return body.to_string();
+    }
+    let class_names = python_class_names(&body[class_at..]);
+    let (before, after) = split_python_constants_around_classes(constants, &class_names);
+    let mut out = String::with_capacity(body.len() + 4);
+    if !before.is_empty() {
+        out.push_str(&before);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    out.push_str(&body[class_at..]);
+    if !after.is_empty() {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push('\n');
+        out.push_str(&after);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Top-level and nested `class Name` declarations in an emitted Python
+/// body. Indentation does not matter: a constant that constructs a
+/// nested class still has to follow that class.
+fn python_class_names(body: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for line in body.lines() {
+        let Some(rest) = line.trim_start().strip_prefix("class ") else {
+            continue;
+        };
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if !name.is_empty() && !names.iter().any(|n| n == &name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// Split a leading constant block into values that do not mention a
+/// class in this file (they stay above the class, so a default
+/// argument can read them) and values that do (they follow the class
+/// they construct).
+fn split_python_constants_around_classes(constants: &str, class_names: &[String]) -> (String, String) {
+    let mut before = String::new();
+    let mut after = String::new();
+    let mut stmt = String::new();
+    let flush = |stmt: &mut String, before: &mut String, after: &mut String| {
+        if stmt.trim().is_empty() {
+            stmt.clear();
+            return;
+        }
+        let depends = class_names.iter().any(|name| {
+            stmt.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .any(|word| word == name.as_str())
+        });
+        if depends {
+            after.push_str(stmt);
+        } else {
+            before.push_str(stmt);
+        }
+        stmt.clear();
+    };
+    for line in constants.split_inclusive('\n') {
+        let is_assign = !line.starts_with(|c: char| c == ' ' || c == '\t')
+            && line.contains(" = ");
+        if is_assign && !stmt.is_empty() {
+            flush(&mut stmt, &mut before, &mut after);
+        }
+        stmt.push_str(line);
+    }
+    flush(&mut stmt, &mut before, &mut after);
+    (
+        before.trim_end_matches(|c: char| c == '\n' || c == '\r').to_string(),
+        after.trim_end_matches(|c: char| c == '\n' || c == '\r').to_string(),
+    )
 }
 
 /// Python runtime transpile table. Mirrors `TYPESCRIPT_RUNTIME` 1:1 by
@@ -1864,6 +2197,28 @@ fn py_wrap_namespace(_namespace: &str, body: &str) -> String {
 /// Python has no tree-shake pass yet, so the reachability roots TS needs
 /// don't apply.
 const PYTHON_RUNTIME: &[RuntimeEntry] = &[
+    runtime_entry! {
+        stem: "active_support_inflections",
+        namespace: "",
+        out_path: "app/active_support_inflections.py",
+        mode: Mode::Library,
+        imports: NO_IMPORTS,
+        prelude: NO_PRELUDE,
+        extra_roots: NO_EXTRA_ROOTS,
+    },
+    runtime_entry! {
+        stem: "i18n_locale",
+        namespace: "",
+        out_path: "app/i18n_locale.py",
+        mode: Mode::Library,
+        imports: &[
+            ("I18nHost", "app.i18n_host"),
+            ("ViewHelpers", "app.v2.view_helpers"),
+            ("ActiveSupport", "app.active_support_inflections"),
+        ],
+        prelude: NO_PRELUDE,
+        extra_roots: NO_EXTRA_ROOTS,
+    },
     runtime_entry! {
         stem: "inflector",
         namespace: "",
@@ -2008,4 +2363,26 @@ where
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::py_wrap_namespace;
+
+    /// Python runs a module constant at import and a method body later:
+    /// a constant that constructs a class in this file follows that
+    /// class's body, and one that does not stays in front of it.
+    #[test]
+    fn py_constant_constructing_a_class_follows_it() {
+        let body = "SLOT = [Config()]\nLIMIT = 3\n\nclass Config:\n    def root(self):\n        return \"\"\n";
+        let out = py_wrap_namespace("", body);
+        let limit_at = out.find("LIMIT = 3").expect("LIMIT");
+        let class_at = out.find("class Config:").expect("class");
+        let body_at = out.find("        return").expect("class body");
+        let slot_at = out.find("SLOT = [Config()]").expect("SLOT");
+        assert!(limit_at < class_at, "{out}");
+        assert!(body_at < slot_at, "the slot follows the class body, not inside it:\n{out}");
+        let slot_line_start = out[..slot_at].rfind('\n').map_or(0, |i| i + 1);
+        assert_eq!(slot_line_start, slot_at, "the slot stays a module constant:\n{out}");
+    }
 }

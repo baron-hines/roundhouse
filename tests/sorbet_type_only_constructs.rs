@@ -170,7 +170,7 @@ fn an_unimplemented_assertion_emits_a_named_refusal() {
     let emitted = emitted(
         r#"class Gauge
   def label(kind)
-    T.must_because(kind) { "a kind" }.to_s
+    T.must_because(kind) { |why| why.to_s }.to_s
   end
 end
 "#,

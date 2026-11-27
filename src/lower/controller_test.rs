@@ -300,6 +300,18 @@ pub fn flatten_params_pairs<'a>(
     pairs
 }
 
+/// The `@<ivar> = <fixture>(:<label>)` a setup assigns, as (fixture, label).
+pub fn setup_fixture(setup: &Expr, ivar: &Symbol, fixture_names: &[Symbol]) -> Option<(Symbol, String)> {
+    let value = test_body_stmts(setup).into_iter().rev().find_map(|stmt| match &*stmt.node {
+        ExprNode::Assign { target: crate::expr::LValue::Ivar { name }, value } if name == ivar => Some(value),
+        _ => None,
+    })?;
+    let ExprNode::Send { recv: None, method, args, .. } = &*value.node else { return None };
+    let [arg] = args.as_slice() else { return None };
+    let ExprNode::Lit { value: Literal::Sym { value: label } } = &*arg.node else { return None };
+    fixture_names.contains(method).then(|| (method.clone(), label.to_string()))
+}
+
 /// Flatten a test body into a statement sequence. If the body is a
 /// single `Seq`, unwrap it; otherwise return it as a singleton.
 /// Matches the convention that Rails test bodies are always Seq at
@@ -308,5 +320,29 @@ pub fn test_body_stmts(body: &Expr) -> Vec<&Expr> {
     match &*body.node {
         ExprNode::Seq { exprs } => exprs.iter().collect(),
         _ => vec![body],
+    }
+}
+
+/// The one code `assert_response sym` accepts; `None` for a range
+/// (`:success`, `:redirect`, `:error`) or a symbol Rails does not know.
+pub fn asserted_status_code(sym: &str) -> Option<u16> {
+    match sym {
+        "missing" => Some(404),
+        "success" | "redirect" | "error" => None,
+        other => crate::lower::status_literal::status_sym_code(other),
+    }
+}
+
+#[cfg(test)]
+mod asserted_status_tests {
+    use super::asserted_status_code;
+
+    #[test]
+    fn a_symbol_names_its_code_and_a_range_names_none() {
+        assert_eq!(asserted_status_code("not_found"), Some(404));
+        assert_eq!(asserted_status_code("missing"), Some(404));
+        assert_eq!(asserted_status_code("unprocessable_entity"), Some(422));
+        assert_eq!(asserted_status_code("redirect"), None);
+        assert_eq!(asserted_status_code("no_such_status"), None);
     }
 }

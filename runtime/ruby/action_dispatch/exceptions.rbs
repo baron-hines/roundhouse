@@ -1,10 +1,16 @@
 module ActionDispatch
-  module RemoteIp
+  class RemoteIp
     class IpSpoofAttackError < StandardError
     end
   end
 
   module Http
+    module Parameters
+      class ParseError < StandardError
+        def initialize: (?untyped message) -> void
+      end
+    end
+
     module MimeNegotiation
       class InvalidType < StandardError
       end

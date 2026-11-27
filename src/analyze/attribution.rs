@@ -45,7 +45,7 @@
 //! `Parse` (a real syntax error), any other `Unsupported` (already a tool
 //! statement), and `GradualUntyped` (author-signed) never move.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::app::App;
 use crate::diagnostic::{Diagnostic, DiagnosticKind, Severity};
@@ -72,17 +72,32 @@ pub fn attribute_analysis_gaps(diags: &mut [Diagnostic], app: &App, gaps: &mut V
         .and_then(|c| c.unknown().find(|g| g.name == "alba" && g.version.is_some()));
     for d in diags {
         let DiagnosticKind::Unsupported { construct, .. } = &d.kind else { continue };
-        if construct.as_str() != "alba_serialization" {
-            continue;
-        }
-        if let Some(gem) = provider {
-            let attribution = format!(
-                " — roundhouse coverage of the `{}` gem; executable serialization remains unsupported",
-                gem.name
-            );
-            if !d.message.ends_with(&attribution) {
-                d.message.push_str(&attribution);
+        match construct.as_str() {
+            "alba_serialization" => {
+                if let Some(gem) = provider {
+                    let attribution = format!(
+                        " — roundhouse coverage of the `{}` gem; executable serialization remains unsupported",
+                        gem.name
+                    );
+                    if !d.message.ends_with(&attribution) {
+                        d.message.push_str(&attribution);
+                    }
+                }
             }
+            // An `alias new old` roundhouse couldn't resolve after
+            // synthesis. Before this construct existed, an unresolved
+            // model alias was a hard INGEST error, and survey mode
+            // always made that non-fatal (the whole model, not just
+            // the alias line, was dropped — see `ModelBodyItem::Alias`'s
+            // doc). Resolving at lowering time keeps the rest of the
+            // model, but owes survey mode the same non-fatal treatment
+            // for the one line that didn't resolve: demote to Info,
+            // unlike `alba_serialization` above (deliberately still
+            // fatal — see this function's doc).
+            "alias_target_unresolved" => {
+                d.severity = Severity::Info;
+            }
+            _ => continue,
         }
         let Some(source) = d.span.file.0.checked_sub(1)
             .and_then(|i| app.sources.get(i as usize)) else { continue };
@@ -145,7 +160,7 @@ fn attribute_gap_ivars(diags: &mut [Diagnostic], app: &App, sites: &[(FileId, u3
     if sites.is_empty() {
         return;
     }
-    let mut ivar_cause: HashMap<(ClassId, crate::ident::Symbol), String> = HashMap::new();
+    let mut ivar_cause: HashMap<(ClassId, crate::ident::Symbol), String> = HashMap::default();
     for c in &app.controllers {
         for a in c.actions() {
             collect_gem_ivars(&a.body, sites, |name, cause| {
@@ -156,13 +171,13 @@ fn attribute_gap_ivars(diags: &mut [Diagnostic], app: &App, sites: &[(FileId, u3
     if ivar_cause.is_empty() {
         return;
     }
-    let mut view_by_file: HashMap<FileId, &crate::ident::Symbol> = HashMap::new();
+    let mut view_by_file: HashMap<FileId, &crate::ident::Symbol> = HashMap::default();
     for v in &app.views {
         if let Some(f) = first_real_file(&[&v.body]) {
             view_by_file.entry(f).or_insert(&v.name);
         }
     }
-    let mut controller_file: HashMap<FileId, &ClassId> = HashMap::new();
+    let mut controller_file: HashMap<FileId, &ClassId> = HashMap::default();
     for c in &app.controllers {
         let bodies: Vec<&Expr> = c.actions().map(|a| &a.body).collect();
         if let Some(f) = first_real_file(&bodies) {
@@ -233,7 +248,7 @@ struct AttributionCtx<'a> {
 
 impl<'a> AttributionCtx<'a> {
     fn build(app: &'a App, gaps: &'a [IngestError]) -> Self {
-        let mut gap_by_path: HashMap<&str, String> = HashMap::new();
+        let mut gap_by_path: HashMap<&str, String> = HashMap::default();
         for gap in gaps {
             let (IngestError::Unsupported { file, .. } | IngestError::Parse { file, .. }) = gap
             else {
@@ -245,7 +260,7 @@ impl<'a> AttributionCtx<'a> {
             });
         }
 
-        let mut tainted_files: HashMap<FileId, &str> = HashMap::new();
+        let mut tainted_files: HashMap<FileId, &str> = HashMap::default();
         for (i, src) in app.sources.iter().enumerate() {
             if let Some((path, _)) = gap_by_path.get_key_value(src.path.as_str()) {
                 tainted_files.insert(FileId(i as u32 + 1), path);
@@ -255,7 +270,7 @@ impl<'a> AttributionCtx<'a> {
         // Class taint by defining file. A class's file is where its first
         // real-span body lands — models/controllers/library classes all
         // ingest single-file in Rails convention.
-        let mut class_file: HashMap<ClassId, FileId> = HashMap::new();
+        let mut class_file: HashMap<ClassId, FileId> = HashMap::default();
         for c in &app.controllers {
             let bodies: Vec<&Expr> = c.actions().map(|a| &a.body).collect();
             if let Some(f) = first_real_file(&bodies) {
@@ -282,7 +297,7 @@ impl<'a> AttributionCtx<'a> {
         let own_taint = |id: &ClassId| -> Option<&str> {
             class_file.get(id).and_then(|f| tainted_files.get(f)).copied()
         };
-        let mut tainted_classes: HashMap<ClassId, &str> = HashMap::new();
+        let mut tainted_classes: HashMap<ClassId, &str> = HashMap::default();
         for id in class_file.keys() {
             if let Some(p) = own_taint(id) {
                 tainted_classes.insert(id.clone(), p);
@@ -301,7 +316,7 @@ impl<'a> AttributionCtx<'a> {
                 continue;
             }
             let mut walk = Some(&c.name);
-            let mut seen: HashSet<&ClassId> = HashSet::new();
+            let mut seen: HashSet<&ClassId> = HashSet::default();
             while let Some(id) = walk {
                 if !seen.insert(id) {
                     break;
@@ -314,7 +329,7 @@ impl<'a> AttributionCtx<'a> {
             }
         }
 
-        let mut view_by_file: HashMap<FileId, &crate::ident::Symbol> = HashMap::new();
+        let mut view_by_file: HashMap<FileId, &crate::ident::Symbol> = HashMap::default();
         for v in &app.views {
             if let Some(f) = first_real_file(&[&v.body]) {
                 view_by_file.entry(f).or_insert(&v.name);
@@ -327,8 +342,8 @@ impl<'a> AttributionCtx<'a> {
             .find_map(|c| tainted_classes.get(&c.name))
             .copied();
 
-        let mut gap_namespaces: HashMap<String, &str> = HashMap::new();
-        let mut gap_receivers: HashMap<String, &str> = HashMap::new();
+        let mut gap_namespaces: HashMap<String, &str> = HashMap::default();
+        let mut gap_receivers: HashMap<String, &str> = HashMap::default();
         let resolver = (!tainted_files.is_empty()).then(|| app.const_resolver.for_sources(&app.sources));
         if let Some(resolver) = &resolver {
             // A namespace several gap files reopen (`module Discourse` in
@@ -475,7 +490,7 @@ pub fn attribute_initializer_constants(diags: &mut [Diagnostic], app: &App) {
         return;
     }
     let root = app.root.trim_end_matches('/');
-    let mut assigned: HashMap<String, Vec<String>> = HashMap::new();
+    let mut assigned: HashMap<String, Vec<String>> = HashMap::default();
     for f in &app.sources {
         let rel = f.path.strip_prefix(root).unwrap_or(&f.path).trim_start_matches('/');
         if !rel.starts_with("config/initializers/") {
@@ -625,7 +640,25 @@ pub fn attribute_unknown_gems(diags: &mut [Diagnostic], app: &App) {
             }
             continue;
         }
+        // Kept an error: the call site is the gem's own refusal, and only what it feeds becomes a note
+        if let DiagnosticKind::Unsupported { construct, .. } = &d.kind
+            && crate::gems::claims_surface(construct.as_str())
+        {
+            sites.push((d.span.file, d.span.start, construct.as_str().to_string()));
+            continue;
+        }
         if !eligible(&d.kind) || d.severity == Severity::Info {
+            continue;
+        }
+        // Catalogued gem classes (e.g. Pay::Charge for `is_a?`) own their
+        // surface: missing methods must stay errors. Downgrading them to
+        // unknown-gem notes would quiet `check` while the empty façade
+        // still NoMethodErrors on emit (invariant 6).
+        if matches!(
+            &d.kind,
+            DiagnosticKind::SendDispatchFailed { recv_ty, .. }
+                if catalogued_class_receiver(recv_ty)
+        ) {
             continue;
         }
         if let Some((gem, evidence)) = gem_for(d) {
@@ -643,7 +676,7 @@ pub fn attribute_unknown_gems(diags: &mut [Diagnostic], app: &App) {
     // Pass 2: ivars assigned from an attributed site, per controller
     // (its own actions and filters), then the reads of those ivars in
     // the controller's views and its own file.
-    let mut ivar_gem: HashMap<(ClassId, crate::ident::Symbol), String> = HashMap::new();
+    let mut ivar_gem: HashMap<(ClassId, crate::ident::Symbol), String> = HashMap::default();
     for c in &app.controllers {
         for a in c.actions() {
             collect_gem_ivars(&a.body, &sites, |name, gem| {
@@ -654,13 +687,13 @@ pub fn attribute_unknown_gems(diags: &mut [Diagnostic], app: &App) {
     if ivar_gem.is_empty() {
         return;
     }
-    let mut view_by_file: HashMap<FileId, &crate::ident::Symbol> = HashMap::new();
+    let mut view_by_file: HashMap<FileId, &crate::ident::Symbol> = HashMap::default();
     for v in &app.views {
         if let Some(f) = first_real_file(&[&v.body]) {
             view_by_file.entry(f).or_insert(&v.name);
         }
     }
-    let mut controller_file: HashMap<FileId, &ClassId> = HashMap::new();
+    let mut controller_file: HashMap<FileId, &ClassId> = HashMap::default();
     for c in &app.controllers {
         let bodies: Vec<&Expr> = c.actions().map(|a| &a.body).collect();
         if let Some(f) = first_real_file(&bodies) {
@@ -692,6 +725,18 @@ fn mark(d: &mut Diagnostic, gem: &str, via_ivar: Option<&str>) {
         None => d.message.push_str(&format!(
             " — likely roundhouse coverage, not an app error (the `{gem}` gem is in the Gemfile and roundhouse does not model it)"
         )),
+    }
+}
+
+/// Receiver class id appears in [`crate::catalog::GEM_CATALOG`]. Roundhouse
+/// already owns that surface — missing methods are intentional refusals,
+/// not unknown-gem notes (invariant 6).
+fn catalogued_class_receiver(ty: &crate::ty::Ty) -> bool {
+    match ty {
+        crate::ty::Ty::Class { id, .. } => crate::catalog::GEM_CATALOG
+            .iter()
+            .any(|g| g.name == id.0.as_str()),
+        _ => false,
     }
 }
 

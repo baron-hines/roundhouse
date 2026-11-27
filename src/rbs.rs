@@ -15,7 +15,7 @@ use ruby_rbs::node::{Node, parse};
 
 use crate::effect::EffectSet;
 use crate::ident::{ClassId, Symbol};
-use crate::ty::{Param, ParamKind, Ty};
+use crate::ty::{FnTy, Param, ParamKind, Ty};
 
 /// Signatures extracted from an RBS source.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -27,12 +27,12 @@ pub struct Signatures {
     /// expected to provide the implementation. The orphan check
     /// skips them so a base-class RBS can carry the contract
     /// without an empty `def` shim on the Ruby side.
-    pub abstract_methods: std::collections::HashSet<Symbol>,
+    pub abstract_methods: crate::det::HashSet<Symbol>,
 }
 
 /// Parse RBS source and extract method signatures.
 pub fn parse_signatures(source: &str) -> Result<Signatures, String> {
-    parse_signatures_with_aliases(source, &AliasTable::new())
+    parse_signatures_with_aliases(source, &AliasTable::default())
 }
 
 /// Inline comments inherit already-resolved aliases from their lexical scope.
@@ -80,12 +80,12 @@ pub(crate) fn parse_signatures_with_aliases(
 /// the distinction can be recovered later when it matters.
 pub fn parse_app_signatures(
     source: &str,
-) -> Result<std::collections::HashMap<ClassId, std::collections::HashMap<Symbol, Ty>>, String> {
+) -> Result<crate::det::HashMap<ClassId, crate::det::HashMap<Symbol, Ty>>, String> {
     let signature = parse(source)?;
-    let mut out: std::collections::HashMap<ClassId, std::collections::HashMap<Symbol, Ty>> =
-        std::collections::HashMap::new();
+    let mut out: crate::det::HashMap<ClassId, crate::det::HashMap<Symbol, Ty>> =
+        crate::det::HashMap::default();
     let decls: Vec<Node<'_>> = signature.declarations().iter().collect();
-    let top_aliases = resolve_aliases(&decls, None, &AliasTable::new());
+    let top_aliases = resolve_aliases(&decls, None, &AliasTable::default());
 
     for decl in decls {
         walk_decl(&decl, None, &top_aliases, &mut out)?;
@@ -94,17 +94,46 @@ pub fn parse_app_signatures(
     Ok(out)
 }
 
+/// The instance methods each class or module of an RBS source declares, by name only (a class's `def self.x` is
+/// not one: an instance of it answers no `x`).
+pub fn parse_instance_method_names(source: &str) -> Result<crate::det::HashMap<ClassId, crate::det::HashSet<Symbol>>, String> {
+    fn walk(decl: &Node<'_>, parent: Option<&str>, out: &mut crate::det::HashMap<ClassId, crate::det::HashSet<Symbol>>) {
+        let (name, members): (String, Vec<Node<'_>>) = match decl {
+            Node::Class(class) => (namespace_join(parent, &declared_name(&class.name())), class.members().iter().collect()),
+            Node::Module(module) => (namespace_join(parent, &declared_name(&module.name())), module.members().iter().collect()),
+            _ => return,
+        };
+        for member in members {
+            match &member {
+                Node::MethodDefinition(method)
+                    if matches!(method.kind(), ruby_rbs::node::MethodDefinitionKind::Instance | ruby_rbs::node::MethodDefinitionKind::SingletonInstance) =>
+                {
+                    out.entry(ClassId(Symbol::new(&name))).or_default().insert(Symbol::new(method.name().as_str()));
+                }
+                Node::Class(_) | Node::Module(_) => walk(&member, Some(&name), out),
+                _ => {}
+            }
+        }
+    }
+    let signature = parse(source)?;
+    let mut out = crate::det::HashMap::default();
+    for decl in signature.declarations().iter() {
+        walk(&decl, None, &mut out);
+    }
+    Ok(out)
+}
+
 /// Parse RBS `@ivar: T` declarations grouped by enclosing class/module.
 /// Names are stored without the leading `@` so they match
 /// `ExprNode::Ivar` / `Ctx::ivar_bindings` keys.
 pub fn parse_app_ivars(
     source: &str,
-) -> Result<std::collections::HashMap<ClassId, std::collections::HashMap<Symbol, Ty>>, String> {
+) -> Result<crate::det::HashMap<ClassId, crate::det::HashMap<Symbol, Ty>>, String> {
     let signature = parse(source)?;
-    let mut out: std::collections::HashMap<ClassId, std::collections::HashMap<Symbol, Ty>> =
-        std::collections::HashMap::new();
+    let mut out: crate::det::HashMap<ClassId, crate::det::HashMap<Symbol, Ty>> =
+        crate::det::HashMap::default();
     let decls: Vec<Node<'_>> = signature.declarations().iter().collect();
-    let top_aliases = resolve_aliases(&decls, None, &AliasTable::new());
+    let top_aliases = resolve_aliases(&decls, None, &AliasTable::default());
 
     for decl in decls {
         walk_ivars(&decl, None, &top_aliases, &mut out)?;
@@ -126,10 +155,10 @@ pub fn parse_app_ivars(
 /// since RBS resolves them lexically.
 pub fn parse_app_includes(
     source: &str,
-) -> Result<std::collections::HashMap<ClassId, Vec<ClassId>>, String> {
+) -> Result<crate::det::HashMap<ClassId, Vec<ClassId>>, String> {
     let signature = parse(source)?;
-    let mut out: std::collections::HashMap<ClassId, Vec<ClassId>> =
-        std::collections::HashMap::new();
+    let mut out: crate::det::HashMap<ClassId, Vec<ClassId>> =
+        crate::det::HashMap::default();
     for decl in signature.declarations().iter() {
         walk_includes(&decl, None, &mut out)?;
     }
@@ -139,7 +168,7 @@ pub fn parse_app_includes(
 fn walk_includes(
     decl: &Node<'_>,
     parent: Option<&str>,
-    out: &mut std::collections::HashMap<ClassId, Vec<ClassId>>,
+    out: &mut crate::det::HashMap<ClassId, Vec<ClassId>>,
 ) -> Result<(), String> {
     match decl {
         Node::Class(class) => {
@@ -162,7 +191,7 @@ fn walk_includes(
 fn collect_class_includes<'a, I: Iterator<Item = Node<'a>>>(
     members: I,
     class_name: &str,
-    out: &mut std::collections::HashMap<ClassId, Vec<ClassId>>,
+    out: &mut crate::det::HashMap<ClassId, Vec<ClassId>>,
 ) -> Result<(), String> {
     let class_id = ClassId(Symbol::new(class_name));
     for member in members {
@@ -217,22 +246,23 @@ fn declared_name(type_name: &ruby_rbs::node::TypeNameNode<'_>) -> String {
 
 fn walk_decl(
     decl: &Node<'_>,
-    parent: Option<&str>,
+    parent: Option<(&str, bool)>,
     aliases: &AliasTable,
-    out: &mut std::collections::HashMap<ClassId, std::collections::HashMap<Symbol, Ty>>,
+    out: &mut crate::det::HashMap<ClassId, crate::det::HashMap<Symbol, Ty>>,
 ) -> Result<(), String> {
+    let (parent, nesting_matches) = parent.map_or((None, true), |(name, matches)| (Some(name), matches));
     match decl {
         Node::Class(class) => {
             let name = namespace_join(parent, &declared_name(&class.name()));
-            collect_class_methods(class.members().iter(), &name, aliases, out)?;
+            collect_class_methods(class.members().iter(), &name, nesting_matches && !class.name().namespace().absolute() && !declared_name(&class.name()).contains("::"), aliases, out)?;
         }
         Node::Module(module) => {
             let name = namespace_join(parent, &declared_name(&module.name()));
-            collect_class_methods(module.members().iter(), &name, aliases, out)?;
+            collect_class_methods(module.members().iter(), &name, nesting_matches && !module.name().namespace().absolute() && !declared_name(&module.name()).contains("::"), aliases, out)?;
         }
         Node::Interface(iface) => {
             let name = namespace_join(parent, &declared_name(&iface.name()));
-            collect_class_methods(iface.members().iter(), &name, aliases, out)?;
+            collect_class_methods(iface.members().iter(), &name, nesting_matches && !iface.name().namespace().absolute() && !declared_name(&iface.name()).contains("::"), aliases, out)?;
         }
         _ => {}
     }
@@ -243,7 +273,7 @@ fn walk_ivars(
     decl: &Node<'_>,
     parent: Option<&str>,
     aliases: &AliasTable,
-    out: &mut std::collections::HashMap<ClassId, std::collections::HashMap<Symbol, Ty>>,
+    out: &mut crate::det::HashMap<ClassId, crate::det::HashMap<Symbol, Ty>>,
 ) -> Result<(), String> {
     match decl {
         Node::Class(class) => {
@@ -267,7 +297,7 @@ fn collect_class_ivars<'a, I: Iterator<Item = Node<'a>>>(
     members: I,
     class_name: &str,
     outer: &AliasTable,
-    out: &mut std::collections::HashMap<ClassId, std::collections::HashMap<Symbol, Ty>>,
+    out: &mut crate::det::HashMap<ClassId, crate::det::HashMap<Symbol, Ty>>,
 ) -> Result<(), String> {
     let class_id = ClassId(Symbol::new(class_name));
     let members: Vec<Node<'a>> = members.collect();
@@ -311,8 +341,9 @@ fn collect_class_ivars<'a, I: Iterator<Item = Node<'a>>>(
 fn collect_class_methods<'a, I: Iterator<Item = Node<'a>>>(
     members: I,
     class_name: &str,
+    nesting_matches: bool,
     outer: &AliasTable,
-    out: &mut std::collections::HashMap<ClassId, std::collections::HashMap<Symbol, Ty>>,
+    out: &mut crate::det::HashMap<ClassId, crate::det::HashMap<Symbol, Ty>>,
 ) -> Result<(), String> {
     let class_id = ClassId(Symbol::new(class_name));
     let members: Vec<Node<'a>> = members.collect();
@@ -322,13 +353,14 @@ fn collect_class_methods<'a, I: Iterator<Item = Node<'a>>>(
         match member {
             Node::MethodDefinition(method) => {
                 let name = Symbol::new(method.name().as_str());
-                let ty = method_signature_ty(&method, Some(class_name), aliases)?;
-                out.entry(class_id.clone()).or_default().insert(name, ty);
+                let (ty, spelled) = spelled(|| method_signature_ty(&method, Some(class_name), aliases));
+                file_spellings(&class_id, &name, spelled, nesting_matches);
+                out.entry(class_id.clone()).or_default().insert(name, ty?);
             }
             // Nested class/module inside this one — recurse with the
             // combined namespace.
             Node::Class(_) | Node::Module(_) | Node::Interface(_) => {
-                walk_decl(&member, Some(class_name), aliases, out)?;
+                walk_decl(&member, Some((class_name, nesting_matches)), aliases, out)?;
             }
             _ => {}
         }
@@ -462,12 +494,12 @@ fn method_signature_ty(
         if let Node::FunctionType(block_fn_type) = block_node.type_() {
             let (block_params, block_ret) =
                 parse_function_type_to_fn(&block_fn_type, &method_name, ctx)?;
-            Some(Ty::Fn {
-                params: block_params,
+            Some(Ty::Fn(Box::new(FnTy {
+                params: block_params.into(),
                 block: None,
-                ret: Box::new(block_ret),
+                ret: std::sync::Arc::new(block_ret),
                 effects: EffectSet::pure(),
-            })
+            })))
         } else {
             // Untyped or proc-typed block — keep the placeholder for
             // backward compatibility with code paths that only checked
@@ -480,17 +512,17 @@ fn method_signature_ty(
     if let Some(ref bty) = block_ty {
         params.push(Param {
             name: Symbol::new("block"),
-            ty: bty.clone(),
+            ty: bty.clone().into(),
             kind: ParamKind::Block,
         });
     }
 
-    Ok(Ty::Fn {
-        params,
-        block: block_ty.map(Box::new),
-        ret: Box::new(ret),
+    Ok(Ty::Fn(Box::new(FnTy {
+        params: params.into(),
+        block: block_ty.map(std::sync::Arc::new),
+        ret: std::sync::Arc::new(ret),
         effects: EffectSet::pure(),
-    })
+    })))
 }
 
 /// Parse a single RBS `FunctionType` into `(params, ret)`. Shared
@@ -537,8 +569,8 @@ fn parse_function_type_to_fn(
             .map(|s| Symbol::new(s.as_str()))
             .unwrap_or_else(|| Symbol::new("rest"));
         let elem_ty = ty_from_node(&fn_param.type_(), ctx)?;
-        let ty = Ty::Array { elem: Box::new(elem_ty) };
-        params.push(Param { name, ty, kind: ParamKind::Rest });
+        let ty = Ty::Array { elem: std::sync::Arc::new(elem_ty) };
+        params.push(Param { name, ty: ty.into(), kind: ParamKind::Rest });
     }
 
     collect_function_params(
@@ -562,7 +594,7 @@ fn parse_function_type_to_fn(
         let ty = ty_from_node(&fn_param.type_(), ctx)?;
         params.push(Param {
             name,
-            ty,
+            ty: ty.into(),
             kind: ParamKind::Keyword { required: true },
         });
     }
@@ -579,7 +611,7 @@ fn parse_function_type_to_fn(
         let ty = ty_from_node(&fn_param.type_(), ctx)?;
         params.push(Param {
             name,
-            ty,
+            ty: ty.into(),
             kind: ParamKind::Keyword { required: false },
         });
     }
@@ -600,12 +632,12 @@ fn parse_function_type_to_fn(
             .unwrap_or_else(|| Symbol::new("opts"));
         let value_ty = ty_from_node(&fn_param.type_(), ctx)?;
         let ty = Ty::Hash {
-            key: Box::new(Ty::Sym),
-            value: Box::new(value_ty),
+            key: std::sync::Arc::new(Ty::Sym),
+            value: std::sync::Arc::new(value_ty),
         };
         params.push(Param {
             name,
-            ty,
+            ty: ty.into(),
             kind: ParamKind::KeywordRest,
         });
     }
@@ -646,7 +678,7 @@ fn collect_function_params<'a, I: Iterator<Item = Node<'a>>>(
             .map(|s| Symbol::new(s.as_str()))
             .unwrap_or_else(|| Symbol::new(format!("arg{idx}")));
         let ty = ty_from_node(&fn_param.type_(), ctx)?;
-        out.push(Param { name, ty, kind: kind.clone() });
+        out.push(Param { name, ty: ty.into(), kind: kind.clone() });
     }
     Ok(())
 }
@@ -681,7 +713,15 @@ fn qualify_class_ref(
             }
         })
         .collect();
-    if ns.absolute() {
+    let root = if ns.absolute() { "::" } else { "" };
+    let written = format!("{root}{}", path_segments.iter().chain([&bare_name]).cloned().collect::<Vec<_>>().join("::"));
+    let resolved = resolve_class_ref(bare_name, &path_segments, ns.absolute(), scope);
+    note_spelling(&resolved, written);
+    resolved
+}
+
+fn resolve_class_ref(bare_name: String, path_segments: &[String], absolute: bool, scope: Option<&str>) -> String {
+    if absolute {
         // `::Foo::Bar` — explicit top-level. Use path-as-written
         // joined with the bare name; ignore enclosing scope.
         if path_segments.is_empty() {
@@ -767,7 +807,55 @@ struct TyCtx<'a> {
 }
 
 /// `type name = ...` declarations in scope, keyed by the name as written.
-pub(crate) type AliasTable = std::collections::HashMap<String, Ty>;
+pub(crate) type AliasTable = crate::det::HashMap<String, Ty>;
+
+/// Resolved name to (written name, lexical nesting matches emitted nesting).
+/// A leading `::` is kept; the name is empty where two spellings met.
+/// Only simple enclosing declarations prove matching nesting; qualified
+/// headers fall back to main's rule for relative names in the Ruby writer.
+pub type Spellings = crate::det::HashMap<String, (String, bool)>;
+/// [`Spellings`] by owner and method, as `App::rbs_spellings` holds them.
+pub type MethodSpellings = crate::det::HashMap<ClassId, crate::det::HashMap<Symbol, Spellings>>;
+
+thread_local! {
+    static READ: std::cell::RefCell<Option<Spellings>> = const { std::cell::RefCell::new(None) };
+    static FILED: std::cell::RefCell<Option<MethodSpellings>> = const { std::cell::RefCell::new(None) };
+}
+
+/// `read`'s value and the class names it spelled.
+pub(crate) fn spelled<T>(read: impl FnOnce() -> T) -> (T, Spellings) {
+    let outer = READ.with(|r| r.replace(Some(Spellings::default())));
+    let value = read();
+    (value, READ.with(|r| r.replace(outer)).unwrap_or_default())
+}
+
+pub(crate) fn note_spelling(resolved: &str, written: String) {
+    READ.with(|r| {
+        if let Some(read) = r.borrow_mut().as_mut() {
+            let (entry, _) = read.entry(resolved.to_string()).or_insert_with(|| (written.clone(), false));
+            if *entry != written {
+                entry.clear();
+            }
+        }
+    });
+}
+
+/// Files `owner#method`'s spellings for an enclosing [`collect_spellings`].
+pub(crate) fn file_spellings(owner: &ClassId, method: &Symbol, mut spellings: Spellings, nesting_matches: bool) {
+    for (_, matches) in spellings.values_mut() { *matches = nesting_matches; }
+    FILED.with(|f| {
+        if let Some(filed) = f.borrow_mut().as_mut() {
+            filed.entry(owner.clone()).or_default().insert(method.clone(), spellings);
+        }
+    });
+}
+
+/// `run`'s value and the spellings of the signatures it read.
+pub fn collect_spellings<T>(run: impl FnOnce() -> T) -> (T, MethodSpellings) {
+    let outer = FILED.with(|f| f.replace(Some(MethodSpellings::default())));
+    let value = run();
+    (value, FILED.with(|f| f.replace(outer)).unwrap_or_default())
+}
 
 fn ty_from_node(node: &Node<'_>, ctx: TyCtx<'_>) -> Result<Ty, String> {
     match node {
@@ -810,7 +898,7 @@ fn ty_from_node(node: &Node<'_>, ctx: TyCtx<'_>) -> Result<Ty, String> {
                 .iter()
                 .map(|n| ty_from_node(&n, ctx))
                 .collect::<Result<_, _>>()?;
-            Ok(Ty::Tuple { elems })
+            Ok(Ty::Tuple { elems: elems.into() })
         }
         // RBS record literal `{ key: T, ?optional: U }` → `Ty::Record`.
         // `Ty::Record` is what strict-typed targets (Crystal, Rust)
@@ -832,7 +920,7 @@ fn ty_from_node(node: &Node<'_>, ctx: TyCtx<'_>) -> Result<Ty, String> {
                 let ty = ty_from_node(&field.type_(), ctx)?;
                 fields.insert(name, ty);
             }
-            Ok(Ty::Record { row: crate::ty::Row { fields, rest: None } })
+            Ok(Ty::Record { row: crate::ty::Row { fields: fields.into(), rest: None } })
         }
         // RBS proc literal `^(T) -> U` → `Ty::Fn`. Reuses the same
         // function-type parser method signatures go through — a proc
@@ -848,12 +936,12 @@ fn ty_from_node(node: &Node<'_>, ctx: TyCtx<'_>) -> Result<Ty, String> {
                 return Err("proc-type payload is not a FunctionType".to_string());
             };
             let (params, ret) = parse_function_type_to_fn(&fn_type, "(proc)", ctx)?;
-            Ok(Ty::Fn {
-                params,
+            Ok(Ty::Fn(Box::new(FnTy {
+                params: params.into(),
                 block: None,
-                ret: Box::new(ret),
+                ret: std::sync::Arc::new(ret),
                 effects: EffectSet::default(),
-            })
+            })))
         }
         // `instance` — an instance of the class that RECEIVED the
         // call, which is exactly what a base class cannot name about
@@ -887,7 +975,7 @@ fn ty_from_node(node: &Node<'_>, ctx: TyCtx<'_>) -> Result<Ty, String> {
         // `singleton(String)` is the class String, not a string.
         Node::ClassSingletonType(class_type) => Ok(Ty::Class {
             id: ClassId(Symbol::new(&qualify_class_ref(&class_type.name(), ctx.scope))),
-            args: Vec::new(),
+            args: Vec::new().into(),
         }),
         // `bot` is what `raise` and `exit` return: no value at all.
         Node::BottomType(_) => Ok(Ty::Bottom),
@@ -1000,13 +1088,13 @@ pub(crate) fn resolve_aliases(members: &[Node<'_>], scope: Option<&str>, outer: 
 /// RBS reader and the `sig { … }` reader so the two spell the same
 /// type the same way.
 pub(crate) fn sorbet_generic_ty(name: &str, args: &[Ty]) -> Option<Ty> {
-    let plain = |id: &str| Ty::Class { id: ClassId(Symbol::new(id)), args: args.to_vec() };
+    let plain = |id: &str| Ty::Class { id: ClassId(Symbol::new(id)), args: args.to_vec().into() };
     Some(match (name, args) {
         ("T::Boolean", []) => Ty::Bool,
-        ("T::Array", [elem]) => Ty::Array { elem: Box::new(elem.clone()) },
+        ("T::Array", [elem]) => Ty::Array { elem: std::sync::Arc::new(elem.clone()) },
         ("T::Hash", [key, value]) => Ty::Hash {
-            key: Box::new(key.clone()),
-            value: Box::new(value.clone()),
+            key: std::sync::Arc::new(key.clone()),
+            value: std::sync::Arc::new(value.clone()),
         },
         ("T::Set", [_]) => plain("Set"),
         ("T::Range", [_]) => plain("Range"),
@@ -1037,19 +1125,19 @@ fn map_class_instance(name: &str, args: Vec<Ty>) -> Ty {
         ("TrueClass" | "FalseClass", []) => Ty::Bool,
         ("NilClass", []) => Ty::Nil,
         ("Array", [elem]) => Ty::Array {
-            elem: Box::new(elem.clone()),
+            elem: std::sync::Arc::new(elem.clone()),
         },
         ("Hash", [key, value]) => Ty::Hash {
-            key: Box::new(key.clone()),
-            value: Box::new(value.clone()),
+            key: std::sync::Arc::new(key.clone()),
+            value: std::sync::Arc::new(value.clone()),
         },
         // A bare `Hash` / `Array` is the unparameterized container, not a
         // class named Hash with nothing to call on it.
-        ("Hash", []) => Ty::Hash { key: Box::new(Ty::Untyped), value: Box::new(Ty::Untyped) },
-        ("Array", []) => Ty::Array { elem: Box::new(Ty::Untyped) },
+        ("Hash", []) => Ty::Hash { key: std::sync::Arc::new(Ty::Untyped), value: std::sync::Arc::new(Ty::Untyped) },
+        ("Array", []) => Ty::Array { elem: std::sync::Arc::new(Ty::Untyped) },
         _ => Ty::Class {
             id: ClassId(Symbol::new(name)),
-            args,
+            args: args.into(),
         },
     }
 }
@@ -1068,7 +1156,7 @@ fn union_or_single(variants: Vec<Ty>) -> Ty {
     if variants.len() == 1 {
         variants.into_iter().next().unwrap()
     } else {
-        Ty::Union { variants }
+        Ty::Union { variants: variants.into() }
     }
 }
 
@@ -1184,7 +1272,7 @@ pub fn print_ty(ty: &Ty) -> String {
         Ty::SelfInstance => "instance".to_string(),
         // Value-position function types would need RBS proc syntax,
         // which the parse direction rejects — degrade.
-        Ty::Fn { .. } => "untyped".to_string(),
+        Ty::Fn(_) => "untyped".to_string(),
         Ty::Var { .. } | Ty::Untyped => "untyped".to_string(),
         _ => "untyped".to_string(),
     }
@@ -1204,7 +1292,8 @@ fn print_ty_grouped(ty: &Ty) -> String {
 /// `None` when `fn_ty` isn't a `Ty::Fn` — there is nothing honest to
 /// print for a bare value type without fabricating an arity.
 pub fn print_method_signature(name: &str, fn_ty: &Ty) -> Option<String> {
-    let Ty::Fn { params, block, ret, .. } = fn_ty else { return None };
+    let Ty::Fn(fn_ty) = fn_ty else { return None };
+    let FnTy { params, block, ret, .. } = &**fn_ty;
     // RBS parameter-list order: required, optional, *rest, keywords,
     // **rest-keywords. Params arrive in that order from the parse
     // direction; re-bucket here so synthesized Fns print canonically
@@ -1223,7 +1312,7 @@ pub fn print_method_signature(name: &str, fn_ty: &Ty) -> Option<String> {
     for p in params.iter().filter(|p| matches!(p.kind, ParamKind::Rest)) {
         // The stored Ty is the collected `Array[E]`; RBS declares the
         // element type (mirror of the parse direction's wrap).
-        let elem = match &p.ty {
+        let elem = match &*p.ty {
             Ty::Array { elem } => print_ty(elem),
             other => print_ty(other),
         };
@@ -1240,14 +1329,15 @@ pub fn print_method_signature(name: &str, fn_ty: &Ty) -> Option<String> {
     }
     for p in params.iter().filter(|p| matches!(p.kind, ParamKind::KeywordRest)) {
         // Stored as the collected `Hash[Symbol, V]`; RBS declares V.
-        let value = match &p.ty {
+        let value = match &*p.ty {
             Ty::Hash { value, .. } => print_ty(value),
             other => print_ty(other),
         };
         parts.push(format!("**{}{}", value, named(p)));
     }
     let block_part = match block.as_deref() {
-        Some(Ty::Fn { params: bp, ret: br, .. }) => {
+        Some(Ty::Fn(fn_ty)) => {
+            let FnTy { params: bp, ret: br, .. } = &**fn_ty;
             let inner: Vec<String> = bp.iter().map(|p| print_ty_grouped(&p.ty)).collect();
             format!(" {{ ({}) -> {} }}", inner.join(", "), print_ty_grouped(br))
         }
@@ -1309,8 +1399,9 @@ mod tests {
     }
 
     fn fn_parts(ty: Ty) -> (Vec<Param>, Ty) {
-        if let Ty::Fn { params, ret, .. } = ty {
-            (params, *ret)
+        if let Ty::Fn(fn_ty) = ty {
+            let FnTy { params, ret, .. } = *fn_ty;
+            (params.to_vec(), std::sync::Arc::unwrap_or_clone(ret))
         } else {
             panic!("expected Ty::Fn, got {ty:?}");
         }
@@ -1389,7 +1480,7 @@ mod tests {
         // must not stop at the top level either.
         let src = "class Base\n  def self.all: () -> Array[instance]\nend\n";
         let (_, ret) = fn_parts(parse_one(src));
-        assert_eq!(ret, Ty::Array { elem: Box::new(Ty::SelfInstance) });
+        assert_eq!(ret, Ty::Array { elem: std::sync::Arc::new(Ty::SelfInstance) });
     }
 
     #[test]
@@ -1397,9 +1488,9 @@ mod tests {
         let src = "module Inflector\n  def pluralize: (Integer, String) -> String\nend\n";
         let (params, ret) = fn_parts(parse_one(src));
         assert_eq!(params.len(), 2);
-        assert_eq!(params[0].ty, Ty::Int);
+        assert_eq!(params[0].ty, Ty::Int.into());
         assert_eq!(params[0].kind, ParamKind::Required);
-        assert_eq!(params[1].ty, Ty::Str);
+        assert_eq!(params[1].ty, Ty::Str.into());
         assert_eq!(ret, Ty::Str);
     }
 
@@ -1424,7 +1515,7 @@ mod tests {
         let src = "module M\n  def f: (Integer, Float, String, Symbol, bool, nil) -> void\nend\n";
         let (params, ret) = fn_parts(parse_one(src));
         assert_eq!(
-            params.iter().map(|p| p.ty.clone()).collect::<Vec<_>>(),
+            params.iter().map(|p| (*p.ty).clone()).collect::<Vec<_>>(),
             vec![Ty::Int, Ty::Float, Ty::Str, Ty::Sym, Ty::Bool, Ty::Nil],
         );
         assert_eq!(ret, Ty::Nil);
@@ -1437,15 +1528,15 @@ mod tests {
         assert_eq!(
             params[0].ty,
             Ty::Array {
-                elem: Box::new(Ty::Int)
-            }
+                elem: std::sync::Arc::new(Ty::Int)
+            }.into()
         );
         assert_eq!(
             params[1].ty,
             Ty::Hash {
-                key: Box::new(Ty::Str),
-                value: Box::new(Ty::Int),
-            }
+                key: std::sync::Arc::new(Ty::Str),
+                value: std::sync::Arc::new(Ty::Int),
+            }.into()
         );
     }
 
@@ -1456,8 +1547,8 @@ mod tests {
         assert_eq!(
             params[0].ty,
             Ty::Union {
-                variants: vec![Ty::Str, Ty::Nil]
-            }
+                variants: vec![Ty::Str, Ty::Nil].into()
+            }.into()
         );
     }
 
@@ -1468,8 +1559,8 @@ mod tests {
         assert_eq!(
             params[0].ty,
             Ty::Union {
-                variants: vec![Ty::Int, Ty::Str]
-            }
+                variants: vec![Ty::Int, Ty::Str].into()
+            }.into()
         );
     }
 
@@ -1480,8 +1571,8 @@ mod tests {
         assert_eq!(
             params[0].ty,
             Ty::Tuple {
-                elems: vec![Ty::Int, Ty::Str]
-            }
+                elems: vec![Ty::Int, Ty::Str].into()
+            }.into()
         );
     }
 
@@ -1489,7 +1580,7 @@ mod tests {
     fn user_class_becomes_class_id() {
         let src = "module M\n  def f: (Article) -> void\nend\n";
         let (params, _) = fn_parts(parse_one(src));
-        let Ty::Class { id, args } = &params[0].ty else {
+        let Ty::Class { id, args } = &*params[0].ty else {
             panic!("expected Class, got {:?}", params[0].ty);
         };
         assert_eq!(id.0.as_str(), "Article");
@@ -1500,7 +1591,7 @@ mod tests {
     fn generic_user_class_keeps_args() {
         let src = "module M\n  def f: (Relation[Article]) -> void\nend\n";
         let (params, _) = fn_parts(parse_one(src));
-        let Ty::Class { id, args } = &params[0].ty else {
+        let Ty::Class { id, args } = &*params[0].ty else {
             panic!("expected Class");
         };
         assert_eq!(id.0.as_str(), "Relation");
@@ -1532,9 +1623,10 @@ mod tests {
     #[test]
     fn effects_default_to_pure() {
         let src = "module M\n  def f: () -> void\nend\n";
-        let Ty::Fn { effects, .. } = parse_one(src) else {
+        let Ty::Fn(fn_ty) = parse_one(src) else {
             panic!("expected Ty::Fn");
         };
+        let FnTy { effects, .. } = *fn_ty;
         assert!(effects.is_pure());
     }
 
@@ -1601,7 +1693,7 @@ end
         let out = parse_app_ivars(src).expect("parses");
         let rel = &out[&ClassId(Symbol::from("ActiveRecord::Relation"))];
         assert_eq!(rel[&Symbol::from("limit")], Ty::Union {
-            variants: vec![Ty::Int, Ty::Nil],
+            variants: vec![Ty::Int, Ty::Nil].into(),
         });
         assert!(matches!(
             &rel[&Symbol::from("records")],
@@ -1613,7 +1705,7 @@ end
         assert_eq!(
             base[&Symbol::from("errors")],
             Ty::Array {
-                elem: Box::new(Ty::Str),
+                elem: std::sync::Arc::new(Ty::Str),
             }
         );
         assert_eq!(base[&Symbol::from("persisted")], Ty::Bool);
@@ -1677,9 +1769,10 @@ end
         let out = parse_app_signatures(src).expect("parses");
         let methods = &out[&ClassId(Symbol::from("Article"))];
         let ty = &methods[&Symbol::from("full_name")];
-        let Ty::Fn { ret, .. } = ty else {
+        let Ty::Fn(fn_ty) = ty else {
             panic!("expected Ty::Fn, got {ty:?}");
         };
+        let FnTy { ret, .. } = &**fn_ty;
         assert_eq!(**ret, Ty::Str);
     }
 
@@ -1706,13 +1799,14 @@ end
     /// Helper: pull the return-type ClassId for a single-method
     /// `(class_name, method_name)` pair from a multi-class app sigs map.
     fn return_class_id(
-        out: &std::collections::HashMap<ClassId, std::collections::HashMap<Symbol, Ty>>,
+        out: &crate::det::HashMap<ClassId, crate::det::HashMap<Symbol, Ty>>,
         class_path: &str,
         method: &str,
     ) -> Option<String> {
         let methods = out.get(&ClassId(Symbol::from(class_path)))?;
         let ty = methods.get(&Symbol::from(method))?;
-        let Ty::Fn { ret, .. } = ty else { return None };
+        let Ty::Fn(fn_ty) = ty else { return None };
+        let FnTy { ret, .. } = &**fn_ty;
         match &**ret {
             Ty::Class { id, .. } => Some(id.0.as_str().to_string()),
             Ty::Array { elem } => match &**elem {
@@ -1758,8 +1852,9 @@ end
         let out = parse_app_signatures(src).expect("parses");
         let methods = out.get(&ClassId(Symbol::from("ActiveRecord::Base"))).expect("Base methods");
         let ty = &methods[&Symbol::from("from_record")];
-        let Ty::Fn { params, .. } = ty else { panic!("expected Ty::Fn") };
-        match &params[0].ty {
+        let Ty::Fn(fn_ty) = ty else { panic!("expected Ty::Fn") };
+        let FnTy { params, .. } = &**fn_ty;
+        match &*params[0].ty {
             Ty::Class { id, .. } => assert_eq!(id.0.as_str(), "ActiveRecord::Base"),
             other => panic!("expected Class(ActiveRecord::Base), got {other:?}"),
         }
@@ -1896,7 +1991,8 @@ end
         let out = parse_app_signatures(src).expect("parses");
         let methods = out.get(&ClassId(Symbol::from("ActiveRecord::Base"))).expect("Base methods");
         let ty = &methods[&Symbol::from("find_by")];
-        let Ty::Fn { ret, .. } = ty else { panic!("expected Ty::Fn") };
+        let Ty::Fn(fn_ty) = ty else { panic!("expected Ty::Fn") };
+        let FnTy { ret, .. } = &**fn_ty;
         let Ty::Union { variants } = &**ret else {
             panic!("expected Union, got {ret:?}");
         };
@@ -1962,24 +2058,24 @@ end
     // ── printer round-trips ──────────────────────────────────────────
 
     fn fn_ty(params: Vec<Param>, ret: Ty) -> Ty {
-        Ty::Fn { params, block: None, ret: Box::new(ret), effects: EffectSet::pure() }
+        Ty::Fn(Box::new(FnTy { params: params.into(), block: None, ret: std::sync::Arc::new(ret), effects: EffectSet::pure() }))
     }
 
     fn req(name: &str, ty: Ty) -> Param {
-        Param { name: Symbol::from(name), ty, kind: ParamKind::Required }
+        Param { name: Symbol::from(name), ty: ty.into(), kind: ParamKind::Required }
     }
 
     #[test]
     fn print_ty_covers_the_parseable_surface() {
         assert_eq!(print_ty(&Ty::Int), "Integer");
         assert_eq!(print_ty(&Ty::Bool), "bool");
-        let account = Ty::Class { id: ClassId(Symbol::from("Account")), args: vec![] };
+        let account = Ty::Class { id: ClassId(Symbol::from("Account")), args: vec![].into() };
         assert_eq!(
-            print_ty(&Ty::Union { variants: vec![account.clone(), Ty::Nil] }),
+            print_ty(&Ty::Union { variants: vec![account.clone(), Ty::Nil].into() }),
             "Account?"
         );
         assert_eq!(
-            print_ty(&Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(Ty::Str) }),
+            print_ty(&Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Str) }),
             "Hash[Symbol, String]"
         );
         // Out-of-subset shapes degrade to valid RBS, never to garbage.
@@ -1989,18 +2085,18 @@ end
 
     #[test]
     fn printed_sidecar_round_trips_through_the_parser() {
-        let account = Ty::Class { id: ClassId(Symbol::from("Account")), args: vec![] };
+        let account = Ty::Class { id: ClassId(Symbol::from("Account")), args: vec![].into() };
         let methods = vec![
             (
                 Symbol::from("find"),
                 fn_ty(
                     vec![req("id", Ty::Str)],
-                    Ty::Union { variants: vec![account.clone(), Ty::Nil] },
+                    Ty::Union { variants: vec![account.clone(), Ty::Nil].into() },
                 ),
             ),
             (
                 Symbol::from("names"),
-                fn_ty(vec![], Ty::Array { elem: Box::new(Ty::Str) }),
+                fn_ty(vec![], Ty::Array { elem: std::sync::Arc::new(Ty::Str) }),
             ),
             (
                 Symbol::from("lookup"),
@@ -2009,11 +2105,11 @@ end
                         req("key", Ty::Sym),
                         Param {
                             name: Symbol::from("strict"),
-                            ty: Ty::Bool,
+                            ty: Ty::Bool.into(),
                             kind: ParamKind::Keyword { required: false },
                         },
                     ],
-                    Ty::Union { variants: vec![Ty::Int, Ty::Str] },
+                    Ty::Union { variants: vec![Ty::Int, Ty::Str].into() },
                 ),
             ),
         ];
@@ -2031,7 +2127,7 @@ end
     fn printed_namespaced_module_sidecar_round_trips() {
         let methods = vec![(
             Symbol::from("current_scope"),
-            fn_ty(vec![], Ty::Class { id: ClassId(Symbol::from("Account")), args: vec![] }),
+            fn_ty(vec![], Ty::Class { id: ClassId(Symbol::from("Account")), args: vec![].into() }),
         )];
         let printed =
             print_sidecar("Admin::ScopeHelper", true, &methods).expect("printable");

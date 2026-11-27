@@ -21,6 +21,22 @@ fn rewrite(expr: &mut Expr) {
 }
 
 pub(crate) fn rewrite_node(expr: &mut Expr) {
+    // Crystal prints these names literally. The rewrite used to live in
+    // `emit/crystal/expr.rs`. `time_current` calls the same function on
+    // the node it just built (`Time.current`, `to_fs(:iso8601)`).
+    ground_crystal_time_bridge(expr);
+    if let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &mut *expr.node {
+        let time_class = matches!(&*r.node, ExprNode::Const { path }
+            if path.last().is_some_and(|s| s.as_str() == "Time")
+                && path.iter().rev().skip(1).all(|s| s.as_str().is_empty()));
+        if time_class && method.as_str() == "find_zone" && args.len() == 1 {
+            *r = Expr::new(r.span, ExprNode::Const {
+                path: vec![Symbol::from("ActiveSupport"), Symbol::from("TimeZone")],
+            });
+            *method = Symbol::from("lookup");
+            return;
+        }
+    }
     // Not `TimeZone[name]`: a class-side index is an operator on the strict targets; the runtime port answers it as `lookup`.
     if let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &mut *expr.node {
         if method.as_str() == "[]" && args.len() == 1 && is_time_zone_class(r) {
@@ -52,15 +68,20 @@ pub(crate) fn rewrite_node(expr: &mut Expr) {
     };
     if is_time_zone_send(r) && args.is_empty() {
         let today = || time_expr(active_support_call("beginning_of_day", vec![now()]));
+        let is_tzinfo = method.as_str() == "tzinfo";
         let grounded = match method.as_str() {
             "now" => active_support_call("now", vec![]),
             "today" => active_support_call("beginning_of_day", vec![now()]),
             "yesterday" => active_support_call("yesterday", vec![today()]),
             "tomorrow" => active_support_call("tomorrow", vec![today()]),
+            "tzinfo" => active_support_call("current_tzinfo", vec![]),
             _ => return,
         };
         *expr.node = grounded;
-        expr.ty = Some(Ty::Time);
+        // `Time.zone.tzinfo` keeps the TimeZoneInfo type analysis gave it.
+        if !is_tzinfo {
+            expr.ty = Some(Ty::Time);
+        }
         return;
     }
     // Rails `Date.current` / `Date.yesterday` / `Date.tomorrow` — class-side.
@@ -98,6 +119,19 @@ pub(crate) fn rewrite_node(expr: &mut Expr) {
         return;
     }
     if !is_time_value(r) {
+        return;
+    }
+    if method.as_str() == "change"
+        && matches!(r.ty, Some(Ty::Time))
+        && let Some(usec) = change_usec_arg(args)
+    {
+        *expr.node = active_support_call("change_time_usec", vec![r.clone(), usec]);
+        expr.ty = Some(Ty::Time);
+        return;
+    }
+    if method.as_str() == "to_date" && args.is_empty() {
+        *expr.node = active_support_call("date_current", vec![r.clone()]);
+        expr.ty = Some(Ty::Date);
         return;
     }
     if method.as_str() == "in_time_zone" && args.len() <= 1 {
@@ -187,7 +221,30 @@ pub(crate) fn rewrite_node(expr: &mut Expr) {
     *expr.node = active_support_call(target, call_args);
 }
 
+pub(crate) fn date_calendar_duration(expr: &Expr) -> Option<(&'static str, &Expr)> {
+    let ExprNode::Send { recv: Some(count), method, args, block: None, .. } = &*expr.node else { return None };
+    if !args.is_empty() || !matches!(count.ty, Some(Ty::Int)) {
+        return None;
+    }
+    let unit = match method.as_str() {
+        "day" | "days" => "days",
+        "week" | "weeks" => "weeks",
+        "month" | "months" => "months",
+        "year" | "years" => "years",
+        _ => return None,
+    };
+    Some((unit, count))
+}
+
 fn rewrite_date_value(expr: &mut Expr, r: &Expr, method: &str, args: &[Expr]) {
+    if matches!(method, "+" | "-") && args.len() == 1
+        && let Some((unit, count)) = date_calendar_duration(&args[0])
+    {
+        let direction = if method == "+" { "since" } else { "ago" };
+        *expr.node = active_support_call(&format!("date_{unit}_{direction}"), vec![r.clone(), count.clone()]);
+        expr.ty = Some(Ty::Date);
+        return;
+    }
     if method == "in_time_zone" && args.len() <= 1 {
         let midnight = time_expr(active_support_call("date_at_midnight", vec![r.clone()]));
         let grounded = match args.first() {
@@ -389,7 +446,7 @@ fn zone_name_arg(zone: &Expr) -> Expr {
         return zone.clone();
     }
     let mut name = Expr::new(Span::synthetic(), active_support_call("zone_name", vec![zone.clone()]));
-    name.ty = Some(Ty::Union { variants: vec![Ty::Str, Ty::Nil] });
+    name.ty = Some(Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() });
     name
 }
 
@@ -415,6 +472,19 @@ fn is_time_zone_class(expr: &Expr) -> bool {
             ["ActiveSupport", "TimeZone"] | ["", "ActiveSupport", "TimeZone"]))
 }
 
+fn change_usec_arg(args: &[Expr]) -> Option<Expr> {
+    let [options] = args else { return None };
+    let ExprNode::Hash { entries, .. } = &*options.node else { return None };
+    let [(key, value)] = entries.as_slice() else { return None };
+    if matches!(&*key.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "usec")
+        && matches!(value.ty, Some(Ty::Int))
+    {
+        Some(value.clone())
+    } else {
+        None
+    }
+}
+
 fn active_support_call(method: &str, args: Vec<Expr>) -> ExprNode {
     let mut recv = Expr::new(
         Span::synthetic(),
@@ -424,7 +494,7 @@ fn active_support_call(method: &str, args: Vec<Expr>) -> ExprNode {
     );
     recv.ty = Some(Ty::Class {
         id: ClassId(Symbol::from("ActiveSupport")),
-        args: vec![],
+        args: vec![].into(),
     });
     ExprNode::Send {
         recv: Some(recv),
@@ -433,6 +503,86 @@ fn active_support_call(method: &str, args: Vec<Expr>) -> ExprNode {
         args,
         block: None,
     }
+}
+
+/// `Time.now.utc` (zero args, bare or root `Time`) → `Time.utc`.
+/// Zero-arg `iso8601` on a time value, or on that clock, → `to_rfc3339`.
+///
+/// `Foo::Time` is a different constant: `Foo::Time.now.utc` stays a chain.
+/// An unknown receiver, a `Date`, and an application class keep `iso8601`
+/// — those targets print the method name, and only `Time` grew
+/// `to_rfc3339`. `Time.utc(year, …)` and `iso8601(n)` stay: Crystal's
+/// clock is the no-arg class method, and an explicit fraction is a
+/// different call.
+pub(crate) fn ground_crystal_time_bridge(expr: &mut Expr) {
+    let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &mut *expr.node else {
+        return;
+    };
+    if method.as_str() == "iso8601" && args.is_empty() && is_time_rfc3339_receiver(r) {
+        *method = Symbol::from("to_rfc3339");
+        expr.decisions |= crate::expr::GROUNDED_TIME_FORMAT;
+        return;
+    }
+    if method.as_str() != "utc" || !args.is_empty() {
+        return;
+    }
+    // The send is already `.utc`. Point it at `Time` instead of rebuilding
+    // the node, so `parenthesized` and the surrounding expr stay.
+    let Some(time) = time_now_const(r) else { return };
+    *r = time;
+}
+
+/// A tree spliced in after the postorder walk (`to_fs` format lambdas).
+pub(crate) fn ground_crystal_time_bridge_tree(expr: &mut Expr) {
+    expr.node.for_each_child_mut(&mut ground_crystal_time_bridge_tree);
+    ground_crystal_time_bridge(expr);
+}
+
+/// The `Time` constant under `Time.now`, cloned so the clock send can
+/// reuse it as `Time.utc`.
+fn time_now_const(now_send: &Expr) -> Option<Expr> {
+    let ExprNode::Send { recv: Some(inner), method, args, block: None, .. } = &*now_send.node else {
+        return None;
+    };
+    if method.as_str() != "now" || !args.is_empty() {
+        return None;
+    }
+    if is_root_time_const(inner) { Some(inner.clone()) } else { None }
+}
+
+/// Bare `Time` and rooted `::Time`. A namespaced `Foo::Time` is not the
+/// stdlib clock — same rule as the TypeScript emitter.
+fn is_root_time_const(e: &Expr) -> bool {
+    matches!(&*e.node, ExprNode::Const { path }
+        if path.last().is_some_and(|s| s.as_str() == "Time")
+            && path.iter().rev().skip(1).all(|s| s.as_str().is_empty()))
+}
+
+/// `Time.now` / `Time.utc` / `Time.now.utc`, including the rooted form.
+/// The type stamp is missing on some synthesized chains; the shape is
+/// still the stdlib clock.
+fn is_stdlib_time_clock(e: &Expr) -> bool {
+    let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*e.node else {
+        return false;
+    };
+    if !args.is_empty() {
+        return false;
+    }
+    match method.as_str() {
+        "now" | "utc" if is_root_time_const(r) => true,
+        "utc" => is_stdlib_time_clock(r),
+        _ => false,
+    }
+}
+
+/// A zero-arg `to_rfc3339` on this receiver is the grounded time format.
+/// Emitters use the same test so an application method of that name
+/// keeps normal dispatch.
+pub(crate) fn is_time_rfc3339_receiver(recv: &Expr) -> bool {
+    if is_root_time_const(recv) {
+        return false;
+    }
+    is_time_value(recv) || is_stdlib_time_clock(recv)
 }
 
 fn is_time_const(e: &Expr) -> bool {
@@ -446,10 +596,50 @@ fn is_date_const(e: &Expr) -> bool {
         && path.iter().rev().skip(1).all(|s| s.as_str().is_empty()))
 }
 
+/// Every `tz.tzinfo` and `Time.zone.tzinfo` the app makes, in its views,
+/// controllers, models and library classes. `ActiveSupport::TimeZone`
+/// and `TimeZoneInfo` are ruby-family runtime classes, so
+/// `project::report_tzinfo_reads` refuses these on the other targets.
+pub(crate) fn tzinfo_reads(app: &App) -> Vec<Span> {
+    fn visit(e: &Expr, out: &mut Vec<Span>) {
+        if let ExprNode::Send { recv: Some(r), method, args, .. } = &*e.node
+            && !e.span.is_synthetic()
+            && ((method.as_str() == "tzinfo"
+                && (is_time_zone_send(r)
+                    // A lookup's zone-or-nil too (`Time.find_zone(…)`).
+                    || matches!(r.ty.as_ref().map(Ty::peel_nilable), Some(Ty::Class { id, .. }) if id.0.as_str() == "ActiveSupport::TimeZone")))
+                // `Time.zone.tzinfo` as this pass grounds it, which keeps the call's span.
+                || (method.as_str() == "current_tzinfo"
+                    && args.is_empty()
+                    && matches!(&*r.node, ExprNode::Const { path } if path.len() == 1 && path[0].as_str() == "ActiveSupport")))
+        {
+            out.push(e.span);
+        }
+        e.node.for_each_child(&mut |c| visit(c, out));
+    }
+    let mut out = Vec::new();
+    for view in &app.views {
+        visit(&view.body, &mut out);
+    }
+    for controller in &app.controllers {
+        for item in &controller.body {
+            if let crate::dialect::ControllerBodyItem::Action { action, .. } = item {
+                visit(&action.body, &mut out);
+            }
+        }
+    }
+    // Association scopes too (`has_many :x, -> { … }`), which the hook
+    // walk leaves out.
+    super::for_each_emit_body_ref(app, &mut |body| visit(body, &mut out));
+    out.sort_by_key(|s| (s.file.0, s.start));
+    out.dedup();
+    out
+}
+
 fn is_time_zone_send(e: &Expr) -> bool {
     matches!(&*e.node,
         ExprNode::Send { recv: Some(z), method, args, block: None, .. }
-            if method.as_str() == "zone" && args.is_empty() && is_time_const(z))
+            if method.as_str() == "zone" && args.is_empty() && is_root_time_const(z))
 }
 
 // Not every `Time`-typed receiver: the `Time` constant and `Time.zone` flatten onto the same type as a Time value.

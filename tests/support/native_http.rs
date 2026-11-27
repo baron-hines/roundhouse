@@ -17,6 +17,9 @@ use std::time::{Duration, Instant};
 
 /// `spin build blog` in `tree`; panics with the compiler's output.
 pub fn build(tree: &Path) {
+    if std::env::var_os("RH_SPINEL_BUNDLE_COLLECT").is_some() {
+        panic!("spinel bundle collect: not bundled");
+    }
     let output = Command::new("spin")
         .args(["build", "blog"])
         .current_dir(tree)
@@ -106,6 +109,13 @@ impl Server {
         self.get_with_headers(path, &[("Cookie", self.cookie.as_str())])
     }
 
+    /// Retain every raw Set-Cookie field rather than collapsing its values
+    /// into the convenience header map.
+    pub fn get_with_set_cookies(&self, path: &str) -> (Response, Vec<String>) {
+        let (status, cookies, headers, body) = self.send("GET", path, &[], "");
+        (Response { status, headers, body }, cookies)
+    }
+
     /// A POST with the session's cookie and token.
     pub fn post(&self, path: &str, content_type: &str, body: &str) -> Response {
         let headers = [
@@ -122,6 +132,18 @@ impl Server {
     pub fn get_with_headers(&self, path: &str, headers: &[(&str, &str)]) -> Response {
         let (status, _, response_headers, body) = self.send("GET", path, headers, "");
         Response { status, headers: response_headers, body }
+    }
+
+    /// Any verb, with exactly the given headers and body (no session).
+    pub fn request(&self, method: &str, path: &str, headers: &[(&str, &str)], body: &str) -> Response {
+        let (status, _, response_headers, body) = self.send(method, path, headers, body);
+        Response { status, headers: response_headers, body }
+    }
+
+    /// Any request, with the cookies the response sets, for a flow that carries them on.
+    pub fn request_with_set_cookies(&self, method: &str, path: &str, headers: &[(&str, &str)], body: &str) -> (Response, Vec<String>) {
+        let (status, set_cookies, response_headers, body) = self.send(method, path, headers, body);
+        (Response { status, headers: response_headers, body }, set_cookies)
     }
 
     /// A POST with neither cookie nor token.

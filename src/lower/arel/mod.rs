@@ -25,12 +25,13 @@ pub use ir::{
     Order, Predicate, PreloadDirective, Select, Update, Value, ValueType,
 };
 pub use visitor::{ArelVisitor, SqliteVisitor};
+pub(crate) use ruby_values::StringEnums;
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::analyze::ClassInfo;
-use crate::expr::{Expr, ExprNode, InterpPart};
-use crate::ident::{ClassId, Symbol};
+use crate::expr::{Expr, ExprNode, InterpPart, LValue};
+use crate::ident::{ClassId, Symbol, VarId};
 use crate::schema::Schema;
 use crate::ty::Ty;
 
@@ -64,11 +65,13 @@ pub fn rewrite_arel_in_expr_with_assocs(
     registry: &HashMap<ClassId, ClassInfo>,
     assocs: &[crate::lower::model_associations::AssociationEdge],
 ) -> bool {
-    let no_scopes = std::collections::HashSet::new();
-    rewrite_arel_in_expr_with_ruby_values(expr, schema, registry, assocs, false, &no_scopes)
+    let no_scopes = crate::det::HashSet::default();
+    rewrite_arel_in_expr_with_ruby_values(expr, schema, registry, assocs, None, &no_scopes, SqliteVisitor::default())
 }
 
 /// Ruby-family values preserve SQL NULL without changing strict-target emit.
+/// `ruby_read_values` is `Some` on those targets only, with the String
+/// enum mappings a folded literal is cast through.
 /// `scopes` is the app's relation-returning class methods (`scope`
 /// declarations plus class methods whose body tail is a query chain) —
 /// see `relation_refined_method_names` for why these license the same
@@ -78,8 +81,9 @@ pub(crate) fn rewrite_arel_in_expr_with_ruby_values(
     schema: &Schema,
     registry: &HashMap<ClassId, ClassInfo>,
     assocs: &[crate::lower::model_associations::AssociationEdge],
-    ruby_read_values: bool,
-    scopes: &std::collections::HashSet<crate::ident::Symbol>,
+    ruby_read_values: Option<&StringEnums>,
+    scopes: &crate::det::HashSet<crate::ident::Symbol>,
+    visitor: SqliteVisitor,
 ) -> bool {
     // Names (ivars/locals) the body later refines with relation-chain
     // methods (`@moderations.where(...)` after `@moderations =
@@ -88,7 +92,8 @@ pub(crate) fn rewrite_arel_in_expr_with_ruby_values(
     // runtime Relation path.
     let mut refined = RefinedNames::default();
     collect_relation_refined_names(expr, scopes, &mut refined);
-    let mut changed = rewrite_arel_inner(expr, schema, registry, assocs, &refined, ruby_read_values, scopes);
+    HOIST_TEMPORARIES.with(|c| c.set(0));
+    let mut changed = rewrite_arel_inner(expr, schema, registry, assocs, &refined, ruby_read_values, scopes, visitor);
     // Both call sites hand us a METHOD BODY, and a body that is a
     // single statement is not a `Seq` — so the hoist post-pass inside
     // `rewrite_arel_inner`, which walks a Seq's statement list, had no
@@ -121,11 +126,12 @@ pub(crate) fn rewrite_arel_in_expr_with_ruby_values(
     changed
 }
 
-const RELATION_REFINERS: &[&str] = &[
-    "where", "not", "joins", "left_outer_joins", "left_joins", "order", "group", "having",
-    "limit", "offset", "merge", "includes", "preload", "eager_load", "references", "distinct",
-    "select", "where!", "order!", "reorder", "rewhere",
-];
+/// A catalog Builder (any receiver) or a [`crate::catalog::BUILDER_ALIASES`]
+/// spelling. Hydrating the receiver of one of these to an Array strands
+/// the call. Same set as [`crate::lower::scope_chain::is_relation_chain_method`].
+pub(crate) fn is_relation_refiner(method: &str) -> bool {
+    crate::catalog::is_relation_builder_name(method)
+}
 
 /// A finder terminates a relation but still needs that relation as its
 /// receiver. If the whole call cannot lift, hydrating only its receiver
@@ -134,8 +140,10 @@ const RELATION_REFINERS: &[&str] = &[
 /// Rails' per-column dynamic finders (`find_by_id`, `find_by_email!`, …)
 /// are the same shape as `find_by` and need the same treatment (#558).
 fn requires_relation_receiver(method: &str) -> bool {
-    RELATION_REFINERS.contains(&method)
+    is_relation_refiner(method)
         || matches!(method, "find_by" | "find_by!" | "sole" | "find_sole_by")
+        // Not a lifted SELECT: Array answers none of the bulk writes, so the hydrated rows would raise NoMethodError.
+        || matches!(method, "delete_all" | "update_all" | "destroy_all" | "touch_all")
         || is_dynamic_finder(method)
 }
 
@@ -193,27 +201,96 @@ fn dynamic_finder_attr(method: &str) -> Option<(&str, bool)> {
 /// would rename that call into a bogus `find_by(password_reset_token:
 /// …)` querying a column that doesn't exist). A name that isn't a real
 /// column is left exactly as written, so it keeps dispatching to
-/// whatever method actually owns it. The model is resolved by walking
-/// the chain down to its root Const rather than trusting the
-/// receiver's stamped `ty`: this pass runs on the lowerer's OWN
-/// re-typing of the body, whose registry is assembled fresh per
-/// lowering call and doesn't carry the main analyze pass's full
-/// class-method catalog, so a `Model.includes(...)` chain root can
-/// still read back `Untyped` here even though the construct is fully
-/// supported end to end.
-fn normalize_dynamic_finder_send(expr: &mut Expr, registry: &HashMap<ClassId, ClassInfo>) -> bool {
-    let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &mut *expr.node
+/// whatever method actually owns it. A nominal model type describes
+/// instances too: only a proven class object or a typed relation can
+/// license this rewrite. At ingest, the caller supplies class-side
+/// context and resolves constant receivers before calling this rule.
+pub(crate) fn normalize_dynamic_finder_send(
+    expr: &mut Expr,
+    registry: &HashMap<ClassId, ClassInfo>,
+    self_class: Option<&ClassId>,
+    before_scope_threading: bool,
+) -> bool {
+    if expr.decisions & crate::expr::FINDER_DISPATCH_FALLBACK != 0
+        || dynamic_finder_delegate_refusal(expr, registry).is_some() { return false; }
+    if normalize_polymorphic_finder(expr, registry, self_class, before_scope_threading) {
+        return true;
+    }
+    let ExprNode::Send { recv, method, args, block, .. } = &mut *expr.node
     else {
         return false;
     };
-    let Some((attr, bang)) = dynamic_finder_attr(method.as_str()) else {
-        return false;
+    let reflected = matches!(method.as_str(), "send" | "public_send" | "__send__");
+    let name = if reflected {
+        let Some(Expr { node, .. }) = args.first() else { return false };
+        match &**node {
+            ExprNode::Lit { value: crate::expr::Literal::Sym { value } } => value.clone(),
+            ExprNode::Lit { value: crate::expr::Literal::Str { value } } => Symbol::from(value.as_str()),
+            _ => return false,
+        }
+    } else {
+        method.clone()
     };
-    let [value] = &args[..] else { return false };
-    let owns_column = chain_root_class(recv, registry)
-        .and_then(|of| registry.get(&of))
-        .is_some_and(|ci| ci.has_schema_column(&Symbol::from(attr)));
-    if !owns_column {
+    if !matches!(name.as_str(), "find_by" | "find_by!") && dynamic_finder_attr(name.as_str()).is_none() { return false; }
+    let owner = match recv.as_ref().map(|r| &*r.node) {
+        None => self_class.cloned(),
+        Some(ExprNode::SelfRef) if self_class.is_some() => self_class.cloned(),
+        Some(ExprNode::Const { .. }) if before_scope_threading && self_class.is_some() => recv.as_ref().and_then(|r| match r.ty.as_ref() {
+            Some(Ty::Class { id, .. }) => Some(id.clone()),
+            _ => build::const_to_class_id(r, registry),
+        }),
+        _ => recv.as_ref().and_then(|r| match r.ty.as_ref() {
+            Some(Ty::Relation { of }) => Some(of.clone()),
+            Some(Ty::Class { id, args }) if id.0.as_str() == "Class" && args.len() == 1 => {
+                match &args[0] { Ty::Class { id, .. } => Some(id.clone()), _ => None }
+            }
+            // Nominal Class types also describe model instances. The
+            // analyzer's value proof survives copies without licensing
+            // record locals or arbitrary model-returning calls.
+            Some(Ty::Class { id, .. }) if r.decisions & crate::expr::CLASS_OBJECT_VALUE != 0 => Some(id.clone()),
+            _ => None,
+        }),
+    };
+    let Some(owner) = owner else { return false };
+    if ClassInfo::class_method_ownership_unknown(registry, &owner, &name) {
+        // A later registry built from lowered models must not rediscover a
+        // framework finder after the original hook provenance has gone.
+        expr.decisions |= crate::expr::FINDER_DISPATCH_FALLBACK;
+        if dynamic_finder_attr(name.as_str()).is_some()
+            && !ClassInfo::class_method_implementation_exists(registry, &owner, &name)
+            && !ClassInfo::class_method_implementation_exists(registry, &owner, &Symbol::from("method_missing"))
+            && !(reflected && ClassInfo::class_method_implementation_exists(registry, &owner, method))
+        {
+            expr.decisions |= crate::expr::FINDER_IMPLEMENTATION_UNKNOWN;
+        }
+        return false;
+    }
+    if block.is_some() { return false; }
+    let Some((attr, bang)) = dynamic_finder_attr(name.as_str()) else { return false };
+    let [value] = (if reflected { &args[1..] } else { &args[..] }) else { return false };
+    if matches!(&*value.node, ExprNode::Splat { .. } | ExprNode::KeywordSplat { .. }) { return false; }
+    if !ClassInfo::active_record_class(registry, &owner)
+        || ClassInfo::schema_column_owner(registry, &owner, &Symbol::from(attr)).is_none()
+        || ClassInfo::source_class_method(registry, &owner, &name)
+        || ClassInfo::class_method_ownership_unknown(registry, &owner, &name)
+        || ClassInfo::source_class_method(registry, &owner, &Symbol::from("method_missing"))
+        || (reflected && ClassInfo::source_class_method(registry, &owner, method))
+    {
+        return false;
+    }
+    // A source delegate runs on the class, rather than the relation's
+    // builtin find_by. Keep its dynamic spelling until scope threading
+    // has finished, so it cannot be mistaken for a relation terminal.
+    if before_scope_threading
+        && (if bang { &["find_by!", "find_by"][..] } else { &["find_by"][..] }).iter().any(|name|
+            ClassInfo::source_class_method(registry, &owner, &Symbol::from(*name)))
+    {
+        // Make implicit class self available to the later, typed pass,
+        // including a reflected send whose delegate is source-owned.
+        if recv.is_none() {
+            *recv = Some(Expr::new(expr.span, ExprNode::SelfRef));
+            return true;
+        }
         return false;
     }
     let span = value.span;
@@ -223,10 +300,208 @@ fn normalize_dynamic_finder_send(expr: &mut Expr, registry: &HashMap<ClassId, Cl
     );
     let hash = Expr::new(
         span,
-        ExprNode::Hash { entries: vec![(key, value.clone())], kwargs: true },
+        // ActiveRecord::DynamicMatchers passes an explicit positional hash.
+        ExprNode::Hash { entries: vec![(key, value.clone())], kwargs: false },
     );
     *method = Symbol::from(if bang { "find_by!" } else { "find_by" });
     *args = vec![hash];
+    if recv.is_none() {
+        *recv = Some(Expr::new(expr.span, ExprNode::SelfRef));
+    }
+    true
+}
+
+/// A relation's builtin find_by is not an application's class delegate.
+/// Until that delegate's scope can be threaded, retain the source call
+/// and refuse emission rather than silently bypass its return and work.
+pub(crate) fn dynamic_finder_delegate_refusal(
+    expr: &Expr, registry: &HashMap<ClassId, ClassInfo>,
+) -> Option<crate::diagnostic::Diagnostic> {
+    if expr.decisions & crate::expr::FINDER_IMPLEMENTATION_UNKNOWN != 0 {
+        return Some(crate::diagnostic::Diagnostic::unsupported(expr.span, None,
+            "dynamic finder without established implementation".to_owned(),
+            "class-side hook ownership is unknown and no emitted finder, missing handler or reflection wrapper is established".to_owned()));
+    }
+    let ExprNode::Send { recv: Some(receiver), method, args, block, .. } = &*expr.node else { return None };
+    let Some(Ty::Relation { of }) = receiver.ty.as_ref() else { return None };
+    let reflected = matches!(method.as_str(), "send" | "public_send" | "__send__");
+    let name = if reflected {
+        match args.first().map(|e| &*e.node) {
+            Some(ExprNode::Lit { value: crate::expr::Literal::Sym { value } }) => value.clone(),
+            Some(ExprNode::Lit { value: crate::expr::Literal::Str { value } }) => Symbol::from(value.as_str()),
+            _ => return None,
+        }
+    } else { method.clone() };
+    let (attr, bang) = dynamic_finder_attr(name.as_str())?;
+    if ClassInfo::class_method_ownership_unknown(registry, of, &name) {
+        return Some(crate::diagnostic::Diagnostic::unsupported(expr.span, None,
+            "relation finder with unknown class-side hook".to_owned(),
+            "retained hooks may own the model finder; the relation builtin cannot replace unknown dispatch".to_owned()));
+    }
+    if ClassInfo::source_class_method_owner(registry, of, &name)
+        .is_some_and(|(_, side)| side == crate::dialect::MethodReceiver::Instance)
+    {
+        return Some(crate::diagnostic::Diagnostic::unsupported(expr.span, None,
+            "relation dynamic finder with source delegate".to_owned(),
+            "the model's extension owns this finder; relation delegation is not established".to_owned()));
+    }
+    if block.is_some() { return None; }
+    if args.len() != if reflected { 2 } else { 1 }
+        || ClassInfo::schema_column_owner(registry, of, &Symbol::from(attr)).is_none()
+        || ClassInfo::source_class_method(registry, of, &name)
+        || ClassInfo::source_class_method(registry, of, &Symbol::from("method_missing"))
+        || !(if bang { &["find_by!", "find_by"][..] } else { &["find_by"][..] }).iter()
+            .any(|name| ClassInfo::source_class_method(registry, of, &Symbol::from(*name))) { return None; }
+    Some(crate::diagnostic::Diagnostic::unsupported(expr.span, None,
+        "relation dynamic finder with source delegate".to_owned(),
+        "the application's class finder delegate requires relation scope threading; the relation builtin cannot replace it".to_owned()))
+}
+
+/// A class-valued local can hold either arm, and inherited helpers run
+/// with the subclass as self. Keep source dispatch on those arms rather
+/// than replacing their finder with the framework delegate.
+fn normalize_polymorphic_finder(
+    expr: &mut Expr,
+    registry: &HashMap<ClassId, ClassInfo>,
+    self_class: Option<&ClassId>,
+    before_scope_threading: bool,
+) -> bool {
+    let ExprNode::Send { recv, method, args, block: None, .. } = &*expr.node else { return false };
+    let reflected = matches!(method.as_str(), "send" | "public_send" | "__send__");
+    let name = if reflected {
+        match args.first().map(|e| &*e.node) {
+            Some(ExprNode::Lit { value: crate::expr::Literal::Sym { value } }) => value.clone(),
+            Some(ExprNode::Lit { value: crate::expr::Literal::Str { value } }) => Symbol::from(value.as_str()),
+            _ => return false,
+        }
+    } else { method.clone() };
+    let (attr, bang) = if let Some((attr, bang)) = dynamic_finder_attr(name.as_str()) {
+        (Some(attr), bang)
+    } else if matches!(name.as_str(), "find_by" | "find_by!")
+        && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+    { (None, name.as_str().ends_with('!')) } else { return false };
+    let values = if reflected { &args[1..] } else { &args[..] };
+    if values.len() != 1 || matches!(&*values[0].node, ExprNode::Splat { .. } | ExprNode::KeywordSplat { .. }) { return false; }
+    let receiver = match recv {
+        None if self_class.is_some() => Expr::new(expr.span, ExprNode::SelfRef),
+        Some(r) if matches!(&*r.node, ExprNode::SelfRef | ExprNode::Var { .. })
+            && (self_class.is_some() && matches!(&*r.node, ExprNode::SelfRef)
+                || r.decisions & crate::expr::CLASS_OBJECT_VALUE != 0) => r.clone(),
+        _ => return false,
+    };
+    let mut union = Vec::new();
+    if let Some(Ty::Union { variants }) = receiver.ty.as_ref() {
+        for ty in variants.iter() {
+            let Ty::Class { id, .. } = ty else { return false };
+            if !ClassInfo::active_record_class(registry, id)
+                || attr.is_some_and(|attr| ClassInfo::schema_column_owner(registry, id, &Symbol::from(attr)).is_none()) { return false; }
+            union.push(id.clone());
+        }
+    }
+    let owner = self_class.cloned().or_else(|| match receiver.ty.as_ref() {
+        Some(Ty::Class { id, .. }) => Some(id.clone()), _ => None,
+    });
+    let mut arms = union.clone();
+    if arms.is_empty() {
+        let Some(owner) = owner else { return false };
+        if !ClassInfo::active_record_class(registry, &owner)
+            || attr.is_some_and(|attr| ClassInfo::schema_column_owner(registry, &owner, &Symbol::from(attr)).is_none()) { return false; }
+        if ClassInfo::source_class_method(registry, &owner, &name)
+            || ClassInfo::class_method_ownership_unknown(registry, &owner, &name)
+            || ClassInfo::source_class_method(registry, &owner, &Symbol::from("method_missing"))
+            || reflected && ClassInfo::source_class_method(registry, &owner, method)
+            || before_scope_threading && (if bang { &["find_by!", "find_by"][..] } else { &["find_by"][..] }).iter()
+                .any(|name| ClassInfo::source_class_method(registry, &owner, &Symbol::from(*name)))
+        { return false; }
+        for id in registry.keys() {
+            if *id == owner { continue; }
+            let mut current = registry.get(id).and_then(|c| c.parent.as_ref());
+            let mut seen = crate::det::HashSet::default();
+            while let Some(parent) = current {
+                if !seen.insert(parent) { break; }
+                if *parent == owner {
+                    if ClassInfo::source_class_method(registry, id, &name)
+                        || ClassInfo::source_class_method(registry, id, &Symbol::from("method_missing"))
+                        || reflected && ClassInfo::source_class_method(registry, id, method)
+                        || (if bang { &["find_by!", "find_by"][..] } else { &["find_by"][..] }).iter()
+                            .any(|name| ClassInfo::source_class_method(registry, id, &Symbol::from(*name)))
+                    { arms.push(id.clone()); }
+                    break;
+                }
+                current = registry.get(parent).and_then(|c| c.parent.as_ref());
+            }
+        }
+    }
+    if arms.is_empty() { return false; }
+    arms.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+    arms.dedup();
+    if arms.iter().any(|id| ClassInfo::source_class_method(registry, id, &Symbol::from("=="))) {
+        // The generated guards require identity comparison. An application
+        // class equality method can select a different finder arm.
+        crate::expr::ExprCold::set_diagnostic(&mut expr.cold, Some(crate::diagnostic::DiagnosticKind::Unsupported {
+            target: None, construct: Symbol::from("polymorphic finder with class equality override"),
+            detail: "source class equality cannot prove the identity guards needed for finder dispatch".to_owned(),
+        }));
+        expr.decisions |= crate::expr::FINDER_DISPATCH_FALLBACK;
+        return true;
+    }
+    let mut fallback = expr.clone();
+    // A generated fallback's receiver is the same class value, but the
+    // ordinary normalizer must not rediscover these polymorphic arms.
+    if let ExprNode::Send { recv, .. } = &mut *fallback.node {
+        let mut r = receiver.clone();
+        r.decisions &= !crate::expr::CLASS_OBJECT_VALUE;
+        *recv = Some(r);
+    }
+    // Normalize the framework arm using the lexical owner's proof.
+    if union.is_empty() {
+        let Some(owner) = self_class.cloned().or_else(|| match receiver.ty.as_ref() {
+            Some(Ty::Class { id, .. }) => Some(id.clone()), _ => None,
+        }) else { return false };
+        let mut constant = Expr::new(expr.span, ExprNode::Const { path: owner.const_path() });
+        constant.ty = Some(Ty::Class { id: owner, args: vec![].into() });
+        constant.decisions |= crate::expr::CLASS_OBJECT_VALUE | crate::expr::RESOLVED_CLASS_REF | crate::expr::GENERATED_CONST_REF;
+        if let ExprNode::Send { recv, .. } = &mut *fallback.node { *recv = Some(constant); }
+        normalize_dynamic_finder_send(&mut fallback, registry, None, before_scope_threading);
+        if let ExprNode::Send { recv, .. } = &mut *fallback.node { *recv = Some(receiver.clone()); }
+        fallback.decisions |= crate::expr::FINDER_DISPATCH_FALLBACK;
+    }
+    for (i, id) in arms.iter().enumerate().rev() {
+        let mut constant = Expr::new(expr.span, ExprNode::Const { path: id.const_path() });
+        constant.ty = Some(Ty::Class { id: id.clone(), args: vec![].into() });
+        constant.decisions |= crate::expr::CLASS_OBJECT_VALUE | crate::expr::RESOLVED_CLASS_REF | crate::expr::GENERATED_CONST_REF;
+        let mut call = expr.clone();
+        if let ExprNode::Send { recv, .. } = &mut *call.node { *recv = Some(constant.clone()); }
+        normalize_dynamic_finder_send(&mut call, registry, None, false);
+        if union.is_empty() && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)) {
+            // Implicit and explicit self can call private methods. An
+            // explicit subclass constant cannot; invoke the original
+            // dispatch through an unowned builtin reflection entry.
+            if let Some(alias) = ["__send__", "send"].into_iter().find(|alias|
+                !ClassInfo::source_class_method(registry, id, &Symbol::from(*alias)))
+            {
+                if let ExprNode::Send { method, args, .. } = &mut *call.node {
+                    args.insert(0, Expr::new(expr.span, ExprNode::Lit {
+                        value: crate::expr::Literal::Sym { value: method.clone() },
+                    }));
+                    *method = Symbol::from(alias);
+                }
+            } else {
+                crate::expr::ExprCold::set_diagnostic(&mut call.cold, Some(crate::diagnostic::DiagnosticKind::Unsupported {
+                    target: None, construct: Symbol::from("polymorphic finder"),
+                    detail: "source send and __send__ overrides prevent preserving implicit finder visibility".to_owned(),
+                }));
+            }
+        }
+        if !union.is_empty() && i + 1 == arms.len() { fallback = call; continue; }
+        let cond = Expr::new(expr.span, ExprNode::Send {
+            recv: Some(receiver.clone()), method: Symbol::from("=="), args: vec![constant],
+            block: None, parenthesized: true,
+        });
+        fallback = Expr::new(expr.span, ExprNode::If { cond, then_branch: call, else_branch: fallback });
+    }
+    fallback.ty = expr.ty.clone();
+    *expr = fallback;
     true
 }
 
@@ -262,7 +537,7 @@ fn chain_root_class<'e>(
 /// actually uses (#558).
 fn requires_relation_receiver_or_scope(
     method: &crate::ident::Symbol,
-    scopes: &std::collections::HashSet<crate::ident::Symbol>,
+    scopes: &crate::det::HashSet<crate::ident::Symbol>,
 ) -> bool {
     requires_relation_receiver(method.as_str()) || scopes.contains(method)
 }
@@ -291,8 +566,8 @@ fn requires_relation_receiver_or_scope(
 /// campfire's caller is `users_scope.active`, and `active` is a scope.
 pub fn relation_refined_method_names(
     body: &Expr,
-    scopes: &std::collections::HashSet<crate::ident::Symbol>,
-    out: &mut std::collections::HashSet<crate::ident::Symbol>,
+    scopes: &crate::det::HashSet<crate::ident::Symbol>,
+    out: &mut crate::det::HashSet<crate::ident::Symbol>,
 ) {
     if let ExprNode::Send { recv: Some(r), method, .. } = body.node.as_ref() {
         if requires_relation_receiver_or_scope(method, scopes) {
@@ -323,7 +598,7 @@ fn self_call_name(e: &Expr) -> Option<crate::ident::Symbol> {
 
 fn collect_relation_refined_names(
     expr: &Expr,
-    scopes: &std::collections::HashSet<crate::ident::Symbol>,
+    scopes: &crate::det::HashSet<crate::ident::Symbol>,
     out: &mut RefinedNames,
 ) {
     if let ExprNode::Send { recv: Some(r), method, args, block, .. } = expr.node.as_ref() {
@@ -355,7 +630,7 @@ fn collect_relation_refined_names(
 /// reading.
 #[derive(Default)]
 struct RefinedNames {
-    always: std::collections::HashSet<Symbol>,
+    always: crate::det::HashSet<Symbol>,
     by_scope: HashMap<Symbol, Vec<Symbol>>,
 }
 
@@ -391,7 +666,7 @@ fn model_declares_scope(registry: &HashMap<ClassId, ClassInfo>, model: &ClassId,
 pub(crate) fn returns_relation(ty: &Ty) -> bool {
     match ty {
         Ty::Relation { .. } => true,
-        Ty::Fn { ret, .. } => returns_relation(ret),
+        Ty::Fn(fn_ty) => returns_relation(&fn_ty.ret),
         _ => false,
     }
 }
@@ -402,8 +677,9 @@ fn rewrite_arel_inner(
     registry: &HashMap<ClassId, ClassInfo>,
     assocs: &[crate::lower::model_associations::AssociationEdge],
     refined: &RefinedNames,
-    ruby_read_values: bool,
-    scopes: &std::collections::HashSet<crate::ident::Symbol>,
+    ruby_read_values: Option<&StringEnums>,
+    scopes: &crate::det::HashSet<crate::ident::Symbol>,
+    visitor: SqliteVisitor,
 ) -> bool {
     if let ExprNode::Assign { target, value } = expr.node.as_ref() {
         let name = match target {
@@ -415,14 +691,19 @@ fn rewrite_arel_inner(
             return false;
         }
     }
-    if let ExprNode::Send { .. } = expr.node.as_ref() {
+    // Literal reflection must use the same normalization as direct
+    // sends. Leave the normalized call on the runtime path: its
+    // delegate may be application-defined.
+    let normalized = normalize_dynamic_finder_send(expr, registry, None, false);
+    if !normalized && expr.decisions & crate::expr::FINDER_DISPATCH_FALLBACK == 0
+        && let ExprNode::Send { .. } = expr.node.as_ref() {
         if let Some((mut op, owner)) =
             build::try_build_arel_with_assocs(expr, schema, registry, assocs)
         {
-            if ruby_read_values {
-                ruby_values::normalize(&mut op, schema);
+            if let Some(enums) = ruby_read_values {
+                ruby_values::normalize(&mut op, schema, enums.of(&owner));
             }
-            let mut replacement = SqliteVisitor.visit(&op, schema, &owner);
+            let mut replacement = visitor.visit(&op, schema, &owner);
             // The expansion replaces the recognized chain wholesale;
             // its provenance is the chain call site. Subtrees the
             // builder lifted out of the chain (predicate values, …)
@@ -454,19 +735,19 @@ fn rewrite_arel_inner(
                 || is_id_finder(method.as_str(), args)
     );
     if unlifted_relation_consumer {
-        let mut changed = normalize_dynamic_finder_send(expr, registry);
+        let mut changed = normalized;
         let ExprNode::Send { recv: Some(recv), args, .. } = &mut *expr.node else {
             unreachable!("matched Send with recv above");
         };
-        changed |= rewrite_arel_spine_args(recv, schema, registry, assocs, refined, ruby_read_values, scopes);
+        changed |= rewrite_arel_spine_args(recv, schema, registry, assocs, refined, ruby_read_values, scopes, visitor);
         for a in args {
-            changed |= rewrite_arel_inner(a, schema, registry, assocs, refined, ruby_read_values, scopes);
+            changed |= rewrite_arel_inner(a, schema, registry, assocs, refined, ruby_read_values, scopes, visitor);
         }
         return changed;
     }
-    let mut changed = false;
+    let mut changed = normalized;
     walk_subexprs_mut(expr, &mut |e| {
-        changed |= rewrite_arel_inner(e, schema, registry, assocs, refined, ruby_read_values, scopes)
+        changed |= rewrite_arel_inner(e, schema, registry, assocs, refined, ruby_read_values, scopes, visitor)
     });
     // Post-pass: when an Arel rewrite landed a multi-stmt hydrate Seq
     // in a *value* position — directly as an Assign value
@@ -498,19 +779,20 @@ fn rewrite_arel_spine_args(
     registry: &HashMap<ClassId, ClassInfo>,
     assocs: &[crate::lower::model_associations::AssociationEdge],
     refined: &RefinedNames,
-    ruby_read_values: bool,
-    scopes: &std::collections::HashSet<crate::ident::Symbol>,
+    ruby_read_values: Option<&StringEnums>,
+    scopes: &crate::det::HashSet<crate::ident::Symbol>,
+    visitor: SqliteVisitor,
 ) -> bool {
     let mut changed = false;
     if let ExprNode::Send { recv, args, block, .. } = &mut *expr.node {
         if let Some(r) = recv {
-            changed |= rewrite_arel_spine_args(r, schema, registry, assocs, refined, ruby_read_values, scopes);
+            changed |= rewrite_arel_spine_args(r, schema, registry, assocs, refined, ruby_read_values, scopes, visitor);
         }
         for a in args {
-            changed |= rewrite_arel_inner(a, schema, registry, assocs, refined, ruby_read_values, scopes);
+            changed |= rewrite_arel_inner(a, schema, registry, assocs, refined, ruby_read_values, scopes, visitor);
         }
         if let Some(b) = block {
-            changed |= rewrite_arel_inner(b, schema, registry, assocs, refined, ruby_read_values, scopes);
+            changed |= rewrite_arel_inner(b, schema, registry, assocs, refined, ruby_read_values, scopes, visitor);
         }
     }
     changed
@@ -548,58 +830,81 @@ fn hoist_value_seqs_in_stmts(stmts: &mut Vec<Expr>) -> bool {
 /// context children (block bodies, if/while branches, nested stmt Seqs)
 /// are NOT descended — their own enclosing Seq's post-pass handles them.
 ///
+/// Left to right, as Ruby evaluates them: a value evaluated before a
+/// hoisted Seq is bound to a temporary ahead of the Seq's statements, so
+/// `[a.save, <hydrate Seq>]` still saves before it queries. Not the
+/// right of `&&` / `||`, which runs only when the left lets it.
+///
 /// Note: two hydrate Seqs hoisted from one statement would both bind the
 /// visitor's fixed `stmt`/`results` locals and collide; that multi-query-
 /// per-statement case is a pre-existing visitor-naming limitation, not
 /// introduced here (every recognized site uses the same var names).
 fn hoist_value_seqs(e: &mut Expr, hoisted: &mut Vec<Expr>) -> bool {
-    let mut changed = false;
-    match &mut *e.node {
-        ExprNode::Send { recv, args, .. } => {
-            if let Some(r) = recv {
-                changed |= hoist_value_child(r, hoisted);
-            }
-            for a in args {
-                changed |= hoist_value_child(a, hoisted);
-            }
-        }
-        ExprNode::Apply { fun, args, .. } => {
-            changed |= hoist_value_child(fun, hoisted);
-            for a in args {
-                changed |= hoist_value_child(a, hoisted);
-            }
-        }
-        ExprNode::Assign { value, .. } | ExprNode::OpAssign { value, .. } => {
-            changed |= hoist_value_child(value, hoisted);
-        }
-        ExprNode::BoolOp { left, right, .. } => {
-            changed |= hoist_value_child(left, hoisted);
-            changed |= hoist_value_child(right, hoisted);
-        }
-        ExprNode::Array { elements, .. } => {
-            for el in elements {
-                changed |= hoist_value_child(el, hoisted);
-            }
-        }
-        ExprNode::Hash { entries, .. } => {
-            for (_, v) in entries {
-                changed |= hoist_value_child(v, hoisted);
-            }
-        }
+    let slots: Vec<&mut Expr> = match &mut *e.node {
+        ExprNode::Send { recv, args, .. } => recv.iter_mut().chain(args.iter_mut()).collect(),
+        ExprNode::Apply { fun, args, .. } => std::iter::once(fun).chain(args.iter_mut()).collect(),
+        ExprNode::Assign { value, .. } | ExprNode::OpAssign { value, .. } => vec![value],
+        ExprNode::BoolOp { left, .. } => vec![left],
+        ExprNode::Array { elements, .. } => elements.iter_mut().collect(),
+        ExprNode::Hash { entries, .. } => entries.iter_mut().flat_map(|(k, v)| [k, v]).collect(),
         ExprNode::Return { value }
         | ExprNode::Raise { value }
         | ExprNode::Splat { value }
-        | ExprNode::KeywordSplat { value } => {
-            changed |= hoist_value_child(value, hoisted);
+        | ExprNode::KeywordSplat { value } => vec![value],
+        ExprNode::Yield { args } => args.iter_mut().collect(),
+        _ => Vec::new(),
+    };
+    let mut changed = false;
+    let mut per_slot: Vec<Vec<Expr>> = Vec::with_capacity(slots.len());
+    let mut slots = slots;
+    for slot in slots.iter_mut() {
+        let mut own = Vec::new();
+        changed |= hoist_value_child(slot, &mut own);
+        per_slot.push(own);
+    }
+    let last_hoisting = per_slot.iter().rposition(|h| !h.is_empty());
+    for (j, (slot, own)) in slots.into_iter().zip(per_slot).enumerate() {
+        hoisted.extend(own);
+        if last_hoisting.is_some_and(|k| j < k) && !is_inert(slot) {
+            hoisted.push(bind_to_temporary(slot));
+            changed = true;
         }
-        ExprNode::Yield { args } => {
-            for a in args {
-                changed |= hoist_value_child(a, hoisted);
-            }
-        }
-        _ => {}
     }
     changed
+}
+
+/// A value whose reading cannot be changed by statements that run after
+/// it: nothing to bind before a later hoist.
+fn is_inert(e: &Expr) -> bool {
+    matches!(&*e.node, ExprNode::Lit { .. } | ExprNode::Const { .. } | ExprNode::SelfRef | ExprNode::Lambda { .. })
+}
+
+thread_local! {
+    static HOIST_TEMPORARIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Temporaries this thread has hoisted. Work handed to a worker thread
+/// must hoist none: the names follow the order bodies are lowered in.
+pub(crate) fn hoisted_temporaries() -> usize {
+    HOIST_TEMPORARIES.with(std::cell::Cell::get)
+}
+
+/// `__hoisted_N = <slot>`, leaving a read of `__hoisted_N` in its place.
+fn bind_to_temporary(slot: &mut Expr) -> Expr {
+    let n = HOIST_TEMPORARIES.with(|c| {
+        let n = c.get();
+        c.set(n + 1);
+        n
+    });
+    let span = slot.span;
+    let name = Symbol::from(format!("__hoisted_{}_{n}", span.start));
+    let ty = slot.ty.clone();
+    let mut read = Expr::new(span, ExprNode::Var { id: VarId(0), name: name.clone() });
+    read.ty = ty.clone();
+    let value = std::mem::replace(slot, read);
+    let mut assign = Expr::new(span, ExprNode::Assign { target: LValue::Var { id: VarId(0), name }, value });
+    assign.ty = ty;
+    assign
 }
 
 /// Process one value-position child: recurse into its own value

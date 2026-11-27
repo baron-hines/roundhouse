@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Cable — Action-Cable-shape WebSocket endpoint for the CRuby target.
 #
 # ARCHITECTURE. One reactor thread owns every connection: a single
@@ -69,6 +70,96 @@ module Cable
   PROTOCOLS = ["actioncable-v1-json"].freeze
   PING_INTERVAL = 3 # seconds — matches Action Cable's BEAT_INTERVAL
 
+  # Where a worker's time goes, for profiling under load. Off unless
+  # ROUNDHOUSE_CABLE_STATS names a period in seconds; then every period
+  # each worker writes one line per stage to stderr:
+  #
+  #   [roundhouse stats] <unix ms> <pid> <stage> <count per bucket, tab-separated>
+  #
+  # with buckets bounded above by BOUNDS milliseconds (the last is
+  # unbounded), so scripts/campfire-users-fold.rb can add up any window.
+  # The stages of one subscribe, in order:
+  #
+  #   pool     queued for a Workers thread
+  #   app      the channel's `subscribed` (Db included)
+  #   reactor  queued for the reactor thread with the outcome
+  #   hub      waiting for the hub to acknowledge a stream (cable_hub.rb),
+  #            which holds the reactor thread
+  #   total    the command's arrival to the confirmation
+  #
+  # And beside them:
+  #
+  #   loop_lag   how late a 10 ms timer on Falcon's event loop fires
+  #              (falcon.rb): the time every request on that worker waited
+  #   db_permit  a write waiting behind this process's writers
+  #   db_flock   a write waiting behind another process's (Db's flock)
+  #   gc         not a histogram: GC.stat's time (ms), major and minor
+  #              collections over the period
+  #   major_by   not a histogram: major collections by GC.latest_gc_info's
+  #              reason (`nofree:3  oldgen:1`), read at loop_lag's ticks,
+  #              so two majors between ticks count as the later one's
+  module Stats
+    PERIOD = ENV["ROUNDHOUSE_CABLE_STATS"].to_f
+    ON = PERIOD > 0
+    BOUNDS = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000].freeze
+    LOCK = Mutex.new
+    @counts = Hash.new { |h, stage| h[stage] = Array.new(BOUNDS.size + 1, 0) }
+    @major_by = Hash.new(0)
+    @majors_seen = nil
+
+    def self.now
+      Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    end
+
+    def self.record(stage, since)
+      ms = (now - since) * 1000
+      bucket = BOUNDS.index { |b| ms <= b } || BOUNDS.size
+      LOCK.synchronize { @counts[stage][bucket] += 1 }
+      nil
+    end
+
+    # Called often (loop_lag's tick): notes the reason for each major
+    # collection since the last call.
+    def self.note_gc
+      majors = GC.stat(:major_gc_count)
+      return if majors == @majors_seen
+      reason = @majors_seen && GC.latest_gc_info(:major_by)
+      @majors_seen = majors
+      LOCK.synchronize { @major_by[reason.to_s] += 1 } if reason
+      nil
+    end
+
+    def self.report
+      counts = LOCK.synchronize { c = @counts; @counts = Hash.new { |h, stage| h[stage] = Array.new(BOUNDS.size + 1, 0) }; c }
+      major_by = LOCK.synchronize { m = @major_by; @major_by = Hash.new(0); m }
+      stamp = Process.clock_gettime(Process::CLOCK_REALTIME, :millisecond)
+      counts.each { |stage, row| $stderr.puts "[roundhouse stats] #{stamp} #{Process.pid} #{stage}\t#{row.join("\t")}" }
+      gc = GC.stat.values_at(:time, :major_gc_count, :minor_gc_count)
+      last = @last_gc || gc
+      @last_gc = gc
+      $stderr.puts "[roundhouse stats] #{stamp} #{Process.pid} gc\t#{gc.zip(last).map { |now, was| now - was }.join("\t")}"
+      $stderr.puts "[roundhouse stats] #{stamp} #{Process.pid} major_by\t#{major_by.map { |r, n| "#{r}:#{n}" }.join("\t")}" unless major_by.empty?
+      nil
+    end
+
+    # Per process: a forked worker starts its own reporter.
+    def self.ensure_reporting
+      return unless ON
+      return if @reporter_pid == Process.pid
+
+      @reporter_pid = Process.pid
+      @last_gc = nil
+      Db.wait_observer = method(:record) if defined?(Db) && Db.respond_to?(:wait_observer=)
+      Thread.new do
+        loop do
+          sleep PERIOD
+          report
+        end
+      end
+      nil
+    end
+  end
+
   # The single event loop. Owns the selector, the connection table and
   # the heartbeat deadline; serializes every mutation of both onto its
   # own thread via `post`.
@@ -138,6 +229,7 @@ module Cable
 
           @thread = Thread.new { run }
           @thread.name = "cable-reactor" if @thread.respond_to?(:name=)
+          Stats.ensure_reporting
         end
         nil
       end
@@ -223,7 +315,10 @@ module Cable
       # table mid-iteration.
       def beat
         payload = %({"type":"ping","message":#{Time.now.to_i}})
-        @connections.values.each { |conn| conn.send_text(payload) }
+        @connections.values.each do |conn|
+          conn.send_text(payload)
+          conn.app_beat
+        end
         nil
       end
     end
@@ -358,12 +453,39 @@ module Cable
       warn "[cable] #{channel.class}#unsubscribed raised: #{e.class}: #{e.message}"
       nil
     end
+
+    # A `message` frame's action (#71 item 6), on the channel object the
+    # subscription holds. Same posture as `subscribe`: a raise is
+    # reported, not propagated - the worker that ran it must survive,
+    # and the client has nothing to be told.
+    def self.perform(channel, data)
+      channel.perform_action(data)
+      nil
+    rescue StandardError => e
+      warn "[cable] #{channel.class}#perform_action raised: #{e.class}: #{e.message}"
+      nil
+    end
   end
 
   # The `Broadcasts` transport: stream name → subscribed connections.
   # Reactor thread only (see the threading contract above), so no lock.
+  # The Redis subscriber's way in (runtime/redis_cable.rb), named as on
+  # spinel.
+  def self.deliver_json(stream, message_json)
+    Registry.deliver_json(stream, message_json)
+  end
+
   module Registry
     SUBS = {}
+    # Told when a stream gains its first subscriber here and loses its last:
+    # the cross-worker hub routes by it (runtime/cable_hub.rb). Set once,
+    # before any connection subscribes.
+    WATCHERS = []
+
+    def self.watch(watcher)
+      WATCHERS << watcher
+      nil
+    end
 
     # Called from Puma request threads by `Broadcasts.record` after a
     # model commit. Returns as soon as the closure is queued — the
@@ -371,6 +493,13 @@ module Cable
     def self.broadcast(stream, message)
       Reactor.post { Registry.deliver(stream, message) }
       nil
+    end
+
+    # A message from Redis for this process's sockets (runtime/
+    # redis_cable.rb's subscriber thread): the JSON Rails published, read
+    # back into the String or Hash `deliver` encodes again.
+    def self.deliver_json(stream, message_json)
+      broadcast(stream, JSON.parse(message_json))
     end
 
     # Reactor thread. `message` is a rendered <turbo-stream> String from
@@ -386,6 +515,15 @@ module Cable
     def self.deliver(stream, message)
       conns = SUBS[stream]
       return nil if conns.nil? || conns.empty?
+
+      # A connection's own internal channel carries a control message
+      # for the connection, not a frame for the client.
+      internal = conns.select { |conn| conn.internal_channel?(stream) }
+      unless internal.empty?
+        internal.each { |conn| conn.process_internal_message(message) }
+        conns = SUBS[stream]
+        return nil if conns.nil? || conns.empty?
+      end
 
       # As Rails writes it: ActiveSupport::JSON escapes `<`, `>` and `&`
       # inside strings, which plain JSON.generate does not (#619).
@@ -409,8 +547,10 @@ module Cable
     end
 
     def self.subscribe(stream, conn)
+      fresh = !SUBS.key?(stream)
       list = (SUBS[stream] ||= [])
       list << conn unless list.include?(conn)
+      WATCHERS.each { |watcher| watcher.stream_added(stream) } if fresh
       nil
     end
 
@@ -418,13 +558,20 @@ module Cable
       list = SUBS[stream]
       return nil if list.nil?
       list.delete(conn)
-      SUBS.delete(stream) if list.empty?
+      if list.empty?
+        SUBS.delete(stream)
+        WATCHERS.each { |watcher| watcher.stream_removed(stream) }
+      end
       nil
     end
 
     def self.unsubscribe_all(conn)
       SUBS.each_value { |list| list.delete(conn) }
-      SUBS.delete_if { |_stream, list| list.empty? }
+      emptied = SUBS.select { |_stream, list| list.empty? }.keys
+      emptied.each do |stream|
+        SUBS.delete(stream)
+        WATCHERS.each { |watcher| watcher.stream_removed(stream) }
+      end
       nil
     end
   end
@@ -462,6 +609,8 @@ module Cable
       @monitor = nil
       @closed = false
       @identity = identity
+      identity.transport = self unless identity.nil?
+      @internal_channel = nil
 
       @driver = WebSocket::Driver.rack(EnvAdapter.new(env, self), protocols: PROTOCOLS)
       @driver.on(:open)    { send_json({ "type" => "welcome" }) }
@@ -477,10 +626,91 @@ module Cable
     # both into @buffer, which is why the monitor must already exist.
     def start
       @driver.start
+      subscribe_internal_channel
+    end
+
+    # Rails' `subscribe_to_internal_channel`: an identified connection
+    # listens on `action_cable/<connection identifier>`, which is where
+    # `ActionCable.server.remote_connections.where(…).disconnect`
+    # broadcasts. Reactor thread, like every SUBS write.
+    def subscribe_internal_channel
+      id = @identity.nil? ? "" : @identity.connection_identifier
+      return nil if id.empty?
+
+      @internal_channel = "action_cable/#{id}"
+      Registry.subscribe(@internal_channel, self)
+    end
+
+    def internal_channel?(stream)
+      !@internal_channel.nil? && @internal_channel == stream
+    end
+
+    # Rails' `process_internal_message`: a "disconnect" closes the
+    # socket, telling the client first whether to reconnect — Action
+    # Cable's client reconnects (and replays its subscriptions, which is
+    # where authorization runs again) only when told to.
+    def process_internal_message(message)
+      type = message[:type] || message["type"]
+      return nil unless type.to_s == "disconnect"
+
+      reconnect = message.key?(:reconnect) ? message[:reconnect] : message["reconnect"]
+      send_json({ "type" => "disconnect", "reason" => "remote", "reconnect" => reconnect ? true : false })
+      on_writable
+      close
+    end
+
+    # The heartbeat's call into the app: Rails' `connection.beat`, which
+    # campfire overrides to look its session up again now and then. Reactor
+    # thread, as Rails' heartbeat runs it on its event loop; work an app
+    # wants done off it goes through `perform_work`. An app error is the
+    # app's, not the reactor's.
+    def app_beat
+      return nil if @closed || @identity.nil?
+      @identity.beat
+      nil
+    rescue StandardError => e
+      warn "[cable] beat: #{e.class}: #{e.message}"
+      nil
+    end
+
+    # `ActionCable::Connection::Base#close(reason:, reconnect:)`, from any
+    # thread: the disconnect frame and the close run on the reactor, as the
+    # internal channel's disconnect does.
+    def close_with_reason(reason, reconnect)
+      Reactor.post do
+        unless @closed
+          send_json({ "type" => "disconnect", "reason" => reason, "reconnect" => reconnect ? true : false })
+          on_writable
+          close
+        end
+      end
+      nil
+    end
+
+    # `ActionCable::Connection::Base#perform_work`'s socket half: the
+    # app's work on a cable worker, with a database connection, as Rails
+    # hands it to its pool.
+    def perform_work(receiver)
+      Workers.post { Db.with_connection { receiver.call } }
+      nil
     end
 
     def identifiers_for(stream)
       @subscriptions[stream] || []
+    end
+
+    def stop_streams(channel)
+      identifier_json = channel.identifier
+      Reactor.post do
+        next unless @channels[identifier_json].equal?(channel)
+
+        @subscriptions.each_value { |list| list.delete(identifier_json) }
+        @subscriptions.each do |stream, list|
+          Registry.unsubscribe(stream, self) if list.empty?
+        end
+        @subscriptions.delete_if { |_stream, list| list.empty? }
+      end
+      nil
     end
 
     # websocket-driver's output sink (via EnvAdapter). Registering write
@@ -506,6 +736,12 @@ module Cable
 
     def send_json(value)
       send_text(JSON.generate(value))
+    end
+
+    def transmit(data)
+      text = JsonBuilder.escape_html_entities(JSON.generate(data))
+      Reactor.post { send_text(text) }
+      nil
     end
 
     def on_readable
@@ -612,10 +848,34 @@ module Cable
       case message["command"]
       when "subscribe"   then begin_subscribe(identifier_json)
       when "unsubscribe" then begin_unsubscribe(identifier_json)
+      when "message"     then begin_perform(identifier_json, message["data"])
       else nil
       end
     rescue JSON::ParserError
       nil
+    end
+
+    # Reactor thread: find the subscription the frame names and hand the
+    # action to a worker, as `subscribe` does. Rails runs every command on
+    # its worker pool too, so two actions from one client may run at
+    # once, as they may there.
+    #
+    # An identifier with no confirmed subscription (none, or still
+    # pending) is logged and dropped - Rails' "Unable to find
+    # subscription". `data` is decoded with its JSON types kept, as Rails
+    # decodes it; one that is not a JSON object is logged and dropped.
+    def begin_perform(identifier_json, data_json)
+      channel = @channels[identifier_json]
+      if channel.nil? || channel == :pending
+        warn "[cable] Unable to find subscription with identifier: #{identifier_json}"
+        return nil
+      end
+      data = JSON.parse(data_json.to_s)
+      unless data.is_a?(Hash)
+        warn "[cable] Unable to process a message whose data is not a JSON object"
+        return nil
+      end
+      Workers.post { Db.with_connection { Dispatch.perform(channel, data) } }
     end
 
     # Reactor thread: resolve the channel class and hand the app's code
@@ -642,11 +902,24 @@ module Cable
 
       @channels[identifier_json] = :pending
       conn = self
+      arrived = Stats.now if Stats::ON
       Workers.post do
+        if Stats::ON
+          Stats.record("pool", arrived)
+          started = Stats.now
+        end
         outcome = Db.with_connection do
           Dispatch.subscribe(klass, conn, identifier_json, identifier)
         end
-        Reactor.post { conn.subscribe_settled(identifier_json, outcome) }
+        if Stats::ON
+          Stats.record("app", started)
+          settling = Stats.now
+        end
+        Reactor.post do
+          Stats.record("reactor", settling) if Stats::ON
+          conn.subscribe_settled(identifier_json, outcome)
+          Stats.record("total", arrived) if Stats::ON
+        end
       end
     end
 
@@ -719,6 +992,9 @@ module Cable
 
     jar = ActionController::CookieJar.new(CgiIo.parse_cookies(env["HTTP_COOKIE"]))
     connection = ActionCable::Connection.build(jar)
+    params = {}
+    CgiIo.parse_form_into(env.fetch("QUERY_STRING", ""), params)
+    connection.request = ActionDispatch::Request.for(env, params)
     connection.connect
     connection
   rescue ActionCable::Connection::Authorization::UnauthorizedError
@@ -751,6 +1027,10 @@ module Cable
     identity = identify(env)
     return nil if identity.nil?
 
+    # This process's Redis subscription, when broadcasts go through Redis
+    # (runtime/redis_cable.rb): started here, on the request thread, so
+    # its wait for the first confirmation never stalls the reactor.
+    RedisCable.ensure_subscriber
     socket = env["rack.hijack"].call
     conn = Connection.new(env, socket, identity == NO_IDENTITY ? nil : identity)
     Reactor.attach(conn)

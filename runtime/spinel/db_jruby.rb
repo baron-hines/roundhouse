@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Primitive Db surface — JRuby variant. Same `module Db` contract as
   # The query cache keeps results up to this many rows — see db.rb.
   QC_CAPTURE_ROWS = 16
@@ -144,6 +145,12 @@ module Db
     st.execute("PRAGMA journal_mode=WAL")
     st.execute("PRAGMA synchronous=NORMAL")
     st.execute("PRAGMA busy_timeout=5000")
+    # Not SQLite's default (off): Rails' DEFAULT_PRAGMAS turn it on, as db.rb's PRAGMAS do.
+    st.execute("PRAGMA foreign_keys=ON")
+    # The app's own `pragmas:` from config/database.yml, after the pins
+    # above (generated: `project::apply_database_pragmas`).
+    # >>> generated: database-pragmas
+    # <<< generated: database-pragmas
     st.close
     Conn.new(raw)
   end
@@ -155,7 +162,7 @@ module Db
   # thread-local (each worker thread's root fiber).
   def self.current_dbh
     c = Fiber[:db_handle]
-    return c unless c.nil?
+    return c if lease_visible?
     @free[0]
   end
 
@@ -172,6 +179,72 @@ module Db
     Fiber[:ar_txn_depth] = value
   end
 
+  # Bit `depth - 1` of this integer is whether that frame can be joined.
+  # Same fiber slot as the depth. See runtime/ruby/db.rbs.
+  def self._txn_joinable_bits
+    bits = Fiber[:ar_txn_joinable_bits]
+    bits.nil? ? 0 : bits
+  end
+
+  def self._txn_joinable_bits=(value)
+    Fiber[:ar_txn_joinable_bits] = value
+  end
+
+  # The open transaction's enlisted writes (connection.rb), held in the
+  # same per-thread storage as the depth.
+  def self._txn_records
+    records = Fiber[:ar_txn_records]
+    if records.nil?
+      records = []
+      Fiber[:ar_txn_records] = records
+    end
+    records
+  end
+
+  # The work `current_transaction.after_commit` holds for the COMMIT
+  # (ActiveRecord::Base._after_commit), beside the records above.
+  def self._txn_callbacks
+    work = Fiber[:ar_txn_callbacks]
+    if work.nil?
+      work = []
+      Fiber[:ar_txn_callbacks] = work
+    end
+    work
+  end
+
+  # The tables whose model is inside `Model.unscoped { … }` on this
+  # thread (relation.rb's `Relation.unscoped_tables`). `Thread.current`,
+  # not `Fiber[]` as the transaction state: fiber storage is copied into
+  # a thread started from this one, and the copy would share this Array,
+  # so a block on one thread would lift the scope on the other.
+  def self._unscoped_tables
+    tables = Thread.current[:ar_unscoped_tables]
+    if tables.nil?
+      tables = []
+      Thread.current[:ar_unscoped_tables] = tables
+    end
+    tables
+  end
+
+  # The relations whose `scoping { }` block runs on this thread,
+  # innermost last (relation.rb's `Relation.current_scope_for`), in
+  # `Thread.current` for the reason the unscoped tables are. Nil until
+  # the first push, which seeds the list with its element.
+  def self._current_scopes
+    Thread.current[:ar_current_scopes]
+  end
+
+  def self._push_current_scope(scope)
+    scopes = Thread.current[:ar_current_scopes]
+    if scopes.nil?
+      scopes = [scope]
+      Thread.current[:ar_current_scopes] = scopes
+    else
+      scopes << scope
+    end
+    scopes
+  end
+
   # Request-scoped connection lease. Mirrors db_cruby.rb: checks out a
   # Conn under @mutex (parking on @cv while the pool is momentarily
   # exhausted), binds it to fiber-storage so `current_dbh` resolves to it
@@ -181,7 +254,16 @@ module Db
   # re-entrant, and a second lease on a thread that holds one would
   # rebind the connection and, on release, unbind the outer lease's.
   def self.in_lease?
-    !Fiber[:db_handle].nil?
+    lease_visible?
+  end
+
+  # Same rule as db_cruby.rb. An ordinary lease stays with its owner
+  # thread. A fixture BEGIN pin is shared with threads the example
+  # starts, so they see the uncommitted rows.
+  def self.lease_visible?
+    return false if Fiber[:db_handle].nil?
+    return true if Fiber[:db_owner] == Thread.current
+    Fiber[:db_txn_pin] == true
   end
 
   # `ActiveRecord::Base.connection_db_config` answers from these
@@ -197,12 +279,62 @@ module Db
     "sqlite3"
   end
 
+  # One database: a connection handle is the shared one (db.rbs).
+  def self.connection_slot(_base)
+    -1
+  end
+
   def self.transaction_open?
     current_dbh.in_txn
   end
 
+  # Rails' SQLite `disable_referential_integrity`: fixtures load and tables empty in any order. Not foreign_keys=OFF alone: that pragma is a no-op inside a transaction, where defer_foreign_keys moves the check to COMMIT instead.
+  def self.without_foreign_keys(&block)
+    on_lease { foreign_keys_off(&block) }
+  end
+
+  def self.foreign_keys_off
+    Db.exec("PRAGMA defer_foreign_keys = ON")
+    Db.exec("PRAGMA foreign_keys = OFF")
+    result = nil
+    begin
+      result = yield
+    ensure
+      Db.exec("PRAGMA defer_foreign_keys = OFF")
+      Db.exec("PRAGMA foreign_keys = ON")
+    end
+    result
+  end
+
+  # Not a lease of its own when the caller holds one: with a pool of one handle, the second checkout waits for the first forever.
+  def self.on_lease(&block)
+    in_lease? ? yield : Db.with_connection(&block)
+  end
+
+  # Rails' `check_all_foreign_keys_valid!`, which its fixture loader runs after a load (`verify_foreign_keys_for_fixtures`).
+  def self.check_foreign_keys!
+    tables = []
+    on_lease do
+      st = Db.prepare("PRAGMA foreign_key_check")
+      while Db.step?(st)
+        table = Db.column_text(st, 0)
+        tables << table unless tables.include?(table)
+      end
+      Db.finalize(st)
+    end
+    raise ActiveRecord::StatementInvalid, "Foreign key violations found: " + tables.join(", ") unless tables.empty?
+    nil
+  end
+
   def self.with_connection
+    # Re-entrant, as db_cruby.rb. A BEGIN outside a lease pins its
+    # connection; a second checkout would miss those uncommitted rows.
+    if in_lease?
+      result = yield
+      return result
+    end
     conn = nil
+    lease_all = nil
     @mutex.synchronize do
       while @free.empty?
         if @missing_connections > 0
@@ -212,8 +344,11 @@ module Db
         end
       end
       conn = @free.pop
+      lease_all = @all
     end
     Fiber[:db_handle] = conn
+    Fiber[:db_owner] = Thread.current
+    Fiber[:db_txn_pin] = false
     request_failed = false
     begin
       yield
@@ -222,19 +357,27 @@ module Db
       raise
     ensure
       cleanup_error = nil
+      closed = conn.raw.is_closed
       begin
-        release_open_statements(conn)
+        release_open_statements(conn) unless closed
       rescue StandardError => e
         cleanup_error = e
       ensure
         Fiber[:db_handle] = nil
+        Fiber[:db_owner] = nil
         begin
-          if conn.open_statements.empty?
+          # `Db.close` inside the lease closes `conn` and `configure`
+          # replaces `@all`. Pushing that handle onto the new `@free`
+          # would make the next checkout a closed JDBC connection.
+          same_pool = !closed && !lease_all.nil? && !@all.nil? && @all.equal?(lease_all)
+          if same_pool && conn.open_statements.empty?
             @mutex.synchronize do
-              @free.push(conn)
-              @cv.signal
+              if !conn.raw.is_closed && !@free.nil? && !@all.nil? && @all.equal?(lease_all)
+                @free.push(conn)
+                @cv.signal
+              end
             end
-          else
+          elsif same_pool
             quarantine_connection(conn)
           end
         rescue StandardError => e
@@ -292,6 +435,12 @@ module Db
   end
 
   def self.close
+    # Same as db_cruby.rb. This shim's live handle is the fiber lease.
+    # Schema switch closes that checkout too: leaving it set makes the
+    # next statement keep using the JDBC connection we just closed.
+    Fiber[:db_handle] = nil
+    Fiber[:db_owner] = nil
+    Fiber[:db_txn_pin] = false
     return if @all.nil?
     error = nil
     @all.each do |conn|
@@ -309,25 +458,61 @@ module Db
     raise error if error
   end
 
+  # A BEGIN outside a lease binds its connection until COMMIT or
+  # ROLLBACK, as db_cruby.rb's `reserve_txn_connection` does. The test
+  # shim's fixture transaction is that BEGIN; a later `with_connection`
+  # has to see its uncommitted rows.
+  def self.reserve_txn_connection
+    conn = nil
+    @mutex.synchronize do
+      while @free.empty?
+        if @missing_connections > 0
+          replace_connection
+        else
+          @cv.wait(@mutex)
+        end
+      end
+      conn = @free.pop
+    end
+    Fiber[:db_handle] = conn
+    Fiber[:db_owner] = Thread.current
+    Fiber[:db_txn_pin] = true
+    conn
+  end
+
+  def self.release_txn_pin_if_idle(conn)
+    return nil unless Fiber[:db_txn_pin] == true && Fiber[:db_owner] == Thread.current
+    return nil if conn.in_txn
+    Fiber[:db_handle] = nil
+    Fiber[:db_owner] = nil
+    Fiber[:db_txn_pin] = false
+    @mutex.synchronize do
+      @free.unshift(conn)
+      @cv.signal
+    end
+    nil
+  end
+
   def self.exec(sql)
     record_query(sql)
     # Any exec is (per the Db contract) DDL or a write — Rails
     # invalidates the whole query cache on write; so do we.
     qcache = Fiber[:rh_qcache]
     qcache.clear unless qcache.nil?
+    word = sql.strip.split(" ", 2).first.to_s.upcase
+    reserve_txn_connection if word == "BEGIN" && !in_lease?
     conn = current_dbh
     st = conn.raw.create_statement
     begin
       st.execute(sql)
-      word = sql.strip.split(" ", 2).first.to_s.upcase
       conn.in_txn = true if word == "BEGIN"
       rollback_to_savepoint = word == "ROLLBACK" && sql.strip.upcase.start_with?("ROLLBACK TO ")
       conn.in_txn = false if word == "COMMIT" || word == "END" || (word == "ROLLBACK" && !rollback_to_savepoint)
-    rescue StandardError => e
-      raise ActiveRecord::RecordNotUnique, e.message if Db.unique_violation?(e.message)
-      raise
+    rescue Java::JavaSql::SQLException => e
+      Db.raise_statement_error(e.message, e.message.include?("SQLITE_BUSY"))
     ensure
       st.close
+      release_txn_pin_if_idle(conn)
     end
     nil
   end
@@ -361,9 +546,8 @@ module Db
           rs.close
         end
       end
-    rescue StandardError => e
-      raise ActiveRecord::RecordNotUnique, e.message if Db.unique_violation?(e.message)
-      raise
+    rescue Java::JavaSql::SQLException => e
+      Db.raise_statement_error(e.message, e.message.include?("SQLITE_BUSY"))
     ensure
       st.close
     end
@@ -423,6 +607,16 @@ module Db
     message.to_s.include?("UNIQUE constraint failed")
   end
 
+  # Not the driver's own exception: Rails translates every statement error into ActiveRecord's hierarchy (sqlite3_adapter `translate_exception`), keyed on SQLite's own message as `unique_violation?` is.
+  def self.raise_statement_error(message, busy)
+    raise ActiveRecord::RecordNotUnique, message if unique_violation?(message)
+    raise ActiveRecord::NotNullViolation, message if message.include?("NOT NULL constraint failed")
+    raise ActiveRecord::InvalidForeignKey, message if message.include?("FOREIGN KEY constraint failed")
+    raise ActiveRecord::CheckViolation, message if message.include?("CHECK constraint failed")
+    raise ActiveRecord::StatementTimeout, message if busy
+    raise ActiveRecord::StatementInvalid, message
+  end
+
   # Prepared-statement cache (roundhouse#12). A cache hit reuses the open
   # PreparedStatement only when idle. Xerial's `executeQuery` in `step?`
   # resets the cursor before execution; release clears old parameters.
@@ -433,6 +627,8 @@ module Db
   def self.prepare(sql)
     return prepare_marked(sql) if sql.include?("\x01")
     prepare_plain(sql)
+  rescue Java::JavaSql::SQLException => e
+    Db.raise_statement_error(e.message, e.message.include?("SQLITE_BUSY"))
   end
 
   # Prepare without re-entering prepare_marked. Post-lift SQL may still
@@ -791,6 +987,7 @@ module Db
     rescue StandardError
       # Failed closes remain owned until lease cleanup quarantines them.
     end
+    Db.raise_statement_error(error.message, error.message.include?("SQLITE_BUSY")) if error.is_a?(Java::JavaSql::SQLException)
     raise error
   end
 
@@ -901,6 +1098,9 @@ module Db
 
   def self.record_query(sql)
     @query_log.push(sql) unless @query_log.nil?
+    if defined?(ActiveSupport::Notifications) && ActiveSupport::Notifications.respond_to?(:sql)
+      ActiveSupport::Notifications.sql(sql)
+    end
   end
 
   # SQL-value escaping primitives — copied verbatim from db_cruby.rb.
@@ -930,6 +1130,25 @@ module Db
     s.nil? ? "NULL" : escape_string(s)
   end
 
+  # `t.binary` columns (the lowerer's `ValueType::Binary`). This shim
+  # tells bytes from text by the value's encoding, so they are its text
+  # methods; the separate names are for a target that cannot (Rust).
+  def self.escape_binary(s)
+    escape_string(s)
+  end
+
+  def self.escape_binary_opt(s)
+    escape_string_opt(s)
+  end
+
+  def self.column_binary(stmt, i)
+    column_text(stmt, i)
+  end
+
+  def self.column_binary_opt(stmt, i)
+    column_text_opt(stmt, i)
+  end
+
   def self.escape_int_opt(n)
     n.nil? ? "NULL" : escape_int(n)
   end
@@ -946,6 +1165,14 @@ module Db
     return "NULL" if ids.empty?
 
     ids.map { |i| i.to_i.to_s }.join(", ")
+  end
+
+  # The same `IN (...)` batch over string keys (a uuid primary key): each
+  # key quoted as a literal, never `to_i`'d to its leading digits.
+  def self.escape_string_list(ids)
+    return "NULL" if ids.empty?
+
+    ids.map { |i| escape_string(i.to_s) }.join(", ")
   end
 
   def self.escape_bool(b)

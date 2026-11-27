@@ -1,0 +1,27 @@
+def check(label, got, want)
+  raise "#{label}: #{got.inspect} (want #{want.inspect})" unless got == want
+end
+a, f, s = StiProbe.seed
+check("each row's type", StiProbe.types, [nil, "Feature", "SpecialFeature"])
+check("[Article, Feature, SpecialFeature].count", StiProbe.counts, [3, 2, 1])
+check("where on the subclass", StiProbe.where_titles, ["f", "s"])
+check("the base's scope on the subclass", StiProbe.scope_titles, ["f"])
+check("sum", StiProbe.id_sum, f + s)
+check("take", StiProbe.take_title, "f")
+check("first", StiProbe.first_class, "Feature")
+check("find, the subclass's row", StiProbe.find_class(f), "Feature")
+check("find, a deeper subclass's row", StiProbe.find_class(s), "SpecialFeature")
+check("find, the base's row", StiProbe.find_class(a), "RecordNotFound")
+check("find_by, the base's row", StiProbe.find_by_title("a"), nil)
+check("find_each", StiProbe.each_titles, ["f", "s"])
+check("find_or_create_by builds the subclass's type", StiProbe.found_or_built_type, "Feature")
+check("select", StiProbe.select_titles, ["f", "s"])
+check("none", StiProbe.none_count, 0)
+check("exists?, the base's row", StiProbe.exists(a), false)
+check("pick", StiProbe.pick_title, "f")
+check("find_or_create_by finds a deeper subclass's row", StiProbe.found_deeper, ["SpecialFeature", s])
+check("find_or_create_by adds no row for it", StiProbe.counts, [3, 2, 1])
+check("select without type, first", StiProbe.select_first_class, "Feature")
+check("select without type, each row", StiProbe.select_classes, ["Feature", "Feature"])
+check("select with type, each row", StiProbe.select_typed_classes, ["Feature", "SpecialFeature"])
+puts "sti queries passed"

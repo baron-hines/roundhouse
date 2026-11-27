@@ -1,0 +1,309 @@
+#!/usr/bin/env ruby
+# scripts/lobsters-http-replay — drive a RUNNING lobsters server over HTTP,
+# from outside the process, and dump each response body.
+#
+# The in-process replays (scripts/lobsters-replay, lobsters-spinel-replay)
+# call Main.run_rack / Main.dispatch directly, so they never exercise the
+# socket, the HTTP parser, cookies on the wire or the server loop. This one
+# talks to whatever listens on --base: the Spinel binary, the CRuby emit
+# behind its server, or the real Rails app. Point it at two of them and
+# compare the dumps with scripts/lobsters-content-diff (or run
+# scripts/lobsters-http-compare, which does both).
+#
+# A local tool, not a CI lane: it assumes you started the servers, on the
+# same data.
+#
+# Usage:
+#   scripts/lobsters-http-replay --base URL --dump DIR [options]
+#
+#   --base URL        server to drive (e.g. http://127.0.0.1:3931)
+#   --dump DIR        write each body to DIR (file = path, non-word -> _)
+#                     plus DIR/_status.json (file -> status), the shape
+#                     lobsters-content-diff reads, and DIR/_location.json
+#                     (file -> Location of each redirect)
+#   --steps FILE      the visits, one per line (default: the ruby-bench
+#                     route set below). Blank lines and `#` comments are
+#                     skipped. A line is
+#                       GET /path [-> STATUS]
+#                       POST /path key=value&key2=value2 [-> STATUS]
+#                     A POST carries the authenticity_token of the last
+#                     page fetched (its form field or csrf-token meta),
+#                     that page as Referer, and the session cookie. A
+#                     path visited again dumps as NAME~2, NAME~3, ….
+#                     scripts/lobsters-http-steps/ has examples. A line
+#                     `#! login EMAIL` or `#! no-login` in the file sets
+#                     who the replay runs as. {story}, {story_path},
+#                     {comment} and {username} expand to ids scraped
+#                     after login; a step whose id was not scraped (no
+#                     {username} under --no-login) is skipped.
+#                     {last_comment} and {last_story} are the record the
+#                     latest POST's redirect named (a new comment's
+#                     `#c_…`, a new story's `/s/…`); {last_location} is
+#                     the path that redirect named, whatever the record.
+#                     {input:NAME} is the value of the last page's form
+#                     field NAME.
+#   --email E         login email    (default $LOBSTERS_EMAIL)
+#   --password P      login password (default $LOBSTERS_PASSWORD)
+#   --username U      for {username} (default $LOBSTERS_USERNAME, else
+#                     scraped from the page after login)
+#   --host H          send `Host: H` (default: the --base host:port). Two
+#                     servers given the same H render the same absolute
+#                     URLs (RSS links, canonical tags), so a compare does
+#                     not trip on their ports
+#   --no-login        visit logged out
+#   --quiet           only the summary
+#
+# Exit code = number of steps whose status is not the expected one (by
+# default 2xx or 3xx; a redirect prints its Location), plus thin 200
+# bodies. Redirects are not followed: each step is one request.
+
+require "net/http"
+require "uri"
+require "json"
+require "fileutils"
+require "cgi"
+require "erb"
+
+opts = {
+  email: ENV["LOBSTERS_EMAIL"], password: ENV["LOBSTERS_PASSWORD"], username: ENV["LOBSTERS_USERNAME"],
+  login: true,
+}
+args = ARGV.dup
+until args.empty?
+  case (a = args.shift)
+  when "--base"     then opts[:base]     = args.shift
+  when "--dump"     then opts[:dump]     = args.shift
+  when "--steps"    then opts[:steps]    = args.shift
+  when "--email"    then opts[:email]    = args.shift
+  when "--password" then opts[:password] = args.shift
+  when "--username" then opts[:username] = args.shift
+  when "--host"     then opts[:host]     = args.shift
+  when "--no-login" then opts[:login]    = false
+  when "--quiet"    then opts[:quiet]    = true
+  else abort "lobsters-http-replay: unknown arg #{a}"
+  end
+end
+abort "usage: lobsters-http-replay --base URL --dump DIR [options]" unless opts[:base] && opts[:dump]
+# A step file says who it runs as (`#! login EMAIL`, `#! no-login`), over the command line: a moderator's flow and a logged-out one sit beside a user's.
+if opts[:steps]
+  File.foreach(opts[:steps]) do |line|
+    case line
+    when /\A#!\s*no-login\s*\z/ then opts[:login] = false
+    when /\A#!\s*login\s+(\S+)\s*\z/ then opts[:login] = true; opts[:email] = $1
+    end
+  end
+end
+if opts[:login] && !(opts[:email] && opts[:password])
+  abort "lobsters-http-replay: --email and --password (or LOBSTERS_EMAIL / LOBSTERS_PASSWORD), or --no-login"
+end
+
+BASE = URI(opts[:base])
+HOST = opts[:host]
+
+# The ruby-bench parity route set (scripts/lobsters-replay ROUTES), as
+# steps, so dumps from either lane join by file name. Several of those are
+# legacy URLs that now redirect, so the pages they redirect to follow.
+DEFAULT_STEPS = <<~STEPS
+  GET /u
+  GET /active
+  GET /newest
+  GET /recent
+  GET /hottest
+  GET /rss
+  GET /privacy
+  GET /about
+  GET /settings
+  GET /top?length=1d
+  GET /top?length=1w
+  GET /top?length=1y
+  GET /hidden
+  GET /saved
+  GET /upvoted/stories
+  GET /comments
+  GET /upvoted/comments
+  GET /threads
+  GET /comments/{comment}/reply
+  GET /threads/{username}
+  GET /u/{username}
+  GET /replies
+  GET /replies/comments
+  GET /replies/stories
+  GET /replies/unread
+  GET /s/{story}
+  GET /
+  GET /users
+  GET /~{username}
+  GET /~{username}/threads
+  GET /inbox/all
+  GET /inbox/unread
+  GET {story_path}
+  GET /stats
+  GET /search?q=hello&what=all&order=newest
+STEPS
+
+Step = Struct.new(:method, :path, :form, :expect)
+
+def parse_steps(text)
+  text.lines.filter_map do |line|
+    line = line.sub(/#.*/, "").strip
+    next if line.empty?
+    line, expect = line.split(/\s*->\s*/, 2)
+    method, path, form = line.split(/\s+/, 3)
+    abort "lobsters-http-replay: bad step #{line.inspect}" unless %w[GET POST].include?(method) && path
+    Step.new(method, path, form, expect&.to_i)
+  end
+end
+
+# ── HTTP with a cookie jar ───────────────────────────────────────────
+$jar = {}
+$last_body = ""
+$last_url = nil
+
+def http
+  @http ||= Net::HTTP.start(BASE.host, BASE.port, use_ssl: BASE.scheme == "https").tap { |h| h.read_timeout = 60 }
+end
+
+def absorb_cookies(response)
+  Array(response.get_fields("set-cookie")).each do |line|
+    k, v = line.split(";", 2).first.to_s.split("=", 2)
+    $jar[k.strip] = v.to_s if k && !k.strip.empty?
+  end
+end
+
+def request(method, path, form: nil)
+  req = method == "POST" ? Net::HTTP::Post.new(path) : Net::HTTP::Get.new(path)
+  req["Referer"] = $last_url if method == "POST" && $last_url
+  req["Cookie"] = $jar.map { |k, v| "#{k}=#{v}" }.join("; ") unless $jar.empty?
+  req["Accept"] = "text/html"
+  req["Host"] = HOST if HOST
+  if form
+    req["Content-Type"] = "application/x-www-form-urlencoded"
+    req.body = form
+  end
+  t = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+  res = http.request(req)
+  ms = ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - t) * 1000).round(1)
+  absorb_cookies(res)
+  body = res.body.to_s
+  if method == "GET"
+    $last_body = body
+    $last_url = "#{BASE.scheme}://#{HOST || "#{BASE.host}:#{BASE.port}"}#{path}"
+  end
+  [res.code.to_i, body, res["location"], ms]
+rescue StandardError => e
+  [:EXC, "#{e.class}: #{e.message}", nil, 0]
+end
+
+def token_of(body)
+  body[/name="authenticity_token"[^>]*value="([^"]+)"/, 1] ||
+    body[/value="([^"]+)"[^>]*name="authenticity_token"/, 1] ||
+    body[/<meta name="csrf-token" content="([^"]+)"/, 1]
+end
+
+def enc(s) = URI.encode_www_form_component(s.to_s)
+
+def body_name(path)
+  name = path.delete_prefix("/").gsub("~", "tilde-").gsub(/[^\w.-]/, "_")
+  return "root" if name.empty?
+  # Not a leading `_`: lobsters-content-diff skips those files as metadata.
+  name.start_with?("_") ? "x#{name}" : name
+end
+
+# ── login, then the ids the steps name ──────────────────────────────
+if opts[:login]
+  st, body, = request("GET", "/login")
+  abort "lobsters-http-replay: GET /login -> #{st}" unless st == 200
+  token = token_of(body) or abort "lobsters-http-replay: no authenticity_token on /login"
+  form = "email=#{enc(opts[:email])}&password=#{enc(opts[:password])}&authenticity_token=#{enc(token)}"
+  st, _body, location, = request("POST", "/login", form: form)
+  abort "lobsters-http-replay: POST /login -> #{st} (expected 302; wrong credentials?)" unless st == 302
+  $stderr.puts "logged in as #{opts[:email]} (-> #{location})" unless opts[:quiet]
+end
+
+ids = {}
+_, newest, = request("GET", "/newest")
+ids["story"] = newest[%r{href="/s/(\w+)}, 1]
+ids["story_path"] = newest[%r{href="(/s/\w+/[^"/?#]+)"}, 1]
+_, comments, = request("GET", "/comments")
+ids["comment"] = comments[%r{/comments/(\w+)/reply}, 1] || comments[%r{/c/(\w+)}, 1]
+_, settings, = request("GET", "/settings") if opts[:login]
+ids["username"] = opts[:username] || settings.to_s[%r{href="/(?:~|u/)(\w+)"}, 1]
+# Filled as the replay goes: the record a POST's redirect names.
+ids["last_comment"] = nil
+ids["last_story"] = nil
+ids["last_location"] = nil
+
+steps = parse_steps(opts[:steps] ? File.read(opts[:steps]) : DEFAULT_STEPS)
+steps.each do |step|
+  "#{step.path} #{step.form}".scan(/\{(\w+)\}/).flatten.each do |k|
+    abort "lobsters-http-replay: unknown placeholder {#{k}} in #{step.path.inspect} (known: #{ids.keys.map { |n| "{#{n}}" }.join(", ")})" unless ids.key?(k)
+  end
+end
+missing = ->(s) { s.scan(/\{(\w+)\}/).flatten.find { |k| ids[k].nil? } }
+# `{input:NAME}`: the value of the last page's form field NAME (a record's database id a form carries, which no URL names).
+input_value = lambda do |name|
+  body = $last_body.to_s
+  q = Regexp.escape(name)
+  v = body[/<input[^>]*name="#{q}"[^>]*value="([^"]*)"/, 1] || body[/<input[^>]*value="([^"]*)"[^>]*name="#{q}"/, 1]
+  abort "lobsters-http-replay: no form field #{name.inspect} on the last page" unless v
+  CGI.unescapeHTML(v)
+end
+# A path takes a path component's escape, a form a form value's: `a b` is `a%20b` in one and `a+b` in the other.
+expand = lambda do |s, form: false|
+  escape = form ? ->(v) { enc(v) } : ->(v) { ERB::Util.url_encode(v) }
+  s.gsub(/\{(\w+)\}/) { ids[$1] }.gsub(/\{input:([^}]+)\}/) { escape.(input_value.($1)) }
+end
+
+# ── the visits ───────────────────────────────────────────────────────
+FileUtils.mkdir_p(opts[:dump])
+# Not left in place: lobsters-content-diff compares every body in the directory, so a previous run's extra steps would be compared too.
+previous = File.join(opts[:dump], "_status.json")
+if File.exist?(previous)
+  # Not a step that raised: it wrote no body, so a file of that name is not the previous run's.
+  JSON.parse(File.read(previous)).each { |name, st| FileUtils.rm_f(File.join(opts[:dump], name)) unless st == "EXC" }
+  FileUtils.rm_f([previous, File.join(opts[:dump], "_location.json")])
+end
+THIN_BYTES = 200
+statuses = {}
+locations = {}
+failures = 0
+skipped = 0
+steps.each do |step|
+  if (key = missing.("#{step.path} #{step.form}"))
+    skipped += 1
+    $stderr.puts format("%-4s %-5s %-36s (no {%s}: none scraped)", "skip", "-", "#{step.method} #{step.path}", key) unless opts[:quiet]
+    next
+  end
+  path = expand.(step.path)
+  form = step.form && expand.(step.form, form: true)
+  if step.method == "POST"
+    token = token_of($last_body)
+    form = [form, ("authenticity_token=#{enc(token)}" if token)].compact.join("&")
+  end
+  st, body, location, ms = request(step.method, path, form: form)
+  name = (step.method == "POST" ? "POST_" : "") + body_name(path)
+  name = "#{name}~#{(2..).find { |i| !statuses.key?("#{name}~#{i}") }}" if statuses.key?(name)
+  statuses[name] = st
+  locations[name] = location if location
+  if step.method == "POST" && location
+    ids["last_comment"] = location[/#c_(\w+)/, 1] || location[%r{/c/(\w+)}, 1] || ids["last_comment"]
+    ids["last_story"] = location[%r{/s/(\w+)}, 1] || ids["last_story"]
+    ids["last_location"] = URI(location).path
+  end
+  File.write(File.join(opts[:dump], name), body) unless st == :EXC
+  ok = step.expect ? st == step.expect : st.is_a?(Integer) && (200..399).cover?(st)
+  # Not for a POST that names its status: one answering `ok` is the whole response.
+  thin = !(step.method == "POST" && step.expect) && st == 200 && body.bytesize < THIN_BYTES
+  failures += 1 if !ok || thin
+  next if opts[:quiet] && ok && !thin
+  note = thin ? " THIN" : ""
+  note += " -> #{location}" if location
+  note += " (expected #{step.expect})" if step.expect && !ok
+  note += " #{body}" if st == :EXC
+  $stderr.puts format("%-4s %-5s %-36s %7d B %8.1f ms%s", ok && !thin ? "ok" : "FAIL", st, "#{step.method} #{path}", body.bytesize, ms, note)
+end
+File.write(File.join(opts[:dump], "_status.json"), JSON.pretty_generate(statuses))
+File.write(File.join(opts[:dump], "_location.json"), JSON.pretty_generate(locations))
+run = steps.size - skipped
+$stderr.puts "#{run - failures}/#{run} steps ok#{", #{skipped} skipped" if skipped > 0}; bodies -> #{opts[:dump]}"
+exit failures

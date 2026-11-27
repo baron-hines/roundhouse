@@ -24,26 +24,36 @@
 use crate::app::App;
 use crate::expr::{Expr, ExprNode, InterpPart, Literal};
 use crate::ident::Symbol;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
+use crate::det::HashSet;
 
 pub fn apply_fused_independent_rewrites(app: &mut App) {
     let skip_exclude = super::exclude_predicate::app_defines_exclude(app);
     let skip_in = super::in_predicate::app_defines_in(app);
     let skip_including = super::including::app_defines_including(app);
-    let skip_full_messages = super::errors_full_messages::app_defines_full_messages(app);
+    let fold = super::errors_full_messages::Fold::of(app);
 
-    super::for_each_hook_body(app, &mut |body| {
+    let controllers: HashSet<crate::ident::ClassId> = app.controllers.iter().map(|c| c.name.clone()).collect();
+    let own_redirect_back = app.controllers.iter().any(|c| c.actions().any(|a| a.name.as_str() == "redirect_back"));
+    super::for_each_owned_hook_body(app, &mut |owner, body| {
+        let site = (owner, &fold);
+        let in_controller = !own_redirect_back && owner.is_some_and(|o| controllers.contains(o));
         walk_postorder(body, &mut |e| {
-            rewrite_hook_node(e, skip_exclude, skip_in, skip_including, skip_full_messages);
+            rewrite_hook_node(e, skip_exclude, skip_in, skip_including, &site);
+            if in_controller {
+                super::redirect_back::rewrite_node(e);
+            }
         });
     });
     for view in &mut app.views {
+        let site = (None, &fold);
         walk_postorder(&mut view.body, &mut |e| {
-            rewrite_view_node(e, skip_exclude, skip_in, skip_including, skip_full_messages);
+            rewrite_view_node(e, skip_exclude, skip_in, skip_including, &site);
         });
     }
     super::for_each_test_body(app, &mut |body| {
-        walk_postorder(body, &mut |e| rewrite_test_node(e, skip_full_messages));
+        let site = (None, &fold);
+        walk_postorder(body, &mut |e| rewrite_test_node(e, &site));
     });
 }
 
@@ -51,8 +61,9 @@ pub fn apply_fused_independent_rewrites(app: &mut App) {
 /// `kwsplat`-expanded) argument lists, and `capture_inline` which
 /// must see `tag_builder`'s synthesized `capture` blocks.
 pub fn apply_fused_late_rewrites(app: &mut App) {
+    let skip_cache = super::rails_cache::app_binds_cache_store(app);
     super::for_each_hook_body(app, &mut |body| {
-        walk_postorder(body, &mut rewrite_late_hook_node);
+        walk_postorder(body, &mut |e| rewrite_late_hook_node(e, skip_cache));
     });
     for view in &mut app.views {
         walk_postorder(&mut view.body, &mut super::attachables_grep::rewrite_node);
@@ -104,6 +115,9 @@ pub fn apply_fused_context_rewrites(app: &mut App) {
         for (_, value) in &mut tm.constants {
             walk_postorder(value, &mut |e| {
                 super::try_guard::rewrite_node(e, &try_definers, &try_parents);
+                // Crystal no longer rewrites this spelling at print time,
+                // and `for_each_test_body` does not reach constants.
+                super::time_calendar::ground_crystal_time_bridge(e);
             });
         }
         for ic in &mut tm.inner_classes {
@@ -111,6 +125,7 @@ pub fn apply_fused_context_rewrites(app: &mut App) {
                 walk_postorder(&mut m.body, &mut |e| {
                     super::webmock::rewrite_node(e);
                     super::try_guard::rewrite_node(e, &try_definers, &try_parents);
+                    super::time_calendar::ground_crystal_time_bridge(e);
                 });
             }
         }
@@ -134,15 +149,12 @@ pub fn apply_fused_context_rewrites(app: &mut App) {
 /// `controller_class_render` is hooks plus per-test attachment locals;
 /// `sum_symbol` is model methods/unknown last so its new `to_a`/`sum`
 /// children are not fed to the other fused rewrites.
-pub fn apply_fused_pre_tag_rewrites(app: &mut App) {
-    let models: HashSet<String> = app
-        .models
-        .iter()
-        .map(|m| m.name.0.as_str().to_string())
-        .collect();
+pub fn apply_fused_pre_tag_rewrites(app: &mut App, target: crate::build_target::BuildTarget) {
+    super::attribute_aliases::receiver::prove(app);
+    let models = super::attribute_aliases::Models::of(app, target);
     let sti_names = super::sti_is_a::subclass_type_names(app);
     let contracts = super::controller_class_render::call_contracts(app);
-    let none = HashSet::new();
+    let none = HashSet::default();
 
     for model in &mut app.models {
         for item in &mut model.body {
@@ -160,6 +172,18 @@ pub fn apply_fused_pre_tag_rewrites(app: &mut App) {
                 }
                 ModelBodyItem::Callback { callback, .. } => {
                     if let Some(cond) = &mut callback.condition {
+                        walk_postorder(cond, &mut |e| {
+                            super::attribute_aliases::rewrite_node(e, &models, true);
+                        });
+                    }
+                }
+                ModelBodyItem::Validation { validation, .. } => {
+                    if let Some(cond) = &mut validation.if_cond {
+                        walk_postorder(cond, &mut |e| {
+                            super::attribute_aliases::rewrite_node(e, &models, true);
+                        });
+                    }
+                    if let Some(cond) = &mut validation.unless_cond {
                         walk_postorder(cond, &mut |e| {
                             super::attribute_aliases::rewrite_node(e, &models, true);
                         });
@@ -300,19 +324,21 @@ fn rewrite_narrow_controller_node(e: &mut Expr) {
 /// `.target`. Collect tables once; one owned-hook walk, one view walk,
 /// one test walk. Tests skip `position_path_params`, matching the
 /// original `route_url_options` surface.
-pub fn apply_fused_mid_rewrites(app: &mut App) {
+pub fn apply_fused_mid_rewrites(app: &mut App, target: crate::build_target::BuildTarget) {
     let helpers = super::route_format_suffix::route_helper_names(app);
     let path_params = if helpers.is_empty() {
         Default::default()
     } else {
+        super::route_url_options::bare_url_helper_receivers(app, &helpers);
         super::route_url_options::helper_path_params(app)
     };
-    let enum_map = super::enum_symbols::enum_columns(app);
+    let enum_map = super::enum_symbols::enum_columns(app, target.has_runtime_relation());
     let json_map = super::has_json::has_json_columns(&app.models);
     let by_model = super::assoc_loaded::has_many_by_model(app);
     let readers = super::assoc_loaded::association_readers_by_model(app);
     let flat_loaded = super::assoc_loaded::flat_loaded_by_model(app);
     let sole_includer = app.sole_includer_of_modules();
+    let own_url_options = super::route_url_options::classes_with_own_url_options(app);
 
     super::for_each_owned_hook_body(app, &mut |owner, body| {
         walk_postorder(body, &mut |e| {
@@ -328,6 +354,7 @@ pub fn apply_fused_mid_rewrites(app: &mut App) {
                 &by_model,
                 &readers,
                 &flat_loaded,
+                &own_url_options,
             );
         });
     });
@@ -345,6 +372,7 @@ pub fn apply_fused_mid_rewrites(app: &mut App) {
                 &by_model,
                 &readers,
                 &flat_loaded,
+                &own_url_options,
             );
         });
     }
@@ -362,6 +390,7 @@ pub fn apply_fused_mid_rewrites(app: &mut App) {
                 &by_model,
                 &readers,
                 &flat_loaded,
+                &own_url_options,
             );
         });
     });
@@ -370,31 +399,33 @@ pub fn apply_fused_mid_rewrites(app: &mut App) {
 fn rewrite_mid_node(
     e: &mut Expr,
     enclosing: Option<&crate::ident::ClassId>,
-    helpers: &std::collections::HashSet<String>,
-    path_params: &std::collections::HashMap<String, Vec<String>>,
+    helpers: &crate::det::HashSet<String>,
+    path_params: &crate::det::HashMap<String, Vec<String>>,
     position_path: bool,
     enum_map: &super::enum_symbols::EnumMap,
     json_map: &super::has_json::HasJsonColumns,
-    sole_includer: &std::collections::HashMap<crate::ident::ClassId, crate::ident::ClassId>,
-    by_model: &std::collections::HashMap<crate::ident::ClassId, std::collections::HashSet<Symbol>>,
-    readers: &std::collections::HashMap<crate::ident::ClassId, std::collections::HashSet<Symbol>>,
-    flat_loaded: &std::collections::HashMap<crate::ident::ClassId, std::collections::HashSet<Symbol>>,
+    sole_includer: &crate::det::HashMap<crate::ident::ClassId, crate::ident::ClassId>,
+    by_model: &crate::det::HashMap<crate::ident::ClassId, crate::det::HashSet<Symbol>>,
+    readers: &crate::det::HashMap<crate::ident::ClassId, crate::det::HashSet<Symbol>>,
+    flat_loaded: &crate::det::HashMap<crate::ident::ClassId, crate::det::HashSet<Symbol>>,
+    own_url_options: &crate::det::HashSet<crate::ident::ClassId>,
 ) {
     if !helpers.is_empty() {
+        let own = enclosing.is_some_and(|c| own_url_options.contains(c));
         super::route_format_suffix::rewrite_node(e, helpers);
         // Format suffix can wrap a helper as `<call> + ".ext"`. Sequential
         // walks still visit that inner `recv: None` send; a fused callback
         // would otherwise only see `+` and skip position/host rewrites.
         if is_format_suffix_wrap(e, helpers) {
             if let ExprNode::Send { recv: Some(inner), .. } = &mut *e.node {
-                apply_route_url_followups(inner, position_path, path_params, helpers);
+                apply_route_url_followups(inner, position_path, path_params, helpers, own);
             }
         } else {
-            apply_route_url_followups(e, position_path, path_params, helpers);
+            apply_route_url_followups(e, position_path, path_params, helpers, own);
         }
     }
     if !enum_map.is_empty() {
-        super::enum_symbols::rewrite_node(e, enum_map);
+        super::enum_symbols::rewrite_node(e, enum_map, enclosing);
     }
     if !json_map.is_empty() {
         super::has_json::rewrite_node(e, json_map);
@@ -406,13 +437,14 @@ fn rewrite_mid_node(
 fn apply_route_url_followups(
     target: &mut Expr,
     position_path: bool,
-    path_params: &std::collections::HashMap<String, Vec<String>>,
-    helpers: &std::collections::HashSet<String>,
+    path_params: &crate::det::HashMap<String, Vec<String>>,
+    helpers: &crate::det::HashSet<String>,
+    own_url_options: bool,
 ) {
     if position_path {
         super::route_url_options::rewrite_position_node(target, path_params);
     }
-    super::route_url_options::rewrite_node(target, helpers);
+    super::route_url_options::rewrite_owned_node(target, helpers, own_url_options);
 }
 
 /// True when `route_format_suffix` just replaced a helper with concat.
@@ -442,14 +474,14 @@ fn rewrite_hook_node(
     skip_exclude: bool,
     skip_in: bool,
     skip_including: bool,
-    skip_full_messages: bool,
+    full_messages: &super::errors_full_messages::Site<'_>,
 ) {
     super::pathname_ctor::rewrite_node(e);
     super::array_ordinal::rewrite_node(e);
     super::save_without_validation::rewrite_node(e);
     super::random_formatter::rewrite_node(e);
     super::number_to_fs::rewrite_node(e);
-    super::string_inflections::rewrite_node(e);
+    super::string_core_ext::rewrite_fused_node(e);
     super::to_json::rewrite_node(e);
     super::preloader::rewrite_node(e);
     super::bigdecimal::rewrite_node(e);
@@ -472,14 +504,13 @@ fn rewrite_hook_node(
     super::destroy_by::rewrite_node(e);
     super::literal_append::rewrite_node(e);
     super::byte_size::rewrite_node(e);
+    super::ruby2_keywords_hash::rewrite_node(e);
     super::dirty_predicate_kwargs::rewrite_node(e);
     super::relation_select_block::rewrite_node(e);
     super::arel_attribute::rewrite_node(e);
     super::attr_or_assign::rewrite_node(e);
     super::group_count::rewrite_node(e);
-    if !skip_full_messages {
-        super::errors_full_messages::rewrite_node(e);
-    }
+    super::errors_full_messages::rewrite_node(e, full_messages);
     super::each_with_index::rewrite_node(e);
     // Last: produces `ActiveSupport.*` / Range nodes no earlier fused
     // rewrite keys on. `where_range_split` still runs sequentially
@@ -492,13 +523,13 @@ fn rewrite_view_node(
     skip_exclude: bool,
     skip_in: bool,
     skip_including: bool,
-    skip_full_messages: bool,
+    full_messages: &super::errors_full_messages::Site<'_>,
 ) {
     super::pathname_ctor::rewrite_node(e);
     super::array_ordinal::rewrite_node(e);
     super::random_formatter::rewrite_node(e);
     super::number_to_fs::rewrite_node(e);
-    super::string_inflections::rewrite_node(e);
+    super::string_core_ext::rewrite_fused_node(e);
     super::to_json::rewrite_node(e);
     super::preloader::rewrite_node(e);
     super::bigdecimal::rewrite_node(e);
@@ -522,28 +553,27 @@ fn rewrite_view_node(
     super::dirty_predicate_kwargs::rewrite_node(e);
     super::relation_select_block::rewrite_node(e);
     super::arel_attribute::rewrite_node(e);
-    if !skip_full_messages {
-        super::errors_full_messages::rewrite_node(e);
-    }
+    super::errors_full_messages::rewrite_node(e, full_messages);
     super::each_with_index::rewrite_node(e);
     super::time_calendar::rewrite_node(e);
 }
 
-fn rewrite_test_node(e: &mut Expr, skip_full_messages: bool) {
+fn rewrite_test_node(e: &mut Expr, full_messages: &super::errors_full_messages::Site<'_>) {
     super::save_without_validation::rewrite_node(e);
     super::preloader::rewrite_node(e);
     super::bigdecimal::rewrite_node(e);
     super::range_enumerable::rewrite_node(e);
     super::enumerable_ext::rewrite_node(e);
     super::byte_size::rewrite_node(e);
+    super::ruby2_keywords_hash::rewrite_node(e);
     super::dirty_predicate_kwargs::rewrite_node(e);
-    if !skip_full_messages {
-        super::errors_full_messages::rewrite_node(e);
-    }
+    super::errors_full_messages::rewrite_node(e, full_messages);
 }
 
-fn rewrite_late_hook_node(e: &mut Expr) {
-    super::rails_cache::rewrite_node(e);
+fn rewrite_late_hook_node(e: &mut Expr, skip_cache: bool) {
+    if !skip_cache {
+        super::rails_cache::rewrite_node(e);
+    }
     super::capture_inline::rewrite_node(e);
     super::and_return::rewrite_node(e);
     super::case_lambda::rewrite_node(e);

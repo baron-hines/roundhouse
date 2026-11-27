@@ -4,11 +4,13 @@
 
 use ruby_prism::Node;
 
-use crate::dialect::{Action, Comment, Controller, ControllerBodyItem, LayoutDecl, RenderTarget};
+use crate::dialect::{Action, Comment, Controller, ControllerBodyItem, LayoutCall, LayoutDecl, LayoutValue, RenderTarget};
 use crate::effect::EffectSet;
 use crate::expr::{Expr, ExprNode, Literal};
 use crate::span::Span;
 use crate::ty::{Row, Ty};
+
+use super::with_options::MergedOption;
 use crate::{ClassId, Symbol};
 
 use super::expr::ingest_expr;
@@ -19,21 +21,8 @@ use super::util::{
 };
 use super::{IngestError, IngestResult};
 
+use crate::ingest::prism_api::PrismLocation;
 pub fn ingest_controller(source: &[u8], file: &str) -> IngestResult<Option<Controller>> {
-    Ok(ingest_controller_with_nesting(source, file)?.map(|(controller, _)| controller))
-}
-
-/// `ingest_controller`, plus the lexical nesting the superclass is
-/// looked up in (`Module.nesting` at the `class` keyword, innermost
-/// first). `Controller` doesn't carry it, and the name can't stand in
-/// for it: `class Admin::XController < BaseController` at top level
-/// looks up `::BaseController`, while the same class written inside
-/// `module Admin` looks up `Admin::BaseController` first. Empty when
-/// the superclass is rooted (`< ::BaseController`).
-pub(super) fn ingest_controller_with_nesting(
-    source: &[u8],
-    file: &str,
-) -> IngestResult<Option<(Controller, Vec<String>)>> {
     super::sources::register(file, &String::from_utf8_lossy(source));
     let result = super::prism::parse(source, file);
     let root = result.node();
@@ -91,18 +80,18 @@ pub(super) fn ingest_controller_with_nesting(
     // `Admin::StatusesController`, not collide with the top-level
     // `StatusesController` (which merges two controllers' actions and
     // poisons both metas' ivar seeding).
-    let (scope, nesting, class) = match chosen_idx {
+    let (scope, class) = match chosen_idx {
         Some(i) => {
-            let (s, n, c) = all_classes.into_iter().nth(i).expect("chosen index in range");
-            (s, n, Some(c))
+            let (s, _, c) = all_classes.into_iter().nth(i).expect("chosen index in range");
+            (s, Some(c))
         }
         None => {
             match all_classes
                 .into_iter()
                 .find(|(_, _, c)| descends_from_controller(c))
             {
-                Some((s, n, c)) => (s, n, Some(c)),
-                None => (Vec::new(), Vec::new(), None),
+                Some((s, _, c)) => (s, Some(c)),
+                None => (Vec::new(), None),
             }
         }
     };
@@ -121,15 +110,10 @@ pub(super) fn ingest_controller_with_nesting(
         .map(|n| super::util::node_span(&n, file))
         .unwrap_or_default();
     let parent = class.superclass().and_then(|n| {
-        constant_path_of(&n).map(|p| ClassId(Symbol::from(p.join("::"))))
+        constant_path_of(&n)
+            .or_else(|| super::engine_config::folded_superclass(&n))
+            .map(|p| ClassId(Symbol::from(p.join("::"))))
     });
-    // `< ::BaseController` names the top level whatever the nesting;
-    // the path above has already dropped the leading `::`.
-    let rooted = class
-        .superclass()
-        .and_then(|n| n.as_constant_path_node().map(|p| p.parent().is_none()))
-        .unwrap_or(false);
-    let nesting = if rooted { Vec::new() } else { nesting };
 
     let mut comments = collect_comments(&result);
     drain_comments_before(&mut comments, class.location().start_offset());
@@ -166,9 +150,28 @@ pub(super) fn ingest_controller_with_nesting(
             // (matches Rails: a later `layout` call overrides an earlier
             // one). The call still falls through to Unknown for source
             // round-trip; the side-channel `Controller.layout` is what
-            // analyze reads to seed layout-view ivar types.
-            if let Some(decl) = parse_layout_call(&stmt) {
-                layout = decl;
+            // `controller_layout` resolves each action's layout from. A
+            // non-literal `only:`/`except:` is a located gap (survey) or a
+            // strict error, as a filter's is, and leaves `layout` as it was.
+            // `alias :new :old` is the keyword spelling of `alias_method :new, :old`, which the lowering copies the method for.
+            if let Some(alias) = stmt.as_alias_method_node()
+                && let (Some(to), Some(from)) = (alias.new_name().as_symbol_node(), alias.old_name().as_symbol_node())
+            {
+                let span = crate::span::Span { file: super::sources::file_id(file), start: stmt_start as u32, end: stmt.location().end_offset() as u32 };
+                let sym = |s: &ruby_prism::SymbolNode<'_>| crate::expr::Expr::new(span, crate::expr::ExprNode::Lit { value: crate::expr::Literal::Sym { value: Symbol::from(String::from_utf8_lossy(s.unescaped()).as_ref()) } });
+                body_items.push(ControllerBodyItem::Unknown {
+                    expr: crate::expr::Expr::new(span, crate::expr::ExprNode::Send { recv: None, method: Symbol::from("alias_method"), args: vec![sym(&to), sym(&from)], block: None, parenthesized: false }),
+                    leading_comments: std::mem::take(&mut leading),
+                    leading_blank_line: leading_blank,
+                });
+                prev_end = Some(stmt.location().end_offset());
+                continue;
+            }
+            match parse_layout_call(&stmt, file) {
+                Ok(Some(decl)) => layout = decl,
+                Ok(None) => {}
+                Err(err) if super::survey::is_active() => super::survey::record(&err),
+                Err(err) => return Err(err),
             }
             // A `before_action :a, :b` line declares one filter per leading
             // symbol; expand to one `Filter` body item each so every target's
@@ -358,7 +361,7 @@ pub(super) fn ingest_controller_with_nesting(
                 Some(
                     super::singleton_class::ingest_singleton_body(&sc, &owner, file, &|def| {
                         super::library_class::ingest_library_method(def, &owner, file)
-                    })
+                    }, false)
                     .map(|b| (b.methods, b.class_body)),
                 )
             } else {
@@ -434,74 +437,84 @@ pub(super) fn ingest_controller_with_nesting(
         }
     }
 
-    Ok(Some((
-        Controller {
-            name: ClassId(Symbol::from(name_path.join("::"))),
-            parent,
-            parent_span,
-            body: body_items,
-            layout,
-            sibling_classes,
-        },
-        nesting,
-    )))
+    Ok(Some(Controller {
+        name: ClassId(Symbol::from(name_path.join("::"))),
+        parent,
+        parent_span,
+        body: body_items,
+        layout,
+        sibling_classes,
+        csp_header: false,
+    }))
 }
 
-/// Recognize a `layout` class-body call. Returns `Some(decl)` if this
-/// is a `layout ...` call we can interpret, `None` otherwise (including
-/// for unsupported shapes like `layout :method_name` where the symbol
-/// names a controller method — those degrade to `Inherit` and the
-/// effective layout falls back to convention).
+/// Recognize a `layout` class-body call. A String names the template, a
+/// Symbol the method Rails calls for it, `false` no layout and `nil` the
+/// default lookup; anything else is kept as computed, for
+/// `controller_layout` to report.
 ///
-/// Note: we can't tell `layout :foo` (static name "foo") from
-/// `layout :foo` (dispatch to method `foo`) syntactically. v1 treats
-/// every `layout :sym` as a static name. The dispatch form is rare
-/// enough on real Rails controllers that this is a safe v1 assumption;
-/// the worst case is a layout-view-name miss, not a crash.
-fn parse_layout_call(stmt: &Node<'_>) -> Option<LayoutDecl> {
-    let call = stmt.as_call_node()?;
-    if call.receiver().is_some() {
-        return None;
+/// Returns `Err` for an `only:`/`except:` value `is_recognized_scope_value`
+/// declines, as `parse_filter_call` does: an unreadable scope would
+/// otherwise read as every action.
+fn parse_layout_call(stmt: &Node<'_>, file: &str) -> IngestResult<Option<LayoutDecl>> {
+    let Some(call) = stmt.as_call_node() else { return Ok(None) };
+    if call.receiver().is_some() || call.block().is_some() {
+        return Ok(None);
     }
     if constant_id_str(&call.name()) != "layout" {
-        return None;
+        return Ok(None);
     }
-    let args = call.arguments()?;
+    let Some(args) = call.arguments() else { return Ok(None) };
     let all_args = args.arguments();
-    let first = all_args.iter().next()?;
-    if let Some(sym) = first.as_symbol_node() {
-        let bytes = sym.unescaped();
-        let name = std::str::from_utf8(bytes).ok()?;
-        return Some(LayoutDecl::Name { name: Symbol::from(name) });
-    }
-    if let Some(s) = first.as_string_node() {
-        let bytes = s.unescaped();
-        let name = std::str::from_utf8(bytes).ok()?;
-        return Some(LayoutDecl::Name { name: Symbol::from(name) });
-    }
-    if first.as_false_node().is_some() || first.as_nil_node().is_some() {
-        // `only:`/`except:` scope the suppression exactly as they scope
-        // a filter — campfire writes `layout false, only: :index`, and
-        // reading past the options would strip the layout from `show`
-        // and `edit` too.
-        let mut only: Vec<Symbol> = Vec::new();
-        let mut except: Vec<Symbol> = Vec::new();
-        for arg in all_args.iter().skip(1) {
-            let Some(hash) = arg.as_keyword_hash_node() else { continue };
-            for element in hash.elements().iter() {
-                let Some(pair) = element.as_assoc_node() else { continue };
-                let Some(key) = pair.key().as_symbol_node() else { continue };
-                let Ok(name) = std::str::from_utf8(key.unescaped()) else { continue };
-                match name {
-                    "only" => only = super::util::symbol_list_value(&pair.value()),
-                    "except" => except = super::util::symbol_list_value(&pair.value()),
-                    _ => {}
+    let Some(first) = all_args.iter().next() else { return Ok(None) };
+    let text = |bytes: &[u8]| std::str::from_utf8(bytes).ok().map(Symbol::from);
+    let value = if let Some(sym) = first.as_symbol_node() {
+        let Some(name) = text(sym.unescaped()) else { return Ok(None) };
+        LayoutValue::Method { name }
+    } else if let Some(s) = first.as_string_node() {
+        let Some(name) = text(s.unescaped()) else { return Ok(None) };
+        LayoutValue::Name { name }
+    } else if first.as_false_node().is_some() {
+        LayoutValue::None
+    } else if first.as_nil_node().is_some() {
+        LayoutValue::Default
+    } else {
+        LayoutValue::Computed
+    };
+    let mut only: Vec<Symbol> = Vec::new();
+    let mut except: Vec<Symbol> = Vec::new();
+    let mut only_present = false;
+    for arg in all_args.iter().skip(1) {
+        let Some(hash) = arg.as_keyword_hash_node() else { continue };
+        for element in hash.elements().iter() {
+            let Some(pair) = element.as_assoc_node() else { continue };
+            let Some(key) = pair.key().as_symbol_node() else { continue };
+            let Ok(name) = std::str::from_utf8(key.unescaped()) else { continue };
+            match name {
+                "only" | "except" if !is_recognized_scope_value(&pair.value()) => {
+                    return Err(IngestError::Unsupported {
+                        file: file.into(),
+                        message: format!(
+                            "`layout` `{name}:` is not a literal Symbol/String or an array of them; the layout is refused rather than silently applied to every action"
+                        ),
+                    });
                 }
+                "only" => {
+                    only = super::util::symbol_list_value(&pair.value());
+                    only_present = true;
+                }
+                "except" => except = super::util::symbol_list_value(&pair.value()),
+                _ => {}
             }
         }
-        return Some(LayoutDecl::None { only, except });
     }
-    None
+    Ok(Some(LayoutDecl::Declared(LayoutCall {
+        value,
+        only,
+        except,
+        only_present,
+        span: super::util::node_span(stmt, file),
+    })))
 }
 
 /// Classify one class-body statement into its `ControllerBodyItem` variant.
@@ -620,7 +633,7 @@ fn ingest_controller_body_item(
             // Block param (`&block`) — methods that name their block so
             // the body can pass it on (`&block`) or that crash without the
             // arity slot.
-            if let Some(bn) = pn.block() {
+            if let Some(bn) = super::prism_api::block_parameter(&pn) {
                 block_param = Some(match bn.name() {
                     Some(n) => Symbol::from(constant_id_str(&n)),
                     // Ruby 3.4 anonymous block param (`def f(&)`) —
@@ -756,10 +769,23 @@ pub(super) fn parse_filter_call(
     stmt: &Node<'_>,
     file: &str,
 ) -> IngestResult<Option<Vec<crate::dialect::Filter>>> {
+    parse_filter_call_on(stmt, file, None)
+}
+
+/// [`parse_filter_call`], also reading a call on the local `receiver`: the
+/// `base` of a `def self.included(base)` hook.
+pub(super) fn parse_filter_call_on(
+    stmt: &Node<'_>,
+    file: &str,
+    receiver: Option<&str>,
+) -> IngestResult<Option<Vec<crate::dialect::Filter>>> {
     use crate::dialect::{Filter, FilterKind};
 
     let Some(call) = stmt.as_call_node() else { return Ok(None) };
-    if call.receiver().is_some() {
+    let on_receiver = call.receiver().is_some_and(|r| {
+        r.as_local_variable_read_node().is_some_and(|read| Some(constant_id_str(&read.name())) == receiver)
+    });
+    if call.receiver().is_some() && !on_receiver {
         return Ok(None);
     }
     let macro_name = constant_id_str(&call.name());
@@ -767,20 +793,21 @@ pub(super) fn parse_filter_call(
         return parse_forgery_macro(&call, macro_name == "protect_from_forgery", file);
     }
     let kind = match macro_name {
-        "before_action" | "prepend_before_action" => FilterKind::Before,
-        "around_action" => FilterKind::Around,
-        "after_action" => FilterKind::After,
+        // `append_*` is Rails' alias of the plain macro (AbstractController::Callbacks).
+        "before_action" | "prepend_before_action" | "append_before_action" => FilterKind::Before,
+        "around_action" | "append_around_action" | "prepend_around_action" => FilterKind::Around,
+        "after_action" | "append_after_action" => FilterKind::After,
         "skip_before_action" => FilterKind::Skip,
         "skip_around_action" => FilterKind::SkipAround,
         "skip_after_action" => FilterKind::SkipAfter,
         _ => return Ok(None),
     };
-    // Rails moves a `prepend_before_action` callback to the head of the
-    // WHOLE chain, ahead of inherited filters too — see `Filter::prepend`.
-    // `prepend_around_action` / `prepend_after_action` are not modeled:
-    // no controller in this codebase's fixtures uses either, so they
-    // stay unrecognized rather than risk a wrong-order claim.
-    let prepend = macro_name == "prepend_before_action";
+    // Rails moves a `prepend_before_action` or `prepend_around_action`
+    // callback to the head of the WHOLE chain, ahead of inherited filters
+    // too — see `Filter::prepend`. `prepend_after_action` is not modeled:
+    // no controller in this codebase's fixtures uses it, so it stays
+    // unrecognized rather than risk a wrong-order claim.
+    let mut prepend = matches!(macro_name, "prepend_before_action" | "prepend_around_action");
 
     let Some(args) = call.arguments() else { return Ok(None) };
 
@@ -793,6 +820,9 @@ pub(super) fn parse_filter_call(
     let mut unless_cond: Option<Symbol> = None;
     let mut if_cond_expr: Option<Expr> = None;
     let mut unless_cond_expr: Option<Expr> = None;
+    let mut unread_guard = false;
+    let mut unread_options = false;
+    let mut only_present = false;
 
     for arg in args.arguments().iter() {
         if let Some(sym) = symbol_value(&arg) {
@@ -807,13 +837,26 @@ pub(super) fn parse_filter_call(
             ));
             continue;
         }
-        let Some(kh) = arg.as_keyword_hash_node() else { continue };
+        let Some(kh) = arg.as_keyword_hash_node() else {
+            unread_guard = true;
+            unread_options = true;
+            continue;
+        };
         for el in kh.elements().iter() {
-            let Some(assoc) = el.as_assoc_node() else { continue };
-            let Some(key) = symbol_value(&assoc.key()) else { continue };
+            let Some(assoc) = el.as_assoc_node() else {
+                unread_guard = true;
+                unread_options = true;
+                continue;
+            };
+            let Some(key) = symbol_value(&assoc.key()) else {
+                unread_guard = true;
+                unread_options = true;
+                continue;
+            };
             let value = assoc.value();
             match key.as_str() {
                 "only" => {
+                    only_present = true;
                     if !is_recognized_scope_value(&value) {
                         return Err(scope_gap(file, macro_name, "only"));
                     }
@@ -828,14 +871,25 @@ pub(super) fn parse_filter_call(
                     except_style = symbol_list_style(&value);
                 }
                 // Symbol-form guards carry the predicate name;
-                // lambda/proc guards carry their body expression.
+                // lambda/proc guards carry their body expression. Any
+                // other value is a guard this cannot read.
                 "if" => {
                     if_cond = symbol_value(&value).map(|s| Symbol::from(s.as_str()));
                     if_cond_expr = lambda_body_expr(&value, file);
+                    unread_guard |= if_cond.is_none() && if_cond_expr.is_none();
                 }
                 "unless" => {
                     unless_cond = symbol_value(&value).map(|s| Symbol::from(s.as_str()));
                     unless_cond_expr = lambda_body_expr(&value, file);
+                    unread_guard |= unless_cond.is_none() && unless_cond_expr.is_none();
+                }
+                "prepend" => {
+                    if value.as_true_node().is_some() {
+                        prepend = true;
+                    } else if value.as_false_node().is_none() && value.as_nil_node().is_none() {
+                        unread_guard = true;
+                        unread_options = true;
+                    }
                 }
                 _ => {}
             }
@@ -862,6 +916,9 @@ pub(super) fn parse_filter_call(
                 unless_cond: unless_cond.clone(),
                 if_cond_expr: if_cond_expr.clone(),
                 unless_cond_expr: unless_cond_expr.clone(),
+                unread_guard,
+                unread_options,
+                only_present,
                 block: None,
                 prepend,
             })
@@ -1003,6 +1060,9 @@ fn parse_forgery_macro(
         unless_cond,
         if_cond_expr,
         unless_cond_expr,
+        unread_guard: false,
+        unread_options: false,
+        only_present: false,
         block: None,
         prepend: false,
     }]))
@@ -1014,102 +1074,6 @@ fn parse_forgery_macro(
 fn is_with_options_call(stmt: &Node<'_>) -> bool {
     stmt.as_call_node()
         .is_some_and(|call| call.receiver().is_none() && constant_id_str(&call.name()) == "with_options")
-}
-
-/// One option a controller-body `with_options` block hands to the calls
-/// inside it: the symbol key, the source of its `key: value` pair,
-/// whether the value is a hash literal (the one case `deep_merge` would
-/// combine), and — for an `if:`/`unless:` key only — whether the value is
-/// a shape [`Filter`](crate::dialect::Filter) can carry (a Symbol or a
-/// lambda/proc). Anything else under `if:`/`unless:` (an Array, say)
-/// would reach `parse_filter_call` and have its condition silently
-/// dropped, so it is checked here instead and declined.
-#[derive(Clone)]
-struct MergedFilterOption {
-    key: String,
-    source: String,
-    hash_value: bool,
-    cond_ok: bool,
-}
-
-fn with_options_gap(file: &str, detail: &str) -> IngestError {
-    IngestError::Unsupported {
-        file: file.into(),
-        message: format!("with_options: {detail}"),
-    }
-}
-
-/// Whether `node` is a shape `Filter.if_cond`/`unless_cond` (Symbol) or
-/// `.if_cond_expr`/`.unless_cond_expr` (lambda/proc body) can hold —
-/// the same two spellings `parse_filter_call` itself recognizes for
-/// `if:`/`unless:` (see `lambda_body_expr`).
-fn is_recognized_cond_value(node: &Node<'_>) -> bool {
-    if node.as_symbol_node().is_some() || node.as_lambda_node().is_some() {
-        return true;
-    }
-    node.as_call_node().is_some_and(|call| {
-        matches!(constant_id_str(&call.name()), "proc" | "lambda") && call.block().is_some()
-    })
-}
-
-/// The `key: value` pairs of a literal option hash, or `None` when the
-/// hash splats (`**opts`): its keys are then unknown. A non-symbol key is
-/// `None` under `symbol_keys_only`, and otherwise skipped (a call's own
-/// string-keyed pair never collides with a merged symbol key).
-fn literal_filter_option_pairs(
-    node: &Node<'_>,
-    symbol_keys_only: bool,
-) -> Option<Vec<MergedFilterOption>> {
-    let elements = if let Some(hash) = node.as_keyword_hash_node() {
-        hash.elements()
-    } else {
-        node.as_hash_node()?.elements()
-    };
-    let mut pairs = Vec::new();
-    for element in elements.iter() {
-        let assoc = element.as_assoc_node()?;
-        let Some(key) = symbol_value(&assoc.key()) else {
-            if symbol_keys_only {
-                return None;
-            }
-            continue;
-        };
-        let location = assoc.location();
-        let value = assoc.value();
-        pairs.push(MergedFilterOption {
-            cond_ok: !matches!(key.as_str(), "if" | "unless") || is_recognized_cond_value(&value),
-            key,
-            source: String::from_utf8_lossy(location.as_slice()).into_owned(),
-            hash_value: value.as_hash_node().is_some() || value.as_keyword_hash_node().is_some(),
-        });
-    }
-    Some(pairs)
-}
-
-/// `inner` deep-merged over `outer`, as `Hash#deep_merge` orders it: an
-/// inner key replaces the outer one in place, new keys follow. Two hash
-/// values under one key would be merged key by key; that is declined
-/// rather than guessed — same semantics `config/routes.rb`'s
-/// `with_options` composes under (`ingest/routes.rs`).
-fn deep_merge_filter_options(
-    outer: &[MergedFilterOption],
-    inner: Vec<MergedFilterOption>,
-    file: &str,
-) -> IngestResult<Vec<MergedFilterOption>> {
-    let mut merged = outer.to_vec();
-    for option in inner {
-        match merged.iter_mut().find(|o| o.key == option.key) {
-            Some(existing) if existing.hash_value && option.hash_value => {
-                return Err(with_options_gap(
-                    file,
-                    &format!("deep-merging two hashes under `{}:` is not composed", option.key),
-                ));
-            }
-            Some(existing) => *existing = option,
-            None => merged.push(option),
-        }
-    }
-    Ok(merged)
 }
 
 /// `with_options unless: :signed_in? do before_action :reject_paging, if:
@@ -1139,38 +1103,25 @@ fn deep_merge_filter_options(
 /// caught and skipped per statement. A controller filter that silently
 /// lost its guard because a SIBLING statement in the same block was
 /// unsupported would be the #785 bug again, one level down; the caller
-/// (`ingest_controller_with_nesting`) is the one place this bubbles up
+/// (`ingest_controller`) is the one place this bubbles up
 /// to and turns into a single gap plus a single whole-statement
 /// `Unknown` round-trip — matching `expand_class_body_macros`'s own
 /// ALL-OR-NOTHING reasoning for a concern macro's body.
 fn ingest_controller_with_options(
     call: &ruby_prism::CallNode<'_>,
-    outer: &[MergedFilterOption],
+    outer: &[MergedOption],
     file: &str,
 ) -> IngestResult<Vec<ControllerBodyItem>> {
     let Some(block) = call.block().and_then(|b| b.as_block_node()) else {
-        return Err(with_options_gap(file, "only the block form is composed"));
+        return Err(super::with_options::gap(file, "only the block form is composed"));
     };
     if block.parameters().is_some() {
-        return Err(with_options_gap(
+        return Err(super::with_options::gap(
             file,
             "a block with a parameter (`|options|`) is not composed",
         ));
     }
-    let args: Vec<Node<'_>> = call
-        .arguments()
-        .map(|a| a.arguments().iter().collect())
-        .unwrap_or_default();
-    let [options] = args.as_slice() else {
-        return Err(with_options_gap(file, "expects exactly one literal option hash"));
-    };
-    let Some(own) = literal_filter_option_pairs(options, true) else {
-        return Err(with_options_gap(
-            file,
-            "options must be a literal hash with symbol keys and no splat",
-        ));
-    };
-    let merged = deep_merge_filter_options(outer, own, file)?;
+    let merged = super::with_options::block_options(call, outer, file)?;
     let Some(body) = block.body() else { return Ok(Vec::new()) };
 
     let mut items = Vec::new();
@@ -1186,7 +1137,7 @@ fn ingest_controller_with_options(
                 ingest_with_options_filter_call(&inner, &merged, file)?
             }
             Some(inner) if inner.receiver().is_none() => {
-                return Err(with_options_gap(
+                return Err(super::with_options::gap(
                     file,
                     &format!(
                         "`{}` with a block is not composed (Rails merges the options into its nested calls too)",
@@ -1195,7 +1146,7 @@ fn ingest_controller_with_options(
                 ));
             }
             _ => {
-                return Err(with_options_gap(
+                return Err(super::with_options::gap(
                     file,
                     "only receiverless calls inside the block are composed",
                 ));
@@ -1214,7 +1165,7 @@ fn ingest_controller_with_options(
 /// `helper_method`, …).
 fn ingest_with_options_filter_call(
     call: &ruby_prism::CallNode<'_>,
-    options: &[MergedFilterOption],
+    options: &[MergedOption],
     file: &str,
 ) -> IngestResult<Vec<ControllerBodyItem>> {
     let args: Vec<Node<'_>> = call
@@ -1223,66 +1174,12 @@ fn ingest_with_options_filter_call(
         .unwrap_or_default();
     if let [only] = args.as_slice() {
         if only.as_lambda_node().is_some() {
-            return Err(with_options_gap(
+            return Err(super::with_options::gap(
                 file,
                 "a call whose only argument is a lambda is not composed",
             ));
         }
     }
-    // A braced positional hash (`before_action :a, { if: :b }`) is not
-    // read as options by `parse_filter_call`, so merging into it would
-    // claim a condition that never reaches the filter.
-    if args.last().is_some_and(|a| a.as_hash_node().is_some()) {
-        return Err(with_options_gap(file, "a positional option hash is not composed"));
-    }
-    let trailing = args.last().filter(|a| a.as_keyword_hash_node().is_some());
-    let own = match trailing {
-        Some(hash) => match literal_filter_option_pairs(hash, false) {
-            Some(pairs) => pairs,
-            None => {
-                return Err(with_options_gap(
-                    file,
-                    "a call whose options splat (`**opts`) is not composed",
-                ));
-            }
-        },
-        None => Vec::new(),
-    };
-    let mut added: Vec<&MergedFilterOption> = Vec::new();
-    for option in options {
-        match own.iter().find(|o| o.key == option.key) {
-            Some(existing) if existing.hash_value && option.hash_value => {
-                return Err(with_options_gap(
-                    file,
-                    &format!("deep-merging two hashes under `{}:` is not composed", option.key),
-                ));
-            }
-            Some(_) => {}
-            None => added.push(option),
-        }
-    }
-    // Reject rather than silently drop a merged `if:`/`unless:` guard
-    // `Filter` cannot carry (an Array, say) — checked over the FINAL
-    // per-call set (the call's own values already took precedence
-    // above), so an outer condition the call's own options shadow never
-    // raises.
-    for option in own.iter().chain(added.iter().copied()) {
-        if matches!(option.key.as_str(), "if" | "unless") && !option.cond_ok {
-            return Err(with_options_gap(
-                file,
-                &format!(
-                    "a merged `{}:` that is not a Symbol or a lambda/proc is not composed",
-                    option.key
-                ),
-            ));
-        }
-    }
-
-    // `parse_filter_call`'s `Err` (a merged `only:`/`except:` that is not
-    // a literal Symbol/String or an array of them) propagates with `?`
-    // like every other decline in this function — refusing the WHOLE
-    // with_options statement, not just this one call, same ALL-OR-NOTHING
-    // reasoning as the rest of `ingest_controller_with_options`.
     let walk = |stmt: Node<'_>| -> IngestResult<Vec<ControllerBodyItem>> {
         match parse_filter_call(&stmt, file)? {
             Some(filters) => Ok(filters
@@ -1296,36 +1193,18 @@ fn ingest_with_options_filter_call(
             None => Ok(vec![ingest_controller_body_item(&stmt, file, Vec::new())?]),
         }
     };
-    if added.is_empty() {
+    // A merged `if:`/`unless:` guard `Filter` cannot carry (an Array,
+    // say) is declined rather than silently dropped.
+    let Some(source) = super::with_options::merged_call_source(call, options, 0, true, file)? else {
         return walk(call.as_node());
-    }
-    let added_src = added.iter().map(|o| o.source.as_str()).collect::<Vec<_>>().join(", ");
-    let (offset, text) = match args.last() {
-        Some(last) => (last.location().end_offset(), format!(", {added_src}")),
-        None => match call.closing_loc() {
-            Some(close) => (close.start_offset(), added_src),
-            None => match call.message_loc() {
-                Some(name) => (name.end_offset(), format!(" {added_src}")),
-                None => return Err(with_options_gap(file, "call has no name to merge into")),
-            },
-        },
     };
-    let location = call.location();
-    let start = location.start_offset();
-    let original = location.as_slice();
-    // Pad to the call's own offset so diagnostics still point into the
-    // controller file; only what follows the insertion point shifts.
-    let mut source = vec![b' '; start];
-    source.extend_from_slice(&original[..offset - start]);
-    source.extend_from_slice(text.as_bytes());
-    source.extend_from_slice(&original[offset - start..]);
     let result = super::prism::parse(&source, file);
     let root = result.node();
     let Some(stmt) = root
         .as_program_node()
         .and_then(|p| p.statements().body().iter().next())
     else {
-        return Err(with_options_gap(file, "merged call did not re-parse"));
+        return Err(super::with_options::gap(file, "merged call did not re-parse"));
     };
     walk(stmt)
 }
@@ -1375,7 +1254,7 @@ pub(crate) fn is_lambda_filter_macro(method: &str) -> bool {
 ///
 /// One function so the two places that need it — this file's own
 /// hand-written block-form `around_action` pass
-/// (`ingest_controller_with_nesting`) and `app::
+/// (`ingest_controller`) and `app::
 /// expand_class_body_macros`'s macro-expanded one — agree on the same
 /// encoding instead of drifting apart.
 pub(super) fn around_block_owner_ident(name: &ClassId) -> String {
@@ -1385,7 +1264,7 @@ pub(super) fn around_block_owner_ident(name: &ClassId) -> String {
 /// The sequence number `around_block_filter` should start COUNTING UP
 /// FROM for `owner_ident` on this controller — one past the highest
 /// `__rh_around_<owner_ident>_<n>` suffix any EARLIER pass already
-/// placed in `body`. `ingest_controller_with_nesting`'s own hand-written
+/// placed in `body`. `ingest_controller`'s own hand-written
 /// block-form `around_action` pass always runs first and starts its own
 /// counter at 0; `app::expand_class_body_macros` runs afterward, over
 /// the same controller, for whatever block-form `around_action` a
@@ -1426,6 +1305,11 @@ pub(crate) struct LambdaFilterTarget {
     pub unless_cond: Option<Symbol>,
     pub if_cond_expr: Option<Expr>,
     pub unless_cond_expr: Option<Expr>,
+    /// An `if:`/`unless:` this could not read; see `Filter::unread_guard`.
+    pub unread_guard: bool,
+    pub unread_options: bool,
+    pub only_present: bool,
+    pub prepend: bool,
 }
 
 impl LambdaFilterTarget {
@@ -1433,7 +1317,7 @@ impl LambdaFilterTarget {
         self.method.as_str() == "after_action"
     }
     pub fn is_prepend(&self) -> bool {
-        self.method.as_str() == "prepend_before_action"
+        self.prepend
     }
 }
 
@@ -1469,6 +1353,21 @@ fn ir_symbol_list(e: &Expr) -> Vec<Symbol> {
     match &*e.node {
         ExprNode::Array { elements, .. } => elements.iter().filter_map(ir_symbol).collect(),
         _ => ir_symbol(e).into_iter().collect(),
+    }
+}
+
+/// Literal action names, as Symbols or Strings, or `None` for any other
+/// value: an unread action list isn't an empty one.
+fn readable_symbol_list(e: &Expr) -> Option<Vec<Symbol>> {
+    fn name(e: &Expr) -> Option<Symbol> {
+        match &*e.node {
+            ExprNode::Lit { value: Literal::Str { value } } => Some(Symbol::from(value.as_str())),
+            _ => ir_symbol(e),
+        }
+    }
+    match &*e.node {
+        ExprNode::Array { elements, .. } => elements.iter().map(name).collect(),
+        _ => name(e).map(|symbol| vec![symbol]),
     }
 }
 
@@ -1669,6 +1568,10 @@ pub(crate) fn lambda_filter_target(expr: &Expr) -> Option<LambdaFilterTarget> {
     let mut unless_cond: Option<Symbol> = None;
     let mut if_cond_expr: Option<Expr> = None;
     let mut unless_cond_expr: Option<Expr> = None;
+    let mut unread_guard = false;
+    let mut unread_options = false;
+    let mut only_present = false;
+    let mut prepend = method.as_str() == "prepend_before_action";
     for a in option_args {
         // A concern macro's `before_action(**kwargs) { ... }` substitutes
         // the call's options Hash under a `**` splat rather than the
@@ -1681,22 +1584,53 @@ pub(crate) fn lambda_filter_target(expr: &Expr) -> Option<LambdaFilterTarget> {
             ExprNode::KeywordSplat { value } => value,
             _ => a,
         };
-        let ExprNode::Hash { entries, .. } = &*a.node else { continue };
+        let ExprNode::Hash { entries, .. } = &*a.node else {
+            unread_guard = true;
+            unread_options = true;
+            continue;
+        };
         for (k, v) in entries {
             let ExprNode::Lit { value: Literal::Sym { value: key } } = &*k.node else {
+                unread_guard = true;
+                unread_options = true;
                 continue;
             };
             match key.as_str() {
-                "only" => only = ir_symbol_list(v),
-                "except" => except = ir_symbol_list(v),
+                "only" => match readable_symbol_list(v) {
+                    Some(list) => {
+                        only_present = true;
+                        only = list;
+                    }
+                    None => {
+                        unread_guard = true;
+                        unread_options = true;
+                    }
+                },
+                "except" => match readable_symbol_list(v) {
+                    Some(list) => except = list,
+                    None => {
+                        unread_guard = true;
+                        unread_options = true;
+                    }
+                },
                 "if" => {
                     if_cond = ir_symbol(v);
                     if_cond_expr = ir_lambda_body(v);
+                    unread_guard |= if_cond.is_none() && if_cond_expr.is_none();
                 }
                 "unless" => {
                     unless_cond = ir_symbol(v);
                     unless_cond_expr = ir_lambda_body(v);
+                    unread_guard |= unless_cond.is_none() && unless_cond_expr.is_none();
                 }
+                "prepend" => match &*v.node {
+                    ExprNode::Lit { value: Literal::Bool { value: true } } => prepend = true,
+                    ExprNode::Lit { value: Literal::Bool { value: false } | Literal::Nil } => {}
+                    _ => {
+                        unread_guard = true;
+                        unread_options = true;
+                    }
+                },
                 _ => {}
             }
         }
@@ -1710,6 +1644,10 @@ pub(crate) fn lambda_filter_target(expr: &Expr) -> Option<LambdaFilterTarget> {
         unless_cond,
         if_cond_expr,
         unless_cond_expr,
+        unread_guard,
+        unread_options,
+        only_present,
+        prepend,
     })
 }
 
@@ -1925,6 +1863,9 @@ pub(super) fn around_block_filter(
         unless_cond,
         if_cond_expr,
         unless_cond_expr,
+        unread_guard: false,
+        unread_options: false,
+        only_present: false,
         block: None,
         prepend: false,
     };
@@ -2178,7 +2119,10 @@ pub fn render_template_name(args: &[Expr]) -> Option<Symbol> {
 /// last segment ends in `Controller` (`ApplicationController`,
 /// `Admin::SectionController`).
 fn descends_from_controller(class: &ruby_prism::ClassNode<'_>) -> bool {
-    let Some(parent) = class.superclass().and_then(|n| constant_path_of(&n)) else {
+    let Some(parent) = class
+        .superclass()
+        .and_then(|n| constant_path_of(&n).or_else(|| super::engine_config::folded_superclass(&n)))
+    else {
         return false;
     };
     parent.first().is_some_and(|s| s == "ActionController")

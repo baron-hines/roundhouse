@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # ActiveJob under the transpiled runtime: the adapter is `:inline` —
 # there is no queue daemon in-process, so the class-side entries
 # (`perform_later`, `set(...).perform_later`) are synthesized by
@@ -109,12 +110,14 @@ module ActiveJob
   # this was written, with two job classes of different arities and
   # argument types, and the output is byte-identical to CRuby's.
   #
-  # ONE QUEUE, NOT ONE PER QUEUE NAME. `queue_as` is inert here (see
-  # `Base` below) because a single in-process drain has no scheduling
-  # decision to make: there is no worker pool to allocate and no
-  # priority to honour, so recording the name would suggest an ordering
-  # guarantee nothing implements.
+  # ONE QUEUE, NOT ONE PER QUEUE NAME. A payload records its job's
+  # `queue_as` name, as Rails' does, but a single in-process drain has
+  # no scheduling decision to make: there is no worker pool to allocate
+  # and no priority to honour, so every entry runs in arrival order.
   PENDING = []
+
+  # Not a field of the entry: an entry stays a bare `() -> nil` so every target can hold it.
+  PENDING_QUEUES = []
 
   # Whether a drain exists to pick the work up. Empty means no — and
   # then `perform_later` runs inline, exactly as before, because a job
@@ -147,6 +150,11 @@ module ActiveJob
   # Proc is opaque to the analyzer either way -- `work.call` answers
   # gradually under both.
   def self.enqueue(work)
+    enqueue_on("default", work)
+  end
+
+  def self.enqueue_on(queue, work)
+    PENDING_QUEUES << queue
     PENDING << work
     nil
   end
@@ -166,8 +174,27 @@ module ActiveJob
   # entry, so the one FIFO and its locking stay as they are. What the
   # Proc closes over is the serialized text, not the job's objects.
   def self.enqueue_payload(json)
-    enqueue(-> { perform_payload(json)
+    enqueue_payload_on("default", json)
+  end
+
+  def self.enqueue_payload_on(queue, json)
+    enqueue_on(queue, -> { perform_payload(json)
     nil })
+  end
+
+  # A payload whose job asks to be enqueued after commit. This default
+  # holds nothing; the Ruby-family job registry redefines it to hold the
+  # payload while `Model.transaction` is open.
+  def self.enqueue_payload_after_commit(json)
+    enqueue_payload_after_commit_on("default", json)
+  end
+
+  def self.enqueue_payload_after_commit_on(queue, json)
+    enqueue_payload_on(queue, json)
+  end
+
+  def self.queue_or(queue, own)
+    queue == "" ? own : queue
   end
 
   def self.pending_count
@@ -186,6 +213,28 @@ module ActiveJob
   # Raised when a payload names a record that is gone, as Rails' is.
   # `discard_on ActiveJob::DeserializationError` drops the job quietly.
   class DeserializationError < StandardError
+  end
+
+  # Raised by `Arguments.serialize` for an argument it cannot write.
+  class SerializationError < ArgumentError
+  end
+
+  # `raise ActiveJob::EnqueueError, message` — the job was not queued.
+  class EnqueueError < StandardError
+  end
+
+  # `include ActiveJob::Continuable` and `step :name { ... }`. Each step
+  # runs once on this instance. The cursor is in memory: there is no
+  # queue checkpoint to resume from after the process stops.
+  module Continuable
+    def step(name)
+      @completed_steps = [] if @completed_steps.nil?
+      key = name.to_s
+      return nil if @completed_steps.include?(key)
+      result = yield
+      @completed_steps << key
+      result
+    end
   end
 
   # Run every job queued so far, FIFO, and answer how many ran.
@@ -232,17 +281,22 @@ module ActiveJob
   end
 
   # Run the held jobs `only` names (all of them when it is empty), in
-  # the order they were enqueued, and answer how many ran. A job one of
-  # them enqueues is held behind it and runs in the same pass. Jobs
-  # `only` leaves out stay held.
+  # the order they were enqueued, and answer how many ran. Only the jobs
+  # held when the call starts run: Rails' `flush_enqueued_jobs` walks a
+  # snapshot (`jobs.dup`), so a job one of them enqueues stays held
+  # behind it for a later call. That is what ends a job that re-enqueues
+  # itself (an interrupted job-iteration job continues from its cursor
+  # as a new enqueue). Jobs `only` leaves out stay held.
   def self.perform_held(only)
     ran = 0
     i = 0
-    while i < HELD.length
+    limit = HELD.length
+    while i < limit && i < HELD.length
       if only.empty? || only.include?(HELD_NAMES[i])
         work = HELD[i]
         HELD.delete_at(i)
         HELD_NAMES.delete_at(i)
+        limit = limit - 1
         work.call
         ran = ran + 1
       else
@@ -259,8 +313,17 @@ module ActiveJob
     nil
   end
 
+  # Rails' adapter classes, for the extensions an engine mixes into them at boot (`engine_config::carry_boot_mixin`).
+  module QueueAdapters
+    class AsyncAdapter
+    end
+  end
+
   class Base
-    # `queue_as :default` — queue routing has no meaning inline.
+    # `queue_as :default` — nothing to do at class load. A job queued as
+    # a payload carries the name as its `queue_name`, read off the
+    # literal at compile time (`lower::job_payload`); the drain still
+    # runs one FIFO.
     def self.queue_as(name = nil)
       nil
     end
@@ -272,8 +335,10 @@ module ActiveJob
     end
 
     # `retry_on` / `discard_on` — error-handling policy for queued
-    # execution; inert inline (an inline job's exception propagates to
-    # the caller, which is the honest development-mode behavior).
+    # execution. Inert here; `discard_on ActiveJob::DeserializationError`
+    # on a payload job is read at compile time into the job registry's
+    # discard table, so the drain drops a job whose record is gone.
+    # `retry_on` has no queue to retry on yet.
     def self.retry_on(error, opts = nil)
       nil
     end

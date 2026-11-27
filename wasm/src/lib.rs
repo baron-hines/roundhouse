@@ -148,13 +148,15 @@ fn transpile_inner(json_in: &str) -> String {
         analyzer.analyze(&mut app);
         Vec::new()
     } else {
-        analyzer.analyze(&mut app);
+        roundhouse::lower::i18n_translate::with_plan_cache(|| {
+            analyzer.analyze(&mut app);
 
-        // Same post-analyze shared lowerings as the CLI transpile driver
-        // (bin/roundhouse): the playground emits from the same IR the CLI
-        // does. Residue joins the diagnostics below; synthetic spans drop
-        // out in the existing filter.
-        roundhouse::lower::apply_post_analyze_lowerings(&mut app, analyzer.class_registry())
+            // Same post-analyze shared lowerings as the CLI transpile driver
+            // (bin/roundhouse): the playground emits from the same IR the CLI
+            // does. Residue joins the diagnostics below; synthetic spans drop
+            // out in the existing filter.
+            roundhouse::lower::apply_post_analyze_lowerings(&mut app, analyzer.class_registry())
+        })
     };
 
     // Analyzer diagnostics + gap-attributed coverage notes (Info severity),
@@ -166,15 +168,16 @@ fn transpile_inner(json_in: &str) -> String {
     roundhouse::analyze::attribution::attribute_analysis_gaps(&mut diags, &app, &mut gaps);
     diags.extend(parse_diags);
     diags.extend(lower_diags);
+    // Two positions per diagnostic and per hover type: each file's line
+    // index is built once (`line_col` alone counts from the top of the file).
+    let mut positions = roundhouse::span::SourcePositions::new(&app.sources);
     let diagnostics: Vec<DiagnosticOut> = diags
         .into_iter()
         .filter_map(|d| {
             if d.span.is_synthetic() {
                 return None;
             }
-            let sf = app.sources.get((d.span.file.0 as usize).checked_sub(1)?)?;
-            let (start_line, start_col) = sf.line_col(d.span.start);
-            let (end_line, end_col) = sf.line_col(d.span.end);
+            let (sf, (start_line, start_col), (end_line, end_col)) = positions.of(d.span)?;
             let severity = match d.severity {
                 Severity::Error => "error",
                 Severity::Warning => "warning",
@@ -203,9 +206,7 @@ fn transpile_inner(json_in: &str) -> String {
             if span.is_synthetic() || matches!(ty, roundhouse::ty::Ty::Var { .. }) {
                 return None;
             }
-            let sf = app.sources.get((span.file.0 as usize).checked_sub(1)?)?;
-            let (start_line, start_col) = sf.line_col(span.start);
-            let (end_line, end_col) = sf.line_col(span.end);
+            let (sf, (start_line, start_col), (end_line, end_col)) = positions.of(span)?;
             Some(TypeOut {
                 path: sf.path.clone(),
                 start_line,
@@ -382,15 +383,16 @@ fn analyze_app_inner(json_in: &str) -> String {
     roundhouse::analyze::attribution::attribute_unknown_gems(&mut diags, &app);
     diags.extend(parse_diags);
 
+    // Two positions per diagnostic: each file's line index is built once
+    // (`line_col` alone counts from the top of the file).
+    let mut positions = roundhouse::span::SourcePositions::new(&app.sources);
     let diagnostics: Vec<DiagnosticOut> = diags
         .into_iter()
         .filter_map(|d| {
             if d.span.is_synthetic() {
                 return None;
             }
-            let sf = app.sources.get((d.span.file.0 as usize).checked_sub(1)?)?;
-            let (start_line, start_col) = sf.line_col(d.span.start);
-            let (end_line, end_col) = sf.line_col(d.span.end);
+            let (sf, (start_line, start_col), (end_line, end_col)) = positions.of(d.span)?;
             let severity = match d.severity {
                 Severity::Error => "error",
                 Severity::Warning => "warning",
@@ -806,6 +808,88 @@ pub unsafe extern "C" fn version(_input_ptr: *const u8, _input_len: u32) -> u64 
         "commit": roundhouse::version::COMMIT,
     });
     pack(out.to_string())
+}
+
+// ── Fractal pass explorer ────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct FractalInput {
+    src: HashMap<String, String>,
+    /// The files to compile (`--file`), relative to the app root.
+    #[serde(default)]
+    files: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct FractalOutput {
+    #[serde(flatten)]
+    stages: roundhouse::emit::fractal::stages::Stages,
+    /// Ruby files under `app/` the explorer can offer to compile.
+    candidates: Vec<String>,
+    /// Ingest gaps, as `path: message`.
+    gaps: Vec<String>,
+}
+
+fn fractal_stages_inner(json_in: &str) -> String {
+    use roundhouse::emit::fractal;
+    let input: FractalInput = match serde_json::from_str(json_in) {
+        Ok(v) => v,
+        Err(e) => return error_json(&format!("invalid input JSON: {e}")),
+    };
+    let mut candidates: Vec<String> =
+        input.src.keys().filter(|p| p.starts_with("app/") && p.ends_with(".rb")).cloned().collect();
+    candidates.sort();
+    let lockfile = input.src.get("Gemfile.lock").cloned();
+    let mut sources: Vec<roundhouse::span::SourceFile> = input
+        .src
+        .iter()
+        .filter(|(path, _)| path.ends_with(".rb"))
+        .map(|(path, text)| roundhouse::span::SourceFile { path: path.clone(), text: text.clone() })
+        .collect();
+    sources.sort_by(|a, b| a.path.cmp(&b.path));
+    let tree: HashMap<PathBuf, Vec<u8>> =
+        input.src.into_iter().map(|(k, v)| (PathBuf::from(k), v.into_bytes())).collect();
+    roundhouse::ingest::survey::activate();
+    let (result, parse_diags) = roundhouse::ingest::prism::scope(|| ingest_app_from_tree(tree));
+    let gaps = roundhouse::ingest::survey::drain();
+    let mut app = match result {
+        Ok(app) => app,
+        Err(e) => return error_json(&format!("ingest: {e}")),
+    };
+    let mut untrusted: Vec<String> = Vec::new();
+    for d in parse_diags.iter().filter(|d| d.severity == Severity::Error) {
+        if let Some(source) = (d.span.file.0 as usize).checked_sub(1).and_then(|i| app.sources.get(i)) {
+            untrusted.push(source.path.clone());
+        }
+    }
+    let mut gaps_out = Vec::new();
+    for gap in &gaps {
+        if let roundhouse::ingest::IngestError::Unsupported { file, message }
+        | roundhouse::ingest::IngestError::Parse { file, message } = gap
+        {
+            untrusted.push(file.clone());
+            gaps_out.push(format!("{file}: {message}"));
+        }
+    }
+    Analyzer::new(&app).analyze(&mut app);
+    let passes = fractal::pass::registered();
+    let passes: Vec<&dyn fractal::Pass> = passes.iter().map(|p| p.as_ref()).collect();
+    let root = std::path::Path::new("");
+    let context = fractal::Context::in_memory(&app, root, sources, lockfile.as_deref());
+    match fractal::stages::stages(&app, &context, &input.files, &untrusted, &passes) {
+        Ok(stages) => serde_json::to_string(&FractalOutput { stages, candidates, gaps: gaps_out })
+            .unwrap_or_else(|e| error_json(&format!("serialize: {e}"))),
+        Err(e) => error_json(&e),
+    }
+}
+
+/// The Fractal pass explorer's entry: input `{"src": {...}, "files": [...]}`,
+/// output the compiled files after each registered pass (see
+/// `roundhouse::emit::fractal::stages`), or `{"error": ...}`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fractal_stages(input_ptr: *const u8, input_len: u32) -> u64 {
+    let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len as usize) };
+    pack(fractal_stages_inner(std::str::from_utf8(input).unwrap_or("{}")))
 }
 
 // ── C ABI exports ────────────────────────────────────────────────────

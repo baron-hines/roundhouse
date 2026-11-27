@@ -5,7 +5,7 @@ use crate::span::Span;
 use crate::ty::Ty;
 
 fn bigdecimal() -> Ty {
-    Ty::Class { id: ClassId(Symbol::from("BigDecimal")), args: vec![] }
+    Ty::Class { id: ClassId(Symbol::from("BigDecimal")), args: vec![].into() }
 }
 
 fn send(span: Span, recv: Option<Expr>, method: &str, args: Vec<Expr>, ty: Ty) -> Expr {
@@ -15,6 +15,16 @@ fn send(span: Span, recv: Option<Expr>, method: &str, args: Vec<Expr>, ty: Ty) -
     );
     e.ty = Some(ty);
     e
+}
+
+/// A String, nil, or a request param's shapes, whose `to_d` the runtime's `loose_to_d` answers.
+fn loose(t: &Ty) -> bool {
+    match t {
+        Ty::Str | Ty::Nil | Ty::Array { .. } => true,
+        Ty::Class { id, .. } => matches!(id.0.as_str(), "ActionController::Parameters" | "ActionDispatch::Http::UploadedFile" | "Roundhouse::ParamValue"),
+        Ty::Union { variants } => variants.iter().all(loose) && variants.iter().any(|v| matches!(v, Ty::Str)),
+        _ => false,
+    }
 }
 
 pub(crate) fn rewrite_node(expr: &mut Expr) {
@@ -29,9 +39,16 @@ pub(crate) fn rewrite_node(expr: &mut Expr) {
         // Not `BigDecimal(float)`: it needs a precision, and `Float#to_d`'s own digits are what the runtime helper spells.
         ("to_d", Some(Ty::Float), []) => {
             let mut support = Expr::new(span, ExprNode::Const { path: vec![Symbol::from("ActiveSupport")] });
-            support.ty = Some(Ty::Class { id: ClassId(Symbol::from("ActiveSupport")), args: vec![] });
+            support.ty = Some(Ty::Class { id: ClassId(Symbol::from("ActiveSupport")), args: vec![].into() });
             let text = send(span, Some(support), "float_decimal_text", vec![r.clone()], Ty::Str);
             send(span, None, "BigDecimal", vec![text], bigdecimal())
+        }
+        // bigdecimal/util's `String#to_d` and `NilClass#to_d`, and a request param's, which raises for another shape.
+        // An untyped receiver too: no emitted tree loads the reopens, so a bare `to_d` would raise where Rails answers.
+        ("to_d", t, []) if t.is_none_or(|t| loose(t) || matches!(t, Ty::Untyped | Ty::Var { .. })) => {
+            let mut support = Expr::new(span, ExprNode::Const { path: vec![Symbol::from("ActiveSupport")] });
+            support.ty = Some(Ty::Class { id: ClassId(Symbol::from("ActiveSupport")), args: vec![].into() });
+            send(span, Some(support), "loose_to_d", vec![r.clone()], bigdecimal())
         }
         ("floor" | "ceil", Some(t), _) if is_decimal(t) && args.len() <= 1 => {
             let mode = if method.as_str() == "floor" { "floor" } else { "ceiling" };

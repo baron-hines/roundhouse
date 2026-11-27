@@ -60,14 +60,14 @@
 //! Ruby-family only, like its sibling: the construct needs a mutable
 //! buffer a callee can write through.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::app::App;
 use crate::dialect::{LibraryClass, MethodDef, Param};
 use crate::expr::{Expr, ExprNode, InterpPart, IrHint, LValue, Literal};
 use crate::ident::{Symbol, VarId};
 use crate::span::Span;
-use crate::ty::{ParamKind, Ty};
+use crate::ty::{FnTy, ParamKind, Ty};
 
 use super::view_buffer_passing::INTO_SUFFIX;
 
@@ -84,7 +84,7 @@ pub struct Variant {
 /// emit (which calls them) agree without one having to run before the
 /// other.
 pub fn variants(app: &App) -> HashMap<(String, String), Variant> {
-    let mut out = HashMap::new();
+    let mut out = HashMap::default();
     for lc in &app.library_classes {
         for m in &lc.methods {
             if let Some((parts, idx)) = tag_block_shape(m) {
@@ -171,7 +171,7 @@ fn append(acc: &str, value: Expr) -> Expr {
             parenthesized: false,
         },
     );
-    e.hint = Some(IrHint::StringBuilderAppend);
+    e.set_hint(Some(IrHint::StringBuilderAppend));
     e
 }
 
@@ -238,22 +238,23 @@ fn half_variant(m: &MethodDef, half: &str, parts: Vec<InterpPart>) -> MethodDef 
     // into a shared handle — which reached campfire's page wrappers as
     // a copy, and /rooms/1 served an empty body (matz/spinel#6065).
     let (names, block, effects): (Vec<Symbol>, _, _) = match &m.signature {
-        Some(Ty::Fn { params: ps, block, effects, .. }) => {
+        Some(Ty::Fn(fn_ty)) => {
+            let FnTy { params: ps, block, effects, .. } = &**fn_ty;
             (ps.iter().map(|p| p.name.clone()).collect(), block.clone(), effects.clone())
         }
         _ => (m.params.iter().map(|p| p.name.clone()).collect(), None, Default::default()),
     };
     let mut out = vec![crate::ty::Param {
         name: Symbol::from(ACC),
-        ty: Ty::Str,
+        ty: Ty::Str.into(),
         kind: ParamKind::Required,
     }];
     out.extend(names.into_iter().map(|name| crate::ty::Param {
         name,
-        ty: Ty::Untyped,
+        ty: Ty::Untyped.into(),
         kind: ParamKind::Required,
     }));
-    let signature = Some(Ty::Fn { params: out, block, ret: Box::new(Ty::Nil), effects });
+    let signature = Some(Ty::Fn(Box::new(FnTy { params: out.into(), block, ret: std::sync::Arc::new(Ty::Nil), effects })));
     let mut v = m.clone();
     v.name = Symbol::from(half_name(m.name.as_str(), half).as_str());
     v.params = params;
@@ -319,7 +320,7 @@ fn capture_block_acc(body: &Expr) -> Option<String> {
         return None;
     }
     let (first, last) = (&exprs[0], &exprs[exprs.len() - 1]);
-    if first.hint != Some(IrHint::StringBuilderInit) || last.hint != Some(IrHint::StringBuilderResult) {
+    if first.hint() != &Some(IrHint::StringBuilderInit) || last.hint() != &Some(IrHint::StringBuilderResult) {
         return None;
     }
     let ExprNode::Assign { target: LValue::Var { name, .. }, .. } = &*first.node else { return None };
@@ -355,9 +356,10 @@ fn try_rewrite(e: &mut Expr, acc: &str, variants: &HashMap<(String, String), Var
     let ExprNode::Const { path } = &*callee_recv.node else { return false };
     // A rooted receiver (`::Rooms::InvolvementsHelper`, from
     // `apply_constant_rooting`) names the same module as the App's
-    // `Rooms::InvolvementsHelper`.
+    // `Rooms::InvolvementsHelper`. The root marker rides on the head
+    // segment (`"::Rooms"`), so it is trimmed rather than filtered.
     let key = (
-        path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::"),
+        path.iter().map(|s| s.as_str().trim_start_matches("::")).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::"),
         callee.as_str().to_string(),
     );
     let Some(variant) = variants.get(&key) else { return false };
@@ -445,7 +447,7 @@ fn buffer_name(m: &MethodDef) -> Option<String> {
     }
     let ExprNode::Seq { exprs } = &*m.body.node else { return None };
     let first = exprs.first()?;
-    if first.hint != Some(IrHint::StringBuilderInit) {
+    if first.hint() != &Some(IrHint::StringBuilderInit) {
         return None;
     }
     let ExprNode::Assign { target: LValue::Var { name, .. }, .. } = &*first.node else { return None };

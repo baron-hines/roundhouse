@@ -9,7 +9,7 @@ use std::fmt::Write;
 use super::ty::rust_ty;
 use crate::dialect::MethodDef;
 use crate::expr::{Expr, ExprNode, InterpPart, Literal};
-use crate::ty::Ty;
+use crate::ty::{FnTy, Ty};
 
 /// Emit a typed `MethodDef` as a standalone `pub fn` Rust function
 /// for the runtime-extraction pipeline. Self-contained walker for a
@@ -31,9 +31,10 @@ pub fn emit_method(m: &MethodDef) -> String {
         .signature
         .as_ref()
         .expect("emit_method requires a signature");
-    let Ty::Fn { params: sig_params, ret, .. } = sig else {
+    let Ty::Fn(fn_ty) = sig else {
         panic!("signature is not Ty::Fn");
     };
+    let FnTy { params: sig_params, ret, .. } = &**fn_ty;
     assert_eq!(
         sig_params.len(),
         m.params.len(),
@@ -76,13 +77,14 @@ fn emit_squish_bang(m: &MethodDef) -> String {
         .signature
         .as_ref()
         .expect("emit_method requires a signature");
-    let Ty::Fn { params, ret, .. } = sig else {
+    let Ty::Fn(fn_ty) = sig else {
         panic!("signature is not Ty::Fn");
     };
+    let FnTy { params, ret, .. } = &**fn_ty;
     assert_eq!(m.params.len(), 1, "squish! must take one String argument");
     assert_eq!(params.len(), 1, "squish! must take one String argument");
     assert!(
-        matches!(params[0].ty, Ty::Str),
+        matches!(*params[0].ty, Ty::Str),
         "squish! argument must be String"
     );
     assert!(matches!(**ret, Ty::Str), "squish! must return String");
@@ -126,7 +128,7 @@ fn rust_return_ty(ty: &Ty) -> String {
 fn rt_emit_expr(e: &Expr) -> String {
     // Analyzer-set diagnostic annotations short-circuit to a target
     // raise-equivalent (preserves Ruby's runtime-raise semantics).
-    if let Some(kind) = &e.diagnostic {
+    if let Some(kind) = &e.diagnostic() {
         return crate::emit::diagnostics::StubStyle::RustPanic
             .render(&crate::diagnostic::Diagnostic::stub_text(kind));
     }
@@ -407,7 +409,8 @@ fn rt_emit_literal(lit: &Literal) -> String {
         Literal::Str { value } => format!("{value:?}"),
         Literal::Sym { value } => format!("{:?}", value.as_str()),
         Literal::Regex { pattern, flags } => {
-            format!("regex::Regex::new({:?}).unwrap()", format!("(?{flags}){pattern}"))
+            let source = crate::emit::shared::regex_literal::re2_style_regex_source(pattern, flags);
+            format!("regex::Regex::new({source:?}).unwrap()")
         }
     }
 }

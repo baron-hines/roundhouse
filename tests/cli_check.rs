@@ -2,6 +2,8 @@
 //! contract a CI gate reads, so the cases that must NOT report clean
 //! are pinned here.
 
+#[path = "support/scratch.rs"]
+mod scratch;
 use std::process::Command;
 
 fn check(args: &[&str]) -> (i32, String) {
@@ -33,15 +35,29 @@ fn a_directory_without_app_is_not_a_clean_app() {
 }
 
 #[test]
+fn class_only_recurring_tasks_do_not_abort_check() {
+    let root = scratch::dir("roundhouse-class-only-recurring");
+    for (path, source) in [
+        ("app/jobs/solid_queue/recurring_job.rb", "module SolidQueue\n  class RecurringJob < ActiveJob::Base\n    def perform(command)\n      eval(command)\n    end\n  end\nend\n"),
+        ("app/jobs/cleanup_job.rb", "class CleanupJob < ActiveJob::Base\n  def perform\n    1\n  end\nend\n"),
+        ("config/recurring.yml", "production:\n  cleanup:\n    class: CleanupJob\n    schedule: every hour\n"),
+    ] {
+        let file = root.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, source).unwrap();
+    }
+    let (code, err) = check(&["--continue", root.to_str().unwrap()]);
+    std::fs::remove_dir_all(root).unwrap();
+    assert_eq!(code, 0, "{err}");
+    assert!(!err.contains("ingest failed"), "{err}");
+}
+
+#[test]
 fn malformed_test_path_configuration_is_not_a_clean_app() {
-    let root = std::env::temp_dir().join(format!(
-        "roundhouse_bad_test_paths_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
+    let root = scratch::dir(&format!("roundhouse_bad_test_paths_{}", std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
-    ));
+            .as_nanos()));
     std::fs::create_dir_all(root.join("app")).expect("create app directory");
     std::fs::write(root.join("roundhouse.yml"), "test_paths: test/unit\n").expect("write config");
     let app = root.to_str().expect("temporary path");
@@ -66,11 +82,41 @@ fn the_store_fixture_checks_clean() {
     );
 }
 
+#[test]
+fn continue_writes_inventory_json_and_prints_hotspots() {
+    let root = scratch::dir("roundhouse-inventory");
+    for (path, source) in [
+        ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n"),
+        ("app/models/article.rb", "class Article < ApplicationRecord\nend\n"),
+        ("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n"),
+        ("app/controllers/articles_controller.rb", "class ArticlesController < ApplicationController\n  def show\n    @missing_thing = Article.find(params[:id]).nope_nope\n    @missing_thing.foo\n  end\nend\n"),
+        ("db/schema.rb", "ActiveRecord::Schema[8.1].define do\n  create_table :articles do |t|\n    t.string :title\n  end\nend\n"),
+        ("config/routes.rb", "Rails.application.routes.draw do\n  resources :articles, only: :show\nend\n"),
+    ] {
+        let file = root.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, source).unwrap();
+    }
+    let inventory = root.join("inventory.json");
+    let app = root.to_str().unwrap();
+    let inv = inventory.to_str().unwrap();
+    let (code, err) = check(&["--continue", "--inventory", inv, app]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("── Hotspots:"), "expected hotspot report: {err}");
+    assert!(err.contains("ivar"), "{err}");
+    let json = std::fs::read_to_string(&inventory).expect("inventory written");
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    assert_eq!(parsed["schema"], 1);
+    assert!(parsed["summary"]["errors"].as_u64().unwrap() >= 1);
+    assert!(parsed["hotspots"].as_array().unwrap().len() >= 1);
+    std::fs::remove_dir_all(root).ok();
+}
+
 /// #207's original nullable ActiveRecord source-property repro must remain
 /// unsupported, but survey mode must ledger the declaration and its provider.
 #[test]
 fn alba_rejections_are_ledgered_without_reporting_executable_support() {
-    let root = std::env::temp_dir().join(format!("roundhouse-207-{}", std::process::id()));
+    let root = scratch::dir("roundhouse-207");
     for (path, source) in [
         ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n"),
         ("app/models/article.rb", "class Article < ApplicationRecord\nend\n"),

@@ -236,7 +236,7 @@ fn builder_chain_sends_do_not_carry_db_effects() {
     assert!(
         published.body.effects.is_pure(),
         "Builder Send `where(...)` should carry no effects; got {:?}",
-        published.body.effects.effects,
+        published.body.effects.effects(),
     );
 }
 
@@ -261,9 +261,9 @@ fn terminal_sends_still_carry_db_effects() {
     // `value` is the `Post.all` Send — Terminal, should carry
     // DbRead(posts) as before.
     assert!(
-        value.effects.effects.contains(&posts_read),
+        value.effects.effects().contains(&posts_read),
         "Terminal Send `Post.all` should carry DbRead(posts); got {:?}",
-        value.effects.effects,
+        value.effects.effects(),
     );
 }
 
@@ -354,7 +354,7 @@ fn custom_adapter_suppresses_db_effects() {
     Analyzer::with_adapter(&app, Box::new(NoDbAdapter)).analyze(&mut app);
 
     for action in app.controllers[0].actions() {
-        for e in &action.effects.effects {
+        for e in action.effects.effects() {
             match e {
                 Effect::DbRead { .. } | Effect::DbWrite { .. } => {
                     panic!(
@@ -379,9 +379,9 @@ fn action_effects_include_db_reads() {
     for action_name in ["index", "show", "destroy"] {
         let action = ctrl.actions().find(|a| a.name.as_str() == action_name).unwrap();
         assert!(
-            action.effects.effects.contains(&posts_read),
+            action.effects.effects().contains(&posts_read),
             "{action_name} missing DbRead(posts); got {:?}",
-            action.effects.effects
+            action.effects.effects()
         );
     }
 }
@@ -399,9 +399,9 @@ fn destroy_effects_include_db_write_via_ivar_dispatch() {
         .unwrap();
     let posts_write = Effect::DbWrite { table: TableRef(Symbol::from("posts")) };
     assert!(
-        destroy.effects.effects.contains(&posts_write),
+        destroy.effects.effects().contains(&posts_write),
         "destroy missing DbWrite(posts); got {:?}",
-        destroy.effects.effects
+        destroy.effects.effects()
     );
 }
 
@@ -447,12 +447,13 @@ fn actions_without_db_calls_stay_pure() {
             }],
             layout: Default::default(),
             sibling_classes: Vec::new(),
+            csp_header: false,
         });
         analyzer.analyze(&mut app);
         app.controllers[0].actions().next().unwrap().effects.clone()
     };
     action.effects = body_ctx_effects;
-    assert!(action.effects.effects.is_empty(), "expected empty effects for empty body");
+    assert!(action.effects.effects().is_empty(), "expected empty effects for empty body");
 }
 
 // Per-expression effect annotation --------------------------------------
@@ -479,14 +480,14 @@ fn per_expr_effects_populated_on_send_site() {
         .unwrap();
     let ExprNode::Assign { value, .. } = &*index.body.node else { panic!() };
     assert!(
-        value.effects.effects.contains(&posts_read),
+        value.effects.effects().contains(&posts_read),
         "Post.all Send should carry DbRead(posts); got {:?}",
-        value.effects.effects,
+        value.effects.effects(),
     );
     assert!(
         index.body.effects.is_pure(),
         "Assign wrapper has no local effect; got {:?}",
-        index.body.effects.effects,
+        index.body.effects.effects(),
     );
     let ExprNode::Send { recv, .. } = &*value.node else { panic!() };
     assert!(
@@ -517,9 +518,9 @@ fn per_expr_effects_on_instance_dispatch() {
         ))
         .expect("destroy Send present");
     assert!(
-        destroy_send.effects.effects.contains(&posts_write),
+        destroy_send.effects.effects().contains(&posts_write),
         "@post.destroy should carry DbWrite(posts); got {:?}",
-        destroy_send.effects.effects,
+        destroy_send.effects.effects(),
     );
     let ExprNode::Send { recv, .. } = &*destroy_send.node else { panic!() };
     assert!(
@@ -546,9 +547,9 @@ fn per_expr_effects_on_io_calls() {
         ))
         .expect("redirect_to Send present");
     assert!(
-        redirect.effects.effects.contains(&Effect::Io),
+        redirect.effects.effects().contains(&Effect::Io),
         "redirect_to should carry Io; got {:?}",
-        redirect.effects.effects,
+        redirect.effects.effects(),
     );
 }
 
@@ -562,7 +563,7 @@ fn action_aggregate_equals_subtree_fold() {
     use std::collections::BTreeSet;
 
     fn fold(expr: &Expr, acc: &mut BTreeSet<Effect>) {
-        acc.extend(expr.effects.effects.iter().cloned());
+        acc.extend(expr.effects.effects().iter().cloned());
         match &*expr.node {
             ExprNode::Lit { .. }
             | ExprNode::Var { .. }
@@ -735,8 +736,8 @@ fn action_aggregate_equals_subtree_fold() {
         let mut folded: BTreeSet<Effect> = BTreeSet::new();
         fold(&action.body, &mut folded);
         assert_eq!(
-            folded,
-            action.effects.effects,
+            &folded,
+            action.effects.effects(),
             "action {} — tree fold should equal the aggregate",
             action.name.as_str(),
         );
@@ -766,7 +767,7 @@ fn analyze_action_body(body: roundhouse::expr::Expr) -> roundhouse::expr::Expr {
         block_param: None,
         body,
         renders: RenderTarget::Inferred,
-        effects: EffectSet { effects: BTreeSet::new() },
+        effects: EffectSet::pure(),
     };
     let mut app = roundhouse::App::new();
     app.controllers.push(Controller {
@@ -780,6 +781,7 @@ fn analyze_action_body(body: roundhouse::expr::Expr) -> roundhouse::expr::Expr {
         }],
         layout: Default::default(),
         sibling_classes: Vec::new(),
+        csp_header: false,
     });
     let mut analyzer = Analyzer::new(&app);
     analyzer.analyze(&mut app);
@@ -921,6 +923,65 @@ fn hash_each_block_binds_key_and_value() {
     let ExprNode::Send { block: Some(b), .. } = &*analyzed.node else { panic!() };
     let ExprNode::Lambda { body, .. } = &*b.node else { panic!() };
     assert_eq!(body.ty, Some(Ty::Int), "block param v should be Int (hash value type)");
+}
+
+#[test]
+fn hash_to_h_block_binds_key_and_value() {
+    // {"a" => 1}.to_h { |k, v| k }  -> k types as String, v as Int.
+    // `Hash#to_h` yields key and value like `each`; with the
+    // parameters unbound, String core-ext calls on `k` (`k.humanize`)
+    // were never grounded and raised at run time.
+    use roundhouse::expr::Expr;
+    use roundhouse::ident::VarId;
+    use roundhouse::span::Span;
+
+    let block_body_ty = |read: (u32, &str)| {
+        let hash = Expr::new(
+            Span::synthetic(),
+            ExprNode::Hash {
+                entries: vec![(
+                    Expr::new(
+                        Span::synthetic(),
+                        ExprNode::Lit { value: Literal::Str { value: "a".to_string() } },
+                    ),
+                    Expr::new(
+                        Span::synthetic(),
+                        ExprNode::Lit { value: Literal::Int { value: 1 } },
+                    ),
+                )],
+                kwargs: false,
+            },
+        );
+        let block_body = Expr::new(
+            Span::synthetic(),
+            ExprNode::Var { id: VarId(read.0), name: Symbol::from(read.1) },
+        );
+        let block = Expr::new(
+            Span::synthetic(),
+            ExprNode::Lambda { extra_params: Vec::new(), rest_param: None,
+                params: vec![Symbol::from("k"), Symbol::from("v")],
+                block_param: None,
+                body: block_body,
+                block_style: Default::default(),
+            },
+        );
+        let send = Expr::new(
+            Span::synthetic(),
+            ExprNode::Send {
+                recv: Some(hash),
+                method: Symbol::from("to_h"),
+                args: vec![],
+                block: Some(block),
+                parenthesized: false,
+            },
+        );
+        let analyzed = analyze_action_body(send);
+        let ExprNode::Send { block: Some(b), .. } = &*analyzed.node else { panic!() };
+        let ExprNode::Lambda { body, .. } = &*b.node else { panic!() };
+        body.ty.clone()
+    };
+    assert_eq!(block_body_ty((1, "k")), Some(Ty::Str), "block param k should be String (hash key type)");
+    assert_eq!(block_body_ty((2, "v")), Some(Ty::Int), "block param v should be Int (hash value type)");
 }
 
 // P2 — controller→view ivar channel --------------------------------------
@@ -2193,6 +2254,41 @@ end
 }
 
 #[test]
+fn has_secure_password_authenticate_includes_its_false_result() {
+    let mut app = app_from_files(&[
+        (
+            "app/models/application_record.rb",
+            "class ApplicationRecord < ActiveRecord::Base\nend\n",
+        ),
+        (
+            "app/models/user.rb",
+            "class User < ApplicationRecord\n  has_secure_password\n\n  def check_password(value)\n    authenticate(value)\n  end\nend\n",
+        ),
+    ]);
+    Analyzer::new(&app).analyze(&mut app);
+    let user = app
+        .models
+        .iter()
+        .find(|model| model.name.0.as_str() == "User")
+        .expect("User model");
+    let check = user
+        .methods()
+        .find(|method| method.name.as_str() == "check_password")
+        .expect("check_password method");
+    let expected = Ty::Union {
+        variants: vec![
+            Ty::Class {
+                id: ClassId(Symbol::from("User")),
+                args: vec![].into(),
+            },
+            Ty::Bool,
+        ]
+        .into(),
+    };
+    assert_eq!(check.body.ty.as_ref(), Some(&expected));
+}
+
+#[test]
 fn bare_module_under_app_models_registers_as_library_class() {
     // A bare `module Foo; def self.x; …` under app/models/ (e.g.
     // lobsters' InactiveUser) is a namespace of singleton methods, not
@@ -3364,6 +3460,28 @@ end
 }
 
 #[test]
+fn an_enqueued_job_types_perform_and_its_rest_parameter() {
+    // `NotifyMessageJob.perform_later(@message)` runs
+    // `NotifyMessageJob#perform(*messages)`: what callers enqueue types
+    // `perform`, a `*rest` parameter is the Array of it, and so the mailer
+    // each element reaches and its template's ivar are typed (lobsters).
+    let app = app_from_files(&[
+        ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\nend\n"),
+        ("app/models/message.rb", "class Message < ApplicationRecord\n  def announce\n    NotifyJob.perform_later(self)\n  end\nend\n"),
+        ("app/jobs/application_job.rb", "class ApplicationJob < ActiveJob::Base\nend\n"),
+        (
+            "app/jobs/notify_job.rb",
+            "class NotifyJob < ApplicationJob\n  def perform(*messages)\n    messages.each do |message|\n      deliver(message)\n    end\n  end\n\n  def deliver(message)\n    NoticeMailer.notify(message).deliver_now\n  end\nend\n",
+        ),
+        ("app/mailers/application_mailer.rb", "class ApplicationMailer < ActionMailer::Base\nend\n"),
+        ("app/mailers/notice_mailer.rb", "class NoticeMailer < ApplicationMailer\n  def notify(message)\n    @message = message\n    mail(to: \"a@example.com\", subject: \"hi\")\n  end\nend\n"),
+        ("app/views/notice_mailer/notify.text.erb", "<%= @message.id %>\n"),
+    ]);
+    let unresolved = ivar_unresolved_names(&app);
+    assert!(!unresolved.iter().any(|n| n == "message"), "@message should resolve through the job; unresolved = {unresolved:?}");
+}
+
+#[test]
 fn active_record_base_and_class_side_finders_resolve() {
     // Two class-side AR gaps:
     //  (1) `ActiveRecord::Base.transaction { ... }` /
@@ -3930,6 +4048,7 @@ end
         ),
         ("app/models/widget.rb", "class Widget < ApplicationRecord\nend\n"),
         ("app/views/widgets/show.html.erb", "<p><%= @widget %></p>\n"),
+        ("app/views/layouts/application.html.erb", "<%= yield %>\n"),
         (
             "db/schema.rb",
             r#"ActiveRecord::Schema[7.1].define(version: 1) do
@@ -3990,7 +4109,7 @@ end
         set_widget.assigns
     );
     assert!(
-        set_widget.effects.effects.iter().any(|e| matches!(e, Effect::DbRead { .. })),
+        set_widget.effects.effects().iter().any(|e| matches!(e, Effect::DbRead { .. })),
         "Widget.find in the filter body surfaces as DbRead; got {:?}",
         set_widget.effects
     );
@@ -4002,7 +4121,7 @@ end
     );
 
     // Convention default layout, resolved through the chain.
-    assert_eq!(res.layout.as_ref().map(|s| s.as_str()), Some("layouts/application"));
+    assert_eq!(res.layouts.iter().map(|s| s.as_str()).collect::<Vec<_>>(), vec!["layouts/application"]);
 }
 
 #[test]
@@ -4057,7 +4176,7 @@ end
     assert_eq!(load.defined_in.0.as_str(), "RoomsController");
     assert_eq!(load.included_via.0.as_str(), "RoomsController");
     assert!(
-        load.effects.effects.iter().any(|e| matches!(e, Effect::DbRead { .. })),
+        load.effects.effects().iter().any(|e| matches!(e, Effect::DbRead { .. })),
         "parent load_room DbRead must reach the subclass filter hop; got {:?}",
         load.effects
     );
@@ -4101,6 +4220,7 @@ end
         ),
         ("app/views/public/index.html.erb", "<p>hi</p>\n"),
         ("app/views/pages/index.html.erb", "<p>hi</p>\n"),
+        ("app/views/layouts/admin.html.erb", "<%= yield %>\n"),
         (
             "db/schema.rb",
             "ActiveRecord::Schema[7.1].define(version: 1) do\nend\n",
@@ -4108,17 +4228,17 @@ end
     ]);
 
     // Explicit `layout "admin"` resolves and inherits down the chain;
-    // explicit `layout false` records as None.
+    // explicit `layout false` records none.
     let pages = app
         .controller_resolutions
         .get(&ClassId(Symbol::from("PagesController")))
         .expect("PagesController resolution");
-    assert_eq!(pages.layout.as_ref().map(|s| s.as_str()), Some("layouts/admin"));
+    assert_eq!(pages.layouts.iter().map(|s| s.as_str()).collect::<Vec<_>>(), vec!["layouts/admin"]);
     let public = app
         .controller_resolutions
         .get(&ClassId(Symbol::from("PublicController")))
         .expect("PublicController resolution");
-    assert_eq!(public.layout, None, "layout false → None");
+    assert!(public.layouts.is_empty(), "layout false → none: {:?}", public.layouts);
 
     // The Skip entry is retained in the chain (per-action consumers
     // apply it), carrying no assigns/effects of its own, while the
@@ -4522,12 +4642,11 @@ fn store_shapes_type_without_errors() {
     assert_eq!(errors_of(&app), Vec::<String>::new());
 }
 
-/// A uuid-keyed model's tokens are not modeled: Rails writes the key into
-/// the payload as a JSON string, which the token runtime does not read
-/// back. So `find_by_token_for` stays an error there rather than typing
-/// a method nothing defines; the Integer-keyed store model still types.
+/// A uuid-keyed model's tokens type as an Integer-keyed one's do: Rails
+/// writes the key into the payload as a JSON string, which the token
+/// runtime writes and reads back (tests/emit_and_run/token_for_string_key.rs).
 #[test]
-fn a_string_keyed_models_token_finder_stays_unsupported() {
+fn a_string_keyed_models_token_finder_types() {
     let app = app_from_files(&[
         (
             "app/controllers/application_controller.rb",
@@ -4552,9 +4671,7 @@ end
 "#,
         ),
     ]);
-    let errors = errors_of(&app);
-    assert_eq!(errors.len(), 1, "only the uuid model's finder errors; got {errors:?}");
-    assert!(errors[0].contains("find_by_token_for") && errors[0].contains("Invite"), "got {errors:?}");
+    assert_eq!(errors_of(&app), Vec::<String>::new());
 }
 
 /// A model's token methods are all or nothing, since they dispatch on a
@@ -4748,12 +4865,12 @@ end
     assert_eq!(ty("form.object.try(:name)", 12), "String?");
 }
 
-/// `.text.erb` templates are ingested for the analyzer (their Ruby
-/// types, the IDE sees them) and dropped before lowering. A `.json.erb`
-/// is not: it lowers through the view path as `<action>_json` (campfire's
-/// PWA manifest), and is no jbuilder.
+/// `.text.erb` templates are typed (the IDE sees them) and lower through
+/// the view path as `<action>_text`, which a mailer's `mail` renders. A
+/// `.json.erb` lowers as `<action>_json` (campfire's PWA manifest), and
+/// is no jbuilder.
 #[test]
-fn text_erb_templates_are_analysis_only_and_json_erb_is_rendered() {
+fn text_erb_and_json_erb_templates_are_rendered() {
     let mut app = app_from_files(&[
         ("app/mailers/application_mailer.rb", "class ApplicationMailer < ActionMailer::Base\nend\n"),
         ("app/mailers/product_mailer.rb", "class ProductMailer < ApplicationMailer\n  def in_stock\n    @name = \"x\"\n  end\nend\n"),
@@ -4768,7 +4885,9 @@ fn text_erb_templates_are_analysis_only_and_json_erb_is_rendered() {
         .filter(|v| v.analysis_only)
         .map(|v| format!("{}.{}", v.name.as_str(), v.format.as_str()))
         .collect();
-    assert_eq!(analysis_only, vec!["product_mailer/in_stock.text"]);
+    assert!(analysis_only.is_empty(), "{analysis_only:?}");
+    let text = app.views.iter().find(|v| v.name.as_str() == "product_mailer/in_stock" && v.format.as_str() == "text").expect("text view");
+    assert!(roundhouse::lower::view::lowers_through_view_path(text));
     let manifest = app.views.iter().find(|v| v.name.as_str() == "pwa/manifest").expect("manifest ingested");
     assert!(!manifest.jbuilder, "a json.erb is text, not jbuilder");
     assert!(roundhouse::lower::view::lowers_through_view_path(manifest));
@@ -5063,7 +5182,7 @@ fn method_ref_block_arg_types_map_result_by_referenced_method_return_ty() {
         .expect("doubled_list present");
     assert_eq!(
         doubled_list.body.ty,
-        Some(Ty::Array { elem: Box::new(Ty::Int) }),
+        Some(Ty::Array { elem: std::sync::Arc::new(Ty::Int) }),
         "[1, 2, 3].map(&method(:double)) should type as Array[Integer], got {:?}",
         doubled_list.body.ty,
     );
@@ -5432,17 +5551,196 @@ fn inertia_share_and_render_inertia_analyze_without_errors_or_survey_gaps() {
 }
 
 #[test]
-fn render_inertia_with_a_computed_component_is_a_survey_gap() {
+fn render_inertia_always_prop_is_not_a_survey_gap() {
     let mut files = INERTIA_APP.to_vec();
     files[5] = (
         "app/controllers/widgets_controller.rb",
-        "class WidgetsController < ApplicationController\n  def index\n    render inertia: \"widgets/\" + action_name\n  end\nend\n",
+        "class WidgetsController < ApplicationController\n  def index\n    render inertia: \"widgets/index\", props: { kept: InertiaRails.always { \"yes\" } }\n  end\nend\n",
+    );
+    let (errors, gaps) = inertia_check(&files);
+    assert!(errors.is_empty(), "{errors:#?}");
+    assert!(gaps.is_empty(), "{gaps:#?}");
+}
+
+#[test]
+fn inertia_full_page_redirect_stays_a_survey_gap() {
+    let mut files = INERTIA_APP.to_vec();
+    files[5] = (
+        "app/controllers/widgets_controller.rb",
+        "class WidgetsController < ApplicationController\n  def show\n    redirect_to \"https://example.com\", inertia: { full_page: true }\n  end\nend\n",
     );
     let (_, gaps) = inertia_check(&files);
     assert!(
-        gaps.iter().any(|g| g.contains("`render inertia:` with a component that is not a String literal")),
+        gaps.iter().any(|g| g.contains("redirect option other than `errors:`, `clear_history:`, or `preserve_fragment:`")),
         "{gaps:#?}"
     );
+}
+
+#[test]
+fn inertia_once_merge_and_lazy_props_stay_survey_gaps() {
+    for source in [
+        "class WidgetsController < ApplicationController\n  def index\n    render inertia: \"widgets/index\", props: { row: InertiaRails.once { 1 } }\n  end\nend\n",
+        "class WidgetsController < ApplicationController\n  def index\n    render inertia: \"widgets/index\", props: { row: InertiaRails.merge { 1 } }\n  end\nend\n",
+        "class WidgetsController < ApplicationController\n  def index\n    render inertia: \"widgets/index\", props: { row: InertiaRails.lazy { 1 } }\n  end\nend\n",
+        "class WidgetsController < ApplicationController\n  def index\n    render inertia: \"widgets/index\", props: { row: InertiaRails.scroll { 1 } }\n  end\nend\n",
+    ] {
+        let mut files = INERTIA_APP.to_vec();
+        files[5] = ("app/controllers/widgets_controller.rb", source);
+        let (_, gaps) = inertia_check(&files);
+        assert!(
+            gaps.iter().any(|g| g.contains("prop type other than `optional`/`defer`/`always`")),
+            "{source}\n{gaps:#?}"
+        );
+    }
+}
+
+#[test]
+fn render_inertia_with_computed_props_has_no_survey_gap() {
+    let mut files = INERTIA_APP.to_vec();
+    files[5] = (
+        "app/controllers/widgets_controller.rb",
+        r#"class WidgetsController < ApplicationController
+  def index
+    render inertia: "widgets/index", props: index_props
+  end
+
+  def show
+    props = { name: "local" }
+    render inertia: "widgets/show", props: props
+  end
+
+  def merged
+    render inertia: "widgets/merged", props: index_props.merge(extra: 1)
+  end
+
+  private
+    def index_props
+      {
+        name: "from-method",
+        secret: InertiaRails.optional { "opt" },
+        stats: InertiaRails.defer { 1 },
+        kept: InertiaRails.always { "yes" }
+      }
+    end
+end
+"#,
+    );
+    let (errors, gaps) = inertia_check(&files);
+    assert!(errors.is_empty(), "{errors:#?}");
+    assert!(
+        !gaps.iter().any(|g| g.contains("props:")),
+        "{gaps:#?}"
+    );
+}
+
+#[test]
+fn render_inertia_with_a_computed_component_has_no_survey_gap() {
+    for source in [
+        "class WidgetsController < ApplicationController\n  def index\n    render inertia: \"widgets/\" + action_name\n  end\nend\n",
+        "class WidgetsController < ApplicationController\n  PAGE = \"widgets/index\"\n  def index\n    render inertia: PAGE\n  end\nend\n",
+        "class WidgetsController < ApplicationController\n  def index\n    render inertia: page_name\n  end\n  def page_name\n    \"widgets/index\"\n  end\nend\n",
+    ] {
+        let mut files = INERTIA_APP.to_vec();
+        files[5] = ("app/controllers/widgets_controller.rb", source);
+        let (errors, gaps) = inertia_check(&files);
+        assert!(errors.is_empty(), "{source}\n{errors:#?}");
+        assert!(
+            !gaps.iter().any(|g| g.contains("component")),
+            "{source}\n{gaps:#?}"
+        );
+    }
+}
+
+#[test]
+fn render_inertia_true_or_a_hash_stays_a_survey_gap() {
+    for source in [
+        "class WidgetsController < ApplicationController\n  def index\n    render inertia: true\n  end\nend\n",
+        "class WidgetsController < ApplicationController\n  def index\n    render inertia: { title: \"x\" }\n  end\nend\n",
+        "class WidgetsController < ApplicationController\n  def index\n    render inertia: nil\n  end\nend\n",
+    ] {
+        let mut files = INERTIA_APP.to_vec();
+        files[5] = ("app/controllers/widgets_controller.rb", source);
+        let (_, gaps) = inertia_check(&files);
+        assert!(
+            gaps.iter().any(|g| g.contains("component that is not a String or a String expression")),
+            "{source}\n{gaps:#?}"
+        );
+    }
+}
+
+#[test]
+fn inertia_clear_history_redirect_is_not_a_survey_gap() {
+    for source in [
+        "class WidgetsController < ApplicationController\n  def destroy\n    redirect_to \"/widgets\", inertia: { clear_history: true }\n  end\nend\n",
+        "class WidgetsController < ApplicationController\n  def update\n    redirect_to \"/widgets\", inertia: { errors: { name: [\"bad\"] }, clear_history: false }\n  end\nend\n",
+    ] {
+        let mut files = INERTIA_APP.to_vec();
+        files[5] = ("app/controllers/widgets_controller.rb", source);
+        let (errors, gaps) = inertia_check(&files);
+        assert!(errors.is_empty(), "{source}\n{errors:#?}");
+        assert!(
+            !gaps.iter().any(|g| g.contains("redirect option")),
+            "{source}\n{gaps:#?}"
+        );
+    }
+    let mut files = INERTIA_APP.to_vec();
+    files[5] = (
+        "app/controllers/widgets_controller.rb",
+        "class WidgetsController < ApplicationController\n  def update\n    redirect_to \"/widgets\", inertia: { flash: \"no\" }\n  end\nend\n",
+    );
+    let (_, gaps) = inertia_check(&files);
+    assert!(
+        gaps.iter().any(|g| g.contains("`inertia:` redirect option other than `errors:`, `clear_history:`, or `preserve_fragment:`")),
+        "{gaps:#?}"
+    );
+    files[5] = (
+        "app/controllers/widgets_controller.rb",
+        "class WidgetsController < ApplicationController\n  def destroy\n    redirect_to \"/widgets\", inertia: { clear_history: \"yes\" }\n  end\nend\n",
+    );
+    let (_, gaps) = inertia_check(&files);
+    assert!(
+        gaps.iter().any(|g| g.contains("`clear_history:` that is not `true` or `false`")),
+        "{gaps:#?}"
+    );
+}
+
+#[test]
+fn inertia_preserve_fragment_redirect_is_not_a_survey_gap() {
+    for source in [
+        "class WidgetsController < ApplicationController\n  def update\n    redirect_to \"/widgets\", inertia: { preserve_fragment: true }\n  end\nend\n",
+        "class WidgetsController < ApplicationController\n  def update\n    redirect_to \"/widgets\", inertia: { preserve_fragment: false }\n  end\nend\n",
+    ] {
+        let mut files = INERTIA_APP.to_vec();
+        files[5] = ("app/controllers/widgets_controller.rb", source);
+        let (errors, gaps) = inertia_check(&files);
+        assert!(errors.is_empty(), "{source}\n{errors:#?}");
+        assert!(
+            !gaps.iter().any(|g| g.contains("redirect option")),
+            "{source}\n{gaps:#?}"
+        );
+    }
+    let mut files = INERTIA_APP.to_vec();
+    files[5] = (
+        "app/controllers/widgets_controller.rb",
+        "class WidgetsController < ApplicationController\n  def update\n    redirect_to \"/widgets\", inertia: { preserve_fragment: \"yes\" }\n  end\nend\n",
+    );
+    let (_, gaps) = inertia_check(&files);
+    assert!(
+        gaps.iter().any(|g| g.contains("`preserve_fragment:` that is not `true` or `false`")),
+        "{gaps:#?}"
+    );
+}
+
+#[test]
+fn inertia_location_is_a_controller_method() {
+    let mut files = INERTIA_APP.to_vec();
+    files[5] = (
+        "app/controllers/widgets_controller.rb",
+        "class WidgetsController < ApplicationController\n  def show\n    inertia_location \"https://example.com/away\"\n  end\nend\n",
+    );
+    let (errors, gaps) = inertia_check(&files);
+    assert!(errors.is_empty(), "{errors:#?}");
+    assert!(gaps.is_empty(), "{gaps:#?}");
 }
 
 #[test]
@@ -5554,6 +5852,60 @@ fn a_vite_tag_without_a_manifest_entry_is_a_survey_gap() {
     );
 }
 
+/// On a large real app, `vite_typescript_tag 'sign_up.ts', crossorigin:
+/// 'anonymous'` was an ingest gap for the whole call — the extra keyword
+/// alone, not a missing manifest entry — which blocked every route that
+/// reached the view. `crossorigin:`, a boolean attribute (`defer:`) and a
+/// `data:` hash all pass through the way vite_rails forwards them to
+/// `javascript_include_tag`, so none of this is a gap any more.
+#[test]
+fn vite_tag_html_options_pass_through_without_a_survey_gap() {
+    let layout = (
+        "app/views/layouts/application.html.erb",
+        "<html><head><%= vite_javascript_tag \"application\", crossorigin: \"anonymous\", defer: true, data: { turbo_track: \"reload\" } %></head><body><%= yield %></body></html>\n",
+    );
+    let (messages, gaps) = vite_check(&[layout, VITE_MANIFEST]);
+    assert!(messages.iter().all(|m| !m.contains("vite_")), "{messages:#?}");
+    assert!(gaps.is_empty(), "{gaps:#?}");
+}
+
+/// `skip_preload_tags:`/`skip_style_tags:`/`media:` and the like change
+/// which tags get emitted, not just which attributes they carry —
+/// approximating them would silently produce the wrong markup, so they
+/// still gap the whole call, but the survey message now names the
+/// specific option rather than a blanket "options ... are not modeled".
+#[test]
+fn a_structural_vite_tag_option_still_gaps_by_name() {
+    let layout = (
+        "app/views/layouts/application.html.erb",
+        "<html><head><%= vite_javascript_tag \"application\", skip_preload_tags: true %></head><body><%= yield %></body></html>\n",
+    );
+    let (_, gaps) = vite_check(&[layout, VITE_MANIFEST]);
+    assert!(
+        gaps.iter().any(|g| g.contains("`vite_javascript_tag`: option `skip_preload_tags` is not modeled")),
+        "{gaps:#?}"
+    );
+}
+
+/// `aria:` needs its own array/boolean token-join rules we don't model
+/// yet — dropping just that option (rather than gapping the whole call,
+/// as an unrepresentable value in `crossorigin:`/`type:` still does) is
+/// what keeps a single odd option from blocking a route that otherwise
+/// has nothing wrong with it.
+#[test]
+fn an_unrepresentable_vite_tag_option_is_dropped_not_a_whole_call_gap() {
+    let layout = (
+        "app/views/layouts/application.html.erb",
+        "<html><head><%= vite_javascript_tag \"application\", crossorigin: \"anonymous\", aria: { hidden: true } %></head><body><%= yield %></body></html>\n",
+    );
+    let (messages, gaps) = vite_check(&[layout, VITE_MANIFEST]);
+    assert!(messages.iter().all(|m| !m.contains("vite_")), "{messages:#?}");
+    assert!(
+        gaps.iter().any(|g| g.contains("`vite_javascript_tag`: option(s) `aria` are not modeled and were dropped")),
+        "{gaps:#?}"
+    );
+}
+
 /// `include ActionView::RecordIdentifier` is admitted on a model and on a
 /// plain library class (no "includes unresolved" refusal), and `dom_id` /
 /// `dom_class` — the module's public surface — type as String there.
@@ -5597,6 +5949,31 @@ fn record_identifier_include_is_admitted_and_dom_calls_are_strings() {
     assert_eq!(row.body.ty, Some(Ty::Str), "Presenter#row");
 }
 
+/// A backtick literal is `Kernel#``: a String, unless the class defines
+/// its own ` (Ruby dispatches the literal to it), whose return wins.
+#[test]
+fn a_backtick_types_as_string_unless_the_class_defines_its_own() {
+    let app = app_from_files(&[
+        (
+            "app/models/application_record.rb",
+            "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n",
+        ),
+        (
+            "lib/shells.rb",
+            "class Shell\n  def run\n    `ls`\n  end\nend\n\nclass FakeShell\n  def `(cmd)\n    [cmd]\n  end\n\n  def run\n    `ls`\n  end\nend\n\nclass ClassOnly\n  def self.`(cmd)\n    [cmd]\n  end\n\n  def run\n    `ls`\n  end\nend\n\nclass InstanceOnly\n  def `(cmd)\n    [cmd]\n  end\n\n  def self.run\n    `ls`\n  end\nend\n",
+        ),
+    ]);
+    let run = |name: &str| {
+        let class = app.library_classes.iter().find(|c| c.name.0.as_str() == name).expect(name);
+        class.methods.iter().find(|m| m.name.as_str() == "run").expect("run").body.ty.clone()
+    };
+    assert_eq!(run("Shell"), Some(Ty::Str), "Shell#run");
+    assert!(matches!(run("FakeShell"), Some(Ty::Array { .. })), "FakeShell#run: {:?}", run("FakeShell"));
+    // A method on the other side is not an override of this call.
+    assert_eq!(run("ClassOnly"), Some(Ty::Str), "ClassOnly#run");
+    assert_eq!(run("InstanceOnly"), Some(Ty::Str), "InstanceOnly.run");
+}
+
 /// Only the BARE `dom_id` is the mixed-in helper (emit qualifies bare
 /// calls alone); an explicit receiver that does not define it stays
 /// unresolved (not String-typed), so nothing claims it runs.
@@ -5619,4 +5996,80 @@ fn record_identifier_explicit_receiver_dom_id_stays_unresolved() {
         .expect("Caller");
     let bad = caller.methods.iter().find(|m| m.name.as_str() == "bad").expect("bad");
     assert_ne!(bad.body.ty, Some(Ty::Str), "explicit-receiver dom_id must not type as String");
+}
+
+#[test]
+fn a_method_reference_to_a_computed_name_reads_untyped() {
+    let app = app_from_files(&[
+        ("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table :articles do |t|\n    t.string :title\n  end\nend\n"),
+        ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n"),
+        ("lib/settings_extension.rb", "module SettingsExtension\n  def setting(name, default)\n    define_singleton_method(name) { default }\n  end\nend\n"),
+        ("app/models/article.rb", "class Article < ApplicationRecord\n  extend SettingsExtension\n  setting :title_limit, 40\n\n  def self.limit_ref\n    method(:title_limit)\n  end\n\n  def self.limits\n    [1].map(&method(:title_limit))\n  end\nend\n"),
+    ]);
+    let article = app.models.iter().find(|m| m.name.0.as_str() == "Article").expect("Article");
+    let limits = article.methods().find(|m| m.name.as_str() == "limits").expect("limits");
+    assert_eq!(limits.body.ty, Some(Ty::Array { elem: std::sync::Arc::new(Ty::Untyped) }), "{:?}", limits.body.ty);
+}
+
+#[test]
+fn a_private_marker_on_a_generated_enum_predicate_is_enforced() {
+    let app = app_from_files(&[
+        ("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table :articles do |t|\n    t.integer :status\n  end\nend\n"),
+        ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n"),
+        ("app/models/article.rb", "class Article < ApplicationRecord\n  enum :status, { draft: 0, published: 1 }\n  private :draft?\nend\n"),
+        ("app/models/probe.rb", "class Probe\n  def self.run\n    Article.new.draft?\n  end\nend\n"),
+    ]);
+    let found = diagnose(&app).iter().any(|d| d.message.contains("private method `draft?` called on Article"));
+    assert!(found, "{:#?}", diagnose(&app).iter().map(|d| d.message.clone()).collect::<Vec<_>>());
+}
+
+#[test]
+fn rest_client_verbs_answer_their_block_value() {
+    let app = app_from_files(&[(
+        "app/models/remote.rb",
+        r#"class Remote
+  def self.status(url)
+    RestClient.get(url) { |response, _request, _result| [1, "ok"] }
+  end
+
+  def self.plain(url)
+    RestClient.get(url)
+  end
+
+  def self.parsed(url)
+    RestClient.get(url) { |response, _request, _result| JSON.parse(response.body) }
+  end
+end
+"#,
+    )]);
+    let remote = app.library_classes.iter().find(|c| c.name.0.as_str() == "Remote").expect("Remote");
+    let ty = |name: &str| remote.methods.iter().find(|m| m.name.as_str() == name).expect(name).body.ty.clone();
+    assert!(matches!(ty("status"), Some(Ty::Array { .. }) | Some(Ty::Tuple { .. })), "block form: {:?}", ty("status"));
+    assert!(
+        matches!(ty("plain"), Some(Ty::Class { ref id, .. }) if id.0.as_str() == "RestClient::Response"),
+        "plain form: {:?}",
+        ty("plain")
+    );
+    assert!(matches!(ty("parsed"), Some(Ty::Untyped)), "untyped block: {:?}", ty("parsed"));
+}
+
+#[test]
+fn an_app_defined_rest_client_get_answers_its_own_type() {
+    let app = app_from_files(&[
+        ("app/models/rest_client.rb", "class RestClient
+  def self.get(url)
+    42
+  end
+end
+"),
+        ("app/models/remote.rb", "class Remote
+  def self.status(url)
+    RestClient.get(url) { \"ok\" }
+  end
+end
+"),
+    ]);
+    let remote = app.library_classes.iter().find(|c| c.name.0.as_str() == "Remote").expect("Remote");
+    let ty = remote.methods.iter().find(|m| m.name.as_str() == "status").expect("status").body.ty.clone();
+    assert!(matches!(ty, Some(Ty::Int)), "the app's own get: {ty:?}");
 }

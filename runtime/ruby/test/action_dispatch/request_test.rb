@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 require_relative "../test_helper"
 
 # Direct unit tests for `runtime/ruby/action_dispatch/request.rb`.
@@ -16,13 +17,26 @@ require_relative "../test_helper"
 # same test file `spinel_toolchain` died on. This file exercises THIS
 # class on both.
 class ActionDispatchRequestTest < Minitest::Test
+  def test_request_id_and_uuid_read_the_trusted_env
+    r = ActionDispatch::Request.for({ "HTTP_X_REQUEST_ID" => "client-only" })
+    assert_nil r.request_id
+    assert_nil r.uuid
+    r.env["action_dispatch.request_id"] = "trusted-id"
+    assert_equal "trusted-id", r.request_id
+    assert_equal "trusted-id", r.uuid
+    r.request_id = "assigned-id"
+    assert_equal "assigned-id", r.env["action_dispatch.request_id"]
+    assert_equal "assigned-id", r.uuid
+    assert_nil ActionDispatch::Request.new.request_id
+  end
+
   def test_every_declared_ivar_has_a_value_after_new
     r = ActionDispatch::Request.new
     # Names from request.rbs's ivar block. A new one added there
     # without a value here is what this test is for.
     %i[
       @remote_ip @path @query_string @script_name @request_method
-      @referer @host @format @body @env @user_agent @params
+      @referer @host @format @body @env @user_agent @params @path_parameters
     ].each do |name|
       assert !r.instance_variable_get(name).nil?,
              "#{name} is unset after `new` — `Request.for` reads it before writing"
@@ -42,6 +56,20 @@ class ActionDispatchRequestTest < Minitest::Test
     r = ActionDispatch::Request.for({ "REQUEST_METHOD" => "POST" })
     assert_equal({}, r.params)
     assert_equal "POST", r.request_method
+  end
+
+  def test_put_predicate_matches_only_the_put_method
+    r = ActionDispatch::Request.new
+    assert !r.put?
+
+    r.request_method = "PUT"
+    assert r.put?
+    assert !r.get?
+    assert !r.post?
+    assert !r.head?
+
+    r.request_method = "put"
+    assert !r.put?
   end
 
   # A key missing from env falls back to the documented default, and a
@@ -80,6 +108,79 @@ class ActionDispatchRequestTest < Minitest::Test
     assert_equal "http://chat.test", r.base_url
   end
 
+  def test_headers_accept_case_insensitive_http_and_rack_names
+    r = ActionDispatch::Request.for({
+      "HTTP_X_CAMPFIRE_BOT_KEY" => "bot-secret",
+      "CONTENT_TYPE" => "application/json",
+    })
+    assert_equal "bot-secret", r.headers["X-Campfire-Bot-Key"]
+    assert_equal "bot-secret", r.headers["http_x_campfire_bot_key"]
+    assert_equal "bot-secret", r.headers.fetch("HtTp_X_CaMpFiRe_BoT_KeY")
+    assert_equal "application/json", r.headers.fetch("content-type", "missing")
+    assert_equal "application/json", r.headers["content_type"]
+    assert r.headers.key?("x-campfire-bot-key")
+    assert !r.headers.key?("X-Missing")
+  end
+
+  def test_wire_names_are_distinct_from_trusted_env_keys
+    expected = {
+      "rack.session" => "HTTP_RACK.SESSION",
+      "action_dispatch.foo" => "HTTP_ACTION,DISPATCH.FOO",
+      "X-Test" => "HTTP_X_TEST",
+      "X_Test" => "HTTP_X,TEST",
+      "HTTP_ACCEPT" => "HTTP_HTTP,ACCEPT",
+      "HTTPS" => "HTTP_HTTPS",
+      "Server-Port" => "HTTP_SERVER_PORT",
+      "content-type" => "CONTENT_TYPE",
+      "cOnTeNt-LeNgTh" => "CONTENT_LENGTH",
+      "Content_Length" => "HTTP_CONTENT,LENGTH",
+    }
+    expected.each do |name, key|
+      assert_equal key, ActionDispatch::Http::Headers.env_name_from_header(name)
+    end
+    assert_equal "rack.session", ActionDispatch::Http::Headers.env_name("rack.session")
+    assert_equal "HTTP_ACCEPT", ActionDispatch::Http::Headers.env_name(:HTTP_ACCEPT)
+    assert_equal "HTTPS", ActionDispatch::Http::Headers.env_name("HTTPS")
+    assert_equal "CONTENT_LENGTH", ActionDispatch::Http::Headers.env_name("Content_Length")
+  end
+
+  def test_authorization_checks_rack_and_legacy_env_keys
+    assert_equal "Bearer key", ActionDispatch::Request.for(
+      { "HTTP_AUTHORIZATION" => "Bearer key" }
+    ).authorization
+    assert_equal "Bearer legacy", ActionDispatch::Request.for(
+      { "X-HTTP-AUTHORIZATION" => "Bearer legacy" }
+    ).authorization
+    assert_equal "Bearer rails legacy", ActionDispatch::Request.for(
+      { "X-HTTP_AUTHORIZATION" => "Bearer rails legacy" }
+    ).authorization
+    assert_equal "Bearer underscore legacy", ActionDispatch::Request.for(
+      { "X_HTTP_AUTHORIZATION" => "Bearer underscore legacy" }
+    ).authorization
+    assert_equal "Bearer redirect", ActionDispatch::Request.for(
+      { "REDIRECT_X_HTTP_AUTHORIZATION" => "Bearer redirect" }
+    ).authorization
+    # Rails' X-HTTP_AUTHORIZATION wins over the supported X-HTTP-AUTHORIZATION
+    # alias when both are present — Token/Basic helpers read this value.
+    assert_equal "Bearer rails wins", ActionDispatch::Request.for(
+      {
+        "X-HTTP_AUTHORIZATION" => "Bearer rails wins",
+        "X-HTTP-AUTHORIZATION" => "Bearer alias loses",
+      }
+    ).authorization
+  end
+
+  def test_path_parameters_are_route_only_and_indifferent
+    r = ActionDispatch::Request.new
+    assert !r.path_parameters.key?(:bot_key)
+    r.path_parameters = { "bot_key" => "route-secret" }
+    assert_equal "route-secret", r.path_parameters[:bot_key]
+    assert_equal "route-secret", r.path_parameters.fetch("bot_key", "missing")
+    assert !r.path_parameters.key?(:query_key)
+    assert_nil r.path_parameters.fetch(:query_key, nil)
+    assert_raises(KeyError) { r.path_parameters.fetch(:query_key) }
+  end
+
   # A proxy chain lists one scheme per hop; the first is the client's.
   def test_optional_port_is_nil_at_the_schemes_standard_port
     assert_nil ActionDispatch::Request.for({ "HTTP_HOST" => "chat.test" }).optional_port
@@ -92,6 +193,40 @@ class ActionDispatchRequestTest < Minitest::Test
     assert_equal 3000, ActionDispatch::Request.for({ "HTTP_HOST" => "chat.test:3000" }).optional_port
     assert_equal 443, ActionDispatch::Request.for({ "HTTP_HOST" => "chat.test:443" }).optional_port
     assert_equal 8080, ActionDispatch::Request.for({ "HTTP_HOST" => "[::1]:8080" }).optional_port
+  end
+
+  def test_port_uses_the_host_or_scheme_default
+    assert_equal 80, ActionDispatch::Request.for({ "HTTP_HOST" => "chat.test" }).port
+    assert_equal 443, ActionDispatch::Request.for({ "HTTP_HOST" => "chat.test", "HTTPS" => "on" }).port
+    assert_equal 3000, ActionDispatch::Request.for({ "HTTP_HOST" => "chat.test:3000" }).port
+    assert_equal 80, ActionDispatch::Request.for({ "HTTP_HOST" => "chat.test:80", "HTTPS" => "on" }).port
+    assert_equal 80, ActionDispatch::Request.for({ "HTTP_HOST" => "[::1]" }).port
+    assert_equal 8080, ActionDispatch::Request.for({ "HTTP_HOST" => "[::1]:8080" }).port
+  end
+
+  def test_port_prefers_forwarded_host_and_uses_server_port_only_without_a_host_header
+    assert_equal 8443, ActionDispatch::Request.for({
+      "HTTP_HOST" => "internal:3000", "HTTP_X_FORWARDED_HOST" => "first.test:81, public.test:8443"
+    }).port
+    assert_equal 443, ActionDispatch::Request.for({
+      "HTTP_HOST" => "internal:3000", "HTTP_X_FORWARDED_HOST" => "public.test", "HTTP_X_FORWARDED_PROTO" => "https"
+    }).port
+    assert_equal 8123, ActionDispatch::Request.for({ "SERVER_NAME" => "chat.test", "SERVER_PORT" => "8123" }).port
+    assert_equal 8123, ActionDispatch::Request.for({ "SERVER_NAME" => "[::1]", "SERVER_PORT" => "8123" }).port
+    assert_equal 80, ActionDispatch::Request.for({ "HTTP_HOST" => "chat.test", "SERVER_PORT" => "8123" }).port
+  end
+
+  def test_a_public_peer_does_not_override_host_with_x_forwarded_host
+    req = ActionDispatch::Request.for({
+      "HTTP_HOST" => "chat.test", "HTTP_X_FORWARDED_HOST" => "evil.com", "REMOTE_ADDR" => "203.0.113.5"
+    })
+    assert_equal "chat.test", req.host
+    blank = ActionDispatch::Request.for({
+      "HTTP_HOST" => "chat.test", "HTTP_X_FORWARDED_HOST" => "evil.com", "REMOTE_ADDR" => ""
+    })
+    assert_equal "chat.test", blank.host
+    assert_equal "http://chat.test", req.base_url
+    assert_equal 80, req.port
   end
 
   def test_the_first_forwarded_scheme_is_the_clients

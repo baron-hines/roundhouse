@@ -45,7 +45,7 @@
 //! byte-parity while the AOT tree stops raising:
 //!
 //! - `after?` / `before?` → `>` / `<` (AS's readable comparators).
-//! - `<t> - <dur>` / `+` → seconds via `.to_i`, the overlay's unwrap.
+//! - `<t> - <dur>` / `+` → the Duration's numeric `.value`.
 //! - `<time> <op> <bare dur>` → the ajd-vs-seconds arithmetic Rails
 //!   reaches through `Time#<=>` → `to_datetime <=> other` →
 //!   `Duration#coerce`. That comparison EVALUATES under Rails rather
@@ -70,17 +70,28 @@
 //! against `COMMENTABLE_DAYS.days.ago`); views rejoin when the view
 //! pipeline migrates to shared lowerings.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use crate::app::App;
-use crate::expr::{Expr, ExprNode, Literal};
-use crate::ident::{ClassId, Symbol};
+use crate::build_target::BuildTarget;
+use crate::expr::{Expr, ExprNode, LValue, Literal};
+use crate::ident::{ClassId, Symbol, VarId};
 use crate::ty::Ty;
 
 /// Ground duration-unit sends across every app body the post-analyze
 /// hook owns (models, library classes, controllers, seeds — not views).
 pub fn apply_duration_lowering(app: &mut App) {
+    apply_duration_lowering_for(app, BuildTarget::Ruby);
+}
+
+pub(crate) fn apply_duration_lowering_for(app: &mut App, target: BuildTarget) {
+    let time_operands = matches!(target, BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Spinel);
     let temporal_predicates = !app_defines_temporal_predicates(app);
-    super::for_each_hook_body(app, &mut |body| {
-        apply_duration_rewrites(body, temporal_predicates)
+    let defined = app_defined_units(app);
+    let duration_constants = named_duration_constants(app, &defined);
+    super::for_each_owned_hook_body(app, &mut |owner, body| {
+        type_duration_constants(body, owner, &duration_constants);
+        apply_duration_rewrites(body, temporal_predicates, time_operands, &defined)
     });
     // TEST BODIES TOO. `1.day.ago` is not a method on any target's
     // Integer — this pass IS what grounds it — so a test writing one
@@ -94,8 +105,77 @@ pub fn apply_duration_lowering(app: &mut App) {
     // runtime answers, rather than leaning on a CRuby overlay the
     // strict-target test lanes do not ship.
     super::for_each_test_body(app, &mut |body| {
-        apply_duration_rewrites(body, temporal_predicates)
+        type_duration_constants(body, None, &duration_constants);
+        apply_duration_rewrites(body, temporal_predicates, time_operands, &defined)
     });
+}
+
+/// Not only the four readers `Time` has: a unit an app or gem class defines too (et-orbi's `EoTime#seconds`, fugit's `@t.seconds`).
+pub(crate) fn app_defined_units(app: &App) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for lc in &app.library_classes {
+        for m in &lc.methods {
+            if m.receiver == crate::dialect::MethodReceiver::Instance && is_duration_unit(m.name.as_str()) {
+                out.insert(m.name.as_str().to_string());
+            }
+        }
+    }
+    for model in &app.models {
+        for item in &model.body {
+            if let crate::dialect::ModelBodyItem::Method { method, .. } = item
+                && method.receiver == crate::dialect::MethodReceiver::Instance
+                && is_duration_unit(method.name.as_str())
+            {
+                out.insert(method.name.as_str().to_string());
+            }
+        }
+    }
+    out
+}
+
+fn named_duration_constants(app: &App, defined: &BTreeSet<String>) -> BTreeSet<Vec<Symbol>> {
+    let mut candidates = BTreeMap::new();
+    let mut record = |path: Vec<Symbol>, value: &Expr| {
+        let mut value = value.clone();
+        rewrite_durations(&mut value, defined);
+        candidates.entry(path)
+            .and_modify(|duration| *duration = false)
+            .or_insert_with(|| is_duration_const_call(&value));
+    };
+    for class in app.library_classes.iter().chain(app.rails_application.iter()) {
+        for (name, value) in &class.constants {
+            let mut path: Vec<_> = class.name.0.as_str().split("::").map(Symbol::from).collect();
+            path.push(name.clone());
+            record(path, value);
+        }
+    }
+    for model in &app.models {
+        for item in &model.body {
+            let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { continue };
+            let ExprNode::Assign { target: LValue::Const { path }, value } = &*expr.node else { continue };
+            let [name] = path.as_slice() else { continue };
+            let mut path: Vec<_> = model.name.0.as_str().split("::").map(Symbol::from).collect();
+            path.push(name.clone());
+            record(path, value);
+        }
+    }
+    candidates.into_iter().filter_map(|(path, duration)| duration.then_some(path)).collect()
+}
+
+fn type_duration_constants(expr: &mut Expr, owner: Option<&ClassId>, constants: &BTreeSet<Vec<Symbol>>) {
+    expr.node.for_each_child_mut(&mut |child| type_duration_constants(child, owner, constants));
+    let ExprNode::Const { path } = &*expr.node else { return };
+    let scoped = owner.map(|owner| {
+        let mut scoped: Vec<_> = owner.0.as_str().split("::").map(Symbol::from).collect();
+        scoped.extend(path.iter().cloned());
+        scoped
+    });
+    if constants.contains(path) || scoped.as_ref().is_some_and(|path| constants.contains(path)) {
+        expr.ty = Some(Ty::Class {
+            id: ClassId(Symbol::from("ActiveSupport::Duration")),
+            args: vec![].into(),
+        });
+    }
 }
 
 /// The pass order the view vestige must mirror
@@ -105,16 +185,17 @@ pub fn apply_duration_lowering(app: &mut App) {
 /// grounded `ActiveSupport::Duration.<unit>(n)` shape. Predicates next,
 /// so a rewritten `after?` reaches the comparison rules as the `>` it
 /// means. Comparisons BEFORE arithmetic: both read a bare Duration
-/// operand, and the arithmetic rewrite hides one behind `.to_i` — after
+/// operand, and the arithmetic rewrite hides one behind `.value` — after
 /// it runs, `<t> - <dur>` is no longer distinguishable from the numeric
 /// `Time - Time` shape.
-pub(crate) fn apply_duration_rewrites(body: &mut Expr, temporal_predicates: bool) {
-    rewrite_durations(body);
+pub(crate) fn apply_duration_rewrites(body: &mut Expr, temporal_predicates: bool, time_operands: bool, defined: &BTreeSet<String>) {
+    rewrite_durations(body, defined);
     if temporal_predicates {
         rewrite_temporal_predicates(body);
     }
+    lift_guarded_durations(body);
     rewrite_duration_comparisons(body);
-    rewrite_time_duration_arith(body);
+    rewrite_time_duration_arith(body, time_operands);
     rewrite_expires_in(body);
 }
 
@@ -274,23 +355,67 @@ fn rewrite_temporal_predicates(expr: &mut Expr) {
 
 /// `<t> - <dur>` / `<t> + <dur>` → the Duration's seconds, which is
 /// what the CRuby overlay's `Time#-` reopen unwraps to before calling
-/// through. `Time ± Integer` is a `Time` on every ruby-family runtime
+/// through. `Time ± Numeric` is a `Time` on every ruby-family runtime
 /// (spinel included), so the outer node keeps its own type and span.
 ///
 /// A Duration RECEIVER is left alone: `1.day - 1.hour` is Duration
 /// arithmetic, and the value class ships no operators, so grounding
 /// only one operand would quietly change what the expression means.
-fn rewrite_time_duration_arith(expr: &mut Expr) {
-    expr.node.for_each_child_mut(&mut rewrite_time_duration_arith);
+fn rewrite_time_duration_arith(expr: &mut Expr, time_operands: bool) {
+    expr.node.for_each_child_mut(&mut |child| rewrite_time_duration_arith(child, time_operands));
     let is_arith = matches!(
         &*expr.node,
         ExprNode::Send { recv: Some(recv), method, args, block: None, .. }
             if args.len() == 1
                 && matches!(method.as_str(), "-" | "+")
-                && is_duration_const_call(&args[0])
+                && (is_duration_const_call(&args[0])
+                    || (is_typed_duration(&args[0])
+                        && recv.ty.as_ref().is_some_and(Ty::contains_time)))
                 && !is_duration_const_call(recv)
+                && !is_typed_duration(recv)
     );
     if !is_arith {
+        let ExprNode::Send {
+            recv: Some(recv),
+            method,
+            args,
+            block: None,
+            ..
+        } = &mut *expr.node
+        else {
+            return;
+        };
+        if !time_operands
+            || !matches!(recv.ty, Some(Ty::Time))
+            || !matches!(method.as_str(), "+" | "-")
+            || args.len() != 1
+            || matches!(args[0].ty, Some(Ty::Int | Ty::Float | Ty::Time))
+        {
+            return;
+        }
+        let operand = take(&mut args[0]);
+        let span = operand.span;
+        let mut duration = Expr::new(
+            span,
+            ExprNode::Const {
+                path: vec![Symbol::from("ActiveSupport"), Symbol::from("Duration")],
+            },
+        );
+        duration.ty = Some(Ty::Class {
+            id: ClassId(Symbol::from("ActiveSupport::Duration")),
+            args: vec![].into(),
+        });
+        args[0] = Expr::new(
+            span,
+            ExprNode::Send {
+                recv: Some(duration),
+                method: Symbol::from("time_operand"),
+                args: vec![operand],
+                block: None,
+                parenthesized: true,
+            },
+        );
+        args[0].ty = Some(Ty::Untyped);
         return;
     }
     let ExprNode::Send { args, .. } = &mut *expr.node else { unreachable!() };
@@ -300,13 +425,18 @@ fn rewrite_time_duration_arith(expr: &mut Expr) {
         span,
         ExprNode::Send {
             recv: Some(dur),
-            method: Symbol::from("to_i"),
+            method: Symbol::from("value"),
             args: vec![],
             block: None,
             parenthesized: false,
         },
     );
-    args[0].ty = Some(Ty::Int);
+    args[0].ty = Some(Ty::Union { variants: vec![Ty::Int, Ty::Float].into() });
+}
+
+fn is_typed_duration(expr: &Expr) -> bool {
+    matches!(expr.ty.as_ref(), Some(Ty::Class { id, .. })
+        if id.0.as_str() == "ActiveSupport::Duration")
 }
 
 /// Move `side` out, leaving the empty-`Seq` placeholder this file uses
@@ -370,6 +500,51 @@ const SECONDS_PER_DAY: f64 = 86_400.0;
 /// grounding it to plain seconds answers a different question — and
 /// raised on every /newest render when an earlier attempt did exactly
 /// that. See the module header's TIME INTEROP note.
+/// `t < (r.is_a?(Numeric) ? Duration.seconds(r) : r.seconds)` as `r.is_a?(Numeric) ? t < Duration.seconds(r) : t < r.seconds`,
+/// so the comparison and arithmetic rules see the Duration operand.
+fn lift_guarded_durations(expr: &mut Expr) {
+    expr.node.for_each_child_mut(&mut lift_guarded_durations);
+    let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &mut *expr.node else { return };
+    if args.len() != 1 || !matches!(method.as_str(), "<" | "<=" | ">" | ">=" | "+" | "-") {
+        return;
+    }
+    let cmp = !matches!(method.as_str(), "+" | "-");
+    // Not past a side with an effect: the lifted test now runs before it.
+    let arg_side = is_guarded_duration(&args[0]) && is_plain_read(recv);
+    let recv_side = cmp && !arg_side && is_guarded_duration(recv) && is_plain_read(&args[0]);
+    if !arg_side && !recv_side {
+        return;
+    }
+    let span = expr.span;
+    let ty = expr.ty.clone();
+    let ExprNode::Send { recv: Some(recv), method, args, .. } = &mut *expr.node else { unreachable!() };
+    let guarded = if arg_side { take(&mut args[0]) } else { take(recv) };
+    let ExprNode::If { cond, then_branch, else_branch } = *guarded.node else { unreachable!() };
+    let other = if arg_side { take(recv) } else { take(&mut args[0]) };
+    let branch = |side: Expr| {
+        let (l, r) = if arg_side { (other.clone(), side) } else { (side, other.clone()) };
+        Expr { ty: ty.clone(), ..Expr::new(span, ExprNode::Send { recv: Some(l), method: method.clone(), args: vec![r], block: None, parenthesized: false }) }
+    };
+    let (then_branch, else_branch) = (branch(then_branch), branch(else_branch));
+    *expr = Expr { ty, ..Expr::new(span, ExprNode::If { cond, then_branch, else_branch }) };
+}
+
+/// The guard `rewrite_durations` writes around a unit call on a receiver that may not be Numeric.
+fn is_guarded_duration(e: &Expr) -> bool {
+    matches!(&*e.node, ExprNode::If { cond, then_branch, .. }
+        if is_duration_const_call(then_branch)
+            && matches!(&*cond.node, ExprNode::Send { method, args, .. }
+                if method.as_str() == "is_a?" && matches!(args.as_slice(), [a] if matches!(&*a.node, ExprNode::Const { path } if path.len() == 1 && path[0].as_str() == "Numeric"))))
+}
+
+fn is_plain_read(e: &Expr) -> bool {
+    match &*e.node {
+        ExprNode::Var { .. } | ExprNode::Ivar { .. } | ExprNode::Const { .. } | ExprNode::Lit { .. } => true,
+        ExprNode::Send { recv: Some(r), args, block: None, .. } => args.is_empty() && matches!(&*r.node, ExprNode::Const { .. }),
+        _ => false,
+    }
+}
+
 fn rewrite_duration_comparisons(expr: &mut Expr) {
     expr.node.for_each_child_mut(&mut rewrite_duration_comparisons);
     let is_cmp = matches!(
@@ -479,6 +654,22 @@ fn is_numeric_expr(e: &Expr) -> bool {
     matches!(&e.ty, Some(Ty::Int) | Some(Ty::Float))
 }
 
+/// A receiver typed as something no number is: its own `seconds` is a method of its class (fugit's `Cron#seconds`), not a Duration.
+/// A union of such types too: `Array#first` and `&.` answer `Lap | nil`, whose `minutes` is still `Lap#minutes`.
+fn known_non_numeric(e: &Expr) -> bool {
+    e.ty.as_ref().is_some_and(non_numeric)
+}
+
+fn non_numeric(ty: &Ty) -> bool {
+    match ty {
+        // Not a `Numeric`, `BigDecimal`, `Rational` or `Complex`: ActiveSupport's `Numeric#minutes` is theirs.
+        Ty::Class { id, .. } => !matches!(id.0.as_str(), "Numeric" | "BigDecimal" | "Rational" | "Complex"),
+        Ty::Str | Ty::Sym | Ty::Array { .. } | Ty::Hash { .. } | Ty::Bool | Ty::Nil => true,
+        Ty::Union { variants } => variants.iter().all(non_numeric),
+        _ => false,
+    }
+}
+
 /// `<n>.days` → `ActiveSupport::Duration.days(<n>)`, in place,
 /// recursively. The receiver moves into argument position keeping its
 /// stamped type. The synthesized `ActiveSupport::Duration` const is
@@ -491,16 +682,34 @@ fn is_numeric_expr(e: &Expr) -> bool {
 /// the registry doesn't model (`send_dispatch`'s fallback convention).
 /// Also the implementation behind the ruby emitter's view-pipeline
 /// vestige.
-pub(crate) fn rewrite_durations(expr: &mut Expr) {
-    expr.node.for_each_child_mut(&mut rewrite_durations);
+pub(crate) fn rewrite_durations(expr: &mut Expr, defined: &BTreeSet<String>) {
+    expr.node.for_each_child_mut(&mut |child| rewrite_durations(child, defined));
     let rewrite = match &*expr.node {
         ExprNode::Send { recv: Some(r), method, args, block: None, .. }
             if args.is_empty() && is_duration_unit(method.as_str()) =>
         {
-            !duration_unit_collides_with_a_reader(method.as_str()) || is_numeric_expr(r)
+            is_numeric_expr(r) || (!duration_unit_collides_with_a_reader(method.as_str()) && !known_non_numeric(r))
         }
         _ => false,
     };
+    // Not a Duration outright where a class's own reader shares the unit's name: Ruby picks by the receiver's class.
+    let guarded = rewrite
+        && matches!(&*expr.node, ExprNode::Send { recv: Some(r), method, .. }
+            if !is_numeric_expr(r) && defined.contains(method.as_str()));
+    // Not read twice: a receiver that runs something (`fetch.seconds`) is bound once in the test and both arms read the binding.
+    let bound = guarded.then(|| match &*expr.node {
+        ExprNode::Send { recv: Some(r), .. } if !matches!(&*r.node, ExprNode::Var { .. } | ExprNode::Ivar { .. } | ExprNode::Const { .. }) => {
+            let name = Symbol::from(format!("_duration_receiver_{}", expr.span.start));
+            let value = r.clone();
+            let mut read = Expr::new(r.span, ExprNode::Var { id: VarId(0), name: name.clone() });
+            read.ty = r.ty.clone();
+            let ExprNode::Send { recv, .. } = &mut *expr.node else { unreachable!() };
+            *recv = Some(read);
+            Some((name, value))
+        }
+        _ => None,
+    }).flatten();
+    let reader = guarded.then(|| expr.clone());
     if rewrite {
         let span = expr.span;
         let node = std::mem::replace(&mut *expr.node, ExprNode::Seq { exprs: vec![] });
@@ -510,7 +719,7 @@ pub(crate) fn rewrite_durations(expr: &mut Expr) {
         let mut duration_const = Expr::new(span, ExprNode::Const { path });
         duration_const.ty = Some(Ty::Class {
             id: ClassId(Symbol::from("ActiveSupport::Duration")),
-            args: vec![],
+            args: vec![].into(),
         });
         *expr.node = ExprNode::Send {
             recv: Some(duration_const),
@@ -522,5 +731,25 @@ pub(crate) fn rewrite_durations(expr: &mut Expr) {
         if matches!(expr.ty, None | Some(Ty::Var { .. })) {
             expr.ty = Some(Ty::Untyped);
         }
+    }
+    if let Some(reader) = reader {
+        let ExprNode::Send { args, .. } = &*expr.node else { return };
+        let span = expr.span;
+        let numeric = Expr::new(span, ExprNode::Const { path: vec![Symbol::from("Numeric")] });
+        // Bound in the test itself, not by a `Let`: a Let renders as statements, and `x = <Let>` stored the receiver.
+        let tested = match &bound {
+            Some((name, value)) => Expr::new(span, ExprNode::Assign { target: LValue::Var { id: VarId(0), name: name.clone() }, value: value.clone() }),
+            None => args[0].clone(),
+        };
+        let cond = Expr::new(span, ExprNode::Send {
+            recv: Some(tested),
+            method: Symbol::from("is_a?"),
+            args: vec![numeric],
+            block: None,
+            parenthesized: true,
+        });
+        let duration = std::mem::replace(expr, Expr::new(span, ExprNode::Lit { value: Literal::Nil }));
+        *expr = Expr::new(span, ExprNode::If { cond, then_branch: duration, else_branch: reader });
+        expr.ty = Some(Ty::Untyped);
     }
 }

@@ -30,8 +30,8 @@
 
 use crate::dialect::LibraryClass;
 use crate::expr::{Arm, Expr, ExprNode, InterpPart, LValue, Literal, RescueClause};
-use crate::ty::{ParamKind, Ty};
-use std::collections::HashMap;
+use crate::ty::{FnTy, ParamKind, Ty};
+use crate::det::HashMap;
 
 /// (ClassName, method_name) → param_tys. ClassName is the last segment
 /// of the LC's name (e.g. `ViewHelpers` for `ActionView::ViewHelpers`)
@@ -79,20 +79,23 @@ pub fn insert_ty_coercions_with_extras(
 }
 
 fn build_registry_from(lcs: &[&LibraryClass]) -> CalleeRegistry {
-    let mut out: CalleeRegistry = HashMap::new();
+    let mut out: CalleeRegistry = HashMap::default();
     for lc in lcs {
         let raw = lc.name.0.as_str();
         let class_name = raw.rsplit("::").next().unwrap_or(raw).to_string();
         let entry = out.entry(class_name).or_default();
         for m in &lc.methods {
             let param_tys: Vec<Ty> = match m.signature.as_ref() {
-                Some(Ty::Fn { params, .. }) => params
-                    .iter()
-                    .filter(|p| {
-                        !matches!(p.kind, ParamKind::Block | ParamKind::KeywordRest)
-                    })
-                    .map(|p| p.ty.clone())
-                    .collect(),
+                Some(Ty::Fn(fn_ty)) => {
+                    let FnTy { params, .. } = &**fn_ty;
+                    params
+                        .iter()
+                        .filter(|p| {
+                            !matches!(p.kind, ParamKind::Block | ParamKind::KeywordRest)
+                        })
+                        .map(|p| (*p.ty).clone())
+                        .collect()
+                },
                 _ => continue,
             };
             entry.insert(m.name.as_str().to_string(), param_tys);
@@ -136,20 +139,23 @@ fn build_registry_from(lcs: &[&LibraryClass]) -> CalleeRegistry {
 }
 
 fn build_registry(lcs: &[LibraryClass]) -> CalleeRegistry {
-    let mut out: CalleeRegistry = HashMap::new();
+    let mut out: CalleeRegistry = HashMap::default();
     for lc in lcs {
         let raw = lc.name.0.as_str();
         let class_name = raw.rsplit("::").next().unwrap_or(raw).to_string();
         let entry = out.entry(class_name).or_default();
         for m in &lc.methods {
             let param_tys: Vec<Ty> = match m.signature.as_ref() {
-                Some(Ty::Fn { params, .. }) => params
-                    .iter()
-                    .filter(|p| {
-                        !matches!(p.kind, ParamKind::Block | ParamKind::KeywordRest)
-                    })
-                    .map(|p| p.ty.clone())
-                    .collect(),
+                Some(Ty::Fn(fn_ty)) => {
+                    let FnTy { params, .. } = &**fn_ty;
+                    params
+                        .iter()
+                        .filter(|p| {
+                            !matches!(p.kind, ParamKind::Block | ParamKind::KeywordRest)
+                        })
+                        .map(|p| (*p.ty).clone())
+                        .collect()
+                },
                 _ => continue,
             };
             entry.insert(m.name.as_str().to_string(), param_tys);
@@ -380,8 +386,8 @@ fn rewrite_expr(expr: &Expr, registry: &CalleeRegistry, class_name: &str) -> Exp
                     .collect(),
                 else_branch: else_branch
                     .as_ref()
-                    .map(|e| rewrite_expr(e, registry, class_name)),
-                ensure: ensure.as_ref().map(|e| rewrite_expr(e, registry, class_name)),
+                    .map(|e| Box::new(rewrite_expr(e, registry, class_name))),
+                ensure: ensure.as_ref().map(|e| Box::new(rewrite_expr(e, registry, class_name))),
                 implicit: *implicit,
             }
         }
@@ -398,8 +404,7 @@ fn rewrite_expr(expr: &Expr, registry: &CalleeRegistry, class_name: &str) -> Exp
         ty: expr.ty.clone(),
         effects: expr.effects.clone(),
         leading_blank_line: expr.leading_blank_line,
-        diagnostic: expr.diagnostic.clone(),
-        hint: expr.hint,
+        cold: expr.cold.clone(),
         decisions: expr.decisions,
     }
 }
@@ -633,8 +638,7 @@ fn wrap_in_cast(arg: &Expr, target_ty: &Ty) -> Expr {
         ty: Some(target_ty.clone()),
         effects: arg.effects.clone(),
         leading_blank_line: arg.leading_blank_line,
-        diagnostic: None,
-        hint: None,
+        cold: None,
         decisions: 0,
     }
 }
@@ -668,10 +672,10 @@ mod tests {
     /// `take("x")` against `take(String?)` gets the same Some-wrap in both.
     #[test]
     fn a_lambda_default_gets_the_coercion_its_body_gets() {
-        let mut registry: CalleeRegistry = HashMap::new();
+        let mut registry: CalleeRegistry = HashMap::default();
         registry.entry("Foo".into()).or_default().insert(
             "take".into(),
-            vec![Ty::Union { variants: vec![Ty::Str, Ty::Nil] }],
+            vec![Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() }],
         );
         let lambda = Expr::new(
             Span::synthetic(),

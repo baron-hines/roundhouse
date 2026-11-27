@@ -47,11 +47,15 @@ const KNOWN: &[(&str, &str, &[&str])] = &[
 
 pub fn restate(app: &mut App) {
     let sole = app.sole_includer_of_modules();
+    // The first library class of each name answers for it (a reopen is its own entry).
+    let mut first: crate::det::HashMap<&ClassId, usize> = Default::default();
+    for (i, lc) in app.library_classes.iter().enumerate() {
+        first.entry(&lc.name).or_insert(i);
+    }
     let parent_of = |id: &ClassId| -> Option<String> {
-        app.library_classes
-            .iter()
-            .find(|lc| &lc.name == id)
-            .and_then(|lc| lc.parent.as_ref())
+        first
+            .get(id)
+            .and_then(|&i| app.library_classes[i].parent.as_ref())
             .map(|p| p.0.as_str().trim_start_matches("::").to_string())
     };
     let mut destination: Vec<Option<String>> = Vec::new();

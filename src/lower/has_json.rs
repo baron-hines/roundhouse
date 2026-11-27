@@ -55,7 +55,7 @@
 //!   seam tells the two apart, which the ruby family's runtime can and
 //!   the lowering cannot.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::dialect::{AccessorKind, MethodDef, Model, ModelBodyItem, Param};
 use crate::expr::{Expr, ExprNode, LValue, Literal};
@@ -256,8 +256,8 @@ pub(crate) fn flat_name(column: &Symbol, key: &Symbol) -> Symbol {
 pub(crate) fn has_json_columns(
     models: &[Model],
 ) -> HashMap<String, HashMap<String, JsonScalar>> {
-    let mut out: HashMap<String, HashMap<String, JsonScalar>> = HashMap::new();
-    let mut conflicted: HashSet<String> = HashSet::new();
+    let mut out: HashMap<String, HashMap<String, JsonScalar>> = HashMap::default();
+    let mut conflicted: HashSet<String> = HashSet::default();
     for model in models {
         for decl in has_json_decls(&model.body) {
             let col = decl.column.as_str().to_string();
@@ -487,7 +487,7 @@ pub(crate) fn column_hash_read(model: &Model, column: &Symbol) -> Option<Expr> {
         .collect();
     Some(super::typing::with_ty(
         sp(ExprNode::Hash { entries, kwargs: false }),
-        Ty::Hash { key: Box::new(Ty::Str), value: Box::new(Ty::Untyped) },
+        Ty::Hash { key: std::sync::Arc::new(Ty::Str), value: std::sync::Arc::new(Ty::Untyped) },
     ))
 }
 
@@ -513,7 +513,7 @@ pub(crate) fn column_assign(model: &Model, column: &Symbol, raw: Expr, slot: Ty)
         .collect();
     let schema = super::typing::with_ty(
         sp(ExprNode::Hash { entries: schema, kwargs: false }),
-        Ty::Hash { key: Box::new(Ty::Str), value: Box::new(Ty::Str) },
+        Ty::Hash { key: std::sync::Arc::new(Ty::Str), value: std::sync::Arc::new(Ty::Str) },
     );
     Some(super::typing::with_ty(
         schematized_json(

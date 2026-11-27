@@ -20,7 +20,7 @@
 //! class — the same tradeoff `html_safe_methods` takes, and the
 //! consequence is confined to a predicate no String answers.
 
-use std::collections::HashSet;
+use crate::det::HashSet;
 
 use crate::app::App;
 use crate::expr::{Expr, ExprNode};
@@ -29,7 +29,7 @@ use crate::ident::Symbol;
 /// Methods that RETURN an inquirer — their body's tail is an
 /// `.inquiry` call.
 pub fn inquirer_methods(app: &App) -> HashSet<Symbol> {
-    let mut out = HashSet::new();
+    let mut out = HashSet::default();
     let mut note = |m: &crate::dialect::MethodDef| {
         if tail_is_inquiry(&m.body) {
             out.insert(m.name.clone());
@@ -76,6 +76,8 @@ pub fn tail_is_inquiry(body: &Expr) -> bool {
         ExprNode::BoolOp { op: crate::expr::BoolOpKind::Or, right, .. } => {
             tail_is_inquiry(right)
         }
+        // `x&.inquiry`, which ingests as `(tmp = x) && tmp.inquiry`: the inquirer, or nil.
+        ExprNode::BoolOp { op: crate::expr::BoolOpKind::And, right, .. } => tail_is_inquiry(right),
         ExprNode::Send { .. } => inquirer_value(body).is_some(),
         _ => false,
     }

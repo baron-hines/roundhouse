@@ -240,7 +240,8 @@ end
 Db.singleton_class.prepend(FailSecondGeneratedReturningTextRead)
 
 # This failure happens while decoding an already materialized INSERT result.
-# It tests staging and handle cleanup; the database write itself is not rolled back.
+# It tests staging and handle cleanup. The save's transaction rolls the
+# INSERT back, as Rails' does for an exception raised inside `save`.
 person = Person.new(first_name: "Decode", last_name: "Failure")
 failure = nil
 sqls = Db.capture_sql do
@@ -255,7 +256,7 @@ raise "generated value reads were not staged in order" unless Db.instance_variab
 raise "the returned handle was not finalized after a read error" unless Db.instance_variable_get(:@rh_test_generated_finalizes) == 1
 raise "first generated cache changed before all reads succeeded" unless person.display_name.nil?
 raise "second generated cache changed before all reads succeeded" unless person.normalized_first_name.nil?
-raise "the already executed INSERT should remain persisted" unless Person.count == 1
+raise "the failed save's INSERT should be rolled back" unless Person.count == 0
 raise "the create used a follow-up SELECT: #{sqls.inspect}" if sqls.any? { |sql| sql.start_with?("SELECT") && sql.include?("people") && sql.include?("display_name") }
 puts "generated RETURNING read failure finalizes without partial cache updates"
 "##,
@@ -722,7 +723,7 @@ fn association_touch_guards_generated_targets_and_preserves_ordinary_columns() {
 }
 
 #[test]
-fn polymorphic_association_touch_guards_resolved_and_unresolved_generated_targets() {
+fn polymorphic_association_touch_guards_generated_targets_with_and_without_an_inverse() {
     use roundhouse::dialect::Association;
     use roundhouse::project::BuildTarget;
 
@@ -772,9 +773,11 @@ fn polymorphic_association_touch_guards_resolved_and_unresolved_generated_target
     else {
         panic!("expected polymorphic belongs_to");
     };
+    // No inverse `as:` or type literal: the association reads any model,
+    // `Person` among them, so the resolved-target branch guards it too.
     assert!(
-        polymorphic_targets.is_empty(),
-        "no inverse or type literal should exercise the unresolved-target guard branch"
+        polymorphic_targets.iter().any(|target| target.0.as_str() == "Person"),
+        "no inverse or type literal should resolve to every model; got {polymorphic_targets:?}"
     );
     assert_association_touch_guard(&analyzed_app, &diagnostics, "touch: :display_name");
 

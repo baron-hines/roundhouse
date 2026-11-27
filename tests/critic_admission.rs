@@ -1,5 +1,7 @@
 //! Regression cases where inference used to certify an unexecutable program.
 //! Both CLI gates must refuse; passing `check` alone is not admission evidence.
+#[path = "support/scratch.rs"]
+mod scratch;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -18,7 +20,7 @@ fn admits(body: &str) {
 }
 
 fn gate(body: &str, expected: &str, extra: &[(&str, &str)], admitted: bool) {
-    let root = std::env::temp_dir().join(format!("rh_admission_{}_{}", std::process::id(), NEXT.fetch_add(1, Ordering::SeqCst)));
+    let root = scratch::dir(&format!("rh_admission_{}", NEXT.fetch_add(1, Ordering::SeqCst)));
     for (path, text) in [
         ("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n".to_string()),
         ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n".to_string()),
@@ -65,9 +67,23 @@ fn unresolved_declared_classes_are_errors() {
 
 #[test]
 fn new_errors_api_requires_runtime_support() {
-    for body in ["errors.added?(:title, :blank)", "errors.details", "errors.where(:title)", "errors.merge!(errors)", "errors.first.options", "errors.delete(:title); errors.size", "f = title.to_sym; errors.full_message(f, \"is taken\")"] {
+    for body in ["errors.added?(:title, :blank, count: 1)", "errors.where(title)", "errors.merge!(title)", "errors.import(errors.first, type: :taken)", "errors.delete(title); errors.size", "f = title.to_sym; errors.full_message(f, \"is taken\")"] {
         refuses(body, "ActiveModel::Errors");
     }
+    // Not `ActiveModel::Error`: on emit, what an iteration yields is already the `ErrorDetail` the lowering iterates.
+    refuses("errors.first.options", "no known method `options`");
+    refuses("errors.of_kind?(title.to_sym, :blank)", "of_kind?");
+    refuses("errors.details[:title].map { |detail| detail[:count] }", "no known method `[]`");
+}
+
+#[test]
+fn errors_merge_details_and_added_are_admitted() {
+    admits("errors.merge!(errors); errors.details[:title].map { |detail| detail[:error] }; errors.added?(:title, :blank)");
+}
+
+#[test]
+fn errors_where_on_a_literal_field_is_admitted() {
+    admits("errors.where(:title, :blank).map(&:full_message)");
 }
 
 #[test]
@@ -77,17 +93,27 @@ fn errors_full_message_on_a_literal_field_is_admitted() {
 }
 
 #[test]
-fn errors_full_message_on_a_computed_receiver_is_refused() {
-    refuses("Probe.create!(title: \"x\").errors.full_message(:title, \"is taken\")", "ActiveModel::Errors");
+fn errors_full_message_on_a_computed_receiver_is_admitted() {
+    admits("Probe.create!(title: \"x\").errors.full_message(:title, \"is taken\").upcase");
 }
 
 #[test]
 fn non_nil_assertions_require_runtime_support() {
-    // `T.must` lowers to sorbet's check (tests/sorbet_must_runs.rs).
-    refuses("T.must_because(1) { \"present\" }", "non-nil assertion");
-    refuses("1.not_nil!", "not_nil!");
+    // `T.must` and `T.must_because` with a literal reason lower to
+    // sorbet's check (tests/sorbet_must_runs.rs,
+    // tests/sorbet_must_because_runs.rs). A reason that is not a
+    // literal block has no message to inline and stays refused.
+    refuses("T.must_because(1, &blk)", "non-nil assertion");
+    refuses("T.must_because(1) { |why| why }", "non-nil assertion");
+    // type_toolkit's `x.not_nil!` runs on the CRuby tree
+    // (tests/not_nil_type_toolkit.rs); other trees refuse it at emit
+    // (tests/not_nil_bang.rs).
+    admits("1.not_nil!");
 }
 
+/// A `for` opens no scope: ingest writes it as a `while`, so the loop
+/// variable and a body local stay visible after it, as in Ruby (the
+/// answers are pinned by `emit_and_run::for_loops`).
 #[test]
 fn for_scope_is_not_a_block_scope() {
     for body in [
@@ -96,7 +122,13 @@ fn for_scope_is_not_a_block_scope() {
         "for x in [1, 2]; y = x * 10; end; y",
         "for p, q in [[1, 2], [3, 4]]; end; [p, q]",
         "for x in []; y = 1; end; [defined?(y), y]",
-    ] { refuses(body, "for"); }
+    ] { admits(body); }
+}
+
+#[test]
+fn string_to_d_has_its_runtime() {
+    // `ActiveSupport.loose_to_d` (runtime/ruby/active_support_ext.rb), run by tests/emit_and_run/string_to_d.rs.
+    admits("\"1.5\".to_d");
 }
 
 #[test]
@@ -105,7 +137,6 @@ fn registry_signatures_do_not_supply_missing_runtime() {
         ("ActiveRecord::Base.connected_to(role: :reading) { 7 }", "connected_to"),
         ("Benchmark.realtime { 1 }", "Benchmark"),
         ("\"2020-01-02\".to_date", "to_date"),
-        ("\"1.5\".to_d", "to_d"),
         ("{}.to_sentence", "to_sentence"),
     ] { refuses(body, name); }
 }
@@ -136,6 +167,8 @@ fn identity_is_invalidated_by_reassignment_and_branch_writes() {
         "k = Probe; [Probe.new] => [k]; k.define_method(:x) { 1 }",
         "k = Probe; begin; raise StandardError; rescue => k; k.define_method(:x) { 1 }; end",
         "Probe.new.class.define_method(:x) { 1 }",
+        "k = title; k.define_method(:x) { 1 } if k.is_a?(Class)",
+        "title.to_s.constantize.define_method(:x) { 1 }",
     ] { refuses(body, "Module protocol"); }
 }
 
@@ -147,6 +180,35 @@ fn cross_date_time_comparison_requires_activesupport_runtime() {
 #[test]
 fn instance_eval_changes_self_identity_in_class_side_methods() {
     refuses_with("Probe.go", "Module protocol", &[("app/models/probe.rb", "class Probe < ApplicationRecord\n  def self.go\n    Probe.new.instance_eval { self.define_method(:x) { 1 } }\n  end\nend\n")]);
+}
+
+#[test]
+fn an_overridden_then_does_not_yield_the_class() {
+    refuses_with("Probe.go", "Module protocol", &[("app/models/probe.rb", "class Probe < ApplicationRecord\n  def self.then\n    yield 1\n  end\n\n  def self.go\n    Probe.then { |k| k.const_defined?(:X) }\n  end\nend\n")]);
+}
+
+#[test]
+fn a_held_class_answers_queries_not_writes() {
+    let holder = "class Holder\n  def initialize(klass)\n    @klass = klass\n  end\n\n  def go\n    @klass.define_method(:x) { 1 }\n  end\n\n  def self.make\n    Holder.new(Probe).go\n  end\nend\n";
+    refuses_with("Holder.make", "Module protocol", &[("app/models/holder.rb", holder)]);
+    let mixed = "class Holder\n  def initialize(klass)\n    @klass = klass\n  end\n\n  def go\n    @klass.const_defined?(:X)\n  end\n\n  def self.make\n    Holder.new(Probe).go\n    Holder.new(Probe.new).go\n  end\nend\n";
+    refuses_with("Holder.make", "Module protocol", &[("app/models/holder.rb", mixed)]);
+}
+
+#[test]
+fn ipaddr_include_takes_only_an_ipaddr() {
+    refuses("IPAddr.new(\"10.0.0.0/8\").include?(title)", "include?");
+    refuses("IPAddr.new(\"10.0.0.0/8\").include?(IPAddr)", "include?");
+}
+
+#[test]
+fn only_a_guard_on_its_own_declaration_is_read_through() {
+    for guard in ["unless defined?(::Other)", "unless defined?(::Other::Sub)"] {
+        let shelf = format!("module Shelf\n  {guard}\n    module Sub\n      X = 1\n    end\n  end\nend\n");
+        refuses_with("Shelf::Sub::X", "Shelf::Sub::X", &[("app/models/shelf.rb", &shelf)]);
+    }
+    let with_else = "module Shelf\n  unless defined?(::Shelf::Sub)\n    module Sub\n      X = 1\n    end\n  else\n    nil\n  end\nend\n";
+    refuses_with("Shelf::Sub::X", "Shelf::Sub::X", &[("app/models/shelf.rb", with_else)]);
 }
 
 #[test]
@@ -176,7 +238,9 @@ fn lambda_parameters_cannot_borrow_outer_class_identity() {
 #[test]
 fn dropped_block_capture_cannot_borrow_outer_identity() {
     refuses("k = Probe; [1].each { |&k| k.define_method(:x) { 1 } }", "block parameter capture");
-    refuses("k = Probe; f = ->(&k) { k.define_method(:x) { 1 } }; f.call", "block parameter capture");
+    // A lambda keeps its named block parameter: `k` there is the block, not the outer class, so `define_method` on it
+    // is refused for its receiver rather than run on `Probe`.
+    refuses("k = Probe; f = ->(&k) { k.define_method(:x) { 1 } }; f.call", "Module protocol");
 }
 
 #[test]

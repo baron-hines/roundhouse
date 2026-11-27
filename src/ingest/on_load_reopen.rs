@@ -55,6 +55,7 @@ use super::util::{
 };
 use super::{survey, IngestError};
 
+use crate::ingest::prism_api::PrismLocation;
 /// The reopened class the tolerant-sgid shape lives on.
 const ATTACHMENT: &str = "ActionText::Attachment";
 /// The envelope key the hand-decode reads; its presence is what says
@@ -70,8 +71,11 @@ pub(super) fn ingest_on_load_reopens(source: &[u8], file: &str, app: &mut App) {
     let root = result.node();
     let src = String::from_utf8_lossy(source);
     let Some(prog) = root.as_program_node() else { return };
-    for stmt in prog.statements().body().iter() {
+    for (stmt, scope) in load_time_statements(&prog) {
         let Some(call) = stmt.as_call_node() else { continue };
+        if carry_framework_include(&call, &scope, file, app) {
+            continue;
+        }
         if constant_id_str(&call.name()) != "on_load" {
             continue;
         }
@@ -90,7 +94,27 @@ pub(super) fn ingest_on_load_reopens(source: &[u8], file: &str, app: &mut App) {
 
         if let Some(statements) = body.as_statements_node() {
             for stmt in statements.body().iter() {
+                if hook == "active_record"
+                    && let Some(write) = stmt.as_constant_path_write_node()
+                    && write.target().parent().is_some_and(|p| p.as_self_node().is_some())
+                    && let Some(value) = constant_path_of(&write.value())
+                {
+                    let name = Symbol::from(String::from_utf8_lossy(write.target().name().map(|n| n.as_slice()).unwrap_or_default()).into_owned());
+                    let path: Vec<Symbol> = value.iter().map(|s| Symbol::from(s.as_str())).collect();
+                    let scope: Vec<Symbol> = scope.iter().map(|s| Symbol::from(s.as_str())).collect();
+                    if !app.load_hook_constants.iter().any(|(n, _, _)| *n == name) {
+                        app.load_hook_constants.push((name, path, scope));
+                    }
+                    continue;
+                }
                 let Some(include) = stmt.as_call_node() else { continue };
+                if hook == "active_record" {
+                    for id in extended_modules(&include) {
+                        if !app.load_hook_extended_macros.contains(&id) {
+                            app.load_hook_extended_macros.push(id);
+                        }
+                    }
+                }
                 if include.receiver().is_some() || constant_id_str(&include.name()) != "include" {
                     continue;
                 }
@@ -170,7 +194,224 @@ pub(super) fn ingest_on_load_reopens(source: &[u8], file: &str, app: &mut App) {
             }
         }
         carry_hook_includes(body, &hook, file, app);
+        if let Some(body) = call.block().and_then(|b| b.as_block_node()).and_then(|b| b.body()) {
+            let scope = scope_at(&root, call.location().start_offset());
+            carry_receiver_mixins(body, &hook, &scope, file, app);
+        }
     }
+}
+
+thread_local! {
+    /// `(file, start)` of each load-hook `extend` that was not carried.
+    static REFUSED: std::cell::RefCell<Vec<(String, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Forget the refusals of an earlier ingest.
+pub(super) fn reset() {
+    REFUSED.with(|r| r.borrow_mut().clear());
+}
+
+/// Whether every statement of `body` is an `ActiveSupport.on_load(:hook)`
+/// whose block holds only what this file carries: `include M` for a hook
+/// with a class, and `Const.extend M`, each of literal constants.
+pub(super) fn carries_all(body: Node<'_>, path: &str) -> bool {
+    let refused = REFUSED.with(|r| r.borrow().iter().filter(|(file, _)| file == path || file.ends_with(&format!("/{path}"))).map(|(_, at)| *at).collect::<Vec<_>>());
+    let statements = flatten_statements(body);
+    !statements.is_empty()
+        && statements.iter().all(|stmt| {
+            let Some(call) = stmt.as_call_node() else { return false };
+            if constant_id_str(&call.name()) != "on_load"
+                || call.receiver().and_then(|r| constant_path_of(&r)).is_none_or(|p| p != ["ActiveSupport"])
+            {
+                return false;
+            }
+            let args: Vec<Node<'_>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+            let [hook] = args.as_slice() else { return false };
+            let Some(hook) = hook.as_symbol_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned()) else { return false };
+            let Some(inner) = call.block().and_then(|b| b.as_block_node()).and_then(|b| b.body()) else { return false };
+            flatten_statements(inner).iter().all(|stmt| {
+                let Some(call) = stmt.as_call_node() else { return false };
+                let literal_args = call.arguments().is_some_and(|a| {
+                    a.arguments().iter().next().is_some() && a.arguments().iter().all(|arg| constant_path_of(&arg).is_some())
+                });
+                let verb = constant_id_str(&call.name());
+                let at = call.location().start_offset() as u32;
+                match call.receiver() {
+                    None => verb == "include" && hook_class(&hook).is_some() && literal_args,
+                    // Not any receiver: before the ingest has its classes, only a framework constant's kind is known.
+                    Some(r) => {
+                        verb == "extend"
+                            && hook_class(&hook).is_some()
+                            && constant_path_of(&r).is_some_and(|p| framework_kind(&p.join("::")).is_some())
+                            && literal_args
+                            && !refused.contains(&at)
+                    }
+                }
+            })
+        })
+}
+
+/// `ActiveJob.extend Root` in a load hook's block: an extend of that
+/// constant, as a reopen of it would write it. (`Const.include M` is
+/// `external_include`'s.)
+fn carry_receiver_mixins(body: Node<'_>, hook: &str, scope: &[String], file: &str, app: &mut App) {
+    for stmt in flatten_statements(body) {
+        let Some(call) = stmt.as_call_node() else { continue };
+        let verb = constant_id_str(&call.name()).to_string();
+        if verb != "extend" {
+            continue;
+        }
+        let Some(receiver) = call.receiver() else { continue };
+        let Some(written) = constant_path_of(&receiver) else { continue };
+        let not_carried = |why: &str| {
+            REFUSED.with(|r| r.borrow_mut().push((file.to_string(), call.location().start_offset() as u32)));
+            survey::record(&IngestError::Unsupported {
+                file: file.into(),
+                message: format!("`{}` in a load hook is not carried: {why}", String::from_utf8_lossy(call.location().as_slice())),
+            });
+        };
+        // Not any hook: one this file has no class for may never fire, as `carry_hook_includes` requires too.
+        if hook_class(hook).is_none() {
+            not_carried("the hook names no class this ingest knows fires it");
+            continue;
+        }
+        let rooted = receiver.as_constant_path_node().is_some_and(|p| super::util::constant_path_is_rooted(&p));
+        let Some(target) = resolve_lexically(&written, rooted, scope, app) else {
+            not_carried("the receiver resolves to no constant this ingest knows the kind of");
+            continue;
+        };
+        let mixins: Option<Vec<Vec<String>>> =
+            call.arguments().map(|args| args.arguments().iter().map(|a| constant_path_of(&a)).collect()).flatten();
+        let Some(mixins) = mixins.filter(|m| !m.is_empty()) else {
+            survey::record(&IngestError::Unsupported {
+                file: file.into(),
+                message: format!(
+                    "`{}` in a load hook is not carried: only literal modules mixed into a literal constant are",
+                    String::from_utf8_lossy(call.location().as_slice())
+                ),
+            });
+            continue;
+        };
+        let name = ClassId(Symbol::from(target.join("::").as_str()));
+        let at = call.location();
+        let span = crate::span::Span {
+            file: super::sources::file_id(file),
+            start: at.start_offset() as u32,
+            end: at.end_offset() as u32,
+        };
+        // Not a parsed reopen: a module body holding only `extend` ingests as no class at all.
+        let index = match app.library_classes.iter().position(|lc| lc.name == name) {
+            Some(i) => i,
+            None => {
+                let Some(is_module) = framework_kind(name.0.as_str()) else {
+                    not_carried("the receiver is no class or module this ingest knows the kind of");
+                    continue;
+                };
+                app.library_classes.push(crate::dialect::LibraryClass {
+                    name: name.clone(),
+                    is_module,
+                    parent: None,
+                    parent_span: span,
+                    includes: Vec::new(),
+                    include_spans: Vec::new(),
+                    methods: Vec::new(),
+                    nullable_columns: Vec::new(),
+                    origin: None,
+                    constants: Vec::new(),
+                    conditional_definitions: Vec::new(),
+                    unknown_calls: Vec::new(),
+                    class_ivar_initializers: Vec::new(),
+                });
+                app.library_classes.len() - 1
+            }
+        };
+        let lc = &mut app.library_classes[index];
+        for path in mixins {
+            let module = crate::expr::Expr::new(
+                span,
+                crate::expr::ExprNode::Const { path: path.iter().map(|p| Symbol::from(p.as_str())).collect() },
+            );
+            lc.unknown_calls.push(crate::expr::Expr::new(
+                span,
+                crate::expr::ExprNode::Send { recv: None, method: Symbol::from("extend"), args: vec![module], block: None, parenthesized: false },
+            ));
+        }
+    }
+}
+
+/// The enclosing `module`/`class` names around `offset`, outermost first.
+fn scope_at(root: &Node<'_>, offset: usize) -> Vec<String> {
+    struct Scope {
+        offset: usize,
+        stack: Vec<String>,
+        found: Option<Vec<String>>,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Scope {
+        fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
+            let loc = node.location();
+            if loc.start_offset() <= self.offset && self.offset < loc.end_offset() {
+                let depth = self.stack.len();
+                self.stack.extend(super::util::module_name_path(node).unwrap_or_default());
+                self.found = Some(self.stack.clone());
+                ruby_prism::visit_module_node(self, node);
+                self.stack.truncate(depth);
+            }
+        }
+        fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+            let loc = node.location();
+            if loc.start_offset() <= self.offset && self.offset < loc.end_offset() {
+                let depth = self.stack.len();
+                self.stack.extend(class_name_path(node).unwrap_or_default());
+                self.found = Some(self.stack.clone());
+                ruby_prism::visit_class_node(self, node);
+                self.stack.truncate(depth);
+            }
+        }
+    }
+    let mut v = Scope { offset, stack: Vec::new(), found: None };
+    ruby_prism::Visit::visit(&mut v, root);
+    v.found.unwrap_or_default()
+}
+
+/// The constant `written` names where Ruby looks it up from `scope`: the
+/// innermost enclosing namespace that holds it, else the top level. None
+/// when no candidate is a class this ingest has or a framework name.
+fn resolve_lexically(written: &[String], rooted: bool, scope: &[String], app: &App) -> Option<Vec<String>> {
+    let known = |name: &str| {
+        app.library_classes.iter().any(|lc| lc.name.0.as_str() == name)
+            || app.models.iter().any(|m| m.name.0.as_str() == name)
+            || framework_kind(name).is_some()
+    };
+    if !rooted {
+        for depth in (1..=scope.len()).rev() {
+            let candidate: Vec<String> = scope[..depth].iter().chain(written.iter()).cloned().collect();
+            if known(&candidate.join("::")) {
+                return Some(candidate);
+            }
+        }
+    }
+    known(&written.join("::")).then(|| written.to_vec())
+}
+
+/// Whether `name` is a module (`Some(true)`) or a class (`Some(false)`) of
+/// the frameworks a load hook runs against; None when not known here.
+fn framework_kind(name: &str) -> Option<bool> {
+    if hook_classes().contains(&name) || name.ends_with("::Base") {
+        return Some(false);
+    }
+    matches!(
+        name,
+        "ActiveJob" | "ActiveRecord" | "ActiveModel" | "ActiveSupport" | "ActiveStorage" | "ActionController"
+            | "ActionView" | "ActionMailer" | "ActionDispatch" | "ActionCable" | "ActionText" | "ActionMailbox" | "Rails"
+    )
+    .then_some(true)
+}
+
+fn hook_classes() -> Vec<&'static str> {
+    ["action_dispatch_request", "action_dispatch_integration_test", "action_controller", "action_controller_test_case", "action_view", "action_mailer", "active_job", "active_record"]
+        .into_iter()
+        .filter_map(hook_class)
+        .collect()
 }
 
 /// The framework class a load hook hands its block, for the hooks whose
@@ -214,6 +455,49 @@ fn carry_hook_includes(body: Node<'_>, hook: &str, file: &str, app: &mut App) {
         Ok(classes) => app.library_classes.extend(classes),
         Err(err) => survey::record(&err),
     }
+}
+
+/// `ActionView::Base.include(M)` written as a statement that runs when the file loads, or in a Railtie's
+/// `initializer` (lucide-rails' `ActionView::Base.include LucideRails::RailsHelper`): the same mixin as the hook's
+/// `include M` and carried the same way, for the classes a hook names.
+fn carry_framework_include(call: &ruby_prism::CallNode<'_>, scope: &[String], file: &str, app: &mut App) -> bool {
+    if constant_id_str(&call.name()) != "include" {
+        return false;
+    }
+    let Some(receiver) = call.receiver() else { return false };
+    let Some(written) = constant_path_of(&receiver) else { return false };
+    let class = written.into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::");
+    if !hook_classes().contains(&class.as_str()) {
+        return false;
+    }
+    // As Ruby resolves the module from where the statement is written (`include RailsHelper` inside `module Vendor`).
+    let mixins: Option<Vec<String>> = call
+        .arguments()
+        .map(|args| {
+            args.arguments()
+                .iter()
+                .map(|a| {
+                    let written = constant_path_of(&a)?;
+                    let rooted = a.as_constant_path_node().is_some_and(|p| super::util::constant_path_is_rooted(&p));
+                    let path = resolve_lexically(&written, rooted, scope, app).unwrap_or_else(|| {
+                        let bare: Vec<String> = written.iter().filter(|s| !s.is_empty()).cloned().collect();
+                        match scope.last() {
+                            Some(outer) if !rooted && bare.len() == 1 => outer.split("::").map(String::from).chain(bare).collect(),
+                            _ => bare,
+                        }
+                    });
+                    Some(path.join("::"))
+                })
+                .collect()
+        })
+        .flatten();
+    let Some(mixins) = mixins.filter(|m| !m.is_empty()) else { return false };
+    let source = format!("class {class}\n  include {}\nend\n", mixins.join(", "));
+    match super::library_class::ingest_library_classes(source.as_bytes(), file) {
+        Ok(classes) => app.library_classes.extend(classes),
+        Err(err) => survey::record(&err),
+    }
+    true
 }
 
 fn not_carried(file: &str, hook: &str, name: &str) {
@@ -379,4 +663,83 @@ fn collect(node: &Node<'_>, class_side: bool, has_from_node: &mut bool, lists: &
             lists.push(out);
         }
     }
+}
+
+/// `extend M`, `ActiveRecord::Base.extend M` and `ActiveRecord::Base.send(:extend, M)`
+/// inside the active_record hook, each argument a constant path.
+fn extended_modules(call: &ruby_prism::CallNode<'_>) -> Vec<ClassId> {
+    let receiver_ok = call.receiver().is_none_or(|recv| {
+        constant_path_of(&recv).is_some_and(|p| p.iter().filter(|s| !s.is_empty()).map(String::as_str).eq(["ActiveRecord", "Base"]))
+    });
+    let Some(args) = call.arguments() else { return Vec::new() };
+    let mut args: Vec<Node<'_>> = args.arguments().iter().collect();
+    match constant_id_str(&call.name()) {
+        "extend" => {}
+        "send" | "public_send"
+            if call.receiver().is_some()
+                && args.first().and_then(|a| a.as_symbol_node()).is_some_and(|s| s.unescaped() == b"extend") =>
+        {
+            args.remove(0);
+        }
+        _ => return Vec::new(),
+    }
+    if !receiver_ok || args.is_empty() {
+        return Vec::new();
+    }
+    let paths: Option<Vec<ClassId>> = args
+        .iter()
+        .map(|arg| {
+            constant_path_of(arg).map(|p| ClassId(Symbol::from(p.into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::"))))
+        })
+        .collect();
+    paths.unwrap_or_default()
+}
+
+fn load_time_statements<'pr>(prog: &ruby_prism::ProgramNode<'pr>) -> Vec<(Node<'pr>, Vec<String>)> {
+    fn railtie(class: &ruby_prism::ClassNode<'_>) -> bool {
+        class.superclass().and_then(|sup| constant_path_of(&sup)).is_some_and(|path| {
+            let path: Vec<&str> = path.iter().map(String::as_str).filter(|s| !s.is_empty()).collect();
+            matches!(path.as_slice(), ["Rails", "Railtie"] | ["Rails", "Engine"])
+        })
+    }
+    fn walk<'pr>(stmts: Vec<Node<'pr>>, out: &mut Vec<(Node<'pr>, Vec<String>)>, in_railtie: bool, scope: &[String]) {
+        // One entry per header, as `Module.nesting` has it: `class Vendor::Railtie` nests in `Vendor::Railtie` alone.
+        let inner = |path: Option<Vec<String>>| {
+            let path = path.unwrap_or_default();
+            let rooted = path.first().is_some_and(|p| p.is_empty());
+            let written = path.into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join("::");
+            let full = match scope.last() {
+                Some(outer) if !rooted => format!("{outer}::{written}"),
+                _ => written,
+            };
+            let mut s = scope.to_vec();
+            s.push(full);
+            s
+        };
+        for stmt in stmts {
+            if let Some(module) = stmt.as_module_node() {
+                let scope = inner(constant_path_of(&module.constant_path()));
+                walk(module.body().map(flatten_statements).unwrap_or_default(), out, false, &scope);
+                continue;
+            }
+            if let Some(class) = stmt.as_class_node() {
+                let scope = inner(constant_path_of(&class.constant_path()));
+                walk(class.body().map(flatten_statements).unwrap_or_default(), out, railtie(&class), &scope);
+                continue;
+            }
+            if in_railtie
+                && let Some(call) = stmt.as_call_node()
+                && call.receiver().is_none()
+                && constant_id_str(&call.name()) == "initializer"
+                && let Some(body) = call.block().and_then(|b| b.as_block_node()).and_then(|b| b.body())
+            {
+                out.extend(flatten_statements(body).into_iter().map(|s| (s, scope.to_vec())));
+                continue;
+            }
+            out.push((stmt, scope.to_vec()));
+        }
+    }
+    let mut out = Vec::new();
+    walk(prog.statements().body().iter().collect(), &mut out, false, &[]);
+    out
 }

@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # `redirect_back_or_to(fallback)` — back to the Referer when it names
 # this site, else to `fallback`. Rails' default refuses another host
 # (`allow_other_host` follows raise_on_open_redirects, on for new apps);
@@ -18,7 +19,8 @@ module ActionController
       target = fallback
       req = ActionController::Current.request
       unless req.nil?
-        ref = req.referer
+        # Not the bare reader: the CRuby overlay's referer is nil when no Referer header came, whatever the RBS says.
+        ref = req.referer.to_s
         base = req.base_url
         if ref == base || ref.start_with?(base + "/")
           target = ref

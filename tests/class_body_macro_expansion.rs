@@ -19,6 +19,8 @@
 //! An unsupplied `**options` means `{}` in Ruby, which makes the skip
 //! UNSCOPED — off every action, not off none.
 
+#[path = "support/scratch.rs"]
+mod scratch;
 use roundhouse::App;
 use roundhouse::dialect::{ControllerBodyItem, FilterKind};
 use roundhouse::ingest::ingest_app_from_tree;
@@ -580,7 +582,7 @@ fn finite_configuration_is_class_state_not_an_action_or_instance_field() {
         .find(|m| m.name.as_str() == "window_options")
         .unwrap();
     assert!(
-        matches!(&reader.signature, Some(roundhouse::ty::Ty::Fn { ret, .. }) if matches!(&**ret, roundhouse::ty::Ty::Hash { .. }))
+        matches!(&reader.signature, Some(roundhouse::ty::Ty::Fn(fn_ty)) if matches!(&*fn_ty.ret, roundhouse::ty::Ty::Hash { .. }))
     );
     for target in [
         roundhouse::project::BuildTarget::Rust,
@@ -1091,7 +1093,7 @@ fn configuration_refuses_forward_includes_and_cross_carrier_storage_aliases() {
 }
 
 #[test]
-fn configuration_refuses_extra_carrier_state_access_and_instance_name_collisions() {
+fn configuration_refuses_extra_carrier_state_access() {
     for method in [
         "def reset_window; @window_options = {}; end",
         "def options_alias; @window_options; end",
@@ -1105,28 +1107,58 @@ fn configuration_refuses_extra_carrier_state_access_and_instance_name_collisions
             "{error}"
         );
     }
+}
+
+#[test]
+fn configuration_keeps_an_instance_method_that_shares_the_class_method_name() {
+    use roundhouse::expr::{ExprNode, LValue};
     for method in [
         "def configure_window(value); value.upcase; end",
         "def window_options; :instance; end",
     ] {
-        let error = configuration_app(
+        let app = configuration_app(
             WINDOW_SETTINGS,
             &format!("{method}\nconfigure_window mode: :month"),
         )
-        .unwrap_err();
-        assert!(error.to_string().contains("name collision"), "{error}");
+        .expect("instance and class methods of one name are different methods");
+        let controller = &app.controllers[0];
+        assert!(
+            controller.class_methods().any(|m| m.name.as_str() == "configure_window"),
+            "{method}"
+        );
+        assert!(
+            controller.body.iter().any(|item| matches!(
+                item,
+                ControllerBodyItem::ClassIvarInit { expr, .. }
+                    if matches!(&*expr.node, ExprNode::Assign { target: LValue::Ivar { name }, .. } if name.as_str() == "window_options")
+            )),
+            "{method}"
+        );
+        let instance_name = method
+            .trim_start_matches("def ")
+            .split([' ', '(', ';'])
+            .next()
+            .unwrap();
+        assert!(
+            controller.actions().any(|a| a.name.as_str() == instance_name),
+            "the instance method stays: {method}"
+        );
     }
 }
 
 #[test]
-fn configuration_refuses_an_inherited_instance_method_name_collision() {
+fn configuration_keeps_an_inherited_instance_method_of_the_same_name() {
     let tree = [
         ("app/controllers/concerns/window_settings.rb", WINDOW_SETTINGS),
         ("app/controllers/parent_controller.rb", "class ParentController < ActionController::Base\n def configure_window(value); value.upcase; end\nend\n"),
         ("app/controllers/child_controller.rb", "class ChildController < ParentController\n include WindowSettings\n configure_window mode: :month\nend\n"),
     ].into_iter().map(|(path, source)| (path.into(), source.as_bytes().to_vec())).collect();
-    let error = ingest_app_from_tree(tree).expect_err("receiver-kind collision through parent");
-    assert!(error.to_string().contains("name collision"), "{error}");
+    let app = ingest_app_from_tree(tree).expect("inherited instance method does not occupy the class method");
+    let child = app.controllers.iter().find(|c| c.name.0.as_str() == "ChildController").expect("child");
+    assert!(child.class_methods().any(|m| m.name.as_str() == "configure_window"));
+    assert!(child.body.iter().any(|item| matches!(item, ControllerBodyItem::ClassIvarInit { .. })));
+    let parent = app.controllers.iter().find(|c| c.name.0.as_str() == "ParentController").expect("parent");
+    assert!(parent.actions().any(|a| a.name.as_str() == "configure_window"));
 }
 
 #[test]
@@ -1202,7 +1234,7 @@ fn blog_target_copies_configuration_source_without_emitting_state() {
 
     let mut app = configuration_app(WINDOW_SETTINGS, "configure_window mode: :month").unwrap();
     roundhouse::session::analyze_and_lower(&mut app);
-    let root = std::env::temp_dir().join(format!("roundhouse-concern-blog-{}", std::process::id()));
+    let root = scratch::dir("roundhouse-concern-blog");
     std::fs::create_dir_all(root.join("app/controllers/concerns")).unwrap();
     std::fs::write(root.join("app/controllers/concerns/window_settings.rb"), WINDOW_SETTINGS).unwrap();
     let result = target_files(&app, &root, BuildTarget::Blog);
@@ -1366,6 +1398,38 @@ fn configuration_refuses_included_ancestor_framework_shadows() {
     assert!(ingest_app_from_tree(tree).is_ok());
 }
 
+const SCOPED_WINDOW: &str = "module Scoped\n module Window\n  extend ActiveSupport::Concern\n  class_methods do\n   def configure_window(**opts)\n    @window_options = opts\n   end\n   def window_options\n    @window_options || {}\n   end\n  end\n end\n module Wrapped\n  extend ActiveSupport::Concern\n  include Window\n  def marker; :wrapper; end\n end\nend\n";
+
+fn assert_configuration_expanded(app: roundhouse::App) {
+    let controller = &app.controllers[0];
+    assert!(
+        controller.body.iter().any(|item| matches!(item, ControllerBodyItem::ClassIvarInit { .. })),
+        "the class macro call was not expanded: {:?}",
+        controller.body
+    );
+}
+
+/// `include Window` inside `Scoped::Wrapped` names `Scoped::Window`, and
+/// Rails 8.1.4 stores the value through it.
+#[test]
+fn configuration_reaches_a_carrier_named_relative_to_its_dependent() {
+    let tree = [
+        ("app/controllers/concerns/scoped.rb", SCOPED_WINDOW),
+        ("app/controllers/window_controller.rb", "class WindowController < ActionController::Base\n include Scoped::Wrapped\n configure_window mode: :month\nend\n"),
+    ].into_iter().map(|(path, source)| (path.into(), source.as_bytes().to_vec())).collect();
+    assert_configuration_expanded(ingest_app_from_tree(tree).unwrap());
+}
+
+/// `include Window` in a controller under `Scoped` names `Scoped::Window`.
+#[test]
+fn configuration_reaches_a_carrier_named_relative_to_its_controller() {
+    let tree = [
+        ("app/controllers/concerns/scoped.rb", SCOPED_WINDOW),
+        ("app/controllers/scoped/window_controller.rb", "module Scoped\n class WindowController < ActionController::Base\n  include Window\n  configure_window mode: :month\n end\nend\n"),
+    ].into_iter().map(|(path, source)| (path.into(), source.as_bytes().to_vec())).collect();
+    assert_configuration_expanded(ingest_app_from_tree(tree).unwrap());
+}
+
 #[test]
 fn configuration_requires_concern_identity_through_dependency_wrappers() {
     for (wrapper, supported) in [
@@ -1518,6 +1582,8 @@ fn rest_actions_macro_with_extract_options_expands_to_a_scoped_filter() {
     assert_eq!(mobile_version_filters("has_mobile_version *%i[index show]"), scoped);
     // A repeated key reads its last value, as Ruby does.
     assert_eq!(mobile_version_filters("has_mobile_version :index, :show, if: :x, if: nil"), scoped);
+    // The last `if:` a Symbol: the filter keeps it as its guard, as a hand-written one's.
+    assert_eq!(mobile_version_filters("has_mobile_version :index, if: nil, if: :x"), vec![vec!["index".to_string()]]);
 }
 
 /// What expansion cannot read stays unexpanded rather than becoming a
@@ -1529,8 +1595,6 @@ fn rest_actions_macro_refuses_what_it_cannot_read() {
         "has_mobile_version *ACTIONS",
         "has_mobile_version *[:index, ACTIONS.first]",
         "has_mobile_version :index, ACTIONS.first",
-        // The last `if:` is a guard this expansion does not carry.
-        "has_mobile_version :index, if: nil, if: :x",
         // A computed key might be `:if`.
         "has_mobile_version :index, \"if\".to_sym => :x",
     ] {
@@ -1709,4 +1773,37 @@ end
         preloads.methods.iter().any(|m| m.name.as_str() == "preload"),
         "refused carrier must keep its class methods on the module"
     );
+}
+
+/// A `class_attribute` carrier whose `included do` runs more than the DSL is a gap only where the expansion would
+/// apply, on a controller: one only a component includes is left as written, unsurveyed (ViewComponent's `Slotable`).
+#[test]
+fn a_class_attribute_carrier_no_controller_includes_is_no_survey_gap() {
+    use roundhouse::ingest::survey;
+
+    let concern = r#"
+module Slotted
+  extend ActiveSupport::Concern
+  included do
+    class_attribute :registered_slots
+    self.registered_slots = {}
+  end
+end
+"#;
+    let gaps_with = |includer: (&str, &str)| {
+        let tree: std::collections::HashMap<_, _> = [("app/models/concerns/slotted.rb", concern), includer]
+            .into_iter()
+            .map(|(path, source)| (path.into(), source.as_bytes().to_vec()))
+            .collect();
+        survey::activate();
+        let result = ingest_app_from_tree(tree);
+        let gaps = survey::drain();
+        result.expect("ingest");
+        gaps.into_iter()
+            .filter(|gap| matches!(gap, roundhouse::ingest::IngestError::Unsupported { file, message }
+                if file == "Slotted" && message.starts_with("class_attribute carrier `included do`")))
+            .count()
+    };
+    assert_eq!(gaps_with(("app/components/card_component.rb", "class CardComponent\n  include Slotted\nend\n")), 0);
+    assert_eq!(gaps_with(("app/controllers/things_controller.rb", "class ThingsController < ActionController::Base\n  include Slotted\nend\n")), 1);
 }

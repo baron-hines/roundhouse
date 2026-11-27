@@ -9,6 +9,8 @@
 //! call's own, as in the source. Native Ruby on the same source is the
 //! oracle.
 
+#[path = "support/scratch.rs"]
+mod scratch;
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
@@ -51,8 +53,7 @@ const REPORT: &str = "Bracelab::Builder.report.each { |f| p f }\n";
 
 #[test]
 fn a_brace_block_after_command_arguments_stays_the_calls_own() {
-    let dir = std::env::temp_dir().join(format!("roundhouse-brace-block-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch::dir("roundhouse-brace-block");
     let builder = dir.join("builder.rb");
     std::fs::write(&builder, BUILDER).unwrap();
     let native = std::process::Command::new("ruby")
@@ -88,7 +89,7 @@ fn a_brace_block_after_command_arguments_stays_the_calls_own() {
     let source = std::fs::read_to_string(emitted.join("app/models/bracelab/builder.rb"))
         .expect("emitted builder");
     let parse = ruby_prism::parse(source.as_bytes());
-    let parse_errors: Vec<String> = parse.errors().map(|e| e.message().to_string()).collect();
+    let parse_errors: Vec<String> = parse.errors().map(|e| String::from_utf8_lossy(e.message()).into_owned()).collect();
     assert!(parse_errors.is_empty(), "{parse_errors:?} in:\n{source}");
 
     let main = emitted.join("main").display().to_string();

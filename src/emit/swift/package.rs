@@ -18,7 +18,8 @@ let package = Package(
     name: "roundhouse-app",
     platforms: [.macOS(.v14)],
     dependencies: [
-        .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.5.0"),
+        // Not below 2.28: 2.26 imports ServiceContextModule, which a reused SPM tree could miss.
+        .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.28.0"),
         .package(url: "https://github.com/hummingbird-project/hummingbird-websocket.git", from: "2.0.0"),
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.65.0"),
     ],

@@ -212,6 +212,7 @@ fn diagnostic_signature(d: &roundhouse::analyze::Diagnostic) -> (String, String)
                 None => expr_kind.as_str().to_string(),
             },
         ),
+        DiagnosticKind::IngestUnsupported { detail } => ("IngestUnsupported".into(), detail.clone()),
         DiagnosticKind::Unsupported { target, construct, detail } => (
             "Unsupported".into(),
             format!(
@@ -242,6 +243,9 @@ fn diagnostic_signature(d: &roundhouse::analyze::Diagnostic) -> (String, String)
         }
         DiagnosticKind::UnconsumedInitializer { statement, .. } => {
             ("UnconsumedInitializer".into(), statement.as_str().to_string())
+        }
+        DiagnosticKind::IgnoredValidatorOption { validator, option, .. } => {
+            ("IgnoredValidatorOption".into(), format!("{}:{}", validator.as_str(), option.as_str()))
         }
     }
 }

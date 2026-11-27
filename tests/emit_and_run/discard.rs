@@ -131,7 +131,7 @@ class DiscardsControllerTest < ActionDispatch::IntegrationTest
 
   test "kept is NULL-tested, not equality-tested" do
     sql = Article.kept.to_sql
-    assert_includes sql, "discarded_at IS NULL"
+    assert_includes sql, %("discarded_at" IS NULL)
     assert_not_includes sql, "= NULL"
     assert_includes Article.discarded.to_sql, "NOT"
   end

@@ -7,10 +7,12 @@
 
 use ruby_prism::Node;
 
-use crate::dialect::{MethodDef, Test, TestModule};
+use crate::dialect::{AccessorKind, LibraryClass, MethodDef, MethodReceiver, MethodVisibility, Test, TestModule};
+use crate::effect::EffectSet;
 use crate::expr::{Expr, ExprNode, LValue, Literal};
 use crate::ident::VarId;
 use crate::span::Span;
+use crate::ty::{FnTy, Ty};
 use crate::{ClassId, Symbol};
 
 use super::expr::ingest_expr;
@@ -121,121 +123,29 @@ fn ingest_test_class(
 
     // Rails convention: `ArticleTest` tests `Article`. Strip the `Test`
     // suffix off the last name-path segment. Unusual naming → None.
-    let mut target = name_path
+    let target = name_path
         .last()
         .and_then(|last| last.strip_suffix("Test"))
         .map(|stem| ClassId(Symbol::from(stem)));
 
-    let mut tests: Vec<Test> = Vec::new();
-    let mut setup: Option<Expr> = None;
-    let mut inner_classes: Vec<crate::dialect::LibraryClass> = Vec::new();
-    let mut helpers: Vec<MethodDef> = Vec::new();
-    let mut constants: Vec<(Symbol, Expr)> = Vec::new();
-    let mut includes: Vec<ClassId> = Vec::new();
-    let mut teardowns: Vec<Expr> = Vec::new();
+    let mut acc = ClassBody { target, ..ClassBody::default() };
+    // Concerns `test_helper.rb` mixes into `ActiveSupport::TestCase`: a
+    // class that derives from a framework base inherits their `included`
+    // registrations ahead of its own, as a parent's callbacks run first.
+    if parent.as_ref().is_some_and(|p| is_framework_test_base(p.0.as_str())) {
+        for concern in test_case_wide_concerns() {
+            apply_test_concern(&concern, &mut acc, &name, 0)?;
+        }
+    }
     if let Some(class_body) = class.body() {
         for stmt in flatten_statements(class_body) {
-            if let Some(test) = ingest_test_declaration(&stmt, file)? {
-                tests.push(test);
-                continue;
-            }
-            if let Some(body) = ingest_teardown_block(&stmt, file)? {
-                teardowns.push(body);
-                continue;
-            }
-            if let Some(body) = ingest_setup_declaration(&stmt, file)? {
-                // Multiple setup hooks compose in source order — append
-                // by wrapping in a Seq. Rare in practice; first wins
-                // when stored as Option, so accumulate.
-                setup = Some(match setup.take() {
-                    None => body,
-                    Some(prev) => {
-                        let prev_stmts = match &*prev.node {
-                            ExprNode::Seq { exprs } => exprs.clone(),
-                            _ => vec![prev],
-                        };
-                        let body_stmts = match &*body.node {
-                            ExprNode::Seq { exprs } => exprs.clone(),
-                            _ => vec![body],
-                        };
-                        let mut all = prev_stmts;
-                        all.extend(body_stmts);
-                        Expr::new(Span::synthetic(), ExprNode::Seq { exprs: all })
-                    }
-                });
-                continue;
-            }
-            // Inline class declaration inside the test class —
-            // `class Validatable; include ActiveRecord::Validations;
-            // ...; end`. Captured per-test-module so the emit can
-            // hoist them to file scope above the lowered test class.
-            if let Some(inner) = stmt.as_class_node() {
-                let lc = library_class_from_node(&inner, file)?;
-                inner_classes.push(lc);
-                continue;
-            }
-            // Non-test, non-setup `def` — instance helper method
-            // (e.g. `setup_adapter_with_stub_row(id)`). Capture as
-            // an ordinary method on the test class so test bodies
-            // can `self.<helper>(...)` it. Definitions of `def
-            // setup` and `def test_*` already short-circuited above.
-            if let Some(def) = stmt.as_def_node() {
-                let m = ingest_library_method(&def, &name, file)?;
-                helpers.push(m);
-                continue;
-            }
-            // `include ModName` at class-body scope. Captured for
-            // the spinel emit to replay verbatim so bare-name refs
-            // (`Router`, `FormBuilder`) resolve under CRuby. TS emit
-            // ignores these — its framework-namespace import-stripper
-            // handles the same refs by a different mechanism.
-            if let Some(call) = stmt.as_call_node() {
-                // `tests RoomMessagesChannel` — ActionCable's channel
-                // and connection test cases (and ActionController::
-                // TestCase) name their subject with this macro when
-                // the class name does not: `RoomMessagesViaStock-
-                // TurboChannelTest` tests `Turbo::StreamsChannel`. It
-                // overrides the `FooTest` → `Foo` convention above.
-                if call.receiver().is_none() && constant_id_str(&call.name()) == "tests" {
-                    if let Some(args) = call.arguments() {
-                        if let Some(arg) = args.arguments().iter().next() {
-                            if let Some(path) = constant_path_of(&arg) {
-                                target = Some(ClassId(Symbol::from(path.join("::"))));
-                            }
-                        }
-                    }
-                    continue;
-                }
-                if call.receiver().is_none()
-                    && constant_id_str(&call.name()) == "include"
-                {
-                    if let Some(args) = call.arguments() {
-                        for arg in args.arguments().iter() {
-                            if let Some(path) = constant_path_of(&arg) {
-                                includes.push(ClassId(Symbol::from(path.join("::"))));
-                            }
-                        }
-                    }
-                    continue;
-                }
-            }
-            // Class-level constant assignment — `TABLE = [...]`,
-            // `Article = Struct.new(...)`. Captured here so the test
-            // emit can hoist them to file scope as `const NAME =
-            // <value>`, which matches Ruby's lexical constant
-            // resolution for bare references inside test methods.
-            if let Some(cw) = stmt.as_constant_write_node() {
-                let const_name = std::str::from_utf8(cw.name().as_slice())
-                    .ok()
-                    .map(Symbol::from);
-                if let Some(const_name) = const_name {
-                    let value = ingest_expr(&cw.value(), file)?;
-                    constants.push((const_name, value));
-                }
-                continue;
+            if !class_body_statement(&stmt, file, &mut acc, &name, 0)? {
+                report_dropped_statement(&stmt, file, &name);
             }
         }
     }
+    let ClassBody { tests, setup, mut inner_classes, mut helpers, constants, includes, teardowns, target, .. } = acc;
+    let body_classes = inner_classes.iter().map(|c| c.name.clone()).collect();
 
     // ActiveSupport runs `teardown do … end` blocks after every test,
     // passed or failed, after the class's own `def teardown` and in
@@ -326,7 +236,7 @@ fn ingest_test_class(
                         body: blocks,
                         rescues: Vec::new(),
                         else_branch: None,
-                        ensure: Some(fallback_super),
+                        ensure: Some(Box::new(fallback_super)),
                         implicit: false,
                     },
                 );
@@ -343,7 +253,7 @@ fn ingest_test_class(
                             ),
                             rescues: Vec::new(),
                             else_branch: None,
-                            ensure: Some(blocks_then_super),
+                            ensure: Some(Box::new(blocks_then_super)),
                             implicit: true,
                         },
                     ),
@@ -362,7 +272,7 @@ fn ingest_test_class(
                         body: blocks,
                         rescues: Vec::new(),
                         else_branch: None,
-                        ensure: Some(super_call()),
+                        ensure: Some(Box::new(super_call())),
                         implicit: true,
                     },
                 ),
@@ -413,9 +323,86 @@ fn ingest_test_class(
         tests,
         setup,
         inner_classes,
+        body_classes,
         helpers,
         constants,
         includes,
+    })
+}
+
+/// A test class body statement the ingest does not model, ledgered by
+/// name: the emitted class goes without it (`INPUT[:accent] = ACCENT`
+/// between two constants, so a later constant built from `INPUT` misses
+/// the key).
+/// A bare `private` is not one: the helpers below it are called from the
+/// class's own tests either way.
+fn report_dropped_statement(stmt: &Node, file: &str, class: &ClassId) {
+    let construct = match stmt.as_call_node() {
+        Some(call) => constant_id_str(&call.name()).to_string(),
+        None => "statement".to_string(),
+    };
+    let bare_marker = stmt.as_call_node().is_some_and(|call| call.receiver().is_none() && call.arguments().is_none());
+    if bare_marker && matches!(construct.as_str(), "private" | "protected" | "public") {
+        return;
+    }
+    let line = String::from_utf8_lossy(stmt.location().as_slice()).lines().next().unwrap_or("").to_string();
+    super::prism::push(crate::lower::residue_diagnostic(
+        "test_class_body",
+        &construct,
+        super::util::node_span(stmt, file),
+        "not modelled",
+        format!("`{line}` in the body of test class `{}` is not modelled and is dropped", class.0.as_str()),
+    ));
+}
+
+/// `self.use_transactional_tests = false` (or `true`) as
+/// `def self.use_transactional_tests; <bool>; end`. The shim calls that
+/// class method; `TestBase` answers true when the class does not override it.
+fn transactional_tests_method(stmt: &Node) -> Option<MethodDef> {
+    let call = stmt.as_call_node()?;
+    if constant_id_str(&call.name()) != "use_transactional_tests=" {
+        return None;
+    }
+    let recv = call.receiver()?;
+    if recv.as_self_node().is_none() {
+        return None;
+    }
+    let args = call.arguments()?;
+    let arg = args.arguments().iter().next()?;
+    let value = if arg.as_true_node().is_some() {
+        true
+    } else if arg.as_false_node().is_some() {
+        false
+    } else {
+        return None;
+    };
+    let body = Expr::new(
+        Span::synthetic(),
+        ExprNode::Lit {
+            value: Literal::Bool { value },
+        },
+    );
+    Some(MethodDef {
+        name: Symbol::from("use_transactional_tests"),
+        receiver: MethodReceiver::Class,
+        visibility: MethodVisibility::Public,
+        params: Vec::new(),
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        block_param: None,
+        name_span: Span::synthetic(),
+        body,
+        signature: Some(Ty::Fn(Box::new(FnTy {
+            params: Vec::new().into(),
+            block: None,
+            ret: std::sync::Arc::new(Ty::Bool),
+            effects: EffectSet::pure(),
+        }))),
+        effects: EffectSet::pure(),
+        enclosing_class: None,
+        kind: AccessorKind::Method,
+        is_async: false,
+        mutates_self: false,
     })
 }
 
@@ -639,9 +626,374 @@ fn is_test_class_node(c: &ruby_prism::ClassNode<'_>) -> bool {
 /// Recognize `setup do ... end` (Call with method=setup, block body)
 /// and `def setup; ...; end` (DefNode named setup). Returns the body
 /// expression in either case. Other shapes return Ok(None).
+/// What a test class body declares, gathered statement by statement:
+/// the class's own and, through `apply_test_concern`, the statements of
+/// a test helper Concern's `included` block where it is included.
+#[derive(Default)]
+struct ClassBody {
+    tests: Vec<Test>,
+    setup: Option<Expr>,
+    inner_classes: Vec<crate::dialect::LibraryClass>,
+    helpers: Vec<MethodDef>,
+    constants: Vec<(Symbol, Expr)>,
+    includes: Vec<ClassId>,
+    teardowns: Vec<Expr>,
+    target: Option<ClassId>,
+    /// Concerns whose `included` block already ran on this class: Ruby
+    /// includes a module once, so a second `include` runs nothing.
+    applied: Vec<String>,
+}
+
+/// One statement of a test class body. Returns whether it is one the
+/// class body models; the class's own unrecognized statements are
+/// skipped, as they always were, and a Concern block's are refused.
+fn class_body_statement(
+    stmt: &Node<'_>,
+    file: &str,
+    acc: &mut ClassBody,
+    name: &ClassId,
+    depth: usize,
+) -> IngestResult<bool> {
+    if let Some(test) = ingest_test_declaration(&stmt, file)? {
+        acc.tests.push(test);
+        return Ok(true);
+    }
+    if let Some(body) = ingest_teardown_block(&stmt, file)? {
+        acc.teardowns.push(body);
+        return Ok(true);
+    }
+    if let Some(body) = ingest_setup_hoisting(&stmt, file, Some(&mut acc.inner_classes))? {
+        // Multiple setup hooks compose in source order — append
+        // by wrapping in a Seq. Rare in practice; first wins
+        // when stored as Option, so accumulate.
+        acc.setup = Some(match acc.setup.take() {
+            None => body,
+            Some(prev) => {
+                let prev_stmts = match &*prev.node {
+                    ExprNode::Seq { exprs } => exprs.clone(),
+                    _ => vec![prev],
+                };
+                let body_stmts = match &*body.node {
+                    ExprNode::Seq { exprs } => exprs.clone(),
+                    _ => vec![body],
+                };
+                let mut all = prev_stmts;
+                all.extend(body_stmts);
+                Expr::new(Span::synthetic(), ExprNode::Seq { exprs: all })
+            }
+        });
+        return Ok(true);
+    }
+    // Inline class declaration inside the test class —
+    // `class Validatable; include ActiveRecord::Validations;
+    // ...; end`. Captured per-test-module so the emit can
+    // hoist them to file scope above the lowered test class.
+    if let Some(inner) = stmt.as_class_node() {
+        let lc = library_class_from_node(&inner, file)?;
+        // Not a second definition beside a setup's hoisted one: Ruby runs the body before setup, so setup's wins.
+        if acc.inner_classes.iter().any(|c| c.name == lc.name) {
+            return Err(IngestError::Unsupported {
+                file: file.into(),
+                message: format!("class `{}` is defined twice in the test class", lc.name.0),
+            });
+        }
+        acc.inner_classes.push(lc);
+        return Ok(true);
+    }
+    // Non-test, non-setup `def` — instance helper method
+    // (e.g. `setup_adapter_with_stub_row(id)`). Capture as
+    // an ordinary method on the test class so test bodies
+    // can `self.<helper>(...)` it. Definitions of `def
+    // setup` and `def test_*` already short-circuited above.
+    if let Some(def) = stmt.as_def_node() {
+        let m = ingest_library_method(&def, name, file)?;
+        acc.helpers.push(m);
+        return Ok(true);
+    }
+    // `include ModName` at class-body scope. Captured for
+    // the spinel emit to replay verbatim so bare-name refs
+    // (`Router`, `FormBuilder`) resolve under CRuby. TS emit
+    // ignores these — its framework-namespace import-stripper
+    // handles the same refs by a different mechanism.
+    if let Some(call) = stmt.as_call_node() {
+        // `tests RoomMessagesChannel` — ActionCable's channel
+        // and connection test cases (and ActionController::
+        // TestCase) name their subject with this macro when
+        // the class name does not: `RoomMessagesViaStock-
+        // TurboChannelTest` tests `Turbo::StreamsChannel`. It
+        // overrides the `FooTest` → `Foo` convention above.
+        if call.receiver().is_none() && constant_id_str(&call.name()) == "tests" {
+            if let Some(args) = call.arguments() {
+                if let Some(arg) = args.arguments().iter().next() {
+                    if let Some(path) = constant_path_of(&arg) {
+                        acc.target = Some(ClassId(Symbol::from(path.join("::"))));
+                    }
+                }
+            }
+            return Ok(true);
+        }
+        if call.receiver().is_none()
+            && constant_id_str(&call.name()) == "include"
+        {
+            if let Some(args) = call.arguments() {
+                for arg in args.arguments().iter() {
+                    if let Some(path) = constant_path_of(&arg) {
+                        let included = path.join("::");
+                        acc.includes.push(ClassId(Symbol::from(included.as_str())));
+                        if let Some(concern) = test_concern(&included) {
+                            apply_test_concern(&concern, acc, name, depth)?;
+                        }
+                    }
+                }
+            }
+            return Ok(true);
+        }
+    }
+    // `self.use_transactional_tests = false` — Rails' per-class
+    // opt-out of the fixture transaction. Kept as a class method
+    // so the autorun shim can ask the class. Anything else in
+    // the class body is still skipped.
+    if let Some(method) = transactional_tests_method(&stmt) {
+        acc.helpers.push(method);
+        return Ok(true);
+    }
+    // Class-level constant assignment — `TABLE = [...]`,
+    // `Article = Struct.new(...)`. Captured here so the test
+    // emit can hoist them to file scope as `const NAME =
+    // <value>`, which matches Ruby's lexical constant
+    // resolution for bare references inside test methods.
+    if let Some(cw) = stmt.as_constant_write_node() {
+        let const_name = std::str::from_utf8(cw.name().as_slice())
+            .ok()
+            .map(Symbol::from);
+        if let Some(const_name) = const_name {
+            let value = ingest_expr(&cw.value(), file)?;
+            acc.constants.push((const_name, value));
+        }
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+/// A test helper `ActiveSupport::Concern` (`test/test_helpers/`, or a
+/// module-only file in a test folder) whose `included do` block a test
+/// class runs when it includes the module.
+#[derive(Clone, Debug)]
+pub struct TestConcern {
+    pub name: String,
+    pub file: String,
+    pub source: Vec<u8>,
+}
+
+/// The app's test helper Concerns, and the names `test/test_helper.rb`
+/// includes into `ActiveSupport::TestCase` (every test case's).
+#[derive(Clone, Debug, Default)]
+pub struct TestConcerns {
+    pub concerns: Vec<TestConcern>,
+    pub case_wide: Vec<String>,
+}
+
+thread_local! {
+    static TEST_CONCERNS: std::cell::RefCell<TestConcerns> = std::cell::RefCell::new(TestConcerns::default());
+}
+
+/// Ingest test files with `concerns` known: an `include` of one runs its
+/// `included` block's statements on the including class.
+pub fn with_test_concerns<R>(concerns: TestConcerns, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<TestConcerns>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let prev = self.0.take().unwrap_or_default();
+            TEST_CONCERNS.with(|c| *c.borrow_mut() = prev);
+        }
+    }
+    let _restore = Restore(Some(TEST_CONCERNS.with(|c| c.replace(concerns))));
+    f()
+}
+
+fn test_concern(name: &str) -> Option<TestConcern> {
+    let name = name.trim_start_matches("::");
+    TEST_CONCERNS.with(|c| c.borrow().concerns.iter().find(|tc| tc.name == name).cloned())
+}
+
+fn test_case_wide_concerns() -> Vec<TestConcern> {
+    TEST_CONCERNS.with(|c| {
+        let c = c.borrow();
+        c.case_wide.iter().filter_map(|n| c.concerns.iter().find(|tc| &tc.name == n).cloned()).collect()
+    })
+}
+
+/// A framework test case: one `ActiveSupport::TestCase` is, or derives
+/// from, so a Concern included into it reaches the class.
+fn is_framework_test_base(parent: &str) -> bool {
+    matches!(
+        parent.trim_start_matches("::"),
+        "ActiveSupport::TestCase"
+            | "ActionDispatch::IntegrationTest"
+            | "ActionController::TestCase"
+            | "ActionMailer::TestCase"
+            | "ActionView::TestCase"
+            | "ActiveJob::TestCase"
+            | "ActionCable::Channel::TestCase"
+            | "ActionCable::Connection::TestCase"
+            | "ActionDispatch::SystemTestCase"
+    )
+}
+
+/// Every module in `source` that is a Concern with an `included do`
+/// block, by its full name (`Widgets::ReadHelper`).
+pub fn concern_modules(source: &[u8], file: &str) -> Vec<String> {
+    let result = super::prism::parse(source, file);
+    let mut out = Vec::new();
+    fn walk(node: &Node<'_>, scope: &[String], out: &mut Vec<String>) {
+        let Some(stmts) = node.as_statements_node() else { return };
+        for stmt in stmts.body().iter() {
+            let Some(m) = stmt.as_module_node() else { continue };
+            let Some(path) = module_name_path(&m) else { continue };
+            let mut full = scope.to_vec();
+            full.extend(path);
+            if included_block_body(&m).is_some() {
+                out.push(full.join("::"));
+            }
+            if let Some(body) = m.body() {
+                walk(&body, &full, out);
+            }
+        }
+    }
+    if let Some(program) = result.node().as_program_node() {
+        walk(&program.statements().as_node(), &[], &mut out);
+    }
+    out
+}
+
+/// The body of a Concern module's `included do … end`: the module must
+/// `extend ActiveSupport::Concern`, which is what gives `included` a
+/// block to run on the includer.
+fn included_block_body<'pr>(m: &ruby_prism::ModuleNode<'pr>) -> Option<Option<Node<'pr>>> {
+    let body = m.body()?;
+    let stmts = flatten_statements(body);
+    let concern = stmts.iter().any(|stmt| {
+        stmt.as_call_node().is_some_and(|call| {
+            call.receiver().is_none()
+                && constant_id_str(&call.name()) == "extend"
+                && call.arguments().is_some_and(|args| {
+                    args.arguments().iter().any(|a| {
+                        constant_path_of(&a).is_some_and(|p| p.join("::").trim_start_matches("::") == "ActiveSupport::Concern")
+                    })
+                })
+        })
+    });
+    if !concern {
+        return None;
+    }
+    stmts.iter().find_map(|stmt| {
+        let call = stmt.as_call_node()?;
+        if call.receiver().is_some() || constant_id_str(&call.name()) != "included" || call.arguments().is_some() {
+            return None;
+        }
+        let block = call.block()?.as_block_node()?;
+        Some(block.body())
+    })
+}
+
+/// `Concern#append_features`: the `included` block runs on the
+/// includer where the `include` stands. Its statements go through the
+/// same class-body reading as the class's own, and one the class body
+/// does not model is refused by name rather than dropped, since the
+/// registration it made would otherwise never run.
+fn apply_test_concern(concern: &TestConcern, acc: &mut ClassBody, name: &ClassId, depth: usize) -> IngestResult<()> {
+    if acc.applied.iter().any(|n| n == &concern.name) {
+        return Ok(());
+    }
+    acc.applied.push(concern.name.clone());
+    let refuse = |message: String| IngestError::Unsupported { file: concern.file.clone(), message };
+    if depth > 8 {
+        return Err(refuse(format!("test helper `{}`: included blocks nest too deeply", concern.name)));
+    }
+    let result = super::prism::parse(&concern.source, &concern.file);
+    let path: Vec<&str> = concern.name.split("::").collect();
+    fn find<'pr>(node: &Node<'pr>, path: &[&str]) -> Option<ruby_prism::ModuleNode<'pr>> {
+        let stmts = node.as_statements_node()?;
+        for stmt in stmts.body().iter() {
+            let Some(m) = stmt.as_module_node() else { continue };
+            let Some(own) = module_name_path(&m) else { continue };
+            if path.len() < own.len() || path[..own.len()].iter().zip(&own).any(|(a, b)| a != b) {
+                continue;
+            }
+            if path.len() == own.len() {
+                return Some(m);
+            }
+            if let Some(found) = m.body().and_then(|body| find(&body, &path[own.len()..])) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    let program = result.node();
+    let Some(module) = program.as_program_node().and_then(|p| find(&p.statements().as_node(), &path)) else {
+        return Ok(());
+    };
+    let Some(body) = included_block_body(&module) else { return Ok(()) };
+    for stmt in body.map(flatten_statements).unwrap_or_default() {
+        if !class_body_statement(&stmt, &concern.file, acc, name, depth + 1)? {
+            let line = String::from_utf8_lossy(stmt.location().as_slice()).lines().next().unwrap_or("").to_string();
+            return Err(refuse(format!(
+                "test helper `{}`'s included block: `{line}` is not modeled on a test class",
+                concern.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `setup :a, :b` / `teardown :a`: callbacks naming the test's own
+/// methods, run in the order named. Options (`prepend: true`, `if:`)
+/// are refused by name.
+fn named_callbacks(call: &ruby_prism::CallNode<'_>, kind: &str, file: &str) -> IngestResult<Expr> {
+    let mut exprs = Vec::new();
+    for arg in call.arguments().into_iter().flat_map(|a| a.arguments().iter()) {
+        let Some(sym) = arg.as_symbol_node() else {
+            return Err(IngestError::Unsupported {
+                file: file.into(),
+                message: format!("test {kind} not modeled: only method names (`{kind} :name`) are, not options"),
+            });
+        };
+        let method = Symbol::from(String::from_utf8_lossy(sym.unescaped()).as_ref());
+        exprs.push(Expr::new(
+            Span::synthetic(),
+            ExprNode::Send { recv: None, method, args: vec![], block: None, parenthesized: false },
+        ));
+    }
+    Ok(Expr::new(Span::synthetic(), ExprNode::Seq { exprs }))
+}
+
 fn ingest_setup_declaration(
     stmt: &Node<'_>,
     file: &str,
+) -> IngestResult<Option<Expr>> {
+    ingest_setup_hoisting(stmt, file, None)
+}
+
+/// A class whose body only declares (`include`, `extend`, `attr_*`, `def`): one `setup do` may define, since running
+/// it again reopens the same class to the same effect. Ruby puts it in the test class's lexical scope, as the class
+/// body's own inline classes are.
+fn static_class_body(class: &ruby_prism::ClassNode<'_>) -> bool {
+    let Some(body) = class.body() else { return true };
+    flatten_statements(body).iter().all(|stmt| {
+        stmt.as_def_node().is_some()
+            || stmt.as_call_node().is_some_and(|call| {
+                call.receiver().is_none()
+                    && call.block().is_none()
+                    && matches!(constant_id_str(&call.name()).as_ref(), "include" | "extend" | "attr_reader" | "attr_writer" | "attr_accessor")
+            })
+    })
+}
+
+fn ingest_setup_hoisting(
+    stmt: &Node<'_>,
+    file: &str,
+    mut hoisted: Option<&mut Vec<LibraryClass>>,
 ) -> IngestResult<Option<Expr>> {
     // `setup do ... end` form.
     if let Some(call) = stmt.as_call_node() {
@@ -654,11 +1006,36 @@ fn ingest_setup_declaration(
         if let Some(block_ref) = call.block() {
             if let Some(block) = block_ref.as_block_node() {
                 let body = match block.body() {
-                    Some(body_node) => ingest_expr(&body_node, file)?,
+                    Some(body_node) => match hoisted.as_deref_mut() {
+                        // maybe's `setup do class MockProcessor; include PlaidAccount::TypeMappable; end … end`.
+                        Some(sink) => {
+                            let mut exprs = Vec::new();
+                            for inner in flatten_statements(body_node) {
+                                match inner.as_class_node() {
+                                    // Not a second definition of a class one already holds: run in order, the two
+                                    // would redefine its methods between them.
+                                    Some(class) if static_class_body(&class) && {
+                                        let lc = library_class_from_node(&class, file)?;
+                                        let fresh = !sink.iter().any(|c| c.name == lc.name);
+                                        if fresh {
+                                            sink.push(lc);
+                                        }
+                                        fresh
+                                    } => {}
+                                    _ => exprs.push(ingest_expr(&inner, file)?),
+                                }
+                            }
+                            Expr::new(Span::synthetic(), ExprNode::Seq { exprs })
+                        }
+                        None => ingest_expr(&body_node, file)?,
+                    },
                     None => Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] }),
                 };
                 return Ok(Some(body));
             }
+        }
+        if call.block().is_none() && call.arguments().is_some() {
+            return named_callbacks(&call, "setup", file).map(Some);
         }
         return Ok(None);
     }
@@ -698,6 +1075,9 @@ fn ingest_teardown_block(stmt: &Node<'_>, file: &str) -> IngestResult<Option<Exp
             });
         }
         return Ok(None);
+    }
+    if call.block().is_none() && call.arguments().is_some() {
+        return named_callbacks(&call, "teardown", file).map(Some);
     }
     let block = call.block().and_then(|b| b.as_block_node());
     match block {

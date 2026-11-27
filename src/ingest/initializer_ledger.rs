@@ -64,9 +64,22 @@
 //!
 //! [`INERT`] lists statements that provably have no effect on a compiled
 //! app, one reason each. An entry matches only when every argument is a
-//! plain literal, so a side effect cannot hide in the value.
+//! plain literal, so a side effect cannot hide in the value. A constant
+//! named on its own line (campfire's `ActiveStorage::Transformers::Vips`,
+//! there to force an autoload) is inert too.
+//!
+//! # Who a statement belongs to
+//!
+//! Each finding names its [`Holder`], read from what the statement calls or
+//! writes and the app's `Gemfile.lock`: Rails behaviour the running app
+//! answers without (`config.middleware.use`), a Rails setting only the build,
+//! the loader or the logs read (`config.assets`), a gem with its fate in
+//! [`crate::gems`] (`Devise.setup`'s settings are devise's), the app's own
+//! code (`DiscourseEvent.on`, an `after_initialize` block) or unknown. A
+//! conditional takes the weightiest holder among its branches. The holder
+//! changes no severity: it is what deciding one per holder will read.
 
-use std::collections::HashSet;
+use crate::det::HashSet;
 use std::path::{Path, PathBuf};
 
 use ruby_prism::Node;
@@ -77,21 +90,24 @@ use crate::span::{SourceFile, Span};
 use crate::vfs::Vfs;
 
 use super::app::{
-    default_locale_line, declares_rails_engine, extract_autoload_lib_ignores,
+    available_locales_line, default_locale_line, declares_rails_engine, fallbacks_line, extract_autoload_lib_ignores,
     extract_autoload_path_roots, extract_config_assignments, extract_config_time_zone,
-    extract_initializer_filters, extract_module_mixins, extract_session_cookie_key,
+    extract_collection_cache_store, extract_filter_parameters, extract_initializer_filters, extract_initializer_response_headers,
+    extract_module_mixins,
     extract_time_formats, extract_variable_content_type_exclusions,
     extract_video_preview_arguments, extract_video_previewer_replacement,
     extract_vips_loader_policy, forgery_strategy_line, kaminari_default_per_page,
-    load_defaults_version, raise_on_missing_line, read_rb_files, wrap_parameters_line,
-    InflectEffect, VideoPreviewArgsExtract, FRAMEWORK_CONFIG_KEYS,
+    load_defaults_version, queue_adapter_line, raise_on_missing_line, read_rb_files, wrap_parameters_line,
+    FilterParametersLine, InflectEffect, VideoPreviewArgsExtract, FRAMEWORK_CONFIG_KEYS,
 };
+use super::after_initialize::{carried_block, server_guarded_hooks, Site};
 use super::util::{
     class_name_path, constant_id_str, constant_path_of, find_all_classes_with_scope,
     flatten_statements,
 };
 use super::{prism, sources, survey};
 
+use crate::ingest::prism_api::PrismLocation;
 /// The file label every probe passes the recognizers: a `<…>` label is never
 /// registered as a source (see `ingest::sources`), so asking a recognizer
 /// about one statement cannot disturb the app's source table.
@@ -138,10 +154,14 @@ struct Probe<'a> {
     /// stays attached and the slice parses on its own).
     text: &'a str,
     node: &'a Node<'a>,
-    /// The initializer's file name (`session_store.rb`).
-    file_name: &'a str,
+    /// The whole file: `node`'s offsets index this, not `text`, which
+    /// starts at the statement.
+    src: &'a str,
     /// `config.autoload_lib(ignore: …)` directories, before any filtering.
     lib_ignores: &'a [String],
+    /// The file, as it is named for spans and for the passes that answer a
+    /// statement by its place in it.
+    path: &'a str,
 }
 
 /// One existing recognizer, how to ask it about a single statement, and
@@ -160,11 +180,35 @@ struct Recognizer {
 /// effect it has on the `App`.
 const RECOGNIZERS: &[Recognizer] = &[
     Recognizer {
-        name: "session_store (config/initializers/session_store.rb: config.session_store key:)",
+        name: "after_initialize (Rails.application.config.after_initialize do … end, run at boot)",
         origins: INIT,
+        levels: TOP,
+        reads: |p| carried(p, Site::Initializer),
+    },
+    Recognizer {
+        name: "after_initialize (under if defined?(Rails::Server), run by the server entries)",
+        origins: INIT,
+        levels: TOP,
+        reads: |p| server_guarded_hooks(p.node).is_some(),
+    },
+    Recognizer {
+        name: "after_initialize (config.after_initialize inside Rails.application.configure, run at boot)",
+        origins: INIT,
+        levels: &[Level::Nested],
+        reads: |p| carried(p, Site::Configure),
+    },
+    Recognizer {
+        name: "after_initialize (config.after_initialize in the Application class body, run at boot)",
+        origins: APP,
+        levels: TOP,
+        reads: |p| carried(p, Site::Application),
+    },
+    Recognizer {
+        name: "session_store (config.session_store key:)",
+        origins: INIT_APP,
         levels: ANY,
         reads: |p| {
-            p.file_name == "session_store.rb" && extract_session_cookie_key(p.text.as_bytes()).is_some()
+            super::session_config::reads(p.text.as_bytes())
         },
     },
     Recognizer {
@@ -186,10 +230,28 @@ const RECOGNIZERS: &[Recognizer] = &[
         reads: |p| mapper_extension(p),
     },
     Recognizer {
+        name: "collection_cache (ActionView::PartialRenderer.collection_cache = Store.reader)",
+        origins: INIT,
+        levels: TOP_HOOK,
+        reads: |p| extract_collection_cache_store(p.text.as_bytes(), PROBE).is_some(),
+    },
+    Recognizer {
+        name: "view_paths (X.prepend_view_path / X.append_view_path / X.view_paths =, bare or in ActiveSupport.on_load)",
+        origins: INIT,
+        levels: TOP_HOOK,
+        reads: |p| super::view_paths::reads_initializer_statement(p.text.as_bytes()),
+    },
+    Recognizer {
         name: "initializer_filters (X.before_action :m, only:)",
         origins: INIT,
         levels: TOP_HOOK,
         reads: |p| !extract_initializer_filters(p.text.as_bytes(), PROBE).is_empty(),
+    },
+    Recognizer {
+        name: "initializer_response_headers (X.after_action { response.set_header(k, v) }, bare or in ActiveSupport.on_load)",
+        origins: INIT,
+        levels: TOP_HOOK,
+        reads: |p| !extract_initializer_response_headers(p.text.as_bytes(), PROBE).is_empty(),
     },
     Recognizer {
         name: "sql_functions (create_function / create_aggregate)",
@@ -198,6 +260,22 @@ const RECOGNIZERS: &[Recognizer] = &[
         reads: |p| {
             (p.text.contains("create_function") || p.text.contains("create_aggregate"))
                 && !super::sql_functions::scan_sql_functions(p.text.as_bytes(), PROBE).is_empty()
+        },
+    },
+    Recognizer {
+        name: "gem_package_settings (<package config receiver>.<attr> = literal, replayed after the Spinel package loads)",
+        origins: INIT,
+        levels: TOP_HOOK,
+        reads: |p| super::gem_package_settings::extract(p.text.as_bytes(), PROBE).iter().any(|s| s.carried()),
+    },
+    Recognizer {
+        name: "pagy settings (Pagy::DEFAULT[:overflow] = for a pagy before 43)",
+        origins: INIT,
+        levels: TOP_HOOK,
+        reads: |p| {
+            let mut state = super::pagy::Settings::default();
+            super::pagy::read_settings(p.text.as_bytes(), PROBE, &mut state);
+            state.recognized
         },
     },
     Recognizer {
@@ -232,6 +310,15 @@ const RECOGNIZERS: &[Recognizer] = &[
         origins: APP,
         levels: TOP,
         reads: |p| config_lift(p),
+    },
+    Recognizer {
+        name: "filter_parameters (config.filter_parameters += / = a Symbol or String list)",
+        origins: INIT_APP,
+        levels: ANY,
+        reads: |p| {
+            let lines = extract_filter_parameters(p.text.as_bytes());
+            !lines.is_empty() && lines.iter().all(|l| matches!(l, FilterParametersLine::Literal { .. }))
+        },
     },
     Recognizer {
         name: "active_storage variable_content_types (config.active_storage.variable_content_types -=)",
@@ -269,10 +356,30 @@ const RECOGNIZERS: &[Recognizer] = &[
         reads: |p| code_lines(p.text).any(|l| wrap_parameters_line(l).is_some()),
     },
     Recognizer {
+        name: "queue_adapter :sidekiq (config.active_job.queue_adapter =)",
+        origins: INIT_APP,
+        levels: ANY,
+        reads: |p| {
+            code_lines(p.text).any(|l| queue_adapter_line(l).flatten().as_deref() == Some("sidekiq"))
+        },
+    },
+    Recognizer {
+        name: "JSON response escaping (action_controller.escape_json_responses / active_support.escape_js_separators_in_json)",
+        origins: INIT_APP,
+        levels: ANY,
+        reads: |p| super::json_response_config::reads(p.node),
+    },
+    Recognizer {
         name: "forgery_protection_verification_strategy",
         origins: INIT_APP,
         levels: ANY,
         reads: |p| code_lines(p.text).any(|l| forgery_strategy_line(l).is_some()),
+    },
+    Recognizer {
+        name: "action_cable origins (config.action_cable.allowed_request_origins / allow_same_origin_as_host / disable_request_forgery_protection =)",
+        origins: INIT_APP,
+        levels: ANY,
+        reads: |p| super::action_cable_config::assignment(p.node).is_some(),
     },
     Recognizer {
         name: "autoload ignore (initializer that explicitly requires an ignored lib/ directory)",
@@ -311,10 +418,57 @@ const RECOGNIZERS: &[Recognizer] = &[
         reads: |p| code_lines(p.text).any(|l| default_locale_line(l).is_some()),
     },
     Recognizer {
+        name: "i18n available_locales (config.i18n.available_locales =)",
+        origins: APP,
+        levels: ANY,
+        // A computed list is not read (the locales come from the app's files), so it stays reported.
+        reads: |p| code_lines(p.text).any(|l| matches!(available_locales_line(l), Some(Ok(_)))),
+    },
+    Recognizer {
+        name: "i18n fallbacks (config.i18n.fallbacks =)",
+        origins: APP,
+        levels: ANY,
+        reads: |p| code_lines(p.text).any(|l| fallbacks_line(l, "").is_some()),
+    },
+    Recognizer {
         name: "i18n raise_on_missing_translations",
         origins: APP,
         levels: ANY,
         reads: |p| code_lines(p.text).any(|l| raise_on_missing_line(l).is_some()),
+    },
+    Recognizer {
+        name: "oj (Oj.mimic_JSON / Oj.optimize_rails: ingest/oj reads the mode)",
+        origins: INIT,
+        levels: ANY,
+        reads: |p| {
+            code_lines(p.text).any(|l| {
+                let l = l.trim_start_matches("::");
+                l == "Oj.mimic_JSON" || l.starts_with("Oj.mimic_JSON(") || l == "Oj.optimize_rails"
+            })
+        },
+    },
+    Recognizer {
+        name: "multi_json (MultiJson.use(:oj): ingest/multi_json reads the adapter)",
+        origins: INIT,
+        levels: ANY,
+        reads: |p| {
+            code_lines(p.text).any(|l| {
+                let l = l.trim_start_matches("::");
+                ["MultiJson.use(:oj)", "MultiJSON.use(:oj)", "MultiJson.use :oj", "MultiJSON.use :oj"].contains(&l.trim_end())
+            })
+        },
+    },
+    Recognizer {
+        name: "load_hooks (ActiveSupport.on_load(:name) a model's run_load_hooks(:name, self) runs as its class body)",
+        origins: INIT,
+        levels: TOP,
+        reads: |p| super::load_hooks::spliced(p.path, p.node).is_some(),
+    },
+    Recognizer {
+        name: "content_security_policy (config.content_security_policy do |policy|)",
+        origins: INIT,
+        levels: ANY,
+        reads: |p| super::app::content_security_policy_method(p.text).is_some(),
     },
 ];
 
@@ -391,10 +545,10 @@ fn mapper_extension(p: &Probe<'_>) -> bool {
         return false;
     }
     let Some(recv) = call.receiver() else { return false };
-    let Some(target) = super::app::constant_text(&recv, p.text) else { return false };
+    let Some(target) = super::app::constant_text(&recv, p.src) else { return false };
     target.trim_start_matches("::") == "ActionDispatch::Routing::Mapper"
         && call.arguments().is_some_and(|a| {
-            a.arguments().iter().any(|arg| super::app::constant_text(&arg, p.text).is_some())
+            a.arguments().iter().any(|arg| super::app::constant_text(&arg, p.src).is_some())
         })
 }
 
@@ -407,19 +561,20 @@ fn content_helper_assignment(p: &Probe<'_>) -> bool {
         return false;
     }
     let Some(recv) = call.receiver() else { return false };
-    if super::app::constant_text(&recv, p.text).as_deref() != Some("ActionText::ContentHelper") {
+    if super::app::constant_text(&recv, p.src).as_deref() != Some("ActionText::ContentHelper") {
         return false;
     }
     call.arguments().is_some_and(|a| a.arguments().iter().count() == 1)
 }
 
+const ASSET_VERSION_INERT: &str = "without an active Propshaft reader, the emitted app does not use this asset digest salt";
+
 /// The inert allowlist: `(normalized target, reason)`. Add an entry only when you can say why the statement is
 /// inert for the COMPILED app: ingest never reads it, and the thing it
 /// configures does not exist in the emitted program.
 pub const INERT: &[(&str, &str)] = &[
-    ("config.filter_parameters", "redacts parameter values in Rails' request log lines; the emitted runtime logs no parameters, and its ParameterFilter (active_support_reporters.rb) reads only `Rails.event` payloads, not this setting"),
     ("config.action_dispatch.cookies_serializer", "selects how Rails encodes cookie payloads on the wire (:json / :marshal); the emitted runtime owns one session codec and never reads the setting"),
-    ("config.assets.version", "salts the asset digest Sprockets/Propshaft compute; the emitted app serves its own assets and does not read it"),
+    ("config.assets.version", ASSET_VERSION_INERT),
     ("config.generators", "consulted only by `rails generate`, which is not part of a compiled app (a block here only calls `g.<option>`)"),
     ("config.enable_reloading", "code reloading; the compiled app has no autoloader or reloader, every class is resolved at compile time"),
     ("config.cache_classes", "the pre-7.1 spelling of `enable_reloading = false`; same reason"),
@@ -490,9 +645,14 @@ fn assoc_is_plain(node: &Node<'_>) -> bool {
         .is_some_and(|a| is_plain_literal(&a.key()) && is_plain_literal(&a.value()))
 }
 
+const BARE_CONSTANT_INERT: &str = "a constant named on its own line only makes Rails autoload it; the compiled app has every class loaded before boot";
+
 /// The inert-allowlist reason for `node`, if its target is listed and its
-/// value is a plain literal.
+/// value is a plain literal, or if it is a bare constant.
 fn inert_reason(node: &Node<'_>, src: &str) -> Option<&'static str> {
+    if node.as_constant_read_node().is_some() || node.as_constant_path_node().is_some() {
+        return Some(BARE_CONSTANT_INERT);
+    }
     let recv_text = |recv: Option<Node<'_>>| -> Option<String> {
         let recv = recv?;
         let loc = recv.location();
@@ -557,6 +717,11 @@ struct Stmt<'a> {
     within: Option<String>,
     /// Through the start of the next statement (or the end of the container).
     text: &'a str,
+}
+
+/// An `after_initialize` block `ingest::after_initialize` carries to boot.
+fn carried(p: &Probe<'_>, site: Site) -> bool {
+    p.node.as_call_node().is_some_and(|call| carried_block(&call, site).is_some())
 }
 
 /// `X.to_prepare { … }` / `X.to_run { … }` with a statement body: the
@@ -627,15 +792,16 @@ fn is_not_a_statement(node: &Node<'_>) -> bool {
 }
 
 /// Judge one host statement against the recognizer table.
-fn judge(origin: Origin, st: &Stmt<'_>, file_name: &str, lib_ignores: &[String], src: &str) -> Verdict {
+fn judge(origin: Origin, st: &Stmt<'_>, lib_ignores: &[String], src: &str, path: &str) -> Verdict {
     if is_not_a_statement(&st.node) {
         return Verdict::NotAStatement;
     }
     let probe = Probe {
         text: st.text,
         node: &st.node,
-        file_name,
+        src,
         lib_ignores,
+        path,
     };
     if st.level == Level::Inflections {
         // Re-ingesting the statement goes through `ingest_expr`, which in
@@ -704,6 +870,9 @@ fn inflections_effect(p: &Probe<'_>) -> Option<InflectEffect> {
 pub struct Finding {
     pub owner: String,
     pub statement: String,
+    /// What the statement writes to or calls, by syntax ([`targets_of`]);
+    /// [`holder_of`] reads who owns it from these.
+    pub targets: Vec<String>,
     pub path: String,
     pub line: u32,
     pub column: u32,
@@ -783,14 +952,12 @@ fn head_of(node: &Node<'_>, src: &str) -> String {
 }
 
 /// Judge every statement of `statements` and return the ledger.
-#[allow(clippy::too_many_arguments)]
 fn judge_all(
     origin: Origin,
     owner_name: &str,
     path: &str,
     src: &str,
     statements: Vec<Stmt<'_>>,
-    file_name: &str,
     lib_ignores: &[String],
     admitted_isolate: bool,
 ) -> FileLedger {
@@ -806,11 +973,16 @@ fn judge_all(
                 Verdict::Consumed("isolate_namespace (literal, admitted engine)")
             } else if let Some(reason) = inert_reason(&st.node, src) {
                 Verdict::Inert(reason)
+            } else if let Some(read) = super::engine_config::engine_statement(&st.node, path) {
+                match read {
+                    super::engine_config::EngineStatement::Consumed(reason) => Verdict::Consumed(reason),
+                    super::engine_config::EngineStatement::Inert(reason) => Verdict::Inert(reason),
+                }
             } else {
                 Verdict::Unconsumed
             }
         } else {
-            judge(origin, &st, file_name, lib_ignores, src)
+            judge(origin, &st, lib_ignores, src, path)
         };
         if verdict == Verdict::Unconsumed {
             // `Const.configure do |c| … end` is a container: nothing reads
@@ -841,6 +1013,10 @@ fn judge_all(
             ledger.findings.push(Finding {
                 owner: owner_text(origin, st.level, owner_name, st.within.as_deref()),
                 statement: head.clone(),
+                targets: match &st.within {
+                    Some(within) => vec![format!("block:{within}")],
+                    None => targets_of(&st.node, src),
+                },
                 path: path.to_string(),
                 line,
                 column,
@@ -925,7 +1101,7 @@ fn initializer_ledger(
         }
         stmts = expanded;
     }
-    judge_all(origin, owner_name, &display_path(path), &src, stmts, file_name, lib_ignores, false)
+    judge_all(origin, owner_name, &display_path(path), &src, stmts, lib_ignores, false)
 }
 
 /// Statements of the `Rails::Application` subclass body in `application.rb`
@@ -955,7 +1131,6 @@ fn application_ledger(path: &Path, bytes: &[u8], lib_ignores: &[String]) -> File
         &display_path(path),
         &src,
         stmts,
-        "application.rb",
         lib_ignores,
         false,
     )
@@ -1025,7 +1200,7 @@ fn engine_class_ledgers(
     lib_ignores: &[String],
 ) -> Vec<FileLedger> {
     let src = String::from_utf8_lossy(bytes).into_owned();
-    let parsed = ruby_prism::parse(bytes);
+    let parsed = super::prism::parse_silent(bytes);
     let root = parsed.node();
     let mut out = Vec::new();
     for (scope, class) in find_all_classes_with_scope(&root) {
@@ -1049,12 +1224,269 @@ fn engine_class_ledgers(
             &display_path(path),
             &src,
             stmts,
-            "",
             lib_ignores,
             admitted.contains(&name),
         ));
     }
     out
+}
+
+/// Rails' own `config.<key>` surface, beyond the railtie a gem adds.
+const RAILS_CONFIG_KEYS: &[&str] = &[
+    "action_cable", "action_controller", "action_dispatch", "action_mailbox", "action_mailer",
+    "action_text", "action_view", "active_job", "active_model", "active_record", "active_storage",
+    "active_support", "add_autoload_paths_to_load_path", "api_only", "assets", "assume_ssl",
+    "autoload_lib", "autoload_once_paths", "autoload_paths", "beginning_of_week", "cache_classes",
+    "cache_store", "colorize_logging", "consider_all_requests_local", "content_security_policy",
+    "content_security_policy_nonce_directives", "content_security_policy_nonce_generator",
+    "content_security_policy_report_only", "debug_exception_response_format", "eager_load",
+    "eager_load_namespaces", "eager_load_paths", "enable_reloading", "encoding", "exceptions_app",
+    "file_watcher", "filter_parameters", "force_ssl", "generators", "host_authorization", "hosts",
+    "i18n", "importmap", "load_defaults", "log_formatter", "log_level", "log_tags", "logger",
+    "middleware", "paths", "permissions_policy", "public_file_server", "railties_order",
+    "relative_url_root", "reload_classes_only_on_change", "reloader", "require_master_key",
+    "secret_key_base", "session_options", "session_store", "ssl_options", "time_zone", "web_console",
+];
+
+/// The Rails boot hooks: their block is the app's own code, run at boot.
+const RAILS_BOOT_HOOKS: &[&str] = &[
+    "after_initialize", "after_routes_loaded", "before_configuration", "before_eager_load",
+    "before_initialize", "to_prepare", "reloader.to_prepare",
+];
+
+/// Rails settings and calls that only change how the app is built, loaded,
+/// logged or developed: nothing the running app answers depends on them.
+const RAILS_BOOT_ONLY: &[&str] = &[
+    "config.active_record.cache_query_log_tags", "config.active_record.dump_schema_after_migration",
+    "config.active_record.migration_error", "config.active_record.query_log_tags",
+    "config.active_record.query_log_tags_enabled", "config.active_record.verbose_query_logs",
+    "config.active_support.deprecation", "config.active_support.disallowed_deprecation",
+    "config.active_support.disallowed_deprecation_warnings", "config.active_support.report_deprecations",
+    "config.action_view.annotate_rendered_view_with_filenames", "config.action_mailer.preview_paths",
+    "config.action_mailer.show_previews", "config.active_job.verbose_enqueue_logs",
+    "config.add_autoload_paths_to_load_path", "config.assets", "config.autoload_lib",
+    "config.autoload_once_paths", "config.autoload_paths", "config.cache_classes",
+    "config.colorize_logging", "config.eager_load", "config.eager_load_namespaces",
+    "config.eager_load_paths", "config.enable_reloading", "config.file_watcher",
+    "config.filter_parameters", "config.generators", "config.importmap.cache_sweepers",
+    "config.log_formatter", "config.log_level", "config.log_tags", "config.logger", "config.paths",
+    "config.reload_classes_only_on_change", "config.web_console", "ActiveRecord::Tasks",
+    "ActiveSupport::Deprecation", "Rails.autoloaders", "Rails.backtrace_cleaner", "Rails.cache.logger",
+    "Rails.logger", "Zeitwerk",
+];
+
+/// The constants Rails and the gems it is built from define.
+const RAILS_NAMESPACES: &[&str] = &[
+    "AbstractController", "ActionCable", "ActionController", "ActionDispatch", "ActionMailbox",
+    "ActionMailer", "ActionText", "ActionView", "ActiveJob", "ActiveModel", "ActiveRecord",
+    "ActiveStorage", "ActiveSupport", "Arel", "I18n", "Mime", "Rack", "Rails", "Zeitwerk",
+];
+
+/// Ruby's own constants an initializer calls on its own behalf.
+const RUBY_CORE: &[&str] = &[
+    "Dir", "ENV", "File", "GC", "Kernel", "Object", "Process", "Regexp", "STDERR", "STDOUT",
+    "Signal", "String", "Thread", "Warning",
+];
+
+/// Who a dropped statement belongs to, so a reader can tell a Rails setting
+/// the running app answers without from a gem the analysis does not model.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Holder {
+    /// Rails behaviour the running app answers differently without.
+    Rails(String),
+    /// A Rails setting that only changes how the app is built, loaded or logged.
+    RailsBootOnly(String),
+    /// A gem's setting or call, with the gem's fate in [`crate::gems`].
+    Gem { names: Vec<String>, fate: crate::gems::GemFate },
+    /// The app's own code, or a Rails boot hook whose block is.
+    App,
+    Unknown,
+}
+
+impl Holder {
+    /// The `holder` a diagnostic carries: `rails`, `rails-boot-only`,
+    /// `gem:<name>[|<name>…]:<fate>`, `app` or `unknown`.
+    pub fn label(&self) -> String {
+        match self {
+            Holder::Rails(_) => "rails".to_string(),
+            Holder::RailsBootOnly(_) => "rails-boot-only".to_string(),
+            Holder::Gem { names, fate } => format!("gem:{}:{}", names.join("|"), fate.label()),
+            Holder::App => "app".to_string(),
+            Holder::Unknown => "unknown".to_string(),
+        }
+    }
+
+    /// Which of two holders a conditional reports: the one whose drop says most.
+    fn weight(&self) -> u8 {
+        use crate::gems::GemFate;
+        match self {
+            Holder::Rails(_) => 6,
+            Holder::Gem { fate: GemFate::Modeled | GemFate::Framework, .. } => 5,
+            Holder::App => 4,
+            Holder::Gem { .. } => 3,
+            Holder::Unknown => 2,
+            Holder::RailsBootOnly(_) => 1,
+        }
+    }
+}
+
+/// The receiver-and-method target of each call or write in `node`, by
+/// syntax: `config.middleware.use`, `Rack::Attack.throttle`, `self.at_exit`,
+/// `def`, `const=NAME`. A conditional answers its branches' statements.
+pub(super) fn targets_of(node: &Node<'_>, src: &str) -> Vec<String> {
+    let text_of = |n: &Node<'_>| {
+        let loc = n.location();
+        let text = normalize_target(&src[loc.start_offset()..loc.end_offset()]);
+        match text.strip_prefix("Rails.configuration") {
+            Some(rest) => format!("config{rest}"),
+            None => text,
+        }
+    };
+    let branches = |stmts: Option<Node<'_>>, out: &mut Vec<String>| {
+        if let Some(stmts) = stmts {
+            for inner in flatten_statements(stmts) {
+                out.extend(targets_of(&inner, src));
+            }
+        }
+    };
+    let mut out = Vec::new();
+    if let Some(call) = node.as_call_node() {
+        let name = constant_id_str(&call.name());
+        match call.receiver() {
+            Some(recv) => out.push(format!("{}.{name}", text_of(&recv))),
+            None => out.push(format!("self.{name}")),
+        }
+    } else if let Some(w) = node.as_call_operator_write_node() {
+        out.push(format!("{}.{}", w.receiver().map(|r| text_of(&r)).unwrap_or_default(), constant_id_str(&w.read_name())));
+    } else if let Some(w) = node.as_call_or_write_node() {
+        out.push(format!("{}.{}", w.receiver().map(|r| text_of(&r)).unwrap_or_default(), constant_id_str(&w.read_name())));
+    } else if let Some(w) = node.as_constant_write_node() {
+        out.push(format!("const={}", constant_id_str(&w.name())));
+    } else if let Some(w) = node.as_constant_path_write_node() {
+        out.push(format!("const={}", text_of(&w.target().as_node())));
+    } else if node.as_def_node().is_some() {
+        out.push("def".to_string());
+    } else if node.as_global_variable_write_node().is_some()
+        || node.as_local_variable_write_node().is_some()
+        || node.as_instance_variable_write_node().is_some()
+    {
+        out.push("var=".to_string());
+    } else if let Some(c) = node.as_if_node() {
+        branches(c.statements().map(|s| s.as_node()), &mut out);
+        branches(c.subsequent(), &mut out);
+    } else if let Some(c) = node.as_unless_node() {
+        branches(c.statements().map(|s| s.as_node()), &mut out);
+        branches(c.else_clause().map(|e| e.as_node()), &mut out);
+    } else if let Some(e) = node.as_else_node() {
+        branches(e.statements().map(|s| s.as_node()), &mut out);
+    } else if let Some(c) = node.as_case_node() {
+        for w in c.conditions().iter() {
+            if let Some(w) = w.as_when_node() {
+                branches(w.statements().map(|s| s.as_node()), &mut out);
+            }
+        }
+        branches(c.else_clause().map(|e| e.as_node()), &mut out);
+    } else if let Some(b) = node.as_begin_node() {
+        branches(b.statements().map(|s| s.as_node()), &mut out);
+    }
+    out
+}
+
+/// Who owns a dropped statement, from its [`targets_of`]: the weightiest
+/// owner among a conditional's branches.
+pub fn holder_of(targets: &[String], lock: Option<&crate::gems::Lockfile>, app_namespaces: &HashSet<String>) -> Holder {
+    targets
+        .iter()
+        .map(|t| holder_of_target(t, lock, app_namespaces))
+        .max_by_key(Holder::weight)
+        .unwrap_or(Holder::App)
+}
+
+fn holder_of_target(target: &str, lock: Option<&crate::gems::Lockfile>, app_namespaces: &HashSet<String>) -> Holder {
+    let covers = |prefix: &str| {
+        target == prefix || target.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('.') || rest.starts_with("::"))
+    };
+    if let Some(within) = target.strip_prefix("block:") {
+        // `Devise.setup do |config| … end`: its statements belong to `Devise`.
+        let recv = within.rsplit_once('.').map_or(within, |(recv, _)| recv);
+        // `within` is the head as written, not normalized: `::Devise.setup` keeps its `::`.
+        return holder_of_target(recv.trim_start_matches("::"), lock, app_namespaces);
+    }
+    if target.starts_with("self.") || target == "def" || target == "var=" || target.starts_with("const=") {
+        return Holder::App;
+    }
+    if let Some(rest) = target.strip_prefix("config.") {
+        if RAILS_BOOT_HOOKS.iter().any(|h| rest == *h || rest.starts_with(&format!("{h}."))) {
+            return Holder::App;
+        }
+        let end = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(rest.len());
+        let key = &rest[..end];
+        if key == "x" {
+            return Holder::App;
+        }
+        if RAILS_BOOT_ONLY.iter().any(|p| covers(p)) {
+            return Holder::RailsBootOnly(format!("config.{key}"));
+        }
+        if RAILS_CONFIG_KEYS.contains(&key) {
+            return Holder::Rails(format!("config.{key}"));
+        }
+        // A gem's railtie namespace: `config.lograge`, `config.mission_control`.
+        let railtie: Vec<String> = lock
+            .map(|l| {
+                l.specs
+                    .iter()
+                    .filter(|(n, _)| {
+                        let n = n.replace('-', "_");
+                        n == key || n.starts_with(&format!("{key}_"))
+                    })
+                    .map(|(n, _)| n.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        return match gem_holder(railtie, lock) {
+            Some(Holder::Gem { fate: crate::gems::GemFate::Framework, .. }) => Holder::Rails(format!("config.{key}")),
+            Some(other) => other,
+            None => Holder::Unknown,
+        };
+    }
+    let end = target.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':')).unwrap_or(target.len());
+    let head = target[..end].trim_end_matches(':').to_string();
+    // A local, a method of the file's own or a Ruby core constant: the app's code.
+    if !head.starts_with(|c: char| c.is_ascii_uppercase()) || RUBY_CORE.contains(&head.as_str()) {
+        return Holder::App;
+    }
+    if RAILS_BOOT_ONLY.iter().any(|p| covers(p)) {
+        return Holder::RailsBootOnly(head);
+    }
+    let gems = lock.map(|l| crate::gems::lock_gems_owning_constant(l, &head)).unwrap_or_default();
+    if let Some(holder) = gem_holder(gems.into_iter().map(str::to_string).collect(), lock) {
+        match holder {
+            Holder::Gem { fate: crate::gems::GemFate::Framework, .. } => return Holder::Rails(head),
+            other => return other,
+        }
+    }
+    let top = head.split("::").next().unwrap_or(&head);
+    if RAILS_NAMESPACES.contains(&top) {
+        return Holder::Rails(head);
+    }
+    if app_namespaces.contains(top) {
+        return Holder::App;
+    }
+    Holder::Unknown
+}
+
+/// The gems of `names` as one holder: their fate when they agree.
+fn gem_holder(names: Vec<String>, lock: Option<&crate::gems::Lockfile>) -> Option<Holder> {
+    // As `GemCensus::of` labels it: a gem locked from a `PATH` source is in-repo.
+    let fate_of = |n: &str| match lock {
+        Some(l) if l.is_in_repo(n) => crate::gems::GemFate::InRepo,
+        Some(l) if l.is_source(n) => crate::gems::GemFate::Source,
+        _ => crate::gems::fate_of(n),
+    };
+    let first = names.first()?;
+    let fate = fate_of(first);
+    let fate = if names.iter().all(|n| fate_of(n) == fate) { fate } else { crate::gems::GemFate::Unknown };
+    Some(Holder::Gem { names, fate })
 }
 
 /// Run the ledger over the host and every in-tree engine and push one
@@ -1066,16 +1498,28 @@ pub(super) fn record<V: Vfs + ?Sized>(
     dir: &Path,
     path_gems: &[PathBuf],
     admitted: &HashSet<String>,
+    lock: Option<&crate::gems::Lockfile>,
+    app_namespaces: &HashSet<String>,
+    carried_rate_limit_stores: &[Span],
+    boot_taken: &super::boot_program::Taken,
 ) {
     let findings = ledger(vfs, dir, path_gems, admitted);
     for f in findings.into_iter().flat_map(|l| l.findings) {
+        if boot_taken.contains(&(f.path.clone(), f.start)) {
+            continue;
+        }
+        let holder = holder_of(&f.targets, lock, app_namespaces);
         let location = format!("{}:{}:{}", f.path, f.line, f.column);
         let file = sources::file_id(&absolute(dir, &f.path));
+        if carried_rate_limit_stores.iter().any(|value| value.file == file && value.start >= f.start && value.end <= f.end) {
+            continue;
+        }
         let span = if file.0 == 0 { Span::synthetic() } else { Span { file, start: f.start, end: f.end } };
         let kind = DiagnosticKind::UnconsumedInitializer {
             owner: Symbol::from(f.owner.as_str()),
             statement: Symbol::from(f.statement.as_str()),
             location: Symbol::from(location.as_str()),
+            holder: Symbol::from(holder.label().as_str()),
         };
         let message = Diagnostic::stub_text(&kind);
         prism::push(Diagnostic { span, severity: Diagnostic::default_severity(&kind), kind, message });
@@ -1091,6 +1535,32 @@ fn absolute(dir: &Path, relative: &str) -> String {
 
 /// The whole ledger, file by file, in report order: host initializers,
 /// `config/application.rb`, then each engine's initializers and class body.
+/// The boot statements of the engine `engine_name` at `engine_dir` that
+/// nothing accounts for, as `statement (path:line)`, read as if its mount
+/// were admitted: its `config/initializers` and its class body.
+pub(super) fn engine_unaccounted<V: Vfs + ?Sized>(vfs: &V, engine_dir: &Path, engine_name: &str) -> Vec<String> {
+    let mut ledgers = Vec::new();
+    let initializers = engine_dir.join("config/initializers");
+    if vfs.is_dir(&initializers) {
+        for entry in read_rb_files(vfs, &initializers).unwrap_or_default() {
+            let Ok(bytes) = vfs.read(&entry) else { continue };
+            ledgers.push(initializer_ledger(Origin::EngineInitializer, engine_name, &entry, &bytes, &[]));
+        }
+    }
+    let admitted: HashSet<String> = std::iter::once(engine_name.to_string()).collect();
+    for entry in read_rb_files(vfs, &engine_dir.join("lib")).unwrap_or_default() {
+        let Ok(bytes) = vfs.read(&entry) else { continue };
+        if bytes.windows(10).any(|w| w == b"Rails::Eng") {
+            ledgers.extend(engine_class_ledgers(&entry, &bytes, &admitted, &[]));
+        }
+    }
+    ledgers
+        .into_iter()
+        .flat_map(|l| l.findings)
+        .map(|f| format!("`{}` ({}:{})", f.statement, f.path, f.line))
+        .collect()
+}
+
 pub fn ledger<V: Vfs + ?Sized>(
     vfs: &V,
     dir: &Path,
@@ -1112,6 +1582,15 @@ pub fn ledger<V: Vfs + ?Sized>(
     }
     if let Some(bytes) = &application_bytes {
         out.push(application_ledger(&application, bytes, &lib_ignores));
+    }
+    if super::propshaft::version_is_consumed(vfs, dir) {
+        for ledger in &mut out {
+            for (_, verdict) in &mut ledger.verdicts {
+                if matches!(verdict, Verdict::Inert(reason) if *reason == ASSET_VERSION_INERT) {
+                    *verdict = Verdict::Consumed("Propshaft asset version");
+                }
+            }
+        }
     }
     for engine_dir in path_gems {
         let lib = engine_dir.join("lib");
@@ -1149,11 +1628,18 @@ pub fn render_summary(diags: &[Diagnostic]) -> String {
     use std::collections::BTreeMap;
     use std::fmt::Write;
     let mut buckets: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut holders: BTreeMap<String, usize> = BTreeMap::new();
     let mut total = 0usize;
     for d in diags {
-        if let DiagnosticKind::UnconsumedInitializer { statement, location, .. } = &d.kind {
+        if let DiagnosticKind::UnconsumedInitializer { statement, location, holder, .. } = &d.kind {
             total += 1;
             buckets.entry(statement.as_str().to_string()).or_default().push(location.as_str().to_string());
+            // By fate, not by gem: the gem names are in each line.
+            let kind = match holder.as_str().strip_prefix("gem:").and_then(|g| g.rsplit_once(':')) {
+                Some((_, fate)) => format!("gem ({fate})"),
+                None => holder.as_str().to_string(),
+            };
+            *holders.entry(kind).or_default() += 1;
         }
     }
     if total == 0 {
@@ -1167,6 +1653,10 @@ pub fn render_summary(diags: &[Diagnostic]) -> String {
         "── Initializer ledger: {total} unconsumed statement(s), {} distinct head(s) ──",
         sorted.len()
     );
+    let mut by_holder: Vec<_> = holders.into_iter().collect();
+    by_holder.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let by_holder: Vec<String> = by_holder.iter().map(|(k, n)| format!("{k} {n}")).collect();
+    let _ = writeln!(out, "  by owner: {}", by_holder.join(", "));
     for (head, locations) in sorted {
         let _ = writeln!(out, "  [{}×] {head}", locations.len());
         for l in locations.iter().take(4) {

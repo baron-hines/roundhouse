@@ -1,0 +1,12 @@
+# unvote and upvote a story and a comment, reading the listing after each;
+# a story vote answers "ok", a comment vote (not XHR) redirects to the comment
+GET /newest
+POST /stories/{story}/unvote -> 200
+GET /newest
+POST /stories/{story}/upvote -> 200
+GET /newest
+GET /comments
+POST /comments/{comment}/unvote -> 302
+GET /comments
+POST /comments/{comment}/upvote -> 302
+GET /comments

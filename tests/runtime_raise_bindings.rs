@@ -1,5 +1,7 @@
 //! Native raises bind the error kinds used by shared Ruby methods.
 
+#[path = "support/scratch.rs"]
+mod scratch;
 #[allow(dead_code)]
 #[path = "../runtime/rust/errors_ext.rs"]
 mod rust_errors;
@@ -14,9 +16,10 @@ fn sanitize_sql_like_only(
     classes
         .into_iter()
         .map(|mut class| {
-            class
-                .methods
-                .retain(|method| method.name.as_str() == "sanitize_sql_like");
+            class.methods.retain(|method| {
+                method.name.as_str() == "sanitize_sql_like"
+                    || method.name.as_str().starts_with("like_")
+            });
             class
         })
         .collect()
@@ -30,31 +33,15 @@ fn sanitize_sql_like_error_references_have_rust_runtime_bindings() {
         .find(|file| file.path == std::path::Path::new("src/active_record_base.rs"))
         .expect("ActiveRecord::Base runtime")
         .content;
-    for (name, kind, expected) in [
-        (
-            "RuntimeError",
-            rust_errors::RuntimeError,
-            "FrameworkError::Runtime",
-        ),
-        (
-            "IndexError",
-            rust_errors::IndexError,
-            "FrameworkError::Index",
-        ),
+    for (name, kind) in [
+        ("RuntimeError", rust_errors::RuntimeError),
+        ("IndexError", rust_errors::IndexError),
     ] {
-        assert!(base.contains(&format!("raise({name},")), "{name}: {base}");
-        assert!(
-            base.contains(&format!("use crate::errors_ext::{name};")),
-            "{name}: {base}"
-        );
-        let failure = std::panic::catch_unwind(|| rust_errors::raise(kind, "replacement escape"))
+        assert!(base.contains(&format!("raise_msg(crate::errors_ext::{name},")), "{name}: {base}");
+        let failure = std::panic::catch_unwind(|| rust_errors::raise_msg(kind, "replacement escape".to_string()))
             .expect_err("raise must diverge");
-        let message = failure
-            .downcast_ref::<String>()
-            .map(String::as_str)
-            .or_else(|| failure.downcast_ref::<&str>().copied())
-            .expect("panic message");
-        assert_eq!(message, expected);
+        let raised = failure.downcast_ref::<rust_errors::Raised>().expect("a Raised payload");
+        assert_eq!((raised.class, raised.message.as_str()), (name, "replacement escape"));
     }
 }
 
@@ -97,7 +84,12 @@ fn emitted_rust_like_escaping_compiles_and_runs_with_a_deadline() {
     let start = base
         .find("    pub fn sanitize_sql_like(")
         .expect("sanitizer");
-    let end = start + base[start..].find("\n    }\n").expect("method end") + 6;
+    // The sanitizer and its `like_*` helpers, which follow it in source order.
+    let last = start
+        + base[start..]
+            .find("    pub fn like_group_reference(")
+            .expect("last helper");
+    let end = last + base[last..].find("\n    }\n").expect("method end") + 6;
     let method = &base[start..end];
     let cases = [
         ("", "\\", ""),
@@ -129,7 +121,7 @@ fn emitted_rust_like_escaping_compiles_and_runs_with_a_deadline() {
         r#"#[allow(dead_code)]
 #[path = {errors:?}]
 mod errors_ext;
-use errors_ext::{{raise, RuntimeError, IndexError}};
+use errors_ext::Raised;
 struct LikeProbe;
 impl LikeProbe {{
 {method}
@@ -140,16 +132,15 @@ fn main() {{
     }}
     std::panic::set_hook(Box::new(|_| {{}}));
     for (marker, expected) in [
-        ("\\k<name>", "FrameworkError::Index"),
-        ("\\k<>", "FrameworkError::Index"),
-        ("\\k<name", "FrameworkError::Runtime"),
+        ("\\k<name>", "IndexError"),
+        ("\\k<>", "IndexError"),
+        ("\\k<name", "RuntimeError"),
     ] {{
         assert_eq!(LikeProbe::sanitize_sql_like("plain", marker), "plain");
         let error = std::panic::catch_unwind(|| LikeProbe::sanitize_sql_like("x%_", marker))
             .expect_err("named replacement must raise");
-        let message = error.downcast_ref::<String>().map(String::as_str)
-            .or_else(|| error.downcast_ref::<&str>().copied()).expect("panic message");
-        assert_eq!(message, expected);
+        let raised = error.downcast_ref::<Raised>().expect("a Raised payload");
+        assert_eq!(raised.class, expected);
     }}
 }}
 "#
@@ -161,8 +152,7 @@ fn main() {{
         }
     }
     let scratch =
-        Scratch(std::env::temp_dir().join(format!("rh-like-rust-{}", std::process::id())));
-    fs::create_dir(&scratch.0).expect("create native probe directory");
+        Scratch(scratch::dir("rh-like-rust"));
     let input = scratch.0.join("probe.rs");
     let binary = scratch.0.join("probe");
     fs::write(&input, source).expect("write emitted sanitizer");
@@ -200,5 +190,32 @@ fn main() {{
             panic!("emitted sanitizer exceeded its 3-second deadline");
         }
         std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// A runtime method whose Ruby body is a bare `nil` answers nil on Swift, not a crash.
+#[test]
+fn swift_bare_nil_bodies_return_nil() {
+    let files = roundhouse::emit::swift::emit(&roundhouse::App::default());
+    for (path, method) in [
+        (
+            "Sources/App/ActiveRecordBase.swift",
+            "func klass() -> Any? {",
+        ),
+        (
+            "Sources/App/ActionControllerBase.swift",
+            "func requestForCsrf() -> Any? {",
+        ),
+    ] {
+        let source = &files
+            .iter()
+            .find(|file| file.path == std::path::Path::new(path))
+            .unwrap_or_else(|| panic!("{path}"))
+            .content;
+        let start = source
+            .find(method)
+            .unwrap_or_else(|| panic!("{method} in {path}"));
+        let body = &source[start..start + source[start..].find("\n    }\n").expect("method end")];
+        assert!(body.contains("return nil"), "{body}");
     }
 }

@@ -56,10 +56,13 @@ pub struct SourceFile {
 
 impl SourceFile {
     /// 1-based (line, column) of a byte offset, by newline count.
-    /// Offsets past the end clamp to the last position — a span from
-    /// a stale registration shouldn't panic a diagnostics printer.
+    /// Offsets past the end clamp to the last position, and an offset
+    /// that lands mid-character (a mistranslated span — roundhouse#1048)
+    /// snaps back to that character's start — a bad offset shouldn't
+    /// panic a diagnostics printer. (Not `str::floor_char_boundary`:
+    /// MSRV is 1.89, which predates its stabilization.)
     pub fn line_col(&self, offset: u32) -> (u32, u32) {
-        let offset = (offset as usize).min(self.text.len());
+        let offset = self.char_start(offset);
         let before = &self.text.as_bytes()[..offset];
         let line = before.iter().filter(|&&b| b == b'\n').count() as u32 + 1;
         let line_start = before
@@ -67,10 +70,86 @@ impl SourceFile {
             .rposition(|&b| b == b'\n')
             .map(|p| p + 1)
             .unwrap_or(0);
-        // Column counts characters, not bytes, so editors that treat
-        // col as a character offset land on the right spot in UTF-8.
-        let col = self.text[line_start..offset].chars().count() as u32 + 1;
-        (line, col)
+        (line, self.column(line_start, offset))
+    }
+
+    /// This file with where each of its lines starts, for many
+    /// `line_col` lookups: [`LineIndex::line_col`] answers the same by a
+    /// binary search, where `line_col` counts the newlines before the
+    /// offset on every call (a source map asks once per mapped node,
+    /// which on a large file is quadratic).
+    pub fn line_index(&self) -> LineIndex<'_> {
+        let after_newlines =
+            self.text.bytes().enumerate().filter(|&(_, b)| b == b'\n').map(|(i, _)| i + 1);
+        LineIndex { file: self, starts: std::iter::once(0).chain(after_newlines).collect() }
+    }
+
+    /// The offset clamped to the text and snapped back to the start of
+    /// the character it lands in.
+    fn char_start(&self, offset: u32) -> usize {
+        let mut offset = (offset as usize).min(self.text.len());
+        while offset > 0 && !self.text.is_char_boundary(offset) {
+            offset -= 1;
+        }
+        offset
+    }
+
+    /// 1-based column of `offset` on the line starting at `line_start`.
+    /// Column counts characters, not bytes, so editors that treat col as
+    /// a character offset land on the right spot in UTF-8.
+    fn column(&self, line_start: usize, offset: usize) -> u32 {
+        self.text[line_start..offset].chars().count() as u32 + 1
+    }
+}
+
+/// A [`SourceFile`] with the byte offset where each of its lines starts
+/// (the first is 0, then one after each newline), from
+/// [`SourceFile::line_index`]. It borrows its file, so an index is never
+/// read against another file's text.
+#[derive(Clone, Debug)]
+pub struct LineIndex<'a> {
+    file: &'a SourceFile,
+    starts: Vec<usize>,
+}
+
+impl<'a> LineIndex<'a> {
+    /// The file this index is of.
+    pub fn file(&self) -> &'a SourceFile {
+        self.file
+    }
+
+    /// [`SourceFile::line_col`] of the same offset, by a binary search.
+    pub fn line_col(&self, offset: u32) -> (u32, u32) {
+        let offset = self.file.char_start(offset);
+        let line = self.starts.partition_point(|&start| start <= offset);
+        (line as u32, self.file.column(self.starts[line - 1], offset))
+    }
+}
+
+/// An app's source files (`App::sources`) with their line indexes, each
+/// built at its file's first lookup, for a caller that resolves many
+/// spans across files: the playground asks two positions per diagnostic
+/// and per hover type, where [`SourceFile::line_col`] alone counts the
+/// newlines from the top of the file on every call.
+pub struct SourcePositions<'a> {
+    sources: &'a [SourceFile],
+    indexes: Vec<Option<LineIndex<'a>>>,
+}
+
+impl<'a> SourcePositions<'a> {
+    pub fn new(sources: &'a [SourceFile]) -> Self {
+        SourcePositions { sources, indexes: vec![None; sources.len()] }
+    }
+
+    /// The span's file with the 1-based (line, column) of its start and
+    /// of its end, as [`SourceFile::line_col`] answers them; `None` when
+    /// the span names no file of the sources (`FileId(0)`, or past the
+    /// last one).
+    pub fn of(&mut self, span: Span) -> Option<(&'a SourceFile, (u32, u32), (u32, u32))> {
+        let n = (span.file.0 as usize).checked_sub(1)?;
+        let file = self.sources.get(n)?;
+        let index = self.indexes[n].get_or_insert_with(|| file.line_index());
+        Some((file, index.line_col(span.start), index.line_col(span.end)))
     }
 }
 
@@ -98,5 +177,56 @@ mod tests {
         let f = SourceFile { path: "a.rb".into(), text: "é = 1".into() };
         // "é" is two bytes; the `=` at byte offset 3 is character column 3.
         assert_eq!(f.line_col(3), (1, 3));
+    }
+
+    /// roundhouse#1048: a diagnostic span can carry an offset that lands
+    /// mid-character (e.g. a mistranslated template offset from a HAML
+    /// continuation). One bad offset must snap back to its char's start
+    /// rather than panicking the whole run on `text[..offset]`.
+    #[test]
+    fn line_col_snaps_a_mid_character_offset_back_to_its_char_boundary() {
+        // "é" is a 2-byte char at bytes 0..2; byte 1 lands inside it.
+        let f = SourceFile { path: "a.rb".into(), text: "é = 1".into() };
+        assert!(!f.text.is_char_boundary(1), "test setup: byte 1 must be mid-character");
+        assert_eq!(f.line_col(1), f.line_col(0));
+    }
+
+    /// The line index answers `line_col` for every offset: at line
+    /// starts and ends, inside multi-byte characters (four bytes too),
+    /// on empty lines, with `\r\n` and a lone `\r`, without a final
+    /// newline, and past the end.
+    #[test]
+    fn line_index_answers_as_line_col_for_every_offset() {
+        let texts = ["", "\n", "\n\n", "ab\ncd\nef", "ab\n", "é\nàx\n\nü", "a\r\nb\r\n", "日本\n語x", "x", "😀a\n\r😀\nb"];
+        for text in texts {
+            let f = SourceFile { path: "a.rb".into(), text: text.into() };
+            let index = f.line_index();
+            for offset in 0..text.len() as u32 + 3 {
+                assert_eq!(index.line_col(offset), f.line_col(offset), "{text:?} at {offset}");
+            }
+        }
+    }
+
+    /// Each span's positions come from its own file: the two files break
+    /// lines at different offsets (every span below answers differently
+    /// against the other file), and the spans alternate between them. A
+    /// span of no file, the synthetic `FileId(0)` or one past the last
+    /// file, has none.
+    #[test]
+    fn source_positions_answer_each_span_from_its_own_file() {
+        let sources = vec![
+            SourceFile { path: "a.rb".into(), text: "x\ny\nz".into() },
+            SourceFile { path: "b.rb".into(), text: "ab\ncd\n".into() },
+        ];
+        let mut positions = SourcePositions::new(&sources);
+        for (file, start, end) in [(1, 0, 2), (2, 3, 4), (1, 2, 4), (2, 4, 6), (1, 4, 5)] {
+            let span = Span { file: FileId(file), start, end };
+            let own = &sources[file as usize - 1];
+            let (found, start_at, end_at) = positions.of(span).expect("a span of a source file");
+            assert_eq!(found.path, own.path, "{span:?}");
+            assert_eq!((start_at, end_at), (own.line_col(start), own.line_col(end)), "{span:?}");
+        }
+        assert!(positions.of(Span::synthetic()).is_none());
+        assert!(positions.of(Span { file: FileId(3), start: 0, end: 0 }).is_none());
     }
 }

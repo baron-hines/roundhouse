@@ -1,5 +1,5 @@
 // Not a plain Hash read: Rails' `Model.statuses` is indifferent-access, so a Symbol key reads the String label it names.
-use std::collections::HashSet;
+use crate::det::HashSet;
 
 use crate::app::App;
 use crate::expr::{Expr, ExprNode};
@@ -115,9 +115,11 @@ fn is_enum_mapping(e: &Expr, mappings: &HashSet<(String, String)>) -> bool {
     let ExprNode::Const { path } = &*c.node else {
         return false;
     };
+    // A rooted `::Model` carries a leading empty segment; it names the same top-level model.
     let model = path
         .iter()
         .map(|s| s.as_str())
+        .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join("::");
     args.is_empty() && mappings.contains(&(model, method.as_str().to_string()))

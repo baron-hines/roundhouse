@@ -2,9 +2,11 @@
 //!
 //! A method named like an association can return an unrelated class. The
 //! reader must have the declared collection's analyzed type before `.new`
-//! becomes `.build`.
+//! becomes `.build`. An untyped owner's reader is untyped too. There the
+//! owner's name must name a model that declares the collection, as
+//! `scope_chain` requires before it lowers the same owner's `build`.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::app::App;
 use crate::dialect::{Association, MethodReceiver, ModelBodyItem};
@@ -12,14 +14,33 @@ use crate::expr::{Expr, ExprNode, Literal};
 use crate::ident::{ClassId, Symbol};
 use crate::ty::Ty;
 
-type Associations = HashMap<ClassId, HashMap<Symbol, ClassId>>;
+/// The readers `<model>.<name>.new` may become `build` on.
+struct Associations {
+    /// model -> name -> the target its `new` is `build` for, or `None`
+    /// when the model declares or defines the name in a way that keeps
+    /// `new` (which a superclass's declaration does not undo).
+    readers: HashMap<ClassId, HashMap<Symbol, Option<ClassId>>>,
+    /// model -> its superclass, so `Article < Publication` reads the
+    /// associations its abstract base declares.
+    parents: HashMap<ClassId, ClassId>,
+}
+
+impl Associations {
+    /// The nearest reader of `name` up `model`'s superclass chain.
+    fn target(&self, model: &ClassId, name: &Symbol) -> Option<&ClassId> {
+        std::iter::successors(Some(model), |class| self.parents.get(*class))
+            .take(self.parents.len() + 1)
+            .find_map(|class| self.readers.get(class)?.get(name))?
+            .as_ref()
+    }
+}
 
 pub fn apply_association_new_lowering(app: &mut App) {
-    let assocs: Associations = app
+    let readers: HashMap<ClassId, HashMap<Symbol, Option<ClassId>>> = app
         .models
         .iter()
         .map(|model| {
-            let mut overrides: HashSet<Symbol> = HashSet::new();
+            let mut overrides: HashSet<Symbol> = HashSet::default();
             for item in &model.body {
                 match item {
                     ModelBodyItem::Method { method, .. }
@@ -58,21 +79,43 @@ pub fn apply_association_new_lowering(app: &mut App) {
                     _ => {}
                 }
             }
-            let names = model
-                .associations()
-                .filter_map(|assoc| match assoc {
-                    Association::HasMany { name, target, .. } if !overrides.contains(name) => {
-                        Some((name.clone(), target.clone()))
+            // An extension defining `new` is what the proxy's `new` runs,
+            // not the alias of `build`, so that call stays `new` and
+            // reaches the extension. One defining `build` keeps `new` too:
+            // the proxy's `new` is bound to Rails' own `build` where the
+            // proxy class defines the alias, so the extension's `build`
+            // never runs for it, and turning `new` into `build` would
+            // call that extension. The controller rewrite expands such a
+            // `new` as Rails' build; elsewhere it is left as written. The
+            // last declaration of a name is the reader, so it alone
+            // decides.
+            let mut names = HashMap::default();
+            for assoc in model.associations() {
+                let aliased = match assoc {
+                    Association::HasMany { target, extension, .. }
+                        if !extension.iter().any(|m| matches!(m.name.as_str(), "new" | "build")) =>
+                    {
+                        Some(target.clone())
                     }
                     _ => None,
-                })
-                .collect();
+                };
+                names.insert(assoc.name().clone(), aliased);
+            }
+            for name in overrides {
+                names.insert(name, None);
+            }
             (model.name.clone(), names)
         })
         .collect();
-    if assocs.values().all(HashMap::is_empty) {
+    if readers.values().all(|names| names.values().all(Option::is_none)) {
         return;
     }
+    let parents = app
+        .models
+        .iter()
+        .filter_map(|model| Some((model.name.clone(), model.parent.clone()?)))
+        .collect();
+    let assocs = Associations { readers, parents };
 
     let model_names: HashSet<ClassId> = app.models.iter().map(|m| m.name.clone()).collect();
     // Bare association reads are valid only in instance methods. Class-side
@@ -104,6 +147,14 @@ pub fn apply_association_new_lowering(app: &mut App) {
                 ModelBodyItem::Callback { callback, .. } => {
                     if let Some(condition) = &mut callback.condition {
                         rewrite(condition, &assocs, None);
+                    }
+                }
+                ModelBodyItem::Validation { validation, .. } => {
+                    if let Some(cond) = &mut validation.if_cond {
+                        rewrite(cond, &assocs, None);
+                    }
+                    if let Some(cond) = &mut validation.unless_cond {
+                        rewrite(cond, &assocs, None);
                     }
                 }
                 ModelBodyItem::Unknown { expr, .. } => rewrite(expr, &assocs, None),
@@ -175,22 +226,20 @@ fn rewrite(expr: &mut Expr, assocs: &Associations, self_model: Option<&ClassId>)
     if !args.is_empty() {
         return;
     }
-    let model = match owner {
-        None => self_model,
-        Some(owner) if matches!(&*owner.node, ExprNode::SelfRef) => self_model,
-        Some(owner) if matches!(&*owner.node, ExprNode::Const { .. }) => None,
+    let (model, by_name) = match owner {
+        None => (self_model.cloned(), false),
+        Some(owner) if matches!(&*owner.node, ExprNode::SelfRef) => (self_model.cloned(), false),
+        Some(owner) if matches!(&*owner.node, ExprNode::Const { .. }) => (None, false),
         Some(owner) if matches!(&*owner.node, ExprNode::Send { method, .. } if method.as_str() == "class") => {
-            None
+            (None, false)
         }
         Some(owner) => match owner.ty.as_ref().map(Ty::peel_nilable) {
-            Some(Ty::Class { id, .. }) => Some(id),
-            _ => None,
+            Some(Ty::Class { id, .. }) => (Some(id.clone()), false),
+            Some(Ty::Untyped) => (super::scope_chain::owner_name_class(owner), true),
+            _ => (None, false),
         },
     };
-    let Some(target) = model
-        .and_then(|id| assocs.get(id))
-        .and_then(|names| names.get(name))
-    else {
+    let Some(target) = model.as_ref().and_then(|id| assocs.target(id, name)) else {
         return;
     };
     let is_collection = match read.ty.as_ref().map(Ty::peel_nilable) {
@@ -198,6 +247,7 @@ fn rewrite(expr: &mut Expr, assocs: &Associations, self_model: Option<&ClassId>)
             matches!(elem.peel_nilable(), Ty::Class { id, .. } if id == target)
         }
         Some(Ty::Relation { of }) => of == target,
+        Some(Ty::Untyped) => by_name,
         _ => false,
     };
     if is_collection {

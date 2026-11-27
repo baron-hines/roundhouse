@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 require_relative "errors"
 require "time"
 
@@ -59,12 +60,16 @@ module ActiveRecord
     text == "" ? nil : enum_int(text, labels, values, texts, attr)
   end
 
+  # A label wins over a stored value of the same spelling, whichever the
+  # declaration lists first, as Rails' enum type casts: with
+  # `{ sent: "done", queued: "sent" }`, "sent" is the label `sent` and
+  # stores "done". A stored value is taken only while no entry matched.
   def self.enum_str(text, labels, values, attr)
     result = text + ""
     found = text == ""
     i = 0
     while i < labels.length
-      if labels[i] == text || values[i] == text
+      if labels[i] == text || (!found && values[i] == text)
         result = values[i]
         found = true
       end
@@ -142,12 +147,43 @@ module ActiveRecord
 
   # Thin reflection surface for `Model.reflect_on_association(:name)`.
   # Campfire asks `counter_cache_column` (nil when the belongs_to did not
-  # declare `counter_cache:`). Deeper Rails reflection stays unmodeled.
+  # declare `counter_cache:`); orm_adapter asks `belongs_to?`,
+  # `foreign_key` and `options[:polymorphic]`. Deeper Rails reflection
+  # stays unmodeled.
   module Reflection
     class AssociationReflection
-      def initialize(name, counter_cache_column)
+      def initialize(name, counter_cache_column, macro, foreign_key, polymorphic)
         @name = name
         @counter_cache_column = counter_cache_column
+        @macro = macro
+        @foreign_key = foreign_key
+        @polymorphic = polymorphic
+      end
+
+      def macro
+        @macro
+      end
+
+      def belongs_to?
+        @macro == :belongs_to
+      end
+
+      def foreign_key
+        @foreign_key
+      end
+
+      def polymorphic?
+        @polymorphic
+      end
+
+      # Not every option the association was declared with: only `polymorphic:` is kept, as Rails holds it (present only when given).
+      def options
+        @polymorphic ? { polymorphic: true } : {}
+      end
+
+      # Rails' `"#{name}_type"`, of a polymorphic belongs_to only.
+      def foreign_type
+        @polymorphic ? "#{@name}_type" : nil
       end
 
       def name
@@ -158,18 +194,34 @@ module ActiveRecord
         @counter_cache_column
       end
 
-      # Catalog also types `.klass` / `.macro`; presence-only callers get
-      # nil rather than a NameError until those halves are synthesized.
+      # Catalog also types `.klass`; presence-only callers get nil rather
+      # than a NameError until that half is synthesized.
       # Bare `nil` (return-tail untyped) — not `result = nil; result`,
       # which rust emits as `Option`/`None` against a Value return
       # (issue #832). Same shape as `request_for_csrf`.
       def klass
         nil
       end
+    end
+  end
 
-      def macro
-        nil
-      end
+  # One error as Rails' `ActiveModel::Error` holds it: the attribute, the
+  # error type (the message itself when `errors.add` was given a String),
+  # the message without the attribute's name, the full message
+  # `errors` lists for it, whether the type is a Symbol, and whether
+  # Rails' `details` keeps nothing beside the type (no `count:` or `value:`).
+  # Not `ActiveModel::Error`: the strict targets emit the class unqualified, beside their own `Error`.
+  class ErrorDetail
+    # `kind`, not Rails' `type`: a field named `type` does not compile in Rust or Go
+    attr_reader :attribute, :kind, :message, :full_message, :symbolic, :optionless
+
+    def initialize(attribute, kind, message, full_message, symbolic, optionless)
+      @attribute = attribute
+      @kind = kind
+      @message = message
+      @full_message = full_message
+      @symbolic = symbolic
+      @optionless = optionless
     end
   end
 
@@ -184,60 +236,83 @@ module ActiveRecord
     def self.sanitize_sql_like(value, escape_character = "\\")
       source = value
       if escape_character != "%" && escape_character != "_" && !escape_character.empty?
-        doubled = ""
-        index = 0
-        while index < value.length
-          if value[index, escape_character.length] == escape_character
-            doubled += escape_character + escape_character
-            index += escape_character.length
-          else
-            doubled += value[index, 1]
-            index += 1
-          end
-        end
-        source = doubled
+        source = like_escapes_doubled(value, escape_character)
       end
+      like_wildcards_marked(source, escape_character)
+    end
 
+    # The helpers below hold one counter loop each, accumulating with `x = x + y` rather than `+=`: the Elixir emit turns only that shape into recursion.
+    # `gsub(escape_character, '\0\0')`: every escape character doubled.
+    def self.like_escapes_doubled(value, escape_character)
+      doubled = ""
+      index = 0
+      while index < value.length
+        piece = value[index, 1]
+        step = 1
+        if value[index, escape_character.length] == escape_character
+          piece = escape_character + escape_character
+          step = escape_character.length
+        end
+        doubled = doubled + piece
+        index += step
+      end
+      doubled
+    end
+
+    # `gsub(/(?=[%_])/, escape_character)`: the expanded replacement before each wildcard.
+    def self.like_wildcards_marked(source, escape_character)
       result = ""
       index = 0
       while index < source.length
         character = source[index, 1]
         if character == "%" || character == "_"
-          # gsub replacement escapes expand against a zero-width match here.
-          replacement_index = 0
-          while replacement_index < escape_character.length
-            replacement = escape_character[replacement_index, 1]
-            if replacement == "\\" && replacement_index + 1 < escape_character.length
-              replacement = escape_character[replacement_index + 1, 1]
-              if replacement == "\\"
-                result += replacement
-              elsif replacement == "`"
-                result += source[0, index]
-              elsif replacement == "'"
-                result += source[index, source.length - index]
-              elsif replacement == "k" && escape_character[replacement_index + 2, 1] == "<"
-                group_name = ""
-                group_index = replacement_index + 3
-                while group_index < escape_character.length && escape_character[group_index, 1] != ">"
-                  group_name += escape_character[group_index, 1]
-                  group_index += 1
-                end
-                raise RuntimeError, "invalid group name reference format" if group_index == escape_character.length
-                raise IndexError, "undefined group name reference: " + group_name
-              elsif !"0123456789&+".include?(replacement)
-                result += "\\" + replacement
-              end
-              replacement_index += 2
-            else
-              result += replacement
-              replacement_index += 1
-            end
-          end
+          result = result + like_replacement(source, index, escape_character)
         end
-        result += character
+        result = result + character
         index += 1
       end
       result
+    end
+
+    # gsub replacement escapes expand against a zero-width match at `index`.
+    def self.like_replacement(source, index, escape_character)
+      result = ""
+      replacement_index = 0
+      while replacement_index < escape_character.length
+        replacement = escape_character[replacement_index, 1]
+        step = 1
+        if replacement == "\\" && replacement_index + 1 < escape_character.length
+          step = 2
+          replacement = escape_character[replacement_index + 1, 1]
+          if replacement == "\\"
+            result = result + replacement
+          elsif replacement == "`"
+            result = result + source[0, index]
+          elsif replacement == "'"
+            result = result + source[index, source.length - index]
+          elsif replacement == "k" && escape_character[replacement_index + 2, 1] == "<"
+            like_group_reference(escape_character, replacement_index + 3)
+          elsif !"0123456789&+".include?(replacement)
+            result = result + "\\" + replacement
+          end
+        else
+          result = result + replacement
+        end
+        replacement_index += step
+      end
+      result
+    end
+
+    # A named group reference raises: the zero-width match has no groups.
+    def self.like_group_reference(escape_character, start)
+      group_name = ""
+      group_index = start
+      while group_index < escape_character.length && escape_character[group_index, 1] != ">"
+        group_name = group_name + escape_character[group_index, 1]
+        group_index += 1
+      end
+      raise RuntimeError, "invalid group name reference format" if group_index == escape_character.length
+      raise IndexError, "undefined group name reference: " + group_name
     end
 
     # No `attr_accessor :id` and no `@id` here — the key lives on each
@@ -264,6 +339,13 @@ module ActiveRecord
       raise NotImplementedError, "id=: subclasses must override"
     end
 
+    # The primary key, which is `id` unless the model names another
+    # column. A table can have both; `id` then stays that column and
+    # this method still answers the key. Models override it.
+    def _primary_key_value
+      id
+    end
+
     # `to_param` — the same contract. The lowerer synthesizes it on
     # ApplicationRecord (the key as a String, Rails' `id&.to_s`) and a
     # model may override it (lobsters' Story answers `short_id`).
@@ -272,6 +354,13 @@ module ActiveRecord
     # has a typed method to call.
     def to_param
       raise NotImplementedError, "to_param: subclasses must override"
+    end
+
+    # ActiveModel::Conversion's `to_key`: the key in a list, nil for a record not yet saved (Devise keeps it in the
+    # session as `[[id], salt]`).
+    def to_key
+      return nil unless persisted?
+      [id]
     end
 
     # Error message accumulator populated by the lowerer-emitted
@@ -287,6 +376,35 @@ module ActiveRecord
     # on a Vec doesn't exist).
     def errors
       @errors
+    end
+
+    # Each message in `errors` as Rails' `ActiveModel::Error` holds it,
+    # index for index: `errors` keeps the full messages because there is
+    # no i18n at run time to build them from these.
+    def error_details
+      @error_details
+    end
+
+    # Rails' `errors[attribute]`: the messages added on one attribute.
+    def error_messages_for(attribute)
+      out = []
+      error_details.each { |error| out << error.message if error.attribute == attribute }
+      out
+    end
+
+    # Rails' `errors.full_messages_for(attribute)`: the full messages of the errors on one attribute.
+    # The ruby-family connection.rb reopen answers them frozen, as Rails does; a strict target has no frozen Array.
+    def error_full_messages_for(attribute)
+      out = []
+      error_details.each { |error| out << error.full_message if error.attribute == attribute }
+      out
+    end
+
+    # Not `errors`, the full messages: Rails renders a record's errors keyed by attribute, as `errors.as_json` answers.
+    def errors_json
+      out = {}
+      error_details.each { |error| out[error.attribute] = error_messages_for(error.attribute) }
+      out
     end
 
     # The one frozen empty Hash a model's `initialize(attrs = …)` defaults
@@ -309,7 +427,12 @@ module ActiveRecord
     # exactly once; before this it also ran on the empty shell, where
     # `new_record?` is true and every column is blank. A distinct object
     # from EMPTY_ATTRS, which is also what a bare `Model.new` receives.
-    HYDRATE_ATTRS = {}.freeze
+    # `Hash.new`, NOT a `{}` literal: CRuby compiles `{}.freeze` to one
+    # shared frozen empty Hash, so two constants spelled that way are
+    # the same object and a bare `new` would be taken for hydration.
+    # The transpiled targets read a bare `Hash.new` constant as `{}`
+    # (`runtime_src::is_bare_hash_new`).
+    HYDRATE_ATTRS = Hash.new.freeze
 
     # `attrs = {}` keeps Base's constructor signature compatible
     # with subclasses that take attrs (`def initialize(attrs = {})`).
@@ -340,6 +463,7 @@ module ActiveRecord
       # (`self.id = (attrs[:id] || 0)` — `|| ""` for a string key), not
       # here: see the class comment on why the base holds no `@id`.
       @errors = []
+      @error_details = []
       @id_previously_changed = false
       @persisted = false
       @destroyed = false
@@ -367,6 +491,11 @@ module ActiveRecord
       table_name
     end
 
+    # A concrete STI subclass overrides this with its descendant names.
+    def self._sti_type_names
+      []
+    end
+
     def self.schema_columns
       raise NotImplementedError, "#{name}.schema_columns must be overridden"
     end
@@ -384,6 +513,19 @@ module ActiveRecord
     # lowerer (`_association_names`). Empty on Base so an unknown model
     # answers `reflect_on_association` with nil the way Rails does.
     def self._association_names
+      []
+    end
+
+    # Each association's macro, foreign key and `polymorphic:`, in `_association_names`' order (the lowerer's too).
+    def self._association_macros
+      []
+    end
+
+    def self._association_foreign_keys
+      []
+    end
+
+    def self._association_polymorphic
       []
     end
 
@@ -405,7 +547,9 @@ module ActiveRecord
       end
       assoc = names[i]
       if assoc.to_s == needle
-        return ActiveRecord::Reflection::AssociationReflection.new(assoc, nil)
+        return ActiveRecord::Reflection::AssociationReflection.new(
+          assoc, nil, _association_macros[i], _association_foreign_keys[i].to_s, _association_polymorphic[i] == true
+        )
       end
       reflect_on_association_at(needle, i + 1)
     end
@@ -454,6 +598,19 @@ module ActiveRecord
       []
     end
 
+    # The enum columns, which `where` casts through `_enum_where_value`.
+    def self.schema_enum_columns
+      []
+    end
+
+    # A `where` value on enum column `col` as its stored value. Only a
+    # column `schema_enum_columns` names reaches it, and a model with an
+    # enum overrides both, so this default never casts.
+    def self._enum_where_value(_col, _value)
+      stored = nil
+      stored
+    end
+
     def self.instantiate(_row)
       raise NotImplementedError, "#{name}.instantiate must be overridden"
     end
@@ -465,6 +622,12 @@ module ActiveRecord
     # models without one fall back to this no-op, which leaves the lazy
     # association readers doing the work (correct, just N+1).
     def self.preload_associations(_records, _specs)
+    end
+
+    # Not left to `preload_associations` alone: an `includes` whose association a condition names is a JOIN in Rails
+    # (`includes(:article).where(article: {…})`); models with such associations answer theirs.
+    def self._eager_load_joins(_specs, _conditions, _joined)
+      []
     end
 
     # Per-model adapter primitives — public AR API delegates here.
@@ -595,6 +758,11 @@ module ActiveRecord
       {}
     end
 
+    # Not the answer a record gives: each model overrides it with its columns' readers (`synth_serializable_hash`).
+    def serializable_hash
+      {}
+    end
+
     # Column-name indexer. Subclasses override with a per-column case
     # dispatch over the typed ivars (each model has a fixed set of
     # columns from the schema). The Base implementation raises so a
@@ -690,6 +858,12 @@ module ActiveRecord
     def mark_persisted!
       @persisted = true
       @destroyed = false
+    end
+
+    # Seat this record on `records`, loaded by a relation built off its
+    # has_many `name`, through that association's inverse. A model whose
+    # has_many has one answers it (generated); any other seats nothing.
+    def _set_inverse_from_queries(name, records)
     end
 
     # ---- Class-level CRUD -------------------------------------------
@@ -819,9 +993,11 @@ module ActiveRecord
     # ---- Instance lifecycle ------------------------------------------
 
     def save
-      before_validation
+      # Here and not in before_validation, which valid? runs: a
+      # direct valid? would write an unsaved belongs_to target, and
+      # Rails' does not (it autosaves in before_save).
+      _autosave_belongs_to
       ok = valid?
-      after_validation
       return false unless ok
 
       save_after_validation
@@ -837,14 +1013,15 @@ module ActiveRecord
       was_new = new_record?
       if was_new
         before_create
-        fill_timestamps(true)
-        self.id = _adapter_insert
+        fill_timestamps(true) if stamps_timestamps?
+        inserted_key = _adapter_insert
+        self.id = inserted_key unless self.class.primary_key.nil?
         @persisted = true
         __track_saved_changes(was_new)
         after_create
       else
         before_update
-        fill_timestamps(false)
+        fill_timestamps(false) if stamps_timestamps?
         _adapter_update
         __track_saved_changes(was_new)
         after_update
@@ -854,6 +1031,16 @@ module ActiveRecord
       # done, as Rails runs them after the transaction: an
       # `after_update_commit` reads what `after_save` wrote (an
       # attachment, a rich-text body), not the record half saved.
+      _save_committed(was_new)
+      true
+    end
+
+    # A save's commit callbacks. Here they run at once, since a strict
+    # target has no transaction for them to wait on; the ruby-family
+    # reopen (connection.rb) holds them until the enclosing
+    # transaction's COMMIT, and drops them on its ROLLBACK, as Rails
+    # does.
+    def _save_committed(was_new)
       if was_new
         after_create_commit
       else
@@ -861,7 +1048,12 @@ module ActiveRecord
       end
       after_save_commit
       after_commit
-      true
+    end
+
+    # `destroy`'s half of the same seam.
+    def _destroy_committed
+      after_destroy_commit
+      after_commit
     end
 
     # A row inserted raw, as Rails' fixture loader (`insert_fixtures_set`)
@@ -873,7 +1065,7 @@ module ActiveRecord
     # so loading the message fixtures left the fixture users with unread
     # rooms Rails never gives them.
     def _insert_row
-      fill_timestamps(true)
+      fill_timestamps(true) if stamps_timestamps?
       self.id = _adapter_insert
       @persisted = true
       _note_hydrated
@@ -1021,11 +1213,31 @@ module ActiveRecord
       changes.key?(name)
     end
 
+    # `to_s`: the pending diff is keyed by column-name String, and
+    # callers usually pass a Symbol.
+    def will_save_change_to_attribute?(name)
+      attribute_changed?(name.to_s)
+    end
+
     # Rails' `changed?` / `has_changes_to_save?`: any column pending.
     # campfire's `RecordCache` snapshots only records with none.
     def changed?
       changes = changes_to_save
       !changes.empty?
+    end
+
+    # ActiveModel::Dirty's names over the same diffs: `changes` is the pending one (`changes_to_save`), keyed by column
+    # String as Rails' indifferent Hash reads it; `previous_changes` the last save's; `changed` the pending columns.
+    def changes
+      changes_to_save
+    end
+
+    def previous_changes
+      saved_changes
+    end
+
+    def changed
+      changes_to_save.keys
     end
 
     def has_changes_to_save?
@@ -1035,6 +1247,24 @@ module ActiveRecord
     def attribute_was(name)
       changes = changes_to_save
       changes[name]
+    end
+
+    # `clear_<col>_change` and `restore_<col>!`: nothing is ever pending
+    # here (see `changes_to_save`), so there is nothing to forget or
+    # write back. The ruby family's connection.rb reopen holds the real
+    # ones.
+    def clear_attribute_change(name)
+      nil
+    end
+
+    def restore_attribute!(name)
+      nil
+    end
+
+    # Rails' `restore_attributes`: every pending change written back, the
+    # names it restored. None here, for the same reason.
+    def restore_attributes
+      changes_to_save.keys
     end
 
     # `id` never appears in the subclass `attributes` hash, so the
@@ -1087,8 +1317,8 @@ module ActiveRecord
     # its Message, and Message's own `belongs_to :room, touch: true`
     # is registered on `after_touch` — so without this call the
     # cascade stops one level short and a room's `updated_at` never
-    # moves. (Rails also fires the commit callbacks here; this runtime
-    # still does not, and that half of the divergence stands.)
+    # moves. (Rails also fires the commit callbacks here; the ruby-family
+    # reopen in connection.rb does, the strict targets still do not.)
     #
     # The bare form writes `updated_at` ALONE (`_adapter_touch`), as
     # Rails' `touch` does. Writing the whole row put back every column
@@ -1103,6 +1333,25 @@ module ActiveRecord
       true
     end
 
+    # `touch_later` — what Rails' `belongs_to …, touch: true` calls.
+    # Rails defers the write to just before the transaction's COMMIT and
+    # stamps each record once, however many children asked; the
+    # ruby-family reopen (connection.rb) does that. A strict target has
+    # no transaction to wait on, so here it is `touch`.
+    def touch_later
+      touch
+    end
+
+    # Whether the update that just ran wrote the row, which is what
+    # Rails' `belongs_to …, touch: true` asks (`if: :saved_changes?`)
+    # before touching the parent from `after_update`. A strict target's
+    # `save` writes the whole row every time, so the answer is always
+    # yes; the ruby-family reopen (connection.rb) skips an update with
+    # nothing pending and answers from `saved_changes`.
+    def _wrote_on_update?
+      true
+    end
+
     # `touch` after a call-site column write (`touch :connected_at`,
     # `increment!(:connections, touch: true)`): the whole row, so the
     # assigned column is written with the timestamp.
@@ -1114,12 +1363,11 @@ module ActiveRecord
     end
 
     # `destroy!` — Rails raises `RecordNotDestroyed` when a
-    # `before_destroy` callback throws `:abort`. This runtime has no
-    # abort channel (`before_destroy` returns into the void and
-    # `destroy` always completes), so the bang form is the same
-    # operation. Written out rather than aliased for the strict
-    # targets, and kept as its own method so the raise lands here when
-    # an abort channel does exist.
+    # `before_destroy` callback throws `:abort`. The strict targets have
+    # no abort channel (`throw` is reported as Ruby-only there), so the
+    # bang form is the same operation; the Ruby targets' connection.rb
+    # catches the abort and raises. Written out rather than aliased for
+    # the strict targets.
     def destroy!
       destroy
     end
@@ -1131,8 +1379,7 @@ module ActiveRecord
       @persisted = false
       @destroyed = true
       after_destroy
-      after_destroy_commit
-      after_commit
+      _destroy_committed
       self
     end
 
@@ -1169,11 +1416,12 @@ module ActiveRecord
     # transaction a plain `reload` already gives the guarantee Rails
     # extracts from the row lock: the enclosing `BEGIN` serializes
     # writers, so nothing can land between this read and a following
-    # write in the same transaction. A Postgres adapter would spell
-    # the `lock` argument as `FOR UPDATE` / `FOR SHARE` here; this
-    # runtime keeps the Rails signature — `lock` may be `true` or a
-    # String locking clause (`lock!("FOR UPDATE NOWAIT")`) — but
-    # doesn't need either under SQLite; both are accepted and ignored.
+    # write in the same transaction. This runtime keeps the Rails
+    # signature — `lock` may be `true` or a String locking clause
+    # (`lock!("FOR UPDATE NOWAIT")`) — but doesn't need either under
+    # SQLite; both are accepted and ignored. On PostgreSQL the ruby
+    # family's reopen (active_record/connection.rb) takes the row lock
+    # the clause names before this reload.
     def lock!(lock = nil)
       # Rails passes `reload(lock: lock)`; this runtime ignores the
       # clause under SQLite, so a bare reload keeps the same guarantee.
@@ -1188,6 +1436,9 @@ module ActiveRecord
     def after_initialize;  end
     def before_validation; end
     def after_validation;  end
+    # Saves each unsaved belongs_to target and takes its id into the
+    # foreign key. The ruby family fills it (`apply_belongs_to_autosave`).
+    def _autosave_belongs_to; end
     def before_save;       end
     def after_save;        end
     def before_create;     end
@@ -1239,6 +1490,11 @@ module ActiveRecord
     # `fill_timestamps({"creating" => true})` and fails to match the
     # method's `bool` param. Positional sidesteps that — TS/Crystal
     # accept either shape, Rust gets the simpler one.
+    # Not a check of the class switch: only the ruby family's connection.rb keeps one, and answers it there
+    def stamps_timestamps?
+      true
+    end
+
     def fill_timestamps(creating)
       cols = self.class.schema_columns
       now = ActiveSupport.db_now
@@ -1246,10 +1502,27 @@ module ActiveRecord
       self[:created_at] = now if creating && cols.include?(:created_at)
     end
 
+    # Rails runs the validation callbacks inside `valid?`
+    # (`run_validations!` wraps the validation chain), so a direct
+    # `valid?` runs them too, not only `save`. The answer is taken
+    # before `after_validation`, as Rails' is: an error that callback
+    # adds is on the record but does not change what `valid?` returns.
+    # The ruby family restates this in connection.rb so that a
+    # before_validation `throw :abort` halts it.
     def valid?
       @errors = []
+      @error_details = []
+      before_validation
       validate
-      @errors.empty?
+      ok = @errors.empty?
+      after_validation
+      ok
+    end
+
+    # Not ActiveModel's `ValidationError`: on a record Rails raises the `RecordInvalid` that `save!` does.
+    def validate!
+      raise RecordInvalid, self unless valid?
+      true
     end
 
     # ---- Equality ---------------------------------------------------

@@ -325,7 +325,7 @@ scripts/campfire-suite --target spinel --jobs 8 --out /tmp/wm-emit \
 Re-run with `--reuse /tmp/wm-emit` to skip the transpile. One file, ~20 s:
 
 ```
-make SPIN_TEST_FLAGS="$(spin flags|tail -1|sed 's/--require-gate //')" \
+make SPIN_TEST_FLAGS="$(spin flags|tail -1|sed -e 's/--strict-require //' -e 's/--require-gate //')" \
      SPINEL_TEST_FLAGS="-O 0 --no-inline-hot" build/test/<name>
 ```
 

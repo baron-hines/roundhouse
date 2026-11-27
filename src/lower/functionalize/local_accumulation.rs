@@ -31,7 +31,16 @@ pub fn transform_method(mut m: MethodDef) -> MethodDef {
     m
 }
 
+// Not a fresh untyped node where the rewrite only rebuilt it: the emitter dispatches on the type the body-typer stamped
 fn rewrite(e: &Expr) -> Expr {
+    let mut out = rewrite_node(e);
+    if out.ty.is_none() && std::mem::discriminant(&*out.node) == std::mem::discriminant(&*e.node) {
+        out.ty = e.ty.clone();
+    }
+    out
+}
+
+fn rewrite_node(e: &Expr) -> Expr {
     match &*e.node {
         // `x += n` / `x -= n` / … on a local → `x = x <op> n`.
         ExprNode::OpAssign { target: target @ LValue::Var { .. }, op, value } => {
@@ -50,7 +59,7 @@ fn rewrite(e: &Expr) -> Expr {
         ExprNode::Send { recv: Some(_), method, args, .. }
             if matches!(method.as_str(), "push" | "<<")
                 && args.len() == 1
-                && e.hint == Some(crate::expr::IrHint::StringBuilderAppend) =>
+                && e.hint() == &Some(crate::expr::IrHint::StringBuilderAppend) =>
         {
             // `e.clone()` (not `clone_send`, which drops `.hint` via a
             // fresh `syn`) so the emitter still sees the tag.
@@ -129,7 +138,7 @@ fn rewrite(e: &Expr) -> Expr {
                 target: target.clone(),
                 value: rewrite(value),
             });
-            a.hint = e.hint;
+            a.set_hint(*e.hint());
             a
         }
         ExprNode::Return { value } => syn(ExprNode::Return { value: rewrite(value) }),
@@ -149,13 +158,15 @@ fn clone_send(e: &Expr) -> Expr {
     let ExprNode::Send { recv, method, args, block, parenthesized } = &*e.node else {
         return e.clone();
     };
-    syn(ExprNode::Send {
+    let mut out = syn(ExprNode::Send {
         recv: recv.as_ref().map(rewrite),
         method: method.clone(),
         args: args.iter().map(rewrite).collect(),
         block: block.as_ref().map(rewrite),
         parenthesized: *parenthesized,
-    })
+    });
+    out.ty = e.ty.clone();
+    out
 }
 
 /// If `method` is an attribute setter (`foo=` with an identifier base —
@@ -282,10 +293,12 @@ mod tests {
             parent: None,
             parent_span: Default::default(),
             includes: vec![],
+            include_spans: Vec::new(),
             methods: vec![out],
             nullable_columns: Vec::new(),
             origin: None,
             constants: Vec::new(),
+            conditional_definitions: Vec::new(),
             unknown_calls: Vec::new(),
             class_ivar_initializers: Vec::new(),
         };
@@ -335,10 +348,12 @@ mod tests {
             parent: None,
             parent_span: Default::default(),
             includes: vec![],
+            include_spans: Vec::new(),
             methods: vec![transform_method(m)],
             nullable_columns: Vec::new(),
             origin: None,
             constants: Vec::new(),
+            conditional_definitions: Vec::new(),
             unknown_calls: Vec::new(),
             class_ivar_initializers: Vec::new(),
         };
@@ -350,7 +365,7 @@ mod tests {
     fn string_builder_hints_emit_iolist_and_param_resolves() {
         use crate::expr::IrHint;
         fn hinted(mut e: Expr, h: IrHint) -> Expr {
-            e.hint = Some(h);
+            e.set_hint(Some(h));
             e
         }
         // def article(article)            # param collides with the fn name
@@ -392,10 +407,12 @@ mod tests {
             parent: None,
             parent_span: Default::default(),
             includes: vec![],
+            include_spans: Vec::new(),
             methods: vec![transform_method(m)],
             nullable_columns: Vec::new(),
             origin: None,
             constants: Vec::new(),
+            conditional_definitions: Vec::new(),
             unknown_calls: Vec::new(),
             class_ivar_initializers: Vec::new(),
         };
@@ -446,10 +463,12 @@ mod tests {
             parent: None,
             parent_span: Default::default(),
             includes: vec![],
+            include_spans: Vec::new(),
             methods: vec![transform_method(m)],
             nullable_columns: Vec::new(),
             origin: None,
             constants: Vec::new(),
+            conditional_definitions: Vec::new(),
             unknown_calls: Vec::new(),
             class_ivar_initializers: Vec::new(),
         };
@@ -504,10 +523,12 @@ mod tests {
             parent: None,
             parent_span: Default::default(),
             includes: vec![],
+            include_spans: Vec::new(),
             methods: vec![transform_method(m)],
             nullable_columns: Vec::new(),
             origin: None,
             constants: Vec::new(),
+            conditional_definitions: Vec::new(),
             unknown_calls: Vec::new(),
             class_ivar_initializers: Vec::new(),
         };
@@ -523,7 +544,7 @@ mod tests {
         use crate::ty::Ty;
         // `acc[k] = v` where `acc` is a Flash struct → Flash.put.
         let mut acc = var(&s("acc"));
-        acc.ty = Some(Ty::Class { id: ClassId(s("ActionDispatch::Flash")), args: vec![] });
+        acc.ty = Some(Ty::Class { id: ClassId(s("ActionDispatch::Flash")), args: vec![].into() });
         let index_set = syn(ExprNode::Send {
             recv: Some(acc),
             method: s("[]="),
@@ -554,10 +575,12 @@ mod tests {
             parent: None,
             parent_span: Default::default(),
             includes: vec![],
+            include_spans: Vec::new(),
             methods: vec![transform_method(m)],
             nullable_columns: Vec::new(),
             origin: None,
             constants: Vec::new(),
+            conditional_definitions: Vec::new(),
             unknown_calls: Vec::new(),
             class_ivar_initializers: Vec::new(),
         };

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use roundhouse::analyze::Analyzer;
 use roundhouse::dialect::MethodReceiver;
 use roundhouse::ingest::ingest_app_from_tree;
-use roundhouse::ty::Ty;
+use roundhouse::ty::{FnTy, Ty};
 
 fn params_of(files: &[(&str, &str)], class: &str, method: &str, side: MethodReceiver) -> Vec<Ty> {
     let mut tree: HashMap<PathBuf, Vec<u8>> =
@@ -21,8 +21,9 @@ fn params_of(files: &[(&str, &str)], class: &str, method: &str, side: MethodRece
         .iter()
         .find(|m| m.name.as_str() == method && m.receiver == side)
         .expect("method");
-    let Some(Ty::Fn { params, .. }) = &def.signature else { panic!("typed: {:?}", def.signature) };
-    params.iter().map(|p| p.ty.clone()).collect()
+    let Some(Ty::Fn(fn_ty)) = &def.signature else { panic!("typed: {:?}", def.signature) };
+    let FnTy { params, .. } = &**fn_ty;
+    params.iter().map(|p| (*p.ty).clone()).collect()
 }
 
 /// The lab's `name_collision`: `self.class.get(path, options)` is the
@@ -66,15 +67,9 @@ fn the_instance_method_keeps_its_own_callers_types() {
         "get",
         MethodReceiver::Instance,
     );
-    let unknown = || Ty::Var { var: roundhouse::ident::TyVar(0) };
     assert_eq!(params[0], Ty::Str);
-    assert_eq!(
-        params[1],
-        Ty::Hash {
-            key: Box::new(Ty::Union { variants: vec![Ty::Str, unknown()] }),
-            value: Box::new(Ty::Union { variants: vec![Ty::Int, unknown()] }),
-        }
-    );
+    // Not joined with the `{}` default: the one caller passes the Hash.
+    assert_eq!(params[1], Ty::Hash { key: std::sync::Arc::new(Ty::Str), value: std::sync::Arc::new(Ty::Int) });
 }
 
 /// A constant receiver reaches the class side when both sides define the

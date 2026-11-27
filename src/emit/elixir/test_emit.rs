@@ -50,8 +50,10 @@ pub(super) fn emit_test_files(app: &App) -> Vec<EmittedFile> {
     if !app.fixtures.is_empty() {
         let lowered = crate::lower::lower_fixtures(app);
         out.push(emit_fixtures_helper(&lowered, app));
+        let held = crate::lower::validations::held_unset_columns(&app.models, &app.schema);
         for f in &lowered.fixtures {
-            out.push(emit_fixture(f));
+            let held: Vec<Symbol> = held.iter().filter(|(class, _)| *class == f.class).map(|(_, col)| col.clone()).collect();
+            out.push(emit_fixture(f, &crate::lower::fixture_to_library::temporal_columns(app, &f.class), &held));
         }
     }
 
@@ -84,8 +86,10 @@ fn known_models(app: &App) -> Vec<Symbol> {
 /// per fixture set. Mirrors `src/emit/elixir/fixture.rs`, retargeted to
 /// `*` and the model's dual-return `save` (`{record, _} = …`); the
 /// saved record carries its assigned id, so `register` uses `record.id`
-/// rather than `Roundhouse.Db.last_insert_rowid()`.
-fn emit_fixture(lowered: &crate::lower::LoweredFixture) -> EmittedFile {
+/// rather than `Roundhouse.Db.last_insert_rowid()`. A column `held` unset
+/// until assigned (`validations::held_unset_columns`) is the struct's
+/// `<col>_raw` key.
+fn emit_fixture(lowered: &crate::lower::LoweredFixture, temporal: &crate::det::HashMap<Symbol, bool>, held: &[Symbol]) -> EmittedFile {
     let fixture_name = lowered.name.as_str();
     let class_name = lowered.class.0.as_str();
     let ns = camelize(fixture_name);
@@ -99,8 +103,18 @@ fn emit_fixture(lowered: &crate::lower::LoweredFixture) -> EmittedFile {
         let label = record.label.as_str();
         let mut field_lines: Vec<String> = Vec::new();
         for field in &record.fields {
-            let col = field.column.as_str();
+            let mut col = field.column.to_string();
+            if held.contains(&field.column) {
+                col.push_str("_raw");
+            }
             let val = match &field.value {
+                // Not `<col>:`: the struct keeps a date or datetime as its stored text, under `<col>_raw`.
+                crate::lower::LoweredFixtureValue::Literal { raw, .. }
+                    if crate::lower::fixture_to_library::is_stored_temporal(temporal, &field.column, raw) =>
+                {
+                    col.push_str("_raw");
+                    format!("{raw:?}")
+                }
                 crate::lower::LoweredFixtureValue::Literal { ty, raw } => ex_literal_for(raw, ty),
                 crate::lower::LoweredFixtureValue::FkLookup {
                     target_fixture,
@@ -122,15 +136,22 @@ fn emit_fixture(lowered: &crate::lower::LoweredFixture) -> EmittedFile {
             };
             field_lines.push(format!("      {col}: {val}"));
         }
-        writeln!(s, "    record = %{class_name}{{").unwrap();
-        for (idx, line) in field_lines.iter().enumerate() {
-            if idx < field_lines.len() - 1 {
-                writeln!(s, "{line},").unwrap();
-            } else {
-                writeln!(s, "{line}").unwrap();
+        // An update of `new()`'s record, not a bare `%Class{…}`: it starts
+        // from the constructor's values (an `id` of 0, as the record's
+        // own uniqueness probe compares, rather than the struct's nil).
+        if field_lines.is_empty() {
+            writeln!(s, "    record = {class_name}.new()").unwrap();
+        } else {
+            writeln!(s, "    record = %{{{class_name}.new() |").unwrap();
+            for (idx, line) in field_lines.iter().enumerate() {
+                if idx < field_lines.len() - 1 {
+                    writeln!(s, "{line},").unwrap();
+                } else {
+                    writeln!(s, "{line}").unwrap();
+                }
             }
+            writeln!(s, "    }}").unwrap();
         }
-        writeln!(s, "    }}").unwrap();
         writeln!(s, "    {{record, ok}} = {class_name}.save(record)").unwrap();
         writeln!(
             s,
@@ -214,7 +235,7 @@ fn ex_literal_for(value: &str, ty: &crate::ty::Ty) -> String {
         Ty::Bool => match value {
             "true" | "1" => "true".into(),
             "false" | "0" => "false".into(),
-            _ => format!("false # TODO: coerce {value:?}"),
+            _ => crate::emit::diagnostics::report_unsupported(crate::span::Span::synthetic(), "elixir", "fixture value", format!("{value:?} for a Boolean column")),
         },
         _ => format!("{value:?}"),
     }
@@ -262,7 +283,7 @@ fn emit_controller_test(tm: &TestModule, app: &App) -> EmittedFile {
     for test in &tm.tests {
         writeln!(s).unwrap();
         writeln!(s, "  test {:?} do", test.name).unwrap();
-        let body = emit_controller_test_body(test, app, ctx);
+        let body = emit_controller_test_body(test, tm.setup.as_ref(), app, ctx);
         if body.trim().is_empty() {
             writeln!(s, "    :ok").unwrap();
         } else {
@@ -285,12 +306,16 @@ fn emit_controller_test(tm: &TestModule, app: &App) -> EmittedFile {
     }
 }
 
-fn emit_controller_test_body(test: &Test, app: &App, ctx: ExTestCtx) -> String {
+fn emit_controller_test_body(test: &Test, setup: Option<&Expr>, app: &App, ctx: ExTestCtx) -> String {
     let mut out = String::new();
     // Prime ivars read without assignment: `@article` → `article =
     // Fixtures.Articles.one()`.
     let walked = crate::lower::walk_controller_ivars(&test.body);
     for ivar in walked.ivars_read_without_assign() {
+        if let Some((fixture, label)) = setup.and_then(|s| setup_fixture(s, &ivar, ctx)) {
+            out.push_str(&format!("{} = Fixtures.{}.{}()\n", ivar.as_str(), camelize(fixture.as_str()), label));
+            continue;
+        }
         let plural = pluralize_snake(ivar.as_str());
         if ctx.fixture_names.iter().any(|s| s.as_str() == plural) {
             let ns = camelize(&plural);
@@ -303,6 +328,18 @@ fn emit_controller_test_body(test: &Test, app: &App, ctx: ExTestCtx) -> String {
         out.push('\n');
     }
     out
+}
+
+/// The `@<ivar> = <fixture>(:<label>)` a setup assigns, as (fixture, label).
+fn setup_fixture(setup: &Expr, ivar: &Symbol, ctx: ExTestCtx) -> Option<(Symbol, String)> {
+    let value = crate::lower::test_body_stmts(setup).into_iter().rev().find_map(|stmt| match &*stmt.node {
+        ExprNode::Assign { target: LValue::Ivar { name }, value } if name == ivar => Some(value),
+        _ => None,
+    })?;
+    let ExprNode::Send { recv: None, method, args, .. } = &*value.node else { return None };
+    let [arg] = args.as_slice() else { return None };
+    let ExprNode::Lit { value: Literal::Sym { value: label } } = &*arg.node else { return None };
+    ctx.fixture_names.contains(method).then(|| (method.clone(), label.to_string()))
 }
 
 fn emit_ctrl_test_stmt(stmt: &Expr, app: &App, ctx: ExTestCtx) -> String {
@@ -368,7 +405,10 @@ fn emit_ctrl_test_send(
             "unprocessable_entity" | "unprocessable_content" => {
                 "TestResponse.assert_unprocessable(resp)".to_string()
             }
-            other => format!("TestResponse.assert_status(resp, 200) # TODO: {other:?}"),
+            other => match crate::lower::controller_test::asserted_status_code(other) {
+                Some(code) => format!("TestResponse.assert_status(resp, {code})"),
+                None => crate::emit::diagnostics::report_unsupported(crate::span::Span::synthetic(), "elixir", "assert_response", format!("`:{other}` names no single status")),
+            },
         },
         Some(ControllerTestSend::AssertRedirectedTo { url }) => {
             format!("TestResponse.assert_redirected_to(resp, {})", emit_url_expr(url, app, ctx))
@@ -426,10 +466,7 @@ fn emit_assert_select(
 ) -> String {
     use crate::lower::AssertSelectKind;
     let ExprNode::Lit { value: Literal::Str { value: selector } } = &*selector_expr.node else {
-        return format!(
-            "TestResponse.assert_select(resp, {}) # TODO: dynamic selector",
-            emit_ctrl_test_expr(selector_expr, app, ctx),
-        );
+        return crate::emit::diagnostics::report_unsupported(selector_expr.span, "elixir", "assert_select", "a selector computed when the test runs");
     };
     match kind {
         AssertSelectKind::Text(expr) => {
@@ -520,6 +557,10 @@ fn emit_ctrl_test_expr(expr: &Expr, app: &App, ctx: ExTestCtx) -> String {
             if method.as_str().ends_with("_url") || method.as_str().ends_with("_path") {
                 return emit_url_expr(expr, app, ctx);
             }
+            // Not a call: each request binds what it answers to `resp`.
+            if method.as_str() == "response" && args.is_empty() {
+                return "resp".to_string();
+            }
             let args_s: Vec<String> =
                 args.iter().map(|a| emit_ctrl_test_expr(a, app, ctx)).collect();
             if args_s.is_empty() {
@@ -545,7 +586,22 @@ fn emit_ctrl_test_expr(expr: &Expr, app: &App, ctx: ExTestCtx) -> String {
                 .collect();
             format!("%{{{}}}", parts.join(", "))
         }
-        _ => "nil # TODO expr".to_string(),
+        ExprNode::StringInterp { parts } => crate::emit::shared::interp::render(
+            parts,
+            &crate::emit::shared::interp::InterpDelims {
+                open_quote: "\"",
+                close_quote: "\"",
+                expr_open: "#{",
+                expr_close: "}",
+            },
+            |e| emit_ctrl_test_expr(e, app, ctx),
+            |value| {
+                let mut out = String::new();
+                super::expr::push_escaped(&mut out, value);
+                out
+            },
+        ),
+        other => crate::emit::diagnostics::report_unsupported(expr.span, "elixir", other.kind_str(), "in a controller test"),
     }
 }
 
@@ -676,7 +732,7 @@ fn emit_model_test_expr(e: &Expr, ctx: ExTestCtx) -> String {
                 .collect();
             format!("%{{{}}}", parts.join(", "))
         }
-        _ => format!("# TODO: model test emit for {:?}", std::mem::discriminant(&*e.node)),
+        other => crate::emit::diagnostics::report_unsupported(e.span, "elixir", other.kind_str(), "in a model test"),
     }
 }
 
@@ -757,6 +813,28 @@ fn emit_model_test_send(
         }
     }
 
+    // `assert_predicate rec, :m?` / `refute_predicate rec, :m?` → the
+    // model's `m?(rec)`; `valid?` is dual-return, `{record, ok}`, and a
+    // local receiver is rebound to the validated record, so a later
+    // `errors` read sees what the check set.
+    if recv.is_none()
+        && matches!(method, "assert_predicate" | "refute_predicate")
+        && args.len() == 2
+        && let ExprNode::Lit { value: Literal::Sym { value: pred } } = &*args[1].node
+        && let Some(module) = receiver_module(&args[0], ctx)
+    {
+        let verb = if method == "assert_predicate" { "assert" } else { "refute" };
+        return if pred.as_str() == "valid?" {
+            let bound = match &*args[0].node {
+                ExprNode::Var { .. } => args_s[0].clone(),
+                _ => "_record".to_string(),
+            };
+            format!("{{{bound}, ok}} = {module}.valid?({})\n{verb} ok", args_s[0])
+        } else {
+            format!("{verb} {module}.{}({})", pred.as_str(), args_s[0])
+        };
+    }
+
     // Assertion macros → ExUnit assert/refute. `assert_not <save>` /
     // `assert <save>` destructure the model's dual-return save.
     if recv.is_none() {
@@ -785,28 +863,50 @@ fn emit_model_test_send(
         }
     }
 
-    // `Class.new(hash)` → `%Class{ k: v, … }` struct literal (bare class
-    // name resolves to `%Class{}` via the alias).
-    if let Some(r) = recv {
-        if method == "new" && args.len() == 1 {
-            if let ExprNode::Const { path } = &*r.node {
-                if let Some(class) = path.last() {
-                    if ctx.known_models.iter().any(|s| s == class) {
-                        if let ExprNode::Hash { entries, .. } = &*args[0].node {
-                            let pairs: Vec<String> = entries
-                                .iter()
-                                .filter_map(|(k, v)| match &*k.node {
-                                    ExprNode::Lit { value: Literal::Sym { value: f } } => {
-                                        Some(format!("{}: {}", f.as_str(), emit_model_test_expr(v, ctx)))
-                                    }
-                                    _ => None,
-                                })
-                                .collect();
-                            return format!("%{}{{{}}}", class, pairs.join(", "));
-                        }
-                    }
-                }
-            }
+    // `Class.new(hash)` → the model's `new(attrs)`, which writes each
+    // value through its column's slot.
+    if let Some(r) = recv
+        && method == "new"
+        && args.len() == 1
+        && let ExprNode::Const { path } = &*r.node
+        && let Some(class) = path.last()
+        && ctx.known_models.iter().any(|s| s == class)
+        && matches!(&*args[0].node, ExprNode::Hash { .. })
+    {
+        return format!("{class}.new({})", args_s[0]);
+    }
+
+    // A record's writer → its module's `set_<col>`, rebinding the local:
+    // `slot.position = 4` → `slot = Slot.set_position(slot, 4)`.
+    if let Some(r) = recv
+        && let ExprNode::Var { name, .. } = &*r.node
+        && args.len() == 1
+        && let Some(col) = method.strip_suffix('=')
+        && !matches!(method, "==" | "!=" | "<=" | ">=" | "===" | "[]=")
+        && let Some(module) = receiver_module(r, ctx)
+    {
+        return format!("{name} = {module}.set_{col}({name}, {})", args_s[0]);
+    }
+
+    // A reader the struct has no key for → its module's function: a
+    // column held unset until assigned (`<col>_raw`), or a method the
+    // model defines (`Slot.next_position(slot)`).
+    if let Some(r) = recv
+        && args.is_empty()
+        && !matches!(&*r.node, ExprNode::Const { .. })
+        && let Some(module) = receiver_module(r, ctx)
+        && let Some(model) = ctx.app.models.iter().find(|m| m.name.0.as_str().rsplit("::").next() == Some(module.as_str()))
+    {
+        let held = crate::lower::validations::held_unset_columns(&ctx.app.models, &ctx.app.schema)
+            .iter()
+            .any(|(class, col)| *class == model.name && col.as_str() == method);
+        let defined = model.methods().any(|d| {
+            matches!(d.receiver, crate::dialect::MethodReceiver::Instance) && d.name.as_str() == method
+        });
+        // `save!` and the like: the runtime's, on every model module.
+        let runtime = matches!(method, "save!" | "save");
+        if held || defined || runtime {
+            return format!("{module}.{method}({})", emit_model_test_expr(r, ctx));
         }
     }
 
@@ -895,6 +995,26 @@ fn emit_block_body(e: &Expr, ctx: ExTestCtx) -> String {
 /// Module name for an instance call's receiver — fixture var names follow
 /// the snake-cased class name (`article` → `Article`, aliased to
 /// `Article`).
+/// The model module a test receiver is a record of: its type, the model
+/// its local is named after (`slot`), or the class a finder or `new`
+/// is called on (`Slot.find(id)`).
+fn receiver_module(recv: &Expr, ctx: ExTestCtx) -> Option<String> {
+    let name = match (&recv.ty, &*recv.node) {
+        (Some(crate::ty::Ty::Class { id, .. }), _) => id.0.as_str().rsplit("::").next()?.to_string(),
+        (_, ExprNode::Var { name, .. }) => camelize(name.as_str()),
+        (_, ExprNode::Send { recv: Some(c), method, .. })
+            if matches!(method.as_str(), "new" | "find" | "find_by" | "create" | "create!" | "first" | "last") =>
+        {
+            match &*c.node {
+                ExprNode::Const { path } => path.last()?.to_string(),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    ctx.known_models.iter().any(|s| s.as_str() == name).then_some(name)
+}
+
 fn camelize_recv(recv: &Expr) -> String {
     match &*recv.node {
         ExprNode::Var { name, .. } => camelize(name.as_str()),

@@ -72,25 +72,40 @@ fn line_containing(src: &str, needle: &str) -> String {
         .to_string()
 }
 
-/// The mapping travels as the declaration's two parallel arrays.
+/// The mapping travels as the declaration's parallel arrays, defined
+/// once on the model rather than built at every read and write.
 #[test]
 fn the_enum_columns_writers_map_the_label() {
     let src = user_src();
     for (site, needle) in [
         (
             "update",
-            "self.role = ActiveRecord.enum_int((attrs[:role]).to_s,",
+            "self.role = ActiveRecord.enum_int(attrs[:role].to_s,",
         ),
-        ("[]=", "@role = ActiveRecord.enum_int((value).to_s,"),
+        ("[]=", "@role = ActiveRecord.enum_int(value.to_s,"),
     ] {
         assert!(
             src.contains(needle),
             "the {site} writer must map the label:\n{src}"
         );
     }
+    for constant in [
+        r#"ROLE_ENUM_LABELS = ["member", "administrator", "bot"]"#,
+        "ROLE_ENUM_VALUES = [0, 1, 2]",
+        r#"ROLE_ENUM_TEXTS = ["0", "1", "2"]"#,
+    ] {
+        assert!(
+            src.contains(constant),
+            "the declaration's labels and stored values are the model's constants:\n{src}"
+        );
+    }
     assert!(
-        src.contains(r#"["member", "administrator", "bot"], [0, 1, 2]"#),
-        "the declaration's labels and stored values ride along:\n{src}"
+        src.contains("User::ROLE_ENUM_LABELS, User::ROLE_ENUM_VALUES, User::ROLE_ENUM_TEXTS, \"role\")"),
+        "the writer reads them rather than literal arrays:\n{src}"
+    );
+    assert!(
+        !src.contains(r#"["member", "administrator", "bot"], [0, 1, 2]"#),
+        "no read or write builds the arrays itself:\n{src}"
     );
 }
 
@@ -102,7 +117,7 @@ fn initialize_stores_the_default_and_maps_explicit_input() {
     assert!(src.contains("@role = 0"), "raw schema default:\n{src}");
     let line = line_containing(&src, "self.role = ActiveRecord.enum_int");
     assert!(
-        line.contains("(attrs[:role]).to_s") && line.ends_with("if attrs.key?(:role)"),
+        line.contains("(attrs[:role].to_s") && line.ends_with("if attrs.key?(:role)"),
         "only explicit input must pass through the mapping:\n{line}"
     );
 }

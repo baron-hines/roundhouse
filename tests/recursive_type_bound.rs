@@ -23,10 +23,10 @@ use std::time::{Duration, Instant};
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
-use roundhouse::analyze::{diagnose, Analyzer, FixpointRounds, LoopEnd, Severity};
+use roundhouse::analyze::{diagnose, Analyzer, FixpointRounds, LoopEnd, Restamp, Severity};
 use roundhouse::ident::{ClassId, Symbol};
 use roundhouse::ingest::ingest_app_from_tree;
-use roundhouse::ty::Ty;
+use roundhouse::ty::{FnTy, Ty};
 
 const TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -148,10 +148,13 @@ fn measure(ty: &Ty) -> (usize, usize) {
         Ty::Record { row } => (row.fields.values().collect(), !row.fields.is_empty()),
         Ty::Union { variants } => (variants.iter().collect(), false),
         Ty::Class { args, .. } => (args.iter().collect(), !args.is_empty()),
-        Ty::Fn { params, block, ret, .. } => (
-            params.iter().map(|p| &p.ty).chain(block.as_deref()).chain(std::iter::once(&**ret)).collect(),
-            true,
-        ),
+        Ty::Fn(fn_ty) => {
+            let FnTy { params, block, ret, .. } = &**fn_ty;
+            (
+                params.iter().map(|p| &*p.ty).chain(block.as_deref()).chain(std::iter::once(&**ret)).collect(),
+                true,
+            )
+        },
         _ => (Vec::new(), false),
     };
     let (mut depth, mut nodes) = (0, 1);
@@ -289,7 +292,8 @@ fn assert_settles(settled: &Settled) {
     assert!(
         production_settles
             && matches!(rounds.views_and_tests, LoopEnd::Settled(_))
-            && rounds.absorb != LoopEnd::RanToCap,
+            && rounds.absorb != LoopEnd::RanToCap
+            && matches!(rounds.restamp.end, LoopEnd::Settled(_)),
         "the fixpoint stopped on a round cap: {rounds:?}"
     );
 }
@@ -335,6 +339,114 @@ fn a_self_recursive_walk_settles_bounded() {
     );
     assert_bounded(&settled);
     assert_settles(&settled);
+}
+
+/// #1494's shape: `score_label` is fed from a view, so its param is only
+/// re-joined after the views are typed, from `shown_score`'s
+/// `Integer | String` return.
+const SCORE_HELPER: &str = r#"
+module ScoreHelper
+  def shown_score(size)
+    if size > 3
+      size
+    else
+      "~"
+    end
+  end
+
+  def score_label(score)
+    if score.is_a? Integer
+      "n#{score}"
+    else
+      "~"
+    end
+  end
+end
+"#;
+
+/// The restamp takes one production pass of its budget: the first re-join
+/// moves the param, and the second moves nothing.
+#[test]
+fn a_view_fed_helper_param_settles_the_restamp_in_one_pass() {
+    let settled = analyze(
+        &[
+            ("app/controllers/trees_controller.rb", "class TreesController < ApplicationController\n  def index\n    @size = 5\n  end\nend\n"),
+            ("app/helpers/score_helper.rb", SCORE_HELPER),
+            ("app/views/trees/index.html.erb", "<% score = shown_score(@size) %>\n<%= score_label(score) %>\n"),
+        ],
+        &[],
+    );
+    assert!(settled.errors.is_empty(), "errors: {:#?}", settled.errors);
+    assert_eq!(settled.rounds.restamp, Restamp { end: LoopEnd::Settled(1), rounds: 2, passes: 1 });
+}
+
+/// Each helper's argument is the previous helper's return in the view, so
+/// each re-join moves the next helper's param.
+const SCORE_CHAIN_HELPER: &str = r#"
+module ScoreHelper
+  def shown_score(size)
+    if size > 3
+      size
+    else
+      "~"
+    end
+  end
+
+  def first_score(score) = score
+  def second_score(score) = score
+  def third_score(score) = score
+end
+"#;
+
+/// The restamp re-joins after every production pass: one pass per helper
+/// on the chain and one that moves nothing, not a pass that moves a return
+/// and a pass that confirms it for each helper.
+#[test]
+fn a_chain_of_view_fed_helper_params_takes_one_restamp_pass_per_helper() {
+    let settled = analyze(
+        &[
+            ("app/controllers/trees_controller.rb", "class TreesController < ApplicationController\n  def index\n    @size = 5\n  end\nend\n"),
+            ("app/helpers/score_helper.rb", SCORE_CHAIN_HELPER),
+            ("app/views/trees/index.html.erb", "<% a = shown_score(@size) %>\n<% b = first_score(a) %>\n<% c = second_score(b) %>\n<%= third_score(c) %>\n"),
+        ],
+        &[("ScoreHelper", "shown_score", false), ("ScoreHelper", "third_score", false)],
+    );
+    assert!(settled.errors.is_empty(), "errors: {:#?}", settled.errors);
+    let shown = settled.returns.iter().find(|(name, _)| name == "ScoreHelper#shown_score").map(|(_, ty)| ty);
+    let third = settled.params.iter().find(|(name, _)| name == "ScoreHelper#third_score[0]").map(|(_, ty)| ty);
+    assert_eq!(third, shown, "third_score's param is shown_score's Integer | String");
+    assert_eq!(settled.rounds.restamp, Restamp { end: LoopEnd::Settled(4), rounds: 5, passes: 4 });
+}
+
+/// `shown`'s param is `nil` from production and gains `String` from the
+/// view, so the absorb loop retypes the chain below it, one method a round,
+/// and runs out of rounds before the end of the chain.
+fn chained_helper(links: usize) -> String {
+    let mut helper = String::from("module ScoreHelper\n  def shown(label) = label\n\n  def chain_0 = shown(nil)\n");
+    for i in 1..=links {
+        helper.push_str(&format!("  def chain_{i} = chain_{}\n", i - 1));
+    }
+    helper + "end\n"
+}
+
+/// The restamp's first re-join moves no param, but the absorb loop stopped
+/// on its cap with returns still moving, so the restamp retypes production
+/// before it can settle.
+#[test]
+fn a_capped_absorb_loop_is_followed_by_a_restamp_pass() {
+    let helper = chained_helper(16);
+    let settled = analyze(
+        &[
+            ("app/controllers/trees_controller.rb", "class TreesController < ApplicationController\n  def index\n  end\nend\n"),
+            ("app/helpers/score_helper.rb", helper.as_str()),
+            ("app/views/trees/index.html.erb", "<%= shown(\"a\") %>\n"),
+        ],
+        &[],
+    );
+    assert!(settled.errors.is_empty(), "errors: {:#?}", settled.errors);
+    assert_eq!(settled.rounds.absorb, LoopEnd::RanToCap);
+    assert!(settled.rounds.restamp.passes >= 1, "restamp: {:?}", settled.rounds.restamp);
+    assert_ne!(settled.rounds.restamp.end, LoopEnd::Settled(0));
 }
 
 /// The call sites live in the class, so analysis sees the same feedback

@@ -78,7 +78,7 @@ pub fn rust_ty(ty: &Ty) -> String {
             // the Const-emit decision in `expr.rs`.
             name.rsplit("::").next().unwrap_or(name).to_string()
         }
-        Ty::Fn { .. } => "Box<dyn Fn()>".to_string(),
+        Ty::Fn(_) => "Box<dyn Fn()>".to_string(),
         Ty::Var { .. } => "serde_json::Value".to_string(),
         // RBS `untyped` is pervasive in HWIA / Parameters / view_helpers
         // (the gradual-typing escape hatch). rust commits this to
@@ -125,7 +125,7 @@ mod tests {
     #[test]
     fn heterogeneous_nilable_union_is_value_shaped() {
         let ty = Ty::Union {
-            variants: vec![Ty::Str, Ty::Int, Ty::Float, Ty::Bool, Ty::Nil],
+            variants: vec![Ty::Str, Ty::Int, Ty::Float, Ty::Bool, Ty::Nil].into(),
         };
         assert!(rust_value_shaped(&ty));
         assert_eq!(rust_ty(&ty), "serde_json::Value");
@@ -134,7 +134,7 @@ mod tests {
     #[test]
     fn string_or_array_union_is_value_shaped() {
         let ty = Ty::Union {
-            variants: vec![Ty::Str, Ty::Array { elem: Box::new(Ty::Untyped) }],
+            variants: vec![Ty::Str, Ty::Array { elem: std::sync::Arc::new(Ty::Untyped) }].into(),
         };
         assert!(rust_value_shaped(&ty));
         assert_eq!(rust_ty(&ty), "serde_json::Value");
@@ -143,7 +143,7 @@ mod tests {
     #[test]
     fn string_symbol_union_is_not_value_shaped() {
         let ty = Ty::Union {
-            variants: vec![Ty::Str, Ty::Sym],
+            variants: vec![Ty::Str, Ty::Sym].into(),
         };
         assert!(!rust_value_shaped(&ty));
         assert!(ty.is_stringish());
@@ -152,7 +152,7 @@ mod tests {
     #[test]
     fn option_string_is_not_value_shaped() {
         let ty = Ty::Union {
-            variants: vec![Ty::Str, Ty::Nil],
+            variants: vec![Ty::Str, Ty::Nil].into(),
         };
         assert!(!rust_value_shaped(&ty));
         assert!(rust_ty(&ty).starts_with("Option<"));

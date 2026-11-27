@@ -53,7 +53,7 @@
 //! diagnostic `diagnose` would otherwise raise for `authenticate_by`
 //! resolves instead of accumulating as phantom modeling debt.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::app::App;
 use crate::diagnostic::Diagnostic;
@@ -99,6 +99,25 @@ fn rewrite_body(body: &mut Expr, secure: &HashMap<ClassId, Vec<Symbol>>) {
 
 fn rewrite(expr: &mut Expr, secure: &HashMap<ClassId, Vec<Symbol>>) {
     expr.node.for_each_child_mut(&mut |c| rewrite(c, secure));
+    // A `begin`'s body, each `rescue` clause's, its `else` and its
+    // `ensure` are statement lists as a method body is, so a slot holding
+    // one statement can become the Seq the prelude goes into. A method
+    // with a trailing `rescue` (campfire's `SessionsController#create`,
+    // `rescue ActiveRecord::RecordInvalid`) puts its whole body here.
+    if let ExprNode::BeginRescue { body, rescues, else_branch, ensure, .. } = &mut *expr.node {
+        let slots = std::iter::once(body)
+            .chain(rescues.iter_mut().map(|clause| &mut clause.body))
+            .chain(else_branch.as_deref_mut())
+            .chain(ensure.as_deref_mut());
+        for slot in slots {
+            if !matches!(&*slot.node, ExprNode::Seq { .. }) {
+                if let Some(prelude) = take_claim(slot, secure) {
+                    hoist(slot, prelude);
+                }
+            }
+        }
+        return;
+    }
     let ExprNode::Seq { exprs } = &mut *expr.node else { return };
     for e in exprs {
         if let Some(prelude) = take_claim(e, secure) {
@@ -244,12 +263,12 @@ fn argument_entries(arg: &Expr) -> Option<Vec<(Expr, Expr)>> {
 
 fn optional(class: &ClassId) -> Ty {
     Ty::Union {
-        variants: vec![Ty::Class { id: class.clone(), args: vec![] }, Ty::Nil],
+        variants: vec![Ty::Class { id: class.clone(), args: vec![].into() }, Ty::Nil].into(),
     }
 }
 
 fn build(plan: &Plan, span: Span) -> Vec<Expr> {
-    let self_ty = Ty::Class { id: plan.class.clone(), args: vec![] };
+    let self_ty = Ty::Class { id: plan.class.clone(), args: vec![].into() };
     let typed = |node: ExprNode, ty: Ty| {
         let mut e = Expr::new(span, node);
         e.ty = Some(ty);
@@ -310,6 +329,7 @@ fn build(plan: &Plan, span: Span) -> Vec<Expr> {
     // Every declared password must verify. `authenticate` answers the
     // record or `false`, so the calls compose with `&&` directly —
     // the same truthiness the surface API is built on.
+    let auth_ty = Ty::Union { variants: vec![self_ty.clone(), Ty::Bool].into() };
     let mut check: Option<Expr> = None;
     for (attr, plaintext) in &plan.passwords {
         let call = typed(
@@ -320,7 +340,7 @@ fn build(plan: &Plan, span: Span) -> Vec<Expr> {
                 block: None,
                 parenthesized: true,
             },
-            self_ty.clone(),
+            auth_ty.clone(),
         );
         check = Some(match check {
             None => call,
@@ -331,7 +351,7 @@ fn build(plan: &Plan, span: Span) -> Vec<Expr> {
                     left: prev,
                     right: call,
                 },
-                self_ty.clone(),
+                auth_ty.clone(),
             ),
         });
     }

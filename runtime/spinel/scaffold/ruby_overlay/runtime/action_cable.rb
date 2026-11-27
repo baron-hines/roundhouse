@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # ActionCable — the framework surface an app's OWN channels sit on, plus
 # the low-level publish API that model code calls directly.
 #
@@ -106,22 +107,14 @@ module ActionCable
     # API. campfire calls it from `User#deactivate` and
     # `User#reset_remote_connections`.
     #
-    # The set it selects is EMPTY here, and that is STILL a divergence
-    # after subscription dispatch: connections now carry an identity and
-    # channels read `current_user` off it, so the selection is finally
-    # expressible — but nothing indexes live connections by user, and
-    # `Cable::Reactor`'s table is keyed by socket. Closing it means an
-    # index the reactor maintains on attach and drops on close, plus a
-    # posted close for each hit.
-    #
-    # WHAT IT COSTS UNTIL THEN: a deactivated or banned user's open
-    # socket keeps its subscriptions. The membership check in
-    # `RoomMessagesChannel` runs at SUBSCRIBE time, which is exactly the
-    # window campfire's own comment calls out ("revoking a membership
-    # disconnects the user with reconnect: true, and the client then
-    # replays its subscriptions") — the replay is now authorized, the
-    # disconnect that forces it is not. Recorded in
-    # docs/pipeline/runtime.md rather than left as a silent no-op.
+    # As Rails does it: `disconnect` broadcasts on the selected
+    # identifier's internal channel (`RemoteConnection` below), and each
+    # identified `Cable::Connection` subscribed to its own internal
+    # channel when it started, so the message closes exactly the sockets
+    # of that user. The membership check in `RoomMessagesChannel` runs at
+    # SUBSCRIBE time, and this close is what makes the client replay its
+    # subscriptions through it ("revoking a membership disconnects the
+    # user with reconnect: true", campfire's own comment).
     def remote_connections
       raise STUB_RAISE[0] if STUB_RAISE_ON[0]
       RemoteConnections.new
@@ -246,9 +239,8 @@ module ActionCable
   end
 
   # The `where(…)` half of the above: a selection over connections
-  # identified by their connection identifiers. Holds no state because
-  # the selection is always empty; `disconnect` is what a caller does
-  # with it.
+  # identified by their connection identifiers. The selection is a NAME,
+  # as in Rails — the identifier text — not a set of sockets.
   class RemoteConnections
     def where(identifiers)
       if Server::EXPECT_COUNT[0] >= 0
@@ -256,20 +248,68 @@ module ActionCable
         admitted = Server::EXPECT_USERS.length == 1 && current_user == Server::EXPECT_USERS[0]
         raise "unexpected invocation: remote_connections.where(current_user: #{current_user&.id})" unless admitted
       end
-      RemoteConnection.new
+      RemoteConnection.new(ActionCable.connection_identifier(identifiers.values))
     end
   end
 
+  # Rails' `RemoteConnection#disconnect` broadcasts
+  # `{ type: "disconnect", reconnect: }` on the selected connections'
+  # INTERNAL CHANNEL, `action_cable/<connection identifier>`; every live
+  # connection subscribed to its own internal channel when it connected,
+  # and closes itself on that message. Both halves are on this lane: the
+  # broadcast here, the subscription and the close in `cable.rb`
+  # (`Cable::Connection#start`, `Cable::Registry.deliver`).
   class RemoteConnection
+    def initialize(identifier = "")
+      @identifier = identifier
+    end
+
+    def internal_channel
+      "action_cable/#{@identifier}"
+    end
+
     def disconnect(reconnect: false)
       if Server::EXPECT_COUNT[0] >= 0
         if reconnect != Server::EXPECT_RECONNECT[0]
           raise "unexpected invocation: remote_connection.disconnect(reconnect: #{reconnect})"
         end
         Server::EXPECT_CALLS[0] += 1
+        # A mocked graph stands in for the real object, as under mocha:
+        # the expectation is the whole effect.
+        return nil
       end
+      ActionCable.server.broadcast(internal_channel, { type: "disconnect", reconnect: reconnect })
       nil
     end
+  end
+
+  # Rails' `Connection::Identification#connection_gid`: each identifier
+  # that is set, as its GlobalID param when it has one, sorted and joined
+  # by ":". The same text names a connection's internal channel on the
+  # socket side and the selection on the broadcasting side.
+  # Rails' `ActionCable::INTERNAL`, the two tables an app reads:
+  # campfire closes a connection whose session has ended with
+  # `close reason: ActionCable::INTERNAL[:disconnect_reasons][:unauthorized]`.
+  # Rails' scalar entries (`default_mount_path`, `protocols`) are left out,
+  # so every value is a table of Strings; an app reading one is an error.
+  INTERNAL = {
+    message_types: {
+      welcome: "welcome",
+      disconnect: "disconnect",
+      ping: "ping",
+      confirmation: "confirm_subscription",
+      rejection: "reject_subscription"
+    }.freeze,
+    disconnect_reasons: {
+      unauthorized: "unauthorized",
+      invalid_request: "invalid_request",
+      server_restart: "server_restart",
+      remote: "remote"
+    }.freeze
+  }.freeze
+
+  def self.connection_identifier(values)
+    values.compact.map { |o| o.respond_to?(:to_gid_param) ? o.to_gid_param : o.to_s }.sort.join(":")
   end
 
   SERVER = Server.new
@@ -401,6 +441,18 @@ module ActionCable
         nil
       end
 
+      def stop_all_streams
+        @connection.stop_streams(self) unless @connection.nil?
+        @streams.clear
+        nil
+      end
+
+      def transmit(data)
+        @connection.transmit({ identifier: @identifier, message: data })
+        nil
+      end
+      private :transmit
+
       def stream_for(record)
         stream_from(broadcasting_for(record))
       end
@@ -489,6 +541,54 @@ module ActionCable
       end
 
       def after_unsubscribe
+        nil
+      end
+
+      # Rails' `Channel::Base` public instance methods (actioncable 8.1,
+      # less Object's). An inherited method of one of these names is not
+      # an action. The same list is `CABLE_BASE_PUBLIC_METHODS` in
+      # `src/project.rs`, which writes the spinel lane's dispatch - the
+      # two lanes must agree on what a client can call.
+      RAILS_BASE_PUBLIC_METHODS = %w[
+        __callbacks _run_subscribe_callbacks _run_subscribe_callbacks!
+        _run_unsubscribe_callbacks _run_unsubscribe_callbacks! _subscribe_callbacks
+        _unsubscribe_callbacks broadcast_to broadcasting_for channel_name connection
+        handler_for_rescue identifier logger params perform_action periodic_timers=
+        pubsub rescue_handlers rescue_handlers= rescue_handlers? rescue_with_handler
+        run_callbacks stop_all_streams stop_stream_for stop_stream_from stream_for
+        stream_from stream_or_reject_for subscribe_to_channel unsubscribe_from_channel
+        unsubscribed?
+      ].freeze
+
+      # Written into every channel by `ingest::channel_callbacks`; class
+      # machinery in Rails, never an action (`CABLE_SYNTHESIZED_METHODS`).
+      SYNTHESIZED_METHODS = %w[after_subscribe after_unsubscribe channel_name].freeze
+
+      # Rails' `action_methods`: the channel's public methods with its
+      # ancestors' and mixins', less this base's (and Rails' base's),
+      # plus the ones the class defines itself.
+      def self.action_methods
+        @action_methods ||= begin
+          inherited = public_instance_methods(true) - ActionCable::Channel::Base.public_instance_methods(true)
+          names = (inherited.map(&:to_s) - RAILS_BASE_PUBLIC_METHODS) + public_instance_methods(false).map(&:to_s)
+          (names.uniq - SYNTHESIZED_METHODS).freeze
+        end
+      end
+
+      # Rails' `perform_action`: the client's `perform("start", {...})`,
+      # with Rails' own calling rule - a method of arity exactly 1 gets
+      # `data` (its `"action"` key still in it), anything else is called
+      # with no arguments. A rejected subscription and an action the
+      # channel does not answer run nothing and are logged; a raise
+      # propagates to `Cable::Dispatch.perform`, which reports it.
+      def perform_action(data)
+        name = data["action"].to_s
+        action = name.empty? ? "receive" : name
+        if !@rejected && self.class.action_methods.include?(action)
+          method(action).arity == 1 ? public_send(action, data) : public_send(action)
+        else
+          warn "[cable] Unable to process #{self.class}##{action}"
+        end
         nil
       end
     end
@@ -581,9 +681,15 @@ module ActionCable
       # controllers use. Handing it a real signed jar is what makes
       # `connect` the app's code rather than a reimplementation of it.
       attr_reader :cookies
+      attr_writer :request
+
+      def request
+        @request ||= ActionDispatch::Request.for({})
+      end
 
       def initialize(cookies)
         @cookies = cookies
+        @request = nil
       end
 
       # Rails' Base does not define `connect`; a subclass that wants
@@ -594,9 +700,67 @@ module ActionCable
         nil
       end
 
+      # Rails' `connection_identifier`, over the one identifier there is:
+      # "" for an anonymous connection, which then has no internal channel.
+      def connection_identifier
+        ActionCable.connection_identifier([ current_user ])
+      end
+
       def reject_unauthorized_connection
         raise Authorization::UnauthorizedError,
               "ActionCable::Connection: the handshake carried no identified user"
+      end
+
+      # Rails' `socket`: the live connection this one was accepted on
+      # (`Cable::Connection` sets it), or `Connection::TestCase`'s
+      # `TestSocket`. Rails 8.2 hands both `close` and `perform_work` to
+      # the socket, and so does this: what a test asserts is what the
+      # socket was told.
+      attr_accessor :transport
+
+      def stop_streams(channel)
+        live = @transport
+        live.stop_streams(channel) unless live.nil?
+        nil
+      end
+
+      def transmit(data)
+        @transport.transmit(data) unless @transport.nil?
+        nil
+      end
+
+      # Rails' `beat`, called on every server heartbeat. Rails' transmits
+      # the ping; here the server's shared heartbeat writes it, so the base
+      # does nothing else and an app's override (campfire's session check)
+      # runs after it.
+      def beat
+        nil
+      end
+
+      # Rails' `perform_work(receiver, method)`, delegated to the socket as
+      # Rails 8.2 delegates it: the live one runs it on a worker rather
+      # than the heartbeat's thread, with a database connection; a test's
+      # runs it inline. With no socket, inline. Modeled for a callable and
+      # `:call`, the one shape an app passes.
+      def perform_work(receiver, method_name)
+        unless method_name.to_s == "call"
+          raise ArgumentError, "ActionCable perform_work: only (callable, :call) is modeled"
+        end
+        live = @transport
+        if live.nil?
+          receiver.call
+        else
+          live.perform_work(receiver)
+        end
+        nil
+      end
+
+      # Rails' `close(reason:, reconnect:)`: tell the client why and whether
+      # to come back, then close the socket.
+      def close(reason: nil, reconnect: true)
+        live = @transport
+        live.close_with_reason(reason, reconnect) unless live.nil?
+        nil
       end
     end
   end

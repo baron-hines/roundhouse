@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Rails' HTTP Token and Basic authentication helpers
 # (`ActionController::HttpAuthentication::Token::ControllerMethods` and
 # `::Basic::ControllerMethods`), which actionpack mixes into every
@@ -75,6 +76,22 @@ module ActionController
       result
     end
 
+    # Rails' `http_basic_authenticate_or_request_with` (actionpack
+    # http_authentication.rb), which mission_control-jobs' basic
+    # authentication calls: both names compared, then both answers.
+    def http_basic_authenticate_or_request_with(name:, password:, realm: nil, message: nil)
+      authenticate_or_request_with_http_basic(realm.nil? ? "Application" : realm, message) do |given_name, given_password|
+        # Not `nil.to_s`: an unset credential would admit an empty one, where Rails' compare raises.
+        if name.nil? || password.nil?
+          false
+        else
+          name_ok = MessageDigest.secure_compare(given_name.to_s, name.to_s)
+          password_ok = MessageDigest.secure_compare(given_password.to_s, password.to_s)
+          name_ok && password_ok
+        end
+      end
+    end
+
     def request_http_basic_authentication(realm = "Application", message = nil)
       headers["WWW-Authenticate"] = "Basic realm=\"#{realm.delete("\"")}\""
       render(message.nil? ? "HTTP Basic: Access denied.\n" : message,
@@ -88,7 +105,7 @@ module ActionController
     def self.authorization(controller)
       req = controller.request
       return "" if req.nil?
-      req.env.fetch("HTTP_AUTHORIZATION", "").to_s
+      req.authorization.to_s
     end
 
     # The `key=value` pairs after the scheme, the first one keyed
@@ -97,10 +114,10 @@ module ActionController
     def self.token_pairs(header)
       pairs = []
       rest = nil
-      if header.start_with?("Token ")
-        rest = header[6, header.length].to_s
-      elsif header.start_with?("Bearer ")
-        rest = header[7, header.length].to_s
+      parts = header.split(" ", 2)
+      scheme = parts[0].to_s.downcase
+      if scheme == "token" || scheme == "bearer"
+        rest = parts[1].to_s
       end
       return pairs if rest.nil?
       rest.tr(";\t", ",,").split(",").each do |raw|

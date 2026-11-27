@@ -13,6 +13,8 @@
 //! other call to that script in this file sits inside a `run: |` block,
 //! which is why the shape looked right.
 
+#[path = "support/scratch.rs"]
+mod scratch;
 use std::fs;
 use std::path::Path;
 
@@ -75,8 +77,7 @@ fn spinel_cache_download_failure_falls_back_without_hiding_build_failures() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let root = std::env::temp_dir().join(format!("spinel-cache-{}-{unique}", std::process::id()));
-    fs::create_dir(&root).unwrap();
+    let root = scratch::dir(&format!("spinel-cache-{unique}"));
     let env_file = root.join("github-env");
     let summary = root.join("summary");
     let output = Command::new("bash")
@@ -166,8 +167,7 @@ fn campfire_docker_recipe_avoids_a_frontend_pull_and_ships_executable_boot() {
         .unwrap()
         .as_nanos();
     let root =
-        std::env::temp_dir().join(format!("campfire-docker-{}-{unique}", std::process::id()));
-    fs::create_dir(&root).unwrap();
+        scratch::dir(&format!("campfire-docker-{unique}"));
     let result = std::process::Command::new("bash")
         .arg("scripts/campfire-docker-files")
         .arg(&root)
@@ -187,14 +187,42 @@ fn campfire_docker_recipe_avoids_a_frontend_pull_and_ships_executable_boot() {
             & 0o777,
         0o755
     );
+    // Published `-p` only reaches non-loopback; #865's development default
+    // is localhost, so the image must pin BINDING (campfire-smoke-docker
+    // went red on every tip after 4f9c0410 until this landed).
+    assert!(
+        dockerfile.contains("ENV BINDING=0.0.0.0\n"),
+        "Dockerfile must publish on 0.0.0.0:\n{dockerfile}"
+    );
     fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
-fn campfire_docker_smoke_caches_apt_for_eight_hours_and_always_builds() {
+fn campfire_docker_smoke_caches_apt_for_eight_hours_and_skips_without_tgz() {
     let workflow: serde_yaml_ng::Value =
         serde_yaml_ng::from_str(&fs::read_to_string(".github/workflows/ci.yml").unwrap()).unwrap();
+    let archive = &workflow["jobs"]["campfire-archive-build"];
+    assert_eq!(
+        archive["outputs"]["docker_tgz"].as_str(),
+        Some("${{ steps.docker-tgz.outputs.present }}")
+    );
+    let mark = archive["steps"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .find(|step| {
+            step["name"].as_str() == Some("Record whether campfire/docker.tgz was produced")
+        })
+        .expect("producer must mark docker.tgz presence");
+    assert_eq!(mark["id"].as_str(), Some("docker-tgz"));
+    assert_eq!(mark["if"].as_str(), Some("always()"));
+
     let job = &workflow["jobs"]["campfire-smoke-docker"];
+    let gate = job["if"].as_str().unwrap();
+    assert!(
+        gate.contains("needs.campfire-archive-build.outputs.docker_tgz == 'true'"),
+        "smoke-docker must skip when pack did not produce docker.tgz: {gate}"
+    );
     let steps = job["steps"].as_sequence().unwrap();
     let step = |name: &str| {
         steps
@@ -264,8 +292,18 @@ fn campfire_docker_smoke_caches_apt_for_eight_hours_and_always_builds() {
         "HTTP checks must always run"
     );
     assert!(
+        script.contains("seq 1 90")
+            && script.contains("did not become ready")
+            && script.contains("http_code"),
+        "readiness must wait longer than 30s and retry status curls (curl exit 56 flake)"
+    );
+    assert!(
         !script.contains("sccache") && !script.contains("CCACHE"),
         "do not hide the pack compile behind a compiler cache"
+    );
+    assert!(
+        script.contains("despite producer docker_tgz=true"),
+        "missing tgz after a true gate is an error, not a soft pack skip"
     );
 
     let save = step("Save Campfire Docker apt layers");
@@ -371,6 +409,38 @@ fn host_libvips_dev_jobs_share_cached_apt_deb_install() {
         // Still a .deb cache around ci-apt-install — never a dpkg-state restore.
         assert!(step.get("run").is_none(), "{job_name}");
     }
+
+    for (job_name, step_name, packages) in [
+        (
+            "unit",
+            "System libvips for the emitted ruby-vips processor",
+            "libvips42",
+        ),
+        ("campfire-compare", "System libvips", "libvips42 sqlite3"),
+        (
+            "campfire-conformance",
+            "Install libvips (ruby-vips binds it through FFI) and ffmpeg",
+            "libvips42 ffmpeg",
+        ),
+    ] {
+        let step = workflow["jobs"][job_name]["steps"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .find(|step| step["name"].as_str() == Some(step_name))
+            .unwrap_or_else(|| panic!("{job_name}: missing {step_name}"));
+        assert_eq!(
+            step["uses"].as_str(),
+            Some("./.github/actions/ci-apt-install-cached"),
+            "{job_name}"
+        );
+        assert_eq!(
+            step["with"]["packages"].as_str(),
+            Some(packages),
+            "{job_name}"
+        );
+        assert_eq!(step["timeout-minutes"].as_u64(), Some(20), "{job_name}");
+    }
 }
 
 #[test]
@@ -396,16 +466,6 @@ fn rust_ci_uses_the_repository_pin_before_restoring_caches() {
             }
         }
     }
-    let wasm_setup = workflow["jobs"]["build-wasm"]["steps"]
-        .as_sequence()
-        .unwrap()
-        .iter()
-        .find(|step| step["uses"].as_str() == Some("./.github/actions/setup-rust"))
-        .unwrap();
-    assert_eq!(
-        wasm_setup["with"]["targets"].as_str(),
-        Some("wasm32-wasip1")
-    );
     let smoke_setup = workflow["jobs"]["smoke"]["steps"]
         .as_sequence()
         .unwrap()
@@ -430,8 +490,7 @@ fn rust_setup_exports_the_selected_toolchain_for_generated_projects() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let root = std::env::temp_dir().join(format!("rust-setup-{}-{unique}", std::process::id()));
-    fs::create_dir(&root).unwrap();
+    let root = scratch::dir(&format!("rust-setup-{unique}"));
     let rustup = root.join("rustup");
     // A different version catches hard-coded exports, and the trailing
     // explanation catches exporting the whole active-toolchain output.
@@ -492,7 +551,7 @@ fn pr_archives_remain_tested_without_pages_publication_work() {
     assert_eq!(
         jobs["build-site"]["if"].as_str(),
         Some(
-            "${{ !cancelled() && contains(fromJSON(needs.plan.outputs.jobs), 'build-site') && needs.generate-fixture.result == 'success' && (needs.plan.outputs.site != 'true' || needs.build-wasm.result == 'success') }}"
+            "${{ !cancelled() && contains(fromJSON(needs.plan.outputs.jobs), 'build-site') && needs.generate-fixture.result == 'success' }}"
         )
     );
     assert_eq!(jobs["smoke"]["needs"][0].as_str(), Some("build-site"));
@@ -566,7 +625,7 @@ fn pr_archives_remain_tested_without_pages_publication_work() {
     assert_eq!(
         jobs["assemble-site"]["if"].as_str(),
         Some(
-            "${{ !cancelled() && needs.plan.outputs.publish == 'true' && needs.build-site.result == 'success' && needs.archive-results.result == 'success' }}"
+            "${{ !cancelled() && needs.plan.outputs.publish == 'true' && needs.build-site.result == 'success' && needs.build-wasm.result == 'success' && needs.archive-results.result == 'success' }}"
         )
     );
     assert!(
@@ -702,8 +761,8 @@ fn campfire_comparisons_require_an_uploaded_binary_and_report_blocking() {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let summary =
-            std::env::temp_dir().join(format!("campfire-ready-{}-{unique}.md", std::process::id()));
+        let summary_dir = scratch::dir(&format!("campfire-ready-{unique}"));
+        let summary = summary_dir.join("summary.md");
         let output = Command::new("bash")
             .args(["-e", "-c", report["run"].as_str().unwrap()])
             .env("ARTIFACT_ID", artifact_id)
@@ -712,7 +771,7 @@ fn campfire_comparisons_require_an_uploaded_binary_and_report_blocking() {
             .unwrap();
         assert!(output.status.success(), "{output:?}");
         assert_eq!(fs::read_to_string(&summary).unwrap(), expected);
-        fs::remove_file(summary).unwrap();
+        fs::remove_dir_all(summary_dir).unwrap();
     }
 }
 
@@ -745,11 +804,7 @@ fn shared_debug_roundhouse_reaches_campfire_consumers_via_roundhouse_bin() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let root = std::env::temp_dir().join(format!(
-        "roundhouse-bin-helper-{}-{unique}",
-        std::process::id()
-    ));
-    fs::create_dir_all(&root).unwrap();
+    let root = scratch::dir(&format!("roundhouse-bin-helper-{unique}"));
     let marker = root.join("invoked.txt");
     let fake = root.join("fake-roundhouse");
     // Staged producer stand-in: records argv and, when given -o, writes a
@@ -987,8 +1042,8 @@ fn campfire_failure_capture_keeps_the_original_exit_and_actual_c() {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root =
-            std::env::temp_dir().join(format!("campfire-ci {}-{unique}", std::process::id()));
+        // Canonical: macOS's temp dir is a symlink, and the script reports the real path.
+        let root = scratch::dir(&format!("campfire-ci {unique}"));
         let source = root.join("build/campfire-compare-spinel");
         fs::create_dir_all(source.join("app/models")).unwrap();
         fs::create_dir_all(source.join("sig")).unwrap();
@@ -1017,7 +1072,7 @@ fn campfire_failure_capture_keeps_the_original_exit_and_actual_c() {
         .unwrap();
         for (path, body) in [
             (
-                "bin/cargo",
+                "bin/roundhouse",
                 "#!/bin/sh\necho emit-output >&2\nexit \"$EMIT_EXIT\"\n",
             ),
             (
@@ -1044,6 +1099,10 @@ fn campfire_failure_capture_keeps_the_original_exit_and_actual_c() {
                 root.join("bin").display(),
                 std::env::var("PATH").unwrap()
             ),
+        );
+        command.env(
+            "ROUNDHOUSE_BIN",
+            root.join("bin/roundhouse").to_string_lossy().as_ref(),
         );
         command.env("EMIT_EXIT", emit_exit.to_string());
         command.env("BUILD_EXIT", build_exit.to_string());
@@ -1139,9 +1198,32 @@ fn spinel_model_differential_does_not_wait_for_the_gc_comparison_build() {
     let ci: serde_yaml_ng::Value = serde_yaml_ng::from_str(&src).expect("parse CI workflow");
     let jobs = &ci["jobs"];
     let db = &jobs["campfire-spinel-db"];
-    assert_eq!(db["needs"][0].as_str(), Some("spinel-build"));
-    assert_eq!(db["needs"][1].as_str(), Some("plan"));
+    let db_needs: Vec<_> = db["needs"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .filter_map(|n| n.as_str())
+        .collect();
+    assert!(
+        db_needs.contains(&"spinel-build") && db_needs.contains(&"plan"),
+        "db differential still needs the Spinel toolchain and plan: {db_needs:?}"
+    );
+    assert!(
+        db_needs.contains(&"build-roundhouse"),
+        "db differential must reuse the same-run debug binary: {db_needs:?}"
+    );
+    assert!(
+        !db_needs.contains(&"campfire-spinel-build"),
+        "db differential must not wait on the GC comparison producer: {db_needs:?}"
+    );
     assert_eq!(db["continue-on-error"].as_bool(), Some(true));
+    assert!(
+        db["if"]
+            .as_str()
+            .unwrap()
+            .contains("needs.build-roundhouse.outputs.roundhouse-bin-artifact-id != ''"),
+        "missing producer binary must block the db job, not cargo-fallback"
+    );
 
     let command = "scripts/campfire-db-differential --spinel /tmp/campfire";
     let db_steps = db["steps"].as_sequence().expect("DB job steps");
@@ -1392,16 +1474,43 @@ fn pr_reuse_receipts_are_checked_against_adversarial_inputs() {
 fn reused_checks_keep_cargo_dependencies_locked_and_upload_only_execution_receipts() {
     let ci: serde_yaml_ng::Value =
         serde_yaml_ng::from_str(&fs::read_to_string(".github/workflows/ci.yml").unwrap()).unwrap();
-    for (name, expected_cargo_commands) in [("store-check", 1)] {
+    for name in ["store-check"] {
         let steps = ci["jobs"][name]["steps"].as_sequence().unwrap();
-        let commands: Vec<_> = steps
+        let commands = steps
             .iter()
             .filter_map(|step| step["run"].as_str())
             .flat_map(str::lines)
             .map(str::trim)
-            .filter(|line| line.starts_with("cargo "))
-            .collect();
-        assert_eq!(commands.len(), expected_cargo_commands);
+            .filter(|line| line.starts_with("cargo "));
+        assert!(
+            commands.clone().any(|command| {
+                let mut args = command.split_whitespace().skip(1);
+                if args.next() != Some("build") {
+                    return false;
+                }
+                let mut options = args.clone().zip(args.skip(1));
+                options
+                    .clone()
+                    .any(|(flag, value)| flag == "--profile" && value == "dev")
+                    && options.any(|(flag, value)| flag == "--bin" && value == "emit_preview")
+            }),
+            "{name}: missing the development bench build"
+        );
+        assert!(
+            steps
+                .iter()
+                .filter_map(|step| step["run"].as_str())
+                .flat_map(str::lines)
+                .any(|line| {
+                    let mut args = line.split_whitespace();
+                    args.next() == Some("target/debug/emit_preview")
+                        && args
+                            .clone()
+                            .zip(args.skip(1))
+                            .any(|(flag, _)| flag == "--target")
+                }),
+            "{name}: missing the bench execution"
+        );
         for command in commands {
             assert!(
                 command.split_whitespace().any(|flag| flag == "--locked"),

@@ -1,0 +1,12 @@
+# a moderator's pages (log in as a moderator: alice in the seed)
+#! login alice@example.com
+GET /mod/
+GET /mod/flagged_stories/1w
+GET /mod/flagged_comments/1w
+GET /mod/commenters/1w
+GET /moderations
+GET /moderators
+GET /mod/stories/{story}/edit
+GET /mod/mails
+GET /hats
+GET /mod_mails

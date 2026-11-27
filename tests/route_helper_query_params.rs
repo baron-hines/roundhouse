@@ -13,7 +13,7 @@
 
 use roundhouse::ingest::ingest_app_from_tree;
 use roundhouse::lower::lower_routes_to_library_functions;
-use roundhouse::ty::{ParamKind, Ty};
+use roundhouse::ty::{FnTy, ParamKind, Ty};
 
 const SCHEMA: &str = "ActiveRecord::Schema.define(version: 1) do\n  \
     create_table :rooms do |t|\n    t.string :name\n  end\n  \
@@ -48,8 +48,9 @@ fn params(app: &roundhouse::App, name: &str) -> Vec<roundhouse::ty::Param> {
         .signature
         .clone()
         .expect("helper signature");
-    let Ty::Fn { params, .. } = sig else { panic!("not a Ty::Fn: {sig:?}") };
-    params
+    let Ty::Fn(fn_ty) = sig else { panic!("not a Ty::Fn: {sig:?}") };
+    let FnTy { params, .. } = *fn_ty;
+    params.to_vec()
 }
 
 /// The `#` literal `append_anchor` emits, as it reads in the debug
@@ -275,7 +276,7 @@ fn an_array_valued_option_takes_an_array_parameter() {
     // `Array[Integer] | Nil` — nilable because every query key is a
     // keyword defaulting to nil, and `Integer` because `param_ty`
     // types the SINGULAR (`user_id`) it is named after.
-    let Ty::Union { variants } = &user_ids.ty else {
+    let Ty::Union { variants } = &*user_ids.ty else {
         panic!("expected a nilable union: {:?}", user_ids.ty)
     };
     assert!(
@@ -299,7 +300,7 @@ fn a_mixed_array_and_scalar_option_stays_scalar() {
         .iter()
         .find(|p| p.name.as_str() == "user_ids")
         .unwrap_or_else(|| panic!("no user_ids parameter: {ps:?}"));
-    let Ty::Union { variants } = &user_ids.ty else {
+    let Ty::Union { variants } = &*user_ids.ty else {
         panic!("expected a nilable union: {:?}", user_ids.ty)
     };
     assert!(
@@ -361,7 +362,7 @@ fn a_record_valued_non_id_query_key_is_a_string() {
         .iter()
         .find(|p| p.name.as_str() == "before")
         .unwrap_or_else(|| panic!("no before parameter: {ps:?}"));
-    let Ty::Union { variants } = &before.ty else {
+    let Ty::Union { variants } = &*before.ty else {
         panic!("expected a nilable union: {:?}", before.ty)
     };
     assert!(

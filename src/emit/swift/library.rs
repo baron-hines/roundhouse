@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use crate::dialect::{AccessorKind, LibraryClass, MethodDef, MethodReceiver};
 use crate::emit::EmittedFile;
 use crate::expr::{Expr, ExprNode, LValue};
-use crate::ty::Ty;
+use crate::ty::{FnTy, Ty};
 
 use super::expr::{begin_method, emit_expr, wrap_return};
 use super::naming::{camel, type_name};
@@ -103,6 +103,37 @@ pub fn emit_module(methods: &[MethodDef]) -> Result<String, String> {
         .map(|s| type_name(s.as_str()))
         .unwrap_or_default();
     register_params_for(&name, methods);
+    // Not left bare: a module renders with no class context, so a bare call to a throwing sibling would get no `try`
+    let qualified: Vec<MethodDef>;
+    let methods: &[MethodDef] = match methods.first().and_then(|m| m.enclosing_class.as_ref()) {
+        Some(owner) => {
+            let owner = crate::ident::ClassId(owner.clone());
+            let names: crate::det::HashSet<crate::ident::Symbol> = methods.iter().map(|m| m.name.clone()).collect();
+            qualified = methods
+                .iter()
+                .cloned()
+                .map(|mut m| {
+                    super::route_errors::qualify_siblings(&mut m.body, &owner, &names);
+                    m
+                })
+                .collect();
+            &qualified
+        }
+        None => methods,
+    };
+    loop {
+        let mut changed = false;
+        for m in methods {
+            let method = camel(m.name.as_str());
+            if !super::expr::throws_lookup(&name, &method) && super::expr::body_throws(&m.body, &name) {
+                super::expr::register_throws(format!("{name}.{method}"));
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
     let mut out = format!("enum {name} {{\n");
     out.push_str(&emit_module_ivars(methods, &BTreeMap::new()));
     for m in methods {
@@ -125,13 +156,13 @@ pub fn emit_module(methods: &[MethodDef]) -> Result<String, String> {
 /// install as instance props so reads/assigns resolve.
 fn emit_module_ivars(methods: &[MethodDef], exclude: &BTreeMap<String, Ty>) -> String {
     let mut ivars: BTreeMap<String, IvarInfo> = BTreeMap::new();
-    let mut containers: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
+    let mut containers: crate::det::HashMap<String, String> =
+        crate::det::HashMap::default();
     for m in methods {
         collect_ivars(&m.body, &mut ivars);
         containers.extend(super::expr::container_scan(&m.body));
     }
-    let mut props: std::collections::HashMap<String, Ty> = std::collections::HashMap::new();
+    let mut props: crate::det::HashMap<String, Ty> = crate::det::HashMap::default();
     let mut out = String::new();
     for (n, info) in &ivars {
         props.insert(n.clone(), info.ty.clone().unwrap_or(Ty::Untyped));
@@ -227,7 +258,7 @@ pub fn emit_test_class(
         collect_ivars(&m.body, &mut body_ivars);
     }
 
-    let mut all_props: std::collections::HashMap<String, Ty> = std::collections::HashMap::new();
+    let mut all_props: crate::det::HashMap<String, Ty> = crate::det::HashMap::default();
     // RoundhouseTestCase (RhTestSupport.swift): XCTestCase + the per-test
     // DB-reset/fixture-reload hook + the controller-test dispatch surface.
     out.push_str(&format!("final class {class_name}: RoundhouseTestCase {{\n"));
@@ -302,15 +333,17 @@ fn class_accessor_props(methods: &[MethodDef]) -> BTreeMap<String, Ty> {
         }
         match m.kind {
             AccessorKind::AttributeReader => {
-                if let Some(Ty::Fn { ret, .. }) = m.signature.as_ref() {
+                if let Some(Ty::Fn(fn_ty)) = m.signature.as_ref() {
+                    let FnTy { ret, .. } = &**fn_ty;
                     props.entry(camel(m.name.as_str())).or_insert_with(|| (**ret).clone());
                 }
             }
             AccessorKind::AttributeWriter => {
-                if let Some(Ty::Fn { params, .. }) = m.signature.as_ref() {
+                if let Some(Ty::Fn(fn_ty)) = m.signature.as_ref() {
+                    let FnTy { params, .. } = &**fn_ty;
                     if let Some(p) = params.first() {
                         let base = m.name.as_str().trim_end_matches('=');
-                        props.entry(camel(base)).or_insert_with(|| p.ty.clone());
+                        props.entry(camel(base)).or_insert_with(|| (*p.ty).clone());
                     }
                 }
             }
@@ -341,12 +374,20 @@ pub fn register_throws_contract(class: &str, method_camel: &str) {
 /// (via the swift_units transform) and the models; `swift::emit` resets
 /// the registries once at start.
 pub fn register_classes(lcs: &[LibraryClass]) {
+    // Not only in the loop below: a module listed before the error classes it raises would run its throws fixpoint without them
+    for lc in lcs {
+        if let Some(p) = &lc.parent
+            && is_core_error(p.0.as_str().rsplit("::").next().unwrap_or(""))
+        {
+            super::expr::register_error_class(type_name(lc.name.0.as_str()));
+        }
+    }
     for lc in lcs {
         let cls = type_name(lc.name.0.as_str());
         // Pure readers collapse into properties, so they're NOT methods
         // at call sites; the merged subscript registers under a marker
         // key for override detection.
-        let mut methods: std::collections::HashSet<String> = lc
+        let mut methods: crate::det::HashSet<String> = lc
             .methods
             .iter()
             .filter(|m| {
@@ -367,13 +408,13 @@ pub fn register_classes(lcs: &[LibraryClass]) {
         // walk.
         if let Some(p) = &lc.parent {
             let pn = p.0.as_str().rsplit("::").next().unwrap_or("");
-            if matches!(pn, "StandardError" | "RuntimeError" | "Exception") {
+            if is_core_error(pn) {
                 super::expr::register_error_class(cls.clone());
             } else {
                 super::expr::register_class_parent(cls.clone(), type_name(p.0.as_str()));
             }
         }
-        let mut statics: std::collections::HashMap<String, String> = lc
+        let mut statics: crate::det::HashMap<String, String> = lc
             .methods
             .iter()
             .filter(|m| m.receiver == MethodReceiver::Class && m.kind == AccessorKind::Method)
@@ -398,8 +439,8 @@ pub fn register_classes(lcs: &[LibraryClass]) {
             .iter()
             .find(|m| m.receiver == MethodReceiver::Instance && m.name.as_str() == "initialize")
         {
-            let (decl, fwd, sig) = render_params(init);
-            super::expr::register_class_init(cls.clone(), decl, fwd, sig);
+            let (_, fwd, sig) = render_params(init);
+            super::expr::register_class_init(cls.clone(), bare_param_decl(init), fwd, sig);
         }
         // Throws registration to a FIXPOINT: a method calling a sibling
         // that throws (processAction → create) becomes throwing itself.
@@ -496,7 +537,7 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
             m.kind == AccessorKind::AttributeReader && signature_ret_is_time(m.signature.as_ref())
         })
         .collect();
-    let temporal_cols: std::collections::HashSet<String> =
+    let temporal_cols: crate::det::HashSet<String> =
         temporal_readers.iter().map(|m| camel(m.name.as_str())).collect();
 
     // 1. Accessor-derived properties (name → type), and the set of method
@@ -510,7 +551,8 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
                 if temporal_cols.contains(&camel(m.name.as_str())) {
                     continue;
                 }
-                if let Some(Ty::Fn { ret, .. }) = m.signature.as_ref() {
+                if let Some(Ty::Fn(fn_ty)) = m.signature.as_ref() {
+                    let FnTy { ret, .. } = &**fn_ty;
                     prop_types
                         .entry(camel(m.name.as_str()))
                         .or_insert_with(|| (**ret).clone());
@@ -518,10 +560,11 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
             }
             AccessorKind::AttributeWriter => {
                 let base = m.name.as_str().trim_end_matches('=');
-                if let Some(Ty::Fn { params, .. }) = m.signature.as_ref() {
+                if let Some(Ty::Fn(fn_ty)) = m.signature.as_ref() {
+                    let FnTy { params, .. } = &**fn_ty;
                     if let Some(p) = params.first() {
                         // writer name is `foo=`; strip the `=`.
-                        prop_types.entry(camel(base)).or_insert_with(|| p.ty.clone());
+                        prop_types.entry(camel(base)).or_insert_with(|| (*p.ty).clone());
                     }
                 }
             }
@@ -555,7 +598,7 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
     // collapsed readers) so the expression walker can coerce
     // untyped-map → typed-property assigns and resolve self-receiver
     // property-vs-method reads.
-    let mut all_props: std::collections::HashMap<String, Ty> =
+    let mut all_props: crate::det::HashMap<String, Ty> =
         prop_types.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     for (n, info) in &body_ivars {
         let ty = pure_readers
@@ -564,6 +607,12 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
             .or_else(|| info.ty.clone())
             .unwrap_or(Ty::Untyped);
         all_props.entry(n.clone()).or_insert(ty);
+    }
+    // The temporal computed properties (`createdAt`), so `self.created_at`
+    // reads the property instead of calling it.
+    for m in &temporal_readers {
+        let ret = m_sig_ret(m).unwrap_or(Ty::Union { variants: vec![Ty::Time, Ty::Nil].into() });
+        all_props.entry(camel(m.name.as_str())).or_insert(ret);
     }
     super::expr::set_instance_prop_types(all_props);
     super::expr::set_current_class(&class_name);
@@ -578,10 +627,7 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
     // (`expr::set_error_class`).
     let is_error_class = matches!(
         &lc.parent,
-        Some(p) if matches!(
-            p.0.as_str().rsplit("::").next().unwrap_or(""),
-            "StandardError" | "RuntimeError" | "Exception"
-        )
+        Some(p) if is_core_error(p.0.as_str().rsplit("::").next().unwrap_or(""))
     );
     super::expr::set_error_class(is_error_class);
     let header = match &lc.parent {
@@ -593,6 +639,10 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
     out.push_str(" {\n");
     if is_error_class {
         out.push_str("    var message: String = \"\"\n");
+        // Not the implicit init alone: `raise X, "message"` builds the error with its message
+        if !lc.methods.iter().any(|m| m.receiver == MethodReceiver::Instance && m.name.as_str() == "initialize") {
+            out.push_str("    init() {}\n    init(_ message: String) { self.message = message }\n");
+        }
     }
 
     // Properties. A slot an ANCESTOR already declares is skipped —
@@ -601,6 +651,7 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
     // with no initializer — Swift's definite-initialization accepts
     // that when every `init` assigns it (the ctor-param-backed accessor
     // shape).
+    let mut undefaulted_prop = false;
     for (n, ty) in &prop_types {
         if super::expr::ancestor_has_prop(&class_name, n) {
             continue;
@@ -610,6 +661,7 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
                 out.push_str(&format!("    var {n}: {} = {d}\n", swift_ty(ty)));
             }
             None => {
+                undefaulted_prop = true;
                 out.push_str(&format!("    var {n}: {}\n", swift_ty(ty)));
             }
         }
@@ -657,7 +709,7 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
     // passes above.)
     for m in &temporal_readers {
         let name = camel(m.name.as_str());
-        let ret = m_sig_ret(m).unwrap_or(Ty::Union { variants: vec![Ty::Time, Ty::Nil] });
+        let ret = m_sig_ret(m).unwrap_or(Ty::Union { variants: vec![Ty::Time, Ty::Nil].into() });
         let ret_str = swift_ty(&ret);
         super::expr::begin_method(&m.body, true);
         let mut inner = String::new();
@@ -725,7 +777,12 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
     {
         if let Some((anc_decl, anc_fwd, anc_sig)) = super::expr::ancestor_init_sig(&class_name) {
             let (_, _, own_sig) = render_params(own_init);
-            if own_sig != anc_sig {
+            if own_sig != anc_sig && undefaulted_prop {
+                // Not forwarded: a property with no default has no value here, and a Ruby call reaches the class's own `initialize`, never this shape.
+                out.push_str(&format!(
+                    "    required init({anc_decl}) {{\n        fatalError(\"{class_name} is built by its own initialize\")\n    }}\n"
+                ));
+            } else if own_sig != anc_sig {
                 out.push_str(&format!(
                     "    required init({anc_decl}) {{\n        super.init({anc_fwd})\n    }}\n"
                 ));
@@ -837,7 +894,7 @@ fn emit_subscript(
 
 fn m_sig_params(m: &MethodDef) -> Option<&Vec<crate::ty::Param>> {
     match m.signature.as_ref() {
-        Some(Ty::Fn { params, .. }) => Some(params),
+        Some(Ty::Fn(fn_ty)) => Some(&fn_ty.params),
         _ => None,
     }
 }
@@ -875,7 +932,7 @@ fn widened_container_ret(cls: &str, name: &str, own: &str) -> Option<String> {
 
 fn m_sig_ret(m: &MethodDef) -> Option<Ty> {
     match m.signature.as_ref() {
-        Some(Ty::Fn { ret, .. }) => Some((**ret).clone()),
+        Some(Ty::Fn(fn_ty)) => Some((*fn_ty.ret).clone()),
         _ => None,
     }
 }
@@ -892,7 +949,7 @@ fn signature_ret_is_time(sig: Option<&Ty>) -> bool {
             _ => false,
         }
     }
-    matches!(sig, Some(Ty::Fn { ret, .. }) if is_time(ret))
+    matches!(sig, Some(Ty::Fn(fn_ty)) if is_time(&fn_ty.ret))
 }
 
 fn indent_method(s: &str) -> String {
@@ -923,8 +980,8 @@ fn is_pure_reader(m: &MethodDef) -> bool {
 
 /// All stored-property names a class declares: instance accessors, body
 /// ivars, collapsed pure readers.
-fn instance_prop_names(lc: &LibraryClass) -> std::collections::HashSet<String> {
-    let mut props: std::collections::HashSet<String> = std::collections::HashSet::new();
+fn instance_prop_names(lc: &LibraryClass) -> crate::det::HashSet<String> {
+    let mut props: crate::det::HashSet<String> = crate::det::HashSet::default();
     for m in &lc.methods {
         match m.kind {
             AccessorKind::AttributeReader => {
@@ -953,9 +1010,55 @@ fn instance_prop_names(lc: &LibraryClass) -> std::collections::HashSet<String> {
 /// the init-shim registry. The signature KEY is types-only: Swift
 /// overload identity ignores internal param names and defaults
 /// (`init(_ _attrs:)` and `init(_ attrs:)` are both `init(_:)`).
+/// Not `render_params`' decl: a subclass's shim of this init keeps no default, or a bare `Sub()` would reach the ancestor's init instead of the subclass's own `initialize`.
+fn bare_param_decl(m: &MethodDef) -> String {
+    let (_, fwd, sig) = render_params(m);
+    let names: Vec<&str> = if fwd.is_empty() { vec![] } else { fwd.split(", ").collect() };
+    let types = split_types(&sig);
+    names.iter().zip(types.iter()).map(|(n, t)| format!("_ {n}: {t}")).collect::<Vec<_>>().join(", ")
+}
+
+/// The `", "`-joined types of `render_params`, split at top level only (a tuple or generic type holds commas of its own).
+fn split_types(sig: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut cur = String::new();
+    let mut chars = sig.chars().peekable();
+    let mut prev = ' ';
+    while let Some(c) = chars.next() {
+        match c {
+            '(' | '[' | '<' => depth += 1,
+            // Not a closing bracket: the `>` of a function type's `->`.
+            '>' if prev == '-' => {}
+            ')' | ']' | '>' => depth -= 1,
+            ',' if depth == 0 && chars.peek() == Some(&' ') => {
+                chars.next();
+                out.push(std::mem::take(&mut cur));
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(c);
+        prev = c;
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn split_types_keeps_a_function_type_whole() {
+        assert_eq!(super::split_types("(Int) -> Int, String"), vec!["(Int) -> Int", "String"]);
+        assert_eq!(super::split_types("[String: Any], Int?"), vec!["[String: Any]", "Int?"]);
+    }
+}
+
 fn render_params(m: &MethodDef) -> (String, String, String) {
     let sig_params = match m.signature.as_ref() {
-        Some(Ty::Fn { params, .. }) => Some(params),
+        Some(Ty::Fn(fn_ty)) => Some(&fn_ty.params),
         _ => None,
     };
     let mut types: Vec<String> = Vec::new();
@@ -1004,10 +1107,10 @@ fn emit_method_impl(m: &MethodDef, is_static: bool, ctx: Option<&ClassCtx>) -> S
     // Params — always typed (Swift requirement), underscore-labeled so
     // the positional lowered call sites work.
     let sig_params = match m.signature.as_ref() {
-        Some(Ty::Fn { params, .. }) => Some(params),
+        Some(Ty::Fn(fn_ty)) => Some(&fn_ty.params),
         _ => None,
     };
-    let params: Vec<String> = m
+    let mut params: Vec<String> = m
         .params
         .iter()
         .enumerate()
@@ -1023,16 +1126,25 @@ fn emit_method_impl(m: &MethodDef, is_static: bool, ctx: Option<&ClassCtx>) -> S
             }
         })
         .collect();
+    // Not left for `yield` to reach nothing: a yielding method takes its block as a closure, as the Kotlin and C# trees do
+    if body_has_yield(&m.body) {
+        let bt = match m.signature.as_ref() {
+            Some(Ty::Fn(fn_ty)) if let Some(b) = &fn_ty.block => swift_ty(b),
+            _ => "(Any?) -> Void".to_string(),
+        };
+        params.push(format!("_ block: {bt}"));
+    }
 
     // Ruby `initialize` → a real Swift `init` (no func keyword, no
     // return clause; `self.`-qualified property assigns let ctor params
     // shadow the properties).
     let is_init = !is_static && m.name.as_str() == "initialize";
 
-    // Return type.
+    // Return type. Not Void for a method without a signature: an app method's answer is its body's type
     let ret_ty = match m.signature.as_ref() {
-        Some(Ty::Fn { ret, .. }) => Some((**ret).clone()),
-        _ => None,
+        Some(Ty::Fn(fn_ty)) => Some((*fn_ty.ret).clone()),
+        _ if m.name.as_str() == "initialize" => None,
+        _ => m.body.ty.clone().filter(|t| !t.is_open()),
     };
     let returns_value =
         !is_init && !force_unit && matches!(&ret_ty, Some(t) if !matches!(t, Ty::Nil));
@@ -1060,7 +1172,7 @@ fn emit_method_impl(m: &MethodDef, is_static: bool, ctx: Option<&ClassCtx>) -> S
             .iter()
             .enumerate()
             .map(|(i, p)| {
-                let ty = sig_params.and_then(|sp| sp.get(i)).map(|sp| sp.ty.clone());
+                let ty = sig_params.and_then(|sp| sp.get(i)).map(|sp| (*sp.ty).clone());
                 (camel(p.name.as_str()), ty)
             })
             .collect(),
@@ -1098,7 +1210,9 @@ fn emit_method_impl(m: &MethodDef, is_static: bool, ctx: Option<&ClassCtx>) -> S
     // directly, via a throwing callee, or by registered contract
     // (ancestor walk covers throwing overrides of a contract decl) —
     // carries `throws`.
-    let cls_name = ctx.map(|c| c.name.as_str()).unwrap_or("");
+    // Not "" for a module: an enum's static methods call each other bare, and the fixpoint registered them under its name
+    let module_name = super::expr::current_class();
+    let cls_name = ctx.map(|c| c.name.as_str()).unwrap_or(module_name.as_str());
     let throws_kw = if super::expr::body_throws(&m.body, cls_name)
         || (!cls_name.is_empty() && super::expr::throws_lookup(cls_name, &name))
     {
@@ -1149,6 +1263,11 @@ fn indent4(s: &str) -> String {
 /// compiles.
 fn emit_body(body: &Expr, returns_value: bool, ret_ty: Option<&Ty>) -> String {
     if !returns_value {
+        // A Void method whose body is a bare `nil` (`collection_rendered`)
+        // has nothing to say; `nil` alone has no contextual type in Swift.
+        if is_empty_body(body) {
+            return String::new();
+        }
         return emit_expr(body);
     }
     if is_empty_body(body) {
@@ -1179,6 +1298,8 @@ fn default_return(ret_ty: Option<&Ty>) -> String {
         {
             "return nil".to_string()
         }
+        // An untyped return is `Any?`, so Ruby's bare `nil` answers as itself
+        Some(Ty::Untyped | Ty::Var { .. }) => "return nil".to_string(),
         _ => "fatalError(\"unimplemented\")".to_string(),
     }
 }
@@ -1292,4 +1413,23 @@ fn try_default_for(ty: &Ty) -> Option<String> {
         Ty::Untyped | Ty::Var { .. } => "nil".to_string(),
         _ => return None,
     })
+}
+
+fn body_has_yield(e: &Expr) -> bool {
+    if matches!(&*e.node, ExprNode::Yield { .. }) {
+        return true;
+    }
+    let mut found = false;
+    // Into blocks too: Ruby's `items.each { |i| yield i }` yields to the method's own block
+    e.node.for_each_child(&mut |c| found |= body_has_yield(c));
+    found
+}
+
+// Not StandardError alone: ArgumentError and the other core errors are what a runtime raises too, and Swift has none of them
+fn is_core_error(name: &str) -> bool {
+    matches!(
+        name,
+        "StandardError" | "RuntimeError" | "Exception" | "ArgumentError" | "TypeError" | "NameError"
+            | "NoMethodError" | "NotImplementedError" | "KeyError" | "IndexError"
+    )
 }

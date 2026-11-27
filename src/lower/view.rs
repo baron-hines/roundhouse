@@ -24,6 +24,7 @@
 //! targets; emission differs.
 
 use crate::expr::{Expr, ExprNode, Literal};
+use crate::ident::Symbol;
 
 /// Numeric and formatted counts keep their label, not `count.to_i`:
 /// a delimited count must keep its commas. Ground ERB and app helpers
@@ -60,13 +61,17 @@ pub(crate) fn pluralize_helper_call(count: Expr, word: Expr) -> Expr {
 /// emitters pull out the bits they need.
 #[derive(Debug)]
 pub enum ViewHelperKind<'a> {
-    /// `<%= csrf_meta_tags %>` — no args.
+    /// `<%= csrf_meta_tags %>` (or Rails' alias `csrf_meta_tag`) — no
+    /// args.
     CsrfMetaTags,
     /// `<%= csp_meta_tag %>` — no args.
     CspMetaTag,
     /// `<%= javascript_importmap_tags %>`, or with an explicit entry
     /// point (`javascript_importmap_tags "user"` — lobsters' layout).
     JavascriptImportmapTags { entry: Option<&'a Expr> },
+    /// `javascript_importmap_tags "application", importmap: M.importmap`:
+    /// an engine's own import map (`App::engine_importmaps`).
+    EngineImportmapTags { entry: &'a Expr, module: String },
     /// `<%= turbo_stream_from "channel" %>` and the multi-streamable
     /// form campfire writes (`turbo_stream_from room, :messages`). The
     /// stream NAME is spelled by `lower::broadcasts::stream_name`,
@@ -90,8 +95,16 @@ pub enum ViewHelperKind<'a> {
     /// `<%= word_wrap(text [, opts]) %>` — returns ordinary text, so
     /// the lowering must escape the result before appending it.
     WordWrap { text: &'a Expr, opts: Option<&'a Expr> },
+    /// `<%= simple_format(text, html_options, sanitize: false
+    /// [, wrapper_tag: :div]) %>`, the one form `simple_format_form`
+    /// models: the text is written as it is (Rails' `raw`), so the
+    /// result is html-safe and appended unescaped.
+    SimpleFormat { text: &'a Expr, html_opts: Option<&'a Expr>, wrapper_tag: Symbol },
     /// `<%= stylesheet_link_tag :name [, opts] %>`.
     StylesheetLinkTag { name: &'a Expr, opts: Option<&'a Expr> },
+    /// `<%= content_tag :name, content [, opts] %>`, with no block: the
+    /// escaped content's `content_tag_html`, appended as it is.
+    ContentTag { name: &'a Expr, content: &'a Expr, opts: Option<&'a Expr> },
     /// `<%= content_for(:slot) %>` (getter, no body).
     ContentForGetter { slot: &'a str },
     /// `<% content_for :slot, "body" %>` (statement-form setter).
@@ -100,7 +113,9 @@ pub enum ViewHelperKind<'a> {
     LinkTo { text: &'a Expr, url: &'a Expr, opts: Option<&'a Expr> },
     /// `<%= link_to_if cond, text, url [, opts] %>` — the link when the
     /// condition holds, the escaped text alone otherwise.
-    LinkToIf { cond: &'a Expr, text: &'a Expr, url: &'a Expr, opts: Option<&'a Expr> },
+    /// `link_to_unless` is the same with `negate` set: the link when the
+    /// condition doesn't hold.
+    LinkToIf { cond: &'a Expr, text: &'a Expr, url: &'a Expr, opts: Option<&'a Expr>, negate: bool },
     /// `<%= button_to text, target [, opts] %>`.
     ButtonTo { text: &'a Expr, target: &'a Expr, opts: Option<&'a Expr> },
 }
@@ -116,7 +131,13 @@ pub enum RenderPartial<'a> {
     /// collection, calling a partial per element. `name` is the
     /// collection's surface name (used by emitters to derive the
     /// partial-fn name and any foreign-key/class lookups).
-    Collection { collection: &'a Expr, name: &'a str },
+    ///
+    /// `locals` is the trailing hash of `render @posts, flag: false`,
+    /// which Rails passes to every element render as its locals, as an
+    /// explicit `locals:` does for [`Self::CollectionNamed`]. The same
+    /// holds for [`Self::Record`], [`Self::Association`] and
+    /// [`Self::TypedCollection`].
+    Collection { collection: &'a Expr, name: &'a str, locals: Option<&'a [(Expr, Expr)]> },
     /// `render @post` — render ONE record's partial. Rails picks
     /// between this and [`Self::Collection`] at runtime, on whether the
     /// argument answers `to_ary`; statically the discriminator is the
@@ -131,10 +152,16 @@ pub enum RenderPartial<'a> {
     /// (`@edit_user` → `Views::EditUsers.edit_user`) resolves to the
     /// name's plural, the same convention every other name-directed
     /// consumer in this lowering follows.
-    Record { record: &'a Expr, name: &'a str },
+    Record { record: &'a Expr, name: &'a str, locals: Option<&'a [(Expr, Expr)]> },
     /// `render @post.comments` — iterate an association method on
     /// a receiver Var/Ivar, calling a partial per element.
-    Association { receiver: &'a Expr, method: &'a str },
+    Association { receiver: &'a Expr, method: &'a str, locals: Option<&'a [(Expr, Expr)]> },
+    /// `render @author.posts.order(:title)` — any other call the
+    /// analyzer typed as a collection of a class. No name in the
+    /// expression says which partial it renders (`order` is not a
+    /// model), so `partial` is the element class's `to_partial_path`
+    /// (`posts/post`), as Rails picks it per record.
+    TypedCollection { collection: &'a Expr, partial: String, locals: Option<&'a [(Expr, Expr)]> },
     /// `render "posts/post", post: @post` — call a named partial
     /// with the first hash entry's value as its argument. When the
     /// kwarg form carries an explicit `locals:` hash (`render partial:
@@ -147,6 +174,9 @@ pub enum RenderPartial<'a> {
         partial: &'a str,
         arg: Option<&'a Expr>,
         locals: Option<&'a [(Expr, Expr)]>,
+        /// An explicit `object:`, which Rails binds under the partial's
+        /// `as:` name whatever `locals:` holds.
+        object: Option<&'a Expr>,
     },
     /// `render partial: "stories/listdetail", collection: stories, as:
     /// :story` — the explicit-kwarg collection form: iterate `collection`,
@@ -168,10 +198,16 @@ pub enum RenderPartial<'a> {
         /// `cached: true` — Rails' collection cache. The concatenated
         /// partials are stored under one key (each element's
         /// `cache_key_with_version`) so a warm campfire room page is
-        /// one `read_str`, not 40 fragment lookups. A proc / non-true
-        /// value is declined: that shape customizes the key and is
-        /// not modeled.
+        /// one `read_str`, not 40 fragment lookups.
         cached: bool,
+        /// `cached: ->(item) { key }` — Rails' collection cache with a
+        /// callable key: each element's fragment is stored under the
+        /// key the lambda answers, and the collection is preloaded
+        /// first because the key may read associations (campfire's
+        /// `message_fragment_cache_key`). Any other non-true value (a
+        /// `{ key:, expires_in: }` hash) is not modeled and renders
+        /// uncached.
+        cached_key: Option<&'a Expr>,
     },
     /// `render partial: @above` — the partial NAME is a runtime value
     /// (an ivar/local), not a literal, so it can't be resolved to one
@@ -210,10 +246,11 @@ pub enum RenderPartial<'a> {
 /// there's a receiver, or when a one-arg Var/Ivar doesn't name a
 /// view-scope local (`is_local`).
 ///
-/// A block is accepted for exactly ONE shape — `render layout: "…" do …
-/// end` (`LayoutBlock`), where the block IS the render's content. Every
-/// other block-form render still returns `None`: the block would be a
-/// Rails feature nothing here models, and saying so beats guessing.
+/// A block is accepted for two shapes, both `LayoutBlock`, where the block
+/// IS the partial's `yield`: `render layout: "…" do … end` and `render
+/// "…"[, k: v] do … end`. Every other block-form render still returns
+/// `None`: the block would be a Rails feature nothing here models, and
+/// saying so beats guessing.
 pub fn classify_render_partial<'a>(
     recv: Option<&'a Expr>,
     method: &str,
@@ -226,6 +263,23 @@ pub fn classify_render_partial<'a>(
         return None;
     }
     if let Some(block) = block {
+        // `render "x"[, k: v] do … end`: Rails renders the partial with the
+        // block as its `yield`, as `render layout: "x"` does. (`render
+        // partial: "x", locals: … do` raises in Rails; it stays
+        // unrecognized.)
+        if let Some(first) = args.first()
+            && let ExprNode::Lit { value: Literal::Str { value } } = &*first.node
+        {
+            let locals = match &args[1..] {
+                [] => None,
+                [h] => match &*h.node {
+                    ExprNode::Hash { entries, .. } => Some(entries.as_slice()),
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            return Some(RenderPartial::LayoutBlock { layout: value.as_str(), locals, block });
+        }
         let [arg] = args else { return None };
         let ExprNode::Hash { entries, .. } = &*arg.node else { return None };
         return classify_render_layout(entries, block);
@@ -258,11 +312,13 @@ pub fn classify_render_partial<'a>(
                     Some(RenderPartial::Record {
                         record: arg,
                         name: name.as_str(),
+                        locals: None,
                     })
                 } else {
                     Some(RenderPartial::Collection {
                         collection: arg,
                         name: name.as_str(),
+                        locals: None,
                     })
                 }
             }
@@ -277,6 +333,7 @@ pub fn classify_render_partial<'a>(
                 Some(RenderPartial::Association {
                     receiver: r,
                     method: m.as_str(),
+                    locals: None,
                 })
             }
             // `render "layouts/lightbox"` — a named partial with NO
@@ -295,18 +352,37 @@ pub fn classify_render_partial<'a>(
                 partial: value,
                 arg: None,
                 locals: None,
+                object: None,
             }),
             // Explicit kwarg form: `render partial: "x/y", collection: c,
             // as: :item` / `render partial: "x/y", item: rec`.
             ExprNode::Hash { entries, .. } => classify_render_kwargs(entries),
+            // `render @author.posts.order(:title)`, `render
+            // @author.posts.published.limit(2)` — a chain longer than the
+            // one hop `Association` reads, or a call with arguments. Left
+            // unclassified, the bare `render` reached the emit and called
+            // a method no view module has. Only the analyzed type knows
+            // the records' class here.
+            ExprNode::Send { .. } => {
+                let Some(crate::ty::Ty::Class { id, .. }) =
+                    arg.ty.as_ref().and_then(|ty| ty.collection_elem())
+                else {
+                    return None;
+                };
+                Some(RenderPartial::TypedCollection {
+                    collection: arg,
+                    partial: model_partial_path(id.0.as_str()),
+                    locals: None,
+                })
+            }
             _ => None,
         },
         [a, b] => {
-            let ExprNode::Lit { value: Literal::Str { value: partial } } = &*a.node else {
-                return None;
-            };
             let ExprNode::Hash { entries, .. } = &*b.node else {
                 return None;
+            };
+            let ExprNode::Lit { value: Literal::Str { value: partial } } = &*a.node else {
+                return classify_object_render_locals(a, entries, is_local, is_options_ivar);
             };
             // Shorthand locals (`render "comments/comment", :comment =>
             // c, :show_story => true`): Rails treats the whole hash as
@@ -321,10 +397,92 @@ pub fn classify_render_partial<'a>(
                 partial: partial.as_str(),
                 arg,
                 locals: Some(entries),
+                object: None,
             })
         }
         _ => None,
     }
+}
+
+/// `render @posts, flag: false` — for any first argument but a Hash,
+/// Rails renders it as `render partial: @posts, locals: { flag: false }`:
+/// the object's partial, once per element for a collection, with EVERY
+/// key of the hash a local (`as:` or `collection:` here are locals, not
+/// options). So the first argument classifies as it does alone, and the
+/// hash rides as its `locals`.
+///
+/// Only a literal hash with symbol keys is read. A `**opts` splat is a
+/// `merge` chain, not a Hash, and never gets here. An options ivar
+/// (`DynamicNamed`) stays unrecognized: Rails ignores the locals when
+/// its value is a Hash and uses them when it is a String, which a static
+/// lowering cannot tell apart.
+fn classify_object_render_locals<'a>(
+    object: &'a Expr,
+    entries: &'a [(Expr, Expr)],
+    is_local: &impl Fn(&str) -> bool,
+    is_options_ivar: &impl Fn(&str) -> bool,
+) -> Option<RenderPartial<'a>> {
+    if matches!(&*object.node, ExprNode::Hash { .. })
+        || !entries.iter().all(|(k, _)| matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { .. } }))
+    {
+        return None;
+    }
+    let locals = Some(entries);
+    match classify_render_partial(None, "render", std::slice::from_ref(object), None, is_local, is_options_ivar)? {
+        RenderPartial::Collection { collection, name, .. } => {
+            Some(RenderPartial::Collection { collection, name, locals })
+        }
+        RenderPartial::Record { record, name, .. } => Some(RenderPartial::Record { record, name, locals }),
+        RenderPartial::Association { receiver, method, .. } => {
+            Some(RenderPartial::Association { receiver, method, locals })
+        }
+        RenderPartial::TypedCollection { collection, partial, .. } => {
+            Some(RenderPartial::TypedCollection { collection, partial, locals })
+        }
+        _ => None,
+    }
+}
+
+/// A literal `nil` or `false`.
+pub fn is_falsy_lit(e: &Expr) -> bool {
+    matches!(&*e.node, ExprNode::Lit { value: Literal::Nil | Literal::Bool { value: false } })
+}
+
+/// A model's `to_partial_path`: its `model_name.collection` and its
+/// element, `Post` → `posts/post`, `Admin::Post` → `admin/posts/post`.
+fn model_partial_path(class_name: &str) -> String {
+    let segs: Vec<&str> = class_name.split("::").collect();
+    let (last, ns) = segs.split_last().expect("a class name");
+    let mut parts: Vec<String> = ns.iter().map(|s| crate::naming::snake_case(s)).collect();
+    parts.push(crate::naming::pluralize_snake(last));
+    parts.push(crate::naming::snake_case(last));
+    parts.join("/")
+}
+
+/// The formats a `render partial: "x", formats: [:xml, :html]` names, in
+/// order. Rails looks the partial up in exactly those formats for that
+/// render (`ActionView::Base#in_rendering_context`): they replace the
+/// lookup's (`LookupContext#with_prepended_formats`), so neither the
+/// rendering template's own format nor html follows them. A list with a
+/// runtime element is not one a static lowering can read.
+pub fn render_formats_option(args: &[Expr]) -> Option<Vec<&str>> {
+    let [arg] = args else { return None };
+    let ExprNode::Hash { entries, .. } = &*arg.node else { return None };
+    let (_, value) = entries.iter().find(|(k, _)| {
+        matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "formats")
+    })?;
+    let elements = match &*value.node {
+        ExprNode::Array { elements, .. } => elements.as_slice(),
+        _ => std::slice::from_ref(value),
+    };
+    let formats = elements
+        .iter()
+        .map(|e| match &*e.node {
+            ExprNode::Lit { value: Literal::Sym { value } } => Some(value.as_str()),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    (!formats.is_empty()).then_some(formats)
 }
 
 /// `render layout: "<path>"[, locals: { … }] do … end` from its kwarg
@@ -376,9 +534,11 @@ fn classify_render_kwargs(entries: &[(Expr, Expr)]) -> Option<RenderPartial<'_>>
     let mut dyn_partial: Option<(&Expr, &str)> = None;
     let mut collection: Option<&Expr> = None;
     let mut as_name: Option<&str> = None;
+    let mut object: Option<&Expr> = None;
     let mut first_local: Option<&Expr> = None;
     let mut locals_entries: Option<&[(Expr, Expr)]> = None;
     let mut cached = false;
+    let mut cached_key: Option<&Expr> = None;
     for (k, v) in entries {
         match key_of(k).as_deref() {
             Some("partial") => match &*v.node {
@@ -397,14 +557,28 @@ fn classify_render_kwargs(entries: &[(Expr, Expr)]) -> Option<RenderPartial<'_>>
                 }
             }
             Some("collection") => collection = Some(v),
-            Some("as") => {
-                if let ExprNode::Lit { value: Literal::Sym { value } } = &*v.node {
-                    as_name = Some(value.as_str());
+            // The record, which is also the single named-partial arg
+            // below.
+            Some("object") => {
+                object = Some(v);
+                if first_local.is_none() {
+                    first_local = Some(v);
                 }
             }
-            Some("cached") => {
-                cached = matches!(&*v.node, ExprNode::Lit { value: Literal::Bool { value: true } });
-            }
+            // `as: :name` or `as: "name"`: Rails takes `as.to_sym`.
+            Some("as") => match &*v.node {
+                ExprNode::Lit { value: Literal::Sym { value } } => as_name = Some(value.as_str()),
+                ExprNode::Lit { value: Literal::Str { value } } => as_name = Some(value.as_str()),
+                _ => {}
+            },
+            // Which formats the partial is looked up in, not a local
+            // (`render_formats_option`).
+            Some("formats") => {}
+            Some("cached") => match &*v.node {
+                ExprNode::Lit { value: Literal::Bool { value: true } } => cached = true,
+                ExprNode::Lambda { params, .. } if params.len() == 1 => cached_key = Some(v),
+                _ => {}
+            },
             // An explicit `locals: {…}` hash — keep the entries so the
             // emitter can bind record + extra locals by name.
             Some("locals") => {
@@ -448,12 +622,14 @@ fn classify_render_kwargs(entries: &[(Expr, Expr)]) -> Option<RenderPartial<'_>>
             as_name,
             locals: locals_entries,
             cached,
+            cached_key,
         })
     } else {
         Some(RenderPartial::Named {
             partial,
             arg: first_local,
             locals: locals_entries,
+            object,
         })
     }
 }
@@ -519,18 +695,107 @@ pub fn classify_turbo_stream_call<'a>(
     }
 }
 
+/// The arguments of a `simple_format` call the lowering models.
+pub struct SimpleFormatForm<'a> {
+    pub text: &'a Expr,
+    /// `None` for no html options or a literal `{}`.
+    pub html_opts: Option<&'a Expr>,
+    pub wrapper_tag: Symbol,
+}
+
+const SIMPLE_FORMAT_SANITIZES: &str = "Rails runs the HTML sanitizer over the text (the default `sanitize: true`), which is not modeled; pass `sanitize: false` for text that is already safe";
+const SIMPLE_FORMAT_NOT_MODELED: &str = "its arguments are not a text, html options and a literal options hash with `sanitize: false` and an optional literal `wrapper_tag:`";
+
+/// `simple_format(text, html_options, options)` with `sanitize: false`
+/// (or `nil`) in a literal options hash, or why the call is left as it
+/// is: the default runs Rails' HTML sanitizer, which removes tags and
+/// re-serializes entities, so even an escaped text isn't the
+/// unsanitized form's output (`analyze::diagnostics` refuses the call
+/// with the reason). `wrapper_tag:` is a literal Symbol or String;
+/// `sanitize_options:` and any other key are left as written.
+pub fn simple_format_form(args: &[Expr]) -> Result<SimpleFormatForm<'_>, &'static str> {
+    let opaque = |a: &Expr| {
+        matches!(
+            &*a.node,
+            ExprNode::Splat { .. }
+                | ExprNode::KeywordSplat { .. }
+                | ExprNode::ForwardArgs
+                | ExprNode::ForwardKeywords
+                | ExprNode::ForwardKeywordsWithPairs { .. }
+        )
+    };
+    fn hash_entries(a: &Expr) -> Option<&Vec<(Expr, Expr)>> {
+        match &*a.node {
+            ExprNode::Hash { entries, .. } => Some(entries),
+            _ => None,
+        }
+    }
+    if args.iter().any(opaque)
+        || args.iter().filter_map(hash_entries).any(|es| es.iter().any(|(k, v)| opaque(k) || opaque(v)))
+    {
+        return Err(SIMPLE_FORMAT_NOT_MODELED);
+    }
+    let [text, html_opts, options] = args else {
+        return match args.len() {
+            1 | 2 => Err(SIMPLE_FORMAT_SANITIZES),
+            _ => Err(SIMPLE_FORMAT_NOT_MODELED),
+        };
+    };
+    let Some(options) = hash_entries(options) else { return Err(SIMPLE_FORMAT_NOT_MODELED) };
+    let key = |k: &Expr| match &*k.node {
+        ExprNode::Lit { value: Literal::Sym { value } } => Some(value.as_str().to_string()),
+        _ => None,
+    };
+    let mut sanitize_off = false;
+    let mut wrapper_tag = Symbol::from("p");
+    for (k, v) in options {
+        match key(k).as_deref() {
+            Some("sanitize") => match &*v.node {
+                ExprNode::Lit { value: Literal::Bool { value: false } | Literal::Nil } => sanitize_off = true,
+                _ => return Err(SIMPLE_FORMAT_SANITIZES),
+            },
+            Some("wrapper_tag") => match &*v.node {
+                ExprNode::Lit { value: Literal::Sym { value } } => wrapper_tag = value.clone(),
+                ExprNode::Lit { value: Literal::Str { value } } => wrapper_tag = Symbol::from(value.as_str()),
+                _ => return Err(SIMPLE_FORMAT_NOT_MODELED),
+            },
+            _ => return Err(SIMPLE_FORMAT_NOT_MODELED),
+        }
+    }
+    if !sanitize_off {
+        return Err(SIMPLE_FORMAT_SANITIZES);
+    }
+    let html_opts = match &*html_opts.node {
+        ExprNode::Hash { entries, .. } if entries.is_empty() => None,
+        ExprNode::Hash { .. } | ExprNode::Var { .. } | ExprNode::Ivar { .. } | ExprNode::Send { .. } => Some(html_opts),
+        _ => return Err(SIMPLE_FORMAT_NOT_MODELED),
+    };
+    Ok(SimpleFormatForm { text, html_opts, wrapper_tag })
+}
+
 pub fn classify_view_helper<'a>(
     method: &str,
     args: &'a [Expr],
 ) -> Option<ViewHelperKind<'a>> {
     match (method, args.len()) {
-        ("csrf_meta_tags", 0) => Some(ViewHelperKind::CsrfMetaTags),
+        ("csrf_meta_tags" | "csrf_meta_tag", 0) => Some(ViewHelperKind::CsrfMetaTags),
         ("csp_meta_tag", 0) => Some(ViewHelperKind::CspMetaTag),
         ("javascript_importmap_tags", 0) => {
             Some(ViewHelperKind::JavascriptImportmapTags { entry: None })
         }
         ("javascript_importmap_tags", 1) => {
             Some(ViewHelperKind::JavascriptImportmapTags { entry: Some(&args[0]) })
+        }
+        ("javascript_importmap_tags", 2) => {
+            let ExprNode::Hash { entries, .. } = &*args[1].node else { return None };
+            let [(key, value)] = entries.as_slice() else { return None };
+            let is_importmap_key = matches!(&*key.node, ExprNode::Lit { value: crate::expr::Literal::Sym { value } } if value.as_str() == "importmap");
+            let ExprNode::Send { recv: Some(recv), method, args: margs, block: None, .. } = &*value.node else { return None };
+            let ExprNode::Const { path } = &*recv.node else { return None };
+            (is_importmap_key && method.as_str() == "importmap" && margs.is_empty()).then(|| ViewHelperKind::EngineImportmapTags {
+                entry: &args[0],
+                module: path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::"),
+            })
         }
         ("turbo_stream_from", n) if n >= 1 => {
             Some(ViewHelperKind::TurboStreamFrom { streamables: args })
@@ -560,6 +825,11 @@ pub fn classify_view_helper<'a>(
             text: &args[0],
             opts: Some(&args[1]),
         }),
+        ("simple_format", _) => simple_format_form(args).ok().map(|f| ViewHelperKind::SimpleFormat {
+            text: f.text,
+            html_opts: f.html_opts,
+            wrapper_tag: f.wrapper_tag,
+        }),
         ("word_wrap", 1) => Some(ViewHelperKind::WordWrap {
             text: &args[0],
             opts: None,
@@ -576,7 +846,25 @@ pub fn classify_view_helper<'a>(
             name: &args[0],
             opts: Some(&args[1]),
         }),
+        // A Hash second argument with no third is Rails' content (it
+        // renders the Hash's `to_s`), not options: left to the generic path.
+        ("content_tag", 2) if !matches!(&*args[1].node, ExprNode::Hash { .. }) => {
+            Some(ViewHelperKind::ContentTag { name: &args[0], content: &args[1], opts: None })
+        }
+        // The options as a Hash literal, or a value typed as a Hash (an
+        // `attrs` local), which the runtime takes the same way.
+        ("content_tag", 3)
+            if matches!(&*args[2].node, ExprNode::Hash { .. }) || matches!(args[2].ty, Some(crate::ty::Ty::Hash { .. })) =>
+        {
+            Some(ViewHelperKind::ContentTag { name: &args[0], content: &args[1], opts: Some(&args[2]) })
+        }
         ("content_for", 1) => {
+            let slot = extract_sym_or_str(&args[0])?;
+            Some(ViewHelperKind::ContentForGetter { slot })
+        }
+        // No content reads the slot, as Rails' `content_for` does when
+        // its content is nil or false.
+        ("content_for", 2) if is_falsy_lit(&args[1]) => {
             let slot = extract_sym_or_str(&args[0])?;
             Some(ViewHelperKind::ContentForGetter { slot })
         }
@@ -597,17 +885,19 @@ pub fn classify_view_helper<'a>(
             url: &args[1],
             opts: Some(&args[2]),
         }),
-        ("link_to_if", 3) => Some(ViewHelperKind::LinkToIf {
+        ("link_to_if" | "link_to_unless", 3) => Some(ViewHelperKind::LinkToIf {
             cond: &args[0],
             text: &args[1],
             url: &args[2],
             opts: None,
+            negate: method == "link_to_unless",
         }),
-        ("link_to_if", 4) => Some(ViewHelperKind::LinkToIf {
+        ("link_to_if" | "link_to_unless", 4) => Some(ViewHelperKind::LinkToIf {
             cond: &args[0],
             text: &args[1],
             url: &args[2],
             opts: Some(&args[3]),
+            negate: method == "link_to_unless",
         }),
         ("button_to", 2) => Some(ViewHelperKind::ButtonTo {
             text: &args[0],
@@ -654,6 +944,25 @@ pub enum FormBuilderMethod {
     Button,
     UrlField,
     EmailField,
+    /// `number_field` / `range_field` / `search_field` /
+    /// `telephone_field` (alias `phone_field`): Rails' `Tags::TextField`
+    /// subclasses, the same `<input>` under another `type`. The options
+    /// their `render` rewrites (`in:`/`within:` → `min`/`max`;
+    /// `autosave:`/`onsearch:`) are refused at analyze
+    /// (`unlowered_form_builder_calls`).
+    NumberField,
+    RangeField,
+    SearchField,
+    TelephoneField,
+    /// `color_field`: `Tags::ColorField`, whose `render` always writes a
+    /// value — an explicit `value:`, else the record's when it holds a
+    /// `#rrggbb`, else `#000000`.
+    ColorField,
+    /// `datetime_local_field`: `Tags::DatetimeLocalField`, whose `render`
+    /// formats a time as `%Y-%m-%dT%T`. A datetime or date column's value
+    /// is formatted; the calls whose value the lowering can't format are
+    /// refused at analyze (`unlowered_form_builder_calls`).
+    DatetimeLocalField,
     FileField,
     RichTextArea,
     /// `form.fields_for :settings, obj do |nested| … end` — Rails'
@@ -706,10 +1015,14 @@ pub fn renders_through_view_path(format: &str) -> bool {
     // `<action>_txt`. Paired with the ingest gate in `ingest::app`'s
     // `walk_erb` the same way `svg`/`json` are: a format admitted only
     // here or only there is silently dropped in between.
+    // `css`: joins them the same way — a CSS responder with no html
+    // sibling (Mastodon's `custom_css#show`), as `<action>_css`.
+    // `text`: a mailer's plain-text part and its layout, as
+    // `<action>_text`, which `lower::mailer_templates` renders.
     matches!(
         format,
         "html" | "turbo_stream" | "svg" | "rss" | "atom" | "xml" | "xls" | "json" | "js" | "pdf"
-            | "csv" | "txt"
+            | "csv" | "txt" | "css" | "md" | "text"
     )
 }
 
@@ -731,6 +1044,21 @@ pub fn view_output_stem(v: &crate::dialect::View) -> String {
         v.name.as_str().to_string()
     } else {
         format!("{}_{}", v.name.as_str(), v.format.as_str())
+    }
+}
+
+/// The template a fragment key names (`articles/_note`), format-qualified
+/// when it is not the html one: `_note.turbo_stream.erb` keys under
+/// `articles/_note.turbo_stream`. Rails names it by its digest path,
+/// `articles/_note:<digest>`, and the digest is the variant's own source,
+/// so the html and turbo_stream fragments of one record never meet.
+/// Without a digest (`walker::cache_key_parts`) the format is what keeps
+/// them apart. The html template keeps the bare path its keys always had.
+pub fn fragment_template_path(path: &str, format: &str) -> String {
+    if format == "html" {
+        path.to_string()
+    } else {
+        format!("{path}.{format}")
     }
 }
 
@@ -759,6 +1087,84 @@ pub fn view_method_name(stem: &str) -> crate::ident::Symbol {
 
 /// Map a Ruby form method name to the lowered method kind. Rails
 /// accepts both `text_area` and `textarea` as aliases; fold them.
+/// The stock fields each app builder (`class StyledFormBuilder < ActionView::Helpers::FormBuilder`) or a builder it
+/// descends from defines again, keyed by the builder's class path: Rails dispatches them to that override.
+pub fn form_builder_overrides(app: &crate::App) -> crate::det::HashMap<String, crate::det::HashSet<String>> {
+    form_builder_overrides_in(&app.library_classes)
+}
+
+pub fn form_builder_overrides_in(classes: &[crate::dialect::LibraryClass]) -> crate::det::HashMap<String, crate::det::HashSet<String>> {
+    // Every declaration of a name is one class: a reopening names no superclass, and its methods are the class's.
+    let decls = |id: &crate::ident::ClassId| -> Vec<&crate::dialect::LibraryClass> {
+        classes.iter().filter(|l| l.name == *id).collect()
+    };
+    let mut out: crate::det::HashMap<String, crate::det::HashSet<String>> = crate::det::HashMap::default();
+    let mut names: Vec<&crate::ident::ClassId> = classes.iter().map(|c| &c.name).collect();
+    names.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+    names.dedup();
+    for name in names {
+        let mut overrides = crate::det::HashSet::default();
+        let mut current = Some(name.clone());
+        let mut descends = false;
+        for _ in 0..32 {
+            let Some(id) = current.take() else { break };
+            // The class's own methods and its included modules', nested includes too.
+            let mut owners: Vec<&crate::dialect::LibraryClass> = decls(&id);
+            let mut seen: crate::det::HashSet<*const crate::dialect::LibraryClass> = crate::det::HashSet::default();
+            while let Some(owner) = owners.pop() {
+                if !seen.insert(owner as *const _) {
+                    continue;
+                }
+                for m in owner.methods.iter().filter(|m| m.receiver == crate::dialect::MethodReceiver::Instance) {
+                    if classify_form_builder_method(m.name.as_str()).is_some() {
+                        overrides.insert(m.name.as_str().to_string());
+                    }
+                }
+                owners.extend(owner.includes.iter().flat_map(|inc| decls(inc)));
+            }
+            let Some(parent) = decls(&id).iter().find_map(|c| c.parent.clone()) else { break };
+            if parent.0.as_str().trim_start_matches("::") == "ActionView::Helpers::FormBuilder" {
+                descends = true;
+                break;
+            }
+            current = Some(parent);
+        }
+        if descends && !overrides.is_empty() {
+            out.insert(name.0.as_str().to_string(), overrides);
+        }
+    }
+    out
+}
+
+/// The associations each model accepts nested attributes for (`accepts_nested_attributes_for`, or its generated
+/// `<assoc>_attributes=`), keyed by model class and association name, valued true for a collection (has_many).
+pub fn nested_attribute_associations(app: &crate::App) -> crate::det::HashMap<(String, String), bool> {
+    use crate::dialect::{Association, ModelBodyItem};
+    let mut out = crate::det::HashMap::default();
+    for model in &app.models {
+        let accepts = |assoc: &str| {
+            let writer = format!("{assoc}_attributes=");
+            model.body.iter().any(|item| match item {
+                ModelBodyItem::Method { method, .. } => method.name.as_str() == writer,
+                ModelBodyItem::Unknown { expr, .. } => matches!(&*expr.node, crate::expr::ExprNode::Send { recv: None, method, args, .. }
+                    if method.as_str() == "accepts_nested_attributes_for"
+                        && args.iter().any(|a| matches!(&*a.node, crate::expr::ExprNode::Lit { value: crate::expr::Literal::Sym { value } } if value.as_str() == assoc))),
+                _ => false,
+            })
+        };
+        for association in model.associations() {
+            let (name, collection) = match association {
+                Association::HasMany { name, .. } | Association::HasAndBelongsToMany { name, .. } => (name, true),
+                Association::HasOne { name, .. } | Association::BelongsTo { name, .. } => (name, false),
+            };
+            if accepts(name.as_str()) {
+                out.insert((model.name.0.as_str().to_string(), name.as_str().to_string()), collection);
+            }
+        }
+    }
+    out
+}
+
 pub fn classify_form_builder_method(method: &str) -> Option<FormBuilderMethod> {
     match method {
         "label" => Some(FormBuilderMethod::Label),
@@ -774,6 +1180,12 @@ pub fn classify_form_builder_method(method: &str) -> Option<FormBuilderMethod> {
         "button" => Some(FormBuilderMethod::Button),
         "url_field" => Some(FormBuilderMethod::UrlField),
         "email_field" => Some(FormBuilderMethod::EmailField),
+        "number_field" => Some(FormBuilderMethod::NumberField),
+        "range_field" => Some(FormBuilderMethod::RangeField),
+        "search_field" => Some(FormBuilderMethod::SearchField),
+        "telephone_field" | "phone_field" => Some(FormBuilderMethod::TelephoneField),
+        "color_field" => Some(FormBuilderMethod::ColorField),
+        "datetime_local_field" => Some(FormBuilderMethod::DatetimeLocalField),
         // The INPUT TAG only. Receiving the upload is Active Storage,
         // which is deferred by design — but rendering `<input
         // type="file">` needs none of it, and without this the call
@@ -790,8 +1202,40 @@ pub fn classify_form_builder_method(method: &str) -> Option<FormBuilderMethod> {
     }
 }
 
+/// The builder methods Rails' default `field_error_proc` wraps in
+/// `<div class="field_with_errors">` when their field has errors: every
+/// control that goes through `Tags::Base#tag`, and the label. A hidden
+/// field, a button, the submit and Action Text's editor are not.
+pub fn wraps_field_errors(method: &str) -> bool {
+    classify_form_builder_method(method).is_some_and(FormBuilderMethod::wraps_field_errors)
+}
+
+impl FormBuilderMethod {
+    pub fn wraps_field_errors(self) -> bool {
+        matches!(
+            self,
+            FormBuilderMethod::Label
+                | FormBuilderMethod::TextField
+                | FormBuilderMethod::TextArea
+                | FormBuilderMethod::PasswordField
+                | FormBuilderMethod::CheckBox
+                | FormBuilderMethod::RadioButton
+                | FormBuilderMethod::Select
+                | FormBuilderMethod::UrlField
+                | FormBuilderMethod::EmailField
+                | FormBuilderMethod::NumberField
+                | FormBuilderMethod::RangeField
+                | FormBuilderMethod::SearchField
+                | FormBuilderMethod::TelephoneField
+                | FormBuilderMethod::ColorField
+                | FormBuilderMethod::DatetimeLocalField
+                | FormBuilderMethod::FileField
+        )
+    }
+}
+
 /// Split a FormBuilder method's positional args into its two
-/// Rails-shaped halves: the field-name symbol and the trailing
+/// Rails-shaped halves: the field name (a Symbol or String) and the trailing
 /// options hash. `form.text_field :title, class: "..."` yields
 /// `(Some("title"), Some(&[(class, "...")]))`; `form.submit` with
 /// no args yields `(None, None)`. Emitters format the opts pairs
@@ -803,7 +1247,9 @@ pub fn classify_form_builder_args(
         return (None, None);
     }
     let (field, rest): (Option<&str>, &[Expr]) = match &*args[0].node {
+        // A String field name is the same field (`f.text_field "title"`), as the lowering reads it.
         ExprNode::Lit { value: Literal::Sym { value } } => (Some(value.as_str()), &args[1..]),
+        ExprNode::Lit { value: Literal::Str { value } } => (Some(value.as_str()), &args[1..]),
         _ => (None, args),
     };
     let opts = rest.iter().find_map(|a| match &*a.node {
@@ -1218,6 +1664,12 @@ mod tests {
     }
 
     #[test]
+    fn classifies_csrf_meta_tag_alias() {
+        let kind = classify_view_helper("csrf_meta_tag", &[]).unwrap();
+        assert!(matches!(kind, ViewHelperKind::CsrfMetaTags));
+    }
+
+    #[test]
     fn classifies_content_for_getter() {
         let args = vec![sym("title")];
         let kind = classify_view_helper("content_for", &args).unwrap();
@@ -1471,7 +1923,7 @@ mod tests {
         let rp =
             classify_render_partial(None, "render", &args, None, &|_| true, &|_| false).unwrap();
         match rp {
-            RenderPartial::Named { partial, arg, locals } => {
+            RenderPartial::Named { partial, arg, locals, .. } => {
                 assert_eq!(partial, "layouts/lightbox");
                 assert!(arg.is_none() && locals.is_none());
             }
