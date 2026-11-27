@@ -635,6 +635,8 @@ module SidekiqWorker
   # `sidekiq_retries_exhausted` hooks in the places `JobRetry` calls them:
   # both see the job as it will be written, error fields and all.
   def self.fail_native(env, raw, queue, label, e, started)
+    # Counted as `fail_job` counts it: the heartbeat's stats flush reads FAILED.
+    LOCK.synchronize { FAILED[0] = FAILED[0] + 1 }
     error_class = e.class.name.to_s
     log("WARN", label + " fail: " + elapsed(started) + " sec: " + error_class + ": " + e.message)
     unless SidekiqEnvelope.retries?(env)
