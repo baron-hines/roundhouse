@@ -104,3 +104,25 @@ fn a_singleton_method_a_class_body_value_defines_stays_clean() {
         assert!(!errors.iter().any(|e| e.contains(&unwanted)), "{unwanted}:\n{errors:#?}");
     }
 }
+
+/// Not refused: a singleton method boot code defines on the class from
+/// outside its body (an initializer), and one a module's `included` hook
+/// installs through another method.
+#[test]
+fn a_singleton_method_defined_from_outside_the_class_body_stays_clean() {
+    let errors = errors_of(
+        emit_and_run::real_blog()
+            .write("app/models/booted_box.rb", "class BootedBox\n  def self.use_flag\n    BootedBox.flag = 1\n  end\nend\n")
+            .write("config/initializers/booted_box.rb", "BootedBox.define_singleton_method(:flag=) { |v| v }\n")
+            .write(
+                "app/models/installer.rb",
+                "module Installer\n  def self.install(base)\n    base.define_singleton_method(:magic) { \"m\" }\n  end\nend\n",
+            )
+            .write("app/models/installing.rb", "module Installing\n  def self.included(base)\n    Installer.install(base)\n  end\nend\n")
+            .write("app/models/hooked_box.rb", "class HookedBox\n  include Installing\n\n  def self.use_magic\n    HookedBox.magic\n  end\nend\n"),
+    );
+    for (name, class) in [("flag=", "BootedBox"), ("magic", "HookedBox")] {
+        let unwanted = format!("no known method `{name}` on {class}");
+        assert!(!errors.iter().any(|e| e.contains(&unwanted)), "{unwanted}:\n{errors:#?}");
+    }
+}

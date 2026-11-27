@@ -57,6 +57,21 @@ pub(in crate::analyze) fn mark(
             && classes.get(id).is_some_and(|c| !c.open && !c.gem_boundary)
             && decls.iter().all(|lc| declaration_closed(lc, &declarations))
     };
+    // Boot and file-level code can define on a class from outside its body (`Box.define_singleton_method(:x=) { }`).
+    let mut touched: HashSet<String> = HashSet::default();
+    let statements = app.boot_program.iter().chain(app.file_programs.iter().flat_map(|p| {
+        p.items.iter().filter_map(|i| match i {
+            crate::app::ProgramItem::Statement(e) => Some(e),
+            _ => None,
+        })
+    }));
+    for stmt in statements {
+        metaprogrammed_constants(stmt, &mut touched);
+    }
+    let touched_from_outside = |id: &ClassId| {
+        let name = id.0.as_str();
+        touched.iter().any(|t| name == t || name.ends_with(&format!("::{t}")))
+    };
     let mut closed: HashSet<ClassId> = HashSet::default();
     for id in declarations.keys() {
         // The class and every superclass up to Object.
@@ -64,7 +79,7 @@ pub(in crate::analyze) fn mark(
         let mut ok = true;
         for _ in 0..32 {
             let Some(cid) = current else { break };
-            if !own_surface_closed(cid) {
+            if !own_surface_closed(cid) || touched_from_outside(cid) {
                 ok = false;
                 break;
             }
@@ -125,4 +140,20 @@ fn reaches_metaprogramming(expr: &Expr) -> bool {
     let mut found = false;
     expr.node.for_each_child(&mut |child| found = found || reaches_metaprogramming(child));
     found
+}
+
+/// The constants a statement reaches for singleton metaprogramming on (`Box.define_singleton_method`, `Box.singleton_class.class_eval`).
+fn metaprogrammed_constants(expr: &Expr, out: &mut HashSet<String>) {
+    if let ExprNode::Send { recv: Some(recv), method, .. } = &*expr.node {
+        if SINGLETON_METAPROGRAMMING.contains(&method.as_str()) {
+            let mut r = recv;
+            while let ExprNode::Send { recv: Some(inner), .. } = &*r.node {
+                r = inner;
+            }
+            if let ExprNode::Const { path } = &*r.node {
+                out.insert(path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::"));
+            }
+        }
+    }
+    expr.node.for_each_child(&mut |child| metaprogrammed_constants(child, out));
 }

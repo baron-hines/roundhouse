@@ -76,12 +76,30 @@ impl<'a> BodyTyper<'a> {
     fn defined_on_own(&self, id: &ClassId, method: &Symbol) -> bool {
         let Some(cls) = self.classes.get(id) else { return true };
         // Not only the class body's own mixins: a file-level `K.extend(M)` (version_gem's `class_eval do extend … end`) and a hook's `base.extend` land in these.
-        let extended = |m: &ClassId| self.classes.get(m).is_none() || self.lookup_in_module(m, method).is_some();
         cls.class_methods.contains_key(method)
             || cls.instance_methods.contains_key(method)
-            || cls.includes.iter().any(|m| self.lookup_in_module(m, method).is_some())
-            || cls.class_method_extensions.iter().any(extended)
-            || cls.hook_extensions.iter().any(extended)
+            || cls.unknown_class_side_hook
+            || cls.class_side_hook_methods.contains(method)
+            || cls.includes.iter().any(|m| self.module_may_answer(m, method))
+            || cls.class_method_extensions.iter().any(|m| self.module_may_answer(m, method))
+            || cls.hook_extensions.iter().any(|m| self.module_may_answer(m, method))
+    }
+
+    /// `lookup_in_module`, except that a module anywhere in the chain the registry does not hold may answer anything.
+    fn module_may_answer(&self, module: &ClassId, method: &Symbol) -> bool {
+        let mut stack = vec![module.clone()];
+        let mut seen = HashSet::default();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            let Some(m) = self.classes.get(&id) else { return true };
+            if m.instance_methods.contains_key(method) || m.class_methods.contains_key(method) || m.unknown_class_side_hook {
+                return true;
+            }
+            stack.extend(m.includes.iter().cloned());
+        }
+        false
     }
 
     /// Every subclass of `id` is closed and none defines `method`.
