@@ -2,7 +2,7 @@
 //! the `ActiveRecord::AdapterInterface` contract, and the `Arel` node
 //! family. Extracted verbatim from `Analyzer::with_adapter`.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::analyze::ClassInfo;
 use crate::ident::{ClassId, Symbol};
@@ -32,7 +32,14 @@ pub(in crate::analyze) fn transaction_ty() -> Ty {
 fn register_connection_surface(classes: &mut HashMap<ClassId, ClassInfo>) {
     const RBS: &str = include_str!("../../../runtime/ruby/active_record/connection.rbs");
     let Ok(parsed) = crate::rbs::parse_app_signatures(RBS) else { return };
-    for name in ["ActiveRecord::Connection", "ActiveRecord::Result", "ActiveRecord::Transaction"] {
+    for name in [
+        "ActiveRecord::Connection",
+        "ActiveRecord::Result",
+        "ActiveRecord::Transaction",
+        "ActiveRecord::SchemaCache",
+        "ActiveRecord::Column",
+        "ActiveRecord::ConnectionAdapters::ConnectionHandler",
+    ] {
         let id = ClassId(Symbol::from(name));
         let Some(methods) = parsed.get(&id) else { continue };
         let cls = classes.entry(id).or_default();
@@ -86,8 +93,37 @@ fn register_connection_surface(classes: &mut HashMap<ClassId, ClassInfo>) {
     }
 }
 
+/// What a record of no model known here answers, from the runtime's signatures: its class's `primary_key` and
+/// `base_class`, and its `id` (orm_adapter's `value.send(value.class.primary_key)` over a record of any model).
+fn register_record_key_surface(classes: &mut HashMap<ClassId, ClassInfo>) {
+    // The connection reopen's table description, for a record of a model a gem declares (Doorkeeper's
+    // `self.class.columns` in its Application mixin), as for the app's models.
+    let base = classes.entry(ClassId(Symbol::from("ActiveRecord::Base"))).or_default();
+    base.class_methods.entry(Symbol::from("columns")).or_insert_with(|| {
+        Ty::Array { elem: std::sync::Arc::new(Ty::Class { id: ClassId(Symbol::from("ActiveRecord::Column")), args: vec![].into() }) }
+    });
+    base.class_methods.entry(Symbol::from("column_names")).or_insert_with(|| Ty::Array { elem: std::sync::Arc::new(Ty::Str) });
+    const BASE: &str = include_str!("../../../runtime/ruby/active_record/base.rbs");
+    const KEYS: &str = include_str!("../../../runtime/spinel/active_record_attribute_keys.rbs");
+    let id = ClassId(Symbol::from("ActiveRecord::Base"));
+    for (rbs, class_side, instance) in [(BASE, &["primary_key"][..], &["id"][..]), (KEYS, &["base_class"][..], &[][..])] {
+        let Ok(parsed) = crate::rbs::parse_app_signatures(rbs) else { continue };
+        let Some(methods) = parsed.get(&id) else { continue };
+        let cls = classes.entry(id.clone()).or_default();
+        for (m, ty) in methods {
+            if class_side.contains(&m.as_str()) {
+                cls.class_methods.entry(m.clone()).or_insert_with(|| ty.clone());
+            }
+            if instance.contains(&m.as_str()) {
+                cls.instance_methods.entry(m.clone()).or_insert_with(|| ty.clone());
+            }
+        }
+    }
+}
+
 pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     register_connection_surface(classes);
+    register_record_key_surface(classes);
     // `ActiveRecord::Base` itself — the literal base class, called
     // directly as `ActiveRecord::Base.transaction { ... }` and
     // `ActiveRecord::Base.connection.exec_query(...)`. It sits at the
@@ -137,6 +173,14 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         base.class_methods
             .entry(Symbol::from("connection"))
             .or_insert_with(connection_ty);
+        // runtime/ruby/active_record/connection.rb's: the handle, and the block's value with one held for it.
+        base.class_methods.entry(Symbol::from("lease_connection")).or_insert_with(connection_ty);
+        // The handler, for the one call a request's end makes of it (`clear_active_connections!`).
+        base.class_methods.entry(Symbol::from("connection_handler")).or_insert(Ty::Class {
+            id: ClassId(Symbol::from("ActiveRecord::ConnectionAdapters::ConnectionHandler")),
+            args: vec![].into(),
+        });
+        base.class_methods.entry(Symbol::from("with_connection")).or_insert(Ty::Untyped);
         base.class_methods.entry(Symbol::from("configurations")).or_insert(Ty::Untyped);
         base.class_methods.entry(Symbol::from("configurations=")).or_insert(Ty::Untyped);
         for m in ["sanitize_sql", "sanitize_sql_array", "sanitize_sql_for_order", "sanitize_sql_like"] {
@@ -578,6 +622,27 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         storage.class_methods.insert(Symbol::from("content_type_for_filename"), Ty::Str);
         storage.class_methods.insert(Symbol::from("url_filename"), Ty::Str);
         classes.insert(ClassId(Symbol::from("ActiveStorage")), storage);
+
+        // `ActiveStorage::Current` — `runtime/ruby/active_storage.rbs`
+        // verbatim (url_options / setter / set / base_url).
+        let url_options_hash = Ty::Hash {
+            key: std::sync::Arc::new(Ty::Sym),
+            value: std::sync::Arc::new(Ty::Untyped),
+        };
+        let nilable_url_options = nilable(url_options_hash);
+        let mut current = ClassInfo::default();
+        current
+            .class_methods
+            .insert(Symbol::from("url_options"), nilable_url_options.clone());
+        current
+            .class_methods
+            .insert(Symbol::from("url_options="), nilable_url_options);
+        current.class_methods.insert(
+            Symbol::from("set"),
+            super::block_fn(&Ty::Untyped, Ty::Untyped),
+        );
+        current.class_methods.insert(Symbol::from("base_url"), Ty::Str);
+        classes.insert(ClassId(Symbol::from("ActiveStorage::Current")), current);
     }
 
     // Arel — the low-level SQL AST that advanced scopes reach for
@@ -611,13 +676,26 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     register_node(classes, "Arel::Nodes::Quoted", &[], &[("to_s", Ty::Str), ("to_sql", Ty::Str)]);
     register_node(classes, "Arel::Nodes::Not", &[], &[("to_s", Ty::Str), ("to_sql", Ty::Str)]);
     register_node(classes, "Arel::Nodes::NamedFunction", &[], &[("to_s", Ty::Str), ("to_sql", Ty::Str)]);
-    for order in ["Arel::Nodes::Ascending", "Arel::Nodes::Descending"] {
+    // An ordering's `expr` is what it sorts by: the column's attribute
+    // for a term `relation.order_values` builds from a Symbol or Hash,
+    // or the SQL literal an app ordering wraps
+    // (`Arel::Nodes::Ascending.new(Arel.sql("LOWER(title)"))`), kept as
+    // given as Rails' Arel::Nodes::Unary keeps it. `name` still reads on
+    // the attribute arm.
+    let ordering_expr = Ty::Union { variants: vec![arel_attribute_ty.clone(), sql_literal.clone()].into() };
+    for order in ["Arel::Nodes::Ordering", "Arel::Nodes::Ascending", "Arel::Nodes::Descending"] {
         let node = Ty::Class { id: ClassId(Symbol::from(order)), args: vec![].into() };
         register_node(
             classes,
             order,
             &[],
-            &[("nulls_first", node.clone()), ("nulls_last", node), ("to_s", Ty::Str), ("to_sql", Ty::Str)],
+            &[
+                ("expr", ordering_expr.clone()),
+                ("nulls_first", node.clone()),
+                ("nulls_last", node),
+                ("to_s", Ty::Str),
+                ("to_sql", Ty::Str),
+            ],
         );
     }
     register_node(classes, "Arel::Nodes::Predicate", &[], &[("to_s", Ty::Str), ("to_sql", Ty::Str)]);
@@ -656,6 +734,7 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     ] {
         arel_attribute.instance_methods.insert(Symbol::from(pred), arel_node.clone());
     }
+    arel_attribute.instance_methods.insert(Symbol::from("name"), Ty::Str);
     classes.insert(ClassId(Symbol::from("Arel::Attribute")), arel_attribute);
 
     // `Arel::Node` boolean combinators chain into nodes; `where(node)`

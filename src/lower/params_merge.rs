@@ -63,7 +63,8 @@
 //! the source shape in place and files a residue diagnostic. Emitting a
 //! setter that doesn't exist would trade a named gap for a silent one.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
+use crate::det::HashMap;
 
 use crate::app::App;
 use crate::diagnostic::Diagnostic;
@@ -71,7 +72,7 @@ use crate::dialect::{MethodDef, Model};
 use crate::expr::{Expr, ExprNode, LValue, Literal};
 use crate::ident::{ClassId, Symbol, VarId};
 use crate::span::Span;
-use crate::ty::Ty;
+use crate::ty::{FnTy, Ty};
 
 use super::controller_to_library::params::{
     collect_specs, helper_spec_map, model_from_params_name, params_source_class, ParamsSpec,
@@ -86,9 +87,8 @@ pub fn apply_params_merge_lowering(app: &mut App) -> Vec<Diagnostic> {
     if specs.iter().next().is_none() {
         return Vec::new();
     }
-    // Before the binding scan, and outside its early return: this site
-    // needs no binding to prove, because the callee is the runtime's
-    // own `attributes=`.
+    // Before the binding scan, and outside its early return: these sites
+    // need no binding to prove, because the callee is the runtime's own.
     convert_attributes_assignments(app, &specs);
     let bindings = scan_bindings(app, &specs);
     if bindings.is_empty() {
@@ -98,8 +98,8 @@ pub fn apply_params_merge_lowering(app: &mut App) -> Vec<Diagnostic> {
     // Writer surface per model, so a merged key can be checked before
     // anything is rewritten. Same authority the permit-writer filter
     // uses — `model_to_library::writable_field_set`.
-    let mut writers: HashMap<Symbol, WriterSet> = HashMap::new();
-    let mut resource_of: HashMap<Symbol, Symbol> = HashMap::new();
+    let mut writers: HashMap<Symbol, WriterSet> = HashMap::default();
+    let mut resource_of: HashMap<Symbol, Symbol> = HashMap::default();
     for m in &app.models {
         let Some(table) = app.schema.tables.get(&m.table.0) else {
             continue;
@@ -251,8 +251,8 @@ impl SiteShapes {
 /// (`User::Bot`) contributes under its own last segment as well —
 /// harmless, because a binding is only ever read back through
 /// `callee_class`, which answers the OWNER's name.
-fn user_declared_methods(app: &App) -> std::collections::HashSet<(Symbol, Symbol)> {
-    let mut out = std::collections::HashSet::new();
+fn user_declared_methods(app: &App) -> crate::det::HashSet<(Symbol, Symbol)> {
+    let mut out = crate::det::HashSet::default();
     let unqualified =
         |id: &ClassId| Symbol::from(id.0.as_str().rsplit("::").next().unwrap_or(id.0.as_str()));
     for model in &app.models {
@@ -289,7 +289,7 @@ fn user_declared_methods(app: &App) -> std::collections::HashSet<(Symbol, Symbol
 /// `Room::MessagePusher` is a PORO — and attributing its parameters to
 /// `Room` would bind a method `Room` does not answer.
 fn including_models(app: &App) -> HashMap<ClassId, Vec<Symbol>> {
-    let mut out: HashMap<ClassId, Vec<Symbol>> = HashMap::new();
+    let mut out: HashMap<ClassId, Vec<Symbol>> = HashMap::default();
     for model in &app.models {
         let owner = Symbol::from(
             model
@@ -335,8 +335,8 @@ fn including_models(app: &App) -> HashMap<ClassId, Vec<Symbol>> {
 }
 
 fn scan_bindings(app: &App, specs: &ParamsSpecs) -> HashMap<BindKey, Binding> {
-    let mut seen: HashMap<BindKey, SiteShapes> = HashMap::new();
-    let assocs = crate::lower::scope_chain::build_assoc_registry(&app.models);
+    let mut seen: HashMap<BindKey, SiteShapes> = HashMap::default();
+    let assocs = crate::lower::scope_chain::build_assoc_registry_for_app(app);
     let assoc = AssocCtx { assocs: &assocs };
 
     // EVERY call site has to be seen, not just the ones that could bind
@@ -437,8 +437,8 @@ fn scan_bindings(app: &App, specs: &ParamsSpecs) -> HashMap<BindKey, Binding> {
 /// `merge` is deliberately absent: `convert_attributes_in` already
 /// rewrites a params receiver's `merge` to `to_attrs.merge` at the
 /// site, so a body calling it proves nothing.
-fn hash_only_params(app: &App) -> std::collections::HashSet<BindKey> {
-    let mut out = std::collections::HashSet::new();
+fn hash_only_params(app: &App) -> crate::det::HashSet<BindKey> {
+    let mut out = crate::det::HashSet::default();
     let unqualified =
         |id: &ClassId| Symbol::from(id.0.as_str().rsplit("::").next().unwrap_or(id.0.as_str()));
     let mut visit = |owner: Symbol, method: &MethodDef, model_class: bool| {
@@ -519,6 +519,18 @@ fn uses_as_hash(body: &Expr, name: &Symbol, ar_hash_api: bool) -> bool {
                 method,
                 ..
             } if matches!(method.as_str(), "delete" | "[]=") && reads_name(r) => {
+                found = true;
+            }
+            // The same `delete`, written by `params_permit` as the read of either key Parameters answer.
+            ExprNode::Send {
+                recv: Some(r),
+                method,
+                args,
+                ..
+            } if method.as_str() == "indifferent_delete"
+                && matches!(&*r.node, ExprNode::Const { path } if path.last().is_some_and(|p| p.as_str() == "Params"))
+                && args.first().is_some_and(&reads_name) =>
+            {
                 found = true;
             }
             ExprNode::Assign {
@@ -764,20 +776,15 @@ fn hash_assignment_covers_all_paths(expr: &Expr, name: &Symbol) -> bool {
 }
 
 /// Runtime slots that take the Symbol-keyed hash a params object has to
-/// become: `@story.attributes = <params>` and the relation's own
-/// conditions slots, `subscriptions.find_by(<params>)`.
+/// become: the relation's own conditions slots,
+/// `subscriptions.find_by(<params>)`.
 ///
 /// These are the runtime's OWN methods, so unlike
 /// [`convert_attrs_call_sites`] there is no user-defined callee to read
 /// a `Binding::Attrs` off and no binding to prove — the conversion is
 /// keyed on the method's name.
 ///
-/// The `attributes=` half stayed unwritten because the one fixture that
-/// assigns a params object this way — lobsters'
-/// `StoriesController#update_story_attributes` — had a `story_params`
-/// helper that never lowered (its permit list carries `tags_a: []`; see
-/// `match_permit_call_full`), so the right-hand side was not yet a
-/// params object to convert. Lowering that helper is what exposed it.
+/// `attributes=` is not one: no runtime defines it, and the controller lowering hands the record to the model's typed `assign_from_<class>`.
 ///
 /// The conditions half came from campfire's push-subscriptions
 /// controller, `@push_subscriptions.find_by(push_subscription_params)`,
@@ -791,7 +798,6 @@ fn hash_assignment_covers_all_paths(expr: &Expr, name: &Symbol) -> bool {
 /// FRAGMENT, and a params object never reaches that spelling in this
 /// corpus — adding it would be a rule with no site to keep it honest.
 const RUNTIME_ATTRS_SLOTS: &[&str] = &[
-    "attributes=",
     "find_by",
     "find_by!",
     "destroy_by",
@@ -919,7 +925,7 @@ fn convert_attrs_call_sites(
     if !bindings.values().any(|b| matches!(b, Binding::Attrs(_))) {
         return;
     }
-    let assocs = crate::lower::scope_chain::build_assoc_registry(&app.models);
+    let assocs = crate::lower::scope_chain::build_assoc_registry_for_app(app);
     let assoc = AssocCtx { assocs: &assocs };
     for controller in &mut app.controllers {
         let actions: Vec<crate::dialect::Action> = controller.actions().cloned().collect();
@@ -1041,12 +1047,7 @@ fn stamp_attr_hash_params(method: &mut MethodDef, indices: &[usize]) {
         value: std::sync::Arc::new(Ty::Untyped),
     };
     let (mut params, block, ret, effects) = match method.signature.clone() {
-        Some(Ty::Fn {
-            params,
-            block,
-            ret,
-            effects,
-        }) => (params, block, ret, effects),
+        Some(Ty::Fn(fn_ty)) => { let FnTy { params, block, ret, effects } = *fn_ty; (params, block, ret, effects) }
         _ => (
             method
                 .params
@@ -1067,12 +1068,12 @@ fn stamp_attr_hash_params(method: &mut MethodDef, indices: &[usize]) {
             p.ty = hash_ty.clone().into();
         }
     }
-    method.signature = Some(Ty::Fn {
+    method.signature = Some(Ty::Fn(Box::new(FnTy {
         params,
         block,
         ret,
         effects,
-    });
+    })));
 }
 
 fn stamp_param_types(method: &mut MethodDef, bound: &[(usize, Symbol, &ParamsSpec)]) {
@@ -1081,12 +1082,7 @@ fn stamp_param_types(method: &mut MethodDef, bound: &[(usize, Symbol, &ParamsSpe
     // rather than declining — the whole point is that this parameter's
     // type is now known.
     let (mut params, block, ret, effects) = match method.signature.clone() {
-        Some(Ty::Fn {
-            params,
-            block,
-            ret,
-            effects,
-        }) => (params, block, ret, effects),
+        Some(Ty::Fn(fn_ty)) => { let FnTy { params, block, ret, effects } = *fn_ty; (params, block, ret, effects) }
         _ => (
             method
                 .params
@@ -1110,12 +1106,12 @@ fn stamp_param_types(method: &mut MethodDef, bound: &[(usize, Symbol, &ParamsSpe
             }.into();
         }
     }
-    method.signature = Some(Ty::Fn {
+    method.signature = Some(Ty::Fn(Box::new(FnTy {
         params,
         block,
         ret,
         effects,
-    });
+    })));
 }
 
 /// Offer each STATEMENT in `body` to `f`, which may rewrite it and push

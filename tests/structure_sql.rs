@@ -16,6 +16,45 @@ fn tree(files: &[(&str, &str)]) -> HashMap<PathBuf, Vec<u8>> {
     files.iter().map(|(p, c)| (PathBuf::from(*p), c.as_bytes().to_vec())).collect()
 }
 
+#[test]
+fn column_primary_keys_are_retained_without_reading_default_text_as_constraints() {
+    let schema = ingest_structure_sql(
+        b"CREATE TABLE jobs (id bigserial PRIMARY KEY, label text DEFAULT 'PRIMARY KEY');",
+        "db/structure.sql",
+    ).unwrap();
+    let table = schema.tables.get(&Symbol::from("jobs")).unwrap();
+    assert!(col(table, "id").primary_key);
+    assert!(!col(table, "label").primary_key);
+}
+
+#[test]
+fn escape_string_defaults_keep_their_quoted_words_out_of_constraints() {
+    let schema = ingest_structure_sql(
+        b"CREATE TABLE notes (\n  id bigserial PRIMARY KEY,\n  body text DEFAULT E'prefix \\' PRIMARY KEY' || E'suffix \\'x',\n  title text DEFAULT 'plain'\n);",
+        "db/structure.sql",
+    ).unwrap();
+    let table = schema.tables.get(&Symbol::from("notes")).unwrap();
+    assert!(col(table, "id").primary_key);
+    assert!(!col(table, "body").primary_key);
+    assert!(!col(table, "title").primary_key);
+}
+
+#[test]
+fn an_identifier_ending_in_e_before_a_quote_is_not_an_escape_string() {
+    let schema = ingest_structure_sql(
+        br"CREATE TABLE notes (
+  id bigserial PRIMARY KEY,
+  code text DEFAULT tag$e'x\' || 'y',
+  title text DEFAULT 'plain'
+);",
+        "db/structure.sql",
+    ).unwrap();
+    let table = schema.tables.get(&Symbol::from("notes")).unwrap();
+    assert!(col(table, "id").primary_key);
+    assert!(table.columns.iter().any(|c| c.name.as_str() == "title"));
+    assert!(!col(table, "title").primary_key);
+}
+
 /// A small hand-rolled `pg_dump`-shaped dump covering the constructs
 /// `ingest_structure_sql` is expected to model plus the ones it must
 /// ledger rather than silently drop.
@@ -195,9 +234,9 @@ fn ingests_tables_columns_indexes_fk_and_pk() {
 
     // Foreign key.
     let fk = widgets.foreign_keys.first().expect("one foreign key");
-    assert_eq!(fk.from_column.as_str(), "company_id");
+    assert_eq!(fk.from_columns[0].as_str(), "company_id");
     assert_eq!(fk.to_table.0.as_str(), "companies");
-    assert_eq!(fk.to_column.as_str(), "id");
+    assert_eq!(fk.to_columns[0].as_str(), "id");
     assert!(matches!(fk.on_delete, roundhouse::schema::ReferentialAction::Cascade));
 
     // Ledgered gaps: the dropped tstzrange column and the unmodeled view.
@@ -260,7 +299,7 @@ fn index_access_method_keyword_requires_a_token_boundary() {
 }
 
 #[test]
-fn composite_primary_and_foreign_keys_are_ledgered_not_narrowed() {
+fn composite_primary_keys_are_kept_whole_and_foreign_keys_ledgered_not_narrowed() {
     let sql = r#"
 CREATE TABLE public.assignments (
     project_id bigint NOT NULL,
@@ -288,8 +327,36 @@ ALTER TABLE ONLY public.assignments
     assert!(assignments.foreign_keys.is_empty(), "composite fk never narrowed to one column pair");
 
     let messages: Vec<String> = gaps.iter().map(|g| format!("{g}")).collect();
-    assert!(messages.iter().any(|m| m.contains("primary key dropped") && m.contains("composite")), "{messages:?}");
+    assert_eq!(assignments.primary_key_columns, [Symbol::from("project_id"), Symbol::from("user_id")]);
+    assert!(!messages.iter().any(|m| m.contains("primary key dropped")), "a composite key is kept, not ledgered: {messages:?}");
     assert!(messages.iter().any(|m| m.contains("foreign key dropped") && m.contains("composite")), "{messages:?}");
+}
+
+#[test]
+fn foreign_key_timing_follows_postgres() {
+    use roundhouse::emit::shared::schema_sql::{Dialect, render_schema_statements_for};
+    use roundhouse::schema::Deferrable::{Deferred, Immediate};
+    // The timing PostgreSQL 18 records for each clause. pg_dump spells a
+    // deferrable key only the first two ways.
+    let cases = [
+        ("deferred", "ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED", Some(Deferred)),
+        ("bare", "DEFERRABLE", Some(Immediate)),
+        ("immediate", "DEFERRABLE INITIALLY IMMEDIATE", Some(Immediate)),
+        ("implied", "INITIALLY DEFERRED", Some(Deferred)),
+        ("never", "NOT DEFERRABLE", None),
+        ("plain", "", None),
+    ];
+    let mut sql = String::from("CREATE TABLE public.parents (\n    id bigint NOT NULL\n);\n\nALTER TABLE ONLY public.parents\n    ADD CONSTRAINT parents_pkey PRIMARY KEY (id);\n");
+    for (name, clause, _) in cases {
+        sql.push_str(&format!("\nCREATE TABLE public.{name}_children (\n    parent_id bigint\n);\n\nALTER TABLE ONLY public.{name}_children\n    ADD CONSTRAINT fk_{name} FOREIGN KEY (parent_id) REFERENCES public.parents(id) {clause};\n"));
+    }
+    let schema = ingest_structure_sql(sql.as_bytes(), "db/structure.sql").unwrap();
+    for (name, _, timing) in cases {
+        assert_eq!(schema.tables[&Symbol::from(format!("{name}_children"))].foreign_keys[0].deferrable, timing, "{name}");
+    }
+    let ddl = render_schema_statements_for(&schema, Dialect::Sqlite).unwrap();
+    let deferred = ddl.iter().find(|s| s.starts_with("CREATE TABLE IF NOT EXISTS deferred_children ")).unwrap();
+    assert!(deferred.contains("ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED"), "{deferred}");
 }
 
 #[test]
@@ -385,8 +452,8 @@ CREATE VIEW public.view_two AS SELECT memberships.org_id FROM public.memberships
             .collect()
     };
 
-    let pk_keys = keys_for("primary key dropped");
-    assert_eq!(pk_keys.len(), 1, "both composite PKs should bucket together: {pk_keys:?}");
+    // Composite primary keys are kept (`Table.primary_key_columns`), not ledgered.
+    assert!(keys_for("primary key dropped").is_empty());
 
     let fk_keys = keys_for("foreign key dropped");
     assert_eq!(fk_keys.len(), 1, "both composite FKs should bucket together: {fk_keys:?}");
@@ -432,12 +499,14 @@ ALTER TABLE ONLY shard.readings_p0
         !schema.tables.contains_key(&Symbol::from("readings_p0")),
         "the attached shard is retracted, not modeled as its own table"
     );
-    // Exactly one composite-pk gap (the parent's), not two — the
-    // shard's own later `ADD CONSTRAINT ... PRIMARY KEY` targets a
-    // table this Schema no longer has, and is silently skipped rather
-    // than ledgering a gap for a table nobody will ever see.
-    let pk_gaps = gaps.iter().filter(|g| format!("{g}").contains("primary key dropped")).count();
-    assert_eq!(pk_gaps, 1, "{gaps:?}");
+    // The parent keeps its composite key; the shard's own later `ADD
+    // CONSTRAINT ... PRIMARY KEY` targets a table this Schema no longer
+    // has, and is silently skipped.
+    assert_eq!(
+        schema.tables[&Symbol::from("readings")].primary_key_columns,
+        [Symbol::from("id"), Symbol::from("shard_key")]
+    );
+    assert!(!gaps.iter().any(|g| format!("{g}").contains("primary key dropped")), "{gaps:?}");
 }
 
 /// pg_dump writes an index on a partitioned table as `CREATE INDEX …

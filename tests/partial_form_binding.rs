@@ -159,3 +159,67 @@ fn shorthand_render_binds_the_form_local_too() {
         "form.text_field must inline under the bot binding:\n{body}"
     );
 }
+
+/// The same binding when the partials declare strict locals, as lobsters'
+/// stories/_form (`<%# locals: (story:, f:, suggesting: false) -%>`) and
+/// _form_errors (`f: nil`) do. The declaration was the signature as
+/// written, so `f:` stayed a keyword param the caller passed an `f` that
+/// does not exist: GET /stories/new was a NameError on every target.
+#[test]
+fn a_strict_locals_form_local_drops_from_interfaces_too() {
+    let files: Vec<(&str, &str)> = vec![
+        (
+            "db/schema.rb",
+            "ActiveRecord::Schema.define(version: 1) do\n  create_table :stories do |t|\n    t.string :title\n  end\nend\n",
+        ),
+        ("app/models/story.rb", "class Story < ApplicationRecord\nend\n"),
+        (
+            "app/views/stories/new.html.erb",
+            r#"<%= form_with model: @story do |f| %>
+  <%= render :partial => "stories/form", :locals => { :story => @story, :f => f } %>
+<% end %>
+"#,
+        ),
+        (
+            "app/views/stories/_form.html.erb",
+            r#"<%# locals: (story:, f:, suggesting: false) -%>
+<%= render :partial => "stories/form_errors", :locals => { :f => f, :story => f.object, suggesting: suggesting } %>
+<%= f.text_field :title %>
+"#,
+        ),
+        (
+            "app/views/stories/_form_errors.html.erb",
+            r#"<%# locals: (story:, f: nil, suggesting: false) -%>
+<% if defined?(f) %>
+  <%= f.hidden_field :seen_previous %>
+<% end %>
+"#,
+        ),
+    ];
+    let tree = files
+        .into_iter()
+        .map(|(p, c)| (std::path::PathBuf::from(p), c.as_bytes().to_vec()))
+        .collect();
+    let app = ingest_app_from_tree(tree).expect("ingest tree");
+    let lowered: Vec<(String, String)> = app
+        .views
+        .iter()
+        .map(|v| {
+            let lc = lower_view_to_library_class(v, &app);
+            let m = lc.methods.first().expect("view method");
+            (
+                format!("{}({:?})", m.name.as_str(), m.params.iter().map(|p| p.name.as_str()).collect::<Vec<_>>()),
+                format!("{:?}", m.body),
+            )
+        })
+        .collect();
+    for name in ["form(", "form_errors("] {
+        let (sig, _) = lowered
+            .iter()
+            .find(|(sig, _)| sig.starts_with(name))
+            .unwrap_or_else(|| panic!("view {name} lowered: {lowered:?}"));
+        assert!(!sig.contains("\"f\""), "the bound form local is not a declared param: {sig}");
+    }
+    let (_, form_body) = lowered.iter().find(|(sig, _)| sig.starts_with("form(")).unwrap();
+    assert!(form_body.contains("story[title]"), "f.text_field inlines under the binding:\n{form_body}");
+}

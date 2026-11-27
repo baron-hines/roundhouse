@@ -21,7 +21,7 @@
 # `shutdown`, `kill`, `wait_for_termination`, `completed_task_count`
 # and the size readers — plus `CyclicBarrier#wait` for the
 # race-condition test, and `Map`'s `[]` / `[]=` / `compute_if_absent` /
-# `clear` (Mutex+Hash; not the gem's lock-free table). The gem's tuning
+# `clear` / `keys` / `each_pair` and its default block (Mutex+Hash; not the gem's lock-free table). The gem's tuning
 # knobs (`idletime`, the fallback policies other than `:abort`,
 # `min_threads` pre-spawn) are accepted where a caller passes them and
 # do nothing: a worker here is a green thread parked on a Queue, which
@@ -190,15 +190,22 @@ module Concurrent
   # call atomic, and `compute_if_absent` runs its block under that lock,
   # as the gem's MRI backend does.
   class Map
-    def initialize
+    def initialize(&default)
       @hash = {}
       @lock = Mutex.new
+      @default = default
     end
 
+    # Not inside the lock: the default block writes back through `[]=` (tzinfo's StringDeduper), and the Mutex is not reentrant.
     def [](key)
       value = nil
-      @lock.synchronize { value = @hash[key] }
-      value
+      found = false
+      @lock.synchronize do
+        found = @hash.key?(key)
+        value = @hash[key] if found
+      end
+      return value if found || @default.nil?
+      @default.call(self, key)
     end
 
     def []=(key, value)
@@ -216,6 +223,20 @@ module Concurrent
 
     def clear
       @lock.synchronize { @hash.clear }
+      self
+    end
+
+    def keys
+      keys = []
+      @lock.synchronize { keys = @hash.keys }
+      keys
+    end
+
+    # Over a copy, not under the lock: the block may write the map (the gem's backend walks a copy too), and the Mutex is not reentrant.
+    def each_pair
+      pairs = []
+      @lock.synchronize { pairs = @hash.to_a }
+      pairs.each { |pair| yield pair[0], pair[1] }
       self
     end
   end

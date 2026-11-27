@@ -2,10 +2,11 @@
 //!
 //! Kernel's conversion FUNCTION, not a method on anything. CRuby mixes
 //! it into Object when `pathname` is required, and it is defined as
-//! exactly `Pathname.new(path)` — the only difference being that an
-//! argument which is already a Pathname comes back identical rather
-//! than as an equal copy, which no call site can tell apart (Pathname
-//! is a string with methods; `==` and `hash` are the string's).
+//! `Pathname.new(path)` — except that an argument which is already a
+//! Pathname comes back as itself, frozen or not, where `Pathname.new`
+//! makes an unfrozen copy (`equal?` and `frozen?` tell them apart).
+//! Analysis admits the call only with a String argument, where the two
+//! agree; with any other it stays unresolved.
 //!
 //! Spinel's bundled `pathname` says so itself, in the package header:
 //! the constructor "cannot be spelled in Spinel yet (a toplevel method
@@ -54,9 +55,9 @@ pub(crate) fn rewrite_node(expr: &mut Expr) {
     *method = Symbol::from("new");
     let ExprNode::Send { recv, .. } = &mut *expr.node else { return };
     *recv = Some(konst);
-    // The result type is left exactly as analyze left it. Pathname is
-    // not in the class registry, so stamping the instance here would
-    // put a receiver on the ledger that nothing can answer methods for
-    // — a dispatch failure invented by a rewrite, which is the shape
-    // [[project_campfire_emit_ledger_zero]] spent six commits removing.
+    // The result type and the `KERNEL_CONVERSION` mark are left exactly as
+    // analyze left them. Stamping a type here would put a receiver on the
+    // ledger that analysis never checked — a dispatch failure invented by
+    // a rewrite, which is the shape [[project_campfire_emit_ledger_zero]]
+    // spent six commits removing.
 }

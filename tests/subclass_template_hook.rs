@@ -67,7 +67,7 @@ fn the_defining_controller_renders_through_a_hook_that_raises() {
     let files = emitted();
     let parent = file(&files, "app/controllers/messages_controller.rb");
     assert!(
-        parent.contains("render(self.__template_show_json, content_type: \"application/json\")"),
+        parent.contains("render(self.__template_show_json, content_type: \"application/json; charset=utf-8\")"),
         "the json branch should render through the hook:\n{parent}"
     );
     assert!(
@@ -93,7 +93,7 @@ fn a_scope_default_format_pins_the_format_on_its_routes() {
     let files = emitted();
     let routes = file(&files, "config/routes.rb");
     assert!(
-        routes.contains("Route.new(\"PATCH\", \"/:bot_key/messages/:id\", :messages_by_bots, :update, :json)"),
+        routes.contains("Route.new(\"PATCH\", \"/:bot_key/messages/:id\", :messages__by_bots, :update, :json)"),
         "the scoped route should carry :json:\n{routes}"
     );
     assert!(

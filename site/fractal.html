@@ -90,10 +90,11 @@
     </p>
     <p class="status-line">
       Status: early. The pipeline is built, and the <a href="fractal/">pass
-      explorer</a> runs it in your browser. No pass is registered yet: the
-      first, <code>inline-enum-predicates</code>, was removed because
-      <a href="https://github.com/rails/rails/pull/59250">rails/rails#59250</a>
-      proposes plain <code>def</code> predicates. The proposal remains open.
+      explorer</a> runs it in your browser. Two passes are registered,
+      <code>inline-delegate</code> and <code>lower-duration</code>, and
+      <code>fractal verify</code> checks an
+      overlay by booting the app before and after it and comparing what Ruby
+      can observe of the compiled code.
     </p>
     <div class="cta">
       <a href="fractal/">▶ Open the pass explorer</a>
@@ -235,6 +236,44 @@
       proposal whole, with a report, when an edit falls outside the file,
       overlaps another edit or moves a line, or when the rewritten file has a
       parse error or warning the original did not.
+    </p>
+
+    <h3>The registered passes</h3>
+    <p><code>inline-delegate</code></p>
+    <p>
+      <code>delegate :name, to: :author</code> makes Active Support build Ruby
+      source for each method at boot and <code>module_eval</code> it. The pass
+      writes that exact source where the call was, on the call's first line,
+      so Rails does not generate it, Bootsnap caches it with the file, and the
+      JIT sees a plain <code>def</code>. It rewrites only the form whose
+      generated source it can reproduce exactly (symbol literals and
+      <code>to:</code> alone, in a class body, with the Active Support version
+      it was checked against, and no app definition of <code>delegate</code>
+      a class body could call instead), and declines everything else with a
+      reason.
+    </p>
+    <p><code>lower-duration</code></p>
+    <p>
+      <code>5.days.ago</code> builds an <code>ActiveSupport::Duration</code>
+      and two hashes only to call <code>::Time.current.advance(days: -5)</code>,
+      and <code>advance</code> then builds three <code>Date</code>s, another hash
+      and several <code>Rational</code>s to move the zone's wall clock by five
+      days. The pass writes what that comes down to in Ruby's own
+      <code>Time</code> arithmetic, with the number folded: the zone's local
+      time plus 432,000 seconds, wrapped back in the zone as Active Support
+      wraps it (<code>::Time.zone.now.plus_without_duration(-432000)</code>),
+      and <code>::Time.now.advance(days: -5)</code> when there is no zone.
+      That is 15 objects and 840 bytes a call instead of 37 and 2,456, and
+      about 2.5 times faster under YJIT and ZJIT. Hours, minutes and seconds
+      become <code>::Time.now.utc + s</code> wrapped once in the zone. Days
+      and weeks stay wall-clock days, so the result across a DST change is
+      the one Rails gives; months and years keep
+      <code>::Time.current.advance</code>. It rewrites only an integer literal
+      receiver with a unit and direction Active Support defines, inside a
+      method, block or lambda, with the Active Support version it was checked
+      against and no
+      app definition of the methods it takes out, and declines everything
+      else with a reason.
     </p>
 
     <h3>Why the first pass was removed</h3>

@@ -28,15 +28,16 @@
 //! `models/article_broadcasts_test.rb` shipped for months without
 //! ever running.
 
+#[path = "support/scratch.rs"]
+mod scratch;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use roundhouse::analyze::Analyzer;
 use roundhouse::ingest::ingest_app;
 use roundhouse::project::BuildTarget;
 
 fn scratch_dir(tag: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("roundhouse-ruby-{tag}"))
+    scratch::dir(&format!("roundhouse-ruby-{tag}"))
 }
 
 /// Recursively copy a tree. Used to seed the scratch dir with
@@ -72,13 +73,12 @@ fn copy_tree(src: &Path, dst: &Path) {
 /// A toolchain test should exercise what ships. `target_files` IS what
 /// ships, so ask it.
 fn generate_project(fixture: &Path, scratch: &Path) {
-    if scratch.exists() {
-        std::fs::remove_dir_all(scratch).expect("clean scratch");
-    }
     std::fs::create_dir_all(scratch).expect("create scratch");
 
     let mut app = ingest_app(fixture).expect("ingest");
-    Analyzer::new(&app).analyze(&mut app);
+    // What `roundhouse --target ruby` runs: analysis plus the shared
+    // post-analyze lowerings (`errors[:attr]`, among others).
+    roundhouse::session::analyze_and_lower_for(&mut app, BuildTarget::Ruby);
     let files = roundhouse::project::target_files(&app, fixture, BuildTarget::Ruby)
         .expect("ruby target files");
     roundhouse::project::write_to_dir(&files, scratch).expect("write ruby target tree");

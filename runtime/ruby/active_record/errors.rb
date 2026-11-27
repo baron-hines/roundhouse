@@ -1,4 +1,29 @@
 # frozen_string_literal: true
+module ActiveModel
+  # Rails' (activemodel 8.1.4) `initialize(record, attribute)` builds its
+  # message from `record.class.name`; this file transpiles into the strict
+  # runtimes, which have no `class` reflection. So the caller builds the
+  # message, as for the ActiveRecord classes below: the Ruby targets'
+  # `_unknown_mass_attribute` (connection.rb) passes Rails' text.
+  class UnknownAttributeError < NoMethodError
+    attr_reader :record, :attribute
+
+    def initialize(record, attribute, message = "ActiveModel::UnknownAttributeError")
+      @record = record
+      @attribute = attribute
+      super(message)
+    end
+  end
+
+  # Rails (activemodel 8.1.4, attribute_methods.rb) raises this from a
+  # generated attribute reader for a column the record's `select` did not
+  # load: "missing attribute 'title' for Post". The raise builds the
+  # message (`Base#_missing_attribute`, connection.rb); like Rails' own,
+  # the class adds nothing to NoMethodError.
+  class MissingAttributeError < NoMethodError
+  end
+end
+
 module ActiveRecord
   # Not StandardError subclasses each: Rails' hierarchy (8.1.4), so `rescue ActiveRecord::StatementInvalid` catches what Rails' does.
   class ActiveRecordError < StandardError
@@ -159,7 +184,7 @@ module ActiveRecord
     end
   end
 
-  # Raised by app code (`raise ActiveRecord::RecordNotSaved.new(msg, record)`) to answer 422 as Rails does; no runtime save path raises it yet.
+  # Raised by app code (`raise ActiveRecord::RecordNotSaved.new(msg, record)`) to answer 422 as Rails does, and by the Ruby targets' `save!` when a callback throws `:abort`.
   class RecordNotSaved < ActiveRecordError
     attr_reader :record
 
@@ -169,8 +194,8 @@ module ActiveRecord
     end
   end
 
-  # Raised by app code (`raise ActiveRecord::RecordNotDestroyed.new(msg, record)`).
-  # `destroy!` does not raise it: there is no abort channel on destroy yet.
+  # Raised by app code (`raise ActiveRecord::RecordNotDestroyed.new(msg, record)`),
+  # and by the Ruby targets' `destroy!` when a `before_destroy` throws `:abort`.
   class RecordNotDestroyed < ActiveRecordError
     attr_reader :record
 
@@ -180,7 +205,7 @@ module ActiveRecord
     end
   end
 
-  # Raised by app code; no runtime path marks a record read-only yet.
+  # Raised saving or destroying a read-only record (connection.rb), or by app code.
   class ReadOnlyRecord < ActiveRecordError
     def initialize(message = "ActiveRecord::ReadOnlyRecord")
       super(message)

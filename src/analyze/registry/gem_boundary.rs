@@ -19,11 +19,11 @@
 //! * an app class that inherits a gem class keeps the gradual escape it
 //!   always had (see `ClassInfo::gem_boundary`).
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::app::App;
 use crate::ident::{ClassId, Symbol};
-use crate::ty::Ty;
+use crate::ty::{FnTy, Ty};
 use crate::gem_boundary::RUBY_CORE;
 
 use super::super::body::ClassInfo;
@@ -75,8 +75,8 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>, ap
 
     // First pass: build every ClassInfo with resolved types and the
     // instance-method surface of each declared mixin.
-    let mut built: HashMap<ClassId, ClassInfo> = HashMap::new();
-    let mut open: HashSet<ClassId> = HashSet::new();
+    let mut built: HashMap<ClassId, ClassInfo> = HashMap::default();
+    let mut open: HashSet<ClassId> = HashSet::default();
     for id in &fresh {
         let gem = &declared[*id];
         let scope = id.0.as_str();
@@ -238,15 +238,18 @@ fn prune_ty(ty: &Ty, resolve: &dyn Fn(&ClassId) -> Option<ClassId>) -> Ty {
         Ty::Union { variants } => {
             Ty::Union { variants: variants.iter().map(|t| prune_ty(t, resolve)).collect() }
         }
-        Ty::Fn { params, block, ret, effects } => Ty::Fn {
-            params: params
-                .iter()
-                .map(|p| crate::ty::Param { name: p.name.clone(), ty: prune_ty(&p.ty, resolve).into(), kind: p.kind.clone() })
-                .collect(),
-            block: block.as_ref().map(|b| std::sync::Arc::new(prune_ty(b, resolve))),
-            ret: std::sync::Arc::new(prune_ty(ret, resolve)),
-            effects: effects.clone(),
-        },
+        Ty::Fn(fn_ty) => {
+            let FnTy { params, block, ret, effects } = &**fn_ty;
+            Ty::Fn(Box::new(FnTy {
+                params: params
+                    .iter()
+                    .map(|p| crate::ty::Param { name: p.name.clone(), ty: prune_ty(&p.ty, resolve).into(), kind: p.kind.clone() })
+                    .collect(),
+                block: block.as_ref().map(|b| std::sync::Arc::new(prune_ty(b, resolve))),
+                ret: std::sync::Arc::new(prune_ty(ret, resolve)),
+                effects: effects.clone(),
+            }))
+        }
         other => other.clone(),
     }
 }

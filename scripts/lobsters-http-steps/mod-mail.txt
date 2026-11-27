@@ -1,0 +1,7 @@
+# a moderator writes mod mail to a user, reads it back, and replies in it
+#! login alice@example.com
+GET /mod/mails/new
+POST /mod/mails mod_mail[subject]=About+your+story&mod_mail[recipient_usernames]=bob&mod_mail[comment_reference_short_ids]={comment}&mod_mail[story_reference_short_ids]={story}
+GET {last_location}
+POST /mod/mail_messages mod_mail_message[message]=A+reply+from+the+replay&mod_mail_message[mod_mail_id]={input:mod_mail_message[mod_mail_id]}
+GET /mod/mails

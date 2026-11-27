@@ -59,13 +59,25 @@ pub fn scope<T>(f: impl FnOnce() -> T) -> (T, Vec<Diagnostic>) {
     // syntax error arrives message-only and then located. Keep the
     // located copy.
     let unlocated = |d: &Diagnostic| d.span.file.0 == 0;
-    let located: std::collections::HashSet<String> = collected
+    let located: crate::det::HashSet<String> = collected
         .iter()
         .filter(|d| !unlocated(d))
         .map(|d| d.message.clone())
         .collect();
     collected.retain(|d| !unlocated(d) || !located.contains(&d.message));
     (result, collected)
+}
+
+/// How many diagnostics the active buffer holds, for `rewind`.
+pub(crate) fn mark() -> Option<usize> {
+    PARSE_DIAGS.with(|c| c.borrow().as_ref().map(Vec::len))
+}
+
+/// Forget what was pushed since `mark`: an ingest pass that is run again.
+pub(crate) fn rewind(mark: Option<usize>) {
+    if let Some(length) = mark {
+        PARSE_DIAGS.with(|c| c.borrow_mut().as_mut().map(|buf| buf.truncate(length)));
+    }
 }
 
 /// Push a diagnostic into the active buffer. A no-op outside a
@@ -75,6 +87,15 @@ pub(super) fn push(d: Diagnostic) {
     PARSE_DIAGS.with(|c| {
         if let Some(buf) = c.borrow_mut().as_mut() {
             buf.push(d);
+        }
+    });
+}
+
+/// Keep only diagnostics whose ingest interpretation survived later resolution.
+pub(super) fn retain(keep: impl Fn(&Diagnostic) -> bool) {
+    PARSE_DIAGS.with(|c| {
+        if let Some(buf) = c.borrow_mut().as_mut() {
+            buf.retain(keep);
         }
     });
 }

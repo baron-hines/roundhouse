@@ -438,7 +438,7 @@ end
 "##,
     );
     assert!(
-        out.contains("render_code({ size: compute }.merge(opts)"),
+        out.contains("render_code({ size: compute() }.merge(opts)"),
         "expected the positional bundle left intact:\n{out}"
     );
     assert_eq!(diags.len(), 1, "expected one residue entry: {diags:?}");

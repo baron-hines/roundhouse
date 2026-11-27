@@ -17,6 +17,8 @@
 //! calling on the dropped `nil` branch raises `NoMethodError` in Ruby
 //! either way, so narrowing it away never changes that call's behavior.
 
+#[path = "support/scratch.rs"]
+mod scratch;
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
@@ -25,12 +27,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 static RUN: AtomicUsize = AtomicUsize::new(0);
 
 fn native(files: &[(&str, &str)], script: &str) -> String {
-    let dir = std::env::temp_dir().join(format!(
-        "roundhouse-nilable-kwargs-{}-{}",
-        std::process::id(),
-        RUN.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch::dir(&format!("roundhouse-nilable-kwargs-{}", RUN.fetch_add(1, Ordering::Relaxed)));
     let mut requires = String::new();
     for (name, source) in files {
         let path = dir.join(name);
@@ -84,6 +81,12 @@ fn a_single_class_nilable_receiver_binds_by_name() {
 
     let source =
         std::fs::read_to_string(run.emitted.join("app/models/nilable/courier.rb")).unwrap();
+    assert!(source.contains("deliver(connection: \"REAL\")"), "{source}");
+    let (neutral, errors) = emit_and_run::real_blog()
+        .write("app/lib/nilable/single_class.rb", SINGLE_CLASS_SOURCE)
+        .emit_target_neutral(roundhouse::project::BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:?}");
+    let source = std::fs::read_to_string(neutral.join("app/models/nilable/courier.rb")).unwrap();
     assert!(
         source.contains("deliver(\"REAL\")"),
         "the keyword should move into the flattened `connection` slot, not stay a Hash:\n{source}"
@@ -135,6 +138,12 @@ fn a_two_class_union_with_matching_slot_shapes_binds_by_name() {
 
     let source =
         std::fs::read_to_string(run.emitted.join("app/models/nilable/courier.rb")).unwrap();
+    assert!(source.contains("deliver(connection: \"REAL\")"), "{source}");
+    let (neutral, errors) = emit_and_run::real_blog()
+        .write("app/lib/nilable/two_class.rb", TWO_CLASS_SOURCE)
+        .emit_target_neutral(roundhouse::project::BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:?}");
+    let source = std::fs::read_to_string(neutral.join("app/models/nilable/courier.rb")).unwrap();
     assert!(
         source.contains("deliver(\"REAL\")"),
         "both branches share a slot shape, so the call should move into it rather than stay a Hash:\n{source}"

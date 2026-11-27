@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use roundhouse::dialect::{MethodDef, MethodReceiver, MethodVisibility, ModelBodyItem};
 use roundhouse::ingest::{
-    ingest_app_from_tree, ingest_library_class, ingest_library_classes, ingest_model,
+    ingest_app_from_tree, ingest_library_class, ingest_library_classes, ingest_model, ingest_schema,
 };
 use roundhouse::schema::Schema;
 
@@ -42,6 +42,29 @@ fn visibility(methods: &[MethodDef], name: &str, receiver: MethodReceiver) -> Me
         .find(|m| m.name.as_str() == name && m.receiver == receiver)
         .expect(name)
         .visibility
+}
+
+#[test]
+fn a_reopened_data_factory_accepts_local_visibility_markers() {
+    for block in [
+        "private\n  def hidden = digest.to_s\n  public\n  def label = hidden",
+        "def hidden = digest.to_s\n  private :hidden\n  def label = hidden",
+        "private def hidden = digest.to_s\n  def label = hidden",
+    ] {
+        let source = format!("Artifact = Data.define(:digest) do\n  {block}\n  def self.build(value) = new(value)\n  private_class_method :build\n  def self.make(value) = build(value)\nend\nclass Artifact\n  def extra = label\nend\n");
+        let classes = ingest_library_classes(source.as_bytes(), "artifact.rb").expect("safe Data reopening");
+        let record = classes.iter().find(|c| c.name.0.as_str() == "Artifact").unwrap();
+        assert_eq!(classes.iter().filter(|c| c.name == record.name).count(), 1);
+        for (name, receiver, want) in [
+            ("hidden", MethodReceiver::Instance, MethodVisibility::Private),
+            ("label", MethodReceiver::Instance, MethodVisibility::Public),
+            ("extra", MethodReceiver::Instance, MethodVisibility::Public),
+            ("build", MethodReceiver::Class, MethodVisibility::Private),
+            ("make", MethodReceiver::Class, MethodVisibility::Public),
+        ] {
+            assert_eq!(visibility(&record.methods, name, receiver), want, "{source}: {name}");
+        }
+    }
 }
 
 #[test]
@@ -210,11 +233,11 @@ fn a_modifier_if_is_not_a_conditional_visibility_declaration() {
         ("def parse(value)\n    if value\n      private :parse\n    end\n    value\n  end", true),
         ("def parse(value)\n    unless value\n      private :parse\n    else\n      value\n    end\n  end", true),
         ("if ready\n    private\n    def hidden; 1; end\n  end", false),
-        // A neighboring `def` is what makes the module surface. Without
-        // it, an accessor inside `if` would be dropped with the module
-        // and the error would never be raised.
-        ("def present; 1; end\n  if enabled\n    attr_reader :token\n  end", false),
-        ("def present; 1; end\n  unless enabled\n    attr_writer :token\n  else\n    attr_accessor :other\n  end", false),
+        // A plain accessor in a load-time conditional's branch is carried
+        // with its branch (`ConditionalDefinitions`); a class-level one
+        // is not.
+        ("def present; 1; end\n  if enabled\n    attr_reader :token\n  end", true),
+        ("def present; 1; end\n  unless enabled\n    attr_writer :token\n  else\n    attr_accessor :other\n  end", true),
         ("def present; 1; end\n  if enabled\n    cattr_reader :domain\n  end", false),
         ("def present; 1; end\n  mattr_accessor :label", true),
         ("return value if value", true),
@@ -250,7 +273,9 @@ fn a_modifier_if_is_not_a_conditional_visibility_declaration() {
 
 /// A model carries a marker naming a method its body does not define
 /// (generated, a superclass's or a gem's) for the lowering and the
-/// analyzer; a library class still refuses it.
+/// analyzer; a library class carries it as a body statement, which the
+/// Ruby family writes back (Hashie's `private :_regular_reader` after
+/// `alias _regular_reader []`) and the other targets report as dropped.
 #[test]
 fn an_inherited_visibility_change_is_carried_by_a_model() {
     for body in ["private :inherited", "private_class_method :inherited"] {
@@ -264,7 +289,12 @@ fn an_inherited_visibility_change_is_carried_by_a_model() {
                     if expr.decisions & roundhouse::expr::INHERITED_VISIBILITY != 0)),
             "{body}"
         );
-        assert!(ingest_library_class(source.as_bytes(), "thing.rb").is_err(), "library accepted {body}");
+        let class = ingest_library_class(source.as_bytes(), "thing.rb").unwrap_or_else(|e| panic!("library refused {body}: {e:?}"));
+        assert!(
+            class.iter().any(|lc| lc.unknown_calls.iter().any(|call| matches!(&*call.node,
+                roundhouse::expr::ExprNode::Send { method, .. } if method.as_str() == body.split(' ').next().unwrap()))),
+            "library dropped {body}"
+        );
     }
     let nested = "class Thing < ApplicationRecord\nclass << self\n  private :inherited\nend\nend";
     assert!(
@@ -416,24 +446,32 @@ end"#;
     }
 }
 
+/// A private `attr_reader` in a model is a reader method carrying that
+/// visibility (mission_control-jobs' `RecurringTask#queue_adapter`); a
+/// private writer or accessor is still refused, since mass assignment
+/// refuses its key in Rails and the model lowering does not model that.
 #[test]
-fn nonpublic_model_accessors_are_not_silently_accepted_without_method_metadata() {
-    for body in [
-        "private\n attr_reader :value",
-        "attr_reader :value\n private :value",
-    ] {
+fn nonpublic_model_readers_are_private_methods_and_writers_are_refused() {
+    for body in ["private\n attr_reader :value", "attr_reader :value\n private :value"] {
+        let source = format!("class Thing < ApplicationRecord\n{body}\nend");
+        assert_eq!(visibility(&methods(&source, true), "value", MethodReceiver::Instance), MethodVisibility::Private, "{source}");
+    }
+    let both = methods("class Thing < ApplicationRecord\n attr_reader :value, :shown\n private :value\nend", true);
+    assert_eq!(visibility(&both, "value", MethodReceiver::Instance), MethodVisibility::Private);
+    assert_eq!(visibility(&both, "shown", MethodReceiver::Instance), MethodVisibility::Public);
+    for body in ["private\n attr_writer :value", "attr_accessor :value\n private :value"] {
         let source = format!("class Thing < ApplicationRecord\n{body}\nend");
         assert!(
-            ingest_model(
-                source.as_bytes(),
-                "thing.rb",
-                &Schema::default(),
-                &Default::default()
-            )
-            .is_err(),
+            ingest_model(source.as_bytes(), "thing.rb", &Schema::default(), &Default::default()).is_err(),
             "{source}"
         );
     }
+    // Over a column, Rails' private reader reads an ivar the record never sets.
+    let schema = ingest_schema(b"ActiveRecord::Schema[8.1].define(version: 1) do\n  create_table :things do |t|\n    t.string :value\n  end\nend\n", "db/schema.rb").unwrap();
+    let source = "class Thing < ApplicationRecord\n private\n attr_reader :value\nend";
+    assert!(ingest_model(source.as_bytes(), "thing.rb", &schema, &Default::default()).is_err());
+    let source = "class Thing < ApplicationRecord\n attribute :secret, :string\n private\n attr_reader :secret\nend";
+    assert!(ingest_model(source.as_bytes(), "thing.rb", &Schema::default(), &Default::default()).is_err());
 }
 
 /// A model aliases a private def under `private` with `alias_method`. The
@@ -601,4 +639,18 @@ fn a_class_methods_carrier_singleton_is_refused_by_name() {
         ),
         "{error}"
     );
+}
+
+#[test]
+fn a_def_on_the_class_s_own_name_is_a_class_method() {
+    for source in [
+        "class Shape\n  def Shape.configure(x)\n    x\n  end\nend\n",
+        "module Graph\n  class Shape\n    def Shape.configure(x)\n      x\n    end\n  end\nend\n",
+    ] {
+        let classes = ingest_library_classes(source.as_bytes(), "shape.rb").expect(source);
+        let shape = classes.iter().find(|c| c.name.0.as_str().ends_with("Shape")).expect(source);
+        assert_eq!(visibility(&shape.methods, "configure", MethodReceiver::Class), MethodVisibility::Public, "{source}");
+    }
+    let foreign = "class Shape\n  def Other.configure(x)\n    x\n  end\nend\n";
+    assert!(ingest_library_classes(foreign.as_bytes(), "shape.rb").is_err(), "a def on another class stays refused");
 }

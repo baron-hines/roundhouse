@@ -2,7 +2,7 @@
 //! still belong to the helper that defined them. Preserve that ownership with
 //! small typed callable bridges; never expose the source's private methods.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::App;
 use crate::analyze::ClassInfo;
@@ -11,18 +11,21 @@ use crate::effect::EffectSet;
 use crate::expr::{Expr, ExprNode, Literal};
 use crate::ident::{ClassId, Symbol, VarId};
 use crate::span::Span;
-use crate::ty::{ParamKind, Ty};
+use crate::ty::{FnTy, ParamKind, Ty};
 
 /// A single builder-yielding call, with the caller's block forwarded through.
 pub(crate) struct FormWrapperHelper {
     pub(super) params: Vec<(Symbol, Option<Expr>)>,
+    pub(super) keyword_rest: bool,
     pub(super) call: Expr,
 }
 
-fn wrapped_call(m: &MethodDef) -> Option<&Expr> {
+fn wrapped_call(m: &MethodDef, native_keywords: bool) -> Option<&Expr> {
     let blk = m.block_param.as_ref()?;
     if m.unsupported_formals.is_some()
-        || m.params.iter().any(|p| p.rest || p.keyword || p.forwarding)
+        || m.params.iter().any(|p| {
+            p.forwarding || if native_keywords { p.rest != p.keyword } else { p.rest || p.keyword }
+        })
     {
         return None;
     }
@@ -46,13 +49,13 @@ fn wrapped_call(m: &MethodDef) -> Option<&Expr> {
 /// visible together, so these one-call wrappers are substituted before the
 /// view walk. Options-tail defaults and static merges are handled at the site.
 pub(super) fn form_wrapper_helpers(app: &App) -> HashMap<String, FormWrapperHelper> {
-    let mut out = HashMap::new();
+    let mut out = HashMap::default();
     for lc in &app.library_classes {
         for m in &lc.methods {
             if app.helper_method_index.get(&m.name) != Some(&lc.name) {
                 continue;
             }
-            let Some(body) = wrapped_call(m) else { continue };
+            let Some(body) = wrapped_call(m, app.native_library_keywords) else { continue };
             let mut call = body.clone();
             if let ExprNode::Send { block, .. } = &mut *call.node {
                 *block = None;
@@ -60,7 +63,15 @@ pub(super) fn form_wrapper_helpers(app: &App) -> HashMap<String, FormWrapperHelp
             out.insert(
                 m.name.as_str().to_string(),
                 FormWrapperHelper {
-                    params: m.params.iter().map(|p| (p.name.clone(), p.default.clone())).collect(),
+                    params: m.params.iter().map(|p| {
+                        let default = if p.keyword && p.rest {
+                            Some(Expr::new(m.name_span, ExprNode::Hash { entries: vec![], kwargs: false }))
+                        } else {
+                            p.default.clone()
+                        };
+                        (p.name.clone(), default)
+                    }).collect(),
+                    keyword_rest: m.params.last().is_some_and(|p| p.keyword && p.rest),
                     call,
                 },
             );
@@ -78,8 +89,8 @@ pub(super) fn form_wrapper_helpers(app: &App) -> HashMap<String, FormWrapperHelp
 /// and control-flow need a real wrapper-frame lowering, not this substitution.
 /// Existing argument/default/merge evaluation limitations are not expanded here.
 pub(crate) fn preserve_argument_owners(app: &mut App, registry: &HashMap<ClassId, ClassInfo>) {
-    let mut names: HashMap<_, HashSet<_>> = HashMap::new();
-    let mut counts: HashMap<_, usize> = HashMap::new();
+    let mut names: HashMap<_, HashSet<_>> = HashMap::default();
+    let mut counts: HashMap<_, usize> = HashMap::default();
     for lc in &app.library_classes {
         for m in &lc.methods {
             names.entry(lc.name.clone()).or_default().insert(m.name.clone());
@@ -96,7 +107,7 @@ pub(crate) fn preserve_argument_owners(app: &mut App, registry: &HashMap<ClassId
         let own_names = names[&lc.name].clone();
         let allocated = names.get_mut(&lc.name).expect("collected owner");
         let mut added = Vec::new();
-        let mut changed = HashSet::new();
+        let mut changed = HashSet::default();
         let original_len = lc.methods.len();
         for (index, m) in lc.methods.iter_mut().enumerate() {
             if app.helper_method_index.get(&m.name) != Some(&lc.name)
@@ -105,7 +116,7 @@ pub(crate) fn preserve_argument_owners(app: &mut App, registry: &HashMap<ClassId
             {
                 continue;
             }
-            let Some(call) = wrapped_call(m) else { continue };
+            let Some(call) = wrapped_call(m, app.native_library_keywords) else { continue };
             let ExprNode::Send { args, .. } = &*call.node else { unreachable!() };
             let mut args = args.clone();
             for arg in &mut args {
@@ -116,7 +127,7 @@ pub(crate) fn preserve_argument_owners(app: &mut App, registry: &HashMap<ClassId
                     {
                         continue;
                     }
-                    let mut reads = HashSet::new();
+                    let mut reads = HashSet::default();
                     let mut needs_owner = false;
                     let mut effects = EffectSet::pure();
                     if !inspect_argument(
@@ -131,12 +142,15 @@ pub(crate) fn preserve_argument_owners(app: &mut App, registry: &HashMap<ClassId
                         continue;
                     }
                     let Some(ret) = value.ty.clone() else { continue };
-                    let Some(Ty::Fn { params: sig_params, .. }) = &m.signature else { continue };
+                    let Some(Ty::Fn(fn_ty)) = &m.signature else { continue };
+                    let FnTy { params: sig_params, .. } = &**fn_ty;
                     let mut bridge = m.clone();
                     bridge.params.retain(|p| reads.contains(&p.name));
                     let mut params = Vec::new();
                     for p in &mut bridge.params {
                         p.default = None;
+                        p.keyword = false;
+                        p.rest = false;
                         p.from_keyword = false;
                         p.from_kwrest = false;
                         let Some(sig) = sig_params.iter().find(|sig| sig.name == p.name) else {
@@ -180,12 +194,12 @@ pub(crate) fn preserve_argument_owners(app: &mut App, registry: &HashMap<ClassId
                             arg
                         })
                         .collect();
-                    bridge.signature = Some(Ty::Fn {
+                    bridge.signature = Some(Ty::Fn(Box::new(FnTy {
                         params: params.into(),
                         block: None,
                         ret: std::sync::Arc::new(ret),
                         effects: effects.clone(),
-                    });
+                    })));
                     let recv = Expr::new(
                         value.span,
                         ExprNode::Const {
@@ -227,7 +241,7 @@ pub(crate) fn preserve_argument_owners(app: &mut App, registry: &HashMap<ClassId
         lc.methods.extend(added);
         for (index, method) in lc.methods.iter_mut().enumerate() {
             if index >= original_len || changed.contains(&index) {
-                crate::lower::typing::type_method_body(method, &classes, &HashMap::new());
+                crate::lower::typing::type_method_body(method, &classes, &HashMap::default());
             }
         }
     }
@@ -265,7 +279,7 @@ fn inspect_argument(
         | ExprNode::StringInterp { .. } => {}
         _ => return false,
     }
-    effects.effects.extend(e.effects.effects.iter().cloned());
+    effects.extend(e.effects.effects().iter().cloned());
     let mut valid = true;
     e.node.for_each_child(&mut |child| {
         valid &= inspect_argument(child, own_names, reads, needs_owner, effects);

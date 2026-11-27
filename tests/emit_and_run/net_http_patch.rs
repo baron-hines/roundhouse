@@ -1,7 +1,6 @@
 //! `Net::HTTP::Patch` and `Net::ProtocolError` run on the emitted Ruby
-//! tree (invariant 6). CRuby-only `HTTPBadResponse` /
-//! `HTTPHeaderSyntaxError` stay refused at check time — do not pin them
-//! here until Spinel defines them.
+//! tree (invariant 6). Native exception class values are covered by
+//! `tests/net_http_exceptions.rs`.
 
 use super::emit_and_run;
 

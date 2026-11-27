@@ -144,6 +144,6 @@ fn jruby_carries_the_ruby_trees_health_controller() {
     for path in ["app/controllers/rails/health_controller.rb", "config/routes.rb", "main.rb"] {
         assert_eq!(file(&ruby, path), file(&jruby, path), "{path}");
     }
-    assert!(file(&ruby, "main.rb").contains("when :rails_health then"));
+    assert!(file(&ruby, "main.rb").contains("when :rails__health then"));
 }
 

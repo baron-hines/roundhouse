@@ -3,23 +3,26 @@
 //! here, and `ClassAttribute` methods, whose parameters are typed from
 //! their call sites like any method's (class-body macro calls included).
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::dialect::{ClassConfigurationRole, Controller, ControllerBodyItem};
 use crate::expr::{Expr, ExprNode, LValue};
 use crate::ident::{ClassId, Symbol};
-use crate::ty::{Param, Ty};
+use crate::ty::{FnTy, Param, Ty};
 
 use super::{Analyzer, Ctx, union_of};
 
 impl Analyzer {
     pub(super) fn analyze_class_configuration(&mut self, controllers: &mut [Controller]) {
-        let mut types: HashMap<(ClassId, Symbol), Ty> = HashMap::new();
+        let mut types: HashMap<(ClassId, Symbol), Ty> = HashMap::default();
         for controller in controllers.iter_mut() {
             for item in &mut controller.body {
                 let ControllerBodyItem::ClassIvarInit { expr, carrier, .. } = item else {
                     continue;
                 };
+                // Typed whatever the frontier: a slot is shared with the
+                // carrier's other includers, and these bodies read it.
+                self.note_retyped(&controller.name);
                 if let ExprNode::Assign { value, .. } = &mut *expr.node {
                     seed_empty_hashes(value, &empty_hash());
                 }
@@ -113,6 +116,7 @@ impl Analyzer {
                 else {
                     continue;
                 };
+                self.note_retyped(&controller.name);
                 let ty = types
                     .get(configuration_slot)
                     .cloned()
@@ -176,9 +180,9 @@ impl Analyzer {
                     }
                 }
                 seed_empty_hashes(&mut method.body, &ty);
-                self.body_typer().analyze_expr(&mut method.body, &ctx);
+                self.body_typer().analyze_method_body(&mut method.body, &ctx);
                 method.effects = self.collect_effects(&mut method.body, &ctx);
-                method.signature = Some(Ty::Fn {
+                method.signature = Some(Ty::Fn(Box::new(FnTy {
                     params: method
                         .params
                         .iter()
@@ -201,7 +205,7 @@ impl Analyzer {
                     block: None,
                     ret: std::sync::Arc::new(method.body.ty.clone().unwrap_or(Ty::Untyped)),
                     effects: method.effects.clone(),
-                });
+                })));
                 // Sibling class methods in this same pass call each other
                 // (a macro's `self.x += …` reads through the reader). Publish
                 // the return before the next method is typed so the registry

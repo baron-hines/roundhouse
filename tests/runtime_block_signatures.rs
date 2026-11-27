@@ -1,5 +1,5 @@
 //! Runtime RBS block contracts survive return-only registry seeds.
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::process::Command;
 
 use roundhouse::analyze::ClassInfo;
@@ -7,7 +7,7 @@ use roundhouse::dialect::MethodDef;
 use roundhouse::expr::{Expr, ExprNode};
 use roundhouse::ident::{ClassId, Symbol};
 use roundhouse::runtime_src::parse_methods_with_rbs_in_ctx;
-use roundhouse::ty::Ty;
+use roundhouse::ty::{FnTy, Ty};
 
 #[path = "support/runtime_block_signature.rs"]
 mod runtime_block_signature;
@@ -65,7 +65,7 @@ fn single_array_block_signature_binds_elements_without_mutating_the_registry() {
     let batch_id = ClassId(Symbol::from("Batch"));
     let mut batch = ClassInfo::default();
     batch.instance_methods.insert(Symbol::from("rows"), Ty::Nil);
-    let classes = HashMap::from([(batch_id.clone(), batch)]);
+    let classes = HashMap::from_iter([(batch_id.clone(), batch)]);
     let methods = parse_methods_with_rbs_in_ctx(RUBY, RBS, &classes).expect("runtime parses");
     let consume = method(&methods, "consume");
     assert_eq!(consume.body.ty, Some(Ty::Int));
@@ -114,7 +114,7 @@ end
     let batch_id = ClassId(Symbol::from("ClassBatch"));
     let mut batch = ClassInfo::default();
     batch.class_methods.insert(Symbol::from("rows"), Ty::Nil);
-    let classes = HashMap::from([(batch_id.clone(), batch)]);
+    let classes = HashMap::from_iter([(batch_id.clone(), batch)]);
     let methods = parse_methods_with_rbs_in_ctx(ruby, rbs, &classes).expect("runtime parses");
     let consume = method(&methods, "consume");
     assert_eq!(consume.body.ty, Some(Ty::Int));
@@ -166,7 +166,7 @@ class Arity
 end
 "#;
     let methods =
-        parse_methods_with_rbs_in_ctx(ruby, rbs, &HashMap::new()).expect("runtime parses");
+        parse_methods_with_rbs_in_ctx(ruby, rbs, &HashMap::default()).expect("runtime parses");
     let consume = method(&methods, "consume");
     assert_eq!(consume.body.ty, Some(Ty::Nil));
     assert_no_inference_gaps(&consume.body);
@@ -207,7 +207,7 @@ class Dyn
 end
 "#;
     let methods =
-        parse_methods_with_rbs_in_ctx(ruby, rbs, &HashMap::new()).expect("runtime parses");
+        parse_methods_with_rbs_in_ctx(ruby, rbs, &HashMap::default()).expect("runtime parses");
     let pick = method(&methods, "pick");
     assert_eq!(pick.body.ty, Some(Ty::Untyped));
     assert_no_inference_gaps(&pick.body);
@@ -246,7 +246,7 @@ class Counter
 end
 "#;
     let methods =
-        parse_methods_with_rbs_in_ctx(ruby, rbs, &HashMap::new()).expect("runtime parses");
+        parse_methods_with_rbs_in_ctx(ruby, rbs, &HashMap::default()).expect("runtime parses");
     let consume = method(&methods, "consume");
     assert_eq!(consume.body.ty, Some(Ty::Int));
     assert_no_inference_gaps(&consume.body);
@@ -286,10 +286,10 @@ end
     let mut batch = ClassInfo::default();
     batch.instance_methods.insert(
         Symbol::from("rows"),
-        Ty::Fn {
+        Ty::Fn(Box::new(FnTy {
             params: vec![].into(),
             ret: std::sync::Arc::new(Ty::Nil),
-            block: Some(std::sync::Arc::new(Ty::Fn {
+            block: Some(std::sync::Arc::new(Ty::Fn(Box::new(FnTy {
                 params: vec![roundhouse::ty::Param {
                     name: Symbol::from("s"),
                     ty: Ty::Str.into(),
@@ -299,11 +299,11 @@ end
                 ret: std::sync::Arc::new(Ty::Nil),
                 block: None,
                 effects: roundhouse::effect::EffectSet::default(),
-            })),
+            })))),
             effects: roundhouse::effect::EffectSet::default(),
-        },
+        })),
     );
-    let classes = HashMap::from([(batch_id, batch)]);
+    let classes = HashMap::from_iter([(batch_id, batch)]);
     let methods = parse_methods_with_rbs_in_ctx(ruby, rbs, &classes).expect("runtime parses");
     let consume = method(&methods, "consume");
     assert_eq!(consume.body.ty, Some(Ty::Int));
@@ -357,7 +357,7 @@ end
     foreign
         .class_methods
         .insert(Symbol::from("answer"), Ty::Bool);
-    let classes = HashMap::from([(probe_id.clone(), probe), (foreign_id.clone(), foreign)]);
+    let classes = HashMap::from_iter([(probe_id.clone(), probe), (foreign_id.clone(), foreign)]);
     let methods = parse_methods_with_rbs_in_ctx(ruby, rbs, &classes).expect("runtime parses");
     let consume = method(&methods, "consume");
     assert_eq!(consume.body.ty, Some(Ty::Str));

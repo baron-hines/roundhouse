@@ -163,6 +163,75 @@ fn a_relation_second_is_not_an_index_read() {
     );
 }
 
+/// A ONE-parameter block over a Hash receives the whole `[key, value]`
+/// pair, so `pair.second` is an index read on a pair (a Tuple at
+/// analysis time, an Array at run time). The parameter used to bind the
+/// key's type, leaving `second` as a dynamic call a strict target cannot
+/// answer. Two parameters, an Array of pairs, and the key-yielding
+/// `select` keep their old meaning.
+#[test]
+fn a_one_param_hash_block_binds_the_pair() {
+    let src = emit_lib(
+        "class GadgetReport\n  def self.from_hash\n    { \"small\" => [1, 2], \"large\" => [3] }.map { |pair| pair.second }\n  end\n\n  \
+         def self.from_hash_two_params\n    { \"small\" => [1, 2], \"large\" => [3] }.map { |name, list| list.second }\n  end\n\n  \
+         def self.from_array\n    [[\"small\", [1, 2]], [\"large\", [3]]].map { |pair| pair.second }\n  end\n\n  \
+         def self.keys_only\n    { [1, 2] => 1 }.select { |k| k.second == 2 }\n  end\n\n  \
+         def self.grouped\n    { \"a\" => [1] }.group_by { |pair| pair.second }\n  end\nend\n",
+        "gadget_report",
+    );
+    assert!(src.contains("map { |pair| pair[1] }"), "one-param Hash block:\n{src}");
+    assert!(src.contains("map { |name, list| list[1] }"), "two-param form:\n{src}");
+    assert!(src.contains("group_by { |pair| pair[1] }"), "group_by pair:\n{src}");
+    assert_eq!(src.matches("pair[1]").count(), 3, "Hash and Array pair forms:\n{src}");
+    assert!(src.contains("select { |k| k[1] == 2 }"), "select still binds the key:\n{src}");
+    assert!(!src.contains(".second"), "no `second` should survive:\n{src}");
+}
+
+/// `sum` yields the pair too (CRuby 4.0.5: `{a: 1}.sum { |pair| pair[1] }`
+/// is 1), so a lone parameter is the pair there as well.
+#[test]
+fn a_one_param_hash_sum_binds_the_pair() {
+    let src = emit_lib(
+        "class GadgetTotal\n  def self.total\n    { \"small\" => [1, 2], \"large\" => [3] }.sum { |pair| pair.second.length }\n  end\nend\n",
+        "gadget_total",
+    );
+    assert!(src.contains("sum { |pair| pair[1].length }"), "one-param Hash sum:\n{src}");
+    assert!(!src.contains(".second"), "no `second` should survive:\n{src}");
+}
+
+/// Only a lone REQUIRED parameter receives the pair (review). With an
+/// optional or a rest after it, CRuby 4.0.5 splats the pair: in
+/// `{5 => 1}.map { |k, v = 0| k }` and `{ |k, *rest| k }`, `k` is `5`.
+/// A destructured `|(name, list)|` takes the pair and unpacks it. The
+/// keys are Strings, which have no `second`, so `k.second` stays a call
+/// where `k` is the key and becomes `k[1]` only where it's the pair.
+#[test]
+fn only_a_lone_required_param_binds_the_pair() {
+    let src = emit_lib(
+        "class GadgetShapes\n  def self.optional\n    { \"a\" => 1 }.map { |k, v = 0| k.second }\n  end\n\n  \
+         def self.rest\n    { \"a\" => 1 }.map { |k, *rest| k.second }\n  end\n\n  \
+         def self.destructured\n    { \"small\" => [1, 2] }.map { |(name, list)| list.second }\n  end\nend\n",
+        "gadget_shapes",
+    );
+    assert_eq!(src.matches("k.second").count(), 2, "the key is no pair:\n{src}");
+    assert!(!src.contains("k[1]"), "the key is no pair:\n{src}");
+    assert!(src.contains("list[1]"), "a destructured pair unpacks:\n{src}");
+}
+
+/// An ordinal past a pair's end isn't an index read (review): Ruby's
+/// `pair.third` is nil, and a strict target's tuple has no index 2.
+#[test]
+fn an_ordinal_past_the_pair_is_left_alone() {
+    let src = emit_lib(
+        "class GadgetEnds\n  def self.third\n    { \"a\" => 1 }.map { |pair| pair.third }\n  end\n\n  \
+         def self.second\n    { \"a\" => 1 }.map { |pair| pair.second }\n  end\nend\n",
+        "gadget_ends",
+    );
+    assert!(src.contains("pair.third"), "past the end:\n{src}");
+    assert!(!src.contains("pair[2]"), "past the end:\n{src}");
+    assert!(src.contains("pair[1]"), "in range:\n{src}");
+}
+
 // ── conversions type through an untyped receiver ─────────────────────
 
 /// `x.to_s` is a String whatever `x` is, and saying so is what lets a

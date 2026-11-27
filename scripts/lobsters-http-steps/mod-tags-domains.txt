@@ -1,0 +1,12 @@
+# a moderator adds and edits a tag, then edits and bans a domain
+#! login alice@example.com
+GET /mod/tags/new
+POST /mod/tags tag[tag]=replay&tag[category_name]=general&tag[description]=Made+by+the+replay&tag[hotness_mod]=0
+GET /t/replay
+GET /mod/tags/replay/edit
+POST /mod/tags/replay _method=patch&tag[description]=Edited+by+the+replay&tag[category_name]=general
+GET /tags
+GET /domains/example.com
+GET /mod/domains/example.com/edit
+POST /mod/domains_ban/example.com _method=patch&domain[banned_reason]=Replay+ban
+GET /domains/example.com

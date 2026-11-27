@@ -1,0 +1,7 @@
+module ActiveRecord
+  class StaleObjectError < ActiveRecordError
+    def record: () -> Object?
+    def attempted_action: () -> Object?
+    def initialize: (?Object? record, ?Object? attempted_action) -> void
+  end
+end

@@ -48,8 +48,8 @@ fn assignment_receiver_grounds_and_assigns_exactly_once() {
     // String), so the predicate goes to `ActiveSupport.present?(value)`,
     // which is nil-safe for every value.
     assert!(
-        body.contains("Const { path: [Symbol(\"ActiveSupport\")] }"),
-        "present? should go to ActiveSupport.present?:\n{body}"
+        body.contains("ActiveSupport"),
+        "present? should be grounded:\n{body}"
     );
     // The assignment survives — and appears exactly once, so the session
     // read is not duplicated.

@@ -115,9 +115,9 @@ module ActiveStorage
   end
 
   module Current
-    self.@url_options: Hash[Symbol, String]?
-    def self.url_options: () -> Hash[Symbol, String]?
-    def self.url_options=: (Hash[Symbol, String]? options) -> Hash[Symbol, String]?
+    def self.url_options: () -> Hash[Symbol, untyped]?
+    def self.url_options=: (Hash[Symbol, untyped]? options) -> Hash[Symbol, untyped]?
+    def self.set: (url_options: Hash[Symbol, untyped]) { () -> untyped } -> untyped
     def self.base_url: () -> String
   end
 
@@ -248,14 +248,19 @@ module ActiveStorage
     @attachment_id: Integer
     @blob: ActiveStorage::Blob?
     @variations: Array[ActiveStorage::Variation]
+    # The blob that `attach` keeps for a record that is not saved yet.
+    @staged: ActiveStorage::Blob?
     def initialize: (String record_type, Integer record_id, String name, Array[ActiveStorage::Variation] variations) -> void
     def variations: () -> Array[ActiveStorage::Variation]
+    def record_id: () -> Integer
+    def take_staged: () -> ActiveStorage::Blob?
     def load_row: () -> nil
     def _preload_row: (Integer attachment_id, ActiveStorage::Blob? blob) -> nil
     def attached?: () -> bool
     def blob: () -> ActiveStorage::Blob?
     def filename: () -> ActiveStorage::Filename?
     def content_type: () -> String?
+    def download: () -> String?
     def key: () -> String
     def signed_id: () -> String
     def byte_size: () -> Integer
@@ -304,6 +309,7 @@ module ActiveStorage
     @rows: Array[ActiveStorage::ManyAttachment]
     @rows_loaded: bool
     def initialize: (String record_type, Integer record_id, String name) -> void
+    def record_id: () -> Integer
     def attached?: () -> bool
     def attachments: () -> Array[ActiveStorage::ManyAttachment]
     def first: () -> ActiveStorage::ManyAttachment?
@@ -322,6 +328,7 @@ module ActiveStorage
   end
 
   class PurgeJob
+    def perform: (ActiveStorage::Blob blob) -> nil
     def self.perform_later: (ActiveStorage::Blob blob) -> nil
   end
 
@@ -334,13 +341,13 @@ end
 # onto the app's generated RouteHelpers so a view that writes one
 # compiles on every target.
 module RouteHelpers
-  def self.rails_blob_path: (ActiveStorage::Attached attachment, ?disposition: String?, ?only_path: bool?) -> String
-  def self.rails_blob_url: (ActiveStorage::Attached attachment, ?disposition: String?, ?only_path: bool?) -> String
+  def self.rails_blob_path: (ActiveStorage::Attached | ActiveStorage::Blob | nil model, ?disposition: String?, ?only_path: bool?) -> String
+  def self.rails_blob_url: (ActiveStorage::Attached | ActiveStorage::Blob | nil model, ?disposition: String?, ?only_path: bool?) -> String
   def self.rails_storage_proxy_path: (ActiveStorage::Attached | ActiveStorage::Blob model, ?disposition: String?, ?only_path: bool?) -> String
   def self.rails_storage_proxy_url: (ActiveStorage::Attached | ActiveStorage::Blob model, ?disposition: String?, ?only_path: bool?) -> String
   def self.rails_storage_redirect_path: (ActiveStorage::Attached | ActiveStorage::Blob model, ?disposition: String?, ?only_path: bool?) -> String
   def self.rails_storage_redirect_url: (ActiveStorage::Attached | ActiveStorage::Blob model, ?disposition: String?, ?only_path: bool?) -> String
-  def self.storage_blob: (ActiveStorage::Attached | ActiveStorage::Blob model) -> ActiveStorage::Blob?
+  def self.storage_blob: (ActiveStorage::Attached | ActiveStorage::Blob | nil model) -> ActiveStorage::Blob?
   def self.rails_representation_path: (ActiveStorage::VariantWithRecord variant, ?only_path: bool?) -> String
   def self.rails_representation_url: (ActiveStorage::VariantWithRecord variant, ?only_path: bool?) -> String
   def self.rails_direct_uploads_path: () -> String

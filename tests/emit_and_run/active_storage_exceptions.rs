@@ -2,6 +2,8 @@
 //! classes and type guards. The emitted runtime must define the same
 //! names and parents, including the service/preview/transformer errors.
 
+#[path = "../support/scratch.rs"]
+mod scratch;
 use super::emit_and_run;
 
 const EXCEPTIONS: &[(&str, &str)] = &[
@@ -223,7 +225,7 @@ fn an_unknown_active_storage_exception_stays_refused() {
 
 #[test]
 fn active_storage_exception_methods_are_still_checked() {
-    let root = std::env::temp_dir().join(format!("roundhouse-storage-methods-{}", std::process::id()));
+    let root = scratch::dir("roundhouse-storage-methods");
     std::fs::create_dir_all(root.join("app/models")).unwrap();
     std::fs::write(
         root.join("app/models/application_record.rb"),
@@ -367,7 +369,7 @@ fn active_storage_exception_owner_constructor_refusals_survive_emission() {
         let run = app(&format!("  def self.value\n    {owner}.new({{ resize_to_limit: [10, 10] }})\n  end"))
             .run_ruby("StorageErrors.value");
         assert!(run.errors.iter().any(|e| e.contains(".new lacks a shared runtime constructor implementation")));
-        assert!(!run.success && run.stderr.contains("ActiveStorage constructor not supported"), "{}", run.stderr);
+        assert!(!run.program_succeeded() && run.stderr.contains("ActiveStorage constructor not supported"), "{}", run.stderr);
     }
 }
 

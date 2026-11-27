@@ -27,6 +27,7 @@ load "#{root}/runtime/spinel/message_digest_cruby.rb"
 load "#{root}/runtime/ruby/action_controller/message_verifier.rb"
 load "#{root}/runtime/ruby/action_controller/cookies.rb"
 load "#{root}/runtime/spinel/cgi_io.rb"
+load "#{root}/runtime/ruby/action_dispatch/request.rb"
 
 # action_cable.rb's one require; the transport half is not under test.
 # Not expand_path: require_relative resolves symlinks, so under a symlinked tree (Bazel's runfiles) the paths differ.
@@ -97,6 +98,11 @@ module ApplicationCable
     include Authentication::SessionLookup
 
     def connect
+      raise "missing listener" unless request.env["roundhouse.listener"] == "unix"
+      raise "missing path" unless request.path == "/cable"
+      raise "missing header" unless request.headers["X-Probe"] == "present"
+      raise "missing params" unless request.params["token"] == "probe"
+      raise "missing remote_ip" unless request.remote_ip == "192.0.2.7"
       self.current_user = find_verified_user
     end
 
@@ -123,7 +129,10 @@ def check(label, got, want)
   end
 end
 
-def env_with(cookie) = { "HTTP_COOKIE" => cookie, "PATH_INFO" => "/cable" }
+def env_with(cookie)
+  { "HTTP_COOKIE" => cookie, "PATH_INFO" => "/cable", "QUERY_STRING" => "token=probe",
+    "HTTP_X_PROBE" => "present", "REMOTE_ADDR" => "192.0.2.7", "roundhouse.listener" => "unix" }
+end
 
 # The jar signs on the way out, so the fixture cookie is signed exactly
 # the way the app's own `sessions_controller` writes it.

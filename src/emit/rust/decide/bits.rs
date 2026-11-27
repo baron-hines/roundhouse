@@ -3,7 +3,7 @@
 //! Layout: bits 0–31 are **cross-target** concerns — predicates whose
 //! semantics other targets (TS/Crystal/Go/Kotlin/Swift) would also
 //! consume if and when those targets grow a decide pass. Bits 32–63
-//! are **rust-local** — semantics tied to Rust's type system
+//! are **target-local**. Rust uses them for its type system
 //! (ownership, move/copy, Option wrapping for `Option<T>`-typed
 //! positions).
 //!
@@ -82,7 +82,13 @@ pub const CLONE_AT: u64 = 1 << 34;
 // Ivar(Class)), making the lowerer-inserted `Cast { target_ty:
 // Option<U> }` the sole signal for Some-wrap. The walker that
 // stamped this bit (`decide/coerce_family.rs`) was deleted in the
-// same commit; the position stays unallocated for future use.
+// same commit. The position is now `crate::expr::NATIVE_KEYWORD_ARGUMENTS`,
+// a Ruby-family-local lowering decision, so Rust must not allocate it.
+
+// Bits 36–39 are also allocated in `crate::expr`: `INHERITED_ALIAS_COPY`
+// (36), `FORMAT_VARIANT_CALL` (37), `INDEXER_CLASS_QUERY_VALUE` (38), and
+// `INDEXER_INSTANCE_VALUE` (39). They share `Expr.decisions` with the
+// Rust flags above, so Rust must not reuse these positions.
 
 // ────────────────────────────────────────────────────────────────────
 // Enum-valued fields (bit groups)
@@ -96,3 +102,25 @@ pub const CLONE_AT: u64 = 1 << 34;
 // pub const COERCE_FAMILY_MASK:  u64 = 0xF << COERCE_FAMILY_SHIFT;
 //
 // Left unallocated until Stage 4 lands the enum shape.
+
+#[cfg(test)]
+mod tests {
+    /// `Expr.decisions` bits are declared here and in `crate::expr`. Two
+    /// flags given one bit in different changes merge without a textual
+    /// conflict, so check that each position is declared once.
+    #[test]
+    fn each_decision_bit_is_declared_once() {
+        let mut owners = std::collections::BTreeMap::new();
+        for source in [include_str!("bits.rs"), include_str!("../../../expr.rs")] {
+            for line in source.lines() {
+                let Some(rest) = line.trim().strip_prefix("pub const ") else { continue };
+                let Some((name, bit)) = rest.split_once(": u64 = 1 << ") else { continue };
+                let bit: u32 = bit.split(';').next().unwrap().trim().parse().expect(name);
+                if let Some(other) = owners.insert(bit, name) {
+                    panic!("decision bit {bit} is both {other} and {name}");
+                }
+            }
+        }
+        assert!(owners.len() > 30, "{owners:?}");
+    }
+}

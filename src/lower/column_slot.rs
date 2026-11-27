@@ -5,7 +5,7 @@
 //! expose a native Date or Time. An `interval` column stores a whole-second
 //! count as text and exposes `ActiveSupport::Duration`. Schema-less JSON
 //! (`t.json`, `t.jsonb`, or `serialize …, coder: JSON`) stores text and
-//! exposes the decoded value through `JsonColumn`. Reader, writer,
+//! exposes the decoded value through `RoundhouseJsonColumn`. Reader, writer,
 //! hydration, `[]`, and Arel's formatting ask this slot instead of matching
 //! those column types again. Dialect DDL keeps its own type names.
 //!
@@ -203,7 +203,7 @@ impl<'a> ColumnSlot<'a> {
         Some(active_support(cast.span, logical.format(), vec![cast], logical.stored_ty()))
     }
 
-    /// `JsonColumn.dump`, typed as the string slot. `None` for every
+    /// `RoundhouseJsonColumn.dump`, typed as the string slot. `None` for every
     /// other column, including temporal — those format instead.
     pub fn json_dump(&self, value: Expr) -> Option<Expr> {
         if !self.is_json() {
@@ -246,15 +246,19 @@ impl<'a> ColumnSlot<'a> {
     }
 }
 
-/// Hydration writer for a JSON column: stored text, no `JsonColumn.dump`.
+/// Hydration writer for a JSON column: stored text, no `RoundhouseJsonColumn.dump`.
 pub fn json_hydration_method(col: &Column) -> Symbol {
     Symbol::from(format!("_write_{}_json_raw", col.name.as_str()))
 }
 
-/// The ivar a column is stored in. Temporal text lives at `<col>_raw`;
-/// every other column, including JSON, uses its own name.
+/// The ivar a column is stored in. Temporal text lives at `<col>_raw`,
+/// and so does a column held nilable for its presence check
+/// (`Column::unset_until_assigned`), whose reader answers another type
+/// than its slot: a target that folds a reader into its stored property
+/// (Swift) keeps the two apart. Every other column, including JSON,
+/// uses its own name.
 pub fn storage_name(col: &Column) -> Symbol {
-    if temporal_codec(&col.col_type).is_some() {
+    if temporal_codec(&col.col_type).is_some() || col.unset_until_assigned {
         Symbol::from(format!("{}_raw", col.name.as_str()))
     } else {
         col.name.clone()
@@ -363,7 +367,7 @@ fn json_column(span: Span, method: &str, args: Vec<Expr>, ty: Ty) -> Expr {
         Expr::new(
             span,
             ExprNode::Send {
-                recv: Some(Expr::new(span, ExprNode::Const { path: vec![Symbol::from("JsonColumn")] })),
+                recv: Some(Expr::new(span, ExprNode::Const { path: vec![Symbol::from("RoundhouseJsonColumn")] })),
                 method: Symbol::from(method),
                 args,
                 block: None,
@@ -385,10 +389,16 @@ mod tests {
             col_type,
             nullable: true,
             default: None,
+            default_expression: None,
+            legacy_default_persistence: false,
             primary_key: false,
             generated: None,
             generated_text_compatible: None,
             generated_int4_compatible: None,
+            array: false,
+            array_stored: false,
+            unset_until_assigned: false,
+            collated: false,
         }
     }
 

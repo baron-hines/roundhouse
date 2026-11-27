@@ -38,7 +38,7 @@
 
 use std::sync::Arc;
 
-use crate::ty::{Param, Row, Ty};
+use crate::ty::{FnTy, Param, Row, Ty};
 
 use super::body;
 
@@ -75,7 +75,7 @@ pub(super) fn bound(ty: Ty) -> Ty {
 /// union, whose arms sit at its own level.
 fn is_container(ty: &Ty) -> bool {
     match ty {
-        Ty::Array { .. } | Ty::Hash { .. } | Ty::Fn { .. } => true,
+        Ty::Array { .. } | Ty::Hash { .. } | Ty::Fn(_) => true,
         Ty::Tuple { elems } => !elems.is_empty(),
         Ty::Record { row } => !row.fields.is_empty(),
         Ty::Class { args, .. } => !args.is_empty(),
@@ -94,7 +94,8 @@ fn each_child<'a>(ty: &'a Ty, f: &mut dyn FnMut(&'a Ty)) {
         Ty::Record { row } => row.fields.values().for_each(f),
         Ty::Union { variants } => variants.iter().for_each(f),
         Ty::Class { args, .. } => args.iter().for_each(f),
-        Ty::Fn { params, block, ret, .. } => {
+        Ty::Fn(fn_ty) => {
+            let FnTy { params, block, ret, .. } = &**fn_ty;
             params.iter().for_each(|p| f(&p.ty));
             block.as_deref().into_iter().for_each(&mut *f);
             f(ret);
@@ -127,6 +128,11 @@ fn measure(ty: &Ty) -> (usize, usize) {
     (depth + usize::from(is_container(ty)), nodes)
 }
 
+/// [`cut`] for a widening outside the bound itself (`oscillation`).
+pub(super) fn cut_to(ty: &Ty, levels: usize) -> Ty {
+    cut(ty, levels)
+}
+
 /// `ty` with at most `levels` nested containers: one that would sit
 /// deeper is `untyped`. Unions are re-joined, since cut arms can coincide.
 fn cut(ty: &Ty, levels: usize) -> Ty {
@@ -151,15 +157,18 @@ fn cut(ty: &Ty, levels: usize) -> Ty {
             },
         },
         Ty::Class { id, args } => Ty::Class { id: id.clone(), args: args.iter().map(inner).collect() },
-        Ty::Fn { params, block, ret, effects } => Ty::Fn {
-            params: params
-                .iter()
-                .map(|p| Param { name: p.name.clone(), ty: Arc::new(inner(&p.ty)), kind: p.kind.clone() })
-                .collect(),
-            block: block.as_ref().map(|b| Arc::new(inner(b))),
-            ret: Arc::new(inner(ret)),
-            effects: effects.clone(),
-        },
+        Ty::Fn(fn_ty) => {
+            let FnTy { params, block, ret, effects } = &**fn_ty;
+            Ty::Fn(Box::new(FnTy {
+                params: params
+                    .iter()
+                    .map(|p| Param { name: p.name.clone(), ty: Arc::new(inner(&p.ty)), kind: p.kind.clone() })
+                    .collect(),
+                block: block.as_ref().map(|b| Arc::new(inner(b))),
+                ret: Arc::new(inner(ret)),
+                effects: effects.clone(),
+            }))
+        }
         other => other.clone(),
     }
 }
@@ -257,7 +266,7 @@ mod tests {
             crate::span::Span::synthetic(),
             crate::expr::ExprNode::Assign { target: crate::expr::LValue::Ivar { name: Symbol::from("h") }, value },
         );
-        let mut ivars = std::collections::HashMap::new();
+        let mut ivars = crate::det::HashMap::default();
         super::super::extract_ivar_assignments(&write, &mut ivars);
         assert_eq!(measure(&ivars[&Symbol::from("h")]).0, MAX_DEPTH);
 
@@ -310,7 +319,7 @@ mod tests {
                 crate::span::Span::synthetic(),
                 crate::expr::ExprNode::Seq { exprs: order.iter().map(|&i| write(writers[i].clone())).collect() },
             );
-            let mut ivars = std::collections::HashMap::new();
+            let mut ivars = crate::det::HashMap::default();
             super::super::extract_ivar_assignments(&body, &mut ivars);
             ivars.remove(&Symbol::from("h")).unwrap()
         };
@@ -327,7 +336,7 @@ mod tests {
         let key = (ClassId(Symbol::from("C")), Symbol::from("m"), crate::dialect::MethodReceiver::Instance);
         let fold = |order: [usize; 3]| {
             let writers = bound_order_writers();
-            let mut rows = std::collections::HashMap::new();
+            let mut rows = crate::det::HashMap::default();
             let observations = order.iter().map(|&i| (key.clone(), vec![writers[i].clone()])).collect();
             super::super::fold_param_observations(&mut rows, observations);
             rows.remove(&key).unwrap()

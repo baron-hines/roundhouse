@@ -1,0 +1,2 @@
+class SpecialFeature < Feature
+end

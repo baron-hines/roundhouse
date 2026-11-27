@@ -27,7 +27,7 @@ use crate::app::App;
 use crate::diagnostic::Diagnostic;
 use crate::expr::{Expr, ExprNode};
 use crate::ident::Symbol;
-use crate::ty::Ty;
+use crate::ty::{FnTy, Ty};
 
 /// Every mailer class: transitive parent-chain closure, since
 /// ApplicationMailer names ActionMailer::Base directly, BanNotification
@@ -67,6 +67,28 @@ pub fn apply_mailer_class_side(app: &mut App) -> Vec<Diagnostic> {
     }
 
     let parameterized = parameterized_mailers(app, &mailers);
+    // A mailer whose actions, or an ancestor's, carry their callback chain
+    // (`ingest::mailer_callbacks`): its own wrappers or ones it inherits.
+    let chained_mailers: BTreeSet<String> = mailers
+        .iter()
+        .filter(|name| {
+            let mut cur = Some((*name).clone());
+            let mut guard = 0;
+            while let Some(class) = cur {
+                guard += 1;
+                if guard > 64 {
+                    break;
+                }
+                let Some(lc) = app.library_classes.iter().find(|c| c.name.0.as_str() == class) else { break };
+                if lc.methods.iter().any(|m| m.name.as_str().starts_with("__mailer_action_")) {
+                    return true;
+                }
+                cur = lc.parent.as_ref().map(|p| p.0.as_str().to_string()).filter(|p| mailers.contains(p));
+            }
+            false
+        })
+        .cloned()
+        .collect();
     let own_with = defines_with(app);
     for lc in app.library_classes.iter_mut() {
         if !mailers.contains(lc.name.0.as_str()) {
@@ -78,6 +100,7 @@ pub fn apply_mailer_class_side(app: &mut App) -> Vec<Diagnostic> {
             .filter(|m| m.receiver == crate::dialect::MethodReceiver::Class)
             .map(|m| m.name.as_str())
             .collect();
+        let chained = chained_mailers.contains(lc.name.0.as_str());
         let mut wrappers: Vec<crate::dialect::MethodDef> = Vec::new();
         for m in &lc.methods {
             // ActionMailer's class-side proxy answers only the public
@@ -111,10 +134,13 @@ pub fn apply_mailer_class_side(app: &mut App) -> Vec<Diagnostic> {
             // and unstamped sends on typed receivers read as dispatch
             // failures.
             let (param_tys, ret_ty): (Vec<Option<Ty>>, Option<Ty>) = match &m.signature {
-                Some(Ty::Fn { params, ret, .. }) if params.len() == m.params.len() => (
-                    params.iter().map(|p| Some((*p.ty).clone())).collect(),
-                    Some((**ret).clone()),
-                ),
+                Some(Ty::Fn(fn_ty)) if fn_ty.params.len() == m.params.len() => {
+                    let FnTy { params, ret, .. } = &**fn_ty;
+                    (
+                        params.iter().map(|p| Some((*p.ty).clone())).collect(),
+                        Some((**ret).clone()),
+                    )
+                },
                 _ => (vec![None; m.params.len()], None),
             };
 
@@ -147,6 +173,17 @@ pub fn apply_mailer_class_side(app: &mut App) -> Vec<Diagnostic> {
                 },
             );
             new_call.ty = Some(Ty::Class { id: lc.name.clone(), args: vec![].into() });
+            // A mailer whose actions carry their callback chain
+            // (`ingest::mailer_callbacks`) runs it for a class-side call
+            // only: the wrapper marks the mailer it builds.
+            if chained {
+                let ty = new_call.ty.clone();
+                new_call = Expr::new(
+                    span,
+                    ExprNode::Send { recv: Some(new_call), method: Symbol::from("__processing"), args: vec![], block: None, parenthesized: false },
+                );
+                new_call.ty = ty;
+            }
             let mut body = Expr::new(
                 span,
                 ExprNode::Send {
@@ -175,7 +212,7 @@ pub fn apply_mailer_class_side(app: &mut App) -> Vec<Diagnostic> {
 
 /// Mailers whose own or an ancestor's `def self.with` answers `with`; Ruby would pick a generated one over the inherited.
 pub(crate) fn defines_with(app: &App) -> BTreeSet<String> {
-    let parents: std::collections::HashMap<&str, &str> = app
+    let parents: crate::det::HashMap<&str, &str> = app
         .library_classes
         .iter()
         .filter_map(|lc| lc.parent.as_ref().map(|p| (lc.name.0.as_str(), p.0.as_str())))
@@ -251,16 +288,33 @@ fn parameterized_constructor(mailer: &crate::ident::ClassId) -> crate::dialect::
         ExprNode::Send { recv: None, method: Symbol::from("new"), args: vec![], block: None, parenthesized: false },
     );
     new_call.ty = Some(instance.clone());
-    let mut body = Expr::new(
+    // `mailer = new; mailer._with_params(params); mailer` (roundhouse#1469):
+    // `_with_params` answers the `self` of `ActionMailer::Base`, which
+    // Spinel types as the base class, so returning it contradicted the
+    // declared mailer under `--rbs .`. The local is the mailer `new` built.
+    let local = Symbol::from("mailer");
+    let read = || {
+        let mut e = Expr::new(span, ExprNode::Var { id: crate::ident::VarId(0), name: local.clone() });
+        e.ty = Some(instance.clone());
+        e
+    };
+    let mut assign = Expr::new(
+        span,
+        ExprNode::Assign { target: crate::expr::LValue::Var { id: crate::ident::VarId(0), name: local.clone() }, value: new_call },
+    );
+    assign.ty = Some(instance.clone());
+    let mut with_params = Expr::new(
         span,
         ExprNode::Send {
-            recv: Some(new_call),
+            recv: Some(read()),
             method: Symbol::from("_with_params"),
             args: vec![arg],
             block: None,
             parenthesized: true,
         },
     );
+    with_params.ty = Some(instance.clone());
+    let mut body = Expr::new(span, ExprNode::Seq { exprs: vec![assign, with_params, read()] });
     body.ty = Some(instance.clone());
     crate::dialect::MethodDef {
         visibility: crate::dialect::MethodVisibility::Public,
@@ -271,12 +325,12 @@ fn parameterized_constructor(mailer: &crate::ident::ClassId) -> crate::dialect::
         receiver: crate::dialect::MethodReceiver::Class,
         params: vec![crate::dialect::Param::positional(params.clone())],
         body,
-        signature: Some(Ty::Fn {
+        signature: Some(Ty::Fn(Box::new(FnTy {
             params: vec![crate::ty::Param { name: params, ty: params_ty.into(), kind: crate::ty::ParamKind::Required }].into(),
             block: None,
             ret: instance.into(),
             effects: Default::default(),
-        }),
+        }))),
         effects: Default::default(),
         enclosing_class: Some(mailer.0.clone()),
         kind: crate::dialect::AccessorKind::Method,

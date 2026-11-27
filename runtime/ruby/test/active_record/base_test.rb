@@ -228,6 +228,26 @@ class BaseTest < Minitest::Test
     refute_equal 0, item.id
   end
 
+  class Tagging < ActiveRecord::Base
+    def self.table_name = "taggings"
+    def self.schema_columns = [:tag_id]
+    def self.primary_key = nil
+
+    def _adapter_insert
+      Db.exec("INSERT INTO taggings (tag_id) VALUES (1)")
+    end
+  end
+
+  def test_save_without_a_primary_key_inserts_without_assigning_id
+    Db.exec("CREATE TABLE taggings (tag_id INTEGER)")
+    tagging = Tagging.new
+
+    assert tagging.save()
+    assert_predicate tagging, :persisted?
+    refute_predicate tagging, :new_record?
+    assert_equal [{ "tag_id" => 1 }], ActiveRecord.adapter.select_rows("SELECT tag_id FROM taggings")
+  end
+
   # ── class-level finders ─────────────────────────────────────
 
   def test_find_returns_instance_for_existing_row
@@ -384,7 +404,7 @@ class BaseTest < Minitest::Test
     rel = ActiveRecord::Relation.new(Item).where(title: "o'k")
     log = Db.capture_sql { assert_equal ["o'k"], rel.to_a.map(&:title) }
     assert_equal 1, log.length
-    assert_match(/items\.title = \?/, log[0])
+    assert_match(/items\."title" = \?/, log[0])
     refute_match(/o''k/, log[0])
     assert_equal [], ActiveRecord::Relation.new(Item).where(id: -1).to_a
   end
@@ -394,8 +414,8 @@ class BaseTest < Minitest::Test
   def test_hash_condition_values_inline_outside_reads
     rel = ActiveRecord::Relation.new(Item).where(title: "o'k", id: 7)
     [rel.to_sql, rel.count_sql, rel.exists_sql(1), rel.arel.to_sql].each do |sql|
-      assert_match(/items\.title = 'o''k'/, sql)
-      assert_match(/items\.id = 7/, sql)
+      assert_match(/items\."title" = 'o''k'/, sql)
+      assert_match(/items\."id" = 7/, sql)
       refute sql.include?("\x01"), sql.inspect
     end
   end
@@ -740,6 +760,60 @@ class BaseTest < Minitest::Test
     refute_kind_of Array, out
   end
 
+  def test_relation_filter_map_uses_loaded_records_and_drops_nil_and_false
+    %w[A B C].each { |title| it = Item.new; it.title = title; it.save() }
+    rel = ActiveRecord::Relation.new(Item).order("id")
+    rel.to_a
+    Item.hydrate_count = 0
+    assert_equal ["C"], rel.filter_map { |it| it.title == "A" ? nil : (it.title != "B" && it.title) }
+    assert_equal 0, Item.hydrate_count
+    assert_equal [], rel.where(title: "missing").filter_map { |it| it.title }
+  end
+
+  def test_relation_flat_map_flattens_one_level
+    it = Item.new; it.title = "A"; it.save()
+    rel = ActiveRecord::Relation.new(Item)
+    assert_equal ["A", ["A"]], rel.flat_map { |record| [record.title, [record.title]] }
+    assert_equal [], rel.where(title: "missing").flat_map { |record| [record.title] }
+  end
+
+  def test_relation_each_with_index_returns_self_or_an_enumerator
+    %w[A B].each { |title| it = Item.new; it.title = title; it.save() }
+    rel = ActiveRecord::Relation.new(Item).order("id")
+    seen = []
+    assert_same rel, rel.each_with_index { |record, index| seen << [record.title, index] }
+    assert_equal [["A", 0], ["B", 1]], seen
+    assert_kind_of Enumerator, rel.each_with_index
+    assert_equal seen, rel.each_with_index.map { |record, index| [record.title, index] }
+  end
+
+  def test_relation_find_each_without_a_block_keeps_the_batch_receiver
+    %w[A B].each { |title| it = Item.new; it.title = title; it.save() }
+    rel = ActiveRecord::Relation.new(Item).order("id")
+    assert_same rel, rel.find_each
+    seen = []
+    assert_same rel, rel.find_each { |record| seen << record.title }
+    assert_equal ["A", "B"], seen
+    assert_equal seen, rel.find_each.map { |record| record.title }
+    assert_equal ["B"], rel.find_each.filter_map { |record| record.title if record.title == "B" }
+  end
+
+  def test_relation_sort_by_without_a_block_sorts_through_with_index
+    %w[B A C].each { |title| it = Item.new; it.title = title; it.save() }
+    rel = ActiveRecord::Relation.new(Item).order("id")
+    assert_kind_of Enumerator, rel.sort_by
+    assert_equal ["C", "A", "B"], rel.sort_by.with_index { |record, index| -index }.map { |record| record.title }
+    assert_equal ["B", "A", "C"], rel.sort_by.with_index { |record, index| 0 }.map { |record| record.title }
+    assert_equal ["A", "B", "C"], rel.sort_by { |record| record.title }.map { |record| record.title }
+  end
+
+  def test_relation_reduce_keeps_the_initial_value_on_empty_relations
+    %w[A B].each { |title| it = Item.new; it.title = title; it.save() }
+    rel = ActiveRecord::Relation.new(Item).order("id")
+    assert_equal "seedAB", rel.find_each.reduce("seed") { |memo, record| memo + record.title }
+    assert_equal true, rel.where(title: "missing").find_each.reduce(true) { |memo, record| false }
+  end
+
   def test_relation_last_n_on_loaded_takes_in_memory_tail
     5.times { |i| it = Item.new; it.title = "T#{i}"; it.save() }
     rel = ActiveRecord::Relation.new(Item).order("id")
@@ -765,8 +839,8 @@ class BaseTest < Minitest::Test
 
   def test_order_term_nested_hash_qualifies_table_column
     rel = ActiveRecord::Relation.new(Item)
-    assert_equal "rooms.updated_at DESC", rel.order_term({ rooms: { updated_at: :desc } })
-    assert_equal "updated_at DESC", rel.order_term({ updated_at: :desc })
+    assert_equal "\"rooms\".\"updated_at\" DESC", rel.order_term({ rooms: { updated_at: :desc } })
+    assert_equal "\"updated_at\" DESC", rel.order_term({ updated_at: :desc })
     assert_equal "updated_at", rel.order_term(:updated_at)
     assert_equal "id DESC", rel.order_term("id DESC")
   end
@@ -775,11 +849,11 @@ class BaseTest < Minitest::Test
     base = ActiveRecord::Relation.new(Item).where(title: "A")
     prior = base.to_sql
     fork = base.spawn.where(title: "B")
-    assert_match(/title = 'B'/, fork.to_sql)
+    assert_match(/"title" = 'B'/, fork.to_sql)
     assert_equal prior, base.to_sql
     # Copy-on-write: mutating the parent after spawn must not rewrite the fork.
     base.where!(title: "C")
-    assert_match(/title = 'B'/, fork.to_sql)
+    assert_match(/"title" = 'B'/, fork.to_sql)
     refute_match(/title = 'C'/, fork.to_sql)
     ordered = ActiveRecord::Relation.new(Item).where(title: "A")
     prior_order = ordered.to_sql
@@ -921,6 +995,54 @@ class BaseTest < Minitest::Test
   def test_create_bang_raises_record_invalid_when_save_fails
     err = assert_raises(ActiveRecord::RecordInvalid) { FailingHashItem.create!(title: "x") }
     assert_match(/Validation failed/, err.message)
+  end
+
+  def test_relation_create_saves_equality_attributes_and_returns_the_record
+    relation = ActiveRecord::Relation.new(HashItem).where(title: "Scoped")
+    item = relation.create
+    assert_kind_of HashItem, item
+    assert_predicate item, :persisted?
+    assert_equal "Scoped", item.title
+    assert_equal "Scoped", HashItem.find(item.id).title
+  end
+
+  def test_relation_create_bang_saves_equality_attributes_and_returns_the_record
+    relation = ActiveRecord::Relation.new(HashItem).where(title: "Scoped")
+    item = relation.create!
+    assert_kind_of HashItem, item
+    assert_predicate item, :persisted?
+    assert_equal "Scoped", item.title
+    assert_equal "Scoped", HashItem.find(item.id).title
+  end
+
+  def test_relation_create_explicit_attributes_override_scope_attributes
+    relation = ActiveRecord::Relation.new(HashItem).where(title: "Scoped")
+    assert_equal "Explicit", relation.create(title: "Explicit").title
+    assert_equal "Bang", relation.create!(title: "Bang").title
+    assert_equal({ title: "Scoped" }, relation.scope_attributes)
+  end
+
+  def test_relation_create_uses_association_scope_attributes
+    relation = ActiveRecord::Relation.new(HashItem).where_scope(title: "Association")
+    assert_equal "Association", relation.create({}).title
+    assert_equal "Association", relation.create!({}).title
+  end
+
+  def test_relation_create_returns_an_unpersisted_record_when_validation_fails
+    relation = ActiveRecord::Relation.new(FailingHashItem).where(title: "Scoped")
+    item = relation.create({})
+    assert_kind_of FailingHashItem, item
+    refute_predicate item, :persisted?
+    assert_equal "Scoped", item.title
+    assert_equal ["boom"], item.errors
+    assert_equal 0, Item.count
+  end
+
+  def test_relation_create_bang_raises_record_invalid_when_validation_fails
+    relation = ActiveRecord::Relation.new(FailingHashItem).where(title: "Scoped")
+    err = assert_raises(ActiveRecord::RecordInvalid) { relation.create!({}) }
+    assert_match(/Validation failed/, err.message)
+    assert_equal 0, Item.count
   end
 
   # ── timestamps (non-trivial: the only Base behavior with state
