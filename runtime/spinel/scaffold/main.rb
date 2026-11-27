@@ -303,12 +303,11 @@ module Main
     @route_table ||= [RouteTable.root] + RouteTable.table + ActiveStorage::Routes.table
   end
 
-  # Tep::Server callback. Routes, runs the controller, copies
-  # status/body/location back, and persists per-request flash via
-  # cookies (one flash_<key> each) so a `redirect_to … notice:`
-  # shows once on the redirect target and is then swept — matching the
-  # cookie-backed Rack path in ruby_overlay/main.rb. Session is still a
-  # fresh per-request object (not yet cookie-persisted), same as Rack.
+  # Tep::Server callback. Routes, runs the controller and copies
+  # status/body/location back; the flash rides the session cookie
+  # (`persist_session`), so a `redirect_to … notice:` shows once on the
+  # redirect target and is then swept, as on the Rack path in
+  # ruby_overlay/main.rb.
   # How often the job fiber looks for work, in seconds. A cooperative
   # poll rather than a wakeup because there is nothing to wake on: the
   # queue is a plain Array and the enqueue happens on another fiber
@@ -403,21 +402,23 @@ module Main
   # configured one, so a literal here would clear the session on every
   # request.
   #
-  # SIGNED (runtime/signed_cookies.rb): a value that does not verify
-  # restores as an empty session. `roundhouse.session.in` is the
-  # restored session's PLAIN encoding — what the persist step compares
-  # against, so an untouched session writes no Set-Cookie and a
-  # rejected one is not rewritten until the action changes it.
+  # ENCRYPTED, Rails' JSON cookie store (runtime/cookie_store.rb): a value
+  # that does not decrypt for this cookie name restores as an empty
+  # session. `roundhouse.session.in` is the restored session's PLAIN JSON —
+  # what the persist step compares against, since the cookie itself
+  # differs on every write (a fresh IV): an untouched session writes no
+  # Set-Cookie and a rejected one is not rewritten until the action
+  # changes it.
   #
   # Not in `dispatch_request` beside the controller: Rails' session
   # middleware sits above Warden's and the routes, which read it first.
   def self.restore_session(req, request_obj)
     session_cookie = Rails.application.session_cookie_key
-    restored = ActionDispatch::Session.from_signed_cookie(
+    restored = ActionDispatch::CookieStore.restore(
       req.cookies.fetch(session_cookie, ""), session_cookie)
     request_obj.session = restored
     request_obj.env["rack.session"] = restored
-    request_obj.env["roundhouse.session.in"] = restored.to_cookie
+    request_obj.env["roundhouse.session.in"] = ActionDispatch::CookieStore.payload(restored)
     nil
   end
 
@@ -673,22 +674,12 @@ module Main
     # resolves. Same shared ActionController::CookieJar the CRuby overlay uses.
     controller.cookies = ActionController::CookieJar.new(req.cookies)
     controller.cookies = controller.request.adopt_cookie_jar(controller.cookies)
-    # Inbound flash: each message rides its own SIGNED cookie
-    # (flash_<key>; runtime/signed_cookies.rb) — one that
-    # does not verify reads as no message, so a client cannot make the
-    # next page show text of its choosing. Load
-    # through the constructor (NOT flash[:k]=) so to_persisted's show-once
-    # diff sees them as carried-in (value == @notice_was) and sweeps them.
-    inbound_flash = ActionDispatch::Flash.new
-    # Every `flash_<key>` cookie, not only notice/alert: lobsters' layout shows `flash[:error]` / `[:success]`.
-    req.cookies.each do |cname, cvalue|
-      if cname.start_with?("flash_")
-        ActionDispatch::Flash.cookie_flashes(cvalue, cname).each do |key, value|
-          inbound_flash[key] = value
-        end
-      end
-    end
-    controller.flash = ActionDispatch::Flash.new(inbound_flash.to_h)
+    # Inbound flash: the messages the session carries under "flash", as
+    # Rails keeps them (runtime/cookie_store.rb), so a client cannot make
+    # the next page show text of its choosing. Loaded through the
+    # constructor (NOT flash[:k]=) so to_persisted's show-once diff sees
+    # them as carried-in and sweeps them.
+    controller.flash = ActionDispatch::Flash.new(ActionDispatch::CookieStore.inbound_flash(request_obj.session))
     request_obj.flash = controller.flash
     controller.request_format = request_format
     controller.accepts_any_format = Main.accepts_any_format?(req.req_headers.fetch("accept", ""))
@@ -818,24 +809,6 @@ module Main
       i += 1
     end
 
-    # Outbound flash: persist messages set THIS request for the NEXT one.
-    # `to_persisted` returns only the entries this request set (show-once);
-    # clear any inbound cookie that wasn't re-persisted so a consumed flash
-    # doesn't stick on the next nav.
-    persisted = controller.flash.to_persisted
-    persisted.each do |kind, pv|
-      if !pv.is_a?(String) || pv.length > 0
-        fname = "flash_" + kind
-        Main.set_flash_cookie(res, fname, ActionDispatch::Flash.signed_cookie(pv, fname), request_obj.ssl?)
-      end
-    end
-    req.cookies.each do |cname, cvalue|
-      if cname.start_with?("flash_") && cvalue.length > 0
-        value = persisted.fetch(cname[6, cname.length - 6], "")
-        Main.clear_flash_cookie(res, cname) if value.is_a?(String) && value.empty?
-      end
-    end
-
     # Outbound cookies: serialize whatever the action recorded via
     # `cookies[:k] = v` / `cookies.permanent[:k] = v` as Set-Cookie. Empty
     # on a read-only request (the common GET path), so this is a no-op there.
@@ -873,17 +846,9 @@ module Main
     controller.assign_http_session(request_obj.session)
     controller.cookies = ActionController::CookieJar.new(req.cookies)
     controller.cookies = controller.request.adopt_cookie_jar(controller.cookies)
-    inbound_flash = ActionDispatch::Flash.new
-    req.cookies.each do |cname, cvalue|
-      if cname.start_with?("flash_")
-        ActionDispatch::Flash.cookie_flashes(cvalue, cname).each do |key, value|
-          inbound_flash[key] = value
-        end
-      end
-    end
     # Not a new Flash when the request already holds one: Rails' flash is the request's, so the routes' controller and an endpoint it reaches (Devise's recall after `flash.now[:alert] =`) share it.
     held_flash = request_obj.flash
-    flash = held_flash.nil? ? ActionDispatch::Flash.new(inbound_flash.to_h) : held_flash
+    flash = held_flash.nil? ? ActionDispatch::Flash.new(ActionDispatch::CookieStore.inbound_flash(request_obj.session)) : held_flash
     controller.flash = flash
     # Not read back from the controller: Devise's FailureApp delegates `flash` to the request, which holds none yet.
     request_obj.flash = flash
@@ -913,22 +878,25 @@ module Main
   def self.persist_session(res, request_obj)
     session_cookie = Rails.application.session_cookie_key
     session_in = request_obj.env.fetch("roundhouse.session.in", "").to_s
-    session_out = request_obj.session.to_cookie
+    # The flash goes into the session first, as Rails' `commit_flash` puts it there, for the routes' controller and an endpoint alike.
+    held_flash = request_obj.flash
+    ActionDispatch::CookieStore.commit_flash(request_obj.session, held_flash) unless held_flash.nil?
+    session_out = ActionDispatch::CookieStore.payload(request_obj.session)
     if session_out != session_in && !request_obj.session_skip?
-      if session_out == ""
-        Main.clear_flash_cookie(res, session_cookie)
+      if request_obj.session.to_hash.empty?
+        Main.clear_session_cookie(res, session_cookie)
       else
-        Main.set_flash_cookie(res, session_cookie,
-          ActionDispatch::Session.signed_cookie(session_out, session_cookie), request_obj.ssl?)
+        Main.set_session_cookie(res, session_cookie,
+          ActionDispatch::CookieStore.cookie_value(request_obj.session, session_cookie), request_obj.ssl?)
       end
     end
     nil
   end
 
-  # Flash cookies are HttpOnly + Path=/; the read side is server-only
-  # (no JS access). A set carries the message to the next request; a
-  # clear (empty value + Max-Age=0) expires a consumed one.
-  def self.set_flash_cookie(res, name, value, secure)
+  # The session cookie is HttpOnly + Path=/ + SameSite=Lax, as Rails'
+  # store writes it; the read side is server-only (no JS access). A clear
+  # (empty value + Max-Age=0) expires an emptied session.
+  def self.set_session_cookie(res, name, value, secure)
     opts = Tep.str_hash
     opts["Path"] = "/"
     opts["HttpOnly"] = +""
@@ -937,7 +905,7 @@ module Main
     res.set_cookie(name, value, opts)
   end
 
-  def self.clear_flash_cookie(res, name)
+  def self.clear_session_cookie(res, name)
     opts = Tep.str_hash
     opts["Path"] = "/"
     opts["Max-Age"] = "0"

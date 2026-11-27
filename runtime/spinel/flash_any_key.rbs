@@ -33,8 +33,6 @@ module ActionDispatch
     def to_session_value: () -> Hash[String, untyped]?
     def merge: (Hash[String, untyped] other) -> Flash
 
-    def self.signed_cookie: (untyped value, String name) -> String
-    def self.cookie_flashes: (String raw, String name) -> Hash[String, untyped]
   end
 
   class FlashNow

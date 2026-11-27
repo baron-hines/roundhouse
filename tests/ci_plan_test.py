@@ -1324,7 +1324,7 @@ class Routing(unittest.TestCase):
     def test_runtime_owners_choose_asymmetric_focused_binaries(self):
         cases = {
             "runtime/spinel/web_push_crypto.rb": "spinel_web_push_crypto",
-            "runtime/spinel/signed_cookies.rbs": "rails_compat_vectors_spinel",
+            "runtime/spinel/tep/url.rb": "rails_compat_vectors_spinel",
             "runtime/spinel/active_record_equality_spinel.rb": "framework_tests_spinel",
             "runtime/spinel/param_builder.rb": "spinel_param_builder",
             "runtime/spinel/multipart.rb": "spinel_param_builder",

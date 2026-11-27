@@ -1364,7 +1364,9 @@ def req(verb, path, body = "")
   [status, headers, chunks.join]
 end
 flashes = lambda do
-  $jar.select { |k, _| k.start_with?("flash_") }.map { |k, v| ActionDispatch::Flash.cookie_flashes(URI.decode_www_form_component(v), k) }.reduce({}, :merge)
+  key = Rails.application.session_cookie_key
+  raw = $jar[key]
+  raw.nil? ? {} : ActionDispatch::CookieStore.inbound_flash(ActionDispatch::CookieStore.restore(URI.decode_www_form_component(raw), key))
 end
 
 req("GET", "/account/new")

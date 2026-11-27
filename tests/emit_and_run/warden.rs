@@ -88,7 +88,9 @@ status, = hit("/dashboard")
 raise "anonymous: #{status}" unless status == 404
 key = Rails.application.session_cookie_key
 # Not a record: with no `serialize_from_session`, Warden reads back the stored value itself.
-signed = ActionDispatch::Session.signed_cookie("warden.user.user.key=42", key)
+session = ActionDispatch::Session.new
+session["warden.user.user.key"] = "42"
+signed = ActionDispatch::CookieStore.cookie_value(session, key)
 status, = hit("/dashboard", "#{key}=#{CgiIo.url_encode(signed)}")
 raise "signed in: #{status}" unless status == 200
 # The form's CSRF token is written to the session, which is committed once, above Warden.

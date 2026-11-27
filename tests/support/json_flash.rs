@@ -84,34 +84,25 @@ raise "flash.now missing: #{payload.inspect}" unless payload == { "inertia" => {
 _, payload = request_flash("/messages", jar)
 raise "flash.now persisted: #{payload.inspect}" unless payload == {}
 request_flash("/messages/create", jar)
-jar["flash_inertia"] = jar.fetch("flash_inertia").sub(/.$/, "!")
+# The flash rides the encrypted session cookie: a tampered one reads as no session at all.
+jar.each_key { |key| jar[key] = jar.fetch(key).sub(/.$/, "!") }
 _, payload = request_flash("/messages", jar)
 raise "tampered cookie accepted" if payload.key?("inertia")
 puts "JSON flash survives one redirect and expires"
 "#;
 
 pub const CODEC_ASSERTIONS: &str = r#"
-name = "flash_inertia"
-strings = ["saved", "123", "false", '{"message":"text"}', "✓"]
-strings.each do |text|
-  signed = ActionDispatch::Flash.signed_cookie(text, name)
-  raise "String cookie bytes changed" unless signed == ActionDispatch::SignedCookie.sign(text, name)
-  raise "String cookie changed type" unless ActionDispatch::Flash.cookie_flashes(signed, name) == { "inertia" => text }
-end
-values = [{ "message" => "saved", "notification_id" => "notice-1" }, ["one", 2, false, nil], false, true, 7, 1.25, {}, []]
+name = "_flash_codec_session"
+values = ["saved", "123", "false", '{"message":"text"}', "✓",
+          { "message" => "saved", "notification_id" => "notice-1" }, ["one", 2, false, nil], false, true, 7, 1.25, {}, []]
 values.each do |value|
-  signed = ActionDispatch::Flash.signed_cookie(value, name)
-  raise "JSON cookie changed value" unless ActionDispatch::Flash.cookie_flashes(signed, name) == { "inertia" => value }
-  raise "JSON cookie changed key" unless ActionDispatch::Flash.cookie_flashes(signed, "flash_other").empty?
-  raise "JSON accepted as String" unless ActionDispatch::SignedCookie.verified(signed, name).empty?
-  raise "unsigned JSON accepted" unless ActionDispatch::Flash.cookie_flashes(JSON.generate(value), name).empty?
+  session = ActionDispatch::Session.new
+  session["flash"] = { "discard" => [], "flashes" => { "inertia" => value } }
+  raw = ActionDispatch::CookieStore.cookie_value(session, name)
+  got = ActionDispatch::CookieStore.inbound_flash(ActionDispatch::CookieStore.restore(raw, name))
+  raise "flash value changed: #{value.inspect} -> #{got.inspect}" unless got == { "inertia" => value }
+  raise "another cookie name accepted" unless ActionDispatch::CookieStore.restore(raw, name + "_other").to_hash.empty?
 end
-signed = ActionDispatch::SignedCookie.sign('{"message":"other key"}', name + ".json")
-raise "legacy .json key aliased" unless ActionDispatch::Flash.cookie_flashes(signed, name).empty?
-raise "legacy .json key lost" unless ActionDispatch::Flash.cookie_flashes(signed, name + ".json") == { "inertia.json" => '{"message":"other key"}' }
-signed = ActionController::MessageVerifier.generate(Rails.application.secret_key_base,
-  ActionController::MessageVerifier::SIGNED_COOKIE_SALT, "{", "flash.json." + name, true)
-raise "invalid JSON accepted" unless ActionDispatch::Flash.cookie_flashes(signed, name).empty?
 puts "String cookie bytes and JSON cookie purposes verified"
 "#;
 
