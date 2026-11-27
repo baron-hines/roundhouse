@@ -23,7 +23,37 @@ module SqliteAdapter
   end
 
   def self.configure(database_path)
+    create_parent_directory(database_path)
     Db.configure(database_path)
+  end
+
+  # Rails' SQLite3Adapter creates the database file's directory before
+  # opening it (`FileUtils.mkdir_p(File.dirname(database))`), so a
+  # database.yml path such as `storage/db/development.sqlite3` opens on
+  # a fresh checkout. `:memory:` and `file:` URIs name no directory.
+  # One segment at a time: the Spinel subset has `Dir.mkdir`, not
+  # `FileUtils`.
+  def self.create_parent_directory(database_path)
+    return nil if database_path == "" || database_path == ":memory:" || database_path.start_with?("file:")
+    dir = File.dirname(database_path)
+    return nil if Dir.exist?(dir)
+    built = dir.start_with?("/") ? "/" : ""
+    dir.split("/").each do |seg|
+      next if seg.length == 0
+      built = (built == "" || built == "/") ? built + seg : built + "/" + seg
+      mkdir_parent(built) unless Dir.exist?(built)
+    end
+    nil
+  end
+
+  # Another process may create the same directory between the check and the mkdir.
+  def self.mkdir_parent(path)
+    begin
+      Dir.mkdir(path)
+    rescue Errno::EEXIST
+      raise unless Dir.exist?(path)
+    end
+    nil
   end
 
   # Writes run with their values written in: a Relation's bind marks

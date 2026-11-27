@@ -5891,6 +5891,7 @@ fn ruby_family_runtime_files(
     apply_app_requires(&mut files, app, RequireTarget::RubyFamily);
     apply_puma_boot_hooks(&mut files, app, RequireTarget::RubyFamily)?;
     apply_rails_version(&mut files, app);
+    apply_database_paths(&mut files, app);
     // Overlay boot replaces the spinel boot wholesale (see comment above
     // on apply_module_mixins), wiping the Date-package inject from
     // `spinel_files`. Re-inject only the shared `date_*` helpers — not
@@ -6770,17 +6771,13 @@ fn apply_postgresql_tree(files: &mut Vec<(String, String)>, app: &App, target: R
     gemfile.1 = gemfile.1.replace("gem \"sqlite3\"", "gem \"pg\"");
 
     const SERVER_POSTGRESQL: &str = "    # PostgreSQL: the server DATABASE_URL names, else libpq's PG*\n    # variables (apply_postgresql_tree).\n    path = ENV.fetch(\"DATABASE_URL\", \"\")\n";
-    // The Ruby overlay's server spells the SQLite path out; the Spinel
-    // server asks `Main.default_db_path`, and its --help names the file.
+    // Both servers ask `Main.default_db_path`; the Spinel --help names the file.
     let server: &[(&str, &str)] = match target {
-        RequireTarget::RubyFamily => &[(
-            "    db_path = ENV[\"BLOG_DB\"]\n    path = (!db_path.nil? && !db_path.empty?) ? db_path : \"storage/development.sqlite3\"\n",
-            SERVER_POSTGRESQL,
-        )],
+        RequireTarget::RubyFamily => &[("    path = Main.default_db_path\n", SERVER_POSTGRESQL)],
         RequireTarget::Spinel => &[
             ("    path = Main.default_db_path\n", SERVER_POSTGRESQL),
             (
-                "    puts \"  SQLite file: BLOG_DB env (default storage/development.sqlite3)\"\n",
+                "    puts \"  SQLite file: BLOG_DB env, else config/database.yml for RAILS_ENV, else storage/development.sqlite3\"\n",
                 "    puts \"  PostgreSQL: DATABASE_URL env, else libpq's PG* variables\"\n",
             ),
         ],
@@ -8720,6 +8717,42 @@ fn apply_rails_version(files: &mut [(String, String)], app: &App) {
             boot.push_str(&block);
         }
     }
+}
+
+/// `config/database.yml`'s main database per environment, as
+/// `AppDatabase.path_for(env)` in boot.rb, for `Main.default_db_path`:
+/// with `RAILS_ENV=production` the binary opens the file Rails would,
+/// not `storage/development.sqlite3`. Always defined (nil for an
+/// environment the file does not name), so main.rb can call it as is.
+fn apply_database_paths(files: &mut [(String, String)], app: &App) {
+    const MARK: &str = "# The app's database per environment, from config/database.yml";
+    let Some((_, boot)) = files.iter_mut().find(|(p, _)| p == "boot.rb") else { return };
+    if boot.contains(MARK) {
+        return;
+    }
+    // A computed (ERB) path and a server database have no file here; that environment keeps the default.
+    let paths: Vec<(&str, &str)> = app
+        .databases
+        .iter()
+        .filter(|d| d.primary && d.adapter == crate::database::DatabaseAdapter::Sqlite3)
+        .filter_map(|d| d.database.as_deref().map(|path| (d.env.as_str(), path)))
+        .collect();
+    let mut body = String::from("    case env\n");
+    for (env, path) in &paths {
+        body.push_str(&format!(
+            "    when {} then {}\n",
+            crate::emit::ruby::expr::ruby_str_literal(env),
+            crate::emit::ruby::expr::ruby_str_literal(path)
+        ));
+    }
+    body.push_str("    end\n");
+    if paths.is_empty() {
+        body = "    nil\n".to_string();
+    }
+    boot.push_str(&format!(
+        "\n{MARK} (see project.rs::apply_database_paths).\n\
+         module AppDatabase\n  def self.path_for(env)\n{body}  end\nend\n"
+    ));
 }
 
 /// `AppEnvironment` at the end of boot.rb. `assume_ssl?(env)` is
@@ -11922,6 +11955,7 @@ fn spinel_files(app: &App, fixture: &Path, param_binds: bool) -> Result<(Vec<(St
     apply_app_requires(&mut files, app, RequireTarget::Spinel);
     apply_puma_boot_hooks(&mut files, app, RequireTarget::Spinel)?;
     apply_rails_version(&mut files, app);
+    apply_database_paths(&mut files, app);
     // All three scaffold targets (spinel + the ruby/jruby trees derived
     // from this set) ship the comprehensive scaffold README as SPECIMEN.md,
     // freeing README.md for the generated quick-start `ensure_readme`
