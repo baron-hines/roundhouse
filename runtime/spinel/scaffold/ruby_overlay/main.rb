@@ -139,8 +139,12 @@ module Main
     # stripping here would make an explicit `/feed.json` route unreachable.
     request_format = :html
     request_path = request[:path]
+    # The format the URL PINS, for `negotiate_format` (see the spinel
+    # dispatcher): the `Accept` sniff below only seeds `request_format`.
+    explicit_format = ""
     if request_path.end_with?(".json")
       request_format = :json
+      explicit_format = "json"
     end
     # Turbo Stream is negotiated by the Accept header, not by a path
     # suffix — a Turbo-driven form POST asks for
@@ -183,6 +187,7 @@ module Main
     # formats one at a time — a Symbol materialized from a runtime
     # String is a shape the strict targets do not share.
     path_format = matched.path_params.fetch("format", "")
+    explicit_format = path_format unless path_format.empty?
     request_format = :json if path_format == "json"
     request_format = :turbo_stream if path_format == "turbo_stream"
     request_format = :rss if path_format == "rss"
@@ -197,6 +202,7 @@ module Main
     # route defaulting to json.
     if path_format.empty? && !matched.req_format.nil?
       request_format = matched.req_format
+      explicit_format = matched.req_format.to_s
       matched.path_params["format"] = matched.req_format.to_s
     end
 
@@ -209,6 +215,22 @@ module Main
     if !allowed.nil? && !allowed.include?("#{matched.controller}##{matched.action}")
       env["roundhouse.declined"] = true
       return [404, "", "text/html; charset=utf-8", nil, {}, {}, {}, {}, {}]
+    end
+
+    # The `?format=json` QUERY parameter: Rails reads `params[:format]`,
+    # route and path parameters over query ones, so it pins only when
+    # nothing above did. Same literal comparisons as above. A PRESENT but
+    # empty value still pins, to a format no template or arm answers
+    # (Rails reads `Mime[""]` as no format at all, so a `respond_to` is a
+    # 406); it is spelled "none" here since "" means unpinned.
+    query_format = request[:params].fetch("format", "").to_s
+    if explicit_format.empty? && request[:params].key?("format")
+      explicit_format = query_format.empty? ? "none" : query_format
+      request_format = :json if query_format == "json"
+      request_format = :turbo_stream if query_format == "turbo_stream"
+      request_format = :rss if query_format == "rss"
+      request_format = :xml if query_format == "xml"
+      request_format = :js if query_format == "js"
     end
 
     # A JSON body that does not parse: Rails' params parser raises
@@ -293,6 +315,9 @@ module Main
     # comma is read as html.
     accept = request.fetch(:accept, "").to_s
     controller.accepts_any_format = !accept.include?(",") && accept.split(";", 2)[0].to_s.strip == "*/*"
+    controller.accept_header = accept
+    controller.accepted_format_names = ActionDispatch::MimeNegotiation.accepted_formats(accept)
+    controller.explicit_format = explicit_format
     # Rails' `Vary: Accept` on a render whose format came from the Accept
     # header (runtime/action_dispatch/mime_negotiation.rb), as the spinel
     # dispatcher decides it.
@@ -345,6 +370,11 @@ module Main
       raise if Kernel.instance_method(:is_a?).bind_call(error, FrameworkParseError) &&
                !Kernel.instance_method(:instance_of?).bind_call(error, FrameworkParseError)
       return [400, "<h1>400 Bad Request</h1>", "text/html; charset=utf-8", nil, {}, {}, {}, {}, {}]
+    rescue ActionController::UnknownFormat
+      # A `respond_to` none of whose arms answers the request's format:
+      # Rails' rescue_responses answer :not_acceptable, and
+      # PublicExceptions renders the status page in the requested format.
+      return [406, controller.unacceptable_body, controller.unacceptable_content_type, nil, {}, {}, {}, {}, {}]
     rescue ActiveRecord::RecordInvalid, ActiveRecord::RecordNotSaved, ActionController::InvalidAuthenticityToken
       # Not a 500: Rails' rescue_responses answer these with 422.
       return [422, "<h1>422 Unprocessable Content</h1>", "text/html; charset=utf-8", nil, {}, {}, {}, {}, {}]
