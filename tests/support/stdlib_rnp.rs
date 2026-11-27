@@ -59,6 +59,10 @@ class StdlibProbe
     config.to_h
   end
 
+  def self.config_responds?
+    config.respond_to?(:country_code) && !config.respond_to?(:missing)
+  end
+
   def self.config?
     config.is_a?(OpenStruct)
   end
@@ -115,6 +119,7 @@ raise "ostruct #{StdlibProbe.config_members}" unless StdlibProbe.config_members 
 raise "ostruct keyword" unless StdlibProbe.keyword_member == "flat"
 raise "ostruct to_h #{StdlibProbe.config_hash}" unless StdlibProbe.config_hash == { locales: ["da", "en"], country_code: "dk" }
 raise "ostruct?" unless StdlibProbe.config?
+raise "ostruct respond_to?" unless StdlibProbe.config_responds?
 puts "stdlib constants OK"
 "#;
 

@@ -1399,6 +1399,8 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     let open_struct = Ty::Class { id: ClassId(Symbol::from("OpenStruct")), args: vec![].into() };
     register_stdlib_class(classes, "OpenStruct", &[("new", open_struct)], &[
         ("to_h", Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Untyped) }),
+        // Listed so `respond_to?(:member)` is not folded to false: members answer through these.
+        ("method_missing", Ty::Untyped), ("respond_to_missing?", Ty::Bool),
     ]);
     // `StringScanner` (`require "strscan"`): the ruby family's own, spinel's
     // `packages/strscan`, whose native bindings these returns follow
