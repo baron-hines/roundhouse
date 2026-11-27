@@ -489,15 +489,21 @@ fn rewrite(expr: &mut Expr, helpers: &crate::det::HashSet<String>) {
 /// The classes that define `default_url_options` themselves: their bare `_url` calls take that host
 /// (`emit::ruby::library::url_for_own_options`).
 pub(crate) fn classes_with_own_url_options(app: &App) -> crate::det::HashSet<crate::ident::ClassId> {
-    let own = |m: &crate::dialect::MethodDef| m.receiver == crate::dialect::MethodReceiver::Instance && m.name.as_str() == "default_url_options";
+    // Not either side for every call: a `class << self` that includes the url helpers (lobsters' Routes) defines its
+    // own there, and an instance method's call would then read a `default_url_options` its side lacks.
+    fn owns(methods: &[&crate::dialect::MethodDef]) -> bool {
+        let sides: Vec<&crate::dialect::MethodReceiver> =
+            methods.iter().filter(|m| m.name.as_str() == "default_url_options").map(|m| &m.receiver).collect();
+        !sides.is_empty() && methods.iter().all(|m| sides.contains(&&m.receiver) || !calls_url_with_options(&m.body))
+    }
     let mut out = crate::det::HashSet::default();
     for lc in &app.library_classes {
-        if lc.methods.iter().any(own) {
+        if owns(&lc.methods.iter().collect::<Vec<_>>()) {
             out.insert(lc.name.clone());
         }
     }
     for m in &app.models {
-        if m.methods().any(own) {
+        if owns(&m.methods().collect::<Vec<_>>()) {
             out.insert(m.name.clone());
         }
     }
@@ -507,6 +513,18 @@ pub(crate) fn classes_with_own_url_options(app: &App) -> crate::det::HashSet<cra
         }
     }
     out
+}
+
+fn calls_url_with_options(e: &Expr) -> bool {
+    if let ExprNode::Send { recv: None, method, args, .. } = &*e.node
+        && method.as_str().ends_with("_url")
+        && args.last().is_some_and(|a| matches!(&*a.node, ExprNode::Hash { kwargs: true, .. }))
+    {
+        return true;
+    }
+    let mut found = false;
+    e.node.for_each_child(&mut |c| found = found || calls_url_with_options(c));
+    found
 }
 
 fn rewrite_owned(expr: &mut Expr, helpers: &crate::det::HashSet<String>, own_url_options: bool) {
@@ -705,11 +723,22 @@ fn strip_host_options(
     // emitter's `url_for_own_options` reads the protocol off the call.
     // Only a protocol and a port: `url_from_path` and `url_for_own_options` take those two, and any other host option
     // left on the call reached the path helper as an argument.
-    let only_protocol = entries.iter().all(|(k, _)| {
-        !matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } }
-            if HOST_ONLY_OPTIONS.contains(&value.as_str()) && value.as_str() != "protocol" && value.as_str() != "port")
+    let path_off = |k: &Expr, v: &Expr| {
+        matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "only_path")
+            && matches!(&*v.node, ExprNode::Lit { value: Literal::Bool { value: false } })
+    };
+    let only_protocol = entries.iter().all(|(k, v)| {
+        path_off(k, v)
+            || !matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } }
+                if HOST_ONLY_OPTIONS.contains(&value.as_str()) && value.as_str() != "protocol" && value.as_str() != "port")
     });
     if own_url_options && !chained && host.is_none() && !only_path && only_protocol && method.as_str().ends_with("_url") {
+        // Not left on the call: `url_for_own_options` takes only the protocol and port off it, and an
+        // `only_path: false` reached the path helper as an argument.
+        entries.retain(|(k, v)| !path_off(k, v));
+        if entries.is_empty() {
+            args.pop();
+        }
         return None;
     }
     entries.retain(|(k, _)| {

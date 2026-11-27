@@ -21,6 +21,8 @@ mod native_http;
 mod namespaced_form_partial;
 #[path = "emit_and_run/url_helper_protocol.rs"]
 mod url_helper_protocol;
+#[path = "emit_and_run/url_option_presence.rs"]
+mod url_option_presence;
 #[path = "emit_and_run/guessed_private_method.rs"]
 mod guessed_private_method;
 #[path = "emit_and_run/literal_send_untyped.rs"]

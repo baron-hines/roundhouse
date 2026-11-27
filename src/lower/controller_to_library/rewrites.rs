@@ -3124,7 +3124,11 @@ fn rewrite_route_helpers_with(
                 if call_protocol.is_some() || call_port.is_some() {
                     url_args.push(call_protocol.clone().unwrap_or_else(nil));
                 }
-                url_args.extend(call_port.clone());
+                if let Some(port) = call_port.clone() {
+                    // Not the port alone: an explicit `port: nil` clears the class's port, as an omitted one does not.
+                    url_args.push(port);
+                    url_args.push(Expr { ty: Some(crate::ty::Ty::Bool), ..Expr::new(e.span, ExprNode::Lit { value: Literal::Bool { value: true } }) });
+                }
                 Expr::new(
                     e.span,
                     ExprNode::Send {

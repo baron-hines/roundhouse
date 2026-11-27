@@ -3245,12 +3245,14 @@ module ActiveRecord
     # statement, not a subquery over every row.
     def scoped_write_where
       windowed = @orders.length > 0 || !@limit.nil? || !@offset.nil?
-      return "" if @wheres.length == 0 && @joins.length == 0 && !windowed
-      if @joins.length == 0 && !windowed
+      # Not `@joins` alone: an `includes` a condition or `references` names joins too, as a read renders it.
+      joined = rendered_joins.length > 0
+      return "" if @wheres.length == 0 && !joined && !windowed
+      if !joined && !windowed
         return " WHERE #{@wheres.join(" AND ")}"
       end
       primary_key = @model.primary_key
-      if windowed && @joins.length > 0
+      if windowed && joined
         inner = append_window(append_join_where("SELECT #{@model._columns_sql} FROM #{@table}"))
         return " WHERE #{primary_key} IN (SELECT #{primary_key} FROM (#{inner}) AS __rh_window)"
       end
