@@ -66,6 +66,8 @@ RSpec.describe Article, type: :model do
     it "change values" do
       expect { Article.create!(title: "New", body: "A body that is long enough.") }.to change(Article, :count).by(1)
       expect { article.title = "Renamed" }.to change { article.title }.from("Getting Started").to("Renamed")
+      # `from`'s argument is read when the matcher is built, before the block runs.
+      expect { article.title = "Again" }.to change { article.title }.from(article.title).to("Again")
       expect { article.valid? }.not_to change { Article.count }
     end
   end
@@ -142,7 +144,7 @@ fn failing_block_expectations_fail_the_emitted_test() {
     ] {
         let run = app(&SPEC.replacen(find, replace, 1)).run_test("test/models/models_article_block_expectations_spec_test.rb");
         assert!(run.errors.is_empty(), "{find}: {:?}", run.errors);
-        assert!(!run.success, "`{replace}` passed:\n{}\n{}", run.stdout, run.stderr);
+        assert!(!run.program_succeeded(), "`{replace}` passed:\n{}\n{}", run.stdout, run.stderr);
     }
 }
 
@@ -156,7 +158,7 @@ fn after_hooks_run_after_the_example() {
     );
     let run = app(&spec).run_test("test/models/models_article_let_spec_test.rb");
     assert!(run.errors.is_empty(), "{:?}", run.errors);
-    assert!(!run.success, "the raising after hook did not fail the test:\n{}\n{}", run.stdout, run.stderr);
+    assert!(!run.program_succeeded(), "the raising after hook did not fail the test:\n{}\n{}", run.stdout, run.stderr);
     assert!(format!("{}{}", run.stdout, run.stderr).contains("after hook ran"), "{}\n{}", run.stdout, run.stderr);
 }
 
