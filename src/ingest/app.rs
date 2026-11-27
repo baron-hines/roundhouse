@@ -17046,7 +17046,11 @@ fn mime_extension_lookups(app: &mut App) {
 /// when the line says nothing about it. One definition for the lift and
 /// the initializer ledger.
 pub(super) fn escape_js_separators_line(line: &str) -> Option<bool> {
-    let rest = line.strip_prefix("config.active_support.escape_js_separators_in_json")?;
+    let rest = line
+        .strip_prefix("Rails.application.config.active_support.escape_js_separators_in_json")
+        .or_else(|| line.strip_prefix("config.active_support.escape_js_separators_in_json"))?;
+    // The value is `true` or `false`, so a `#` can only start a comment.
+    let rest = rest.split('#').next().unwrap_or("");
     let value = rest.trim().strip_prefix('=')?.trim();
     match value {
         "true" => Some(true),

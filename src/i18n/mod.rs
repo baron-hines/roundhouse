@@ -788,6 +788,10 @@ impl Catalog {
                 if i > 0 {
                     out.push(',');
                 }
+                // A dotted key (`"a.b"`) flattens onto the path of a nested `a: { b: }`, so the two cannot be told apart here.
+                if child.contains('.') {
+                    return None;
+                }
                 let below = format!("{path}.{child}");
                 out.push_str(&json_string(child, separators));
                 out.push(':');
@@ -1514,6 +1518,9 @@ mod tests {
         assert_eq!(c.subtree_json("gone", false), None);
         assert_eq!(c.subtree_json("num", false), None);
         assert_eq!(c.subtree_json("missing", false), None);
+        // A dotted key collides with the nested path it flattens to: not folded.
+        let c = catalog(&[("config/locales/en.yml", "en:\n  js:\n    \"a.b\": \"flat\"\n    a:\n      b: \"nested\"\n")]);
+        assert_eq!(c.subtree_json("js", false), None);
     }
 
     #[test]
