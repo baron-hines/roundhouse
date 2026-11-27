@@ -6771,17 +6771,13 @@ fn apply_postgresql_tree(files: &mut Vec<(String, String)>, app: &App, target: R
     gemfile.1 = gemfile.1.replace("gem \"sqlite3\"", "gem \"pg\"");
 
     const SERVER_POSTGRESQL: &str = "    # PostgreSQL: the server DATABASE_URL names, else libpq's PG*\n    # variables (apply_postgresql_tree).\n    path = ENV.fetch(\"DATABASE_URL\", \"\")\n";
-    // The Ruby overlay's server spells the SQLite path out; the Spinel
-    // server asks `Main.default_db_path`, and its --help names the file.
+    // Both servers ask `Main.default_db_path`; the Spinel --help names the file.
     let server: &[(&str, &str)] = match target {
-        RequireTarget::RubyFamily => &[(
-            "    db_path = ENV[\"BLOG_DB\"]\n    path = (!db_path.nil? && !db_path.empty?) ? db_path : \"storage/development.sqlite3\"\n",
-            SERVER_POSTGRESQL,
-        )],
+        RequireTarget::RubyFamily => &[("    path = Main.default_db_path\n", SERVER_POSTGRESQL)],
         RequireTarget::Spinel => &[
             ("    path = Main.default_db_path\n", SERVER_POSTGRESQL),
             (
-                "    puts \"  SQLite file: BLOG_DB env (default storage/development.sqlite3)\"\n",
+                "    puts \"  SQLite file: BLOG_DB env, else config/database.yml for RAILS_ENV, else storage/development.sqlite3\"\n",
                 "    puts \"  PostgreSQL: DATABASE_URL env, else libpq's PG* variables\"\n",
             ),
         ],
