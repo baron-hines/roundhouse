@@ -68,9 +68,20 @@ pub(in crate::analyze) fn mark(
     for stmt in statements {
         metaprogrammed_constants(stmt, &mut touched);
     }
+    // An initializer statement the ingest does not carry is in neither, so config/ is read as text too.
+    let config_texts: Vec<&str> = app
+        .sources
+        .iter()
+        .filter(|f| f.path.contains("config/"))
+        .map(|f| f.text.as_str())
+        .collect();
     let touched_from_outside = |id: &ClassId| {
         let name = id.0.as_str();
+        let short = name.rsplit("::").next().unwrap_or(name);
         touched.iter().any(|t| name == t || name.ends_with(&format!("::{t}")))
+            || config_texts.iter().any(|text| {
+                SINGLETON_METAPROGRAMMING.iter().any(|m| text.contains(&format!("{short}.{m}")))
+            })
     };
     let mut closed: HashSet<ClassId> = HashSet::default();
     for id in declarations.keys() {
