@@ -54,7 +54,7 @@ use ruby_prism::Node;
 
 use crate::app::App;
 use crate::det::{HashMap, HashSet};
-use crate::dialect::{ControllerBodyItem, LayoutDecl, View};
+use crate::dialect::{ControllerBodyItem, View};
 use crate::diagnostic::Diagnostic;
 use crate::expr::{Expr, ExprNode, InterpPart, LValue, Literal};
 use crate::span::Span;
@@ -489,9 +489,7 @@ struct Member {
     /// the first ancestor's, as Rails' prefixes do.
     relative: Vec<(String, Span)>,
     prefixes: Vec<String>,
-    /// A scoped `layout false` (`only:` / `except:`) up its chain, and the
-    /// renders (by span) of the actions it leaves without a layout.
-    layout_scope: Option<LayoutDecl>,
+    /// The renders (by span) of the actions that render without a layout.
     layout_free: HashSet<Span>,
 }
 
@@ -657,6 +655,7 @@ impl ViewLookup {
         let mut roots: Vec<PathBuf> = base.clone();
         let mut contexts: Vec<Vec<usize>> = Vec::new();
         let mut members = Vec::new();
+        let resolver = crate::controller_layout::Layouts::without_templates(&app.controllers);
         for class in &classes {
             let mut list: Vec<usize> = Vec::new();
             for path in registry.get(&class.name) {
@@ -678,10 +677,10 @@ impl ViewLookup {
                     contexts.len() - 1
                 }
             };
-            let (mut layouts, renders, layout_scope, mut layout_free) = if class.mailer {
-                (mailer_layouts(app, &class.name), Vec::new(), None, HashSet::default())
+            let (mut layouts, renders, bare_actions, mut layout_free) = if class.mailer {
+                (mailer_layouts(app, &class.name), Vec::new(), HashSet::default(), HashSet::default())
             } else {
-                controller_references(app, &class.name)
+                controller_references(app, &resolver, &class.name)
             };
             // `ActionController::API` renders no layout.
             if registry.descends_from(&class.name, API_BASE) {
@@ -696,7 +695,7 @@ impl ViewLookup {
                     .collect();
                 (actions, Vec::new())
             } else {
-                relative_renders(app, &class.name, layout_scope.as_ref(), &mut layout_free)
+                relative_renders(app, &class.name, &bare_actions, &mut layout_free)
             };
             members.push(Member {
                 dir: view_dir(&class.name, class.mailer),
@@ -706,7 +705,6 @@ impl ViewLookup {
                 renders,
                 relative,
                 prefixes,
-                layout_scope,
                 layout_free,
             });
         }
@@ -1214,30 +1212,45 @@ fn view_dir(class: &str, mailer: bool) -> String {
     stem.split("::").map(crate::naming::snake_case).collect::<Vec<_>>().join("/")
 }
 
-/// A controller's layouts (the nearest `layout "x"` up its chain, else
-/// `layouts/application`) and the templates its methods render by name.
-fn controller_references(app: &App, class: &str) -> (Vec<String>, Vec<(String, Span)>, Option<LayoutDecl>, HashSet<Span>) {
+/// A controller's layouts (every one its actions can render in, a template
+/// a lookup may find counted as found), the templates its methods render
+/// by name, and the actions that render without a layout.
+fn controller_references(
+    app: &App,
+    resolver: &crate::controller_layout::Layouts<'_>,
+    class: &str,
+) -> (Vec<String>, Vec<(String, Span)>, HashSet<String>, HashSet<Span>) {
+    use crate::controller_layout::Layout;
     let by_name: HashMap<&str, &crate::dialect::Controller> =
         app.controllers.iter().map(|c| (c.name.0.as_str(), c)).collect();
-    let mut layouts = vec!["layouts/application".to_string()];
-    let mut scope = None;
+    let mut layouts: Vec<String> = Vec::new();
+    let mut bare: HashSet<String> = HashSet::default();
+    let mut add = |picks: Vec<Layout>| {
+        for pick in picks {
+            if let Layout::Template(name) = pick
+                && !layouts.iter().any(|l| l == name.as_str())
+            {
+                layouts.push(name.as_str().to_string());
+            }
+        }
+    };
     let mut current = by_name.get(class).copied();
+    let mut defined: HashSet<&str> = HashSet::default();
     for _ in 0..64 {
         let Some(c) = current else { break };
-        match &c.layout {
-            LayoutDecl::Name { name } => {
-                layouts = vec![format!("layouts/{}", name.as_str())];
-                break;
+        for action in c.actions() {
+            if defined.insert(action.name.as_str()) {
+                let picks = resolver.possible_for_action(class, action.name.as_str());
+                if picks.iter().all(|p| *p == Layout::None) {
+                    bare.insert(action.name.as_str().to_string());
+                }
+                add(picks);
             }
-            LayoutDecl::None { only, except } if only.is_empty() && except.is_empty() => {
-                layouts.clear();
-                break;
-            }
-            // `layout false, only: :index`: those actions go without it.
-            decl @ LayoutDecl::None { .. } if scope.is_none() => scope = Some(decl.clone()),
-            _ => {}
         }
         current = c.parent.as_ref().and_then(|p| by_name.get(p.0.as_str().trim_start_matches("::")).copied());
+    }
+    if defined.is_empty() {
+        add(resolver.possible_for_action(class, ""));
     }
     // Its own methods and those it inherits: an inherited action renders
     // through the subclass's lookup.
@@ -1251,7 +1264,7 @@ fn controller_references(app: &App, class: &str) -> (Vec<String>, Vec<(String, S
             if defined.insert(action.name.as_str()) {
                 let from = renders.len();
                 collect_controller_renders(&action.body, &mut renders);
-                if scope.as_ref().is_some_and(|s: &LayoutDecl| s.suppresses(&action.name)) {
+                if bare.contains(action.name.as_str()) {
                     layout_free.extend(renders[from..].iter().map(|(_, span)| *span));
                     layout_free.insert(action.body.span);
                 }
@@ -1262,7 +1275,7 @@ fn controller_references(app: &App, class: &str) -> (Vec<String>, Vec<(String, S
         }
         current = c.parent.as_ref().and_then(|p| by_name.get(p.0.as_str().trim_start_matches("::")).copied());
     }
-    (layouts, renders, scope, layout_free)
+    (layouts, renders, bare, layout_free)
 }
 
 /// A controller's relative render targets, own and inherited (see
@@ -1271,7 +1284,7 @@ fn controller_references(app: &App, class: &str) -> (Vec<String>, Vec<(String, S
 fn relative_renders(
     app: &App,
     class: &str,
-    scope: Option<&LayoutDecl>,
+    bare_actions: &HashSet<String>,
     layout_free: &mut HashSet<Span>,
 ) -> (Vec<(String, Span)>, Vec<String>) {
     let by_name: HashMap<&str, &crate::dialect::Controller> =
@@ -1303,7 +1316,7 @@ fn relative_renders(
                 out.push((action.name.as_str().to_string(), action.body.span));
             }
             collect_relative_renders(&action.body, &mut out);
-            if scope.is_some_and(|s| s.suppresses(&action.name)) {
+            if bare_actions.contains(action.name.as_str()) {
                 layout_free.extend(out[from..].iter().map(|(_, span)| *span));
             }
         }

@@ -10,6 +10,8 @@
 //!
 //!     cargo test --test elixir_toolchain -- --ignored --nocapture
 
+#[path = "support/scratch.rs"]
+mod scratch;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
@@ -20,6 +22,11 @@ mod emit_and_run;
 #[path = "support/i18n_locales_app.rs"]
 #[allow(dead_code)]
 mod i18n_locales_app;
+#[path = "support/record_slice_app.rs"]
+#[allow(dead_code)]
+mod record_slice_app;
+#[path = "support/namespaced_serializer.rs"]
+mod namespaced_serializer;
 
 use roundhouse::emit::elixir;
 use roundhouse::ingest::ingest_app;
@@ -39,13 +46,10 @@ fn mix_guard() -> std::sync::MutexGuard<'static, ()> {
 }
 
 fn scratch_dir(fixture: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("roundhouse-elixir-check-{fixture}"))
+    scratch::dir(&format!("roundhouse-elixir-check-{fixture}"))
 }
 
 fn generate_project(fixture_path: &Path, out: &Path) {
-    if out.exists() {
-        std::fs::remove_dir_all(out).expect("clean scratch");
-    }
     std::fs::create_dir_all(out).expect("create scratch");
 
     let mut app = ingest_app(fixture_path).expect("ingest");
@@ -213,6 +217,71 @@ end
     mix_deps_get(&emitted);
     let output = Command::new("mix")
         .args(["test", "test/i18n_probe_test.exs"])
+        .current_dir(&*emitted)
+        .env("MIX_HOME", emitted.join(".mix"))
+        .output()
+        .expect("run mix test");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore]
+fn real_blog_record_slice_runs() {
+    // The answers `emit_and_run::record_slice` checks on CRuby.
+    let _g = mix_guard();
+    let (emitted, errors) = record_slice_app::probe_app().emit(roundhouse::project::BuildTarget::Elixir);
+    assert!(errors.is_empty(), "{errors:?}");
+    std::fs::write(emitted.join("test/record_slice_probe_test.exs"), r#"
+defmodule RecordSliceProbeTest do
+  use ExUnit.Case, async: false
+
+  test "slice" do
+    assert Article.sliced() == ["2", "Sliced", "7", "1", "Other", "3", "Bound", "5", "4", "A comment body."]
+  end
+end
+"#).expect("write probe");
+    mix_deps_get(&emitted);
+    let output = Command::new("mix")
+        .args(["test", "test/record_slice_probe_test.exs"])
+        .current_dir(&*emitted)
+        .env("MIX_HOME", emitted.join(".mix"))
+        .output()
+        .expect("run mix test");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// #2087: the serializer modules a namespaced controller's renders call
+/// are emitted, and write what the gem writes for a record.
+#[test]
+#[ignore]
+fn real_blog_namespaced_serializer_render_runs() {
+    let _g = mix_guard();
+    let (emitted, errors) = namespaced_serializer::overlay().emit(roundhouse::project::BuildTarget::Elixir);
+    assert!(errors.is_empty(), "{errors:?}");
+    std::fs::write(emitted.join("test/namespaced_serializer_probe_test.exs"), r#"
+defmodule NamespacedSerializerProbeTest do
+  use ExUnit.Case, async: false
+
+  test "serializers" do
+    record = %{id: 7, title: "Seven"}
+    assert ArticleSerializer.as_json_str(ArticleSerializer.new(record)) == ~s({"id":7,"title":"Seven"})
+    assert Api.ArticleSerializer.as_json_str(Api.ArticleSerializer.new(record)) == ~s({"id":7})
+  end
+end
+"#).expect("write probe");
+    assert_mix_compile_passes("real-blog with a namespaced serializer render", &emitted);
+    let output = Command::new("mix")
+        .args(["test", "test/namespaced_serializer_probe_test.exs"])
         .current_dir(&*emitted)
         .env("MIX_HOME", emitted.join(".mix"))
         .output()

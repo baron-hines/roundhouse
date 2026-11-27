@@ -4,6 +4,8 @@
 //! does not pass yet is ignored as `fork spec: postgresql`. A probe needs
 //! ROUNDHOUSE_PG_TEST_URL and the pg gem (tests/support/pg_probe.rs).
 
+#[path = "support/scratch.rs"]
+mod scratch;
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
@@ -97,7 +99,7 @@ fn app() -> emit_and_run::Overlay {
 #[test]
 #[ignore = "fork spec: postgresql"]
 fn a_singleton_include_and_its_macro_run_on_the_singleton_class_as_in_cruby() {
-    let gem = std::env::temp_dir().join(format!("rh_ts_gem_native_{}", std::process::id()));
+    let gem = scratch::dir("rh_ts_gem_native");
     for (path, text) in GEM_FILES {
         let file = gem.join(path);
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -109,7 +111,7 @@ fn a_singleton_include_and_its_macro_run_on_the_singleton_class_as_in_cruby() {
     assert_eq!(String::from_utf8_lossy(&native.stdout), EXPECTED, "native control");
 
     let run = app().write("roundhouse.yml", "").run_ruby(SCRIPT);
-    assert!(run.success, "{}\n{}\n{}\n{:?}", run.emitted.display(), run.stdout, run.stderr, run.errors);
+    run.assert_passes();
     assert_eq!(run.stdout, EXPECTED, "{}", run.stderr);
 }
 

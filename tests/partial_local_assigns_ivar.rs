@@ -1,7 +1,7 @@
-//! A partial that reads both `local_assigns[:x]` and `@x` takes one `x`.
-//! After the ivar→local rewrite both reads are the local `x`, and the
-//! threaded closure ivar already carries it (#389). The call sites drop
-//! the same name, or they pass one argument too many.
+//! A partial that reads both `local_assigns[:x]` and `@x` takes one `x`
+//! (#389). Rails keeps the two apart, so the local is `x` and the ivar
+//! reads as `x_`, a closure param of its own. The call sites drop the
+//! same name, or they pass one argument too many.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -176,8 +176,8 @@ const CARD: (&str, &str) = (
 );
 const CLASS_INDEX: &str = "class PostsController < ApplicationController\n  def index\n    @class = \"wide\"\n  end\nend\n";
 
-/// A reserved word: the closure carries `@class` as `class_`, the extra
-/// is the raw `class`. They are the same local, so still one param.
+/// A reserved word: the extra is the raw `class`, read as `class_`, and
+/// the closure carries `@class` as `class__`. Still one `class_` param.
 #[test]
 fn a_reserved_word_local_and_ivar_take_one_param() {
     let files = spinel(&[
@@ -193,7 +193,7 @@ fn a_reserved_word_local_and_ivar_take_one_param() {
 }
 
 /// The same reserved word as a `locals:` key from a view: the raw key
-/// `class` is the closure's `class_`, not a second param.
+/// `class` is the extra's `class_`, not a second param.
 #[test]
 fn a_reserved_word_view_local_passes_the_same_arguments() {
     let files = spinel(&[
@@ -233,10 +233,10 @@ fn a_reserved_word_controller_local_passes_the_same_arguments() {
         "class_",
         "app/controllers/posts_controller.rb",
     );
-    // As for `error` below, the same-named local wins over the ivar: the
-    // key is `class`, the param it binds is `class_` (#571).
+    // The key is `class`, the param it binds is `class_` (#571), and
+    // `class__` takes the action's `@class`.
     let source = file(&files, "app/controllers/posts_controller.rb");
-    assert!(source.contains("Views::Posts.card(nil, \"x\", @flash[:notice], @flash[:alert])"), "{source}");
+    assert!(source.contains("Views::Posts.card(nil, @class, @flash[:notice], @flash[:alert], \"x\")"), "{source}");
 }
 
 const ROUTES_PREVIEW: &str =
@@ -270,7 +270,7 @@ fn a_controller_render_passes_a_reserved_word_ivar_by_its_own_name() {
 
 /// A helper's render binds its `locals:` through the same contract
 /// (`apply_library_partial_render_lowering`): the key `class` reaches
-/// the param `class_`.
+/// the param `class_`, and the template's `@class` its own.
 #[test]
 fn a_reserved_word_helper_local_reaches_the_partial() {
     let files = spinel(&[
@@ -288,7 +288,10 @@ fn a_reserved_word_helper_local_reaches_the_partial() {
         .find(|(p, _)| p.ends_with("posts_helper.rb"))
         .expect("posts_helper.rb");
     assert_parses(source, path);
-    assert!(source.contains("Views::Posts.card(nil, \"x\")"), "{source}");
+    assert!(
+        source.contains("Views::Posts.card(nil, ActionController::Current.controller.instance_variable_get(:@class), nil, nil, \"x\")"),
+        "{source}"
+    );
 }
 
 /// A controller-side partial render binds the extras through
@@ -315,12 +318,12 @@ fn a_controller_render_with_locals_passes_the_same_arguments() {
         "error",
         "app/controllers/posts_controller.rb",
     );
-    // The contract lets a same-named local win over the ivar: `error`
-    // receives the local "x", not `@error`.
+    // The ivar's param receives `@error`, and `error` the local "x".
     let source = file(&files, "app/controllers/posts_controller.rb");
     let args = source
         .lines()
         .find_map(|l| arg_list(l, "Views::Posts.note("))
         .unwrap_or_else(|| panic!("no note call:\n{source}"));
-    assert_eq!(args[1], "\"x\"", "args {args:?}\n{source}");
+    assert_eq!(args[1], "@error", "args {args:?}\n{source}");
+    assert!(source.contains("Views::Posts.note(nil, @error, @flash[:notice], \"a\", \"x\""), "{source}");
 }

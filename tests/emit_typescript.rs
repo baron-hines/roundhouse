@@ -299,6 +299,7 @@ fn length_validation_emits_with_options_object() {
         attributes: Row::closed(),
         body: vec![ModelBodyItem::Validation {
             validation: Validation {
+                prepend: false,
                 attribute: Symbol::from("body"),
                 rules: vec![ValidationRule::Length {
                     min: Some(10),
@@ -434,6 +435,7 @@ fn controller_new_action_is_reserved_word_escaped() {
         }],
         layout: Default::default(),
         sibling_classes: Vec::new(),
+        csp_header: false,
     });
     let files = typescript::emit(&app);
     let content = find(&files, "app/controllers/widgets_controller.ts");
@@ -514,6 +516,7 @@ fn custom_action_body_walks_through_sendkind_dispatch() {
         ],
         layout: Default::default(),
         sibling_classes: Vec::new(),
+        csp_header: false,
     });
     // Model is needed so classify_controller_send treats `Article.*`
     // as a known-model call.
@@ -639,6 +642,7 @@ fn walker_passes_last_bound_local_to_view_fn() {
         }],
         layout: Default::default(),
         sibling_classes: Vec::new(),
+        csp_header: false,
     });
     let files = typescript::emit(&app);
     let content = find(&files, "app/controllers/articles_controller.ts");
@@ -750,6 +754,7 @@ fn custom_action_with_respond_to_flattens_to_html_branch() {
         }],
         layout: Default::default(),
         sibling_classes: Vec::new(),
+        csp_header: false,
     });
     let files = typescript::emit(&app);
     let content = find(&files, "app/controllers/articles_controller.ts");
@@ -816,6 +821,7 @@ fn custom_action_without_terminal_gets_implicit_render() {
         }],
         layout: Default::default(),
         sibling_classes: Vec::new(),
+        csp_header: false,
     });
     let files = typescript::emit(&app);
     let content = find(&files, "app/controllers/articles_controller.ts");

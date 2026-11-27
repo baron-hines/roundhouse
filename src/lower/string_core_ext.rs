@@ -3,13 +3,13 @@
 //! `(name, receiver shape, arity, runtime receiver, runtime name)` for
 //! `humanize`, `titleize`/`titlecase`, `underscore`, `demodulize`,
 //! `singularize`, `camelize`/`camelcase`, `classify`, `dasherize`,
-//! `deconstantize`, `foreign_key`, `remove`, `ordinalize`, and
-//! `parameterize`. The bodies stay in
+//! `deconstantize`, `foreign_key`, `remove`, `strip_heredoc`,
+//! `ordinalize`, and `parameterize`. The bodies stay in
 //! `runtime/ruby/active_support_inflections.rb` and
 //! `runtime/ruby/inflector_ext.rb` (`Inflector.parameterize`); this
-//! pass only rewrites the call. `tableize` and `strip_heredoc` have no
-//! runtime body, so analysis refuses them (`String extension`) instead
-//! of typing them as a String.
+//! pass only rewrites the call. `tableize` has no runtime body, so
+//! analysis refuses it (`String extension`) instead of typing it as a
+//! String.
 //!
 //! `parameterize` stays on model `def` bodies and unknown model-body
 //! expressions. The fused view walk does not apply that row, which is
@@ -197,6 +197,15 @@ const STRING_CORE_EXT: &[StringCoreExt] = &[
         stamp_string: true,
     },
     StringCoreExt {
+        name: "strip_heredoc",
+        receiver: ReceiverShape::StringOrNil,
+        arity: 0,
+        runtime_receiver: &["ActiveSupport"],
+        runtime_name: "strip_heredoc",
+        site: Site::Fused,
+        stamp_string: true,
+    },
+    StringCoreExt {
         name: "ordinalize",
         receiver: ReceiverShape::Int,
         arity: 0,
@@ -262,7 +271,29 @@ pub(crate) fn rewrite_fused_node(expr: &mut Expr) -> bool {
     rewrite_node(expr, Site::Fused)
 }
 
+/// ActiveSupport's underscore-style aliases of a String's own predicates.
+/// Analysis types them as the predicates they alias, and no runtime
+/// defines them, so they become the core method on the same receiver.
+const STRING_ALIASES: &[(&str, &str)] = &[("starts_with?", "start_with?"), ("ends_with?", "end_with?")];
+
+fn rewrite_alias(expr: &mut Expr) -> bool {
+    let ExprNode::Send { recv: Some(receiver), method, block: None, .. } = &mut *expr.node else {
+        return false;
+    };
+    let Some((_, core)) = STRING_ALIASES.iter().find(|(alias, _)| *alias == method.as_str()) else {
+        return false;
+    };
+    if !ReceiverShape::StringOrNil.matches(receiver.ty.as_ref()) {
+        return false;
+    }
+    *method = Symbol::from(*core);
+    true
+}
+
 fn rewrite_node(expr: &mut Expr, site: Site) -> bool {
+    if site == Site::Fused && rewrite_alias(expr) {
+        return true;
+    }
     let Some(matched) = match_rule(expr, site) else {
         return false;
     };
@@ -343,6 +374,7 @@ mod tests {
         "deconstantize",
         "foreign_key",
         "remove",
+        "strip_heredoc",
         "ordinalize",
         "parameterize",
     ];

@@ -1801,6 +1801,9 @@ fn is_bogus_class_id(index: &Index, facts: &Facts, id: &str) -> bool {
 /// App classes a typed receiver can be. Empty means "unknown": fan out.
 fn classes_of(ty: &Ty) -> Vec<String> {
     match ty {
+        // Keep a class value's target visible to the bogus-constant guard
+        // and the conservative dispatch walk, just like a flat class id.
+        Ty::Class { id, args } if id.0.as_str() == "Class" && args.len() == 1 => classes_of(&args[0]),
         Ty::Class { id, .. } => vec![id.0.as_str().to_string()],
         Ty::Union { variants } => {
             let mut out = Vec::new();
@@ -1891,6 +1894,7 @@ mod tests {
             }],
             layout: LayoutDecl::Inherit,
             sibling_classes: Vec::new(),
+            csp_header: false,
         }
     }
 

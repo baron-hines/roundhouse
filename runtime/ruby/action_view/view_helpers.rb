@@ -32,6 +32,7 @@ module ActionView
     # TS/Crystal/Rust/Go/Spinel keep working.
     @slots = {}
     @broadcast_rendering = false
+    @hidden_autocomplete = false
 
     def self.reset_slots!
       @slots = {}
@@ -246,6 +247,32 @@ module ActionView
         b = erb_url_byte(bytes, i)
         if (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) ||
            b == 45 || b == 46 || b == 95 || b == 126
+          out = out + printable[b - 32, 1].to_s
+        else
+          out = out + "%" + hex[b / 16, 1].to_s + hex[b % 16, 1].to_s
+        end
+        i += 1
+      end
+      out
+    end
+
+    # A path param's value in a URL a route helper writes, as Rails'
+    # `Journey::Router::Utils.escape_segment`: the unreserved bytes, the
+    # sub-delims and `:` `@` as they are, every other byte (`/` too) as
+    # `%XX`, so `site_path("a/b")` is `/sites/a%2Fb`. Here rather than on
+    # the Router, because a route helper already reaches this module on
+    # every target (its query keys go through `url_encode`).
+    def self.escape_segment(s)
+      hex = "0123456789ABCDEF"
+      printable = " !\"\#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+      bytes = s.bytes
+      out = ""
+      i = 0
+      while i < bytes.length
+        b = erb_url_byte(bytes, i)
+        if (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) ||
+           b == 45 || b == 46 || b == 95 || b == 126 || b == 33 || b == 36 ||
+           (b >= 38 && b <= 44) || b == 58 || b == 59 || b == 61 || b == 64
           out = out + printable[b - 32, 1].to_s
         else
           out = out + "%" + hex[b / 16, 1].to_s + hex[b % 16, 1].to_s
@@ -673,6 +700,83 @@ module ActionView
       end
     end
 
+    # Rails 8.1.4's TextHelper#simple_format with `sanitize: false`, the
+    # one form the lowering passes here (the default runs the HTML
+    # sanitizer, which isn't modeled): `\r\n` and `\r` are newlines, two
+    # or more newlines end a paragraph, one between two other characters
+    # is followed by `<br />`, and each paragraph is `content_tag(
+    # wrapper_tag, raw(paragraph), html_options)`, joined by a blank
+    # line. A blank text is one empty tag. Measured against actionview
+    # 8.1.4. The text is written as it is (Rails' `raw`): the result is
+    # html-safe.
+    def self.simple_format(text, wrapper_tag, opts = EMPTY_HTML_OPTS)
+      return content_tag_html(wrapper_tag, "", opts) if simple_format_blank?(text)
+      simple_format_paragraphs(text, wrapper_tag, opts)
+    end
+
+    # Rails' `String#blank?`: nothing but `[[:space:]]`, the ASCII
+    # whitespace and the Unicode spaces (U+0085, U+00A0, U+1680,
+    # U+2000..U+200A, U+2028, U+2029, U+202F, U+205F, U+3000).
+    # `text[i, 1]` is `"\r\n"` on a target whose characters are grapheme
+    # clusters (Swift), and it is blank too.
+    def self.simple_format_blank?(text)
+      spaces = " \t\n\v\f\r\u0085\u00A0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200A\u2028\u2029\u202F\u205F\u3000"
+      blank = true
+      i = 0
+      while i < text.length
+        if !spaces.include?(text[i, 1]) && text[i, 1] != "\r\n"
+          blank = false
+        end
+        i += 1
+      end
+      blank
+    end
+
+    # One loop, ending in `i += 1` (Elixir): a run of newlines is counted
+    # in `nl` and settled at the next other character, and the `\n` of a
+    # `\r\n` isn't counted, so no index steps by two. Where characters are
+    # grapheme clusters (Swift), a `\r\n` is one `c`, and one newline, even
+    # after a `\r`.
+    def self.simple_format_paragraphs(text, wrapper_tag, opts)
+      out = ""
+      para = ""
+      nl = 0
+      prev = ""
+      i = 0
+      while i < text.length
+        c = text[i, 1]
+        if c == "\r" || c == "\n" || c == "\r\n"
+          if c == "\r" || c == "\r\n" || prev != "\r"
+            nl = nl + 1
+          end
+        elsif nl == 0
+          para = para + c
+        elsif nl == 1
+          para = para + simple_format_break(para) + c
+          nl = 0
+        else
+          out = simple_format_join(out, content_tag_html(wrapper_tag, para, opts))
+          para = c
+          nl = 0
+        end
+        prev = c
+        i += 1
+      end
+      # One trailing newline stays in the paragraph; more end it, and
+      # Ruby's `split` drops the empty one after.
+      para = para + "\n" if nl == 1
+      simple_format_join(out, content_tag_html(wrapper_tag, para, opts))
+    end
+
+    # The newline itself, then `<br />` unless it opens the text.
+    def self.simple_format_break(para)
+      para.empty? ? "\n" : "\n<br />"
+    end
+
+    def self.simple_format_join(out, paragraph)
+      out.empty? ? paragraph : out + "\n\n" + paragraph
+    end
+
     # ── DOM helpers ──────────────────────────────────────────────────
 
     # Monomorphic: param typed `ActiveRecord::Base`. Was previously a
@@ -753,6 +857,13 @@ module ActionView
     # Frozen empty default so no-opts helpers do not allocate a Hash.
     # Methods that delete keys dup first.
     EMPTY_HTML_OPTS = {}.freeze
+
+    # Rails' `url_for(:back)` (`link_to "Back", :back`): a step back in the history, what Rails answers for a request
+    # with no referrer. A strict target's view has no request in scope (see `url_for_path`); the ruby family reopens
+    # it in `view_helpers_ext.rb` over the request's referrer.
+    def self.back_url
+      "javascript:history.back()"
+    end
 
     def self.link_to(text, href, opts = EMPTY_HTML_OPTS)
       # `opts.to_h` is a no-op on Ruby Hash and NamedTuple→Hash on
@@ -897,7 +1008,7 @@ module ActionView
       form_attrs[:class] = (form_class || "button_to").to_s
       button_attrs = render_attrs({ type: "submit" }.merge(inner_opts))
       method_input = if !method.nil? && method.to_s != "post"
-                       %(<input type="hidden" name="_method" value="#{method}">)
+                       %(<input type="hidden" name="_method" value="#{method}"#{hidden_autocomplete_attr}>)
                      else
                        ""
                      end
@@ -947,11 +1058,102 @@ module ActionView
     def self.csp_meta_tag
       ""
     end
+
+    # Not `Rails.application`'s nonce here: a strict target has no `Rails` in a view helper, so its tags carry none;
+    # the ruby family reopens this in `view_helpers_ext.rb`, as `csp_meta_tag`.
+    def self.content_security_policy_nonce
+      nil
+    end
   
     def self.stylesheet_link_tag(name, opts = EMPTY_HTML_OPTS)
-      href = digested_asset_path("#{name}.css")
-      attrs = render_attrs({ rel: "stylesheet", href: href }.merge(opts.to_h))
-      "<link#{attrs}>"
+      href = stylesheet_href(name.to_s)
+      given = opts.to_h
+      # Rel, href, then the options, as Rails writes them. Not through
+      # `render_attrs`, whose Hash iteration Swift sorts by key (its
+      # Dictionary keeps no order), which would put href first. An option
+      # that replaces either attribute takes the merge, as Rails' does.
+      if given.key?(:rel) || given.key?(:href)
+        attrs = render_attrs({ rel: "stylesheet", href: href }.merge(given))
+        return "<link#{attrs} />"
+      end
+      "<link rel=\"stylesheet\" href=\"#{html_escape(href)}\"#{render_attrs(given)} />"
+    end
+
+    # Rails 8.1.4's `path_to_stylesheet` (actionview `asset_path`, type
+    # :stylesheet): a blank source is ""; a URL (`scheme://`, `//`, `cid:`,
+    # `data:`) as given; otherwise `.css` unless the name already ends in it,
+    # then the pipeline unless the path is absolute, with a `?…`/`#…` tail
+    # kept at the end. String ops only: no portable Regexp.
+    def self.stylesheet_href(source)
+      return "" if blank_source?(source)
+      return source if asset_url?(source)
+      cut = first_char_index(source, "?")
+      fragment = first_char_index(source, "#")
+      # Two flat statements, not `a && (b || c)` (Crystal's and Go's emits
+      # drop those parentheses) nor a nested modifier `if` (Python's emit
+      # writes it on one line).
+      cut = fragment if fragment >= 0 && cut < 0
+      cut = fragment if fragment >= 0 && fragment < cut
+      # Rails splits a tail of at least one character after the mark.
+      cut = source.length if cut < 0 || cut == source.length - 1
+      path = source[0, cut]
+      tail = source[cut, source.length - cut]
+      path = path + ".css" unless css_extname?(path)
+      path = digested_asset_path(path) unless path.start_with?("/")
+      path + tail
+    end
+
+    # Rails' asset `URI_REGEXP`: `[-a-z]+://` (any case), `cid:`, `data:`, `//`.
+    def self.asset_url?(source)
+      return true if source.start_with?("//")
+      lower = source.downcase
+      return true if lower.start_with?("cid:") || lower.start_with?("data:")
+      i = scheme_letter_count(lower)
+      i > 0 && lower[i, 3] == "://"
+    end
+
+    # Rails' `String#blank?`: empty, or every character `[[:space:]]`.
+    def self.blank_source?(s)
+      i = 0
+      while i < s.length
+        return false unless " \t\n\u000b\u000c\r\u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000".include?(s[i, 1])
+        i += 1
+      end
+      true
+    end
+
+    # How many of `s`'s first characters are `-` or `a`-`z`. Its own
+    # method, a counter loop at the top, as Elixir's loop lowering takes it.
+    def self.scheme_letter_count(s)
+      i = 0
+      while i < s.length
+        return i unless "-abcdefghijklmnopqrstuvwxyz".include?(s[i, 1])
+        i += 1
+      end
+      s.length
+    end
+
+    # `File.extname(path) == ".css"`: the last segment ends in `.css` after
+    # a name (`.css` alone has no extname).
+    def self.css_extname?(path)
+      slash = -1
+      i = 0
+      while i < path.length
+        slash = i if path[i, 1] == "/"
+        i += 1
+      end
+      base = path[slash + 1, path.length - slash - 1]
+      base.length > 4 && base.end_with?(".css")
+    end
+
+    # The index of the first `ch` in `s`, or -1.
+    def self.first_char_index(s, ch)
+      i = 0
+      while i < s.length
+        return i if s[i, 1] == ch
+        i += 1
+      end
+      -1
     end
 
     # `<script src>` include for a JS source. The source resolves through
@@ -1016,6 +1218,24 @@ module ActionView
       return source if source.start_with?("/")
       return source if source.include?("://")
       digested_asset_path(source)
+    end
+
+    # `asset_url` — `asset_path` with the host Rails prefixes when one is
+    # configured. Neither a request nor `config.asset_host` reaches a
+    # module function, so it answers the same path (the `image_url`
+    # posture), digested where the tree has a Propshaft manifest; apps
+    # that set `skip_pipeline: true` (an icon model's `url`) hand in the
+    # `/assets/...` path themselves. `data:` and `cid:` sources pass
+    # through, as Rails' URI_REGEXP lets them.
+    def self.asset_url(source, skip_pipeline: false)
+      return source if skip_pipeline
+      return source if source.start_with?("/")
+      return source if source.include?("://")
+      # Rails' URI_REGEXP is case-insensitive: `DATA:` and `CID:` pass too.
+      scheme = source.downcase
+      return source if scheme.start_with?("data:") || scheme.start_with?("cid:")
+      url = digested_asset_path(source)
+      url
     end
 
     # `path_to_javascript "application"` → the asset path for a JS source.
@@ -1084,8 +1304,60 @@ module ActionView
     # lands as C# `object`, and C# rejects any non-null default on a
     # reference-typed parameter (CS1763); `to_s` maps nil → "".
     def self.content_tag(name, content = nil, opts = EMPTY_HTML_OPTS)
-      n = name.to_s
-      "<#{n}#{render_attrs(opts.to_h)}>#{html_escape(content.to_s)}</#{n}>"
+      n = content_tag_name(name.to_s)
+      "<#{n}#{render_attrs(opts.to_h)}>#{content_tag_pre(n)}#{html_escape(content.to_s)}</#{n}>"
+    end
+
+    # `content_tag(name[, opts]) do … end` in a template: the block's
+    # captured markup, already escaped, is the content (Rails'
+    # `capture`), so it is written as it is.
+    def self.content_tag_html(name, html, opts = EMPTY_HTML_OPTS)
+      n = content_tag_name(name.to_s)
+      "<#{n}#{render_attrs(opts.to_h)}>#{content_tag_pre(n)}#{html}</#{n}>"
+    end
+
+    # `button_to url, opts do … end` whose options are computed (a `**opts` merge chain): Rails' form around a submit
+    # button that holds the block's captured markup, `method:` and `form_class:` read out of the options as the
+    # compile-time spelling reads them (`view_to_library::helpers::button_to_wrapper_markup`).
+    def self.button_to_html(url, html, opts = EMPTY_HTML_OPTS)
+      # Not a `reject` block: the strict targets emit none for a runtime Hash. `button_to`'s portable spelling.
+      method = opts.fetch(:method, "post").to_s
+      form_class = opts.fetch(:form_class, "button_to").to_s
+      attrs = opts.to_h.dup
+      attrs.delete(:method)
+      attrs.delete(:form_class)
+      # Rails' GET form carries neither a method override nor the token.
+      form_method = method == "get" ? "get" : "post"
+      token = method == "get" ? "" : csrf_token_hidden_input
+      "<form action=\"#{html_escape(url.to_s)}\" method=\"#{form_method}\" class=\"#{html_escape(form_class)}\">#{method_override_input(method)}<button type=\"submit\"#{render_attrs(attrs)}>#{html}</button>#{token}</form>"
+    end
+
+    # Rails' `ensure_valid_html5_tag_name` (`/\A[a-zA-Z][^\s\/>]*\z/`):
+    # a letter, then no whitespace, `/` or `>`, else ArgumentError, so a
+    # dynamic name never writes past the tag. Bytes, not the Regexp (no
+    # portable match?).
+    def self.content_tag_name(name)
+      bytes = name.bytes
+      ok = bytes.length > 0
+      i = 0
+      while i < bytes.length
+        b = erb_url_byte(bytes, i)
+        if i == 0
+          ok = (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
+        elsif b == 32 || (b >= 9 && b <= 13) || b == 47 || b == 62
+          ok = false
+        end
+        i += 1
+      end
+      raise ArgumentError, "Invalid HTML5 tag name: #{name}" unless ok
+      name
+    end
+
+    # Rails' `PRE_CONTENT_STRINGS`: a textarea's content follows a
+    # newline, which the HTML parser drops, so a leading newline of the
+    # content's own survives.
+    def self.content_tag_pre(name)
+      name == "textarea" ? "\n" : ""
     end
 
     # Emit the importmap script + per-pin modulepreload hints + a
@@ -1124,12 +1396,15 @@ module ActionView
       end
       import_lines = pins.map { |p| "    \"#{p[:name]}\": \"#{p[:path]}\"" }.join(",\n")
       json = "{\n  \"imports\": {\n" + import_lines + "\n  }\n}"
+      # importmap-rails passes `nonce: request&.content_security_policy_nonce` to each tag; the tag helper drops a nil one.
+      nonce = content_security_policy_nonce
+      attr = nonce.nil? ? "" : %( nonce="#{nonce}")
       parts = []
-      parts << %(<script type="importmap" data-turbo-track="reload">) + json + %(</script>)
+      parts << %(<script type="importmap" data-turbo-track="reload") + attr + ">" + json + %(</script>)
       pins.each do |p|
-        parts << %(<link rel="modulepreload" href="#{p[:path]}">)
+        parts << %(<link rel="modulepreload" href="#{p[:path]}") + attr + ">"
       end
-      parts << %(<script type="module">import "#{entry}"</script>)
+      parts << %(<script type="module") + attr + %(>import "#{entry}"</script>)
       parts.join("\n")
     end
   
@@ -1203,7 +1478,18 @@ module ActionView
       return "" if @broadcast_rendering == true
       return "" if ActionController.forgery_switched_off
       return "" if token_fields_omitted?
-      %(<input type="hidden" name="authenticity_token" value="#{html_escape(form_authenticity_token)}">)
+      %(<input type="hidden" name="authenticity_token" value="#{html_escape(form_authenticity_token)}"#{hidden_autocomplete_attr}>)
+    end
+
+    # Rails' `autocomplete="off"` on a hidden input, which `load_defaults` 8.1 drops: a view of an app before it turns it
+    # on (`keep_hidden_autocomplete`, the lowered render's first call).
+    def self.hidden_autocomplete_attr
+      @hidden_autocomplete == true ? " autocomplete=\"off\"" : ""
+    end
+
+    def self.keep_hidden_autocomplete
+      @hidden_autocomplete = true
+      ""
     end
 
     # Strict non-Ruby targets do not emit Rails::Application. The Ruby
@@ -1281,7 +1567,7 @@ module ActionView
       if method_str == "get" || method_str == "post"
         ""
       else
-        %(<input type="hidden" name="_method" value="#{method_str}">)
+        %(<input type="hidden" name="_method" value="#{method_str}"#{hidden_autocomplete_attr}>)
       end
     end
 
@@ -1354,6 +1640,211 @@ module ActionView
       end
     end
 
+    # ` value="…"` for a `form.color_field` with no `value:` (Rails
+    # 8.1.4's `ColorField#render`): the record's value through
+    # `validate_color_string`, so nil, or a value with no color, is
+    # "#000000". Takes the column's value as `optional_value_attr` does.
+    def self.color_value_attr(value)
+      if value.nil?
+        %( value="#000000")
+      else
+        %( value="#{html_escape(validated_color(value.to_s))}")
+      end
+    end
+
+    # `ColorField#render`'s `options["value"] ||= …` for a computed
+    # `value:`: the option as given, or the record's value through
+    # `color_value_attr` when it is nil or false (`||=`). One call, so the
+    # option is evaluated once. `false` is a non-String whose `to_s` is
+    # "false" (`render_attrs`'s boolean-attribute check, keeping the
+    # String "false"): `option == false` does not type on C# (no
+    # `object == bool`) or Swift (`Any` is not `Bool`).
+    def self.color_field_value_attr(option, value)
+      if option.nil? || (!option.is_a?(String) && option.to_s == "false")
+        color_value_attr(value)
+      else
+        %( value="#{html_escape(option.to_s)}")
+      end
+    end
+
+    # ` value="…"` for a `form.datetime_local_field` on a datetime or
+    # date column (Rails 8.1.4's `DatetimeLocalField`, `%Y-%m-%dT%T`),
+    # from the value's text: a stored timestamp, or a Time's `to_s`,
+    # starts `YYYY-MM-DD HH:MM:SS` (any fraction or zone after it is
+    # dropped), and a date is `YYYY-MM-DD`, at midnight. nil, or the
+    # empty text an unsaved record's column reads as, writes no value.
+    # The text is the app zone's wall time when that zone is UTC, which
+    # analyze requires for a datetime column.
+    def self.datetime_local_value_attr(value)
+      return "" if value.nil?
+      s = value.to_s
+      if s.empty?
+        ""
+      elsif s.length >= 19
+        %( value="#{html_escape(s[0, 10] + "T" + s[11, 8])}")
+      elsif s.length == 10
+        %( value="#{html_escape(s + "T00:00:00")}")
+      else
+        %( value="#{html_escape(s)}")
+      end
+    end
+
+    # `s` lowercased when it holds `#` and six hex digits anywhere (the
+    # Regexp is unanchored), else "#000000". Probes with `s[i, n]` and
+    # `include?`, not the Regexp (no portable match?).
+    def self.validated_color(s)
+      i = 0
+      while i + 7 <= s.length
+        return s.downcase if s[i, 1] == "#" && hex_digits?(s[i + 1, 6])
+        i += 1
+      end
+      "#000000"
+    end
+
+    # Every character of `s` is a hex digit. Its own method: no nested
+    # `while` (Elixir).
+    def self.hex_digits?(s)
+      i = 0
+      while i < s.length
+        return false unless "0123456789abcdefABCDEF".include?(s[i, 1])
+        i += 1
+      end
+      true
+    end
+
+    # Rails 8.1.4's `current_page?(path)` for a path or a URL (actionview
+    # url_helper.rb): false unless the request is a GET or HEAD; the path,
+    # percent-decoded, against the request's path (its fullpath when the
+    # path has a query), percent-decoded too, each without the `/` before
+    # its query or at its end. A decoded `scheme://…` is compared with the
+    # request's protocol and host (with port) in front of that path.
+    # Compared as bytes, as Rails compares the unescaped strings in
+    # BINARY. `ingest::current_page` writes the call with the request's
+    # parts, as Strings, so no target needs a request type here:
+    # `request_origin` is its protocol and host with port
+    # (`http://example.org:8080`).
+    def self.current_page_match?(request_method, request_path, request_fullpath, request_origin, path)
+      return false unless request_method == "GET" || request_method == "HEAD"
+      url = percent_decoded(path.bytes)
+      here = first_byte_index(url, 63) >= 0 ? request_fullpath : request_path
+      here_bytes = percent_decoded(here.bytes)
+      here_bytes = joined_bytes(request_origin.bytes, here_bytes) if scheme_at_line_start?(url)
+      same_bytes?(trailing_slash_trimmed(url), trailing_slash_trimmed(here_bytes))
+    end
+
+    # Rails' `%r{^\w+://}`: at the start, or after a newline, one or more
+    # word bytes (ASCII letters, digits, `_`) and then `://`.
+    def self.scheme_at_line_start?(bytes)
+      run = 0
+      i = 0
+      while i < bytes.length
+        b = byte_at(bytes, i)
+        if b == 10
+          run = 0
+        elsif run > 0 && b == 58 && i + 2 < bytes.length && byte_at(bytes, i + 1) == 47 && byte_at(bytes, i + 2) == 47
+          return true
+        elsif run >= 0 && word_byte?(b)
+          run = run + 1
+        else
+          run = -1
+        end
+        i += 1
+      end
+      false
+    end
+
+    def self.word_byte?(byte)
+      return true if byte >= 48 && byte <= 57
+      return true if byte >= 65 && byte <= 90
+      return true if byte >= 97 && byte <= 122
+      byte == 95
+    end
+
+    def self.joined_bytes(a, b)
+      out = []
+      i = 0
+      while i < a.length + b.length
+        if i < a.length
+          out << byte_at(a, i)
+        else
+          out << byte_at(b, i - a.length)
+        end
+        i += 1
+      end
+      out
+    end
+
+    # Each valid `%HH` as its byte; an invalid one, and a `+`, stay as
+    # written (URI's `unescape`, which `current_page?` uses).
+    # One `while` stepping by 1, with `skip` passing over a sequence's
+    # two hex digits: the shape Elixir's loop lowering takes.
+    def self.percent_decoded(bytes)
+      out = []
+      skip = 0
+      i = 0
+      while i < bytes.length
+        b = byte_at(bytes, i)
+        if skip > 0
+          skip = skip - 1
+        elsif b == 37 && i + 2 < bytes.length && hex_value(byte_at(bytes, i + 1)) >= 0 && hex_value(byte_at(bytes, i + 2)) >= 0
+          out << hex_value(byte_at(bytes, i + 1)) * 16 + hex_value(byte_at(bytes, i + 2))
+          skip = 2
+        else
+          out << b
+        end
+        i += 1
+      end
+      out
+    end
+
+    # The byte at `i`, an Integer on every target.
+    def self.byte_at(bytes, i)
+      bytes[i]
+    end
+
+    # An ASCII hex digit's value, or -1.
+    def self.hex_value(byte)
+      return byte - 48 if byte >= 48 && byte <= 57
+      return byte - 55 if byte >= 65 && byte <= 70
+      return byte - 87 if byte >= 97 && byte <= 102
+      -1
+    end
+
+    # The index of the first `byte` in `bytes`, or -1.
+    def self.first_byte_index(bytes, byte)
+      i = 0
+      while i < bytes.length
+        return i if byte_at(bytes, i) == byte
+        i += 1
+      end
+      -1
+    end
+
+    # Rails' `remove_trailing_slash!`: the byte before the first `?` (with
+    # none, or one at the start, the last byte) is dropped if it is `/`.
+    def self.trailing_slash_trimmed(bytes)
+      q = first_byte_index(bytes, 63)
+      at = q > 0 ? q - 1 : bytes.length - 1
+      return bytes if at < 0 || byte_at(bytes, at) != 47
+      out = []
+      i = 0
+      while i < bytes.length
+        out << byte_at(bytes, i) unless i == at
+        i += 1
+      end
+      out
+    end
+
+    def self.same_bytes?(a, b)
+      return false unless a.length == b.length
+      i = 0
+      while i < a.length
+        return false unless byte_at(a, i) == byte_at(b, i)
+        i += 1
+      end
+      true
+    end
+
     # Inverse of `html_escape`'s nil-discipline: returns html_escape
     # on the value when present, empty string when nil. Used by the
     # macro-inline `form.text_area` expansion for the textarea body
@@ -1404,18 +1895,27 @@ module ActionView
         # as a bare (undeclared) assignment — to `name`, which in DOM
         # scope is a const global (TS2588), and to an `inner_name` the
         # sibling lines then couldn't find (TS2304).
-        name = k.to_s
-        unless v.nil?
+        # Every NAME written goes through `xml_name_escape`, as Rails'
+        # `tag_option` does: a key is data too, and unescaped it could
+        # close the attribute and open another.
+        name = xml_name_escape(k.to_s)
+        # A name that escapes to "" (a blank key) is NO attribute: written
+        # as ` ="…"`, the parser reads `="foo` as a name and the value's
+        # later words as attributes. Rails writes a blank Symbol key that
+        # way; this is stricter on purpose.
+        unless v.nil? || name == ""
           if v.is_a?(Hash)
             v.each do |inner_k, inner_v|
-              inner_name = inner_k.to_s.tr("_", "-")
-              unless inner_v.nil?
+              # Rails escapes the whole `data-<inner>` name, prefix
+              # included, after the dasherize.
+              inner_name = xml_name_escape(k.to_s + "-" + inner_k.to_s.tr("_", "-"))
+              unless inner_v.nil? || inner_name == ""
                 # Coerce untyped Hash values to String before
                 # html_escape; html_escape's contract is
                 # `(String) -> String` and the untyped values flowing
                 # through Hash[String, untyped] need explicit
                 # stringification.
-                out = out + " #{name}-#{inner_name}=\"#{html_escape(inner_v.to_s)}\""
+                out = out + " #{inner_name}=\"#{html_escape(inner_v.to_s)}\""
               end
             end
           elsif boolean_attr?(name)
@@ -1440,6 +1940,46 @@ module ActionView
         end
       end
       out
+    end
+
+    # Rails' `ERB::Util.xml_name_escape` (activesupport 8.1.4,
+    # core_ext/erb/util.rb), which `tag_option` applies to every
+    # attribute name: a blank name is "", a valid XML name is itself,
+    # and otherwise a first character outside the name-START set and
+    # each later character outside the name set become "_".
+    #
+    # The ASCII part of those sets is exact: start is `@ : A-Z _ a-z`,
+    # and a later character may also be `- . 0-9`. NON-ASCII is
+    # conservative: Rails keeps most characters from U+00C0 up (`é`
+    # stays `é`), and here a non-ASCII character becomes "_" — one per
+    # character on CRuby, and on a target whose regexps match bytes or
+    # UTF-16 units, one per unit. Either way the name is plain ASCII.
+    # Keeping one would need Rails' Unicode ranges in a character class,
+    # which not every target's regexp engine reads the same. Likewise
+    # "blank" is ASCII whitespace only: a name of Unicode spaces renders
+    # "_"s where Rails gives "".
+    #
+    # The SHAPE is Rails' own (a gsub over the name, then the first
+    # character), spelled with what every target emits and runs on every
+    # page: a constant pattern, `gsub` with a String replacement, and
+    # `[i, n]` slices of an ASCII String. Not a byte walk: elixir has no
+    # `while`, and swift marks a call that can raise (`erb_url_byte`)
+    # `throws`, which an attribute loop's closure cannot call. No `\A`
+    # anchor either (JavaScript has none): the first character is
+    # sliced out and checked on its own. A valid name — every name a
+    # template writes by hand — is one scan and comes back as itself.
+    XML_NAME_INVALID_CHAR = /[^@:A-Z_a-z.0-9-]/.freeze
+    XML_NAME_INVALID_START = /[^@:A-Z_a-z]/.freeze
+    XML_NAME_BLANK_CHAR = /[\t\n\x0b\f\r ]/.freeze
+
+    def self.xml_name_escape(name)
+      escaped = name.gsub(XML_NAME_INVALID_CHAR, "_")
+      return "" if escaped != name && name.gsub(XML_NAME_BLANK_CHAR, "") == ""
+      return escaped if escaped == ""
+      head = escaped[0, 1].to_s
+      fixed = head.gsub(XML_NAME_INVALID_START, "_")
+      return name if fixed == head && escaped == name
+      fixed + escaped[1, escaped.length - 1].to_s
     end
 
     # The TEXT of one attribute value, before escaping: `to_s` here,
@@ -1522,5 +2062,16 @@ module ActionView
         name == "sortable" || name == "truespeed" || name == "typemustmatch" ||
         name == "visible"
     end
+  end
+end
+
+# turbo-rails' helper modules, which a component includes for `turbo_frame_tag` / `turbo_stream_from` (maybe's
+# ApplicationComponent). Not their methods here: a template's calls are lowered where they are written, and a call
+# from Ruby code stays an unknown method.
+module Turbo
+  module FramesHelper
+  end
+
+  module StreamsHelper
   end
 end

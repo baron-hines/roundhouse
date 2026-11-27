@@ -1181,8 +1181,8 @@ fn children(e: &Expr) -> Vec<&Expr> {
         ExprNode::BeginRescue { body, rescues, else_branch, ensure, .. } => {
             v.push(body);
             v.extend(rescues.iter().map(|r| &r.body));
-            v.extend(else_branch.iter());
-            v.extend(ensure.iter());
+            v.extend(else_branch.as_deref());
+            v.extend(ensure.as_deref());
         }
         _ => {}
     }
@@ -1489,9 +1489,10 @@ fn emit_node(n: &ExprNode, e: &Expr) -> String {
         // Not an `if` expression: Swift allows one only as a whole statement's value, and this binding sits inside an expression
         ExprNode::Let { body, .. } => {
             let ret = e.ty.as_ref().map(super::ty::swift_ty).unwrap_or_else(|| "Any?".to_string());
-            let try_kw = if body_throws(e, &current_class()) { "try " } else { "" };
+            // `throws` only with the `try`: an unmarked call to a throwing closure does not compile
+            let (try_kw, throws_kw) = if body_throws(e, &current_class()) { ("try ", "throws ") } else { ("", "") };
             let ExprNode::Let { name, value, .. } = n else { unreachable!() };
-            format!("({try_kw}{{ () throws -> {ret} in\n{}\n{}\n}}())", indent(&bind_let(name.as_str(), value)), indent(&wrap_return(body)))
+            format!("({try_kw}{{ () {throws_kw}-> {ret} in\n{}\n{}\n}}())", indent(&bind_let(name.as_str(), value)), indent(&wrap_return(body)))
         }
         // Not `rescue` too: a Swift raise is a fatalError or a typed throw, which a Ruby rescue clause does not map onto
         ExprNode::BeginRescue { body, rescues, else_branch: None, ensure: None, .. } if rescues.is_empty() => emit_expr(body),
@@ -1501,7 +1502,7 @@ fn emit_node(n: &ExprNode, e: &Expr) -> String {
         ExprNode::BeginRescue { body, rescues, else_branch: None, ensure, .. }
             if !rescues.is_empty() && rescues.iter().all(rescue_catches_throw) =>
         {
-            emit_do_catch(&emit_expr(body), rescues, ensure.as_ref(), false)
+            emit_do_catch(&emit_expr(body), rescues, ensure.as_deref(), false)
         }
         other => {
             let stub = crate::emit::diagnostics::report_unsupported(e.span, "swift", other.kind_str(), "no Swift form for this construct here");
@@ -2392,7 +2393,7 @@ pub(super) fn wrap_return(e: &Expr) -> String {
         ExprNode::BeginRescue { body, rescues, else_branch: None, ensure, .. }
             if !rescues.is_empty() && rescues.iter().all(rescue_catches_throw) =>
         {
-            emit_do_catch(&wrap_return(body), rescues, ensure.as_ref(), true)
+            emit_do_catch(&wrap_return(body), rescues, ensure.as_deref(), true)
         }
         ExprNode::Let { name, value, body, .. } => format!("{}\n{}", bind_let(name.as_str(), value), wrap_return(body)),
         ExprNode::Seq { exprs } if !exprs.is_empty() => emit_stmts(exprs, true),
@@ -2408,6 +2409,90 @@ pub(super) fn wrap_return(e: &Expr) -> String {
                 indent(&with_nonnull_scope(&then_nn, || wrap_return(then_branch))),
                 indent(&with_nonnull_scope(&else_nn, || wrap_return(else_branch)))
             )
+        }
+        // A value method's tail `c ? x : nil` (or `x if c`): Swift's `if`
+        // expression needs both arms, so the taken arm returns and Ruby's
+        // missing arm is the `return nil` after it.
+        ExprNode::If { cond, then_branch, else_branch }
+            if is_empty_branch(else_branch)
+                && !is_empty_branch(then_branch)
+                && RETURNS_VALUE.with(|r| *r.borrow()) =>
+        {
+            let then_nn = props_proven_nonnull(cond);
+            let c = emit_expr(cond);
+            format!(
+                "if {c} {{\n{}\n}}\nreturn nil",
+                indent(&with_nonnull_scope(&then_nn, || wrap_return(then_branch)))
+            )
+        }
+        // Not the assignment alone: Ruby's assignment answers the value, and a value method must return it
+        ExprNode::Assign { target: LValue::Var { id, name }, value } => {
+            // Not the local read back: a branch that proved it non-nil would
+            // read it as `x!`, which traps once `x = nil` has run.
+            if matches!(&*value.node, ExprNode::Lit { value: crate::expr::Literal::Nil }) {
+                return format!("{}\nreturn nil", emit_expr(e));
+            }
+            let read = ExprNode::Var { id: *id, name: name.clone() };
+            format!("{}\nreturn {}", emit_expr(e), emit_expr(&Expr::new(e.span, read)))
+        }
+        // An ivar's property can be typed apart from the method's return, so
+        // the assigned value is returned, not the property read back. The
+        // value is held as the property store coerces it (`coerce_for_prop`
+        // reads the value's own shape, a map read's `Any??`), then stored.
+        ExprNode::Assign { target: LValue::Ivar { name }, value } => {
+            if matches!(&*value.node, ExprNode::Lit { value: crate::expr::Literal::Nil }) {
+                return format!("{}\nreturn nil", emit_expr(e));
+            }
+            let sn = camel(name.as_str());
+            // `[]`/`[:]` take their type from the property they are stored in; a
+            // held `let` of one has none, so the property itself is returned.
+            if matches!(&*value.node, ExprNode::Array { elements, .. } if elements.is_empty())
+                || matches!(&*value.node, ExprNode::Hash { entries, .. } if entries.is_empty())
+            {
+                // Read as the store writes it: a parameter of the same
+                // name would answer a bare `return {sn}`.
+                let prop = if IN_MODULE.with(|f| *f.borrow()) { sn.clone() } else { format!("self.{sn}") };
+                return format!("{}\nreturn {prop}", emit_expr(e));
+            }
+            // A name the value doesn't read: inside the `do` scope a `let` can't
+            // read an outer local of its own name.
+            fn reads(e: &Expr, emitted: &str) -> bool {
+                let mut found = matches!(&*e.node, ExprNode::Var { name: n, .. } if camel(n.as_str()) == emitted);
+                e.node.for_each_child(&mut |c| found |= reads(c, emitted));
+                found
+            }
+            let temp_var = |n: usize| {
+                let name = if n == 0 { "__rh_ret".to_string() } else { format!("__rh_ret{n}") };
+                emit_expr(&Expr::new(value.span, ExprNode::Var { id: crate::ident::VarId(0), name: crate::ident::Symbol::from(name.as_str()) }))
+            };
+            let mut n = 0;
+            while reads(value, &temp_var(n)) {
+                n += 1;
+            }
+            let held = temp_var(n);
+            let coerced = coerce_for_prop(&sn, value, assign_value(value));
+            // An Integer held for a Float property: the `let` is an `Int`
+            // (a literal, or a local typed Integer), which the method returns
+            // (Ruby's `@ratio = 0` answers the Integer) and which a `Double`
+            // property won't take, so the store converts it.
+            let int_into_float = matches!(value.ty, Some(crate::ty::Ty::Int))
+                && matches!(instance_prop_ty(name.as_str()).as_ref().map(crate::ty::Ty::peel_nilable), Some(crate::ty::Ty::Float));
+            // The same for an Integer array held for a Float-array property
+            // (`@ratios = [0]`, `@ratios = [n]`): the method returns the
+            // `[Int]`, and the store maps each element to `Double`.
+            let ints_into_floats = matches!(&value.ty, Some(crate::ty::Ty::Array { elem }) if matches!(**elem, crate::ty::Ty::Int))
+                && matches!(instance_prop_ty(name.as_str()).as_ref().map(crate::ty::Ty::peel_nilable),
+                    Some(crate::ty::Ty::Array { elem }) if matches!(elem.peel_nilable(), crate::ty::Ty::Float));
+            let stored = if int_into_float {
+                format!("Double({held})")
+            } else if ints_into_floats {
+                format!("{held}.map {{ Double($0) }}")
+            } else {
+                held.clone()
+            };
+            let store = if IN_MODULE.with(|f| *f.borrow()) { format!("{sn} = {stored}") } else { format!("self.{sn} = {stored}") };
+            // Its own scope, so an app local of the same name can't collide.
+            format!("do {{\n{}\n}}", indent(&format!("let {held} = {coerced}\n{store}\nreturn {held}")))
         }
         ExprNode::Return { .. }
         | ExprNode::Raise { .. }

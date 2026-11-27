@@ -60,6 +60,25 @@ module Params
     filtered
   end
 
+  def self.record_list(sub, key, allowed)
+    value = Params.nested(sub, key, allowed, "list")
+    if value.is_a?(Array)
+      records = []
+      value.each do |item|
+        records.push(item) if item.is_a?(Hash)
+      end
+      records
+    elsif value.is_a?(Hash)
+      numbered = {}
+      value.each do |name, item|
+        numbered[name] = item if item.is_a?(Hash)
+      end
+      numbered
+    else
+      nil
+    end
+  end
+
   def self.nested_key(key)
     if key.is_a?(Symbol)
       key.to_s
@@ -361,6 +380,30 @@ module Params
   end
 
   # Permitted scalar keys, including matching multiparameter keys.
+  # A Symbol read of a value that may be Rails' Parameters (String-keyed here) or a Symbol-keyed Hash: the key as
+  # given, else its String.
+  # `delete(:name)` on Parameters, which removes the String key a request's Hash holds as well as a Symbol one.
+  # Not `key?` asked of a value that is no Hash: a controller's typed params object answers `delete` and `[]` by
+  # either key itself.
+  def self.indifferent_delete(hash, key)
+    return nil if hash.nil?
+    return hash.delete(key) unless hash.is_a?(Hash)
+    return hash.delete(key) if hash.key?(key)
+    hash.delete(key.to_s)
+  end
+
+  def self.indifferent_read(hash, key)
+    return nil if hash.nil?
+    return hash[key] unless hash.is_a?(Hash)
+    return hash[key] if hash.key?(key)
+    hash[key.to_s]
+  end
+
+  # `params.permit(*names)` over names a program computes (Symbols or Strings): the scalars under them.
+  def self.permitted_names(hash, names)
+    Params.allowed_scalars(hash, names.map { |name| name.to_s })
+  end
+
   def self.allowed_scalars(hash, allowed)
     out = {}
     i = 0

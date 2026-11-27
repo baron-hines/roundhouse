@@ -7,8 +7,8 @@
 use crate::det::{HashMap, HashSet};
 
 use crate::App;
-use crate::dialect::{MethodDef, MethodReceiver};
-use crate::expr::{Expr, ExprNode};
+use crate::dialect::{LibraryClass, MethodDef, MethodReceiver};
+use crate::expr::{Expr, ExprNode, LValue};
 use crate::ident::{ClassId, Symbol};
 
 use super::SourceContractIndex;
@@ -51,11 +51,20 @@ pub(super) fn index_unmodeled_lookup_mutations(app: &App, index: &mut SourceCont
     // Every method name the app defines, on any class, module or model: a
     // send of one on a hook's callback receiver runs app code, which may
     // change the receiver's lookup (`base.install_factory` after
-    // `base.extend(Factory)`).
+    // `base.extend(Factory)`). A definition that makes no call can't, so
+    // an accessor named `methods` on some unrelated class doesn't make
+    // `base.methods` suspect.
     let app_methods: HashSet<Symbol> = super::classes(app)
         .flat_map(|class| class.methods.iter())
         .chain(app.models.iter().flat_map(|model| model.methods()))
         .chain(app.test_modules.iter().flat_map(|module| module.helpers.iter()))
+        .filter(|method| !makes_no_call(method))
+        .map(|method| method.name.clone())
+        .collect();
+    let class_side_methods: HashSet<Symbol> = super::classes(app)
+        .flat_map(|class| class.methods.iter())
+        .chain(app.models.iter().flat_map(|model| model.methods()))
+        .filter(|method| method.receiver == MethodReceiver::Class)
         .map(|method| method.name.clone())
         .collect();
     let modules_with_custom_new: HashSet<ClassId> = index
@@ -116,14 +125,25 @@ pub(super) fn index_unmodeled_lookup_mutations(app: &App, index: &mut SourceCont
             modules_with_custom_initialize,
             &modules_with_mutating_hooks,
         );
+        let lookup_changers = lookup_changing_methods(
+            app,
+            &app_methods,
+            &modules_with_custom_new,
+            modules_with_custom_initialize,
+            &known_module_names,
+            &modules_with_mutating_hooks,
+            &hook_targets,
+            question,
+        );
         let context = ConstructorMutationContext {
             owner_aliases: &constructor_owner_aliases,
             modules_with_custom_new: &modules_with_custom_new,
             modules_with_custom_initialize,
             known_modules: &known_module_names,
-            app_methods: &app_methods,
+            app_methods: &lookup_changers,
             modules_with_mutating_hooks: &modules_with_mutating_hooks,
             hook_targets: Some(&hook_targets),
+            class_side_methods: Some(&class_side_methods),
             question,
         };
         let findings = collect_app_lookup_mutations(app, &context);
@@ -150,12 +170,15 @@ pub(super) fn index_unmodeled_lookup_mutations(app: &App, index: &mut SourceCont
 fn shadows_supplied_initialize(app: &App) -> HashSet<ClassId> {
     let resolver = app.const_resolver.for_sources(&app.sources);
     let initialize = Symbol::from("initialize");
-    let plain = |owner: &ClassId, method: &MethodDef| {
+    let declared = |owner: &ClassId, method: &MethodDef| {
         let span = method.name_span;
         !span.is_synthetic()
             // A `def`'s name token; an alias copy spans its statement.
             && (span.end - span.start) as usize == initialize.as_str().len()
             && resolver.namespaces_declared_in(span.file).any(|name| name == owner.0.as_str())
+    };
+    let plain = |owner: &ClassId, method: &MethodDef| {
+        declared(owner, method)
             && !contains_super(&method.body)
             && method.params.iter().all(|param| param.default.as_ref().is_none_or(|d| !contains_super(d)))
     };
@@ -170,20 +193,63 @@ fn shadows_supplied_initialize(app: &App) -> HashSet<ClassId> {
                 && (target == full || full.ends_with(&format!("::{target}")) || target.ends_with(&format!("::{full}")))
         })
     };
+    let mut parts_of: HashMap<&ClassId, Vec<&LibraryClass>> = HashMap::default();
+    for class in super::classes(app) {
+        parts_of.entry(&class.name).or_default().push(class);
+    }
     let mut out = HashSet::default();
-    for class in super::classes(app).filter(|class| !class.is_module) {
-        let defs: Vec<&MethodDef> = class
-            .methods
+    // Every reopening's together: one's plain `initialize` does not answer for another's `super`.
+    for (name, parts) in &parts_of {
+        if parts.iter().any(|class| class.is_module) {
+            continue;
+        }
+        let defs: Vec<&MethodDef> = parts
             .iter()
+            .flat_map(|class| class.methods.iter())
             .filter(|m| m.receiver == MethodReceiver::Instance && m.name == initialize)
             .collect();
         if !defs.is_empty()
-            && defs.iter().all(|m| plain(&class.name, m))
-            && !class.unknown_calls.iter().any(prepends)
-            && !prepended_elsewhere(&class.name)
+            && defs.iter().all(|m| plain(name, m))
+            && !parts.iter().any(|class| class.unknown_calls.iter().any(prepends))
+            && !prepended_elsewhere(name)
         {
-            out.insert(class.name.clone());
+            out.insert((*name).clone());
         }
+    }
+    // A `super`, or no `initialize` at all, lands on the parent's: when that one never passes the call on and no mixin of
+    // the owner's own sits between them with an `initialize`, the call stops there too (maybe's `DS::Button` and
+    // `DS::Link` under `DS::Buttonish`).
+    let brings_initialize = |module: &ClassId| match parts_of.get(module) {
+        None => !catalog_leaves(module.0.as_str(), Question::NewOrInitialize),
+        Some(known) => known.iter().any(|c| {
+            !c.is_module
+                || !c.includes.is_empty()
+                || c.unknown_calls.iter().any(prepends)
+                || c.methods.iter().any(|m| m.receiver == MethodReceiver::Instance && m.name == initialize)
+        }),
+    };
+    let stops_at_parent = |name: &ClassId, parts: &[&LibraryClass], out: &HashSet<ClassId>| {
+        parts.iter().all(|class| !class.is_module)
+            && parts
+                .iter()
+                .flat_map(|class| class.methods.iter())
+                .filter(|m| m.receiver == MethodReceiver::Instance && m.name == initialize)
+                .all(|m| declared(name, m))
+            && parts.iter().all(|class| class.parent.as_ref().is_none_or(|parent| out.contains(parent)))
+            && parts.iter().any(|class| class.parent.is_some())
+            && !parts.iter().any(|class| class.includes.iter().any(&brings_initialize) || class.unknown_calls.iter().any(prepends))
+            && !prepended_elsewhere(name)
+    };
+    loop {
+        let found: Vec<ClassId> = parts_of
+            .iter()
+            .filter(|(name, parts)| !out.contains(**name) && stops_at_parent(name, parts, &out))
+            .map(|(name, _)| (*name).clone())
+            .collect();
+        if found.is_empty() {
+            break;
+        }
+        out.extend(found);
     }
     for model in &app.models {
         let defs: Vec<&MethodDef> =
@@ -238,10 +304,14 @@ const MIXINS_WITHOUT_CONSTRUCTOR_HOOK: &[(&str, bool)] = &[
     ("ActionView::Helpers::SanitizeHelper", false),
     ("ActionView::Helpers::JavaScriptHelper", false),
     ("Rails.application.routes.url_helpers", true),
+    // The same module as ingest records its include (`library_class`: the program's generated route helpers).
+    ("RouteHelpers", true),
     ("ActiveModel::Model", true),
     ("ActiveModel::Validations", false),
     ("ActiveModel::Attributes", true),
     ("Sidekiq::Worker", false),
+    ("Enumerable", false),
+    ("Comparable", false),
 ];
 
 /// Whether `name` is a catalog mixin that leaves `question` unaffected.
@@ -343,6 +413,7 @@ fn resolve_mutating_hook_modules(
                     app_methods,
                     modules_with_mutating_hooks,
                     hook_targets: None,
+                    class_side_methods: None,
                     question,
                 };
                 let scan = scan_constructor_mutations(
@@ -503,7 +574,7 @@ fn constructor_contract<'a>(
     contracts: &SourceContractIndex<'a>,
     owner: &ClassId,
 ) -> Option<ConstructorContract<'a>> {
-    if !contracts.verified_hierarchy(owner, &mut HashSet::default()) {
+    if !contracts.verified(owner) {
         return Some(ConstructorContract::UnknownLookup);
     }
     // `new` itself may be replaced: no own `initialize` changes that.
@@ -607,6 +678,17 @@ pub(super) fn scan_constructor_mutations(
             _ => false,
         }
     }
+    // Not every app method handed a value of the receiver: a class-side one no body of which changes lookup only stores it (`child.virtual_path = child.identifier.gsub(…)`).
+    fn runs_own_harmless_method(
+        recv: Option<&Expr>,
+        method: &Symbol,
+        callback_receiver: &Symbol,
+        context: &ConstructorMutationContext<'_>,
+    ) -> bool {
+        recv.is_some_and(|recv| matches!(&*recv.node, ExprNode::Var { name, .. } if name == callback_receiver))
+            && context.class_side_methods.is_some_and(|names| names.contains(method))
+            && !context.app_methods.contains(method)
+    }
     fn contains_callback(expr: &Expr, callback_receiver: &Symbol) -> bool {
         if matches!(&*expr.node, ExprNode::Var { name, .. } if name == callback_receiver) {
             return true;
@@ -625,10 +707,19 @@ pub(super) fn scan_constructor_mutations(
         result: &mut ConstructorMutationScan,
     ) {
         if let ExprNode::Send {
-            recv, method, args, ..
+            recv, method, args, block, ..
         } = &*expr.node
         {
-            let mutates_lookup = mutates_constructor_lookup_method(
+            let mutates_lookup = !callback_receiver.is_some_and(|callback_receiver| {
+                eval_only_registers_filters(
+                    recv.as_ref(),
+                    method,
+                    args,
+                    block.as_ref(),
+                    callback_receiver,
+                    context.app_methods,
+                )
+            }) && mutates_constructor_lookup_method(
                 method.as_str(),
                 args,
                 context.modules_with_custom_new,
@@ -652,9 +743,10 @@ pub(super) fn scan_constructor_mutations(
                     && recv
                         .as_ref()
                         .is_some_and(|recv| receiver_uses_callback(recv, callback_receiver)))
-                    || args
-                        .iter()
-                        .any(|arg| contains_callback(arg, callback_receiver))
+                    || (!runs_own_harmless_method(recv.as_ref(), method, callback_receiver, context)
+                        && args
+                            .iter()
+                            .any(|arg| contains_callback(arg, callback_receiver)))
             });
             if mutates_lookup || mutates_callback_receiver {
                 match recv.as_ref().map(|recv| &*recv.node) {
@@ -719,6 +811,8 @@ pub(super) struct ConstructorMutationContext<'a> {
     pub(super) modules_with_mutating_hooks: &'a HashSet<ClassId>,
     /// The module sets above, probed by spelling: once they are final.
     pub(super) hook_targets: Option<&'a HookTargets>,
+    /// Every class-side method name the app defines, once `app_methods` is final.
+    pub(super) class_side_methods: Option<&'a HashSet<Symbol>>,
     pub(super) question: Question,
 }
 
@@ -841,13 +935,285 @@ fn literal_method_name(expr: &Expr) -> Option<&str> {
     }
 }
 
+/// A body of reads and local or instance variable writes: it runs nothing
+/// else, whichever receiver it lands on. Anything not named here counts as
+/// a call, including a setter write and a nested `def`'s stamped nil.
+fn makes_no_call(method: &MethodDef) -> bool {
+    fn runs_nothing(expr: &Expr) -> bool {
+        if expr.diagnostic().is_some() || expr.nested_def().is_some() {
+            return false;
+        }
+        match &*expr.node {
+            ExprNode::Lit { .. }
+            | ExprNode::Ivar { .. }
+            | ExprNode::Var { .. }
+            | ExprNode::SelfRef
+            | ExprNode::Const { .. } => true,
+            ExprNode::Seq { exprs } => exprs.iter().all(runs_nothing),
+            ExprNode::Assign { target: LValue::Ivar { .. } | LValue::Var { .. }, value } => {
+                runs_nothing(value)
+            }
+            _ => false,
+        }
+    }
+    runs_nothing(&method.body)
+        && method.params.iter().all(|param| param.default.as_ref().is_none_or(runs_nothing))
+}
+
+/// Action callback registrations. On a controller they add to its callback
+/// chain and leave `new` and `initialize` alone (Rails 8.1.4,
+/// `tests/included_hook_constructor/oracle.rb`).
+const ACTION_CALLBACK_MACROS: &[&str] = &[
+    "before_action",
+    "after_action",
+    "around_action",
+    "append_before_action",
+    "append_after_action",
+    "append_around_action",
+    "prepend_before_action",
+    "prepend_after_action",
+    "prepend_around_action",
+    "skip_before_action",
+    "skip_after_action",
+    "skip_around_action",
+];
+
+/// What a guard around such a registration may ask of the receiver.
+const LOOKUP_READS: &[&str] = &[
+    "include?",
+    "instance_methods",
+    "method_defined?",
+    "methods",
+    "public_instance_methods",
+    "public_method_defined?",
+    "public_methods",
+    "respond_to?",
+    "singleton_methods",
+];
+
+/// Whether `recv.method(args) { block }` is an eval, on the hook's own
+/// receiver, of a literal block that can't change constructor lookup:
+/// `base.instance_eval { before_action(:load) if base.methods.include?(:before_action) }`.
+/// That block is the `base.before_action` the scan already accepts, written
+/// through `self`.
+///
+/// Inside an eval block `self` is the includer, so any call may reach `new`
+/// by a route the name-based scan doesn't follow: `def new`, `eval`,
+/// `private_class_method :new`, a `Method` object, `singleton_class`, `self`
+/// through a local. Hence an allow-list over the whole block rather than a
+/// search for bad calls: anything it doesn't name keeps the eval's refusal.
+/// Names the app defines stay out because their bodies are app code.
+fn eval_only_registers_filters(
+    recv: Option<&Expr>,
+    method: &Symbol,
+    args: &[Expr],
+    block: Option<&Expr>,
+    callback_receiver: &Symbol,
+    app_methods: &HashSet<Symbol>,
+) -> bool {
+    fn framework_name(names: &[&str], method: &Symbol, app_methods: &HashSet<Symbol>) -> bool {
+        names.contains(&method.as_str()) && !app_methods.contains(method)
+    }
+    fn is_implicit_self(recv: Option<&Expr>) -> bool {
+        recv.is_none_or(|recv| matches!(&*recv.node, ExprNode::SelfRef))
+    }
+    /// Ingest writes a nested `def` as a stamped nil, so a nil isn't
+    /// always nothing: `def new` in the block, or `before_action(def new; end)`.
+    fn is_unstamped(expr: &Expr) -> bool {
+        expr.diagnostic().is_none() && expr.nested_def().is_none()
+    }
+    /// A value with no calls in it: a filter name or an `only:` list.
+    fn is_literal(expr: &Expr) -> bool {
+        if !is_unstamped(expr) {
+            return false;
+        }
+        match &*expr.node {
+            ExprNode::Lit { .. } => true,
+            ExprNode::Array { elements, .. } => elements.iter().all(is_literal),
+            ExprNode::Hash { entries, .. } => {
+                entries.iter().all(|(key, value)| is_literal(key) && is_literal(value))
+            }
+            _ => false,
+        }
+    }
+    fn is_read(expr: &Expr, callback_receiver: &Symbol, app_methods: &HashSet<Symbol>) -> bool {
+        let ExprNode::Send { recv, method, args, block: None, .. } = &*expr.node else {
+            return false;
+        };
+        is_unstamped(expr)
+            && framework_name(LOOKUP_READS, method, app_methods)
+            && args.iter().all(is_literal)
+            && (is_implicit_self(recv.as_ref())
+                || recv.as_ref().is_some_and(|recv| {
+                    matches!(&*recv.node, ExprNode::Var { name, .. } if name == callback_receiver)
+                        || is_read(recv, callback_receiver, app_methods)
+                }))
+    }
+    fn is_registration(expr: &Expr, callback_receiver: &Symbol, app_methods: &HashSet<Symbol>) -> bool {
+        if !is_unstamped(expr) {
+            return false;
+        }
+        match &*expr.node {
+            ExprNode::Lit { value: crate::expr::Literal::Nil } => true,
+            ExprNode::Seq { exprs } => {
+                exprs.iter().all(|expr| is_registration(expr, callback_receiver, app_methods))
+            }
+            ExprNode::If { cond, then_branch, else_branch } => {
+                is_read(cond, callback_receiver, app_methods)
+                    && is_registration(then_branch, callback_receiver, app_methods)
+                    && is_registration(else_branch, callback_receiver, app_methods)
+            }
+            ExprNode::Send { recv, method, args, block: None, .. } => {
+                is_implicit_self(recv.as_ref())
+                    && framework_name(ACTION_CALLBACK_MACROS, method, app_methods)
+                    && args.iter().all(is_literal)
+            }
+            _ => false,
+        }
+    }
+
+    if !matches!(
+        method.as_str(),
+        "class_eval" | "module_eval" | "instance_eval" | "class_exec" | "instance_exec"
+    ) || !args.is_empty()
+        || !recv.is_some_and(|recv| {
+            matches!(&*recv.node, ExprNode::Var { name, .. } if name == callback_receiver)
+        })
+    {
+        return false;
+    }
+    matches!(
+        block.map(|block| &*block.node),
+        Some(ExprNode::Lambda { params, rest_param: None, extra_params, block_param: None, body, .. })
+            if params.is_empty()
+                && extra_params.is_empty()
+                && is_registration(body, callback_receiver, app_methods)
+    )
+}
+
+/// A method that may change lookup by what it is handed (`extend(Factory)`), or by running code (`class_eval`).
+fn lookup_primitive(name: &str) -> bool {
+    matches!(
+        name,
+        "include" | "extend" | "prepend" | "define_method" | "define_singleton_method" | "remove_method" | "undef_method"
+            | "alias_method" | "class_eval" | "module_eval" | "instance_eval" | "class_exec" | "module_exec" | "instance_exec"
+            | "send" | "public_send" | "__send__"
+    )
+}
+
+// Not every app method's name: one no definition of which changes lookup, sends by a built name, or calls such a method runs code that cannot reach it.
+#[allow(clippy::too_many_arguments)]
+fn lookup_changing_methods(
+    app: &App,
+    app_methods: &HashSet<Symbol>,
+    modules_with_custom_new: &HashSet<ClassId>,
+    modules_with_custom_initialize: &HashSet<ClassId>,
+    known_modules: &KnownModules,
+    modules_with_mutating_hooks: &HashSet<ClassId>,
+    hook_targets: &HookTargets,
+    question: Question,
+) -> HashSet<Symbol> {
+    fn visit(expr: &Expr, name: &Symbol, changes: &mut dyn FnMut(&Symbol, &[Expr]) -> bool, found: &mut bool) {
+        if *found {
+            return;
+        }
+        if expr.diagnostic().is_some() || expr.nested_def().is_some() {
+            *found = true;
+            return;
+        }
+        // Not the explicit sends alone: a bound method (`recv.method(:install)`) runs its name when called, and an
+        // attribute's compound or multiple assignment calls its writer.
+        let writer = |attr: &Symbol| Symbol::from(format!("{}=", attr.as_str()).as_str());
+        let implicit = match &*expr.node {
+            // Not the reference's own arguments: the bound method runs with the later call's, so a primitive whose
+            // effect its arguments decide (`method(:extend).call(Factory)`) counts whatever it is handed.
+            ExprNode::MethodRef { name: referenced, .. } => lookup_primitive(referenced.as_str()) || changes(referenced, &[]),
+            ExprNode::Send { method, args, .. } if matches!(method.as_str(), "method" | "public_method" | "instance_method") => {
+                args.first().map(literal_method_name).is_none_or(|name| {
+                    name.is_none_or(|name| lookup_primitive(name) || changes(&Symbol::from(name), &[]))
+                })
+            }
+            ExprNode::OpAssign { target: crate::expr::LValue::Attr { name: attr, .. }, value, .. } => {
+                changes(attr, &[]) || changes(&writer(attr), std::slice::from_ref(value))
+            }
+            ExprNode::MultiAssign { targets, .. } => targets
+                .iter()
+                .any(|target| matches!(target, crate::expr::LValue::Attr { name: attr, .. } if changes(&writer(attr), &[]))),
+            _ => false,
+        };
+        if implicit {
+            *found = true;
+            return;
+        }
+        match &*expr.node {
+            ExprNode::Send { method, args, .. } if changes(method, args) => {
+                *found = true;
+                return;
+            }
+            // Not the `super` call's own arguments alone: a zsuper passes the method's, so a primitive's override (`def self.include(*m) = super`) changes lookup whatever it is handed.
+            ExprNode::Super { .. }
+                if changes(name, &[])
+                    || lookup_primitive(name.as_str())
+                    || is_method_lookup_hook(name.as_str())
+                    || defines_constructor_lookup_callback(name.as_str()) =>
+            {
+                *found = true;
+                return;
+            }
+            _ => {}
+        }
+        expr.node.for_each_child(&mut |child| visit(child, name, changes, found));
+    }
+    let methods: Vec<&MethodDef> = super::classes(app)
+        .flat_map(|class| class.methods.iter())
+        .chain(app.models.iter().flat_map(|model| model.methods()))
+        .chain(app.test_modules.iter().flat_map(|module| module.helpers.iter()))
+        .filter(|method| app_methods.contains(&method.name))
+        .collect();
+    let mut changers: HashSet<Symbol> = HashSet::default();
+    loop {
+        let before = changers.len();
+        for method in &methods {
+            if changers.contains(&method.name) {
+                continue;
+            }
+            let mut changes = |called: &Symbol, args: &[Expr]| {
+                mutates_constructor_lookup_method(
+                    called.as_str(),
+                    args,
+                    modules_with_custom_new,
+                    modules_with_custom_initialize,
+                    known_modules,
+                    modules_with_mutating_hooks,
+                    Some(hook_targets),
+                    question,
+                ) || sends_app_method(called, args, &changers)
+                    || (matches!(called.as_str(), "send" | "public_send" | "__send__")
+                        && args.first().and_then(literal_method_name).is_none())
+            };
+            let mut found = false;
+            visit(&method.body, &method.name, &mut changes, &mut found);
+            for default in method.params.iter().filter_map(|param| param.default.as_ref()) {
+                visit(default, &method.name, &mut changes, &mut found);
+            }
+            if found {
+                changers.insert(method.name.clone());
+            }
+        }
+        if changers.len() == before {
+            return changers;
+        }
+    }
+}
+
 /// Whether `method(args)` runs a method the app defines: by name, or
 /// through `send` / `public_send` / `__send__` with a literal name. A
 /// dynamic send with any other name may run one, so it counts.
 fn sends_app_method(method: &Symbol, args: &[Expr], app_methods: &HashSet<Symbol>) -> bool {
     if matches!(method.as_str(), "send" | "public_send" | "__send__") {
-        return match args.first().map(literal_method_name) {
-            Some(Some(name)) => app_methods.contains(&Symbol::from(name)),
+        // Not the literal name alone: `public_send(:send, :install, …)` runs what the inner send names.
+        return match args.split_first().map(|(first, rest)| (literal_method_name(first), rest)) {
+            Some((Some(name), rest)) => sends_app_method(&Symbol::from(name), rest, app_methods),
             _ => true,
         };
     }

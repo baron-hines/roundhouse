@@ -120,12 +120,28 @@ pub(super) fn dirty_classes_for_retype(
         qi += 1;
         let names = moved_by_class.get(&id).cloned().unwrap_or_default();
         for child in children.get(&id).cloned().unwrap_or_default() {
+            // A `super` records no call site, so a child's own method of a
+            // moved name, which may read the moved one through it, is no
+            // caller of it: the child is dirty itself. The spread below
+            // reaches a subclass anyway, but not a model or plain class
+            // that includes a module.
+            if classes.get(&child).is_some_and(|c| {
+                names.iter().any(|n| c.source_instance_methods.contains(n) || c.source_class_methods.contains(n))
+            }) {
+                dirty.insert(child.clone());
+            }
             let entry = moved_by_class.entry(child.clone()).or_default();
             let before = entry.len();
             entry.extend(names.iter().cloned());
             if entry.len() != before {
                 queue.push(child);
             }
+        }
+    }
+    // `foo.map` is typed from `each` (`enumerable_view`), with no `map` entry of its own to move.
+    for names in moved_by_class.values_mut() {
+        if names.contains(&Symbol::from("each")) {
+            names.extend(crate::analyze::body::ENUMERABLE_METHODS.iter().map(|m| Symbol::from(*m)));
         }
     }
     for (id, names) in &moved_by_class {
@@ -139,12 +155,38 @@ pub(super) fn dirty_classes_for_retype(
     // Descendants and included modules share one worklist so a module
     // pulled in for concern-ivar seeding also dirties its other
     // includers (children). Separate passes left those siblings clean.
+    //
+    // Only its controller (and module) includers, though: the ivar
+    // environment `concern_ivar_env_of` gives a module comes from the
+    // controllers that include it, and a controller re-types the
+    // concern's spliced actions against it (Phase B′). A model or plain
+    // class that includes the module reads nothing of that environment;
+    // what it reads of the module is the module's method table, and a
+    // change there reaches it through the moved names above in the
+    // round it happens. Dirtying every includer of a shared mixin pushed
+    // the frontier over its budget whenever one of them moved, and every
+    // round then re-typed the whole app.
+    let controllers: HashSet<&ClassId> = app.controllers.iter().map(|c| &c.name).collect();
+    let is_module = |id: &ClassId| classes.get(id).is_some_and(|c| c.is_module);
     let mut queue: Vec<ClassId> = dirty.iter().cloned().collect();
     let mut qi = 0;
     while qi < queue.len() {
         let id = queue[qi].clone();
         qi += 1;
+        let controller = controllers.contains(&id);
         for child in children.get(&id).cloned().unwrap_or_default() {
+            // Not every subclass of a plain class either. A model or
+            // library class types its bodies against its own ivars, and
+            // what a subclass reads of it, its method table, reaches the
+            // subclass through the moved names above. Only a controller
+            // seeds its subclasses (Phase B). Counting every subclass sent
+            // one moved exception initializer to all of StandardError's
+            // subclasses, and an included library the app carries no body
+            // of (`Enumerable`), which is never known to be a module, to
+            // all of its includers: past the budget, every round.
+            if !controller && !controllers.contains(&child) && !is_module(&child) {
+                continue;
+            }
             if dirty.insert(child.clone()) {
                 queue.push(child);
             }
@@ -176,4 +218,65 @@ pub(super) fn dirty_classes_for_retype(
         eprintln!("DBG dirty {}/{budget}: {names:?}", dirty.len());
     }
     (dirty.len() <= budget).then_some(dirty)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dialect::MethodReceiver;
+    use std::path::PathBuf;
+
+    fn id(name: &str) -> ClassId {
+        ClassId(Symbol::from(name))
+    }
+
+    fn app(files: &[(&str, &str)]) -> App {
+        let tree = files.iter().map(|(path, src)| (PathBuf::from(path), src.as_bytes().to_vec())).collect();
+        crate::ingest::ingest_app_from_tree(tree).expect("ingest")
+    }
+
+    /// Classes `name < parent`, the frontier after `owner#method`'s
+    /// parameter row moved and nothing else did.
+    fn frontier(app: &App, classes: &[(&str, Option<&str>)], owner: &str, method: &str) -> Option<HashSet<ClassId>> {
+        let classes: HashMap<ClassId, ClassInfo> = classes
+            .iter()
+            .map(|(name, parent)| (id(name), ClassInfo { parent: parent.map(id), ..Default::default() }))
+            .collect();
+        let key = (id(owner), Symbol::from(method), MethodReceiver::Instance);
+        let now: HashMap<super::super::ParamKey, Vec<Ty>> = [(key.clone(), vec![Ty::Int])].into_iter().collect();
+        let before: HashMap<super::super::ParamKey, Vec<Ty>> = [(key, vec![Ty::Str])].into_iter().collect();
+        let hints = DirtyHints {
+            sig: InferenceSig { instance: HashMap::default(), class_methods: HashMap::default(), params: before },
+            block_value: HashMap::default(),
+        };
+        dirty_classes_for_retype(app, &classes, &now, &HashMap::default(), &hints)
+    }
+
+    const PLAIN: &str = "class One\n  def a; 1; end\nend\nclass Two\n  def a; 1; end\nend\nclass Three\n  def a; 1; end\nend\nclass Four\n  def a; 1; end\nend\nclass Five\n  def a; 1; end\nend\nclass Six\n  def a; 1; end\nend\n";
+
+    #[test]
+    fn a_moved_row_on_a_plain_class_leaves_its_subclasses_clean() {
+        let app = app(&[("app/lib/plain.rb", PLAIN)]);
+        let dirty = frontier(&app, &[("Base", None), ("A", Some("Base")), ("B", Some("Base")), ("C", Some("Base"))], "Base", "initialize")
+            .expect("narrowed");
+        assert!(dirty.contains(&id("Base")), "{dirty:?}");
+        assert!(!dirty.contains(&id("A")) && !dirty.contains(&id("B")) && !dirty.contains(&id("C")), "{dirty:?}");
+    }
+
+    #[test]
+    fn a_moved_row_on_a_controller_dirties_its_subclasses() {
+        let app = app(&[
+            ("app/lib/plain.rb", PLAIN),
+            ("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\n  def helper(x); x; end\nend\n"),
+            ("app/controllers/posts_controller.rb", "class PostsController < ApplicationController\n  def index; end\nend\n"),
+        ]);
+        let dirty = frontier(
+            &app,
+            &[("ApplicationController", None), ("PostsController", Some("ApplicationController"))],
+            "ApplicationController",
+            "helper",
+        )
+        .expect("narrowed");
+        assert!(dirty.contains(&id("PostsController")), "{dirty:?}");
+    }
 }

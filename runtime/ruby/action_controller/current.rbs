@@ -8,6 +8,7 @@ module ActionController
     def request_host_for_redirect: () -> String
     def request_protocol_for_url: () -> String
     def request_for_csrf: () -> ActionDispatch::Request?
+    def content_security_policy_source: (Integer index) -> String
     def csrf_header_token: () -> String
   end
 

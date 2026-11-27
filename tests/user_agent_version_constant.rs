@@ -3,6 +3,8 @@
 //! Ported from the Shopify/roundhouse-1 fork's tests. A test the compiler
 //! does not pass yet is ignored as `fork spec: postgresql`. A probe needs
 //! ROUNDHOUSE_PG_TEST_URL and the pg gem (tests/support/pg_probe.rs).
+#[path = "support/prerequisite.rs"]
+mod prerequisite;
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
@@ -122,7 +124,7 @@ fn the_class_body_versions_compile_and_answer_like_the_gem_on_the_postgresql_tre
 fn the_installed_gem_answers_the_same_comparisons() {
     let probe = emit_and_run::ruby().args(["-e", "gem 'useragent', '0.16.11'"]).output().expect("ruby");
     if !probe.status.success() {
-        eprintln!("useragent 0.16.11 is not installed; skipping the native control");
+        prerequisite::missing("useragent 0.16.11 is not installed; the native control does not run");
         return;
     }
     let out = emit_and_run::ruby()

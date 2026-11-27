@@ -5,6 +5,8 @@
 //! as a PATH gem of `Gemfile.lock`. A test the compiler does not pass yet
 //! is ignored with the group of behavior it waits on (`fork spec: ...`).
 
+#[path = "support/scratch.rs"]
+mod scratch;
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
@@ -15,8 +17,7 @@ const ORACLE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/rails_o
 fn native(program: &str) -> String {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("rh_hook_class_attribute_{}_{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch::dir(&format!("rh_hook_class_attribute_{n}"));
     std::fs::write(dir.join("main.rb"), format!("require {ORACLE:?}\n{program}")).unwrap();
     let out = Command::new("ruby").arg("main.rb").current_dir(&dir).output().expect("ruby is on PATH");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -79,7 +80,7 @@ fn an_included_hook_s_class_attribute_is_the_includer_s_as_native() {
         "native control"
     );
     let run = classes.iter().fold(emit_and_run::empty_app(), |overlay, (path, source)| overlay.write(path, source)).run_ruby(SCRIPT);
-    assert!(run.success, "emitted tree failed in {}\n{}\n{}", run.emitted.display(), run.stdout, run.stderr);
+    run.assert_passes();
     assert_eq!(run.stdout, expected, "{}", run.stderr);
 }
 
@@ -128,7 +129,7 @@ fn a_respond_to_guarded_hook_declaration_is_its_branch_as_native() {
         .write("config/application.rb", "require \"redir\"\n")
         .write("vendor/gems/redir-1.0.0/lib/redir.rb", REDIRECTS)
         .run_ruby(script);
-    assert!(run.success, "emitted tree failed in {}\n{}\n{}", run.emitted.display(), run.stdout, run.stderr);
+    run.assert_passes();
     assert!(!run.stderr.contains("file_require_not_carried"), "{}", run.stderr);
     assert_eq!(run.stdout, expected, "{}", run.stderr);
 }
@@ -177,6 +178,6 @@ fn an_included_hook_s_cattr_is_the_includer_s_class_variable_as_native() {
         "native control"
     );
     let run = classes.iter().fold(emit_and_run::empty_app(), |overlay, (path, source)| overlay.write(path, source)).run_ruby(script);
-    assert!(run.success, "emitted tree failed in {}\n{}\n{}", run.emitted.display(), run.stdout, run.stderr);
+    run.assert_passes();
     assert_eq!(run.stdout, expected, "{}", run.stderr);
 }

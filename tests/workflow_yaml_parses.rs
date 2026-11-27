@@ -13,6 +13,8 @@
 //! other call to that script in this file sits inside a `run: |` block,
 //! which is why the shape looked right.
 
+#[path = "support/scratch.rs"]
+mod scratch;
 use std::fs;
 use std::path::Path;
 
@@ -75,8 +77,7 @@ fn spinel_cache_download_failure_falls_back_without_hiding_build_failures() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let root = std::env::temp_dir().join(format!("spinel-cache-{}-{unique}", std::process::id()));
-    fs::create_dir(&root).unwrap();
+    let root = scratch::dir(&format!("spinel-cache-{unique}"));
     let env_file = root.join("github-env");
     let summary = root.join("summary");
     let output = Command::new("bash")
@@ -166,8 +167,7 @@ fn campfire_docker_recipe_avoids_a_frontend_pull_and_ships_executable_boot() {
         .unwrap()
         .as_nanos();
     let root =
-        std::env::temp_dir().join(format!("campfire-docker-{}-{unique}", std::process::id()));
-    fs::create_dir(&root).unwrap();
+        scratch::dir(&format!("campfire-docker-{unique}"));
     let result = std::process::Command::new("bash")
         .arg("scripts/campfire-docker-files")
         .arg(&root)
@@ -409,6 +409,38 @@ fn host_libvips_dev_jobs_share_cached_apt_deb_install() {
         // Still a .deb cache around ci-apt-install — never a dpkg-state restore.
         assert!(step.get("run").is_none(), "{job_name}");
     }
+
+    for (job_name, step_name, packages) in [
+        (
+            "unit",
+            "System libvips for the emitted ruby-vips processor",
+            "libvips42",
+        ),
+        ("campfire-compare", "System libvips", "libvips42 sqlite3"),
+        (
+            "campfire-conformance",
+            "Install libvips (ruby-vips binds it through FFI) and ffmpeg",
+            "libvips42 ffmpeg",
+        ),
+    ] {
+        let step = workflow["jobs"][job_name]["steps"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .find(|step| step["name"].as_str() == Some(step_name))
+            .unwrap_or_else(|| panic!("{job_name}: missing {step_name}"));
+        assert_eq!(
+            step["uses"].as_str(),
+            Some("./.github/actions/ci-apt-install-cached"),
+            "{job_name}"
+        );
+        assert_eq!(
+            step["with"]["packages"].as_str(),
+            Some(packages),
+            "{job_name}"
+        );
+        assert_eq!(step["timeout-minutes"].as_u64(), Some(20), "{job_name}");
+    }
 }
 
 #[test]
@@ -458,8 +490,7 @@ fn rust_setup_exports_the_selected_toolchain_for_generated_projects() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let root = std::env::temp_dir().join(format!("rust-setup-{}-{unique}", std::process::id()));
-    fs::create_dir(&root).unwrap();
+    let root = scratch::dir(&format!("rust-setup-{unique}"));
     let rustup = root.join("rustup");
     // A different version catches hard-coded exports, and the trailing
     // explanation catches exporting the whole active-toolchain output.
@@ -520,7 +551,7 @@ fn pr_archives_remain_tested_without_pages_publication_work() {
     assert_eq!(
         jobs["build-site"]["if"].as_str(),
         Some(
-            "${{ !cancelled() && contains(fromJSON(needs.plan.outputs.jobs), 'build-site') && needs.generate-fixture.result == 'success' && (needs.plan.outputs.site != 'true' || needs.build-wasm.result == 'success') }}"
+            "${{ !cancelled() && contains(fromJSON(needs.plan.outputs.jobs), 'build-site') && needs.generate-fixture.result == 'success' }}"
         )
     );
     assert_eq!(jobs["smoke"]["needs"][0].as_str(), Some("build-site"));
@@ -594,7 +625,7 @@ fn pr_archives_remain_tested_without_pages_publication_work() {
     assert_eq!(
         jobs["assemble-site"]["if"].as_str(),
         Some(
-            "${{ !cancelled() && needs.plan.outputs.publish == 'true' && needs.build-site.result == 'success' && needs.archive-results.result == 'success' }}"
+            "${{ !cancelled() && needs.plan.outputs.publish == 'true' && needs.build-site.result == 'success' && needs.build-wasm.result == 'success' && needs.archive-results.result == 'success' }}"
         )
     );
     assert!(
@@ -730,8 +761,8 @@ fn campfire_comparisons_require_an_uploaded_binary_and_report_blocking() {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let summary =
-            std::env::temp_dir().join(format!("campfire-ready-{}-{unique}.md", std::process::id()));
+        let summary_dir = scratch::dir(&format!("campfire-ready-{unique}"));
+        let summary = summary_dir.join("summary.md");
         let output = Command::new("bash")
             .args(["-e", "-c", report["run"].as_str().unwrap()])
             .env("ARTIFACT_ID", artifact_id)
@@ -740,7 +771,7 @@ fn campfire_comparisons_require_an_uploaded_binary_and_report_blocking() {
             .unwrap();
         assert!(output.status.success(), "{output:?}");
         assert_eq!(fs::read_to_string(&summary).unwrap(), expected);
-        fs::remove_file(summary).unwrap();
+        fs::remove_dir_all(summary_dir).unwrap();
     }
 }
 
@@ -773,11 +804,7 @@ fn shared_debug_roundhouse_reaches_campfire_consumers_via_roundhouse_bin() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let root = std::env::temp_dir().join(format!(
-        "roundhouse-bin-helper-{}-{unique}",
-        std::process::id()
-    ));
-    fs::create_dir_all(&root).unwrap();
+    let root = scratch::dir(&format!("roundhouse-bin-helper-{unique}"));
     let marker = root.join("invoked.txt");
     let fake = root.join("fake-roundhouse");
     // Staged producer stand-in: records argv and, when given -o, writes a
@@ -1016,10 +1043,7 @@ fn campfire_failure_capture_keeps_the_original_exit_and_actual_c() {
             .unwrap()
             .as_nanos();
         // Canonical: macOS's temp dir is a symlink, and the script reports the real path.
-        let root = std::env::temp_dir()
-            .canonicalize()
-            .unwrap()
-            .join(format!("campfire-ci {}-{unique}", std::process::id()));
+        let root = scratch::dir(&format!("campfire-ci {unique}"));
         let source = root.join("build/campfire-compare-spinel");
         fs::create_dir_all(source.join("app/models")).unwrap();
         fs::create_dir_all(source.join("sig")).unwrap();

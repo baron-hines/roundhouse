@@ -85,7 +85,7 @@ pub fn emit_overlay_files(app: &App) -> Vec<EmittedFile> {
     // App-wide nullable-column set, for cross-class reads (a view
     // renders `article.title`, whose model isn't the class being
     // emitted). Per-class tables are set by `emit_library_class`.
-    expr::set_all_nullable_columns(nullable_column_pairs(app));
+    expr::set_all_nullable_columns(nullable_column_go_tys(app));
     expr::reset_error_classes();
 
     // Hand-written runtime — copied verbatim under `app/v2/`.
@@ -125,6 +125,13 @@ pub fn emit_overlay_files(app: &App) -> Vec<EmittedFile> {
         });
     }
 
+    // `content_tag_html` and `simple_format` of the transpiled
+    // `ActionView::ViewHelpers`, kept for the views' coercion pass below:
+    // their declared `opts` is what widens a view's options Hash (a
+    // literal or a local) to the `map[string]interface{}` they take. Only
+    // those: the views' other helper calls are emitted as they were
+    // (`dom_id`'s record param would cast a model).
+    let mut view_helpers: Vec<crate::dialect::LibraryClass> = Vec::new();
     let units = match crate::runtime_loader::go_units(|_ns, classes| {
         // ActionView::ViewHelpers's six slot methods (reset_slots!,
         // content_for_set/get, get_slot, get_yield, set_yield) are
@@ -153,7 +160,13 @@ pub fn emit_overlay_files(app: &App) -> Vec<EmittedFile> {
                 c
             })
             .collect();
-        lower::lower_for_go(classes)
+        let lowered = lower::lower_for_go(classes);
+        for class in lowered.iter().filter(|c| c.name.0.as_str() == "ActionView::ViewHelpers") {
+            let mut class = class.clone();
+            class.methods.retain(|m| matches!(m.name.as_str(), "content_tag_html" | "simple_format"));
+            view_helpers.push(class);
+        }
+        lowered
     }) {
         Ok(u) => u,
         Err(e) => {
@@ -292,6 +305,10 @@ func main() {\n\
                 &params_specs,
             );
         let lowered_models = lower::lower_for_go(model_lcs);
+        // The methods each model's Go type has, by the class emit's own
+        // field-or-method choice: a view's 0-arg read of another record's
+        // method is a call only when the type has it as a method.
+        expr::set_all_model_methods(model_go_methods(&lowered_models));
 
         // Controllers are lowered next so we can build the variadic-
         // ctor registry across the full set (runtime + models +
@@ -396,7 +413,7 @@ func main() {\n\
                     })
                     .or_insert(lc);
             }
-            lower::lower_for_go(merged.into_values().collect())
+            lower::lower_for_go_with_extras(merged.into_values().collect(), &view_helpers)
         } else {
             Vec::new()
         };
@@ -775,7 +792,8 @@ fn emit_v2_test_compat(app: &App) -> EmittedFile {
         if !has_table {
             continue;
         }
-        let model = m.name.0.as_str();
+        // The Go type name (`ActiveStorage::Attachment` → `ActiveStorageAttachment`).
+        let model = library::sanitize_type_name(m.name.0.as_str());
         s.push_str(&format!(
             "func {model}Find(id int64) *{model} {{ return {model}_find(id) }}\n"
         ));
@@ -795,7 +813,9 @@ fn emit_v2_test_compat(app: &App) -> EmittedFile {
     let mut seen = crate::det::HashSet::default();
     for route in &flat {
         let as_name = route.as_name.as_str();
-        if as_name.is_empty() {
+        // An unnamed route's `as_name` is an action-name fallback (an
+        // unmodeled endpoint's is `lambda endpoint`): no helper to shim.
+        if !route.named || as_name.is_empty() {
             continue;
         }
         // Path helper (no _path suffix on as_name; legacy adds Path).
@@ -808,7 +828,7 @@ fn emit_v2_test_compat(app: &App) -> EmittedFile {
         // Param signature follows the v2 helper's signature; recover
         // by counting path params via the route's dynamic segments.
         let dyn_count = route.path_params.len();
-        let (params, args) = match dyn_count {
+        let (mut params, mut args) = match dyn_count {
             0 => (String::new(), String::new()),
             1 => ("id int64".to_string(), "id".to_string()),
             2 => (
@@ -817,6 +837,13 @@ fn emit_v2_test_compat(app: &App) -> EmittedFile {
             ),
             _ => continue, // skip unusual arities
         };
+        // `scope format: true` makes the helper's format a required last
+        // param, outside `path_params`.
+        if route.format_required {
+            let sep = if params.is_empty() { "" } else { ", " };
+            params.push_str(&format!("{sep}format string"));
+            args.push_str(&format!("{sep}format"));
+        }
         s.push_str(&format!(
             "func {legacy}({params}) string {{ return {v2_name}({args}) }}\n"
         ));
@@ -832,7 +859,8 @@ fn emit_v2_test_compat(app: &App) -> EmittedFile {
         if !has_table {
             continue;
         }
-        let model = m.name.0.as_str();
+        // The Go type name (`ActiveStorage::Attachment` → `ActiveStorageAttachment`).
+        let model = library::sanitize_type_name(m.name.0.as_str());
         s.push_str(&format!(
             "// Test-only Save() override — initializes the embedded\n\
              // *ApplicationRecord and the Modeler back-pointer when a\n\
@@ -1153,6 +1181,77 @@ pub(super) fn nullable_column_pairs(app: &crate::App) -> Vec<(String, String)> {
         for c in &table.columns {
             if c.nullable && !c.primary_key {
                 out.push((m.name.0.as_str().to_string(), c.name.as_str().to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// The struct field and pointer converter a test or fixture writes the
+/// column `column` of `model` through, when the shared lowering holds it
+/// unset for its presence check (`lower::validations::held_unset_columns`):
+/// its nilable `<Col>Raw` slot, not a `<Col>` field the struct lacks.
+pub(super) fn held_column_field(app: &crate::App, model: &str, column: &str) -> Option<(String, &'static str)> {
+    let model_ref = app.models.iter().find(|m| m.name.0.as_str().rsplit("::").next() == Some(model))?;
+    let held = crate::lower::validations::held_unset_columns(&app.models, &app.schema);
+    let (_, name) = held.iter().find(|(m, c)| *m == model_ref.name && c.as_str() == column)?;
+    let col = app.schema.tables.get(&model_ref.table.0)?.columns.iter().find(|c| c.name == *name)?;
+    let conv = match col.col_type {
+        crate::schema::ColumnType::Float | crate::schema::ColumnType::Decimal { .. } => "OptFloat64",
+        _ => "OptInt64",
+    };
+    Some((shared::go_field_name(&format!("{column}_raw")), conv))
+}
+
+/// `(Model path, method)` for every method a model's Go type has: its own,
+/// and its parent models' (`ApplicationRecord`'s), which Go promotes
+/// through the embedded `*Parent`. The parents are walked nearest first,
+/// and a name the model or a nearer parent defines, as a method or a
+/// field, shadows a farther parent's method.
+fn model_go_methods(models: &[crate::dialect::LibraryClass]) -> Vec<(String, String)> {
+    let by_name: crate::det::HashMap<&str, &crate::dialect::LibraryClass> =
+        models.iter().map(|lc| (lc.name.0.as_str(), lc)).collect();
+    let mut out = Vec::new();
+    for lc in models {
+        let defined = |c: &'_ crate::dialect::LibraryClass| -> Vec<String> {
+            c.methods
+                .iter()
+                .filter(|m| m.receiver == crate::dialect::MethodReceiver::Instance)
+                .map(|m| m.name.as_str().to_string())
+                .collect()
+        };
+        let mut shadowed: crate::det::HashSet<String> = defined(lc).into_iter().collect();
+        let mut names = library::emitted_instance_methods(lc);
+        let mut seen = std::collections::BTreeSet::new();
+        let mut parent = lc.parent.as_ref().and_then(|p| by_name.get(p.0.as_str()));
+        while let Some(p) = parent {
+            if !seen.insert(p.name.0.as_str()) {
+                break;
+            }
+            for m in library::emitted_instance_methods(p) {
+                if !shadowed.contains(&m) && !names.contains(&m) {
+                    names.push(m);
+                }
+            }
+            shadowed.extend(defined(p));
+            parent = p.parent.as_ref().and_then(|q| by_name.get(q.0.as_str()));
+        }
+        out.extend(names.into_iter().map(|m| (lc.name.0.as_str().to_string(), m)));
+    }
+    out
+}
+
+/// `(Model, column, Go pointer type)` for every nullable column: the
+/// type a read of it from another class has (`*int64` for an integer
+/// column), as the model's own struct field declares it.
+pub(super) fn nullable_column_go_tys(app: &crate::App) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    for m in &app.models {
+        let Some(table) = app.schema.tables.get(&m.table.0) else { continue };
+        for c in &table.columns {
+            if c.nullable && !c.primary_key {
+                let ty = crate::lower::model_to_library::ty_of_column_slot(c);
+                out.push((m.name.0.as_str().to_string(), c.name.as_str().to_string(), ty::go_ty_ptr(Some(&ty))));
             }
         }
     }

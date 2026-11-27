@@ -3,6 +3,8 @@
 //! Ported from the Shopify/roundhouse-1 fork's tests. A test the compiler
 //! does not pass yet is ignored as `fork spec: postgresql`. A probe needs
 //! ROUNDHOUSE_PG_TEST_URL and the pg gem (tests/support/pg_probe.rs).
+#[path = "support/scratch.rs"]
+mod scratch;
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
@@ -99,8 +101,7 @@ fn app() -> emit_and_run::Overlay {
 #[test]
 #[ignore = "fork spec: postgresql"]
 fn the_native_control_configures_from_the_sig() {
-    let root = std::env::temp_dir().join(format!("roundhouse-gem-sig-load-hooks-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = scratch::dir("roundhouse-gem-sig-load-hooks");
     for (path, text) in FILES.iter().copied().chain([("queue_names.rb", QUEUES)]) {
         let file = root.join("lib").join(path);
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -153,6 +154,6 @@ fn the_sig_reads_the_constant_it_names_and_the_require_stays() {
 #[ignore = "fork spec: postgresql"]
 fn the_emitted_boot_configures_from_the_sig_and_resolves_the_required_class() {
     let run = app().run_ruby(SCRIPT);
-    assert!(run.success, "{}\n=== stdout ===\n{}\n=== stderr ===\n{}", run.emitted.display(), run.stdout, run.stderr);
+    run.assert_passes();
     assert_eq!(run.stdout, EXPECTED, "{}", run.stderr);
 }

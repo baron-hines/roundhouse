@@ -6,6 +6,8 @@
 //! and an integer enum stays a reported gap. Answers are activerecord
 //! 8.1.4's (`rails_answers_the_table`).
 
+#[path = "support/prerequisite.rs"]
+mod prerequisite;
 #[path = "support/emit_and_run.rs"]
 #[allow(dead_code)]
 mod emit_and_run;
@@ -84,7 +86,7 @@ fn an_integer_enums_keys_stay_a_gap() {
 fn rails_answers_the_table() {
     let probe = r#"gem "activerecord", "8.1.4"; require "active_record"; require "sqlite3""#;
     if !Command::new("ruby").args(["-e", probe]).status().is_ok_and(|s| s.success()) {
-        eprintln!("skipping: ruby with activerecord 8.1.4 and sqlite3 not available");
+        prerequisite::missing("ruby with activerecord 8.1.4 and sqlite3 not available");
         return;
     }
     let script = format!(

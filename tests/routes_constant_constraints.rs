@@ -7,6 +7,8 @@
 //! directory. A constant the route file itself defines folds too. A `format:` constant is a requirement on the extension,
 //! as a literal is. Answers are actionpack 8.1.4's (`rails_answers_the_table`).
 
+#[path = "support/prerequisite.rs"]
+mod prerequisite;
 #[path = "support/emit_and_run.rs"]
 #[allow(dead_code)]
 mod emit_and_run;
@@ -117,7 +119,7 @@ fn a_constant_regex_with_a_modifier_stays_a_gap() {
 fn rails_answers_the_table() {
     let probe = r#"gem "actionpack", "8.1.4"; require "action_controller""#;
     if !Command::new("ruby").args(["-e", probe]).status().is_ok_and(|s| s.success()) {
-        eprintln!("skipping: ruby with actionpack 8.1.4 not available");
+        prerequisite::missing("ruby with actionpack 8.1.4 not available");
         return;
     }
     let script = format!(

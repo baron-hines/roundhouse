@@ -1,7 +1,7 @@
 # roda-sequel-blog
 
 A small, idiomatic **Roda + Sequel** blog, built as the strawman exemplar for
-[roundhouse#67](https://github.com/rubys/roundhouse/issues/67) — the RFC asking
+[roundhouse#67](https://github.com/roundhouse-rb/roundhouse/issues/67) — the RFC asking
 whether Roundhouse (a Rails-to-many-languages transpiler) can take Roda + Sequel
 as a second source framework.
 
@@ -18,7 +18,7 @@ below notes the divergence. Transliterating Rails into Roda would make a
 dishonest test — the whole point is to see the idiomatic stack's real shape.
 
 > **Status:** reviewed strawman. @jeremyevans reviewed the first cut in the
-> [RFC thread](https://github.com/rubys/roundhouse/issues/67); his notes are
+> [RFC thread](https://github.com/roundhouse-rb/roundhouse/issues/67); his notes are
 > folded in (see *Idiomatic choices adopted from review* below).
 
 ## Run it
@@ -42,18 +42,18 @@ bundle exec ruby test/blog_test.rb
 route surface: redirects, CRUD with valid and invalid input, flash messages via
 the session, the method-override form pattern, the interior-node 404s, the
 `r.post true` path-termination check, and default escaping. It doubles as the
-behavioral oracle for [roundhouse#67](https://github.com/rubys/roundhouse/issues/67):
+behavioral oracle for [roundhouse#67](https://github.com/roundhouse-rb/roundhouse/issues/67):
 a transpiled version of this app must pass the same suite unchanged.
 
 ## Transpile it
 
-[Roundhouse](https://rubys.github.io/roundhouse/) ingests this app through its
+[Roundhouse](https://roundhouse-rb.dev/) ingests this app through its
 Roda + Sequel front-end and emits it for other runtimes. The CRuby target
 produces a metaprogramming-free Ruby tree (Puma + Rack, every query compiled
 to SQL at build time) that passes this repo's test suite:
 
 ```sh
-git clone https://github.com/rubys/roundhouse.git
+git clone https://github.com/roundhouse-rb/roundhouse.git
 git clone https://github.com/rubys/roda-sequel-blog.git
 
 cd roundhouse
@@ -69,7 +69,7 @@ Prerequisites: Rust (for the transpile) and Ruby 3.4+ with bundler (to run
 the output) — no Node, and no Rails, Roda, or Sequel gems in the emitted
 tree. Swap `--target ruby` for `typescript`, `crystal`, `go`, `rust`, … to
 see the other emitters, or try it without installing anything at
-[the in-browser playground](https://rubys.github.io/roundhouse/playground/?app=roda).
+[the in-browser playground](https://roundhouse-rb.dev/playground/?app=roda).
 
 ### Native binary (Spinel)
 
@@ -186,7 +186,7 @@ runtime surface rather than IR-shape questions.
 
 ## Idiomatic choices adopted from review
 
-Changes made after @jeremyevans's [review](https://github.com/rubys/roundhouse/issues/67),
+Changes made after @jeremyevans's [review](https://github.com/roundhouse-rb/roundhouse/issues/67),
 each taking the Roda/Sequel idiom over the Rails transliteration:
 
 - **`render escape: true`** — output escapes by default (`<%==` for raw), so the

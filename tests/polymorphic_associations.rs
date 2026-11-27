@@ -5,7 +5,8 @@
 //! (`resolve_polymorphic_targets`) from two sources: the inverse `as:`
 //! declarations (Rails-canonical), and — when no model declares one —
 //! literal `<x>_type` mentions in the owner's own body
-//! (`where(item_type: "Moderation")` hashes, raw-SQL join fragments).
+//! (`where(item_type: "Moderation")` hashes, raw-SQL join fragments),
+//! and when neither names one, every table-backed app model.
 //! The lowering then synthesizes a type-switched reader, a writer that
 //! stores the (type, id) pair, and inverse readers scoped by the type
 //! column. Both shapes are lobsters HEAD idioms (Notification's
@@ -245,14 +246,15 @@ end
     );
 }
 
-/// Unresolved polymorphic belongs_to (no inverse `as:`, no body
-/// literals) must not fall through to the monomorphic synthesizer.
+/// A polymorphic belongs_to with no inverse `as:` and no body literals
+/// reads any app model, as Rails' reader constantizes the stored class
+/// name, and never falls through to the monomorphic synthesizer.
 /// ActionText::Markdown / RichText declare `belongs_to :record,
 /// polymorphic: true` with phantom target `Record`; emitting
 /// `Record.find_by` is a NameError if the accessor is called, and the
 /// monomorphic writer drops `record_type`.
 #[test]
-fn unresolved_polymorphic_skips_monomorphic_synth() {
+fn polymorphic_with_no_inverse_reads_any_model_not_its_phantom_class() {
     let app = app_from(vec![
         (
             "db/schema.rb",
@@ -278,9 +280,10 @@ fn unresolved_polymorphic_skips_monomorphic_synth() {
         panic!("expected BelongsTo");
     };
     assert!(polymorphic);
-    assert!(
-        polymorphic_targets.is_empty(),
-        "no inverse as: → unresolved; got {polymorphic_targets:?}"
+    assert_eq!(
+        polymorphic_targets.iter().map(|t| t.0.as_str()).collect::<Vec<_>>(),
+        vec!["ActionText::Markdown"],
+        "no inverse as: → every table-backed model"
     );
     assert_eq!(target.0.as_str(), "Record", "Rails phantom target");
 
@@ -294,19 +297,20 @@ fn unresolved_polymorphic_skips_monomorphic_synth() {
         .iter()
         .find(|lc| lc.name.0.as_str() == "ActionText::Markdown")
         .expect("lowered Markdown");
-    assert!(
-        !lowered.methods.iter().any(|m| {
-            m.name.as_str() == "record" && m.receiver == roundhouse::dialect::MethodReceiver::Instance
-        }),
-        "must not synth monomorphic `record` → Record.find_by; methods: {:?}",
+    let method = |name: &str| {
         lowered
             .methods
             .iter()
-            .map(|m| m.name.as_str())
-            .collect::<Vec<_>>()
+            .find(|m| m.name.as_str() == name && m.receiver == roundhouse::dialect::MethodReceiver::Instance)
+            .unwrap_or_else(|| panic!("`{name}` synthesized"))
+    };
+    let reader = format!("{:?}", method("record").body);
+    assert!(
+        reader.contains("record_type") && !reader.contains("Symbol(\"Record\")"),
+        "reader switches on record_type, never `Record.find_by`: {reader}"
     );
     assert!(
-        !lowered.methods.iter().any(|m| m.name.as_str() == "record="),
-        "must not synth monomorphic writer that drops record_type"
+        format!("{:?}", method("record=").body).contains("record_type"),
+        "writer stores record_type"
     );
 }

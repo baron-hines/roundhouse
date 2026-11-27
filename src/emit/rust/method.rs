@@ -9,7 +9,7 @@ use std::fmt::Write;
 use super::expr::emit_expr;
 use super::ty::rust_ty;
 use crate::dialect::{MethodDef, MethodReceiver};
-use crate::ty::Ty;
+use crate::ty::{FnTy, Ty};
 
 /// Receiver-kind picker driven by the `mutates_self` heuristic
 /// computed in `library.rs`. Returned tokens already include the
@@ -79,13 +79,9 @@ pub(super) fn emit_module_method(m: &MethodDef) -> Result<String, String> {
         ));
     }
     let mut out = String::new();
-    let params = render_params(m);
-    let ret_clause = render_return(m);
-    let fn_name = super::expr::sanitize_ident(m.name.as_str());
-    writeln!(out, "pub fn {fn_name}{params}{ret_clause} {{").unwrap();
     let return_ty = effective_return_ty(m);
     let param_types = collect_param_types(m);
-    let body = super::expr::with_param_types(param_types, || super::expr::with_current_return_ty(return_ty.clone(), || super::expr::with_class_method_scope(|| {
+    let (body, mut_params) = super::expr::with_iter_mut_params(|| super::expr::with_param_types(param_types, || super::expr::with_current_return_ty(return_ty.clone(), || super::expr::with_class_method_scope(|| {
         super::expr::with_method_scope(&m.body, || {
             // Same as emit_instance_method: enable the return-tail
             // flag so the body's top-level expression (Seq tail / If
@@ -94,7 +90,11 @@ pub(super) fn emit_module_method(m: &MethodDef) -> Result<String, String> {
             // for Option<T>-returning class methods, etc.).
             super::expr::with_return_tail(true, || super::expr::emit_expr_tail(&m.body))
         })
-    })));
+    }))));
+    let params = render_params(m, &mut_params);
+    let ret_clause = render_return(m);
+    let fn_name = super::expr::sanitize_ident(m.name.as_str());
+    writeln!(out, "pub fn {fn_name}{params}{ret_clause} {{").unwrap();
     // Function-tail Some(...) wrap — same logic as emit_instance_method.
     // Class methods that return Option<T> need their last expression
     // wrapped in `Some(...)` when the body-typer typed it as T.
@@ -124,7 +124,7 @@ pub(super) fn emit_module_method(m: &MethodDef) -> Result<String, String> {
     Ok(out)
 }
 
-fn render_params(m: &MethodDef) -> String {
+fn render_params(m: &MethodDef, mut_params: &crate::det::HashSet<String>) -> String {
     // Pull positional + kwarg sig params (filter Block — handled separately).
     // The Ruby `def` syntax omits `&block` from `m.params` but the
     // RBS-derived signature appends a `Block` Param at the end. Without
@@ -135,7 +135,8 @@ fn render_params(m: &MethodDef) -> String {
         Option<Vec<&crate::ty::Param>>,
         Option<&crate::ty::Param>,
     ) = match m.signature.as_ref() {
-        Some(Ty::Fn { params, .. }) => {
+        Some(Ty::Fn(fn_ty)) => {
+            let FnTy { params, .. } = &**fn_ty;
             let non_block: Vec<&crate::ty::Param> = params
                 .iter()
                 .filter(|p| !matches!(p.kind, crate::ty::ParamKind::Block))
@@ -161,9 +162,10 @@ fn render_params(m: &MethodDef) -> String {
         .enumerate()
         .map(|(i, p)| {
             let name = super::expr::util::escape_rust_keyword(p.name.as_str());
+            let mutability = if mut_params.contains(p.name.as_str()) { "mut " } else { "" };
             match sig_params.and_then(|sp| sp.get(i)) {
-                Some(sig_p) => format!("{name}: {}", rust_param_ty(&sig_p.ty)),
-                None => format!("{name}: ()"),
+                Some(sig_p) => format!("{mutability}{name}: {}", rust_param_ty(&sig_p.ty)),
+                None => format!("{mutability}{name}: ()"),
             }
         })
         .collect();
@@ -227,7 +229,8 @@ fn render_block_param_placeholder(name: &str) -> String {
 /// source-declared identifier so body Var refs resolve against the
 /// same parameter; legacy `yield`-only callers pass "f".
 fn render_block_closure_param(name: &str, block_ty: &Ty) -> String {
-    if let Ty::Fn { params, ret, .. } = block_ty {
+    if let Ty::Fn(fn_ty) = block_ty {
+        let FnTy { params, ret, .. } = &**fn_ty;
         let arg_tys: Vec<String> = params
             .iter()
             .filter(|p| !matches!(p.kind, crate::ty::ParamKind::Block))
@@ -273,10 +276,38 @@ fn render_return(m: &MethodDef) -> String {
 /// body's value as Ruby's does.
 fn effective_return_ty(m: &MethodDef) -> Option<Ty> {
     match m.signature.as_ref() {
-        Some(Ty::Fn { ret, .. }) => Some((**ret).clone()),
+        Some(Ty::Fn(fn_ty)) => Some((*fn_ty.ret).clone()),
         Some(_) => None,
         None if m.name.as_str() == "initialize" || is_writer_name(m.name.as_str()) => None,
-        None => m.body.ty.clone().filter(|t| !t.mentions_unknown() && !matches!(t, Ty::Bottom | Ty::Nil)),
+        None => m.body.ty.clone().filter(|t| settled_for_rust(t) && !matches!(t, Ty::Bottom | Ty::Nil)),
+    }
+}
+
+/// A body type rust can declare: nothing unknown in it, except a Hash
+/// value that rust renders as `serde_json::Value` whatever it holds
+/// (`record.slice`'s `Hash[String, untyped]`). An unfinished inference
+/// variable is never settled.
+fn settled_for_rust(ty: &Ty) -> bool {
+    match ty {
+        Ty::Hash { key, value } => {
+            !key.mentions_unknown()
+                && (settled_for_rust(value)
+                    || (super::ty::rust_value_shaped(value) && !mentions_var(value)))
+        }
+        Ty::Union { variants } => variants.iter().all(settled_for_rust),
+        other => !other.mentions_unknown(),
+    }
+}
+
+fn mentions_var(ty: &Ty) -> bool {
+    match ty {
+        Ty::Var { .. } => true,
+        Ty::Hash { key, value } => mentions_var(key) || mentions_var(value),
+        Ty::Array { elem } => mentions_var(elem),
+        Ty::Union { variants } => variants.iter().any(mentions_var),
+        Ty::Class { args, .. } => args.iter().any(mentions_var),
+        Ty::Tuple { elems } => elems.iter().any(mentions_var),
+        _ => false,
     }
 }
 
@@ -495,13 +526,6 @@ pub(super) fn emit_instance_method(
                 .as_ref()
                 .map(|bp| render_block_param_placeholder(bp.name.as_str()))
         });
-    let params = render_instance_params(m, receiver, block_param.as_deref());
-    let ret_clause = if is_init {
-        " -> Self".to_string()
-    } else {
-        render_return(m)
-    };
-    writeln!(out, "pub fn {fn_name}{params}{ret_clause} {{").unwrap();
     // Thread the method's RBS-declared return type through to the
     // Return arm in `emit_expr` so `return nil` in a method typed
     // `-> T?` emits as `return None` instead of bare `return` (the
@@ -512,7 +536,7 @@ pub(super) fn emit_instance_method(
     // Option-ness from RBS to Var reads inside the body, so this is
     // the authoritative source for "is this param Option-typed".
     let param_types = collect_param_types(m);
-    let body = super::expr::with_param_types(param_types, || super::expr::with_current_return_ty(return_ty.clone(), || super::expr::with_method_scope(&m.body, || {
+    let (body, mut_params) = super::expr::with_iter_mut_params(|| super::expr::with_param_types(param_types, || super::expr::with_current_return_ty(return_ty.clone(), || super::expr::with_method_scope(&m.body, || {
         if is_init {
             let fields: Vec<String> = ivars.iter().map(|(n, _)| n.clone()).collect();
             // Constructor mode renders field writes as `let` bindings
@@ -539,7 +563,14 @@ pub(super) fn emit_instance_method(
                 super::expr::emit_expr_tail(&m.body)
             })
         }
-    })));
+    }))));
+    let params = render_instance_params(m, receiver, block_param.as_deref(), &mut_params);
+    let ret_clause = if is_init {
+        " -> Self".to_string()
+    } else {
+        render_return(m)
+    };
+    writeln!(out, "pub fn {fn_name}{params}{ret_clause} {{").unwrap();
     // Function-tail Some(...) wrap: if the method returns Option<T>
     // and the body's tail expression is T-typed (non-Option), wrap
     // the last line in `Some(...)`. The Ruby idiom returns the last
@@ -636,14 +667,15 @@ pub(super) fn emit_instance_method(
             if !assigned.contains(fname) {
                 writeln!(
                     out,
-                    "    let {fname}: {} = {};",
+                    "    let {}: {} = {};",
+                    crate::emit::rust::expr::util::escape_rust_keyword(fname),
                     super::ty::rust_ty(fty),
                     default_value_for_ty(fty),
                 )
                 .unwrap();
             }
         }
-        let fields: Vec<&str> = ivars.iter().map(|(n, _)| n.as_str()).collect();
+        let fields: Vec<String> = ivars.iter().map(|(n, _)| crate::emit::rust::expr::util::escape_rust_keyword(n)).collect();
         writeln!(out, "    Self {{ {} }}", fields.join(", ")).unwrap();
     }
     out.push_str("}\n");
@@ -773,9 +805,10 @@ fn default_value_for_ty(ty: &Ty) -> String {
 /// the authoritative source.
 fn collect_param_types(m: &MethodDef) -> crate::det::HashMap<String, Ty> {
     let mut out = crate::det::HashMap::default();
-    let Some(Ty::Fn { params, .. }) = m.signature.as_ref() else {
+    let Some(Ty::Fn(fn_ty)) = m.signature.as_ref() else {
         return out;
     };
+    let FnTy { params, .. } = &**fn_ty;
     if params.len() != m.params.len() {
         return out;
     }
@@ -789,9 +822,10 @@ fn render_instance_params(
     m: &MethodDef,
     receiver: Option<&'static str>,
     block_param: Option<&str>,
+    mut_params: &crate::det::HashSet<String>,
 ) -> String {
     let sig_params = match m.signature.as_ref() {
-        Some(Ty::Fn { params, .. }) if params.len() == m.params.len() => Some(params),
+        Some(Ty::Fn(fn_ty)) if fn_ty.params.len() == m.params.len() => Some(&fn_ty.params),
         _ => None,
     };
     let mut parts: Vec<String> = Vec::new();
@@ -800,9 +834,10 @@ fn render_instance_params(
     }
     for (i, p) in m.params.iter().enumerate() {
         let name = super::expr::util::escape_rust_keyword(p.name.as_str());
+        let mutability = if mut_params.contains(p.name.as_str()) { "mut " } else { "" };
         let rendered = match sig_params.and_then(|sp| sp.get(i)) {
-            Some(sig_p) => format!("{name}: {}", rust_param_ty(&sig_p.ty)),
-            None => format!("{name}: ()"),
+            Some(sig_p) => format!("{mutability}{name}: {}", rust_param_ty(&sig_p.ty)),
+            None => format!("{mutability}{name}: ()"),
         };
         parts.push(rendered);
     }
@@ -983,10 +1018,10 @@ mod tests {
         use crate::analyze::block_refine;
         use crate::dialect::LibraryClass;
         use crate::ident::ClassId;
-        use crate::ty::{Param as TyParam, ParamKind, Ty};
+        use crate::ty::{FnTy, Param as TyParam, ParamKind, Ty};
 
         let blk = Symbol::from("blk");
-        let block_sig = Ty::Fn {
+        let block_sig = Ty::Fn(Box::new(FnTy {
             params: vec![TyParam {
                 name: Symbol::new("k"),
                 ty: Ty::Str.into(),
@@ -995,7 +1030,7 @@ mod tests {
             block: None,
             ret: std::sync::Arc::new(Ty::Nil),
             effects: EffectSet::pure(),
-        };
+        }));
         let callee = MethodDef {
             visibility: crate::dialect::MethodVisibility::Public,
             unsupported_formals: None,
@@ -1005,7 +1040,7 @@ mod tests {
             receiver: MethodReceiver::Class,
             params: vec![],
             body: empty_body(),
-            signature: Some(Ty::Fn {
+            signature: Some(Ty::Fn(Box::new(FnTy {
                 params: vec![TyParam {
                     name: Symbol::new("block"),
                     ty: block_sig.clone().into(),
@@ -1014,7 +1049,7 @@ mod tests {
                 block: Some(std::sync::Arc::new(block_sig)),
                 ret: std::sync::Arc::new(Ty::Nil),
                 effects: EffectSet::pure(),
-            }),
+            }))),
             effects: EffectSet::pure(),
             enclosing_class: Some(Symbol::from("Holder")),
             kind: AccessorKind::Method,

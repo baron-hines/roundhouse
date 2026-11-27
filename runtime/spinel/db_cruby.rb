@@ -322,6 +322,25 @@ module Db
     tables
   end
 
+  # The relations whose `scoping { }` block runs on this thread,
+  # innermost last (relation.rb's `Relation.current_scope_for`), in
+  # `Thread.current` for the reason the unscoped tables are. Nil until
+  # the first push, which seeds the list with its element.
+  def self._current_scopes
+    Thread.current[:ar_current_scopes]
+  end
+
+  def self._push_current_scope(scope)
+    scopes = Thread.current[:ar_current_scopes]
+    if scopes.nil?
+      scopes = [scope]
+      Thread.current[:ar_current_scopes] = scopes
+    else
+      scopes << scope
+    end
+    scopes
+  end
+
   # Request-scoped connection lease. Checks out a handle, binds it to
   # this thread's fiber-storage so `current_dbh` resolves to it for the
   # block's duration, and returns it on completion (even on raise).
@@ -362,6 +381,11 @@ module Db
 
   def self.adapter_name
     "sqlite3"
+  end
+
+  # One database: a connection handle is the shared one (db.rbs).
+  def self.connection_slot(_base)
+    -1
   end
 
   def self.transaction_open?
@@ -1772,6 +1796,25 @@ module Db
   # nil instead of coming back as the type's zero.
   def self.escape_string_opt(s)
     s.nil? ? "NULL" : escape_string(s)
+  end
+
+  # `t.binary` columns (the lowerer's `ValueType::Binary`). This shim
+  # tells bytes from text by the value's encoding, so they are its text
+  # methods; the separate names are for a target that cannot (Rust).
+  def self.escape_binary(s)
+    escape_string(s)
+  end
+
+  def self.escape_binary_opt(s)
+    escape_string_opt(s)
+  end
+
+  def self.column_binary(stmt, i)
+    column_text(stmt, i)
+  end
+
+  def self.column_binary_opt(stmt, i)
+    column_text_opt(stmt, i)
   end
 
   def self.escape_int_opt(n)

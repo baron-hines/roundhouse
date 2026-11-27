@@ -75,14 +75,14 @@ dialect-neutral) or the lowerer. `Dialect::Postgres` (stage (a) of
 adapter creates them, quotes every identifier, and gives a key Rails'
 default convention for its type: `bigserial`, `serial` for an
 `integer` key, and `uuid … DEFAULT gen_random_uuid()` for a `uuid`
-one. Neither dialect reproduces source column defaults, foreign keys
-or CHECK constraints: Postgres synthesizes the key defaults above, so
+one. Both dialects preserve supported CHECK constraints and expression indexes.
+Neither dialect reproduces source column defaults or foreign keys: Postgres synthesizes the key defaults above, so
 a custom or suppressed one is not reproduced, and the model layer
 applies supported literal defaults. A virtual table has no Postgres
 DDL, so that dialect returns an error for it. Postgres renders what
 ingest kept, so it shares the current ingest and IR limits.
 `schema.rb` ingest drops `array: true`; an index's `order:` and
-`opclass:`, and expression indexes; precision on `numeric`,
+`opclass:`; precision on `numeric`,
 `datetime` and `time`; and schema qualifiers. An `integer` `limit:` of 1
 or 2 still normalizes to `ColumnType::Integer` for ordinary typing, but
 its original smallint width is retained as negative evidence for generated
@@ -112,6 +112,9 @@ A Postgres dump's `::text` casts or `= ANY (ARRAY[…])` fall outside it;
 that index is unique over every row, and the transpile names it in a
 warning. The migration fold refuses to rename or remove a column a
 predicate names.
+Case conversion in expression keys and predicates uses the destination database's
+`lower` and `upper`. SQLite's built-in functions fold ASCII only: a unique `lower(email)` index accepts
+both `É@example.test` and `é@example.test`, unlike PostgreSQL with a Unicode-aware locale.
 An index's literal access method is kept from `schema.rb`'s `using:` or
 `structure.sql`'s `USING` clause and quoted in PostgreSQL DDL. Schema Ruby
 methods must be ASCII unquoted SQL identifiers and are folded to lowercase.
@@ -285,12 +288,49 @@ the environment is a mapping, otherwise the one configuration
 the adapter (`adapter:`, or the scheme of a literal `url:`, which wins;
 an environment given as a URL string is that URL's configuration).
 Only identity keys are read (`adapter`, `url`, `replica`,
-`database_tasks`, `migrations_paths`, `schema_search_path`), so no
-connection value or credential reaches the IR. ERB is not run: an
+`database_tasks`, `migrations_paths`, `schema_search_path`, a literal
+`schema_dump`, and a SQLite configuration's literal `database`), so no
+credential reaches the IR. ERB is not run: an
 output tag in a connection value does not matter, one in an identity key
 leaves that configuration out with a warning, and a control tag leaves
 them all out. `DATABASE_URL` is not read. The primary's SQLite
 `pragmas:` are read from the same file (`App::database_pragmas`).
+
+The test environment's primary may name its schema file with
+`schema_dump:` (`database_yml::named_schema`). One form is read: a plain
+or quoted YAML string, written directly in that configuration, naming a
+relative `.rb` file under `db/`, read in place of `db/schema.rb`, or a
+`.sql` file when the configuration says `schema_format: sql` itself. The
+guards are conservative: a `.rb` name is refused when a `schema_format`
+other than a direct literal `ruby` is written there, or, when the
+configuration sets no `schema_format` of its own, when any Ruby file under
+`config/` mentions `schema_format` (a literal one in the configuration
+wins over the application's, as in Rails). A name is also refused when
+any Ruby file under `config/` mentions `.paths`, `paths[`, `paths.add` or `db_dir`
+(comments included; `config.assets.paths` aside), or when a directory under `config/`
+can't be listed or a file there can't be read, or when the
+configuration's `url:` is
+computed, not a string, written under more than one spelling (`:url`,
+quoted, any case), or names `schema_dump` or `schema_format` in its
+query, or when the file runs any ERB control flow (`<% ... %>`), or when a
+merge key (`<<:`) comes after other keys in that configuration or merges
+configurations into the test environment, since Rails' YAML applies a
+merge where it is written, or when the file has a root-level merge or a
+top-level `shared:` block, which Rails applies to the test configuration.
+`false`, null or an unquoted YAML 1.1
+boolean names no file, and the schema is found as before. Any other
+`schema_dump:` there (ERB, an anchor, alias, merge or flow value, the
+`:schema_dump:` key, another name, a missing file) is an error naming
+the configuration and the setting. Another test database whose schema
+file exists is a warning, except a replica (`replica: true`), one with
+`database_tasks: false`, and solid_queue's `db/queue_schema.rb` once its
+tables have joined the primary's; no warning doesn't mean no such file.
+The file named is the one its `schema_dump` names, else the default its
+literal `schema_format` names. A file the parser can't settle (it doesn't
+parse once its ERB is set aside, a merge key doesn't merge a mapping, or
+the test environment's key may be computed) refuses a named file when the
+word `schema_dump` appears on any line but a comment line, and otherwise
+builds as before.
 
 Which database a model runs on is read from source, never from the
 file: a literal `connects_to database: { writing:, reading: }` in an
@@ -305,6 +345,43 @@ for `connected_to`, `connected_to_many` and `connecting_to`, passes the
 `role:` or `shard:` Rails requires; a call on another object is the
 app's own method. A `connects_to` whose
 writing database is the primary checks clean and runs.
+
+The Spinel target on SQLite carries one routed shape
+(`App::database_routes`): one abstract class directly under
+`ActiveRecord::Base` declares a literal `connects_to database:` or
+`connects_to shards:`, and every model descends from it. Each
+configuration it names is a SQLite file written as a literal
+`database:` (which is read for this), and each writable one is the
+primary or says `schema_dump: schema.rb`, the app's own schema file:
+Rails' default for another database is a schema file of its own, which
+is not read. `Db.configure` then opens a pool per shard and role, in an
+arm per environment the file describes this way, and creates the
+schema's tables in each writable file; an environment without an arm
+raises at boot. The roles are Rails' defaults, `writing` and `reading`.
+
+In such an app `connected_to` and `while_preventing_writes` run as in
+Rails 8.1.4, on `ActiveRecord::Base` or the connection class, with a
+block of their own: the role and shard resolve separately through the
+enclosing blocks, the block's selection is restored when it returns,
+raises, or is left by `return` or `break`, a pool nothing defines
+raises `ActiveRecord::ConnectionNotDefined` at the first query, and a
+reading role, `while_preventing_writes` or a `replica: true`
+configuration raises `ActiveRecord::ReadOnlyError` before a write
+runs. The selection belongs to the thread, as under Rails' default
+`isolation_level`. `current_role`, `current_shard`,
+`current_preventing_writes`, `connected_to?` and `default_shard`
+answer as Rails does. Still refused there, each by name: a string or
+configured role name, computed options, a forwarded block,
+`connected_to_many`, `connecting_to`, `prohibit_shard_swapping`,
+`connection_handler`, a registration at run time, and any of these
+blocks in a view, a seed or a test helper. A connection handle
+(`connection`, `lease_connection`, `with_connection`) is routed when
+it is taken and stays on that pool, as in Rails. Refused when called,
+with `NotImplementedError`: a block that selects another database
+inside an open transaction (including a raw transaction on a leased connection),
+a raw transaction on a handle outside the active model route, a block that returns a relation,
+`connection_pool`, `raw_connection`, and `ActiveRecord::Base.transaction`
+when Base's database is not the models'. Every other target keeps one error for the app.
 
 The primary the test environment names decides the SQL dialect of the
 Ruby target's emit (`schema_sql::Dialect::for_app`). For postgresql, the
@@ -382,19 +459,26 @@ shortcut declarations whose paths, `to:` targets, controller/action options,
 and supported `as:`/`match via:` options are literal. Nonliteral targets
 and all `redirect(...)` route targets, `resources`/`resource`,
 `namespace`/`scope`, and other routing wrappers remain explicit errors; they
-are not flattened into public routes. The engine's route helpers and the
-host's named mount proxy helpers are not composed. Calls that could otherwise
-fall through to a same-named host helper receive a located `route mount`
-error. Rack applications and all other engine mount forms remain explicit
+are not flattened into public routes. The engine's route helpers resolve as
+Rails resolves them: inside the engine's own code (its `app/`, `lib/` and
+views) a bare `products_path` is the engine's route under the mount
+(`/catalog/products`), `main_app.products_path` is the host's, and host code
+reaches the engine's through the proxy, `catalog.products_path`. The routes
+are drawn under the proxy's name as a helper prefix (`catalog_products_path`)
+and each such call is rewritten to it as it is ingested
+(`src/ingest/engine_helpers.rs`); the engine's root keeps the trailing slash
+Rails joins to the mount (`/catalog/`). A host route already named like one of
+those prefixed helpers keeps its name, the engine's helpers are left out, and
+each call that reached them is a located `route mount` error. The host's
+named mount helper (`catalog_path`) is not composed. Rack applications and all other engine mount forms remain explicit
 errors, including dynamic or patterned prefixes, `as:` aliases,
 nested or repeated mounts, custom engine initializers and middleware, route
 constraints or conditional branches, route prepends, Devise visibility
 wrappers, and engine `direct` helpers. Strict emission refuses these errors;
 `--allow-unsupported` can write an incomplete project, and survey mode records
-the gap without clearing the diagnostic. Direct and literal reflective
-(`send`, `public_send`, or `__send__`) uses of engine route helpers or the
-mounted proxy are also located errors; engine helper proxies are not resolved
-to the host route table.
+the gap without clearing the diagnostic. Literal reflective (`send`, `public_send`,
+or `__send__`) uses of engine route helpers or the mounted proxy are located
+errors.
 The generic CRuby dispatch contract is exercised by
 `tests/emit_and_run.rs`; `tests/spinel_toolchain.rs` carries the ignored native
 Spinel HTTP witness.
@@ -516,10 +600,42 @@ PostgreSQL's `pg_dump` format. It skips the `\restrict` and
 `\unrestrict` lines that pg_dump 18 (and the August 2025 minor
 releases) brackets a dump with and that Rails before 7.2.3/8.0.3 keeps;
 any other psql meta-command is ledgered as a statement it does not
-model. When there is neither (never migrated locally, or gitignored),
+model. A composite primary key (`PRIMARY KEY (shop_id, id)`) is kept
+whole in `Table.primary_key_columns`, with no column flagged as the key.
+A model on such a table keys on the column it declares
+(`self.primary_key = :id`, in its own file or a reopen), which ingest
+then flags; a model that declares none is refused, since Rails would key
+it on every column and this compiler does not yet. When there is neither (never migrated locally, or gitignored),
 the walk falls back to folding `db/migrate/*.rb` in filename order —
 `src/ingest/schema.rs::ingest_migration`, called from
-`src/ingest/app.rs`. Migration shapes it can't fold deterministically
+`src/ingest/app.rs`. A `change_table` block folds through the verbs
+its `t.<method>` calls stand for in Rails' `Table`: `t.change`,
+`t.change_default`, `t.change_null`, `t.rename`, `t.remove` (once per
+name), column adds through `t.<type>` (once per name, with `index:`) and
+`t.column`, `t.index`, `t.remove_index`, `t.rename_index`,
+`t.timestamps`, `t.remove_timestamps`, `t.references` / `t.belongs_to`
+and their removals, and `t.foreign_key` / `t.remove_foreign_key`.
+`remove_foreign_key`, top-level or in the block, drops the key Rails
+picks: the first matching every part it gives (target table, `column:`,
+`primary_key:`), and without `column:` one on the default column
+(`author_id` for `:authors`) when there is one; a key named by `name:`
+is a gap, since the fold does not
+record key names. Questions (`column_exists?` and the like) and other
+constraint verbs change nothing the fold models. A non-literal table or
+column name, a block that is not a literal block, an unmapped column
+type, and a `t` used other than as the receiver of a plain statement
+(under an `if` or `case`, or passed to a helper) are gaps. Removing a
+column, top-level or in the block, removes the indexes over it.
+`change_column` (and `t.change`)
+keeps the column's nullability, default and key unless the call gives
+them, as every Rails adapter does, and redefines the column in place.
+`execute` folds when every statement in its literal SQL only sets the
+table's default character set or collation (`ALTER TABLE posts
+COLLATE=utf8mb4_bin`, `… DEFAULT CHARSET=utf8mb4`), which applies only
+to columns added later; any other SQL, `CONVERT TO CHARACTER SET`
+included (it can retype the string columns it re-encodes), is a gap that
+quotes the statement.
+Migration shapes it can't fold deterministically
 (see `UNSUPPORTED_VERBS`) error with a pointer to `rails db:migrate`,
 which materializes the schema.rb this fallback substitutes for. Roda
 apps get the same fallback for Sequel-DSL migrations via

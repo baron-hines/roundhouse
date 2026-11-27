@@ -15,7 +15,7 @@
 
 use crate::expr::{Expr, ExprNode, InterpPart, LValue, Literal};
 use crate::ident::{Symbol, VarId};
-use crate::naming::{singularize, snake_case};
+use crate::naming::{last_segment, singularize, snake_case};
 use crate::span::Span;
 
 use super::attr_parts::append_attr_parts;
@@ -169,7 +169,7 @@ pub(super) fn emit_form_with_blockless(args: &[Expr], ctx: &ViewCtx) -> Option<V
         return None;
     }
     let url = value_for("url")?;
-    let method = value_for("method").unwrap_or_else(|| lit_sym(Symbol::from("post")));
+    let method = tag_option(&entries, "method").unwrap_or_else(|| lit_sym(Symbol::from("post")));
 
     let route_helpers = || {
         Expr::new(
@@ -186,17 +186,13 @@ pub(super) fn emit_form_with_blockless(args: &[Expr], ctx: &ViewCtx) -> Option<V
         id_prefix: String::new(),
     };
     let mut out: Vec<Expr> = form_with_entry(ctx).into_iter().collect();
-    out.extend([
-        emit_open_form_tag(&comps, ctx, false),
-        accumulator_append_call(
-            view_helpers_call("method_override_input", vec![method]),
-            ctx,
-        ),
-        accumulator_append_call(
-            view_helpers_call("csrf_token_hidden_input", Vec::new()),
-            ctx,
-        ),
-    ]);
+    out.push(emit_open_form_tag(&comps, ctx, false));
+    if !is_get(&comps.method) {
+        out.push(accumulator_append_call(view_helpers_call("method_override_input", vec![method]), ctx));
+        if sends_token(&comps.opts_entries) {
+            out.push(accumulator_append_call(view_helpers_call("csrf_token_hidden_input", Vec::new()), ctx));
+        }
+    }
     Some(out)
 }
 
@@ -209,6 +205,60 @@ pub(super) fn emit_form_with_inline(
     args: &[Expr],
     block: &Expr,
     ctx: &ViewCtx,
+) -> Vec<Expr> {
+    emit_form_inline(args, block, ctx, None)
+}
+
+/// What `form_for(record, as:, html:)` adds to the form_with it lowers to: Rails' `apply_form_for_options!` gives the
+/// `<form>` a class and id from the record's state (`new_user`, `edit_user`), under the `html:` the call passes.
+pub(super) struct FormForHtml {
+    pub(super) html: Vec<(Expr, Expr)>,
+    pub(super) named: bool,
+}
+
+pub(super) fn emit_form_for_inline(args: &[Expr], block: &Expr, ctx: &ViewCtx, html: FormForHtml) -> Vec<Expr> {
+    emit_form_inline(args, block, ctx, Some(html))
+}
+
+fn form_for_lead(comps: &FormWithComponents, record_var: &Symbol, form_for: FormForHtml) -> Vec<(Expr, Expr)> {
+    let record = || Expr::new(Span::synthetic(), ExprNode::Var { id: VarId(0), name: record_var.clone() });
+    let persisted = send(Some(record()), "persisted?", Vec::new(), None, false);
+    let by_state = |edit: Expr, new: Expr| Expr::new(Span::synthetic(), ExprNode::If { cond: persisted.clone(), then_branch: edit, else_branch: new });
+    let name = &comps.model_name;
+    let class = by_state(lit_str(format!("edit_{name}")), lit_str(format!("new_{name}")));
+    let prefix = if comps.id_prefix.is_empty() { String::new() } else { format!("{}_", comps.id_prefix) };
+    // Without `as:` the id is `dom_id(record, :edit)`, which carries the record's key.
+    let edit_id = if form_for.named {
+        lit_str(format!("{prefix}edit_{name}"))
+    } else {
+        Expr::new(Span::synthetic(), ExprNode::StringInterp {
+            parts: vec![
+                InterpPart::Text { value: format!("{prefix}edit_{name}_") },
+                InterpPart::Expr { expr: send(Some(record()), "id", Vec::new(), None, false) },
+            ],
+        })
+    };
+    let id = by_state(edit_id, lit_str(format!("{prefix}new_{name}")));
+    let key = |k: &str| Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Sym { value: Symbol::from(k) } });
+    let key_of = |k: &Expr| match &*k.node {
+        ExprNode::Lit { value: Literal::Sym { value } } => Some(value.as_str().to_string()),
+        _ => None,
+    };
+    let mut out = vec![(key("class"), class), (key("id"), id)];
+    for (k, v) in form_for.html {
+        match out.iter().position(|(o, _)| key_of(o).is_some() && key_of(o) == key_of(&k)) {
+            Some(i) => out[i].1 = v,
+            None => out.push((k, v)),
+        }
+    }
+    out
+}
+
+fn emit_form_inline(
+    args: &[Expr],
+    block: &Expr,
+    ctx: &ViewCtx,
+    form_for: Option<FormForHtml>,
 ) -> Vec<Expr> {
     let ExprNode::Lambda { extra_params, params, body, .. } = &*block.node else {
         return vec![accumulator_append_call(lit_str(String::new()), ctx)];
@@ -230,9 +280,11 @@ pub(super) fn emit_form_with_inline(
         .cloned()
         .unwrap_or_else(|| Symbol::from("form"));
 
-    let record_local = find_kwarg_local_name(args);
+    // A form_for record is often a helper (Devise's `resource`), which a local of its name would not call.
+    let record_local = find_kwarg_local_name(args).filter(|name| form_for.is_none() || ctx.locals.iter().any(|l| l == name));
 
-    let Some(comps) = classify_form_with_components(args, ctx) else {
+    let synth_record = format!("{}_record", form_param.as_str());
+    let Some(comps) = classify_form_with_components(args, ctx, &synth_record) else {
         // Non-resource form_with (no `model:` kwarg) — fall back to a
         // safe-empty append so the file still parses. Real fixtures
         // always pass `model:`; if this shape becomes load-bearing,
@@ -280,49 +332,95 @@ pub(super) fn emit_form_with_inline(
     //    action expression spliced in. Order matches Rails'
     //    `render_attrs({action:, "accept-charset":, method:}.merge(opts))`:
     //    action, accept-charset, method, then user opts. The HTML
-    //    `method` attribute is always "post" for resource forms
-    //    (PATCH/DELETE flow through `_method` override below); :get
-    //    fixtures aren't exercised so we hard-code "post" here.
-    out.push(emit_open_form_tag(&comps, ctx, block_has_file_field(body, form_param_str, ctx)));
+    //    `method` attribute is "post" for resource forms (PATCH/DELETE
+    //    flow through `_method` override below), "get" for a GET form.
+    let lead = form_for.map(|html| form_for_lead(&comps, &record_var, html)).unwrap_or_default();
+    out.push(emit_open_form_tag_led(&comps, ctx, block_has_file_field(body, form_param_str, ctx), &lead));
 
     // 2. Method override: `<input type="hidden" name="_method"
     //    value="patch">` for non-get/post methods, empty string
     //    otherwise. Calls the runtime helper with the bound method
     //    local so the conditional evaluates once.
-    let method_var_ref = Expr::new(
-        Span::synthetic(),
-        ExprNode::Var { id: VarId(0), name: form_method_var.clone() },
-    );
-    out.push(accumulator_append_call(
-        view_helpers_call("method_override_input", vec![method_var_ref]),
-        ctx,
-    ));
-
-    // 3. CSRF token hidden input — emitted unconditionally to match
-    //    Rails' position (after _method, before the body).
-    out.push(accumulator_append_call(
-        view_helpers_call("csrf_token_hidden_input", Vec::new()),
-        ctx,
-    ));
+    // 3. CSRF token hidden input, in Rails' position (after _method,
+    //    before the body). Neither for a GET form, as Rails writes none.
+    if !is_get(&comps.method) {
+        let method_var_ref = Expr::new(
+            Span::synthetic(),
+            ExprNode::Var { id: VarId(0), name: form_method_var.clone() },
+        );
+        out.push(accumulator_append_call(
+            view_helpers_call("method_override_input", vec![method_var_ref]),
+            ctx,
+        ));
+        if sends_token(&comps.opts_entries) {
+            out.push(accumulator_append_call(
+                view_helpers_call("csrf_token_hidden_input", Vec::new()),
+                ctx,
+            ));
+        }
+    }
 
     // 4. Walk the block body against the OUTER accumulator. The
     //    binding registered below feeds `form.X` macro expansion
     //    (form_builder.rs::emit_form_builder_inline) — no runtime
     //    FormBuilder construction; the form.X calls inline directly
     //    to `<label>...`/`<input>...` HTML.
+    // A builder of another class (`builder: MoneyFormBuilder`) whose own methods the body calls: Rails' object, at
+    // request time, for those calls (`form.money_field :title`), as the lowering expands only the stock fields.
+    let overridden = custom_builder(args)
+        .and_then(|b| match &*b.node {
+            ExprNode::Const { path } => {
+                let key = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::");
+                ctx.builder_overrides.get(key.trim_start_matches("::")).cloned()
+            }
+            _ => None,
+        })
+        .unwrap_or_default();
+    if let Some(builder) = custom_builder(args)
+        && calls_unexpanded(body, form_param_str, &overridden)
+    {
+        // Rails' object name is the model's `param_key`, a String.
+        let object_name = Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Str { value: comps.model_name.clone() } });
+        let template = send(Some(Expr::new(Span::synthetic(), ExprNode::Const { path: vec![Symbol::from("ActionView"), Symbol::from("Base")] })), "new", Vec::new(), None, false);
+        let record = Expr::new(Span::synthetic(), ExprNode::Var { id: VarId(0), name: record_var.clone() });
+        // The form's own options, which Rails hands the builder (`layout: :horizontal` a builder reads).
+        let entries: Vec<(Expr, Expr)> = args
+            .iter()
+            .filter_map(|arg| match &*arg.node {
+                ExprNode::Hash { entries, .. } => Some(entries.iter()),
+                _ => None,
+            })
+            .flatten()
+            .filter(|(k, _)| !matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "builder"))
+            .map(|(k, v)| (k.clone(), rewrite_helpers_in_expr(v, ctx)))
+            .collect();
+        let options = Expr::new(Span::synthetic(), ExprNode::Hash { entries, kwargs: false });
+        out.push(Expr::new(
+            Span::synthetic(),
+            ExprNode::Assign {
+                target: LValue::Var { id: VarId(0), name: Symbol::from(form_param_str) },
+                value: send(Some(builder), "new", vec![object_name, record, template, options], None, true),
+            },
+        ));
+    }
     let mut inner_ctx = ctx.with_locals([form_param_str.to_string()]);
     inner_ctx.form_records.push(FormBuilderBinding {
         form_param: form_param_str.to_string(),
         model_name: comps.model_name.clone(),
+        model_class: form_model_class(&comps.model, &comps.model_name, ctx),
         record_var: record_var.clone(),
         form_method_var,
         id_prefix: comps.id_prefix.clone(),
+        recordless: !comps.model_name.is_empty() && matches!(&*comps.model.node, ExprNode::Lit { value: Literal::Nil }),
+        builder: (!overridden.is_empty()).then(|| custom_builder(args)).flatten(),
+        overridden,
+        child_counters: Default::default(),
     });
     // `f.object` is the one FormBuilder method used in EXPRESSION
     // position (`errors_for f.object`) — substitute the record local
     // before the walk so downstream classifiers see a plain Var.
     let body = rewrite_form_object_reads(body, form_param_str, &record_var);
-    out.extend(walk_body(&body, &inner_ctx));
+    out.extend(super::walk_counting(&body, &inner_ctx));
 
     // 5. Close `</form>`.
     out.push(accumulator_append_call(
@@ -375,6 +473,9 @@ fn form_tag_attributes(opts: &[(Expr, Expr)]) -> Vec<(Expr, Expr)> {
     // `merge!`: an existing key keeps its position and takes html's
     // value; a new key appends.
     for (hk, hv) in html {
+        if matches!(key_of(&hk).as_deref(), Some("method" | "authenticity_token" | "multipart")) {
+            continue;
+        }
         match (key_of(&hk), out.iter().position(|(k, _)| key_of(k) == key_of(&hk))) {
             (Some(_), Some(i)) => out[i].1 = hv,
             _ => out.push((hk, hv)),
@@ -430,16 +531,43 @@ fn block_has_file_field(body: &Expr, form_param: &str, ctx: &ViewCtx) -> bool {
     found
 }
 
+/// `method: :get` (or "get") as written: Rails' form then says `method="get"` and carries no
+/// `_method` or authenticity token (mission_control-jobs' job filters).
+fn is_get(method: &Expr) -> bool {
+    str_or_sym_literal(method).is_some_and(|m| m.eq_ignore_ascii_case("get"))
+}
+
+/// A `<form>` option as Rails takes it: `html:`'s entry over the top-level one (`options.slice(...).merge!(html)`).
+fn tag_option(entries: &[(Expr, Expr)], name: &str) -> Option<Expr> {
+    let key_is = |k: &Expr, want: &str| matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == want);
+    let html = entries.iter().find(|(k, _)| key_is(k, "html")).and_then(|(_, v)| match &*v.node {
+        ExprNode::Hash { entries, .. } => entries.iter().find(|(k, _)| key_is(k, name)).map(|(_, v)| v.clone()),
+        _ => None,
+    });
+    html.or_else(|| entries.iter().find(|(k, _)| key_is(k, name)).map(|(_, v)| v.clone()))
+}
+
+/// `authenticity_token: false` drops Rails' token input (a form posting to another site).
+fn sends_token(entries: &[(Expr, Expr)]) -> bool {
+    !matches!(tag_option(entries, "authenticity_token").map(|v| v.node), Some(n) if matches!(&*n, ExprNode::Lit { value: Literal::Bool { value: false } }))
+}
+
 fn emit_open_form_tag(comps: &FormWithComponents, ctx: &ViewCtx, multipart: bool) -> Expr {
-    let mut parts: Vec<InterpPart> = Vec::new();
+    emit_open_form_tag_led(comps, ctx, multipart, &[])
+}
+
+/// `lead` renders before `action`: form_for's html options, which Rails merges its defaults under.
+fn emit_open_form_tag_led(comps: &FormWithComponents, ctx: &ViewCtx, multipart: bool, lead: &[(Expr, Expr)]) -> Expr {
+    let mut parts: Vec<InterpPart> = vec![InterpPart::Text { value: "<form".to_string() }];
+    append_attr_parts(&mut parts, lead);
     parts.push(InterpPart::Text {
-        value: "<form action=\"".to_string(),
+        value: " action=\"".to_string(),
     });
     parts.push(InterpPart::Expr {
         expr: view_helpers_call("html_escape", vec![comps.action.clone()]),
     });
     parts.push(InterpPart::Text {
-        value: "\" accept-charset=\"UTF-8\" method=\"post\"".to_string(),
+        value: format!("\" accept-charset=\"UTF-8\" method=\"{}\"", if is_get(&comps.method) { "get" } else { "post" }),
     });
     // `enctype`: what Rails renders for `multipart: true`, which a
     // `file_field` in the block sets for it (`block_has_file_field`).
@@ -474,7 +602,7 @@ fn emit_open_form_tag(comps: &FormWithComponents, ctx: &ViewCtx, multipart: bool
 /// pass through unchanged. Matches the existing FormBuilder-side
 /// simplification so per-form-tag and per-input-attr behavior stay
 /// in sync.
-fn simplify_opts_value(k: &Expr, v: &Expr) -> Expr {
+pub(super) fn simplify_opts_value(k: &Expr, v: &Expr) -> Expr {
     let is_class_key = matches!(
         &*k.node,
         ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "class",
@@ -581,11 +709,14 @@ pub(super) fn emit_tag_builder_void_or_content(
         return out;
     }
     if let Some(c) = content {
-        let escaped = view_helpers_call(
-            "html_escape",
-            vec![send(Some(rewrite_helpers_in_expr(&c, ctx)), "to_s", Vec::new(), None, false)],
-        );
-        out.push(accumulator_append_call(escaped, ctx));
+        // Content Rails holds as an html-safe buffer (`truncate(x)`,
+        // `truncate(x) + "!"`) is written as it is; anything else escaped.
+        let rewritten = rewrite_helpers_in_expr(&c, ctx);
+        let written = match super::walker::safe_buffer_value(&rewritten, ctx) {
+            Some(safe) => send(Some(safe), "to_s", Vec::new(), None, false),
+            None => view_helpers_call("html_escape", vec![send(Some(rewritten), "to_s", Vec::new(), None, false)]),
+        };
+        out.push(accumulator_append_call(written, ctx));
     }
     out.push(accumulator_append_call(lit_str(format!("</{element}>")), ctx));
     out
@@ -728,11 +859,12 @@ fn route_helperize(url: Expr, route_helpers: &impl Fn() -> Expr, ctx: &ViewCtx) 
             };
             let member =
                 super::member_path_call(ctx, &format!("{name}_path"), member_arg);
-            let collection = super::route_helpers_call(&format!("{plural}_path"), Vec::new());
+            let collection_helper = format!("{}_path", crate::lower::routes::collection_name(name, &plural));
+            let collection = super::route_helpers_call(&collection_helper, Vec::new());
             let has_member = ctx.route_helper_names.is_empty()
                 || ctx.route_helper_names.contains(&format!("{name}_path"));
             let has_collection = ctx.route_helper_names.is_empty()
-                || ctx.route_helper_names.contains(&format!("{plural}_path"));
+                || ctx.route_helper_names.contains(&collection_helper);
             return match (has_member, has_collection) {
                 (true, false) => member,
                 (false, true) => collection,
@@ -781,11 +913,13 @@ fn route_helperize(url: Expr, route_helpers: &impl Fn() -> Expr, ctx: &ViewCtx) 
 fn classify_form_with_components(
     args: &[Expr],
     ctx: &ViewCtx,
+    record: &str,
 ) -> Option<FormWithComponents> {
     let mut model_expr: Option<Expr> = None;
     let mut url_expr: Option<Expr> = None;
     let mut method_expr: Option<Expr> = None;
     let mut namespace: Option<String> = None;
+    let mut scope: Option<String> = None;
     let mut opts_entries: Vec<(Expr, Expr)> = Vec::new();
 
     for arg in args {
@@ -818,10 +952,11 @@ fn classify_form_with_components(
                         // not an HTML attribute — left in opts it rendered
                         // a bogus `scope="…"` attr (keybase's
                         // `scope: :keybase_proof`) whose Symbol value
-                        // crashed html_escape. Dropped here (field-name
-                        // prefixing itself is a separate unimplemented gap;
-                        // fields name bare today either way).
+                        // crashed html_escape. A form with no model takes
+                        // it as the prefix (`filter[job_class_name]`); a
+                        // model form still names its fields after the model.
                         "scope" => {
+                            scope = str_or_sym_literal(v);
                             continue;
                         }
                         // form_with's generated-id prefix option, not an
@@ -845,6 +980,9 @@ fn classify_form_with_components(
         }
     }
 
+    if let Some(method) = tag_option(&opts_entries, "method") {
+        method_expr = Some(method);
+    }
     // form_with's POST default when no explicit `method:` was given.
     let default_post = || lit_sym(Symbol::from("post"));
 
@@ -866,7 +1004,7 @@ fn classify_form_with_components(
             let url = url_expr?;
             return Some(FormWithComponents {
                 model: Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
-                model_name: String::new(),
+                model_name: scope.clone().unwrap_or_default(),
                 action: route_helperize(url, &route_helpers, ctx),
                 method: method_expr.clone().unwrap_or_else(default_post),
                 opts_entries,
@@ -875,14 +1013,28 @@ fn classify_form_with_components(
         }
     };
 
-    if let Some((nested_model, nested_name, nested_action)) =
-        nested_resource_form(&model, &route_helpers)
+    if let Some((nested_model, nested_name, nested_action, persisted)) =
+        nested_resource_form(&model, &route_helpers, record, ctx)
     {
+        let method = method_expr.clone().unwrap_or_else(|| match persisted {
+            Some(cond) => Expr::new(
+                Span::synthetic(),
+                ExprNode::If { cond, then_branch: lit_sym(Symbol::from("patch")), else_branch: lit_sym(Symbol::from("post")) },
+            ),
+            None => default_post(),
+        });
         return Some(FormWithComponents {
             model: nested_model,
             model_name: nested_name,
-            action: nested_action,
-            method: method_expr.clone().unwrap_or_else(default_post),
+            // Not the nested route when `url:` is given: Rails' form_with takes the url first. A `nil` is `url ||=`'s
+            // fallback; a Hash `url:` keeps the nested route, which `route_helperize` does not resolve (the plain form's gap).
+            action: match &url_expr {
+                Some(url) if !matches!(&*url.node, ExprNode::Lit { value: Literal::Nil } | ExprNode::Hash { .. }) => {
+                    route_helperize(url.clone(), &route_helpers, ctx)
+                }
+                _ => nested_action,
+            },
+            method,
             opts_entries,
             id_prefix: namespace.clone().unwrap_or_default(),
         });
@@ -899,7 +1051,10 @@ fn classify_form_with_components(
     if let Some((record, record_singular, scope_prefix)) = scoped_record_form(&model) {
         let record_plural = crate::naming::pluralize_snake(&record_singular);
         let member_name = format!("{scope_prefix}_{record_singular}_path");
-        let collection_name = format!("{scope_prefix}_{record_plural}_path");
+        let collection_name = format!(
+            "{scope_prefix}_{}_path",
+            crate::lower::routes::collection_name(&record_singular, &record_plural)
+        );
         let persisted =
             send(Some(record.clone()), "persisted?", Vec::new(), None, false);
         let member_arg = if ctx.slug_models.contains(record_singular.as_str()) {
@@ -968,17 +1123,45 @@ fn classify_form_with_components(
     // `form_with model: @mod_note` posts to `mod_notes_path` in Rails,
     // and the directory's `user_path` exists too.
     // Then the analyzer's model for the view ivar (`@users` recorded as User where the binding's own type is a collection).
-    let typed_class = match model.ty.as_ref().map(crate::ty::Ty::peel_nilable) {
-        Some(crate::ty::Ty::Class { id, .. }) => Some(id.0.as_str().rsplit("::").next().unwrap_or_default().to_string()),
+    let typed_full = match model.ty.as_ref().map(crate::ty::Ty::peel_nilable) {
+        Some(crate::ty::Ty::Class { id, .. }) => Some(id.0.as_str().to_string()),
         _ => None,
     }
     .or_else(|| record_local_name(&model).and_then(|name| ctx.ivar_models.get(&name).cloned()));
-    if let Some(name) = typed_class.clone().or_else(|| record_local_name(&model)) {
+    let typed_class = typed_full.as_deref().map(|full| last_segment(full).to_string());
+    // The record's local's name is the fallback route. A typed record
+    // takes it only when the directory names no route and its class IS
+    // that local's model: campfire's `rooms/layouts/_form` is handed a
+    // `Rooms::Open < Room` as `room`, and neither `opens_path` nor
+    // `rooms_layouts_path` is a route where `rooms_path` is, while
+    // `rooms/directs/new`'s `Rooms::Direct` keeps its directory's
+    // `rooms_directs_path`. A `Post` handed as `user` posting to
+    // `users_path` would be silently wrong where the unrouted `posts_path`
+    // fails loudly. An untyped record has only its name to go by, and it
+    // wins over the directory as it always has (`posts/_form` handed a
+    // `user` posts to `users_path`); the partial's own emission, which
+    // serves every render, types campfire's `room` as nothing.
+    let known = |n: &str| ctx.route_helper_names.contains(&format!("{n}_path"));
+    let directory_known = known(&plural_owned) || known(&singularize(&plural_owned));
+    let by_local = record_local_name(&model).filter(|local| match typed_full.as_deref() {
+        None => true,
+        Some(full) => !directory_known && {
+            let local = singularize(&snake_case(local));
+            ctx.model_lineage.get(full).is_some_and(|lineage| lineage.contains(&local))
+        },
+    });
+    for name in typed_class.clone().into_iter().chain(by_local) {
         let rec_singular = singularize(&snake_case(&name));
         let rec_plural = crate::naming::pluralize_snake(&rec_singular);
-        let known = |n: &str| ctx.route_helper_names.contains(&format!("{n}_path"));
-        if rec_plural != plural_owned && (known(&rec_plural) || known(&rec_singular)) {
+        // The class naming the directory proves nothing when the directory
+        // is no route (`opens/_form` handed a `Rooms::Open` `room`): the
+        // local still gets its look.
+        if rec_plural == plural_owned {
+            continue;
+        }
+        if known(&rec_plural) || known(&rec_singular) {
             plural_owned = rec_plural;
+            break;
         }
     }
     let plural = plural_owned.as_str();
@@ -988,16 +1171,30 @@ fn classify_form_with_components(
     // `url:` beside `model:` overrides the resource-convention action
     // (Rails consults url first; lobsters' settings form has no
     // `setting_path` route for the convention to name). Fields still
-    // name under the model. Method: an explicit `method:` opt wins,
-    // else form_with's POST default.
+    // name under the model. Method: an explicit `method:` opt wins;
+    // else, for a record the view knows is a model, Rails' own
+    // `persisted? ? :patch : :post` (url: does not change the verb, so
+    // campfire's message edit form PATCHes); else form_with's POST.
     if let Some(url) = url_expr {
-        // `method:` steers the form verb (captured out of opts above);
-        // default POST like the url-only branch.
+        let method = method_expr.clone().unwrap_or_else(|| {
+            if is_known_model_record(&model, ctx) {
+                Expr::new(
+                    Span::synthetic(),
+                    ExprNode::If {
+                        cond: send(Some(model.clone()), "persisted?", Vec::new(), None, false),
+                        then_branch: lit_sym(Symbol::from("patch")),
+                        else_branch: lit_sym(Symbol::from("post")),
+                    },
+                )
+            } else {
+                default_post()
+            }
+        });
         return Some(FormWithComponents {
-            model_name: record_model_name(&model, ctx, &singular),
+            model_name: scope.clone().unwrap_or_else(|| record_model_name(&model, ctx, &singular)),
             model,
             action: route_helperize(url, &route_helpers, ctx),
-            method: method_expr.clone().unwrap_or_else(default_post),
+            method,
             opts_entries,
             id_prefix: namespace.clone().unwrap_or_default(),
         });
@@ -1035,10 +1232,11 @@ fn classify_form_with_components(
         send(Some(model.clone()), "id", Vec::new(), None, false)
     };
     let member_path =
-        super::member_path_call(ctx, &format!("{singular}_path"), member_arg);
+        super::member_path_call(ctx, &format!("{singular}_path"), member_arg.clone());
+    let collection_helper = format!("{}_path", crate::lower::routes::collection_name(&singular, plural));
     let collection_path = send(
         Some(route_helpers()),
-        &format!("{plural}_path"),
+        &collection_helper,
         Vec::new(),
         None,
         false,
@@ -1052,7 +1250,7 @@ fn classify_form_with_components(
     let has_member = ctx.route_helper_names.is_empty()
         || ctx.route_helper_names.contains(&format!("{singular}_path"));
     let has_collection = ctx.route_helper_names.is_empty()
-        || ctx.route_helper_names.contains(&format!("{plural}_path"));
+        || ctx.route_helper_names.contains(&collection_helper);
     let action = match (has_member, has_collection) {
         (true, false) => member_path,
         (false, true) => collection_path,
@@ -1065,6 +1263,7 @@ fn classify_form_with_components(
             },
         ),
     };
+    let action = sti_action(ctx, &model, &singular, &persisted, &member_arg, action);
     // An explicit `method:` wins (Rails honors it verbatim); otherwise
     // the resource convention — PATCH for a persisted record, POST for a
     // new one. Feeds both the `<form>`'s `_method` override and
@@ -1081,13 +1280,68 @@ fn classify_form_with_components(
     });
 
     Some(FormWithComponents {
-        model_name: record_model_name(&model, ctx, &singular),
+        model_name: scope.unwrap_or_else(|| record_model_name(&model, ctx, &singular)),
         model,
         action,
         method,
         opts_entries,
         id_prefix: namespace.unwrap_or_default(),
     })
+}
+
+/// Rails routes `form_with model: record` through the record's CLASS
+/// (`polymorphic_path`): a new `Rooms::Open` posts to `rooms_opens_path`,
+/// a persisted one to `rooms_open_path(id)`. A record typed as the
+/// subclass takes its routes directly; one typed as an STI base asks
+/// `dom_prefix` at run time, one arm per subclass the routes declare,
+/// the base action last (as `tag_builder` does for `link_to [:edit, @room]`).
+fn sti_action(ctx: &ViewCtx, record: &Expr, singular: &str, persisted: &Expr, member_arg: &Expr, base: Expr) -> Expr {
+    let has = |n: &str| ctx.route_helper_names.contains(n);
+    let arm = |stem: &str| {
+        let member_name = format!("{stem}_path");
+        let collection_name = format!("{}_path", crate::lower::routes::collection_name(stem, &crate::naming::pluralize_snake(stem)));
+        let member = has(&member_name).then(|| super::member_path_call(ctx, &member_name, member_arg.clone()));
+        let collection = has(&collection_name).then(|| super::route_helpers_call(&collection_name, Vec::new()));
+        match (member, collection) {
+            (Some(m), Some(c)) => Some(Expr::new(Span::synthetic(), ExprNode::If { cond: persisted.clone(), then_branch: m, else_branch: c })),
+            (m, c) => m.or(c),
+        }
+    };
+    if let Some(crate::ty::Ty::Class { id, .. }) = record.ty.as_ref().map(crate::ty::Ty::peel_nilable) {
+        let stem = crate::lower::tag_builder::class_route_stem(id.0.as_str());
+        if stem != singular && ctx.sti_route_stems.values().any(|stems| stems.contains(&stem)) {
+            return arm(&stem).unwrap_or(base);
+        }
+    }
+    let Some(stems) = ctx.sti_route_stems.get(singular) else { return base };
+    let mut dispatch = base;
+    for stem in stems.iter().rev() {
+        let Some(arm) = arm(stem) else { continue };
+        let prefix = send(Some(record.clone()), "dom_prefix", Vec::new(), None, true);
+        let cond = send(Some(prefix), "==", vec![lit_str(stem.clone())], None, false);
+        dispatch = Expr::new(Span::synthetic(), ExprNode::If { cond, then_branch: arm, else_branch: dispatch });
+    }
+    dispatch
+}
+
+/// The typed record class used for metadata, independent of its field prefix.
+pub(super) fn form_model_class(model: &Expr, parameter: &str, ctx: &ViewCtx) -> Option<String> {
+    if let Some(crate::ty::Ty::Class { id, .. }) = model.ty.as_ref().map(crate::ty::Ty::peel_nilable) {
+        return Some(id.0.as_str().to_owned());
+    }
+    if let ExprNode::Send { recv: Some(recv), method, .. } = &*model.node {
+        if method.as_str() == "new" {
+            if let ExprNode::Const { path } = &*recv.node {
+                return Some(path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>().join("::"));
+            }
+        }
+    }
+    let name = match &*model.node {
+        ExprNode::Var { name, .. } | ExprNode::Ivar { name } => Some(name.as_str()),
+        _ => None,
+    };
+    name.and_then(|name| ctx.record_classes.get(name).cloned())
+        .or_else(|| ctx.i18n.model_class(parameter).map(str::to_owned))
 }
 
 /// The form's object name — what Rails calls `param_key`. Rails names
@@ -1099,6 +1353,29 @@ fn classify_form_with_components(
 /// falls back to the directory singular when the record's type isn't a
 /// known model — that fallback is the whole pre-existing behavior, so an
 /// untyped record is no worse off than before.
+/// The model expression is a record of a model the view's ivar-type map
+/// knows (an ivar, local or bare reader), so `persisted?` is defined on
+/// it. A constructed `X.new` is never persisted and form objects aren't
+/// known models, so both keep the POST default.
+fn is_known_model_record(model: &Expr, ctx: &ViewCtx) -> bool {
+    let name = match &*model.node {
+        ExprNode::Var { name, .. } | ExprNode::Ivar { name } => name.as_str(),
+        ExprNode::Send { recv: None, method, args, block: None, .. } if args.is_empty() => {
+            method.as_str()
+        }
+        _ => return false,
+    };
+    // The expression's own type first: a local can share a name with a model ivar and hold a form object.
+    if let Some(crate::ty::Ty::Class { id, .. }) = model.ty.as_ref().map(crate::ty::Ty::peel_nilable) {
+        // An STI subclass is a library class, so its own key is not among the models'.
+        let stem = crate::lower::tag_builder::class_route_stem(id.0.as_str());
+        return ctx.model_param_keys.get(id.0.as_str()).is_some_and(|key| ctx.model_singulars.contains(key))
+            || ctx.sti_route_stems.values().any(|stems| stems.contains(&stem));
+    }
+    // Not every typed ivar: a form object (`SearchForm`) has no `persisted?`, and keeps POST as in Rails.
+    ctx.ivar_models.get(name).is_some_and(|key| ctx.model_singulars.contains(key))
+}
+
 fn record_model_name(model: &Expr, ctx: &ViewCtx, fallback: &str) -> String {
     // `model: Message.new` — a record CONSTRUCTED in the form call,
     // which is what a form for a not-yet-persisted resource looks like
@@ -1109,14 +1386,13 @@ fn record_model_name(model: &Expr, ctx: &ViewCtx, fallback: &str) -> String {
     // named every field after the VIEW that reached the helper and the
     // composer posted `rooms_show[body]` where Rails posts
     // `message[body]`. The class is right there in the expression;
-    // Rails' `param_key` is its demodulized name, underscored, whether
-    // or not the constructor took arguments.
+    // Rails' default `param_key` underscores the complete class name,
+    // joining namespace segments with underscores too.
     if let ExprNode::Send { recv: Some(recv), method, .. } = &*model.node {
         if method.as_str() == "new" {
             if let ExprNode::Const { path } = &*recv.node {
-                if let Some(last) = path.last() {
-                    return snake_case(last.as_str());
-                }
+                let name = path.iter().map(|part| part.as_str()).filter(|part| !part.is_empty()).collect::<Vec<_>>().join("::");
+                return ctx.model_param_keys.get(&name).cloned().unwrap_or_else(|| crate::naming::model_param_key(&name));
             }
         }
     }
@@ -1127,9 +1403,15 @@ fn record_model_name(model: &Expr, ctx: &ViewCtx, fallback: &str) -> String {
         }
         _ => return fallback.to_string(),
     };
+    // A view's own local (`<% comment = article.comments.first %>`) is in no ivar map: its type names the model too.
+    let typed = match model.ty.as_ref().map(|t| t.peel_nilable()) {
+        Some(crate::ty::Ty::Class { id, .. }) => ctx.model_param_keys.get(id.0.as_str()).cloned(),
+        _ => None,
+    };
     ctx.ivar_models
         .get(name)
         .cloned()
+        .or(typed)
         .unwrap_or_else(|| fallback.to_string())
 }
 
@@ -1185,7 +1467,9 @@ fn scoped_record_form(model: &Expr) -> Option<(Expr, String, String)> {
 fn nested_resource_form(
     model: &Expr,
     route_helpers: &dyn Fn() -> Expr,
-) -> Option<(Expr, String, Expr)> {
+    record: &str,
+    ctx: &ViewCtx,
+) -> Option<(Expr, String, Expr, Option<Expr>)> {
     let ExprNode::Array { elements, .. } = &*model.node else {
         return None;
     };
@@ -1206,38 +1490,62 @@ fn nested_resource_form(
     };
     let parent_singular = singularize(&snake_case(&parent_local));
 
-    // Child class: only support `Class.new(...)` shape. Comment.new is
-    // by definition not persisted, so the action is the nested
-    // collection path with method :post.
-    let ExprNode::Send {
-        recv: Some(child_recv),
-        method: child_method,
-        ..
-    } = &*child.node
-    else {
-        return None;
+    // `Class.new(...)`, by definition not persisted: the nested collection path with method :post.
+    let constructed = match &*child.node {
+        ExprNode::Send { recv: Some(child_recv), method, .. } if method.as_str() == "new" => match &*child_recv.node {
+            ExprNode::Const { path } => Some(path.last()?.as_str().to_string()),
+            _ => None,
+        },
+        _ => None,
     };
-    if child_method.as_str() != "new" {
-        return None;
-    }
-    let ExprNode::Const { path } = &*child_recv.node else {
-        return None;
+    // A record of a known model (`comment`): the member path once persisted, as Rails' `polymorphic_path` picks.
+    let typed = match child.ty.as_ref().map(|t| t.peel_nilable()) {
+        Some(crate::ty::Ty::Class { id, .. }) if constructed.is_none() && !matches!(&*child.node, ExprNode::Send { method, .. } if method.as_str() == "new") => {
+            Some(id.0.as_str().rsplit("::").next()?.to_string())
+        }
+        _ => None,
     };
-    let class_name = path.last()?.as_str();
+    let class_name = constructed.clone().or(typed)?;
+    let class_name = class_name.as_str();
     let child_singular = snake_case(class_name);
-    let child_plural = format!("{child_singular}s"); // naïve; comments fixture only
+    let child_plural = crate::naming::pluralize_snake(&child_singular);
+    let child_collection = crate::lower::routes::collection_name(&child_singular, &child_plural);
 
-    // RouteHelpers.<parent_singular>_<child_plural>_path(parent.id)
-    let parent_id = send(Some(parent.clone()), "id", Vec::new(), None, false);
+    // RouteHelpers.<parent_singular>_<child collection>_path(parent.id)
+    let parent_id = send(Some(parent.clone()), if ctx.slug_models.contains(&parent_singular) { "to_param" } else { "id" }, Vec::new(), None, false);
     let action = send(
         Some(route_helpers()),
-        &format!("{parent_singular}_{child_plural}_path"),
+        &format!("{parent_singular}_{child_collection}_path"),
         vec![parent_id],
         None,
         true,
     );
 
-    Some((child.clone(), child_singular, action))
+    if constructed.is_some() {
+        return Some((child.clone(), child_singular, action, None));
+    }
+    // Not the child again: the form binds it to `record` first, and a `comments.build` read three times builds three.
+    let read = Expr::new(Span::synthetic(), ExprNode::Var { id: VarId(0), name: Symbol::from(record) });
+    let persisted = send(Some(read.clone()), "persisted?", Vec::new(), None, false);
+    let key = |e: Expr, singular: &str| send(Some(e), if ctx.slug_models.contains(singular) { "to_param" } else { "id" }, Vec::new(), None, false);
+    let member_name = format!("{parent_singular}_{child_singular}_path");
+    let member = send(
+        Some(route_helpers()),
+        &member_name,
+        vec![key(parent.clone(), &parent_singular), key(read, &child_singular)],
+        None,
+        true,
+    );
+    // Only the arms the route table defines, as the plain record's form does.
+    let has_member = ctx.route_helper_names.is_empty() || ctx.route_helper_names.contains(&member_name);
+    let has_collection = ctx.route_helper_names.is_empty()
+        || ctx.route_helper_names.contains(&format!("{parent_singular}_{child_collection}_path"));
+    let action = match (has_member, has_collection) {
+        (true, false) => member,
+        (false, true) => action,
+        _ => Expr::new(Span::synthetic(), ExprNode::If { cond: persisted.clone(), then_branch: member, else_branch: action }),
+    };
+    Some((child.clone(), child_singular, action, Some(persisted)))
 }
 
 /// True when the receiver is a `<x>.errors` Send — i.e. the iterable
@@ -1360,6 +1668,44 @@ pub(super) fn rewrite_errors_each_body(body: &Expr, var_name: &str) -> Expr {
 /// new-records, complex expressions). Used to seed
 /// `ctx.form_records` so FormBuilder method dispatch can resolve
 /// attribute lookups.
+/// The `builder:` a form names, when it is a class of its own.
+fn custom_builder(args: &[Expr]) -> Option<Expr> {
+    args.iter().find_map(|arg| {
+        let ExprNode::Hash { entries, .. } = &*arg.node else { return None };
+        entries.iter().find_map(|(k, v)| {
+            (matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "builder")
+                && matches!(&*v.node, ExprNode::Const { .. }))
+            .then(|| v.clone())
+        })
+    })
+}
+
+/// Whether the body calls a method of the builder the form lowering does not expand, or hands the builder to a call
+/// (`render_money(form)`), which may call one.
+fn calls_unexpanded(body: &Expr, form_param: &str, overridden: &crate::det::HashSet<String>) -> bool {
+    let mut found = false;
+    fn walk(e: &Expr, form_param: &str, overridden: &crate::det::HashSet<String>, found: &mut bool) {
+        let is_form = |e: &Expr| matches!(&*e.node, ExprNode::Var { name, .. } if name.as_str() == form_param);
+        // A render's locals hash (`render "x", f: form`) hands the builder too, which a partial of an overriding builder takes.
+        let hands = |e: &Expr| {
+            is_form(e)
+                || (!overridden.is_empty()
+                    && matches!(&*e.node, ExprNode::Hash { entries, .. } if entries.iter().any(|(_, v)| is_form(v))))
+        };
+        if let ExprNode::Send { recv, method, args, .. } = &*e.node
+            && (recv.as_ref().is_some_and(|r| is_form(r))
+                && method.as_str() != "object"
+                && (crate::lower::classify_form_builder_method(method.as_str()).is_none() || overridden.contains(method.as_str()))
+                || args.iter().any(hands))
+        {
+            *found = true;
+        }
+        e.node.for_each_child(&mut |c| walk(c, form_param, overridden, found));
+    }
+    walk(body, form_param, overridden, &mut found);
+    found
+}
+
 fn find_kwarg_local_name(args: &[Expr]) -> Option<String> {
     for arg in args {
         let ExprNode::Hash { entries, .. } = &*arg.node else {
@@ -1541,6 +1887,9 @@ mod tests {
     fn ctx_with(model_singulars: &[&str], ivar_models: &[(&str, &str)]) -> ViewCtx {
         ViewCtx {
             locals: Vec::new(),
+            ivar_params: Vec::new(),
+            assigned_locals: Vec::new(),
+            nested_assigned_locals: Vec::new(),
             arg_name: String::new(),
             resource_dir: String::new(),
             view_name: String::new(),
@@ -1549,23 +1898,36 @@ mod tests {
             nullable_locals: Default::default(),
             reference_reads: Default::default(),
             reference_targets: Default::default(),
+            nested_record_classes: Default::default(),
             nilable_scalar_reads: Default::default(),
             html_safe_methods: Default::default(),
             model_singulars: Rc::new(
                 model_singulars.iter().map(|s| s.to_string()).collect::<HashSet<_>>(),
             ),
+            model_lineage: Default::default(),
             slug_models: Default::default(),
+            sti_route_stems: Default::default(),
             bool_readers: Default::default(),
+            time_columns: Default::default(),
             store_readers: Default::default(),
             route_helper_names: Default::default(),
+            app_helper_names: Default::default(),
+            view_context_helpers: Default::default(),
+            direct_route_helpers: Default::default(),
             i18n: Default::default(),
             route_helper_arity: Default::default(),
             form_wrappers: Default::default(),
+            builder_overrides: Default::default(),
+            hidden_autocomplete: false,
+            nested_attributes: Default::default(),
             form_with_entry: true,
+            model_param_keys: Default::default(),
             stylesheets: Vec::new(),
             lexxy: false,
             lexxy_editor_adapter: false,
             partial_ivars: Default::default(),
+            partial_record_locals: Default::default(),
+            ivar_records: Default::default(),
             formats: vec!["html".to_string()],
             view_formats: Default::default(),
             multipart_partials: Default::default(),
@@ -1573,15 +1935,20 @@ mod tests {
             partial_stems: Default::default(),
             partial_extras: Default::default(),
             strict_locals: Default::default(),
+            yielding_partials: Default::default(),
+            record_carries_yield: false,
+            record_classes: Default::default(),
             str_ivars: Default::default(),
             ivar_locals: Default::default(),
             own_flash: Default::default(),
+            held_ivars: Vec::new(),
             ivar_models: Rc::new(
                 ivar_models
                     .iter()
                     .map(|(k, v)| (k.to_string(), v.to_string()))
                     .collect::<HashMap<_, _>>(),
             ),
+            nilable_ivar_models: Default::default(),
         }
     }
 

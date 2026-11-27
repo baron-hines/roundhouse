@@ -318,6 +318,9 @@ fn filter_item(
             unless_cond: None,
             if_cond_expr: None,
             unless_cond_expr: None,
+            unread_guard: false,
+            unread_options: false,
+            only_present: false,
             block: None,
             prepend: false,
         },
@@ -337,6 +340,7 @@ fn controller(
         body: items,
         layout: Default::default(),
         sibling_classes: Vec::new(),
+        csp_header: false,
     }
 }
 
@@ -417,6 +421,9 @@ fn resolve_before_actions_respects_except_list() {
             unless_cond: None,
             if_cond_expr: None,
             unless_cond_expr: None,
+            unread_guard: false,
+            unread_options: false,
+            only_present: false,
             block: None,
             prepend: false,
         },

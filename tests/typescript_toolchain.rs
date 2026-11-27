@@ -12,20 +12,63 @@
 //!
 //!     cargo test --test typescript_toolchain -- --ignored --nocapture
 
+#[path = "support/scratch.rs"]
+mod scratch;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[path = "support/memoized_fields.rs"]
 mod memoized_fields;
+#[path = "support/own_not_nil.rs"]
+mod own_not_nil;
 #[path = "support/app_class_base.rs"]
 mod app_class_base;
 #[path = "support/parenless_calls.rs"]
 mod parenless_calls;
 #[path = "support/model_class_methods.rs"]
 mod model_class_methods;
+#[path = "support/ts_controller_ivars.rs"]
+mod ts_controller_ivars;
 #[path = "support/emit_and_run.rs"]
 #[allow(dead_code)]
 mod emit_and_run;
+#[path = "support/content_tag_options.rs"]
+#[allow(dead_code)]
+mod content_tag_options;
+#[path = "support/link_to_if_eval_order.rs"]
+#[allow(dead_code)]
+mod link_to_if_eval_order;
+#[path = "support/simple_format.rs"]
+mod simple_format;
+#[path = "support/link_to_computed_url.rs"]
+mod link_to_computed_url;
+#[path = "support/nested_route_helper_record.rs"]
+#[allow(dead_code)]
+mod nested_route_helper_record;
+#[path = "support/ivar_named_local.rs"]
+#[allow(dead_code)]
+mod ivar_named_local;
+#[path = "support/record_if_condition.rs"]
+#[allow(dead_code)]
+mod record_if_condition;
+#[path = "support/link_to_template_local.rs"]
+#[allow(dead_code)]
+mod link_to_template_local;
+#[path = "support/each_no_param.rs"]
+#[allow(dead_code)]
+mod each_no_param;
+#[path = "support/view_unless_no_else.rs"]
+#[allow(dead_code)]
+mod view_unless_no_else;
+#[path = "support/nilable_string_view.rs"]
+#[allow(dead_code)]
+mod nilable_string_view;
+#[path = "support/each_receiver_once.rs"]
+#[allow(dead_code)]
+mod each_receiver_once;
+#[path = "support/join_nil.rs"]
+#[allow(dead_code)]
+mod join_nil;
 #[path = "support/nested_classes.rs"]
 mod nested_classes;
 #[path = "support/array_methods.rs"]
@@ -37,23 +80,27 @@ mod class_constants;
 #[path = "support/i18n_locales_app.rs"]
 #[allow(dead_code)]
 mod i18n_locales_app;
+#[path = "support/record_slice_app.rs"]
+#[allow(dead_code)]
+mod record_slice_app;
+#[path = "support/namespaced_serializer.rs"]
+mod namespaced_serializer;
+#[path = "support/param_default_import.rs"]
+mod param_default_import;
 
 use roundhouse::emit::typescript;
 use roundhouse::ingest::ingest_app;
 
 fn scratch_dir(tag: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("roundhouse-ts-check-{tag}"))
+    scratch::dir(&format!("roundhouse-ts-check-{tag}"))
 }
 
 fn generate_project(fixture_path: &Path, out: &Path) {
-    if out.exists() {
-        std::fs::remove_dir_all(out).expect("clean scratch");
-    }
     std::fs::create_dir_all(out).expect("create scratch");
 
     let mut app = ingest_app(fixture_path).expect("ingest");
     // Emit from the post-analyze lowered IR, as `roundhouse --target typescript` does
-    roundhouse::session::analyze_and_lower(&mut app);
+    roundhouse::session::analyze_and_lower_for(&mut app, roundhouse::build_target::BuildTarget::Typescript);
     let files = typescript::emit(&app);
 
     for file in &files {
@@ -70,14 +117,11 @@ fn generate_project_with_profile(
     out: &Path,
     profile: &roundhouse::profile::DeploymentProfile,
 ) {
-    if out.exists() {
-        std::fs::remove_dir_all(out).expect("clean scratch");
-    }
     std::fs::create_dir_all(out).expect("create scratch");
 
     let mut app = ingest_app(fixture_path).expect("ingest");
     // Emit from the post-analyze lowered IR, as `roundhouse --target typescript` does
-    roundhouse::session::analyze_and_lower(&mut app);
+    roundhouse::session::analyze_and_lower_for(&mut app, roundhouse::build_target::BuildTarget::Typescript);
     let files = typescript::emit_with_profile(&app, profile);
 
     for file in &files {
@@ -251,6 +295,90 @@ fn non_model_find_keeps_its_params_argument() {
     assert_tsc_passes("real-blog with a non-model find", &emitted);
 }
 
+/// #2087: a controller in `module Api` rendering through a top-level
+/// serializer, one per element, and one in its own namespace. The entry
+/// files named the controller `Api::ArticlesController` (TS1005), the
+/// one-argument `new ArticleSerializer(record)` missed the constructor's
+/// defaulted `options` (TS2554), and `Api.ArticleSerializer.new(...)`
+/// named nothing in scope (TS2304).
+#[test]
+#[ignore]
+fn real_blog_namespaced_serializer_render_tsc_passes() {
+    let (emitted, errors) = namespaced_serializer::overlay().emit(roundhouse::project::BuildTarget::Typescript);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_tsc_passes("real-blog with a namespaced serializer render", &emitted);
+}
+
+/// #2066: the namespaced controller's three routes, requested through the
+/// emitted router as the emitted integration tests request theirs, answer
+/// what active_model_serializers answers on Rails: `serializer:
+/// ::ArticleSerializer` and `each_serializer: ::ArticleSerializer` render
+/// the top-level class (`id` and `title`), `serializer:
+/// Api::ArticleSerializer` the namespaced one (`id` only).
+#[test]
+#[ignore]
+fn real_blog_namespaced_serializer_render_answers_the_rooted_class() {
+    let (emitted, errors) = namespaced_serializer::overlay().emit(roundhouse::project::BuildTarget::Typescript);
+    assert!(errors.is_empty(), "{errors:?}");
+    let out = run_under_tsx(
+        &emitted,
+        r#"import "./test/_runtime/setup.js";
+import { Test } from "./test/_runtime/minitest.js";
+import { ArticlesFixtures } from "./test/fixtures/articles.js";
+const id = ArticlesFixtures.one().id;
+const t: any = new Test();
+const out: string[] = [];
+for (const path of [`/api/articles/${id}`, "/api/articles", `/api/articles/${id}/nested`]) {
+  t.get(path);
+  out.push(`${t.status} ${t.body}`);
+}
+console.log(out.join("\n"));
+"#,
+    );
+    assert_eq!(
+        out,
+        "200 {\"id\":1,\"title\":\"Getting Started with Rails\"}\n\
+         200 [{\"id\":1,\"title\":\"Getting Started with Rails\"},{\"id\":2,\"title\":\"Understanding MVC Architecture\"}]\n\
+         200 {\"id\":1}"
+    );
+}
+
+/// A namespaced controller whose joined name a top-level controller
+/// already has (`Mod::MailsController`, `ModMailsController`): the entry
+/// files bound both as `ModMailsController` (TS2300).
+#[test]
+#[ignore]
+fn real_blog_namespaced_controller_beside_its_joined_name_tsc_passes() {
+    let (emitted, errors) = emit_and_run::real_blog()
+        .write(
+            "app/controllers/mod/mails_controller.rb",
+            "module Mod\n  class MailsController < ApplicationController\n    def index\n      render plain: \"namespaced\"\n    end\n  end\nend\n",
+        )
+        .write(
+            "app/controllers/mod_mails_controller.rb",
+            "class ModMailsController < ApplicationController\n  def index\n    render plain: \"top-level\"\n  end\nend\n",
+        )
+        .edit(
+            "config/routes.rb",
+            "  resources :articles do",
+            "  get \"mod/mails\" => \"mod/mails#index\"\n  get \"mod_mails\" => \"mod_mails#index\"\n  resources :articles do",
+        )
+        .emit(roundhouse::project::BuildTarget::Typescript);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_tsc_passes("real-blog with Mod::MailsController and ModMailsController", &emitted);
+}
+
+/// A constructor default naming another app class
+/// (`opts = Options.new`): the default is emitted, and its class must be
+/// imported (TS2304).
+#[test]
+#[ignore]
+fn real_blog_param_default_import_tsc_passes() {
+    let (emitted, errors) = param_default_import::overlay().emit(roundhouse::project::BuildTarget::Typescript);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_tsc_passes("real-blog with a constructor default naming an app class", &emitted);
+}
+
 /// Diagnostic test: emit transpiled_blog and dump tsc errors so we
 /// know what the body-walker still needs to fix. Does NOT assert
 /// success — purely an inspection helper.
@@ -409,6 +537,22 @@ fn run_under_tsx(emitted: &Path, script: &str) -> String {
 
 #[test]
 #[ignore]
+fn real_blog_own_not_nil_runs_under_tsx() {
+    // A class's own `not_nil!` is the method it defines, as on CRuby, not
+    // type_toolkit's; the app compiles.
+    let (emitted, errors) = own_not_nil::overlay().emit(roundhouse::project::BuildTarget::Typescript);
+    assert!(errors.is_empty(), "{errors:?}");
+    let out = run_under_tsx(
+        &emitted,
+        "import { Lookup } from \"./app/models/lookup.js\";\nconsole.log(JSON.stringify([Lookup.read(\"ada\"), Lookup.read(null)]));\n",
+    );
+    assert_eq!(out, own_not_nil::SUMMARY);
+    std::fs::remove_file(emitted.join("check.ts")).unwrap();
+    assert_tsc_passes("real-blog with its own not_nil!", &emitted);
+}
+
+#[test]
+#[ignore]
 fn real_blog_memoized_fields_run_under_tsx() {
     // Readers memoizing a literal answer it, on a plain class's two sides
     // and on a model, as CRuby does (#1238); the app compiles.
@@ -454,6 +598,25 @@ fn real_blog_app_class_base_runs_under_tsx() {
     assert_eq!(out, app_class_base::SUMMARY);
     std::fs::remove_file(emitted.join("check.ts")).unwrap();
     assert_tsc_passes("real-blog with an app Base", &emitted);
+}
+
+#[test]
+#[ignore]
+fn controller_ivars_named_like_base_state_compile_and_render() {
+    // An app controller's `@status`, `@location` and `@headers` (its
+    // own, ApplicationController's and a concern's) compile next to the
+    // runtime base's fields of those names, render on the page, and leave
+    // the response as it was: 200, no Location (#1614).
+    let (emitted, errors) = ts_controller_ivars::overlay().emit(roundhouse::project::BuildTarget::Typescript);
+    assert!(errors.is_empty(), "{errors:?}");
+    let out = run_under_tsx(
+        &emitted,
+        "import { ProbesController } from \"./app/controllers/probes_controller.js\";\nconst c = new ProbesController();\nc.params = {};\nc.request_method = \"GET\";\nawait c.process_action(\"show\");\nconsole.log(JSON.stringify([c.status, c.location, c.body]));\n",
+    );
+    let want = format!("[200,null,{}]", serde_json::to_string(ts_controller_ivars::BODY).unwrap());
+    assert_eq!(out, want);
+    std::fs::remove_file(emitted.join("check.ts")).unwrap();
+    assert_tsc_passes("an app controller with ivars named like the base's state", &emitted);
 }
 
 #[test]
@@ -627,4 +790,352 @@ console.log("locales passed");
     assert_eq!(out, "locales passed");
     std::fs::remove_file(emitted.join("check.ts")).unwrap();
     assert_tsc_passes("real-blog with two locales", &emitted);
+}
+
+#[test]
+#[ignore]
+fn real_blog_record_slice_runs_under_tsx() {
+    // The answers `emit_and_run::record_slice` checks on CRuby.
+    let (emitted, errors) = record_slice_app::probe_app().emit(roundhouse::project::BuildTarget::Typescript);
+    assert!(errors.is_empty(), "{errors:?}");
+    let out = run_under_tsx(
+        &emitted,
+        r#"import { Article } from "./app/models/article.js";
+const got = Article.sliced();
+if (JSON.stringify(got) !== JSON.stringify(["2", "Sliced", "7", "1", "Other", "3", "Bound", "5", "4", "A comment body."])) throw new Error("sliced: " + JSON.stringify(got));
+console.log("slice passed");
+"#,
+    );
+    assert_eq!(out, "slice passed");
+    std::fs::remove_file(emitted.join("check.ts")).unwrap();
+    assert_tsc_passes("real-blog with record slices", &emitted);
+}
+
+/// A non-block `content_tag` with options renders as Rails 8.1.4 does
+/// (#1780): the app's integration test, run by the emitted node test.
+#[test]
+#[ignore]
+fn content_tag_with_options_renders() {
+    let (emitted, errors) = content_tag_options::app(content_tag_options::VIEW).emit(roundhouse::project::BuildTarget::Typescript);
+    assert!(errors.is_empty(), "{errors:?}");
+    let install = Command::new("npm").args(["install", "--silent", "--no-audit", "--no-fund"]).current_dir(&*emitted).output().expect("run npm install");
+    assert!(install.status.success(), "{}", String::from_utf8_lossy(&install.stderr));
+    let output = Command::new("./node_modules/.bin/tsx")
+        .args(["--test", "test/probes_controller.test.ts"])
+        .current_dir(&*emitted)
+        .output()
+        .expect("run tsx --test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success() && stdout.contains("pass 1"), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+}
+
+/// `link_to_unless`'s block form with a name that is an expression, not a
+/// call (`"a" + "b"`), in a block without a parameter and in one whose
+/// parameter the block doesn't read: the no-link branch still evaluates
+/// the name, and the generated view type-checks.
+#[test]
+#[ignore]
+fn a_link_to_unless_block_over_an_expression_name_tsc_passes() {
+    let (emitted, errors) = emit_and_run::real_blog()
+        .edit(
+            "app/views/articles/index.html.erb",
+            "<% content_for :title, \"Articles\" %>\n",
+            "<% content_for :title, \"Articles\" %>\n<% t = @articles.nil? %>\n<%= link_to_unless !t, \"a\" + \"b\", \"/x\" do %>none<% end %>\n<%= link_to_unless !t, \"c\" + \"d\", \"/x\" do |name| %>none<% end %>\n",
+        )
+        .emit(roundhouse::project::BuildTarget::Typescript);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_tsc_passes("real-blog with link_to_unless blocks", &emitted);
+}
+
+/// #1862: `link_to_if` / `link_to_unless` evaluate the url when no link
+/// is made, and the generated view still builds and renders as Rails
+/// (`link_to_if_eval_order::STRICT_VIEW`): the app's integration test, run by the emitted node test.
+#[test]
+#[ignore]
+fn link_to_if_evaluates_its_url_and_renders() {
+    let (emitted, errors) = content_tag_options::app_rendering(link_to_if_eval_order::STRICT_VIEW, link_to_if_eval_order::STRICT_RENDERS).emit(roundhouse::project::BuildTarget::Typescript);
+    assert!(errors.is_empty(), "{errors:?}");
+    let install = Command::new("npm").args(["install", "--silent", "--no-audit", "--no-fund"]).current_dir(&*emitted).output().expect("run npm install");
+    assert!(install.status.success(), "{}", String::from_utf8_lossy(&install.stderr));
+    let output = Command::new("./node_modules/.bin/tsx")
+        .args(["--test", "test/probes_controller.test.ts"])
+        .current_dir(&*emitted)
+        .output()
+        .expect("run tsx --test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success() && stdout.contains("pass 1"), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+}
+
+/// #1861: `simple_format` with `sanitize: false` renders as Rails 8.1.4
+/// does, multibyte texts included (`simple_format::VIEW`): the app's integration test, run by the emitted node test.
+#[test]
+#[ignore]
+fn simple_format_renders() {
+    let (emitted, errors) = content_tag_options::app_rendering(simple_format::VIEW, simple_format::RENDERS).emit(roundhouse::project::BuildTarget::Typescript);
+    assert!(errors.is_empty(), "{errors:?}");
+    let install = Command::new("npm").args(["install", "--silent", "--no-audit", "--no-fund"]).current_dir(&*emitted).output().expect("run npm install");
+    assert!(install.status.success(), "{}", String::from_utf8_lossy(&install.stderr));
+    let output = Command::new("./node_modules/.bin/tsx")
+        .args(["--test", "test/probes_controller.test.ts"])
+        .current_dir(&*emitted)
+        .output()
+        .expect("run tsx --test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success() && stdout.contains("pass 1"), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+}
+
+/// #1865: `link_to` with a url the template computes renders as Rails
+/// 8.1.4 does (`link_to_computed_url::VIEW`).
+#[test]
+#[ignore]
+fn link_to_computed_url_renders() {
+    let (emitted, errors) = content_tag_options::app_rendering(link_to_computed_url::VIEW, link_to_computed_url::RENDERS).emit(roundhouse::project::BuildTarget::Typescript);
+    assert!(errors.is_empty(), "{errors:?}");
+    let install = Command::new("npm").args(["install", "--silent", "--no-audit", "--no-fund"]).current_dir(&*emitted).output().expect("run npm install");
+    assert!(install.status.success(), "{}", String::from_utf8_lossy(&install.stderr));
+    let output = Command::new("./node_modules/.bin/tsx")
+        .args(["--test", "test/probes_controller.test.ts"])
+        .current_dir(&*emitted)
+        .output()
+        .expect("run tsx --test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success() && stdout.contains("pass 1"), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+}
+
+/// #1890: a record handed to a route helper inside an output
+/// expression renders as Rails 8.1.4 does
+/// (`nested_route_helper_record::VIEW`).
+#[test]
+#[ignore]
+fn nested_route_helper_record_renders() {
+    let (emitted, errors) = nested_route_helper_record::strict_app().0.emit(roundhouse::project::BuildTarget::Typescript);
+    assert!(errors.is_empty(), "{errors:?}");
+    let install = Command::new("npm").args(["install", "--silent", "--no-audit", "--no-fund"]).current_dir(&*emitted).output().expect("run npm install");
+    assert!(install.status.success(), "{}", String::from_utf8_lossy(&install.stderr));
+    let output = Command::new("./node_modules/.bin/tsx")
+        .args(["--test", "test/probes_controller.test.ts"])
+        .current_dir(&*emitted)
+        .output()
+        .expect("run tsx --test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success() && stdout.contains("pass 1"), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+}
+
+/// A template local assigned from the ivar of its own name renders as
+/// Rails 8.1.4 does (`ivar_named_local::VIEW`).
+#[test]
+#[ignore]
+fn ivar_named_local_renders() {
+    let (emitted, errors) = ivar_named_local::strict_app().emit(roundhouse::project::BuildTarget::Typescript);
+    assert!(errors.is_empty(), "{errors:?}");
+    let install = Command::new("npm").args(["install", "--silent", "--no-audit", "--no-fund"]).current_dir(&*emitted).output().expect("run npm install");
+    assert!(install.status.success(), "{}", String::from_utf8_lossy(&install.stderr));
+    let output = Command::new("./node_modules/.bin/tsx")
+        .args(["--test", "test/probes_controller.test.ts"])
+        .current_dir(&*emitted)
+        .output()
+        .expect("run tsx --test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success() && stdout.contains("pass 1"), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+}
+
+/// #1909: a record as an `if` condition renders as Rails 8.1.4 does
+/// (`record_if_condition::VIEW`).
+#[test]
+#[ignore]
+fn record_if_condition_renders() {
+    let (emitted, errors) = record_if_condition::strict_app().emit(roundhouse::project::BuildTarget::Typescript);
+    assert!(errors.is_empty(), "{errors:?}");
+    let install = Command::new("npm").args(["install", "--silent", "--no-audit", "--no-fund"]).current_dir(&*emitted).output().expect("run npm install");
+    assert!(install.status.success(), "{}", String::from_utf8_lossy(&install.stderr));
+    let output = Command::new("./node_modules/.bin/tsx")
+        .args(["--test", "test/probes_controller.test.ts"])
+        .current_dir(&*emitted)
+        .output()
+        .expect("run tsx --test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success() && stdout.contains("pass 1"), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+}
+
+/// #1898: a record in a local the template assigns, handed to
+/// `link_to`'s url helper, renders as Rails 8.1.4 does
+/// (`link_to_template_local::VIEW`).
+#[test]
+#[ignore]
+fn link_to_template_local_renders() {
+    let (emitted, errors) = link_to_template_local::strict_app().emit(roundhouse::project::BuildTarget::Typescript);
+    assert!(errors.is_empty(), "{errors:?}");
+    let install = Command::new("npm").args(["install", "--silent", "--no-audit", "--no-fund"]).current_dir(&*emitted).output().expect("run npm install");
+    assert!(install.status.success(), "{}", String::from_utf8_lossy(&install.stderr));
+    let output = Command::new("./node_modules/.bin/tsx")
+        .args(["--test", "test/probes_controller.test.ts"])
+        .current_dir(&*emitted)
+        .output()
+        .expect("run tsx --test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success() && stdout.contains("pass 1"), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+}
+
+/// #1910: a block with no parameter renders as Rails 8.1.4 does
+/// (`each_no_param::VIEW`).
+#[test]
+#[ignore]
+fn each_no_param_renders() {
+    let (emitted, errors) = each_no_param::strict_app().emit(roundhouse::project::BuildTarget::Typescript);
+    assert!(errors.is_empty(), "{errors:?}");
+    let install = Command::new("npm").args(["install", "--silent", "--no-audit", "--no-fund"]).current_dir(&*emitted).output().expect("run npm install");
+    assert!(install.status.success(), "{}", String::from_utf8_lossy(&install.stderr));
+    let output = Command::new("./node_modules/.bin/tsx")
+        .args(["--test", "test/probes_controller.test.ts"])
+        .current_dir(&*emitted)
+        .output()
+        .expect("run tsx --test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success() && stdout.contains("pass 1"), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+}
+
+/// An empty `map` block maps each element to nil, as Rails 8.1.4
+/// does (`each_no_param::EMPTY_MAP_VIEW`).
+#[test]
+#[ignore]
+fn each_no_param_empty_map_renders() {
+    let (emitted, errors) = each_no_param::strict_empty_map_app().emit(roundhouse::project::BuildTarget::Typescript);
+    assert!(errors.is_empty(), "{errors:?}");
+    let install = Command::new("npm").args(["install", "--silent", "--no-audit", "--no-fund"]).current_dir(&*emitted).output().expect("run npm install");
+    assert!(install.status.success(), "{}", String::from_utf8_lossy(&install.stderr));
+    let output = Command::new("./node_modules/.bin/tsx")
+        .args(["--test", "test/probes_controller.test.ts"])
+        .current_dir(&*emitted)
+        .output()
+        .expect("run tsx --test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success() && stdout.contains("pass 1"), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+}
+
+/// #1921: an `unless` with no `else` in a view renders as Rails 8.1.4
+/// does (`view_unless_no_else::VIEW`).
+#[test]
+#[ignore]
+fn view_unless_no_else_renders() {
+    let (emitted, errors) = view_unless_no_else::strict_app().emit(roundhouse::project::BuildTarget::Typescript);
+    assert!(errors.is_empty(), "{errors:?}");
+    let install = Command::new("npm").args(["install", "--silent", "--no-audit", "--no-fund"]).current_dir(&*emitted).output().expect("run npm install");
+    assert!(install.status.success(), "{}", String::from_utf8_lossy(&install.stderr));
+    let output = Command::new("./node_modules/.bin/tsx")
+        .args(["--test", "test/probes_controller.test.ts"])
+        .current_dir(&*emitted)
+        .output()
+        .expect("run tsx --test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success() && stdout.contains("pass 1"), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+}
+
+/// #1937: a view reading a nullable string column with `==`, `!=`,
+/// `empty?` and `length` renders as Rails 8.1.4 does
+/// (`nilable_string_view::VIEW`).
+#[test]
+#[ignore]
+fn nilable_string_view_renders() {
+    let (emitted, errors) = nilable_string_view::strict_app().emit(roundhouse::project::BuildTarget::Typescript);
+    assert!(errors.is_empty(), "{errors:?}");
+    let install = Command::new("npm").args(["install", "--silent", "--no-audit", "--no-fund"]).current_dir(&*emitted).output().expect("run npm install");
+    assert!(install.status.success(), "{}", String::from_utf8_lossy(&install.stderr));
+    let output = Command::new("./node_modules/.bin/tsx")
+        .args(["--test", "test/probes_controller.test.ts"])
+        .current_dir(&*emitted)
+        .output()
+        .expect("run tsx --test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success() && stdout.contains("pass 1"), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+}
+
+/// #1937: `==` and `!=` on a nullable string column evaluate each
+/// operand once, left then right, as Rails 8.1.4 does
+/// (`nilable_string_view::EFFECT_VIEW`, title present).
+#[test]
+#[ignore]
+fn nilable_string_view_effect_renders() {
+    let (emitted, errors) = nilable_string_view::strict_effect_app().emit(roundhouse::project::BuildTarget::Typescript);
+    assert!(errors.is_empty(), "{errors:?}");
+    let install = Command::new("npm").args(["install", "--silent", "--no-audit", "--no-fund"]).current_dir(&*emitted).output().expect("run npm install");
+    assert!(install.status.success(), "{}", String::from_utf8_lossy(&install.stderr));
+    let output = Command::new("./node_modules/.bin/tsx")
+        .args(["--test", "test/probes_controller.test.ts"])
+        .current_dir(&*emitted)
+        .output()
+        .expect("run tsx --test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success() && stdout.contains("pass 1"), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+}
+
+/// #1937: with the column nil, `==` and `!=` render as Rails 8.1.4
+/// does (`nilable_string_view::NIL_VIEW`).
+#[test]
+#[ignore]
+fn nilable_string_view_nil_renders() {
+    let (emitted, errors) = nilable_string_view::strict_nil_app().emit(roundhouse::project::BuildTarget::Typescript);
+    assert!(errors.is_empty(), "{errors:?}");
+    let install = Command::new("npm").args(["install", "--silent", "--no-audit", "--no-fund"]).current_dir(&*emitted).output().expect("run npm install");
+    assert!(install.status.success(), "{}", String::from_utf8_lossy(&install.stderr));
+    let output = Command::new("./node_modules/.bin/tsx")
+        .args(["--test", "test/probes_controller.test.ts"])
+        .current_dir(&*emitted)
+        .output()
+        .expect("run tsx --test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success() && stdout.contains("pass 1"), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+}
+
+/// #1937: the same operands with a nil title: the right operand still
+/// runs, as in Rails 8.1.4 (`nilable_string_view::EFFECT_VIEW`).
+#[test]
+#[ignore]
+fn nilable_string_view_nil_effect_renders() {
+    let (emitted, errors) = nilable_string_view::strict_nil_effect_app().emit(roundhouse::project::BuildTarget::Typescript);
+    assert!(errors.is_empty(), "{errors:?}");
+    let install = Command::new("npm").args(["install", "--silent", "--no-audit", "--no-fund"]).current_dir(&*emitted).output().expect("run npm install");
+    assert!(install.status.success(), "{}", String::from_utf8_lossy(&install.stderr));
+    let output = Command::new("./node_modules/.bin/tsx")
+        .args(["--test", "test/probes_controller.test.ts"])
+        .current_dir(&*emitted)
+        .output()
+        .expect("run tsx --test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success() && stdout.contains("pass 1"), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+}
+
+/// #1946: `each` runs a receiver with an effect once, as Rails 8.1.4
+/// does (`each_receiver_once::VIEW`).
+#[test]
+#[ignore]
+fn each_receiver_once_renders() {
+    let (emitted, errors) = each_receiver_once::strict_app().emit(roundhouse::project::BuildTarget::Typescript);
+    assert!(errors.is_empty(), "{errors:?}");
+    let install = Command::new("npm").args(["install", "--silent", "--no-audit", "--no-fund"]).current_dir(&*emitted).output().expect("run npm install");
+    assert!(install.status.success(), "{}", String::from_utf8_lossy(&install.stderr));
+    let output = Command::new("./node_modules/.bin/tsx")
+        .args(["--test", "test/probes_controller.test.ts"])
+        .current_dir(&*emitted)
+        .output()
+        .expect("run tsx --test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success() && stdout.contains("pass 1"), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+}
+
+/// #1949: `join` reads a nil element as an empty string, as Rails 8.1.4
+/// does (`join_nil::VIEW`).
+#[test]
+#[ignore]
+fn join_nil_renders() {
+    let (emitted, errors) = join_nil::strict_app().emit(roundhouse::project::BuildTarget::Typescript);
+    assert!(errors.is_empty(), "{errors:?}");
+    let install = Command::new("npm").args(["install", "--silent", "--no-audit", "--no-fund"]).current_dir(&*emitted).output().expect("run npm install");
+    assert!(install.status.success(), "{}", String::from_utf8_lossy(&install.stderr));
+    let output = Command::new("./node_modules/.bin/tsx")
+        .args(["--test", "test/probes_controller.test.ts"])
+        .current_dir(&*emitted)
+        .output()
+        .expect("run tsx --test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success() && stdout.contains("pass 1"), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
 }

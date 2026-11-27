@@ -7,6 +7,10 @@
 //! virtuals; the constructor now routes the same ones. Answers are
 //! activerecord 8.1.4's (`rails_answers_the_table`).
 
+#[path = "support/prerequisite.rs"]
+mod prerequisite;
+#[path = "support/scratch.rs"]
+mod scratch;
 #[path = "support/emit_and_run.rs"]
 #[allow(dead_code)]
 mod emit_and_run;
@@ -78,7 +82,7 @@ fn strict_targets_emit_the_constructor() {
 fn rails_answers_the_table() {
     let probe = r#"gem "activerecord", "8.1.4"; require "active_record"; require "sqlite3""#;
     if !Command::new("ruby").args(["-e", probe]).status().is_ok_and(|s| s.success()) {
-        eprintln!("skipping: ruby with activerecord 8.1.4 and sqlite3 not available");
+        prerequisite::missing("ruby with activerecord 8.1.4 and sqlite3 not available");
         return;
     }
     let script = format!(
@@ -172,7 +176,7 @@ fn rails_refuses_a_private_writer_key() {
 fn rails_refuses_keys(model: &str, keys: &[&str]) {
     let probe = r#"gem "activerecord", "8.1.4"; require "active_record"; require "sqlite3""#;
     if !Command::new("ruby").args(["-e", probe]).status().is_ok_and(|s| s.success()) {
-        eprintln!("skipping: ruby with activerecord 8.1.4 and sqlite3 not available");
+        prerequisite::missing("ruby with activerecord 8.1.4 and sqlite3 not available");
         return;
     }
     let keys = keys.iter().map(|k| format!(":{k}")).collect::<Vec<_>>().join(", ");
@@ -227,8 +231,7 @@ const PRIVATE_ATTR_FORMS: [(&str, &str); 3] = [
 #[test]
 fn a_private_attr_writer_is_refused_at_ingest() {
     for (key, model) in PRIVATE_ATTR_FORMS {
-        let root = std::env::temp_dir().join(format!("roundhouse-private-attr-{}-{key}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = scratch::dir(&format!("roundhouse-private-attr-{key}"));
         for (path, body) in [
             ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n"),
             ("app/models/member.rb", model),
@@ -302,7 +305,7 @@ fn an_operator_method_is_not_a_writer() {
 fn rails_answers_the_operator_script() {
     let probe = r#"gem "activerecord", "8.1.4"; require "active_record"; require "sqlite3""#;
     if !Command::new("ruby").args(["-e", probe]).status().is_ok_and(|s| s.success()) {
-        eprintln!("skipping: ruby with activerecord 8.1.4 and sqlite3 not available");
+        prerequisite::missing("ruby with activerecord 8.1.4 and sqlite3 not available");
         return;
     }
     let script = format!(

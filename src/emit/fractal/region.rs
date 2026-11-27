@@ -140,11 +140,14 @@ pub fn find<'app>(app: &'app App, selection: &Selection, file: FileId, path: &st
     let parsed = ruby_prism::parse(source.text.as_bytes());
     let mut finder = Finder { file, selection, singletons: Vec::new(), found: Vec::new() };
     finder.visit(&parsed.node());
+    // Each region's line, from the file's line index built once: `line_col`
+    // alone counts the newlines from the top of the file for every `def`.
+    let index = source.line_index();
     let mut regions: Vec<Region<'app>> = finder
         .found
         .into_iter()
         .map(|found| {
-            let (line, _) = source.line_col(found.definition_span.start);
+            let (line, _) = index.line_col(found.definition_span.start);
             let copies: Vec<Analyzed<'app>> =
                 analyzed.get(&found.name_span).map(|methods| methods.iter().map(|method| method.view()).collect()).unwrap_or_default();
             let knowledge = Knowledge::of(&copies);

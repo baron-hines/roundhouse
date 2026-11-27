@@ -95,12 +95,16 @@ pub fn apply_route_url_options_lowering(app: &mut App) {
     if helpers.is_empty() {
         return;
     }
+    bare_url_helper_receivers(app, &helpers);
     let params = helper_path_params(app);
     super::for_each_hook_body(app, &mut |e| position_path_params(e, &params));
     for view in &mut app.views {
         position_path_params(&mut view.body, &params);
     }
-    super::for_each_hook_body(app, &mut |e| rewrite(e, &helpers));
+    let own_options = classes_with_own_url_options(app);
+    super::for_each_owned_hook_body(app, &mut |owner, e| {
+        rewrite_owned(e, &helpers, owner.is_some_and(|o| own_options.contains(o)))
+    });
     for view in &mut app.views {
         rewrite(&mut view.body, &helpers);
     }
@@ -117,6 +121,56 @@ pub fn apply_route_url_options_lowering(app: &mut App) {
         for m in &mut tm.helpers {
             rewrite(&mut m.body, &helpers);
         }
+    }
+}
+
+/// `UrlHelpers.admin_export_download_url(token: t, filename: f, host: h)`
+/// is the bare helper call: a class that singleton-includes
+/// `Rails.application.routes.url_helpers` (the include is recorded as
+/// RouteHelpers, Core's `UrlHelpers`) answers every named route helper, so
+/// the receiver adds nothing. Dropping it hands the call to the passes
+/// below that spell path params positionally and ground `host:` /
+/// `protocol:`; left qualified, the emit retargeted it to `RouteHelpers`
+/// afterwards and the keyword path params reached a positional helper.
+pub(crate) fn bare_url_helper_receivers(app: &mut App, helpers: &crate::det::HashSet<String>) {
+    let classes: crate::det::HashSet<Symbol> = app
+        .library_classes
+        .iter()
+        .filter(|lc| lc.includes.iter().any(|i| i.0.as_str() == "RouteHelpers"))
+        .map(|lc| lc.name.0.clone())
+        .collect();
+    if classes.is_empty() {
+        return;
+    }
+    let strip = &mut |e: &mut Expr| strip_receivers(e, &classes, helpers);
+    super::for_each_hook_body(app, strip);
+    for view in &mut app.views {
+        strip_receivers(&mut view.body, &classes, helpers);
+    }
+    for tm in &mut app.test_modules {
+        if let Some(setup) = &mut tm.setup {
+            strip_receivers(setup, &classes, helpers);
+        }
+        for t in &mut tm.tests {
+            strip_receivers(&mut t.body, &classes, helpers);
+        }
+        for m in &mut tm.helpers {
+            strip_receivers(&mut m.body, &classes, helpers);
+        }
+    }
+}
+
+fn strip_receivers(
+    expr: &mut Expr,
+    classes: &crate::det::HashSet<Symbol>,
+    helpers: &crate::det::HashSet<String>,
+) {
+    expr.node.for_each_child_mut(&mut |c| strip_receivers(c, classes, helpers));
+    let ExprNode::Send { recv, method, .. } = &mut *expr.node else { return };
+    let Some(r) = recv else { return };
+    let ExprNode::Const { path } = &*r.node else { return };
+    if path.len() == 1 && classes.contains(&path[0]) && helpers.contains(method.as_str()) {
+        *recv = None;
     }
 }
 
@@ -166,6 +220,12 @@ pub(crate) fn rewrite_position_node(
     };
     let Some(names) = params.get(method.as_str()) else { return };
     let Some(last) = args.last() else { return };
+    let is_url = method.as_str().ends_with("_url");
+    if let Some(spread) = splat_options(last, args.len() - 1, names, is_url) {
+        args.pop();
+        args.extend(spread);
+        return;
+    }
     if let Some(spread) = spread_options_local(last, args.len() - 1, names) {
         args.pop();
         args.extend(spread);
@@ -195,6 +255,187 @@ pub(crate) fn rewrite_position_node(
     if !entries.is_empty() {
         args.push(Expr::new(last.span, ExprNode::Hash { entries, kwargs: true }));
     }
+}
+
+/// One link of an erased `**` chain: literal pairs, or a hash read.
+enum SplatPart<'a> {
+    Pairs(&'a [(Expr, Expr)]),
+    Spread(&'a Expr),
+}
+
+/// The links of `{ origin: o, **options }` — the `merge` chain the
+/// ingest desugar made of it — or of a lone Hash-typed local. `None`
+/// for anything else, so a record argument is never read as a splat.
+fn splat_parts(arg: &Expr, top: bool) -> Option<Vec<SplatPart<'_>>> {
+    match &*arg.node {
+        ExprNode::Var { .. } | ExprNode::Ivar { .. } => {
+            // A bare read is a splat only when it is a Hash: inside a
+            // chain `merge` already says so, standing alone the type
+            // must (a model local is a record, not options).
+            if top && !matches!(&arg.ty, Some(crate::ty::Ty::Hash { .. })) {
+                return None;
+            }
+            Some(vec![SplatPart::Spread(arg)])
+        }
+        ExprNode::Hash { entries, .. } if !top => Some(vec![SplatPart::Pairs(entries)]),
+        ExprNode::Send { recv: Some(base), method, args, block: None, .. }
+            if method.as_str() == "merge" && args.len() == 1 =>
+        {
+            let mut parts = splat_parts(base, false)?;
+            parts.extend(splat_parts(&args[0], false)?);
+            Some(parts)
+        }
+        _ => None,
+    }
+}
+
+fn sym_key(key: &str, span: crate::span::Span) -> Expr {
+    Expr::new(span, ExprNode::Lit { value: Literal::Sym { value: Symbol::from(key) } })
+}
+
+/// `admin_export_download_url(**options)` where `options` holds the
+/// path params (`token:`, `filename:`) and the host: Rails fills a
+/// segment from an option hash as readily as from a positional
+/// argument, and Core's `CsvOutputCollector.download_url` builds one
+/// hash for two route helpers. The generated helper takes segments
+/// positionally, and the splat reached it as keywords it does not
+/// have.
+///
+/// Each segment slot the call left open is read off the chain
+/// (`options[:token]`; an earlier literal pair becomes the default,
+/// `options.fetch(:origin, o)`, since a later `**` wins as in Ruby).
+/// A `_url` spelling also reads `host:` and `protocol:` off it, which
+/// the host pass below turns into the absolute URL. Whatever the chain
+/// holds beyond the segments and the host options is the query, handed
+/// on as `params:` for `RouteHelpers.query_suffix`.
+///
+/// `anchor:` out of a splat is dropped, not rendered: it is a
+/// fragment, the query is not, and no Core call site puts one there.
+/// Ruby's `**` raises for a missing required key; the read here is nil.
+///
+/// Declines when the helper has no segments left to fill and is a
+/// `_path` (the existing trailing-splat rendering owns that), and for a
+/// lone Hash local that the older [`spread_options_local`] handles
+/// exactly — unless the helper is a `_url`, which needs the host.
+fn splat_options(arg: &Expr, index: usize, names: &[String], is_url: bool) -> Option<Vec<Expr>> {
+    let parts = splat_parts(arg, true)?;
+    let chain = matches!(&*arg.node, ExprNode::Send { .. });
+    let lone = !chain;
+    if index > names.len() || (index == names.len() && !is_url) {
+        return None;
+    }
+    if lone && !is_url && index != 0 {
+        return None;
+    }
+    let span = arg.span;
+    let value_ty = match &arg.ty {
+        Some(crate::ty::Ty::Hash { value, .. }) => Some((**value).clone()),
+        _ => None,
+    };
+    let read_ty = |e: &mut Expr| {
+        if let Some(v) = &value_ty {
+            e.ty = Some(crate::ty::Ty::Union { variants: vec![v.clone(), crate::ty::Ty::Nil].into() });
+        }
+    };
+    let key_of = |k: &Expr| match &*k.node {
+        ExprNode::Lit { value: Literal::Sym { value } } => Some(value.as_str().to_string()),
+        _ => None,
+    };
+    let send = |recv: &Expr, method: &str, args: Vec<Expr>| {
+        Expr::new(
+            span,
+            ExprNode::Send {
+                recv: Some(recv.clone()),
+                method: Symbol::from(method),
+                args,
+                block: None,
+                parenthesized: true,
+            },
+        )
+    };
+    // The value the chain gives `key`: last writer wins.
+    let read = |key: &str| -> Option<Expr> {
+        let mut acc: Option<Expr> = None;
+        for part in &parts {
+            match part {
+                SplatPart::Pairs(entries) => {
+                    if let Some((_, v)) = entries.iter().rev().find(|(k, _)| key_of(k).as_deref() == Some(key)) {
+                        acc = Some(v.clone());
+                    }
+                }
+                SplatPart::Spread(h) => {
+                    acc = Some(match acc.take() {
+                        None => {
+                            let mut e = send(h, "[]", vec![sym_key(key, span)]);
+                            read_ty(&mut e);
+                            e
+                        }
+                        Some(default) => send(h, "fetch", vec![sym_key(key, span), default]),
+                    });
+                }
+            }
+        }
+        acc
+    };
+    let nil = || Expr::new(span, ExprNode::Lit { value: Literal::Nil });
+    let mut out: Vec<Expr> = names[index..].iter().map(|n| read(n).unwrap_or_else(nil)).collect();
+    let mut kwargs: Vec<(Expr, Expr)> = Vec::new();
+    if is_url {
+        for key in ["host", "protocol"] {
+            if let Some(v) = read(key) {
+                kwargs.push((sym_key(key, span), v));
+            }
+        }
+    }
+    // The query: every key that is neither a segment nor reserved.
+    let reserved = |k: &str| {
+        names.iter().any(|n| n == k) || k == "anchor" || k == "params" || k == "format"
+            || HOST_ONLY_OPTIONS.contains(&k)
+    };
+    let has_spread = parts.iter().any(|p| matches!(p, SplatPart::Spread(_)));
+    let mut literal_query: Vec<(Expr, Expr)> = Vec::new();
+    for part in &parts {
+        if let SplatPart::Pairs(entries) = part {
+            for (k, v) in entries.iter() {
+                if key_of(k).is_some_and(|k| !reserved(&k)) {
+                    literal_query.push((k.clone(), v.clone()));
+                }
+            }
+        }
+    }
+    if !has_spread {
+        kwargs.extend(literal_query);
+    } else {
+        let excluded: Vec<Expr> = names
+            .iter()
+            .map(String::as_str)
+            .chain(["anchor", "params", "format"])
+            .chain(HOST_ONLY_OPTIONS.iter().copied())
+            .map(|k| sym_key(k, span))
+            .collect();
+        let mut rest: Option<Expr> = None;
+        for part in &parts {
+            let piece = match part {
+                SplatPart::Spread(h) => send(h, "except", excluded.clone()),
+                SplatPart::Pairs(_) => continue,
+            };
+            rest = Some(match rest {
+                None => piece,
+                Some(acc) => send(&acc, "merge", vec![piece]),
+            });
+        }
+        let mut rest = rest?;
+        if !literal_query.is_empty() {
+            let lit = Expr::new(span, ExprNode::Hash { entries: literal_query, kwargs: false });
+            rest = send(&lit, "merge", vec![rest]);
+        }
+        rest.ty = arg.ty.clone();
+        kwargs.push((sym_key("params", span), rest));
+    }
+    if !kwargs.is_empty() {
+        out.push(Expr::new(span, ExprNode::Hash { entries: kwargs, kwargs: true }));
+    }
+    Some(out)
 }
 
 /// `story_short_id_path(story, options)` where `options` is a local
@@ -242,13 +483,62 @@ fn spread_options_local(arg: &Expr, index: usize, names: &[String]) -> Option<Ve
 }
 
 fn rewrite(expr: &mut Expr, helpers: &crate::det::HashSet<String>) {
-    expr.node.for_each_child_mut(&mut |c| rewrite(c, helpers));
-    rewrite_node(expr, helpers);
+    rewrite_owned(expr, helpers, false);
+}
+
+/// The classes that define `default_url_options` themselves: their bare `_url` calls take that host
+/// (`emit::ruby::library::url_for_own_options`).
+pub(crate) fn classes_with_own_url_options(app: &App) -> crate::det::HashSet<crate::ident::ClassId> {
+    // Not either side for every call: a `class << self` that includes the url helpers (lobsters' Routes) defines its
+    // own there, and an instance method's call would then read a `default_url_options` its side lacks.
+    fn owns(methods: &[&crate::dialect::MethodDef]) -> bool {
+        let sides: Vec<&crate::dialect::MethodReceiver> =
+            methods.iter().filter(|m| m.name.as_str() == "default_url_options").map(|m| &m.receiver).collect();
+        !sides.is_empty() && methods.iter().all(|m| sides.contains(&&m.receiver) || !calls_url_with_options(&m.body))
+    }
+    let mut out = crate::det::HashSet::default();
+    for lc in &app.library_classes {
+        if owns(&lc.methods.iter().collect::<Vec<_>>()) {
+            out.insert(lc.name.clone());
+        }
+    }
+    for m in &app.models {
+        if owns(&m.methods().collect::<Vec<_>>()) {
+            out.insert(m.name.clone());
+        }
+    }
+    for c in &app.controllers {
+        if c.actions().any(|a| a.name.as_str() == "default_url_options") {
+            out.insert(c.name.clone());
+        }
+    }
+    out
+}
+
+fn calls_url_with_options(e: &Expr) -> bool {
+    if let ExprNode::Send { recv: None, method, args, .. } = &*e.node
+        && method.as_str().ends_with("_url")
+        && args.last().is_some_and(|a| matches!(&*a.node, ExprNode::Hash { kwargs: true, .. }))
+    {
+        return true;
+    }
+    let mut found = false;
+    e.node.for_each_child(&mut |c| found = found || calls_url_with_options(c));
+    found
+}
+
+fn rewrite_owned(expr: &mut Expr, helpers: &crate::det::HashSet<String>, own_url_options: bool) {
+    expr.node.for_each_child_mut(&mut |c| rewrite_owned(c, helpers, own_url_options));
+    rewrite_owned_node(expr, helpers, own_url_options);
 }
 
 pub(crate) fn rewrite_node(expr: &mut Expr, helpers: &crate::det::HashSet<String>) {
+    rewrite_owned_node(expr, helpers, false);
+}
+
+pub(crate) fn rewrite_owned_node(expr: &mut Expr, helpers: &crate::det::HashSet<String>, own_url_options: bool) {
     ground_symbol_query_values(expr, helpers);
-    let Some((stem, host, protocol)) = strip_host_options(expr, helpers) else {
+    let Some((stem, host, protocol)) = strip_host_options(expr, helpers, own_url_options) else {
         return;
     };
     let span = expr.span;
@@ -274,8 +564,33 @@ pub(crate) fn rewrite_node(expr: &mut Expr, helpers: &crate::det::HashSet<String
     // we accept only the first.
     // Without one, the scheme is the request's, as Rails' `url_for`
     // takes it — `Rails.application.protocol` carries its own `://`.
+    // A value read off a `**` hash (`options[:protocol]`) is nil where
+    // the hash lacks the key, which Ruby's `**` would not have passed at
+    // all: it then falls back as an omitted keyword does.
     let mut parts: Vec<InterpPart> = Vec::new();
     match protocol {
+        Some(p) if hash_read(&p) => parts.push(InterpPart::Expr {
+            expr: nil_or(
+                p.clone(),
+                crate::lower::view_to_library::rails_application_call("protocol"),
+                Expr::new(
+                    span,
+                    ExprNode::StringInterp {
+                        parts: vec![
+                            InterpPart::Expr { expr: p },
+                            InterpPart::Text { value: "://".to_string() },
+                        ],
+                    },
+                ),
+            ),
+        }),
+        // Not `"https://://"`: Rails' `normalize_protocol` drops a written `://` or `:`.
+        Some(p) if matches!(&*p.node, ExprNode::Lit { value: Literal::Str { .. } }) => {
+            let ExprNode::Lit { value: Literal::Str { value } } = &*p.node else { unreachable!() };
+            let scheme = value.trim_end_matches("//").trim_end_matches(':');
+            // Not `://host`: Rails writes `"//"` as a protocol-relative URL.
+            parts.push(InterpPart::Text { value: if scheme.is_empty() { "//".to_string() } else { format!("{scheme}://") } });
+        }
         Some(p) => {
             parts.push(InterpPart::Expr { expr: p });
             parts.push(InterpPart::Text { value: "://".to_string() });
@@ -284,10 +599,38 @@ pub(crate) fn rewrite_node(expr: &mut Expr, helpers: &crate::det::HashSet<String
             expr: crate::lower::view_to_library::rails_application_call("protocol"),
         }),
     }
+    let host = match host {
+        Some(h) if hash_read(&h) => nil_or(h.clone(), crate::lower::view_to_library::rails_application_call("domain"), h),
+        Some(h) => h,
+        None => crate::lower::view_to_library::rails_application_call("domain"),
+    };
     parts.push(InterpPart::Expr { expr: host });
     parts.push(InterpPart::Expr { expr: path_call });
     *expr.node = ExprNode::StringInterp { parts };
     expr.ty = Some(crate::ty::Ty::Str);
+}
+
+/// `h[:key]`: a read that is nil where the hash lacks the key.
+fn hash_read(e: &Expr) -> bool {
+    matches!(&*e.node, ExprNode::Send { recv: Some(_), method, args, block: None, .. }
+        if method.as_str() == "[]"
+            && matches!(args.as_slice(), [k] if matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { .. } })))
+}
+
+/// `value.nil? ? fallback : present`.
+fn nil_or(value: Expr, fallback: Expr, present: Expr) -> Expr {
+    let span = value.span;
+    let mut cond = Expr::new(
+        span,
+        ExprNode::Send { recv: Some(value), method: Symbol::from("nil?"), args: vec![], block: None, parenthesized: false },
+    );
+    // This pass runs after the body typer, so nothing else will type the
+    // synthesized send; left untyped under a typed receiver it reads as
+    // a dispatch failure (`no known method nil? on Integer?`).
+    cond.ty = Some(crate::ty::Ty::Bool);
+    let mut out = Expr::new(span, ExprNode::If { cond, then_branch: fallback, else_branch: present });
+    out.ty = Some(crate::ty::Ty::Str);
+    out
 }
 
 /// `x_path(size: :small)` → `x_path(size: "small")`. A query value
@@ -325,7 +668,8 @@ fn ground_symbol_query_values(expr: &mut Expr, helpers: &crate::det::HashSet<Str
 fn strip_host_options(
     expr: &mut Expr,
     helpers: &crate::det::HashSet<String>,
-) -> Option<(String, Expr, Option<Expr>)> {
+    own_url_options: bool,
+) -> Option<(String, Option<Expr>, Option<Expr>)> {
     let ExprNode::Send { recv, method, args, block: None, .. } = &mut *expr.node else {
         return None;
     };
@@ -375,6 +719,28 @@ fn strip_host_options(
             _ => {}
         }
     }
+    // Not stripped in a class with its own `default_url_options`: a call naming no host takes the class's, and the
+    // emitter's `url_for_own_options` reads the protocol off the call.
+    // Only a protocol and a port: `url_from_path` and `url_for_own_options` take those two, and any other host option
+    // left on the call reached the path helper as an argument.
+    let path_off = |k: &Expr, v: &Expr| {
+        matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "only_path")
+            && matches!(&*v.node, ExprNode::Lit { value: Literal::Bool { value: false } })
+    };
+    let only_protocol = entries.iter().all(|(k, v)| {
+        path_off(k, v)
+            || !matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } }
+                if HOST_ONLY_OPTIONS.contains(&value.as_str()) && value.as_str() != "protocol" && value.as_str() != "port")
+    });
+    if own_url_options && !chained && host.is_none() && !only_path && only_protocol && method.as_str().ends_with("_url") {
+        // Not left on the call: `url_for_own_options` takes only the protocol and port off it, and an
+        // `only_path: false` reached the path helper as an argument.
+        entries.retain(|(k, v)| !path_off(k, v));
+        if entries.is_empty() {
+            args.pop();
+        }
+        return None;
+    }
     entries.retain(|(k, _)| {
         !matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } }
             if HOST_ONLY_OPTIONS.contains(&value.as_str()))
@@ -407,5 +773,10 @@ fn strip_host_options(
     // what `emit::ruby::library::rewrite_url_helpers_absolute` builds
     // for the explicit `…routes.url_helpers.x_url(…, host:)` chain.
     // Two spellings, one rendering.
-    Some((stem.to_string(), host?, protocol))
+    // Not any protocol alone: only a literal one, normalized below; a run-time value (nil, `false`, "https://") stays as it was.
+    let literal_protocol = protocol.as_ref().is_some_and(|p| matches!(&*p.node, ExprNode::Lit { value: Literal::Str { .. } }));
+    if host.is_none() && !literal_protocol {
+        return None;
+    }
+    Some((stem.to_string(), host, protocol))
 }

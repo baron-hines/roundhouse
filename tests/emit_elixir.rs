@@ -125,3 +125,34 @@ fn save_primary_key_guards_are_folded_before_functionalization() {
         }
     }
 }
+
+/// Elixir has no `while`: `while_to_recursion` turns a counter loop into a
+/// recursive helper, and a loop outside its shape is emitted as a `raise`.
+/// The shared runtime's view helpers all take that shape.
+#[test]
+fn view_helper_loops_lower_to_recursion() {
+    let mut app = ingest_app(Path::new("fixtures/real-blog")).expect("ingest");
+    Analyzer::new(&app).analyze(&mut app);
+    let files = elixir::emit(&app);
+    let helpers = find(&files, "lib/view_helpers.ex");
+    assert!(!helpers.contains("While not supported"), "{}", helpers.lines().filter(|l| l.contains("not supported")).collect::<Vec<_>>().join("\n"));
+}
+
+/// `simple_format`'s two loops (#1861) take that shape too, in an app whose
+/// view calls it, so the helpers are emitted.
+#[test]
+fn simple_format_loops_lower_to_recursion() {
+    let mut app = ingest_app(Path::new("fixtures/real-blog")).expect("ingest");
+    let view = roundhouse::ingest::view::ingest_view(
+        "<%= simple_format(@article.title, { class: \"k\" }, sanitize: false) %>\n",
+        Path::new("articles/notes.html.erb"),
+        "app/views/articles/notes.html.erb",
+    )
+    .expect("ingest view");
+    app.views.push(view);
+    Analyzer::new(&app).analyze(&mut app);
+    let files = elixir::emit(&app);
+    let helpers = find(&files, "lib/view_helpers.ex");
+    assert!(helpers.contains("simple_format_paragraphs") && helpers.contains("simple_format_blank"), "simple_format isn't emitted:\n{helpers}");
+    assert!(!helpers.contains("While not supported"), "{}", helpers.lines().filter(|l| l.contains("not supported")).collect::<Vec<_>>().join("\n"));
+}

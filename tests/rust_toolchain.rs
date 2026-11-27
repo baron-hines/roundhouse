@@ -17,27 +17,62 @@
 //!
 //!     cargo test --test rust_toolchain -- --ignored --nocapture
 
+#[path = "support/scratch.rs"]
+mod scratch;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[path = "support/emit_and_run.rs"]
 #[allow(dead_code)]
 mod emit_and_run;
+#[path = "support/content_tag_options.rs"]
+#[allow(dead_code)]
+mod content_tag_options;
+#[path = "support/link_to_if_eval_order.rs"]
+#[allow(dead_code)]
+mod link_to_if_eval_order;
+#[path = "support/simple_format.rs"]
+mod simple_format;
+#[path = "support/link_to_computed_url.rs"]
+mod link_to_computed_url;
+#[path = "support/nested_route_helper_record.rs"]
+#[allow(dead_code)]
+mod nested_route_helper_record;
+#[path = "support/ivar_named_local.rs"]
+#[allow(dead_code)]
+mod ivar_named_local;
+#[path = "support/record_if_condition.rs"]
+#[allow(dead_code)]
+mod record_if_condition;
+#[path = "support/link_to_template_local.rs"]
+#[allow(dead_code)]
+mod link_to_template_local;
+#[path = "support/each_no_param.rs"]
+#[allow(dead_code)]
+mod each_no_param;
+#[path = "support/view_unless_no_else.rs"]
+#[allow(dead_code)]
+mod view_unless_no_else;
+#[path = "support/nilable_string_view.rs"]
+#[allow(dead_code)]
+mod nilable_string_view;
+#[path = "support/rust_bare_model.rs"]
+mod rust_bare_model;
 #[path = "support/i18n_locales_app.rs"]
 #[allow(dead_code)]
 mod i18n_locales_app;
+#[path = "support/record_slice_app.rs"]
+#[allow(dead_code)]
+mod record_slice_app;
 
 use roundhouse::emit::rust;
 use roundhouse::ingest::ingest_app;
 
 fn scratch_dir(fixture: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("roundhouse-rust-check-{fixture}"))
+    scratch::dir(&format!("roundhouse-rust-check-{fixture}"))
 }
 
 fn generate_project(fixture_path: &Path, out: &Path) {
-    if out.exists() {
-        std::fs::remove_dir_all(out).expect("clean scratch");
-    }
     std::fs::create_dir_all(out).expect("create scratch");
 
     let mut app = ingest_app(fixture_path).expect("ingest");
@@ -364,10 +399,7 @@ async fn articles_index_is_two_queries_not_n_plus_one() {
 #[test]
 #[ignore]
 fn filters_that_read_action_name_compile() {
-    let app_dir = scratch_dir("action-name-app");
-    if app_dir.exists() {
-        std::fs::remove_dir_all(&app_dir).expect("clean app copy");
-    }
+    let app_dir = scratch_dir("action-name-app").join("app");
     let copied = Command::new("cp")
         .arg("-R")
         .arg(roundhouse::fixtures::real_blog())
@@ -388,6 +420,46 @@ fn filters_that_read_action_name_compile() {
     std::fs::write(&controller, edited).expect("write controller");
 
     let scratch = scratch_dir("action-name");
+    generate_project(&app_dir, &scratch);
+    let output = Command::new("cargo")
+        .arg("check")
+        .arg("--quiet")
+        .current_dir(&scratch)
+        .output()
+        .expect("run cargo check");
+
+    assert!(
+        output.status.success(),
+        "cargo check failed on the emitted project at {}:\n\
+         \n=== stderr ===\n{}",
+        scratch.display(),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// `<%= render @articles %>` as the view's only read of `@articles`.
+/// With no defensive clone to borrow from, the emitted `iter_mut()`
+/// borrows the view param itself, so the param must be declared `mut`.
+#[test]
+#[ignore]
+fn single_read_collection_render_compiles() {
+    let app_dir = scratch_dir("single-read-render-app").join("app");
+    let copied = Command::new("cp")
+        .arg("-R")
+        .arg(roundhouse::fixtures::real_blog())
+        .arg(&app_dir)
+        .status()
+        .expect("copy real-blog");
+    assert!(copied.success(), "copy real-blog");
+    let view = app_dir.join("app/views/articles/index.html.erb");
+    let source = std::fs::read_to_string(&view).expect("read view");
+    let start = source.find("<% if @articles.any? %>").expect("collection guard");
+    let end = source[start..].find("<% end %>").expect("guard end") + start + "<% end %>".len();
+    let edited = format!("{}<%= render @articles %>{}", &source[..start], &source[end..]);
+    assert_eq!(edited.matches("@articles").count(), 1, "the view reads @articles once");
+    std::fs::write(&view, edited).expect("write view");
+
+    let scratch = scratch_dir("single-read-render");
     generate_project(&app_dir, &scratch);
     let output = Command::new("cargo")
         .arg("check")
@@ -437,6 +509,34 @@ fn i18n_locales_probe() {
     .expect("write probe");
     let output = Command::new("cargo")
         .args(["test", "--test", "i18n_probe"])
+        .current_dir(&*emitted)
+        .output()
+        .expect("run cargo test");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore]
+fn real_blog_record_slice_runs() {
+    // The answers `emit_and_run::record_slice` checks on CRuby.
+    let (emitted, errors) = record_slice_app::probe_app().emit(roundhouse::project::BuildTarget::Rust);
+    assert!(errors.is_empty(), "{errors:?}");
+    std::fs::create_dir_all(emitted.join("tests")).expect("tests dir");
+    std::fs::write(
+        emitted.join("tests/record_slice.rs"),
+        format!(
+            "use app::models::Article;\n\n#[test]\nfn sliced() {{\n    assert_eq!(Article::sliced(), {:?});\n}}\n",
+            record_slice_app::EXPECTED
+        ),
+    )
+    .expect("write probe");
+    let output = Command::new("cargo")
+        .args(["test", "--test", "record_slice"])
         .current_dir(&*emitted)
         .output()
         .expect("run cargo test");
@@ -532,4 +632,399 @@ async fn a_missing_record_is_rescued_to_404() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// A non-block `content_tag` with options renders as Rails 8.1.4 does
+/// (#1780): the app's integration test, run by `cargo test`. Rust's
+/// test emit has no `assert_includes`; the probe defines it.
+#[test]
+#[ignore]
+fn content_tag_with_options_renders() {
+    let (emitted, errors) = content_tag_options::app(content_tag_options::VIEW).emit(roundhouse::project::BuildTarget::Rust);
+    assert!(errors.is_empty(), "{errors:?}");
+    let test = emitted.join("src/tests/probes_controller_test.rs");
+    let mut source = std::fs::read_to_string(&test).expect("probes_controller_test.rs");
+    source.push_str("\nfn assert_includes(body: String, want: &str) {\n    assert!(body.contains(want), \"missing {want} in {body}\");\n}\n");
+    std::fs::write(&test, source).expect("write probe");
+    let output = Command::new("cargo")
+        .args(["test", "content_tag_renders"])
+        .current_dir(&*emitted)
+        .output()
+        .expect("run cargo test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success() && stdout.contains("content_tag_renders ... ok"), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+}
+
+/// #1711: a model with no validations, no timestamp columns, or neither
+/// builds, and the generated app's `cargo test` passes, its saving test
+/// included.
+#[test]
+#[ignore]
+fn a_model_without_validations_or_timestamps_builds_and_saves() {
+    for (validated, timestamped) in rust_bare_model::VARIANTS {
+        let (emitted, errors) = rust_bare_model::app(validated, timestamped).emit(roundhouse::project::BuildTarget::Rust);
+        assert!(errors.is_empty(), "{errors:?}");
+        let output = Command::new("cargo").arg("test").current_dir(&*emitted).output().expect("run cargo test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("an_account_saves ... ok"),
+            "validated: {validated}, timestamped: {timestamped}\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+/// `link_to_unless`'s block form with a name that is an expression, not a
+/// call (`"a" + "b"`), in a block without a parameter and in one whose
+/// parameter the block doesn't read: the no-link branch still evaluates
+/// the name, and the generated view compiles.
+#[test]
+#[ignore]
+fn a_link_to_unless_block_over_an_expression_name_compiles() {
+    let (emitted, errors) = emit_and_run::real_blog()
+        .edit(
+            "app/views/articles/index.html.erb",
+            "<% content_for :title, \"Articles\" %>\n",
+            "<% content_for :title, \"Articles\" %>\n<% t = @articles.empty? %>\n<%= link_to_unless !t, \"a\" + \"b\", \"/x\" do %>none<% end %>\n<%= link_to_unless !t, \"c\" + \"d\", \"/x\" do |name| %>none<% end %>\n",
+        )
+        .emit(roundhouse::project::BuildTarget::Rust);
+    assert!(errors.is_empty(), "{errors:?}");
+    let output = Command::new("cargo")
+        .arg("check")
+        .arg("--quiet")
+        .current_dir(&emitted)
+        .output()
+        .expect("run cargo check");
+    assert!(
+        output.status.success(),
+        "cargo check failed on the emitted project at {}:\n\n=== stderr ===\n{}",
+        emitted.display(),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// #1862: `link_to_if` / `link_to_unless` evaluate the url when no link
+/// is made, and the generated view still builds and renders as Rails
+/// (`link_to_if_eval_order::STRICT_VIEW`): the app's integration test, run by `cargo test`.
+#[test]
+#[ignore]
+fn link_to_if_evaluates_its_url_and_renders() {
+    let (emitted, errors) = content_tag_options::app_rendering(link_to_if_eval_order::STRICT_VIEW, link_to_if_eval_order::STRICT_RENDERS).emit(roundhouse::project::BuildTarget::Rust);
+    assert!(errors.is_empty(), "{errors:?}");
+    let test = emitted.join("src/tests/probes_controller_test.rs");
+    let mut source = std::fs::read_to_string(&test).expect("probes_controller_test.rs");
+    source.push_str("\nfn assert_includes(body: String, want: &str) {\n    assert!(body.contains(want), \"missing {want} in {body}\");\n}\n");
+    std::fs::write(&test, source).expect("write probe");
+    let output = Command::new("cargo")
+        .args(["test", "content_tag_renders"])
+        .current_dir(&*emitted)
+        .output()
+        .expect("run cargo test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success() && stdout.contains("content_tag_renders ... ok"), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+}
+
+/// #1861: `simple_format` with `sanitize: false` renders as Rails 8.1.4
+/// does, multibyte texts included (`simple_format::VIEW`): the app's integration test, run by `cargo test`.
+#[test]
+#[ignore]
+fn simple_format_renders() {
+    let (emitted, errors) = content_tag_options::app_rendering(simple_format::VIEW, simple_format::RENDERS).emit(roundhouse::project::BuildTarget::Rust);
+    assert!(errors.is_empty(), "{errors:?}");
+    let test = emitted.join("src/tests/probes_controller_test.rs");
+    let mut source = std::fs::read_to_string(&test).expect("probes_controller_test.rs");
+    source.push_str("\nfn assert_includes(body: String, want: &str) {\n    assert!(body.contains(want), \"missing {want} in {body}\");\n}\n");
+    std::fs::write(&test, source).expect("write probe");
+    let output = Command::new("cargo")
+        .args(["test", "content_tag_renders"])
+        .current_dir(&*emitted)
+        .output()
+        .expect("run cargo test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success() && stdout.contains("content_tag_renders ... ok"), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+}
+
+/// #1865: `link_to` with a url the template computes renders as Rails
+/// 8.1.4 does (`link_to_computed_url::VIEW`).
+#[test]
+#[ignore]
+fn link_to_computed_url_renders() {
+    let (emitted, errors) = content_tag_options::app_rendering(link_to_computed_url::VIEW, link_to_computed_url::RENDERS).emit(roundhouse::project::BuildTarget::Rust);
+    assert!(errors.is_empty(), "{errors:?}");
+    let test = emitted.join("src/tests/probes_controller_test.rs");
+    let mut source = std::fs::read_to_string(&test).expect("probes_controller_test.rs");
+    source.push_str("\nfn assert_includes(body: String, want: &str) {\n    assert!(body.contains(want), \"missing {want} in {body}\");\n}\n");
+    std::fs::write(&test, source).expect("write probe");
+    let output = Command::new("cargo")
+        .args(["test", "content_tag_renders"])
+        .current_dir(&*emitted)
+        .output()
+        .expect("run cargo test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success() && stdout.contains("content_tag_renders ... ok"), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+}
+
+/// #1890: a record handed to a route helper inside an output
+/// expression renders as Rails 8.1.4 does
+/// (`nested_route_helper_record::VIEW`).
+#[test]
+#[ignore]
+fn nested_route_helper_record_renders() {
+    let (emitted, errors) = nested_route_helper_record::strict_app().0.emit(roundhouse::project::BuildTarget::Rust);
+    assert!(errors.is_empty(), "{errors:?}");
+    let test = emitted.join("src/tests/probes_controller_test.rs");
+    let mut source = std::fs::read_to_string(&test).expect("probes_controller_test.rs");
+    source.push_str("\nfn assert_includes(body: String, want: &str) {\n    assert!(body.contains(want), \"missing {want} in {body}\");\n}\n");
+    std::fs::write(&test, source).expect("write probe");
+    let output = Command::new("cargo")
+        .args(["test", "content_tag_renders"])
+        .current_dir(&*emitted)
+        .output()
+        .expect("run cargo test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success() && stdout.contains("content_tag_renders ... ok"), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+}
+
+/// A template local assigned from the ivar of its own name renders as
+/// Rails 8.1.4 does (`ivar_named_local::VIEW`).
+#[test]
+#[ignore]
+fn ivar_named_local_renders() {
+    let (emitted, errors) = ivar_named_local::strict_app().emit(roundhouse::project::BuildTarget::Rust);
+    assert!(errors.is_empty(), "{errors:?}");
+    let test = emitted.join("src/tests/probes_controller_test.rs");
+    let mut source = std::fs::read_to_string(&test).expect("probes_controller_test.rs");
+    source.push_str("\nfn assert_includes(body: String, want: &str) {\n    assert!(body.contains(want), \"missing {want} in {body}\");\n}\n");
+    std::fs::write(&test, source).expect("write probe");
+    let output = Command::new("cargo")
+        .args(["test", "content_tag_renders"])
+        .current_dir(&*emitted)
+        .output()
+        .expect("run cargo test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success() && stdout.contains("content_tag_renders ... ok"), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+}
+
+/// #1909: a record as an `if` condition renders as Rails 8.1.4 does
+/// (`record_if_condition::VIEW`).
+#[test]
+#[ignore]
+fn record_if_condition_renders() {
+    let (emitted, errors) = record_if_condition::strict_app().emit(roundhouse::project::BuildTarget::Rust);
+    assert!(errors.is_empty(), "{errors:?}");
+    let test = emitted.join("src/tests/probes_controller_test.rs");
+    let mut source = std::fs::read_to_string(&test).expect("probes_controller_test.rs");
+    source.push_str("\nfn assert_includes(body: String, want: &str) {\n    assert!(body.contains(want), \"missing {want} in {body}\");\n}\n");
+    std::fs::write(&test, source).expect("write probe");
+    let output = Command::new("cargo")
+        .args(["test", "content_tag_renders"])
+        .current_dir(&*emitted)
+        .output()
+        .expect("run cargo test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success() && stdout.contains("content_tag_renders ... ok"), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+}
+
+/// #1909: an assignment as the `if` condition, the record read in the
+/// branch, renders as Rails 8.1.4 does (`record_if_condition::ASSIGN_VIEW`).
+#[test]
+#[ignore]
+fn record_if_assignment_renders() {
+    let (emitted, errors) = record_if_condition::strict_assign_app().emit(roundhouse::project::BuildTarget::Rust);
+    assert!(errors.is_empty(), "{errors:?}");
+    let test = emitted.join("src/tests/probes_controller_test.rs");
+    let mut source = std::fs::read_to_string(&test).expect("probes_controller_test.rs");
+    source.push_str("\nfn assert_includes(body: String, want: &str) {\n    assert!(body.contains(want), \"missing {want} in {body}\");\n}\n");
+    std::fs::write(&test, source).expect("write probe");
+    let output = Command::new("cargo")
+        .args(["test", "content_tag_renders"])
+        .current_dir(&*emitted)
+        .output()
+        .expect("run cargo test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success() && stdout.contains("content_tag_renders ... ok"), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+}
+
+/// #1898: a record in a local the template assigns, handed to
+/// `link_to`'s url helper, renders as Rails 8.1.4 does
+/// (`link_to_template_local::VIEW`).
+#[test]
+#[ignore]
+fn link_to_template_local_renders() {
+    let (emitted, errors) = link_to_template_local::strict_app().emit(roundhouse::project::BuildTarget::Rust);
+    assert!(errors.is_empty(), "{errors:?}");
+    let test = emitted.join("src/tests/probes_controller_test.rs");
+    let mut source = std::fs::read_to_string(&test).expect("probes_controller_test.rs");
+    source.push_str("\nfn assert_includes(body: String, want: &str) {\n    assert!(body.contains(want), \"missing {want} in {body}\");\n}\n");
+    std::fs::write(&test, source).expect("write probe");
+    let output = Command::new("cargo")
+        .args(["test", "content_tag_renders"])
+        .current_dir(&*emitted)
+        .output()
+        .expect("run cargo test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success() && stdout.contains("content_tag_renders ... ok"), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+}
+
+/// #1910: a block with no parameter renders as Rails 8.1.4 does
+/// (`each_no_param::VIEW`).
+#[test]
+#[ignore]
+fn each_no_param_renders() {
+    let (emitted, errors) = each_no_param::strict_app().emit(roundhouse::project::BuildTarget::Rust);
+    assert!(errors.is_empty(), "{errors:?}");
+    let test = emitted.join("src/tests/probes_controller_test.rs");
+    let mut source = std::fs::read_to_string(&test).expect("probes_controller_test.rs");
+    source.push_str("\nfn assert_includes(body: String, want: &str) {\n    assert!(body.contains(want), \"missing {want} in {body}\");\n}\n");
+    std::fs::write(&test, source).expect("write probe");
+    let output = Command::new("cargo")
+        .args(["test", "content_tag_renders"])
+        .current_dir(&*emitted)
+        .output()
+        .expect("run cargo test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success() && stdout.contains("content_tag_renders ... ok"), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+}
+
+/// A no-parameter block over a partial's local builds and renders
+/// as Rails 8.1.4 does (`each_no_param::strict_partial_local_app`).
+#[test]
+#[ignore]
+fn each_no_param_partial_local_renders() {
+    let (emitted, errors) = each_no_param::strict_partial_local_app().emit(roundhouse::project::BuildTarget::Rust);
+    assert!(errors.is_empty(), "{errors:?}");
+    let test = emitted.join("src/tests/probes_controller_test.rs");
+    let mut source = std::fs::read_to_string(&test).expect("probes_controller_test.rs");
+    source.push_str("\nfn assert_includes(body: String, want: &str) {\n    assert!(body.contains(want), \"missing {want} in {body}\");\n}\n");
+    std::fs::write(&test, source).expect("write probe");
+    let output = Command::new("cargo")
+        .args(["test", "content_tag_renders"])
+        .current_dir(&*emitted)
+        .output()
+        .expect("run cargo test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success() && stdout.contains("content_tag_renders ... ok"), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+}
+
+/// An empty `map` block maps each element to nil, as Rails 8.1.4
+/// does (`each_no_param::EMPTY_MAP_VIEW`).
+#[test]
+#[ignore]
+fn each_no_param_empty_map_renders() {
+    let (emitted, errors) = each_no_param::strict_empty_map_app().emit(roundhouse::project::BuildTarget::Rust);
+    assert!(errors.is_empty(), "{errors:?}");
+    let test = emitted.join("src/tests/probes_controller_test.rs");
+    let mut source = std::fs::read_to_string(&test).expect("probes_controller_test.rs");
+    source.push_str("\nfn assert_includes(body: String, want: &str) {\n    assert!(body.contains(want), \"missing {want} in {body}\");\n}\n");
+    std::fs::write(&test, source).expect("write probe");
+    let output = Command::new("cargo")
+        .args(["test", "content_tag_renders"])
+        .current_dir(&*emitted)
+        .output()
+        .expect("run cargo test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success() && stdout.contains("content_tag_renders ... ok"), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+}
+
+/// #1910: a block whose only parameter is a rest (`|*args|`) doesn't
+/// take the `_` closure a block with no parameter takes, so the rest
+/// isn't left unbound (`each_no_param::REST_VIEW`).
+#[test]
+fn each_no_param_rest_blocks_keep_their_parameter() {
+    let (emitted, _errors) = each_no_param::strict_rest_app().emit(roundhouse::project::BuildTarget::Rust);
+    let mut view = String::new();
+    let mut stack = vec![emitted.join("src")];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read emitted dir").flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.to_string_lossy().contains("probes") && path.extension().is_some_and(|x| x == "rs") {
+                view.push_str(&std::fs::read_to_string(&path).expect("read view"));
+            }
+        }
+    }
+    assert!(view.contains("args"), "no probes view found");
+    assert!(!view.contains("|_|"), "{view}");
+}
+
+/// #1921: an `unless` with no `else` in a view renders as Rails 8.1.4
+/// does (`view_unless_no_else::VIEW`).
+#[test]
+#[ignore]
+fn view_unless_no_else_renders() {
+    let (emitted, errors) = view_unless_no_else::strict_app().emit(roundhouse::project::BuildTarget::Rust);
+    assert!(errors.is_empty(), "{errors:?}");
+    let test = emitted.join("src/tests/probes_controller_test.rs");
+    let mut source = std::fs::read_to_string(&test).expect("probes_controller_test.rs");
+    source.push_str("\nfn assert_includes(body: String, want: &str) {\n    assert!(body.contains(want), \"missing {want} in {body}\");\n}\n");
+    std::fs::write(&test, source).expect("write probe");
+    let output = Command::new("cargo")
+        .args(["test", "content_tag_renders"])
+        .current_dir(&*emitted)
+        .output()
+        .expect("run cargo test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success() && stdout.contains("content_tag_renders ... ok"), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+}
+
+/// #1937: a view reading a nullable string column with `==`, `!=`,
+/// `empty?` and `length` renders as Rails 8.1.4 does
+/// (`nilable_string_view::VIEW`).
+#[test]
+#[ignore]
+fn nilable_string_view_renders() {
+    let (emitted, errors) = nilable_string_view::strict_app().emit(roundhouse::project::BuildTarget::Rust);
+    assert!(errors.is_empty(), "{errors:?}");
+    let test = emitted.join("src/tests/probes_controller_test.rs");
+    let mut source = std::fs::read_to_string(&test).expect("probes_controller_test.rs");
+    source.push_str("\nfn assert_includes(body: String, want: &str) {\n    assert!(body.contains(want), \"missing {want} in {body}\");\n}\n");
+    std::fs::write(&test, source).expect("write probe");
+    let output = Command::new("cargo")
+        .args(["test", "content_tag_renders"])
+        .current_dir(&*emitted)
+        .output()
+        .expect("run cargo test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success() && stdout.contains("content_tag_renders ... ok"), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+}
+
+/// #1937: with the column nil, `==` and `!=` render as Rails 8.1.4
+/// does (`nilable_string_view::NIL_VIEW`).
+#[test]
+#[ignore]
+fn nilable_string_view_nil_renders() {
+    let (emitted, errors) = nilable_string_view::strict_nil_app().emit(roundhouse::project::BuildTarget::Rust);
+    assert!(errors.is_empty(), "{errors:?}");
+    let test = emitted.join("src/tests/probes_controller_test.rs");
+    let mut source = std::fs::read_to_string(&test).expect("probes_controller_test.rs");
+    source.push_str("\nfn assert_includes(body: String, want: &str) {\n    assert!(body.contains(want), \"missing {want} in {body}\");\n}\n");
+    std::fs::write(&test, source).expect("write probe");
+    let output = Command::new("cargo")
+        .args(["test", "content_tag_renders"])
+        .current_dir(&*emitted)
+        .output()
+        .expect("run cargo test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success() && stdout.contains("content_tag_renders ... ok"), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+}
+
+/// #1950: a nil column against a String literal on the left renders as
+/// Rails 8.1.4 does (`nilable_string_view::NIL_LEFT_VIEW`).
+#[test]
+#[ignore]
+fn nilable_string_view_nil_left_renders() {
+    let (emitted, errors) = nilable_string_view::strict_nil_left_app().emit(roundhouse::project::BuildTarget::Rust);
+    assert!(errors.is_empty(), "{errors:?}");
+    let test = emitted.join("src/tests/probes_controller_test.rs");
+    let mut source = std::fs::read_to_string(&test).expect("probes_controller_test.rs");
+    source.push_str("\nfn assert_includes(body: String, want: &str) {\n    assert!(body.contains(want), \"missing {want} in {body}\");\n}\n");
+    std::fs::write(&test, source).expect("write probe");
+    let output = Command::new("cargo")
+        .args(["test", "content_tag_renders"])
+        .current_dir(&*emitted)
+        .output()
+        .expect("run cargo test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success() && stdout.contains("content_tag_renders ... ok"), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
 }

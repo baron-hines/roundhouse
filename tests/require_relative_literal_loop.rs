@@ -3,6 +3,8 @@
 //! Ported from the Shopify/roundhouse-1 fork's tests, with the gem written
 //! as a PATH gem of `Gemfile.lock`. A test the compiler does not pass yet
 //! is ignored with the group of behavior it waits on (`fork spec: ...`).
+#[path = "support/scratch.rs"]
+mod scratch;
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
@@ -82,8 +84,7 @@ fn native(lib: &Path) -> Vec<String> {
 
 #[test]
 fn a_require_relative_loop_over_a_literal_list_loads_each_file_it_names() {
-    let root = std::env::temp_dir().join(format!("roundhouse-require-relative-literal-loop-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = scratch::dir("roundhouse-require-relative-literal-loop");
     let lib = root.join("adaptkit/lib");
     for (path, text) in FILES {
         let file = lib.join(path);
@@ -102,13 +103,7 @@ fn a_require_relative_loop_over_a_literal_list_loads_each_file_it_names() {
         app = app.write(&format!("vendor/gems/adaptkit-1.0.0/lib/{path}"), text);
     }
     let run = app.run_ruby(SCRIPT);
-    assert!(
-        run.success,
-        "emitted tree failed in {}\n=== stdout ===\n{}\n=== stderr ===\n{}",
-        run.emitted.display(),
-        run.stdout,
-        run.stderr
-    );
+    run.assert_passes();
     assert_eq!(lines(run.stdout.as_bytes()), EXPECTED, "emitted boot diverges from CRuby\n{}", run.stderr);
 
     // Each loop became one require per element in the file's program
@@ -154,7 +149,7 @@ end
         app = app.write(&format!("vendor/gems/adaptkit-1.0.0/lib/{path}"), text);
     }
     let run = app.run_ruby("require \"adaptkit\" unless defined?(Adaptkit)\nputs Adaptkit::LOADED.inspect\n");
-    assert!(run.success, "emitted tree failed in {}\n{}\n{}", run.emitted.display(), run.stdout, run.stderr);
+    assert!(run.program_succeeded(), "the expected errors aside, the emitted program failed in {}\n=== stdout ===\n{}\n=== stderr ===\n{}", run.emitted.display(), run.stdout, run.stderr);
     assert_eq!(lines(run.stdout.as_bytes()), ["[:alpha]"], "{}", run.stderr);
     assert!(
         run.stderr.contains("error[file_require_not_carried]") && run.stderr.contains("adapters/gone_adapter"),

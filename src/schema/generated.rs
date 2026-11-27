@@ -13,10 +13,12 @@
 use super::{Column, ColumnType, Table};
 
 /// Expression syntax admitted while ingesting generated-column schema
-/// metadata. This is a source-expression validation mode, not a project
-/// database selector. Application ingest uses [`Portable`](Self::Portable)
-/// so PostgreSQL-only syntax remains unsupported by current targets.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// metadata and CHECKs. This is a source-expression validation mode: it
+/// says whose SQL the text is, not which database a target runs.
+/// Application ingest never uses [`Postgres`](Self::Postgres), so
+/// PostgreSQL-only syntax remains unsupported by current targets.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum GeneratedExpressionDialect {
     /// The existing expression grammar shared by SQLite and PostgreSQL DDL.
     #[default]
@@ -24,6 +26,22 @@ pub enum GeneratedExpressionDialect {
     /// The portable grammar plus bounded text/int4 casts and JSON extraction
     /// used by the PostgreSQL schema-DDL renderer.
     Postgres,
+    /// The portable grammar, plus SQLite's own in a CHECK: every database
+    /// in the application's `config/database.yml` is sqlite3, so SQLite DDL
+    /// carries the text to the engine it was written for.
+    Sqlite,
+    /// The portable grammar, for an application whose `config/database.yml`
+    /// names another adapter than sqlite3. A CHECK or index expression the
+    /// grammar can't read is that database's own SQL: ingest leaves it out
+    /// of the schema with a warning, as it did before it modeled them,
+    /// where [`Portable`](Self::Portable) refuses it.
+    OtherDatabase,
+}
+
+impl GeneratedExpressionDialect {
+    pub(crate) fn is_portable(&self) -> bool {
+        *self == Self::Portable
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -69,7 +87,6 @@ pub(crate) fn validate_column_with_dialect(
     let Some(generated) = &column.generated else {
         return Ok(());
     };
-
     if column.primary_key {
         return Err("generated columns cannot be primary keys".into());
     }
@@ -82,8 +99,18 @@ pub(crate) fn validate_column_with_dialect(
             column.name.as_str()
         ));
     }
-    if column.default.is_some() {
+    if column.default.is_some() || column.default_expression.is_some() {
         return Err("generated columns cannot also have a default".into());
+    }
+    if generated.native {
+        return match dialect {
+            // OtherDatabase is the grammar that kept it: a migration revalidating the table reads it again.
+            GeneratedExpressionDialect::Postgres | GeneratedExpressionDialect::OtherDatabase => Ok(()),
+            _ => Err(format!(
+                "`{}` is the app's own database's SQL, which only a tree running on that database carries",
+                generated.expression.trim()
+            )),
+        };
     }
     let text_result = is_text_type(&column.col_type);
     let int4_result = matches!(&column.col_type, ColumnType::Integer);

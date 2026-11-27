@@ -19,6 +19,8 @@
 //! 2.15.1 render for the same templates and the rows `(1, "a")` and
 //! `(2, "b")`.
 
+#[path = "support/scratch.rs"]
+mod scratch;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -83,7 +85,30 @@ const TEMPLATES: &[(&str, &str)] = &[
         "partial_local",
         "json.count @widgets.size\njson.gadget @widgets.first, partial: \"widgets/widget\", as: :widget, label: @widgets.size\n",
     ),
+    // A partial path built at run time is lowered to a switch over the
+    // partials it may name (#360) only with one interpolation between
+    // fixed text, outside the collection form. These stay refused.
+    (
+        "dynamic_partial_collection",
+        "json.count @widgets.size\njson.partial! \"widgets/#{@widgets.first.name}\", collection: @widgets, as: :widget\n",
+    ),
+    (
+        "dynamic_partial_two_values",
+        "json.count @widgets.size\njson.partial! \"#{@widgets.size}/#{@widgets.first.name}\", widget: @widgets.first\n",
+    ),
+    (
+        "dynamic_partial_no_text",
+        "json.count @widgets.size\njson.partial! \"#{@widgets.first.name}\", widget: @widgets.first\n",
+    ),
 ];
+
+/// A partial path built at run time whose fixed text matches none of
+/// the app's jbuilder partials: every render raises in Rails, and the
+/// call is refused with its own reason.
+const DYNAMIC_NO_MATCH: (&str, &str) = (
+    "dynamic_partial_no_match",
+    "json.count @widgets.size\njson.partial! \"gadgets/#{@widgets.first.name}\", widget: @widgets.first\n",
+);
 
 /// An inline partial on one record or on a collection, in both
 /// spellings, and what jbuilder renders for each: an object for the
@@ -165,7 +190,8 @@ fn app() -> roundhouse::App {
     let all = TEMPLATES
         .iter()
         .copied()
-        .chain(SET_BANG.iter().chain(INLINE_PARTIAL).map(|(n, t, _)| (*n, *t)));
+        .chain(SET_BANG.iter().chain(INLINE_PARTIAL).map(|(n, t, _)| (*n, *t)))
+        .chain([DYNAMIC_NO_MATCH]);
     for (name, template) in all {
         controller.push_str(&format!("  def {name}\n    @widgets = Widget.all\n    render :{name}\n  end\n\n"));
         routes.push_str(&format!(
@@ -213,7 +239,7 @@ fn view<'a>(files: &'a [(String, String)], name: &str) -> &'a str {
 /// Each template on CRuby with two widgets: its JSON, or the class and
 /// message of what it raises.
 fn render_all(tag: &str, files: &[(String, String)]) -> HashMap<String, String> {
-    let dir = std::env::temp_dir().join(format!("roundhouse-jbuilder-unrecognised-call-{tag}-{}", std::process::id()));
+    let dir = scratch::dir(&format!("roundhouse-jbuilder-unrecognised-call-{tag}"));
     for (path, source) in files.iter().filter(|(p, _)| p.ends_with(".rb")) {
         let file = dir.join(path);
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -227,7 +253,12 @@ fn render_all(tag: &str, files: &[(String, String)]) -> HashMap<String, String> 
         dir.join("app/views/widgets/_widget_json.rb").display().to_string()
     ));
     script.push_str("Widget = Struct.new(:id, :name)\nwidgets = [Widget.new(1, \"a\"), Widget.new(2, \"b\")]\n");
-    for name in TEMPLATES.iter().map(|(n, _)| *n).chain(SET_BANG.iter().chain(INLINE_PARTIAL).map(|(n, _, _)| *n)) {
+    for name in TEMPLATES
+        .iter()
+        .map(|(n, _)| *n)
+        .chain(SET_BANG.iter().chain(INLINE_PARTIAL).map(|(n, _, _)| *n))
+        .chain([DYNAMIC_NO_MATCH.0])
+    {
         let file = dir.join(format!("app/views/widgets/{name}_json.rb"));
         script.push_str(&format!(
             "require {file:?}\nout = begin\n  Views::Widgets.{name}_json(widgets)\nrescue => e\n  \"raises #{{e.class}}: #{{e.message}}\"\nend\nputs \"{name}\\t#{{out}}\"\n",
@@ -301,6 +332,19 @@ fn an_unrecognised_json_call_raises_when_rendered() {
             "{name}: {got}"
         );
     }
+}
+
+/// A partial path built at run time that names none of the app's
+/// jbuilder partials is refused where it stands, and raises there.
+#[test]
+fn a_dynamic_partial_path_matching_no_partial_is_refused() {
+    let refusal = "jbuilder partial! with a path built at run time not supported";
+    let files = emitted();
+    let src = view(&files, DYNAMIC_NO_MATCH.0);
+    assert_eq!(src.matches(refusal).count(), 1, "one refusal:\n{src}");
+    let out = render_all("dynamic", &files);
+    let got = &out[DYNAMIC_NO_MATCH.0];
+    assert!(got.starts_with("raises RuntimeError: ") && got.contains(refusal), "{got}");
 }
 
 /// `json.set!(:k, …)` is `json.k(…)`: a pair, an array built by the

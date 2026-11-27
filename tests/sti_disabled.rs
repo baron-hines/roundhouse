@@ -6,6 +6,8 @@
 //!
 //!     ruby tests/sti_disabled/oracle.rb
 
+#[path = "support/scratch.rs"]
+mod scratch;
 #[path = "support/emit_and_run.rs"]
 #[allow(dead_code)]
 mod emit_and_run;
@@ -187,9 +189,7 @@ fn a_model_with_sti_turned_off_keeps_type_as_an_attribute_on_spinel() {
 fn scratch(name: &str) -> PathBuf {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("roundhouse-sti-disabled-{name}-{}-{n}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
+    let dir = scratch::dir(&format!("roundhouse-sti-disabled-{name}-{n}"));
     dir
 }
 
@@ -217,7 +217,7 @@ fn survey_with(note: &str, sticky: &str) -> String {
     write(&src, "app/models/sticky.rb", &format!("class Sticky < Note\n{sticky}end\n"));
     write(&src, "app/models/sticky_probe.rb", "class StickyProbe\n  def self.first_title\n    Sticky.first.title\n  end\nend\n");
     let run = Command::new(env!("CARGO_BIN_EXE_roundhouse"))
-        .args(["--target", "ruby", "--allow-unsupported", "--survey", "-o"])
+        .args(["--target", "rust", "--allow-unsupported", "--survey", "-o"])
         .arg(&out)
         .arg(&src)
         .output()

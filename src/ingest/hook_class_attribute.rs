@@ -75,6 +75,250 @@ pub(super) fn expand(app: &mut App) {
     expand_class_bodies(app);
     expand_model_bodies(app);
     expand_hooks(app);
+    expand_included_blocks(app);
+}
+
+/// A library Concern's `included do class_attribute :default_page_size,
+/// default: 1000 end` (mission_control-jobs' `ActiveJob::Querying`, which
+/// an on_load hook includes into `ActiveJob::Base`): each library class
+/// that includes the module declares it, as if written in its own body.
+/// A block may also give the attributes their values, by `self.name =`
+/// or by a call of one of the Concern's class methods that only does that
+/// (responders' `self.responder = …` and `clear_respond_to`). Such a
+/// value becomes a seed, so it may not read the class, and the writes
+/// must run as the seeds do (`seeds_run_like_the_block`), after every
+/// declaration. Anything else in the block, or a class with its own class
+/// method of the called name, or an includer that `extend`s anything,
+/// keeps the block as it was.
+fn expand_included_blocks(app: &mut App) {
+    let names: Vec<String> = app.library_classes.iter().map(|lc| lc.name.0.as_str().to_string()).collect();
+    for mi in 0..app.library_classes.len() {
+        let module = &app.library_classes[mi];
+        if !module.is_module || module.origin.is_some() {
+            continue;
+        }
+        let Some((ci, decls, writes, calls_a_method, private)) = module.unknown_calls.iter().enumerate().find_map(|(ci, call)| {
+            let ExprNode::Send { recv: None, method, args, block: Some(block), .. } = &*call.node else { return None };
+            if method.as_str() != "included" || !args.is_empty() {
+                return None;
+            }
+            let ExprNode::Lambda { params, body, .. } = &*block.node else { return None };
+            if !params.is_empty() {
+                return None;
+            }
+            let stmts: Vec<&Expr> = match &*body.node {
+                ExprNode::Seq { exprs } => exprs.iter().collect(),
+                _ => vec![body],
+            };
+            let class_attribute = |stmt: &Expr| declaration(stmt, None).filter(|d| matches!(d.kind, Kind::ClassAttribute { .. }));
+            let declared = stmts.iter().take_while(|stmt| class_attribute(stmt).is_some()).count();
+            let decls: Vec<Decl> = stmts[..declared].iter().filter_map(|stmt| class_attribute(stmt)).collect();
+            if decls.is_empty() {
+                return None;
+            }
+            let mut writes = Vec::new();
+            // `private_class_method :name, :name=` of what the block declared (discourse's JsonApiKit resources).
+            let accessors: Vec<String> = decls
+                .iter()
+                .flat_map(|d| d.names.iter())
+                .flat_map(|n| [n.as_str().to_string(), format!("{}=", n.as_str()), format!("{}?", n.as_str())])
+                .collect();
+            let mut private: Vec<Symbol> = Vec::new();
+            let mut rest: Vec<&Expr> = Vec::new();
+            for stmt in &stmts[declared..] {
+                match &*stmt.node {
+                    ExprNode::Send { recv: None, method, args, block: None, .. } if method.as_str() == "private_class_method" && !args.is_empty() => {
+                        for arg in args {
+                            let ExprNode::Lit { value: Literal::Sym { value } } = &*arg.node else { return None };
+                            if !accessors.iter().any(|a| a == value.as_str()) {
+                                return None;
+                            }
+                            private.push(value.clone());
+                        }
+                    }
+                    _ if !private.is_empty() => return None,
+                    _ => rest.push(stmt),
+                }
+            }
+            // Not beside an instance accessor, which reads the class's through `self.class.name`.
+            if !private.is_empty()
+                && decls.iter().any(|d| !matches!(d.kind, Kind::ClassAttribute { instance_reader: false, instance_writer: false, .. }))
+            {
+                return None;
+            }
+            for stmt in rest.iter().copied() {
+                if class_attribute(stmt).is_some() || !block_writes(stmt, module, &app.library_classes, &decls, &mut writes) {
+                    return None;
+                }
+            }
+            let calls_a_method = rest.iter().any(|stmt| matches!(&*stmt.node, ExprNode::Send { recv: None, .. }));
+            seeds_run_like_the_block(&decls, &writes).then_some((ci, decls, writes, calls_a_method, private))
+        }) else {
+            continue;
+        };
+        let module_name = module.name.0.as_str().to_string();
+        let own_consts: Vec<Symbol> = module.constants.iter().map(|(n, _)| n.clone()).collect();
+        let mut decls = decls;
+        for decl in &mut decls {
+            if let Some(default) = &mut decl.default {
+                qualify_constants(default, &module_name, &own_consts);
+            }
+        }
+        let mut writes = writes;
+        for (_, value) in &mut writes {
+            qualify_constants(value, &module_name, &own_consts);
+        }
+        // The block runs in the class that finally includes it, through any modules between.
+        let mut holders: Vec<String> = vec![module_name.clone()];
+        loop {
+            let more: Vec<String> = app
+                .library_classes
+                .iter()
+                .filter(|c| c.is_module && !holders.contains(&c.name.0.as_str().to_string()))
+                .filter(|c| c.includes.iter().any(|inc| resolve(&names, inc.0.as_str(), c.name.0.as_str()).is_some_and(|r| holders.contains(&r))))
+                .map(|c| c.name.0.as_str().to_string())
+                .collect();
+            if more.is_empty() {
+                break;
+            }
+            holders.extend(more);
+        }
+        let includers: Vec<usize> = app
+            .library_classes
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !c.is_module)
+            .filter(|(_, c)| {
+                c.includes.iter().any(|inc| resolve(&names, inc.0.as_str(), c.name.0.as_str()).is_some_and(|r| holders.contains(&r)))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if includers.is_empty() {
+            continue;
+        }
+        // An `extend` can put another method of that name ahead of the Concern's, by order or through what the module includes.
+        if calls_a_method && includers.iter().any(|&i| app.library_classes[i].unknown_calls.iter().any(is_extend)) {
+            continue;
+        }
+        for &i in &includers {
+            let lc = &mut app.library_classes[i];
+            let mut added = Vec::new();
+            for decl in &decls {
+                added.extend(methods(&lc.name, Some("superclass"), &lc.methods, &added, decl, decl.span));
+                lc.class_ivar_initializers.extend(seeds_with_writes(decl, &writes));
+            }
+            for m in added.iter_mut().filter(|m| m.receiver == MethodReceiver::Class && private.contains(&m.name)) {
+                // A private reader is not callable on `superclass`: the parent's value is read as Ruby's singleton lookup
+                // would reach it.
+                if !m.name.as_str().ends_with(['=', '?'])
+                    && let Some(mut reader) = defs(&format!(
+                        "  def self.{n}\n    @{w} ? @{n} : superclass.send(:{n})\n  end\n",
+                        n = m.name.as_str(),
+                        w = written(m.name.as_str())
+                    ))
+                    .into_iter()
+                    .next()
+                {
+                    reader.name_span = m.name_span;
+                    reader.enclosing_class = m.enclosing_class.clone();
+                    *m = reader;
+                }
+                m.visibility = crate::dialect::MethodVisibility::Private;
+            }
+            lc.methods.splice(0..0, added);
+        }
+        app.library_classes[mi].unknown_calls.remove(ci);
+    }
+}
+
+/// Seeds run in declaration order, one per declared name, with a
+/// `default:` in place of a written value. Writes that follow that order,
+/// in a block with no default and no name declared twice, evaluate
+/// exactly as the block would.
+fn seeds_run_like_the_block(decls: &[Decl], writes: &[(Symbol, Expr)]) -> bool {
+    let order: Vec<&Symbol> = decls.iter().flat_map(|d| &d.names).collect();
+    let position = |name: &Symbol| order.iter().position(|n| *n == name);
+    let unique = order.iter().enumerate().all(|(i, name)| !order[..i].contains(name));
+    writes.is_empty() || (unique && decls.iter().all(|d| d.default.is_none()) && writes.windows(2).all(|w| position(&w[0].0) < position(&w[1].0)))
+}
+
+/// `stmt` read as writes to the block's declared attributes, appended
+/// to `out` in the order they run. False for anything else.
+fn block_writes(
+    stmt: &Expr,
+    module: &crate::dialect::LibraryClass,
+    classes: &[crate::dialect::LibraryClass],
+    decls: &[Decl],
+    out: &mut Vec<(Symbol, Expr)>,
+) -> bool {
+    if let Some(write) = attribute_write(stmt, decls) {
+        out.push(write);
+        return true;
+    }
+    let ExprNode::Send { recv: None, method, args, block: None, .. } = &*stmt.node else { return false };
+    if !args.is_empty() {
+        return false;
+    }
+    let Some(called) = module
+        .methods
+        .iter()
+        .find(|m| &m.name == method && matches!(m.receiver, MethodReceiver::Class) && m.params.is_empty())
+    else {
+        return false;
+    };
+    // Ruby answers with a class's own method ahead of the Concern's. Any class's, not only an includer's: the splice has not settled who includes what through other modules.
+    let shadowed = classes.iter().filter(|c| !c.is_module).flat_map(|c| c.methods.iter()).any(|m| {
+        &m.name == method && matches!(m.receiver, MethodReceiver::Class) && m.name_span != called.name_span
+    });
+    if shadowed {
+        return false;
+    }
+    let body: Vec<&Expr> = match &*called.body.node {
+        ExprNode::Seq { exprs } => exprs.iter().collect(),
+        _ => vec![&called.body],
+    };
+    // All of the method or none of it: a partly read body would drop what it does besides.
+    let Some(writes) = body.iter().map(|e| attribute_write(e, decls)).collect::<Option<Vec<_>>>() else {
+        return false;
+    };
+    out.extend(writes);
+    true
+}
+
+fn is_extend(call: &Expr) -> bool {
+    matches!(&*call.node, ExprNode::Send { recv: None, method, .. } if method.as_str() == "extend")
+}
+
+/// `self.name = value` for a name one of `decls` declares.
+fn attribute_write(e: &Expr, decls: &[Decl]) -> Option<(Symbol, Expr)> {
+    let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*e.node else { return None };
+    let name = Symbol::from(method.as_str().strip_suffix('=')?);
+    let [value] = args.as_slice() else { return None };
+    (matches!(&*recv.node, ExprNode::SelfRef) && decls.iter().any(|d| d.names.contains(&name)) && !reads_the_class(value))
+        .then(|| (name, value.clone()))
+}
+
+fn reads_the_class(e: &Expr) -> bool {
+    if matches!(&*e.node, ExprNode::SelfRef | ExprNode::Ivar { .. } | ExprNode::Send { recv: None, .. }) {
+        return true;
+    }
+    let mut found = false;
+    e.node.for_each_child(&mut |c| found = found || reads_the_class(c));
+    found
+}
+
+/// A bare read of one of the Concern's own constants, spelled from the top so it still names it in the includer.
+fn qualify_constants(e: &mut Expr, module: &str, own: &[Symbol]) {
+    if let ExprNode::Const { path } = &mut *e.node
+        && path.len() == 1
+        && own.contains(&path[0])
+    {
+        let mut full: Vec<Symbol> = std::iter::once(Symbol::from("")).chain(module.split("::").map(Symbol::from)).collect();
+        full.push(path[0].clone());
+        *path = full;
+        return;
+    }
+    e.node.for_each_child_mut(&mut |c| qualify_constants(c, module, own));
 }
 
 /// `class_attribute :live` written in a library class's own body.
@@ -166,8 +410,8 @@ fn expand_model_bodies(app: &mut App) {
             Some((class.clone(), ClassId(Symbol::from(found))))
         })
         .collect();
-    // `self.name` per attribute a class above `class` declares and
-    // `class` neither declares nor defines a reader for.
+    // `self.name` and `self.name=` per attribute a class above `class`
+    // declares and `class` neither declares nor defines a reader for.
     let readers = |class: &ClassId, defined: &dyn Fn(&Symbol) -> bool| -> Vec<MethodDef> {
         let Some(parent) = parents.get(class) else { return Vec::new() };
         let mut inherited: Vec<&Symbol> = Vec::new();
@@ -179,16 +423,21 @@ fn expand_model_bodies(app: &mut App) {
             seen += 1;
         }
         let up = format!("::{}", parent.0.as_str());
+        // Not the reader alone: a write in this class's body (`self.name = …`) then sets an ivar its own setter declares, as Ruby's inherited one does.
         let src: String = inherited
             .iter()
             .filter(|name| !declared.iter().any(|(owner, own)| owner == class && own == **name) && !defined(name))
-            .map(|name| class_reader(name.as_str(), Some(&up)))
+            .map(|name| {
+                let n = name.as_str();
+                format!("{}  def self.{n}=(value)\n    @{w} = true\n    @{n} = value\n  end\n", class_reader(n, Some(&up)), w = self::written(n))
+            })
             .collect();
         if src.is_empty() {
             return Vec::new();
         }
         defs(&src)
             .into_iter()
+            .filter(|method| !defined(&method.name))
             .map(|mut method| {
                 method.enclosing_class = class.0.as_str().rsplit("::").next().map(Symbol::from);
                 method
@@ -533,6 +782,21 @@ fn class_body_seeds(decl: &Decl) -> Vec<Expr> {
         out.push(ivar(name.as_str().to_string(), value));
     }
     out
+}
+
+/// [`class_body_seeds`], with the value the block last wrote to a name
+/// in place of the declaration's own: one Ivar seed per name, so its
+/// type is the written value's alone.
+fn seeds_with_writes(decl: &Decl, writes: &[(Symbol, Expr)]) -> Vec<Expr> {
+    let mut seeds = class_body_seeds(decl);
+    for seed in &mut seeds {
+        if let ExprNode::Assign { target: LValue::Ivar { name }, value } = &mut *seed.node
+            && let Some((_, written)) = writes.iter().rev().find(|(n, _)| n == name)
+        {
+            *value = written.clone();
+        }
+    }
+    seeds
 }
 
 /// What the hook's declaration does to `base` once its defs exist.

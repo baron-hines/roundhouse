@@ -4,7 +4,7 @@
 
 use ruby_prism::Node;
 
-use crate::dialect::{Action, Comment, Controller, ControllerBodyItem, LayoutDecl, RenderTarget};
+use crate::dialect::{Action, Comment, Controller, ControllerBodyItem, LayoutCall, LayoutDecl, LayoutValue, RenderTarget};
 use crate::effect::EffectSet;
 use crate::expr::{Expr, ExprNode, Literal};
 use crate::span::Span;
@@ -110,7 +110,9 @@ pub fn ingest_controller(source: &[u8], file: &str) -> IngestResult<Option<Contr
         .map(|n| super::util::node_span(&n, file))
         .unwrap_or_default();
     let parent = class.superclass().and_then(|n| {
-        constant_path_of(&n).map(|p| ClassId(Symbol::from(p.join("::"))))
+        constant_path_of(&n)
+            .or_else(|| super::engine_config::folded_superclass(&n))
+            .map(|p| ClassId(Symbol::from(p.join("::"))))
     });
 
     let mut comments = collect_comments(&result);
@@ -148,9 +150,28 @@ pub fn ingest_controller(source: &[u8], file: &str) -> IngestResult<Option<Contr
             // (matches Rails: a later `layout` call overrides an earlier
             // one). The call still falls through to Unknown for source
             // round-trip; the side-channel `Controller.layout` is what
-            // analyze reads to seed layout-view ivar types.
-            if let Some(decl) = parse_layout_call(&stmt) {
-                layout = decl;
+            // `controller_layout` resolves each action's layout from. A
+            // non-literal `only:`/`except:` is a located gap (survey) or a
+            // strict error, as a filter's is, and leaves `layout` as it was.
+            // `alias :new :old` is the keyword spelling of `alias_method :new, :old`, which the lowering copies the method for.
+            if let Some(alias) = stmt.as_alias_method_node()
+                && let (Some(to), Some(from)) = (alias.new_name().as_symbol_node(), alias.old_name().as_symbol_node())
+            {
+                let span = crate::span::Span { file: super::sources::file_id(file), start: stmt_start as u32, end: stmt.location().end_offset() as u32 };
+                let sym = |s: &ruby_prism::SymbolNode<'_>| crate::expr::Expr::new(span, crate::expr::ExprNode::Lit { value: crate::expr::Literal::Sym { value: Symbol::from(String::from_utf8_lossy(s.unescaped()).as_ref()) } });
+                body_items.push(ControllerBodyItem::Unknown {
+                    expr: crate::expr::Expr::new(span, crate::expr::ExprNode::Send { recv: None, method: Symbol::from("alias_method"), args: vec![sym(&to), sym(&from)], block: None, parenthesized: false }),
+                    leading_comments: std::mem::take(&mut leading),
+                    leading_blank_line: leading_blank,
+                });
+                prev_end = Some(stmt.location().end_offset());
+                continue;
+            }
+            match parse_layout_call(&stmt, file) {
+                Ok(Some(decl)) => layout = decl,
+                Ok(None) => {}
+                Err(err) if super::survey::is_active() => super::survey::record(&err),
+                Err(err) => return Err(err),
             }
             // A `before_action :a, :b` line declares one filter per leading
             // symbol; expand to one `Filter` body item each so every target's
@@ -340,7 +361,7 @@ pub fn ingest_controller(source: &[u8], file: &str) -> IngestResult<Option<Contr
                 Some(
                     super::singleton_class::ingest_singleton_body(&sc, &owner, file, &|def| {
                         super::library_class::ingest_library_method(def, &owner, file)
-                    })
+                    }, false)
                     .map(|b| (b.methods, b.class_body)),
                 )
             } else {
@@ -423,64 +444,77 @@ pub fn ingest_controller(source: &[u8], file: &str) -> IngestResult<Option<Contr
         body: body_items,
         layout,
         sibling_classes,
+        csp_header: false,
     }))
 }
 
-/// Recognize a `layout` class-body call. Returns `Some(decl)` if this
-/// is a `layout ...` call we can interpret, `None` otherwise (including
-/// for unsupported shapes like `layout :method_name` where the symbol
-/// names a controller method — those degrade to `Inherit` and the
-/// effective layout falls back to convention).
+/// Recognize a `layout` class-body call. A String names the template, a
+/// Symbol the method Rails calls for it, `false` no layout and `nil` the
+/// default lookup; anything else is kept as computed, for
+/// `controller_layout` to report.
 ///
-/// Note: we can't tell `layout :foo` (static name "foo") from
-/// `layout :foo` (dispatch to method `foo`) syntactically. v1 treats
-/// every `layout :sym` as a static name. The dispatch form is rare
-/// enough on real Rails controllers that this is a safe v1 assumption;
-/// the worst case is a layout-view-name miss, not a crash.
-fn parse_layout_call(stmt: &Node<'_>) -> Option<LayoutDecl> {
-    let call = stmt.as_call_node()?;
-    if call.receiver().is_some() {
-        return None;
+/// Returns `Err` for an `only:`/`except:` value `is_recognized_scope_value`
+/// declines, as `parse_filter_call` does: an unreadable scope would
+/// otherwise read as every action.
+fn parse_layout_call(stmt: &Node<'_>, file: &str) -> IngestResult<Option<LayoutDecl>> {
+    let Some(call) = stmt.as_call_node() else { return Ok(None) };
+    if call.receiver().is_some() || call.block().is_some() {
+        return Ok(None);
     }
     if constant_id_str(&call.name()) != "layout" {
-        return None;
+        return Ok(None);
     }
-    let args = call.arguments()?;
+    let Some(args) = call.arguments() else { return Ok(None) };
     let all_args = args.arguments();
-    let first = all_args.iter().next()?;
-    if let Some(sym) = first.as_symbol_node() {
-        let bytes = sym.unescaped();
-        let name = std::str::from_utf8(bytes).ok()?;
-        return Some(LayoutDecl::Name { name: Symbol::from(name) });
-    }
-    if let Some(s) = first.as_string_node() {
-        let bytes = s.unescaped();
-        let name = std::str::from_utf8(bytes).ok()?;
-        return Some(LayoutDecl::Name { name: Symbol::from(name) });
-    }
-    if first.as_false_node().is_some() || first.as_nil_node().is_some() {
-        // `only:`/`except:` scope the suppression exactly as they scope
-        // a filter — campfire writes `layout false, only: :index`, and
-        // reading past the options would strip the layout from `show`
-        // and `edit` too.
-        let mut only: Vec<Symbol> = Vec::new();
-        let mut except: Vec<Symbol> = Vec::new();
-        for arg in all_args.iter().skip(1) {
-            let Some(hash) = arg.as_keyword_hash_node() else { continue };
-            for element in hash.elements().iter() {
-                let Some(pair) = element.as_assoc_node() else { continue };
-                let Some(key) = pair.key().as_symbol_node() else { continue };
-                let Ok(name) = std::str::from_utf8(key.unescaped()) else { continue };
-                match name {
-                    "only" => only = super::util::symbol_list_value(&pair.value()),
-                    "except" => except = super::util::symbol_list_value(&pair.value()),
-                    _ => {}
+    let Some(first) = all_args.iter().next() else { return Ok(None) };
+    let text = |bytes: &[u8]| std::str::from_utf8(bytes).ok().map(Symbol::from);
+    let value = if let Some(sym) = first.as_symbol_node() {
+        let Some(name) = text(sym.unescaped()) else { return Ok(None) };
+        LayoutValue::Method { name }
+    } else if let Some(s) = first.as_string_node() {
+        let Some(name) = text(s.unescaped()) else { return Ok(None) };
+        LayoutValue::Name { name }
+    } else if first.as_false_node().is_some() {
+        LayoutValue::None
+    } else if first.as_nil_node().is_some() {
+        LayoutValue::Default
+    } else {
+        LayoutValue::Computed
+    };
+    let mut only: Vec<Symbol> = Vec::new();
+    let mut except: Vec<Symbol> = Vec::new();
+    let mut only_present = false;
+    for arg in all_args.iter().skip(1) {
+        let Some(hash) = arg.as_keyword_hash_node() else { continue };
+        for element in hash.elements().iter() {
+            let Some(pair) = element.as_assoc_node() else { continue };
+            let Some(key) = pair.key().as_symbol_node() else { continue };
+            let Ok(name) = std::str::from_utf8(key.unescaped()) else { continue };
+            match name {
+                "only" | "except" if !is_recognized_scope_value(&pair.value()) => {
+                    return Err(IngestError::Unsupported {
+                        file: file.into(),
+                        message: format!(
+                            "`layout` `{name}:` is not a literal Symbol/String or an array of them; the layout is refused rather than silently applied to every action"
+                        ),
+                    });
                 }
+                "only" => {
+                    only = super::util::symbol_list_value(&pair.value());
+                    only_present = true;
+                }
+                "except" => except = super::util::symbol_list_value(&pair.value()),
+                _ => {}
             }
         }
-        return Some(LayoutDecl::None { only, except });
     }
-    None
+    Ok(Some(LayoutDecl::Declared(LayoutCall {
+        value,
+        only,
+        except,
+        only_present,
+        span: super::util::node_span(stmt, file),
+    })))
 }
 
 /// Classify one class-body statement into its `ControllerBodyItem` variant.
@@ -735,10 +769,23 @@ pub(super) fn parse_filter_call(
     stmt: &Node<'_>,
     file: &str,
 ) -> IngestResult<Option<Vec<crate::dialect::Filter>>> {
+    parse_filter_call_on(stmt, file, None)
+}
+
+/// [`parse_filter_call`], also reading a call on the local `receiver`: the
+/// `base` of a `def self.included(base)` hook.
+pub(super) fn parse_filter_call_on(
+    stmt: &Node<'_>,
+    file: &str,
+    receiver: Option<&str>,
+) -> IngestResult<Option<Vec<crate::dialect::Filter>>> {
     use crate::dialect::{Filter, FilterKind};
 
     let Some(call) = stmt.as_call_node() else { return Ok(None) };
-    if call.receiver().is_some() {
+    let on_receiver = call.receiver().is_some_and(|r| {
+        r.as_local_variable_read_node().is_some_and(|read| Some(constant_id_str(&read.name())) == receiver)
+    });
+    if call.receiver().is_some() && !on_receiver {
         return Ok(None);
     }
     let macro_name = constant_id_str(&call.name());
@@ -746,20 +793,21 @@ pub(super) fn parse_filter_call(
         return parse_forgery_macro(&call, macro_name == "protect_from_forgery", file);
     }
     let kind = match macro_name {
-        "before_action" | "prepend_before_action" => FilterKind::Before,
-        "around_action" => FilterKind::Around,
-        "after_action" => FilterKind::After,
+        // `append_*` is Rails' alias of the plain macro (AbstractController::Callbacks).
+        "before_action" | "prepend_before_action" | "append_before_action" => FilterKind::Before,
+        "around_action" | "append_around_action" | "prepend_around_action" => FilterKind::Around,
+        "after_action" | "append_after_action" => FilterKind::After,
         "skip_before_action" => FilterKind::Skip,
         "skip_around_action" => FilterKind::SkipAround,
         "skip_after_action" => FilterKind::SkipAfter,
         _ => return Ok(None),
     };
-    // Rails moves a `prepend_before_action` callback to the head of the
-    // WHOLE chain, ahead of inherited filters too — see `Filter::prepend`.
-    // `prepend_around_action` / `prepend_after_action` are not modeled:
-    // no controller in this codebase's fixtures uses either, so they
-    // stay unrecognized rather than risk a wrong-order claim.
-    let prepend = macro_name == "prepend_before_action";
+    // Rails moves a `prepend_before_action` or `prepend_around_action`
+    // callback to the head of the WHOLE chain, ahead of inherited filters
+    // too — see `Filter::prepend`. `prepend_after_action` is not modeled:
+    // no controller in this codebase's fixtures uses it, so it stays
+    // unrecognized rather than risk a wrong-order claim.
+    let mut prepend = matches!(macro_name, "prepend_before_action" | "prepend_around_action");
 
     let Some(args) = call.arguments() else { return Ok(None) };
 
@@ -772,6 +820,9 @@ pub(super) fn parse_filter_call(
     let mut unless_cond: Option<Symbol> = None;
     let mut if_cond_expr: Option<Expr> = None;
     let mut unless_cond_expr: Option<Expr> = None;
+    let mut unread_guard = false;
+    let mut unread_options = false;
+    let mut only_present = false;
 
     for arg in args.arguments().iter() {
         if let Some(sym) = symbol_value(&arg) {
@@ -786,13 +837,26 @@ pub(super) fn parse_filter_call(
             ));
             continue;
         }
-        let Some(kh) = arg.as_keyword_hash_node() else { continue };
+        let Some(kh) = arg.as_keyword_hash_node() else {
+            unread_guard = true;
+            unread_options = true;
+            continue;
+        };
         for el in kh.elements().iter() {
-            let Some(assoc) = el.as_assoc_node() else { continue };
-            let Some(key) = symbol_value(&assoc.key()) else { continue };
+            let Some(assoc) = el.as_assoc_node() else {
+                unread_guard = true;
+                unread_options = true;
+                continue;
+            };
+            let Some(key) = symbol_value(&assoc.key()) else {
+                unread_guard = true;
+                unread_options = true;
+                continue;
+            };
             let value = assoc.value();
             match key.as_str() {
                 "only" => {
+                    only_present = true;
                     if !is_recognized_scope_value(&value) {
                         return Err(scope_gap(file, macro_name, "only"));
                     }
@@ -807,14 +871,25 @@ pub(super) fn parse_filter_call(
                     except_style = symbol_list_style(&value);
                 }
                 // Symbol-form guards carry the predicate name;
-                // lambda/proc guards carry their body expression.
+                // lambda/proc guards carry their body expression. Any
+                // other value is a guard this cannot read.
                 "if" => {
                     if_cond = symbol_value(&value).map(|s| Symbol::from(s.as_str()));
                     if_cond_expr = lambda_body_expr(&value, file);
+                    unread_guard |= if_cond.is_none() && if_cond_expr.is_none();
                 }
                 "unless" => {
                     unless_cond = symbol_value(&value).map(|s| Symbol::from(s.as_str()));
                     unless_cond_expr = lambda_body_expr(&value, file);
+                    unread_guard |= unless_cond.is_none() && unless_cond_expr.is_none();
+                }
+                "prepend" => {
+                    if value.as_true_node().is_some() {
+                        prepend = true;
+                    } else if value.as_false_node().is_none() && value.as_nil_node().is_none() {
+                        unread_guard = true;
+                        unread_options = true;
+                    }
                 }
                 _ => {}
             }
@@ -841,6 +916,9 @@ pub(super) fn parse_filter_call(
                 unless_cond: unless_cond.clone(),
                 if_cond_expr: if_cond_expr.clone(),
                 unless_cond_expr: unless_cond_expr.clone(),
+                unread_guard,
+                unread_options,
+                only_present,
                 block: None,
                 prepend,
             })
@@ -982,6 +1060,9 @@ fn parse_forgery_macro(
         unless_cond,
         if_cond_expr,
         unless_cond_expr,
+        unread_guard: false,
+        unread_options: false,
+        only_present: false,
         block: None,
         prepend: false,
     }]))
@@ -1224,6 +1305,11 @@ pub(crate) struct LambdaFilterTarget {
     pub unless_cond: Option<Symbol>,
     pub if_cond_expr: Option<Expr>,
     pub unless_cond_expr: Option<Expr>,
+    /// An `if:`/`unless:` this could not read; see `Filter::unread_guard`.
+    pub unread_guard: bool,
+    pub unread_options: bool,
+    pub only_present: bool,
+    pub prepend: bool,
 }
 
 impl LambdaFilterTarget {
@@ -1231,7 +1317,7 @@ impl LambdaFilterTarget {
         self.method.as_str() == "after_action"
     }
     pub fn is_prepend(&self) -> bool {
-        self.method.as_str() == "prepend_before_action"
+        self.prepend
     }
 }
 
@@ -1267,6 +1353,21 @@ fn ir_symbol_list(e: &Expr) -> Vec<Symbol> {
     match &*e.node {
         ExprNode::Array { elements, .. } => elements.iter().filter_map(ir_symbol).collect(),
         _ => ir_symbol(e).into_iter().collect(),
+    }
+}
+
+/// Literal action names, as Symbols or Strings, or `None` for any other
+/// value: an unread action list isn't an empty one.
+fn readable_symbol_list(e: &Expr) -> Option<Vec<Symbol>> {
+    fn name(e: &Expr) -> Option<Symbol> {
+        match &*e.node {
+            ExprNode::Lit { value: Literal::Str { value } } => Some(Symbol::from(value.as_str())),
+            _ => ir_symbol(e),
+        }
+    }
+    match &*e.node {
+        ExprNode::Array { elements, .. } => elements.iter().map(name).collect(),
+        _ => name(e).map(|symbol| vec![symbol]),
     }
 }
 
@@ -1467,6 +1568,10 @@ pub(crate) fn lambda_filter_target(expr: &Expr) -> Option<LambdaFilterTarget> {
     let mut unless_cond: Option<Symbol> = None;
     let mut if_cond_expr: Option<Expr> = None;
     let mut unless_cond_expr: Option<Expr> = None;
+    let mut unread_guard = false;
+    let mut unread_options = false;
+    let mut only_present = false;
+    let mut prepend = method.as_str() == "prepend_before_action";
     for a in option_args {
         // A concern macro's `before_action(**kwargs) { ... }` substitutes
         // the call's options Hash under a `**` splat rather than the
@@ -1479,22 +1584,53 @@ pub(crate) fn lambda_filter_target(expr: &Expr) -> Option<LambdaFilterTarget> {
             ExprNode::KeywordSplat { value } => value,
             _ => a,
         };
-        let ExprNode::Hash { entries, .. } = &*a.node else { continue };
+        let ExprNode::Hash { entries, .. } = &*a.node else {
+            unread_guard = true;
+            unread_options = true;
+            continue;
+        };
         for (k, v) in entries {
             let ExprNode::Lit { value: Literal::Sym { value: key } } = &*k.node else {
+                unread_guard = true;
+                unread_options = true;
                 continue;
             };
             match key.as_str() {
-                "only" => only = ir_symbol_list(v),
-                "except" => except = ir_symbol_list(v),
+                "only" => match readable_symbol_list(v) {
+                    Some(list) => {
+                        only_present = true;
+                        only = list;
+                    }
+                    None => {
+                        unread_guard = true;
+                        unread_options = true;
+                    }
+                },
+                "except" => match readable_symbol_list(v) {
+                    Some(list) => except = list,
+                    None => {
+                        unread_guard = true;
+                        unread_options = true;
+                    }
+                },
                 "if" => {
                     if_cond = ir_symbol(v);
                     if_cond_expr = ir_lambda_body(v);
+                    unread_guard |= if_cond.is_none() && if_cond_expr.is_none();
                 }
                 "unless" => {
                     unless_cond = ir_symbol(v);
                     unless_cond_expr = ir_lambda_body(v);
+                    unread_guard |= unless_cond.is_none() && unless_cond_expr.is_none();
                 }
+                "prepend" => match &*v.node {
+                    ExprNode::Lit { value: Literal::Bool { value: true } } => prepend = true,
+                    ExprNode::Lit { value: Literal::Bool { value: false } | Literal::Nil } => {}
+                    _ => {
+                        unread_guard = true;
+                        unread_options = true;
+                    }
+                },
                 _ => {}
             }
         }
@@ -1508,6 +1644,10 @@ pub(crate) fn lambda_filter_target(expr: &Expr) -> Option<LambdaFilterTarget> {
         unless_cond,
         if_cond_expr,
         unless_cond_expr,
+        unread_guard,
+        unread_options,
+        only_present,
+        prepend,
     })
 }
 
@@ -1723,6 +1863,9 @@ pub(super) fn around_block_filter(
         unless_cond,
         if_cond_expr,
         unless_cond_expr,
+        unread_guard: false,
+        unread_options: false,
+        only_present: false,
         block: None,
         prepend: false,
     };
@@ -1976,7 +2119,10 @@ pub fn render_template_name(args: &[Expr]) -> Option<Symbol> {
 /// last segment ends in `Controller` (`ApplicationController`,
 /// `Admin::SectionController`).
 fn descends_from_controller(class: &ruby_prism::ClassNode<'_>) -> bool {
-    let Some(parent) = class.superclass().and_then(|n| constant_path_of(&n)) else {
+    let Some(parent) = class
+        .superclass()
+        .and_then(|n| constant_path_of(&n).or_else(|| super::engine_config::folded_superclass(&n)))
+    else {
         return false;
     };
     parent.first().is_some_and(|s| s == "ActionController")

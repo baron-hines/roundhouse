@@ -52,9 +52,8 @@
 #
 # Last definition wins under spinel, and a redefined method sees the
 # class's other methods and ivars — `transport_request` below is the
-# package's `#request` body re-stated over `connect`/`begin_transport`
-# (also defined below) and `write_request`/`read_response`, which this
-# file leaves alone.
+# package's `#request` body re-stated over the package's `connect`,
+# `begin_transport` below and `write_request`/`read_response`.
 require "net/http"
 require_relative "http_stub"
 require_relative "tcp_socket_stub"
@@ -68,24 +67,24 @@ module Net
     # path and silently break all three.
     READ_BODY_CHUNK = 16384
 
-    # `response.read_body { |chunk| ... }` — CRuby streams the body from
-    # the socket here; this package has already read it whole, so the
-    # stream is the String, sliced. A declared `&blk`, not `yield`, for
-    # the reason `HTTP#request` below gives: the response reaches
-    # `Opengraph::Fetch#size_restricted_body` boxed, and a yielding
-    # method has no dispatch entry for a boxed receiver — the call
-    # landed on nothing and raised `no block given (yield)`.
-    def read_body(&blk)
-      unless blk.nil?
-        offset = 0
-        total = @body.bytesize
-        while offset < total
-          blk.call(@body.byteslice(offset, READ_BODY_CHUNK).to_s)
-          offset += READ_BODY_CHUNK
+    # Keep the package's reader, read-once checks and destination argument.
+    # A stub already has a String body; bound its callback chunks as before.
+    alias read_body_from_package read_body
+
+    def read_body(dest = nil, &blk)
+      if blk.nil?
+        read_body_from_package(dest)
+      else
+        read_body_from_package(dest) do |chunk|
+          offset = 0
+          while offset < chunk.bytesize
+            blk.call(chunk.byteslice(offset, READ_BODY_CHUNK).to_s)
+            offset += READ_BODY_CHUNK
+          end
         end
       end
-      @body
     end
+    private :read_body_from_package
 
     # Integer or nil, as CRuby answers it — `Opengraph::Fetch` applies
     # `.to_i` and compares, so nil has to survive the read.
@@ -196,10 +195,11 @@ module Net
     # four delivery tests. A `&blk` parameter keeps the standalone
     # entry, so the block-less webhook call and `Opengraph::Fetch`'s
     # `request(req) { |res| … }` dispatch to the same method. The
-    # response is complete before the block sees it, as the package
-    # documents; `read_body` above is what slices it for a streaming
-    # reader.
+    # response keeps its live reader through the callback and is drained
+    # before the implicit session finishes.
     def request(req, &blk)
+      started = @started
+      start unless started
       i = HttpStub.find_for(req.method, stub_url(req.path), req.body)
       res =
         if i < 0
@@ -208,7 +208,15 @@ module Net
           build_response("1.1", HttpStub::STUB_STATUSES[i].to_s, "", HttpStub.headers_at(i), HttpStub::STUB_BODIES[i])
         end
       blk.call(res) unless blk.nil?
+      # Keep #1753's body-before-finish guarantee after the live callback.
+      res.body
       res
+    ensure
+      @tls.sysclose unless @tls.nil?
+      @tls = nil
+      @socket.close unless @socket.nil?
+      @socket = nil
+      finish if !started && started?
     end
 
     # The package's `connect_with_timeout`, re-stated over one question
@@ -259,17 +267,9 @@ module Net
     # records a connection's stage there and its pool reads it back to
     # tell a dead idle connection from a push the service may have
     # (`lower::known_super_forwarding` gives its `(...)` overrides these
-    # signatures). Both are defined here rather than relied on from the
-    # package, which names them only from matz/spinel#8361 on.
+    # signatures). The package's connect also owns TLS verification and
+    # the handshake deadline (Spinel af56d9db7 or later).
     def transport_request(req)
-      unless @started
-        begin
-          @started = true
-          return transport_request(req)
-        ensure
-          finish
-        end
-      end
       connect if @socket.nil?
       begin_transport(req)
       write_request(req)
@@ -293,22 +293,6 @@ module Net
 
     def keep_alive_timeout=(seconds)
       @keep_alive_timeout = seconds
-    end
-
-    def connect
-      @socket = connect_with_timeout
-      if @use_ssl
-        begin
-          tls = OpenSSL::SSL::SSLSocket.new(@socket)
-        rescue NameError
-          raise "net/http: an https request needs the openssl package (require \"openssl\")"
-        end
-        tls.hostname = @address
-        tls.connect
-        @tls = tls
-      end
-      @fresh = true
-      nil
     end
 
     # Connects again unless the socket was opened for this request: every

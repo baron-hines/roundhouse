@@ -285,6 +285,7 @@ mod tests {
             class_attr_defaults: indexmap::IndexMap::new(),
             lexical_json_shadow: false,
             sti_subclass_names: Vec::new(),
+            mixin_sends: Vec::new(),
             select_aliases: Vec::new(),
             i18n: Default::default(),
             span: crate::span::Span::synthetic(),
@@ -305,6 +306,7 @@ mod tests {
             scope: None,
             extension: Vec::new(),
             primary_key: None,
+            inverse_of: None,
         }
     }
 
@@ -313,6 +315,7 @@ mod tests {
             name: sym(name),
             target: cid(target),
             foreign_key: sym(fk),
+            foreign_key_explicit: false,
             optional: false,
             polymorphic: false,
             polymorphic_targets: vec![],
@@ -320,6 +323,7 @@ mod tests {
             touch: None,
             foreign_type: None,
             primary_key: None,
+            scope: None,
         }
     }
 

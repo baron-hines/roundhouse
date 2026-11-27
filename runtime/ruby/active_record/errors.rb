@@ -14,6 +14,14 @@ module ActiveModel
       super(message)
     end
   end
+
+  # Rails (activemodel 8.1.4, attribute_methods.rb) raises this from a
+  # generated attribute reader for a column the record's `select` did not
+  # load: "missing attribute 'title' for Post". The raise builds the
+  # message (`Base#_missing_attribute`, connection.rb); like Rails' own,
+  # the class adds nothing to NoMethodError.
+  class MissingAttributeError < NoMethodError
+  end
 end
 
 module ActiveRecord
@@ -197,7 +205,7 @@ module ActiveRecord
     end
   end
 
-  # Raised by app code; no runtime path marks a record read-only yet.
+  # Raised saving or destroying a read-only record (connection.rb), or by app code.
   class ReadOnlyRecord < ActiveRecordError
     def initialize(message = "ActiveRecord::ReadOnlyRecord")
       super(message)

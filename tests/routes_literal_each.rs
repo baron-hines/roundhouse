@@ -11,6 +11,8 @@
 //! The expected answers are Rails 8.1.4's on the same app, booted
 //! in-process with `Rack::MockRequest`.
 
+#[path = "support/scratch.rs"]
+mod scratch;
 use roundhouse::det::HashMap;
 
 use roundhouse::ingest::routes::ingest_routes_with_draws;
@@ -111,14 +113,20 @@ fn a_loop_inside_a_concern_still_sees_the_concern_options() {
     );
 }
 
+/// `each_with_index` binds its second parameter to the element's index, which the body may read.
+#[test]
+fn each_with_index_binds_the_index() {
+    let routes = routes_of(&draw("  %w[alpha beta].each_with_index { |page, i| get \"#{page}#{i}\", to: \"pages##{page}\" }\n"));
+    assert_eq!(routes, vec!["Get /alpha0 PagesController#alpha", "Get /beta1 PagesController#beta"]);
+}
+
 /// A collection the walker cannot read (a constant, a computed value) or
-/// a block method other than `each` is a gap with a line, not a silent
+/// a block method other than `each` or `each_with_index` is a gap with a line, not a silent
 /// skip. Strict ingest fails; survey keeps the sibling routes.
 #[test]
 fn any_other_receiver_block_is_a_located_gap() {
     for (body, line) in [
         ("  PAGES.each { |page| get page, to: \"pages##{page}\" }\n", 3),
-        ("  %w[alpha beta].each_with_index { |page, i| get page, to: \"pages##{page}\" }\n", 3),
         ("  2.times { |i| get \"p#{i}\", to: \"pages#show\" }\n", 3),
         ("  [page_name].each { |page| get page, to: \"pages##{page}\" }\n", 3),
     ] {
@@ -221,11 +229,7 @@ end
 /// a partial mount.
 #[test]
 fn a_mount_inside_a_literal_each_loop_is_a_located_gap_on_every_iteration() {
-    let root = std::env::temp_dir().join(format!(
-        "roundhouse-routes-literal-each-mount-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-    ));
+    let root = scratch::dir(&format!("roundhouse-routes-literal-each-mount-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
     let app_dir = root.join("app");
     for (path, source) in [
         (

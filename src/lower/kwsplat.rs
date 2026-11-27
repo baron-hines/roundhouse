@@ -135,6 +135,17 @@ struct Signatures {
     /// Superclass links, so a call landing on an inherited `initialize`
     /// still resolves.
     parents: HashMap<ClassId, ClassId>,
+    /// The source spans of `self` inside class-side (`def self.`) method
+    /// bodies: a class object there, though typed as the class's instance,
+    /// so an instance method of the same name is not its callee.
+    class_self: crate::det::HashSet<crate::span::Span>,
+    /// Each class's and module's includes, for a method a mixin supplies.
+    includes: HashMap<ClassId, Vec<ClassId>>,
+    /// Each instance method name in `methods`, with its owner when only
+    /// one app class defines it (`None` when several do), so
+    /// [`unique_instance_params`] is a lookup rather than a scan of
+    /// every method per send.
+    instance_owners: HashMap<Symbol, Option<ClassId>>,
 }
 
 pub fn apply_kwsplat_expansion(app: &mut App) -> Vec<Diagnostic> {
@@ -192,11 +203,26 @@ fn apply_to_self_sends(app: &mut App, sigs: &Signatures, diags: &mut Vec<Diagnos
             crate::analyze::controller_includes(controller),
         );
     }
+    // Each owner's own methods, indexed once per table. Scanning every
+    // signature in the app for every class on every class's ancestry was
+    // |classes| * depth * |methods|. An (owner, name) key is unique, so
+    // within one owner the order these are visited in cannot change which
+    // entry wins.
+    type ByOwner<'s> = HashMap<&'s ClassId, Vec<(&'s Symbol, &'s Vec<Param>)>>;
+    fn index_by_owner(table: &HashMap<(ClassId, Symbol), Vec<Param>>) -> ByOwner<'_> {
+        let mut by_owner: ByOwner<'_> = HashMap::default();
+        for ((owner, name), params) in table {
+            by_owner.entry(owner).or_default().push((name, params));
+        }
+        by_owner
+    }
+    let instance_by_owner = index_by_owner(&sigs.methods);
+    let class_by_owner = index_by_owner(&sigs.class_methods);
     let view_of = |id: &ClassId, class_side: bool| -> HashMap<Symbol, Vec<Param>> {
-        let table = if class_side {
-            &sigs.class_methods
+        let by_owner = if class_side {
+            &class_by_owner
         } else {
-            &sigs.methods
+            &instance_by_owner
         };
         let mut out: HashMap<Symbol, Vec<Param>> = HashMap::default();
         let mut queue: Vec<ClassId> = vec![id.clone()];
@@ -205,12 +231,10 @@ fn apply_to_self_sends(app: &mut App, sigs: &Signatures, diags: &mut Vec<Diagnos
             if !seen.insert(cid.clone()) {
                 continue;
             }
-            for ((owner, name), params) in table {
-                if *owner == cid {
-                    // Nearest definition wins: the class itself is
-                    // visited first, then what it reaches.
-                    out.entry(name.clone()).or_insert_with(|| params.clone());
-                }
+            for (name, params) in by_owner.get(&cid).map(Vec::as_slice).unwrap_or_default() {
+                // Nearest definition wins: the class itself is
+                // visited first, then what it reaches.
+                out.entry((*name).clone()).or_insert_with(|| (*params).clone());
             }
             if let Some(parent) = sigs.parents.get(&cid) {
                 queue.push(parent.clone());
@@ -348,6 +372,33 @@ fn collect_signatures(app: &App) -> Signatures {
             }
         }
     }
+    for lc in &app.library_classes {
+        if !lc.includes.is_empty() {
+            sigs.includes.entry(lc.name.clone()).or_default().extend(lc.includes.iter().cloned());
+        }
+    }
+    for model in &app.models {
+        let included = crate::analyze::model_includes(model);
+        if !included.is_empty() {
+            sigs.includes.entry(model.name.clone()).or_default().extend(included);
+        }
+    }
+    fn class_selves(e: &Expr, out: &mut crate::det::HashSet<crate::span::Span>) {
+        if matches!(&*e.node, ExprNode::SelfRef) && !e.span.is_synthetic() {
+            out.insert(e.span);
+        }
+        e.node.for_each_child(&mut |c| class_selves(c, out));
+    }
+    for lc in &app.library_classes {
+        for m in lc.methods.iter().filter(|m| matches!(m.receiver, MethodReceiver::Class)) {
+            class_selves(&m.body, &mut sigs.class_self);
+        }
+    }
+    for model in &app.models {
+        for m in model.methods().filter(|m| matches!(m.receiver, MethodReceiver::Class)) {
+            class_selves(&m.body, &mut sigs.class_self);
+        }
+    }
     for controller in &app.controllers {
         if let Some(parent) = &controller.parent {
             sigs.parents.insert(controller.name.clone(), parent.clone());
@@ -360,6 +411,12 @@ fn collect_signatures(app: &App) -> Signatures {
                 );
             }
         }
+    }
+    for (owner, name) in sigs.methods.keys() {
+        sigs.instance_owners
+            .entry(name.clone())
+            .and_modify(|unique| *unique = None)
+            .or_insert_with(|| Some(owner.clone()));
     }
     sigs
 }
@@ -391,6 +448,36 @@ fn rewrite(expr: &mut Expr, sigs: &Signatures, diags: &mut Vec<Diagnostic>) {
         return;
     }
     restore_kwrest_on_typed_send(expr, sigs);
+    convert_splatted_object(expr, sigs);
+}
+
+/// `{ **attrs, k: v }` where `attrs` is an object of an app class: Ruby
+/// splats it through its `to_hash`. The ingest desugar wrote the merge
+/// chain `attrs.merge({ k: v })`, which asks the object for a `merge` it
+/// does not define (a log-attributes wrapper with only `to_hash`). A
+/// `merge` whose receiver is typed as an app class that defines `to_hash`
+/// and no `merge` of its own, its ancestors' or an included module's,
+/// could only have been written as that splat, so the receiver is read
+/// through `to_hash`.
+fn convert_splatted_object(expr: &mut Expr, sigs: &Signatures) {
+    let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &mut *expr.node else { return };
+    if method.as_str() != "merge" || args.len() != 1 {
+        return;
+    }
+    let Some(ty) = recv.ty.as_ref() else { return };
+    // A `merge` the class gets from an included module is a real call too.
+    if !matches!(ty, Ty::Class { .. })
+        || callee_params(ty, method, sigs).is_some()
+        || mixin_defines(ty, method, sigs)
+        || callee_params(ty, &Symbol::from("to_hash"), sigs).is_none()
+    {
+        return;
+    }
+    let inner = recv.clone();
+    *recv = Expr::new(
+        inner.span,
+        ExprNode::Send { recv: Some(inner), method: Symbol::from("to_hash"), args: vec![], block: None, parenthesized: false },
+    );
 }
 
 fn is_self_send(recv: Option<&Expr>) -> bool {
@@ -425,9 +512,8 @@ fn restore_kwrest_on_typed_send(expr: &mut Expr, sigs: &Signatures) {
     let params = params.clone();
     let ExprNode::Send { args, .. } = &mut *expr.node else { return };
     restore_kwrest_splat(args, &params);
-    // A callee with no keyword parameter takes the Hash positionally, so
-    // the Ruby emitter must not write the source's `**` back over it.
-    if params.iter().all(|p| !p.keyword) {
+    // Flattened keyword parameters still use the established positional ABI.
+    if params.iter().any(|p| p.from_keyword || p.from_kwrest) && params.iter().all(|p| !p.keyword) {
         for arg in args.iter_mut() {
             arg.decisions &= !crate::expr::ERASED_KEYWORD_SPLAT;
         }
@@ -607,6 +693,18 @@ fn erased_splat(expr: &Expr, sigs: &Signatures) -> Option<ErasedSplat> {
     let ExprNode::Send { recv: Some(recv), method, args, .. } = &*expr.node else {
         return None;
     };
+    // `Klass.m(x)` reaches the CLASS side, and `sigs.methods` holds
+    // instance methods only: an instance `m(kw: true)` of the same name
+    // (`RolloutRecord#to_entity(load_associations:)` beside the class
+    // side `to_entity(rollout_record)`) would read the one positional
+    // argument as an erased `**x` and write it back as `to_entity(**self)`.
+    // `new` is the one class-side send that resolves to an instance method.
+    // `self` in a `def self.` body is the class object too.
+    let class_side = matches!(&*recv.node, ExprNode::Const { .. })
+        || (matches!(&*recv.node, ExprNode::SelfRef) && sigs.class_self.contains(&recv.span));
+    if class_side && method.as_str() != "new" {
+        return None;
+    }
     let params = callee_params(recv.ty.as_ref()?, method, sigs)?;
     erased_splat_against(args, params)
 }
@@ -673,14 +771,40 @@ fn is_literal(expr: &Expr) -> bool {
 /// The parameters of the only app class defining instance method
 /// `method`, or `None` when none or several do.
 fn unique_instance_params<'s>(method: &Symbol, sigs: &'s Signatures) -> Option<&'s Vec<Param>> {
-    let mut found = sigs.methods.iter().filter(|((_, name), _)| name == method);
-    let (_, params) = found.next()?;
-    found.next().is_none().then_some(params)
+    let owner = sigs.instance_owners.get(method)?.as_ref()?;
+    sigs.methods.get(&(owner.clone(), method.clone()))
 }
 
 /// The callee's parameter list, walking the inheritance chain the way
 /// `normalize_trailing_kwargs` does — including its `new` → `initialize`
 /// hop, since Ruby auto-generates `new` to forward to the constructor.
+/// Does a module the receiver's class (or an ancestor) includes, directly
+/// or through another module, define the instance method `method`?
+fn mixin_defines(recv_ty: &Ty, method: &Symbol, sigs: &Signatures) -> bool {
+    let Ty::Class { id, .. } = recv_ty else { return false };
+    let mut classes = vec![id.clone()];
+    let mut current = sigs.parents.get(id).cloned();
+    for _ in 0..32 {
+        let Some(cid) = current else { break };
+        current = sigs.parents.get(&cid).cloned();
+        classes.push(cid);
+    }
+    let mut stack: Vec<ClassId> = classes.iter().filter_map(|c| sigs.includes.get(c)).flatten().cloned().collect();
+    let mut seen = crate::det::HashSet::default();
+    while let Some(module) = stack.pop() {
+        if !seen.insert(module.clone()) {
+            continue;
+        }
+        if sigs.methods.contains_key(&(module.clone(), method.clone())) {
+            return true;
+        }
+        if let Some(more) = sigs.includes.get(&module) {
+            stack.extend(more.iter().cloned());
+        }
+    }
+    false
+}
+
 fn callee_params<'s>(
     recv_ty: &Ty,
     method: &Symbol,

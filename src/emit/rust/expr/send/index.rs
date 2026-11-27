@@ -169,6 +169,10 @@ pub(super) fn try_recv_typed_method(
                     emit_expr(r),
                 ));
             }
+            // Missing key or nil value, Ruby's nil either way.
+            if map_holds_option(recv_ty) {
+                return Some(format!("{}.get({}).cloned().flatten()", emit_expr(r), emit_expr(&args[0])));
+            }
             if matches!(&*r.node, ExprNode::Const { .. }) {
                 return Some(format!(
                     "{}.lock().unwrap()[({}) as usize]",
@@ -347,7 +351,13 @@ pub(super) fn try_recv_typed_method(
             // str_color's Hash-recv coloring doesn't fire and the args
             // arrive un-coerced. Append `.to_string()` per arg whose
             // K/V slot is String-shaped. Idempotent for already-String.
-            let recv_hash_kv = recv_var_back_propagated_hash_kv(r);
+            let recv_hash_kv = recv_var_back_propagated_hash_kv(r).or_else(|| match &*r.node {
+                ExprNode::Ivar { name } => match ivar_field_ty(name.as_str()).as_ref().map(peel_nil) {
+                    Some(crate::ty::Ty::Hash { key, value }) => Some((key.as_ref().clone(), value.as_ref().clone())),
+                    _ => None,
+                },
+                _ => None,
+            });
             let is_hash_recv =
                 matches!(r.ty.as_ref(), Some(crate::ty::Ty::Hash { .. }))
                     || recv_hash_kv.is_some();
@@ -594,6 +604,28 @@ pub(super) fn try_recv_typed_method(
                  {{ (*{table_s}.get(&__caps[0]).unwrap_or(&\"\")).to_string() }}).into_owned()"
             ));
         }
+        // `s.gsub(pattern, "literal")` with a `Regexp` first arg and a
+        // String literal holding no `\` (`view_helpers.xml_name_escape`):
+        // `pattern.replace_all(&s, NoExpand(lit))`. `NoExpand`, because
+        // the regex crate reads `$` in a replacement as a group. A
+        // replacement with a Ruby `\1`/`\0` back-reference, or one that
+        // is not a literal, keeps the previous path.
+        if method == "gsub"
+            && args.len() == 2
+            && matches!(r.ty.as_ref().map(peel_nil), Some(crate::ty::Ty::Str))
+            && matches!(
+                args[0].ty.as_ref().map(peel_nil),
+                Some(crate::ty::Ty::Class { id, .. }) if id.0.as_str() == "Regexp"
+            )
+            && matches!(&*args[1].node, ExprNode::Lit { value: Literal::Str { value } } if !value.contains('\\'))
+        {
+            let recv_s = emit_expr(r);
+            let pat_s = emit_expr(&args[0]);
+            let repl_s = emit_expr(&args[1]);
+            return Some(format!(
+                "{pat_s}.replace_all(&{recv_s}, regex::NoExpand(&*{repl_s})).into_owned()"
+            ));
+        }
         // `s.gsub(needle, replacement)` — both String args. Ruby
         // returns a new string with all occurrences substituted;
         // Rust's `str::replace(needle, replacement)` is the direct
@@ -780,10 +812,62 @@ fn rust_emits_session_or_flash_get(recv: &Expr) -> bool {
 /// total nil to fall back on.
 fn map_holds_json_value(recv_ty: Option<&crate::ty::Ty>) -> bool {
     use crate::ty::Ty;
+    // As `rust_ty` renders the value: `T | nil` is an `Option<T>`, not a Value.
     matches!(
         recv_ty,
-        Some(Ty::Hash { value, .. })
-            if matches!(value.as_ref(), Ty::Untyped)
-                || matches!(value.as_ref(), Ty::Union { .. })
+        Some(Ty::Hash { value, .. }) if super::super::super::ty::rust_value_shaped(value)
     )
+}
+
+/// A map of `Option<T>` values (`{ "title" => title }` over a nullable
+/// column): its `T | nil` is the Option itself.
+fn map_holds_option(recv_ty: Option<&crate::ty::Ty>) -> bool {
+    matches!(recv_ty, Some(crate::ty::Ty::Hash { value, .. }) if super::super::util::is_option_ty(value))
+}
+
+#[cfg(test)]
+mod gsub_string_replacement_tests {
+    use super::super::super::{emit_expr, with_emit_ctx};
+    use crate::emit::rust::EmitCtx;
+    use crate::expr::{Expr, ExprNode, Literal};
+    use crate::ident::{ClassId, Symbol, VarId};
+    use crate::span::Span;
+    use crate::ty::Ty;
+
+    fn node(n: ExprNode, ty: Ty) -> Expr {
+        let mut e = Expr::new(Span::synthetic(), n);
+        e.ty = Some(ty);
+        e
+    }
+
+    fn gsub(repl: &str) -> String {
+        let regexp = Ty::Class { id: ClassId(Symbol::from("Regexp")), args: vec![].into() };
+        let e = node(
+            ExprNode::Send {
+                recv: Some(node(ExprNode::Var { id: VarId(0), name: Symbol::from("name") }, Ty::Str)),
+                method: Symbol::from("gsub"),
+                args: vec![
+                    node(ExprNode::Const { path: vec![Symbol::from("PATTERN")] }, regexp),
+                    node(ExprNode::Lit { value: Literal::Str { value: repl.to_string() } }, Ty::Str),
+                ],
+                block: None,
+                parenthesized: true,
+            },
+            Ty::Str,
+        );
+        with_emit_ctx(EmitCtx::default(), || emit_expr(&e))
+    }
+
+    #[test]
+    fn a_string_replacement_is_a_no_expand_replace_all() {
+        let out = gsub("_");
+        assert!(out.contains(".replace_all(&name, regex::NoExpand(&*\"_\")).into_owned()"), "{out}");
+    }
+
+    /// A Ruby back-reference (`\\1`) keeps the previous path.
+    #[test]
+    fn a_back_reference_does_not_take_the_no_expand_arm() {
+        let out = gsub("(\\1)");
+        assert!(!out.contains("NoExpand"), "{out}");
+    }
 }
