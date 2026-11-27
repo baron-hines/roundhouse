@@ -71,7 +71,7 @@ pub(in crate::analyze) fn mark(
         .sources
         .iter()
         .filter(|f| f.path.contains("config/"))
-        .map(|f| f.text.split_whitespace().collect::<String>())
+        .map(|f| f.text.replace("\\\n", "").split_whitespace().collect::<String>())
         .collect();
     let touched_from_outside = |id: &ClassId| {
         let name = id.0.as_str();
