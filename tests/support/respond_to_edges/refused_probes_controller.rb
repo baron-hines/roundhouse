@@ -4,13 +4,6 @@ class RefusedProbesController < ApplicationController
   skip_forgery_protection
   layout false
 
-  def any_multi
-    respond_to do |format|
-      format.html { render html: "h" }
-      format.any(:json, :turbo_stream) { render plain: "multi" }
-    end
-  end
-
   # request.format forced before respond_to
   def force_json
     request.format = :json

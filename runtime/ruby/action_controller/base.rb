@@ -122,245 +122,6 @@ module ActionController
       c == "\x1e" || c == "\x1f" || c == "\x7f"
   end
 
-  # ---- Accept negotiation (`Base#negotiate_format`'s helpers) ------------
-  #
-  # Module functions with ONE counter-stepped loop each and no early return
-  # inside it: the shape `functionalize/while_to_recursion` lowers to
-  # recursion for the Elixir library emit.
-
-  # `Request#formats` from the `Accept` header, as format names in
-  # preference order (highest q first, ties in header order). A blank
-  # header, or a browser's list that ends in or contains `*/*` beside
-  # other types (Rails' BROWSER_LIKE_ACCEPTS), is html alone. The
-  # XMLHttpRequest case (`X-Requested-With`) is not modeled.
-  #
-  # Cost: ranking is quadratic in the item count (an item's slot counts
-  # the items that outrank it), and a header's item count is the
-  # client's to choose. So ranking runs on the DISTINCT recognised
-  # formats only, never on the raw items: items of an unregistered type,
-  # and every item but the best one of a format (highest q, earliest on
-  # a tie), cannot change which format comes first, so dropping them
-  # changes no outcome. That leaves at most one item per registered
-  # format plus `*/*` (about forty), however long the header, and every
-  # earlier step is linear. Rails ranks them all and gets the same order.
-  def self.accepted_formats(accept)
-    return ["html"] if accept.strip.empty?
-    squeezed = accept.gsub(" ", "").gsub("\t", "").gsub("\n", "").gsub("\r", "")
-    return ["html"] if squeezed.include?(",*/*") || squeezed.include?("*/*,")
-    items = expand_trailing_stars(accept.split(","))
-    all_names = accept_item_names(items)
-    all_qs = accept_item_qs(items)
-    keep = best_item_flags(all_names, all_qs)
-    names = flagged_names(all_names, keep)
-    qs = flagged_qs(all_qs, keep)
-    # An item's slot is the number of items that outrank it.
-    ranks = outranking_counts(qs)
-    ordered_non_empty(names, ranks)
-  end
-
-  # `text/*` and `application/*` expand to the registered types they
-  # match, in Rails' registration order, each keeping the item's
-  # parameters (so its q): Rails' `parse_trailing_star`. Only those two
-  # prefixes, and case-sensitively, as upstream's TRAILING_STAR_REGEXP.
-  def self.expand_trailing_stars(items)
-    out = []
-    i = 0
-    while i < items.length
-      item = items[i].to_s
-      star = trailing_star_mimes(item.strip)
-      if star.empty?
-        out << item
-      else
-        rest = item.include?(";") ? ";" + item.split(";", 2)[1].to_s : ""
-        out.concat(star_items(star, rest))
-      end
-      i += 1
-    end
-    out
-  end
-
-  def self.star_items(mimes, rest)
-    items = []
-    j = 0
-    while j < mimes.length
-      items << mimes[j].to_s + rest
-      j += 1
-    end
-    items
-  end
-
-  # One flag per item: true for the best item of each recognised format.
-  def self.best_item_flags(names, qs)
-    best = []
-    i = 0
-    while i < names.length
-      name = names[i].to_s
-      if !name.empty?
-        slot = best_slot(names, best, name)
-        if slot < 0
-          best << i
-        elsif qs[i] > qs[best[slot]]
-          best[slot] = i
-        end
-      end
-      i += 1
-    end
-    flags_for(best, names.length)
-  end
-
-  # Where in `best` the item for `name` sits, or -1.
-  def self.best_slot(names, best, name)
-    found = -1
-    k = 0
-    while k < best.length
-      found = k if names[best[k]] == name && found < 0
-      k += 1
-    end
-    found
-  end
-
-  # One loop, like every helper here: two would not lower to Elixir.
-  def self.flags_for(indexes, count)
-    flags = []
-    i = 0
-    while i < count
-      flags << indexes.include?(i)
-      i += 1
-    end
-    flags
-  end
-
-  def self.flagged_names(names, flags)
-    out = []
-    i = 0
-    while i < names.length
-      out << names[i] if flags[i]
-      i += 1
-    end
-    out
-  end
-
-  def self.flagged_qs(qs, flags)
-    out = []
-    i = 0
-    while i < qs.length
-      out << qs[i] if flags[i]
-      i += 1
-    end
-    out
-  end
-
-  # The mime types `Mime::Type.parse("<prefix>/*")` answers under
-  # actionpack 8.1.3.1 + turbo-rails 2.0.23, in order (a type matches
-  # when its string or a synonym contains the prefix: `text/xml` and
-  # `text/x-json` put xml and json under `text`; turbo_stream registers
-  # last).
-  def self.trailing_star_mimes(item)
-    if item.start_with?("text/*")
-      return ["text/html", "text/plain", "text/javascript", "text/css", "text/calendar",
-              "text/csv", "text/vcard", "text/vtt", "text/markdown", "application/xml",
-              "application/x-yaml", "application/json", "text/vnd.turbo-stream.html"]
-    end
-    if item.start_with?("application/*")
-      return ["text/html", "text/javascript", "application/xml", "application/rss+xml",
-              "application/atom+xml", "application/x-yaml", "application/x-www-form-urlencoded",
-              "application/json", "application/pdf", "application/zip", "application/gzip"]
-    end
-    []
-  end
-
-  def self.accept_item_names(items)
-    names = []
-    i = 0
-    while i < items.length
-      names << accept_item_name(items[i].to_s)
-      i += 1
-    end
-    names
-  end
-
-  def self.accept_item_qs(items)
-    qs = []
-    i = 0
-    while i < items.length
-      qs << accept_item_q(items[i].to_s)
-      i += 1
-    end
-    qs
-  end
-
-  def self.accept_item_name(item)
-    # Case-sensitive, as Rails' registry lookup is: `TEXT/HTML` is no type.
-    mime = item.split(";")[0].to_s.strip
-    return "*/*" if mime == "*/*"
-    format_name_for_mime(mime)
-  end
-
-  # "text/vnd.turbo-stream.html" -> "turbo_stream"; "" for a type the
-  # registry does not know.
-  def self.format_name_for_mime(mime)
-    return "" unless Mime::Type.valid?(mime)
-    symbol = Mime::Type.lookup(mime).symbol
-    return "" if symbol.nil?
-    symbol.to_s
-  end
-
-  def self.accept_item_q(item)
-    parts = item.split(";")
-    given = []
-    j = 1
-    while j < parts.length
-      param = parts[j].to_s.strip
-      given << param[2, 16].to_s.to_f if param.start_with?("q=")
-      j += 1
-    end
-    return 1.0 if given.empty?
-    given[given.length - 1]
-  end
-
-  def self.outranking_counts(qs)
-    ranks = []
-    k = 0
-    while k < qs.length
-      ranks << outranking_count(qs, k)
-      k += 1
-    end
-    ranks
-  end
-
-  def self.outranking_count(qs, at)
-    outranking = []
-    j = 0
-    while j < qs.length
-      outranking << j if qs[j] > qs[at] || (qs[j] == qs[at] && j < at)
-      j += 1
-    end
-    outranking.length
-  end
-
-  # The names in rank order, unknown types (empty names) left out.
-  def self.ordered_non_empty(names, ranks)
-    ordered = []
-    r = 0
-    while r < names.length
-      name = names[rank_index(ranks, r)].to_s
-      ordered << name unless name.empty?
-      r += 1
-    end
-    ordered
-  end
-
-  def self.rank_index(ranks, rank)
-    found = []
-    j = 0
-    while j < ranks.length
-      found << j if ranks[j] == rank
-      j += 1
-    end
-    return 0 if found.empty?
-    found[0]
-  end
-
   # The first requested format that has an arm (or a `*/*`); "" for none.
   def self.first_requested_format(accepted, order)
     hits = []
@@ -984,7 +745,7 @@ module ActionController
     # format its URL PINS ("" when it pins none): a `.json` suffix, a
     # `(.:format)` segment, a route's `format:` default. The dispatchers
     # set both; `negotiate_format` is the only reader.
-    attr_reader :accept_header
+    attr_accessor :accept_header
     attr_accessor :explicit_format
     # Rails' `ActionController::MimeResponds#respond_to` selection, for
     # the arms the lowering registered (`order`, in source order, as
@@ -1067,28 +828,10 @@ module ActionController
     end
 
     # `Request#formats` from the `Accept` header, as format names in
-    # preference order (highest q first, ties in header order). A blank
-    # header, or a browser's list that ends in or contains `*/*` beside
-    # other types (Rails' BROWSER_LIKE_ACCEPTS), is html alone. The
-    # XMLHttpRequest case (`X-Requested-With`, which makes that list
-    # trusted) is not modeled; Turbo's fetch does not send it.
-    #
-    # Parsed once per request: `negotiate_format` runs once per
-    # `respond_to` and per implicit render, and the parse is the costly
-    # part. `accept_header=` drops the memo.
-    def accepted_format_names
-      names = @accepted_format_names
-      return names unless names.nil?
-      parsed = ActionController.accepted_formats(@accept_header)
-      @accepted_format_names = parsed
-      parsed
-    end
-
-    def accept_header=(value)
-      @accepted_format_names = nil
-      @accept_header = value
-      @accept_header
-    end
+    # preference order. The dispatcher parses it once per request
+    # (`ActionDispatch::MimeNegotiation.accepted_formats`): only the ruby
+    # family carries that parser, and this class goes to every target.
+    attr_accessor :accepted_format_names
 
     # Rails' `request.should_apply_vary_header?`: the response format
     # was negotiated from the request's Accept header (no `format`
@@ -1150,8 +893,8 @@ module ActionController
       @query_string = +""
       @accepts_any_format = false
       @accept_header = +""
-      @accepted_format_names = nil
       @explicit_format = +""
+      @accepted_format_names = ["html"]
       @vary_on_accept = false
       @content_type = "text/html; charset=utf-8"
       @content_type_explicit = false

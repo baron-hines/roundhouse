@@ -6,5 +6,24 @@ module ActionDispatch
     def self.preferred_type: (String accept) -> String
     def self.format_name: (String extension, String accept, String x_requested_with, String content_type) -> String
     def self.json_type?: (String media_type) -> bool
+    def self.format_names: (Array[String | Symbol] list) -> Array[String]
+    def self.accepted_formats: (String accept) -> Array[String]
+    def self.expand_trailing_stars: (Array[String] items) -> Array[String]
+    def self.star_items: (Array[String] mimes, String rest) -> Array[String]
+    def self.trailing_star_mimes: (String item) -> Array[String]
+    def self.best_item_flags: (Array[String] names, Array[Float] qs) -> Array[bool]
+    def self.best_slot: (Array[String] names, Array[Integer] best, String name) -> Integer
+    def self.flags_for: (Array[Integer] indexes, Integer count) -> Array[bool]
+    def self.flagged_names: (Array[String] names, Array[bool] flags) -> Array[String]
+    def self.flagged_qs: (Array[Float] qs, Array[bool] flags) -> Array[Float]
+    def self.accept_item_names: (Array[String] items) -> Array[String]
+    def self.accept_item_qs: (Array[String] items) -> Array[Float]
+    def self.accept_item_name: (String item) -> String
+    def self.accept_item_q: (String item) -> Float
+    def self.format_name_for_mime: (String mime) -> String
+    def self.outranking_counts: (Array[Float] qs) -> Array[Integer]
+    def self.outranking_count: (Array[Float] qs, Integer at) -> Integer
+    def self.ordered_non_empty: (Array[String] names, Array[Integer] ranks) -> Array[String]
+    def self.rank_index: (Array[Integer] ranks, Integer rank) -> Integer
   end
 end

@@ -214,19 +214,19 @@ fn accept_parsing_is_exact_and_linear() {
 # Exact: a late q=1 turbo item outranks 32 earlier html q=0.5 items, as in
 # Rails; unknown types and empty items change nothing.
 many = (["text/html;q=0.5"] * 32 + ["text/vnd.turbo-stream.html"] * 8).join(",")
-raise ActionController.accepted_formats(many).inspect unless ActionController.accepted_formats(many) == ["turbo_stream", "html"]
+raise ActionDispatch::MimeNegotiation.accepted_formats(many).inspect unless ActionDispatch::MimeNegotiation.accepted_formats(many) == ["turbo_stream", "html"]
 late = (["image/png"] * 33 + ["text/html"]).join(",")
-raise "late html" unless ActionController.accepted_formats(late) == ["png", "html"]
-raise "empties" unless ActionController.accepted_formats((["" ] * 40 + ["text/html"]).join(",")) == ["html"]
+raise "late html" unless ActionDispatch::MimeNegotiation.accepted_formats(late) == ["png", "html"]
+raise "empties" unless ActionDispatch::MimeNegotiation.accepted_formats((["" ] * 40 + ["text/html"]).join(",")) == ["html"]
 # The best item of a format counts, wherever it sits; ties keep header order.
-raise "best q" unless ActionController.accepted_formats("text/html;q=0.1, application/json;q=0.5, text/html;q=0.9") == ["html", "json"]
-raise "tie" unless ActionController.accepted_formats("application/json, text/html, application/json") == ["json", "html"]
+raise "best q" unless ActionDispatch::MimeNegotiation.accepted_formats("text/html;q=0.1, application/json;q=0.5, text/html;q=0.9") == ["html", "json"]
+raise "tie" unless ActionDispatch::MimeNegotiation.accepted_formats("application/json, text/html, application/json") == ["json", "html"]
 # A header can break across lines: `text/html,\n*/*` is a browser list.
-raise "newline" unless ActionController.accepted_formats("text/html,\n*/*") == ["html"]
+raise "newline" unless ActionDispatch::MimeNegotiation.accepted_formats("text/html,\n*/*") == ["html"]
 # Linear in the header, not quadratic: 210000 items answer at once.
 t = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 huge = (["text/html;q=0.5", "application/json;q=0.4", "x/y"] * 70_000).join(",")
-raise "huge" unless ActionController.accepted_formats(huge) == ["html", "json"]
+raise "huge" unless ActionDispatch::MimeNegotiation.accepted_formats(huge) == ["html", "json"]
 raise "slow" if Process.clock_gettime(Process::CLOCK_MONOTONIC) - t > 5
 puts "accept ok"
 "##;
@@ -236,16 +236,14 @@ puts "accept ok"
 }
 
 #[test]
-fn accept_parsing_is_memoized_per_request() {
+fn accept_is_parsed_by_the_dispatcher_and_read_by_negotiation() {
     let script = r##"
 c = ActionController::Base.new
-c.accept_header = "text/html"
-first = c.accepted_format_names
-raise "not memoized" unless c.accepted_format_names.equal?(first)
 c.accept_header = "text/vnd.turbo-stream.html"
-raise "stale memo" unless c.accepted_format_names == ["turbo_stream"]
+c.accepted_format_names = ActionDispatch::MimeNegotiation.accepted_formats(c.accept_header)
+raise "turbo" unless c.negotiate_format(["html", "turbo_stream"]) == "turbo_stream"
 other = ActionController::Base.new
-raise "memo leaked across requests" unless other.accepted_format_names == ["html"]
+raise "a fresh controller reads html" unless other.accepted_format_names == ["html"]
 puts "accept ok"
 "##;
     let run = probes().run_ruby(script);

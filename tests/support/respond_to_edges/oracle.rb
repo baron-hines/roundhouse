@@ -12,7 +12,7 @@ require File.join(HERE, "accepts")
 
 ROUTES = {
   "h_side" => "probes", "h_side_json" => "probes", "h_multi" => "probes", "h_other" => "probes",
-  "h_redirect" => "probes", "h_bare_noview" => "probes", "any_bare" => "probes", "any_multi" => "refused_probes",
+  "h_redirect" => "probes", "h_bare_noview" => "probes", "any_bare" => "probes", "any_multi" => "probes",
   "mixed" => "probes", "force_json" => "refused_probes", "force_turbo" => "refused_probes",
   "force_plain" => "refused_probes", "pin" => "probes", "semi" => "probes", "h_cond" => "probes", "cond_arm" => "refused_probes", "helper_resp" => "refused_probes",
 }
