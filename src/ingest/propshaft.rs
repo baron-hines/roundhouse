@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
+use crate::det::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -154,7 +155,7 @@ pub(super) fn read_version<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
     if vfs.is_dir(&init_dir) {
         initializers.extend(super::app::read_rb_files(vfs, &init_dir)?);
     }
-    let mut versions = HashSet::new();
+    let mut versions = HashSet::default();
     for environment in environments {
         let mut value = base.clone();
         if let Some(path) = environment {
@@ -289,7 +290,7 @@ fn digested_paths(assets: &BTreeMap<String, Vec<u8>>, version: &str) -> BTreeMap
             hash.update(bytes);
             if pattern(logical).is_some() {
                 let mut refs = Vec::new();
-                referenced(logical, assets, &mut HashSet::new(), &mut refs);
+                referenced(logical, assets, &mut HashSet::default(), &mut refs);
                 for path in refs {
                     hash.update(&assets[&path]);
                 }
@@ -374,6 +375,17 @@ fn app_assets<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult<BTreeMap<Str
             }
         }
     }
+    // A mounted engine's directories its own initializer adds to the paths, each a root of its own as Propshaft reads one.
+    for root in super::engine_config::asset_dirs() {
+        if vfs.is_dir(&root) {
+            let mut engine = BTreeMap::new();
+            collect(vfs, &root, &root, &mut engine)?;
+            // Not over the app's own: its paths come first, so a logical name it has resolves there.
+            for (logical, bytes) in engine {
+                assets.entry(logical).or_insert(bytes);
+            }
+        }
+    }
     Ok(assets)
 }
 
@@ -443,20 +455,7 @@ pub(super) fn ingest<V: Vfs + ?Sized>(
         })?;
     let rails = app
         .rails_application
-        .get_or_insert_with(|| crate::dialect::LibraryClass {
-            name: crate::ident::ClassId(crate::ident::Symbol::from("Rails::Application")),
-            is_module: false,
-            parent: None,
-            parent_span: Default::default(),
-            includes: Vec::new(),
-            include_spans: Vec::new(),
-            methods: Vec::new(),
-            nullable_columns: Vec::new(),
-            origin: None,
-            constants: Vec::new(),
-            unknown_calls: Vec::new(),
-            class_ivar_initializers: Vec::new(),
-        });
+        .get_or_insert_with(crate::ingest::rails_application_class);
     rails.methods.append(&mut methods);
     Ok(())
 }

@@ -236,7 +236,7 @@ fn builder_chain_sends_do_not_carry_db_effects() {
     assert!(
         published.body.effects.is_pure(),
         "Builder Send `where(...)` should carry no effects; got {:?}",
-        published.body.effects.effects,
+        published.body.effects.effects(),
     );
 }
 
@@ -261,9 +261,9 @@ fn terminal_sends_still_carry_db_effects() {
     // `value` is the `Post.all` Send — Terminal, should carry
     // DbRead(posts) as before.
     assert!(
-        value.effects.effects.contains(&posts_read),
+        value.effects.effects().contains(&posts_read),
         "Terminal Send `Post.all` should carry DbRead(posts); got {:?}",
-        value.effects.effects,
+        value.effects.effects(),
     );
 }
 
@@ -354,7 +354,7 @@ fn custom_adapter_suppresses_db_effects() {
     Analyzer::with_adapter(&app, Box::new(NoDbAdapter)).analyze(&mut app);
 
     for action in app.controllers[0].actions() {
-        for e in &action.effects.effects {
+        for e in action.effects.effects() {
             match e {
                 Effect::DbRead { .. } | Effect::DbWrite { .. } => {
                     panic!(
@@ -379,9 +379,9 @@ fn action_effects_include_db_reads() {
     for action_name in ["index", "show", "destroy"] {
         let action = ctrl.actions().find(|a| a.name.as_str() == action_name).unwrap();
         assert!(
-            action.effects.effects.contains(&posts_read),
+            action.effects.effects().contains(&posts_read),
             "{action_name} missing DbRead(posts); got {:?}",
-            action.effects.effects
+            action.effects.effects()
         );
     }
 }
@@ -399,9 +399,9 @@ fn destroy_effects_include_db_write_via_ivar_dispatch() {
         .unwrap();
     let posts_write = Effect::DbWrite { table: TableRef(Symbol::from("posts")) };
     assert!(
-        destroy.effects.effects.contains(&posts_write),
+        destroy.effects.effects().contains(&posts_write),
         "destroy missing DbWrite(posts); got {:?}",
-        destroy.effects.effects
+        destroy.effects.effects()
     );
 }
 
@@ -447,12 +447,13 @@ fn actions_without_db_calls_stay_pure() {
             }],
             layout: Default::default(),
             sibling_classes: Vec::new(),
+            csp_header: false,
         });
         analyzer.analyze(&mut app);
         app.controllers[0].actions().next().unwrap().effects.clone()
     };
     action.effects = body_ctx_effects;
-    assert!(action.effects.effects.is_empty(), "expected empty effects for empty body");
+    assert!(action.effects.effects().is_empty(), "expected empty effects for empty body");
 }
 
 // Per-expression effect annotation --------------------------------------
@@ -479,14 +480,14 @@ fn per_expr_effects_populated_on_send_site() {
         .unwrap();
     let ExprNode::Assign { value, .. } = &*index.body.node else { panic!() };
     assert!(
-        value.effects.effects.contains(&posts_read),
+        value.effects.effects().contains(&posts_read),
         "Post.all Send should carry DbRead(posts); got {:?}",
-        value.effects.effects,
+        value.effects.effects(),
     );
     assert!(
         index.body.effects.is_pure(),
         "Assign wrapper has no local effect; got {:?}",
-        index.body.effects.effects,
+        index.body.effects.effects(),
     );
     let ExprNode::Send { recv, .. } = &*value.node else { panic!() };
     assert!(
@@ -517,9 +518,9 @@ fn per_expr_effects_on_instance_dispatch() {
         ))
         .expect("destroy Send present");
     assert!(
-        destroy_send.effects.effects.contains(&posts_write),
+        destroy_send.effects.effects().contains(&posts_write),
         "@post.destroy should carry DbWrite(posts); got {:?}",
-        destroy_send.effects.effects,
+        destroy_send.effects.effects(),
     );
     let ExprNode::Send { recv, .. } = &*destroy_send.node else { panic!() };
     assert!(
@@ -546,9 +547,9 @@ fn per_expr_effects_on_io_calls() {
         ))
         .expect("redirect_to Send present");
     assert!(
-        redirect.effects.effects.contains(&Effect::Io),
+        redirect.effects.effects().contains(&Effect::Io),
         "redirect_to should carry Io; got {:?}",
-        redirect.effects.effects,
+        redirect.effects.effects(),
     );
 }
 
@@ -562,7 +563,7 @@ fn action_aggregate_equals_subtree_fold() {
     use std::collections::BTreeSet;
 
     fn fold(expr: &Expr, acc: &mut BTreeSet<Effect>) {
-        acc.extend(expr.effects.effects.iter().cloned());
+        acc.extend(expr.effects.effects().iter().cloned());
         match &*expr.node {
             ExprNode::Lit { .. }
             | ExprNode::Var { .. }
@@ -735,8 +736,8 @@ fn action_aggregate_equals_subtree_fold() {
         let mut folded: BTreeSet<Effect> = BTreeSet::new();
         fold(&action.body, &mut folded);
         assert_eq!(
-            folded,
-            action.effects.effects,
+            &folded,
+            action.effects.effects(),
             "action {} — tree fold should equal the aggregate",
             action.name.as_str(),
         );
@@ -766,7 +767,7 @@ fn analyze_action_body(body: roundhouse::expr::Expr) -> roundhouse::expr::Expr {
         block_param: None,
         body,
         renders: RenderTarget::Inferred,
-        effects: EffectSet { effects: BTreeSet::new() },
+        effects: EffectSet::pure(),
     };
     let mut app = roundhouse::App::new();
     app.controllers.push(Controller {
@@ -780,6 +781,7 @@ fn analyze_action_body(body: roundhouse::expr::Expr) -> roundhouse::expr::Expr {
         }],
         layout: Default::default(),
         sibling_classes: Vec::new(),
+        csp_header: false,
     });
     let mut analyzer = Analyzer::new(&app);
     analyzer.analyze(&mut app);
@@ -921,6 +923,65 @@ fn hash_each_block_binds_key_and_value() {
     let ExprNode::Send { block: Some(b), .. } = &*analyzed.node else { panic!() };
     let ExprNode::Lambda { body, .. } = &*b.node else { panic!() };
     assert_eq!(body.ty, Some(Ty::Int), "block param v should be Int (hash value type)");
+}
+
+#[test]
+fn hash_to_h_block_binds_key_and_value() {
+    // {"a" => 1}.to_h { |k, v| k }  -> k types as String, v as Int.
+    // `Hash#to_h` yields key and value like `each`; with the
+    // parameters unbound, String core-ext calls on `k` (`k.humanize`)
+    // were never grounded and raised at run time.
+    use roundhouse::expr::Expr;
+    use roundhouse::ident::VarId;
+    use roundhouse::span::Span;
+
+    let block_body_ty = |read: (u32, &str)| {
+        let hash = Expr::new(
+            Span::synthetic(),
+            ExprNode::Hash {
+                entries: vec![(
+                    Expr::new(
+                        Span::synthetic(),
+                        ExprNode::Lit { value: Literal::Str { value: "a".to_string() } },
+                    ),
+                    Expr::new(
+                        Span::synthetic(),
+                        ExprNode::Lit { value: Literal::Int { value: 1 } },
+                    ),
+                )],
+                kwargs: false,
+            },
+        );
+        let block_body = Expr::new(
+            Span::synthetic(),
+            ExprNode::Var { id: VarId(read.0), name: Symbol::from(read.1) },
+        );
+        let block = Expr::new(
+            Span::synthetic(),
+            ExprNode::Lambda { extra_params: Vec::new(), rest_param: None,
+                params: vec![Symbol::from("k"), Symbol::from("v")],
+                block_param: None,
+                body: block_body,
+                block_style: Default::default(),
+            },
+        );
+        let send = Expr::new(
+            Span::synthetic(),
+            ExprNode::Send {
+                recv: Some(hash),
+                method: Symbol::from("to_h"),
+                args: vec![],
+                block: Some(block),
+                parenthesized: false,
+            },
+        );
+        let analyzed = analyze_action_body(send);
+        let ExprNode::Send { block: Some(b), .. } = &*analyzed.node else { panic!() };
+        let ExprNode::Lambda { body, .. } = &*b.node else { panic!() };
+        body.ty.clone()
+    };
+    assert_eq!(block_body_ty((1, "k")), Some(Ty::Str), "block param k should be String (hash key type)");
+    assert_eq!(block_body_ty((2, "v")), Some(Ty::Int), "block param v should be Int (hash value type)");
 }
 
 // P2 — controller→view ivar channel --------------------------------------
@@ -3987,6 +4048,7 @@ end
         ),
         ("app/models/widget.rb", "class Widget < ApplicationRecord\nend\n"),
         ("app/views/widgets/show.html.erb", "<p><%= @widget %></p>\n"),
+        ("app/views/layouts/application.html.erb", "<%= yield %>\n"),
         (
             "db/schema.rb",
             r#"ActiveRecord::Schema[7.1].define(version: 1) do
@@ -4047,7 +4109,7 @@ end
         set_widget.assigns
     );
     assert!(
-        set_widget.effects.effects.iter().any(|e| matches!(e, Effect::DbRead { .. })),
+        set_widget.effects.effects().iter().any(|e| matches!(e, Effect::DbRead { .. })),
         "Widget.find in the filter body surfaces as DbRead; got {:?}",
         set_widget.effects
     );
@@ -4059,7 +4121,7 @@ end
     );
 
     // Convention default layout, resolved through the chain.
-    assert_eq!(res.layout.as_ref().map(|s| s.as_str()), Some("layouts/application"));
+    assert_eq!(res.layouts.iter().map(|s| s.as_str()).collect::<Vec<_>>(), vec!["layouts/application"]);
 }
 
 #[test]
@@ -4114,7 +4176,7 @@ end
     assert_eq!(load.defined_in.0.as_str(), "RoomsController");
     assert_eq!(load.included_via.0.as_str(), "RoomsController");
     assert!(
-        load.effects.effects.iter().any(|e| matches!(e, Effect::DbRead { .. })),
+        load.effects.effects().iter().any(|e| matches!(e, Effect::DbRead { .. })),
         "parent load_room DbRead must reach the subclass filter hop; got {:?}",
         load.effects
     );
@@ -4158,6 +4220,7 @@ end
         ),
         ("app/views/public/index.html.erb", "<p>hi</p>\n"),
         ("app/views/pages/index.html.erb", "<p>hi</p>\n"),
+        ("app/views/layouts/admin.html.erb", "<%= yield %>\n"),
         (
             "db/schema.rb",
             "ActiveRecord::Schema[7.1].define(version: 1) do\nend\n",
@@ -4165,17 +4228,17 @@ end
     ]);
 
     // Explicit `layout "admin"` resolves and inherits down the chain;
-    // explicit `layout false` records as None.
+    // explicit `layout false` records none.
     let pages = app
         .controller_resolutions
         .get(&ClassId(Symbol::from("PagesController")))
         .expect("PagesController resolution");
-    assert_eq!(pages.layout.as_ref().map(|s| s.as_str()), Some("layouts/admin"));
+    assert_eq!(pages.layouts.iter().map(|s| s.as_str()).collect::<Vec<_>>(), vec!["layouts/admin"]);
     let public = app
         .controller_resolutions
         .get(&ClassId(Symbol::from("PublicController")))
         .expect("PublicController resolution");
-    assert_eq!(public.layout, None, "layout false → None");
+    assert!(public.layouts.is_empty(), "layout false → none: {:?}", public.layouts);
 
     // The Skip entry is retained in the chain (per-action consumers
     // apply it), carrying no assigns/effects of its own, while the
@@ -4579,12 +4642,11 @@ fn store_shapes_type_without_errors() {
     assert_eq!(errors_of(&app), Vec::<String>::new());
 }
 
-/// A uuid-keyed model's tokens are not modeled: Rails writes the key into
-/// the payload as a JSON string, which the token runtime does not read
-/// back. So `find_by_token_for` stays an error there rather than typing
-/// a method nothing defines; the Integer-keyed store model still types.
+/// A uuid-keyed model's tokens type as an Integer-keyed one's do: Rails
+/// writes the key into the payload as a JSON string, which the token
+/// runtime writes and reads back (tests/emit_and_run/token_for_string_key.rs).
 #[test]
-fn a_string_keyed_models_token_finder_stays_unsupported() {
+fn a_string_keyed_models_token_finder_types() {
     let app = app_from_files(&[
         (
             "app/controllers/application_controller.rb",
@@ -4609,9 +4671,7 @@ end
 "#,
         ),
     ]);
-    let errors = errors_of(&app);
-    assert_eq!(errors.len(), 1, "only the uuid model's finder errors; got {errors:?}");
-    assert!(errors[0].contains("find_by_token_for") && errors[0].contains("Invite"), "got {errors:?}");
+    assert_eq!(errors_of(&app), Vec::<String>::new());
 }
 
 /// A model's token methods are all or nothing, since they dispatch on a
@@ -5961,4 +6021,55 @@ fn a_private_marker_on_a_generated_enum_predicate_is_enforced() {
     ]);
     let found = diagnose(&app).iter().any(|d| d.message.contains("private method `draft?` called on Article"));
     assert!(found, "{:#?}", diagnose(&app).iter().map(|d| d.message.clone()).collect::<Vec<_>>());
+}
+
+#[test]
+fn rest_client_verbs_answer_their_block_value() {
+    let app = app_from_files(&[(
+        "app/models/remote.rb",
+        r#"class Remote
+  def self.status(url)
+    RestClient.get(url) { |response, _request, _result| [1, "ok"] }
+  end
+
+  def self.plain(url)
+    RestClient.get(url)
+  end
+
+  def self.parsed(url)
+    RestClient.get(url) { |response, _request, _result| JSON.parse(response.body) }
+  end
+end
+"#,
+    )]);
+    let remote = app.library_classes.iter().find(|c| c.name.0.as_str() == "Remote").expect("Remote");
+    let ty = |name: &str| remote.methods.iter().find(|m| m.name.as_str() == name).expect(name).body.ty.clone();
+    assert!(matches!(ty("status"), Some(Ty::Array { .. }) | Some(Ty::Tuple { .. })), "block form: {:?}", ty("status"));
+    assert!(
+        matches!(ty("plain"), Some(Ty::Class { ref id, .. }) if id.0.as_str() == "RestClient::Response"),
+        "plain form: {:?}",
+        ty("plain")
+    );
+    assert!(matches!(ty("parsed"), Some(Ty::Untyped)), "untyped block: {:?}", ty("parsed"));
+}
+
+#[test]
+fn an_app_defined_rest_client_get_answers_its_own_type() {
+    let app = app_from_files(&[
+        ("app/models/rest_client.rb", "class RestClient
+  def self.get(url)
+    42
+  end
+end
+"),
+        ("app/models/remote.rb", "class Remote
+  def self.status(url)
+    RestClient.get(url) { \"ok\" }
+  end
+end
+"),
+    ]);
+    let remote = app.library_classes.iter().find(|c| c.name.0.as_str() == "Remote").expect("Remote");
+    let ty = remote.methods.iter().find(|m| m.name.as_str() == "status").expect("status").body.ty.clone();
+    assert!(matches!(ty, Some(Ty::Int)), "the app's own get: {ty:?}");
 }

@@ -3,7 +3,8 @@
 //! controller render/redirect). Inherent `Analyzer` methods extracted
 //! verbatim from `src/analyze/mod.rs` (pure code motion).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+use crate::det::HashMap;
 
 use crate::adapter::ArMethodKind;
 use crate::App;
@@ -11,7 +12,7 @@ use crate::dialect::ControllerBodyItem;
 use crate::effect::{Effect, EffectSet};
 use crate::expr::{Expr, ExprNode, LValue};
 use crate::ident::{ClassId, Symbol};
-use crate::ty::Ty;
+use crate::ty::{FnTy, Ty};
 
 use super::Ctx;
 
@@ -61,7 +62,7 @@ impl super::Analyzer {
             let _ = self.collect_effects(expr, &Ctx::default());
         }
 
-        let mut by_key: HashMap<(ClassId, Symbol), EffectSet> = HashMap::new();
+        let mut by_key: HashMap<(ClassId, Symbol), EffectSet> = HashMap::default();
         for controller in &app.controllers {
             for action in controller.actions() {
                 by_key.insert(
@@ -109,7 +110,8 @@ impl super::Analyzer {
 
     fn stamp_method(&self, class: &ClassId, method: &mut crate::dialect::MethodDef) {
         method.effects = self.stamp_expr(class, &mut method.body);
-        if let Some(Ty::Fn { effects, .. }) = &mut method.signature {
+        if let Some(Ty::Fn(fn_ty)) = &mut method.signature {
+            let FnTy { effects, .. } = &mut **fn_ty;
             *effects = method.effects.clone();
         }
     }
@@ -117,7 +119,7 @@ impl super::Analyzer {
     pub(super) fn collect_effects(&self, expr: &mut Expr, ctx: &Ctx) -> EffectSet {
         let mut set = BTreeSet::new();
         self.visit_effects(expr, ctx, &mut set);
-        EffectSet { effects: set }
+        EffectSet::from(set)
     }
 
     /// Walk a typed expression tree computing each node's *local* effects
@@ -343,7 +345,7 @@ impl super::Analyzer {
         // (two-pass before_action seeding), and each pass computes local
         // effects from scratch against the current typed tree.
         out.extend(local.iter().cloned());
-        expr.effects = EffectSet { effects: local };
+        expr.effects = EffectSet::from(local);
     }
 
     /// Visit every `Expr` embedded in a `MatchPattern` — a `Value`'s
@@ -435,7 +437,7 @@ fn lookup_filter_effects(
         return effects.clone();
     }
     let mut current = rf.included_via.clone();
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = crate::det::HashSet::default();
     while seen.insert(current.clone()) {
         let Some(parent) = parents.get(&current).and_then(|p| p.clone()) else {
             break;

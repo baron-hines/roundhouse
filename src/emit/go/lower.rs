@@ -332,8 +332,8 @@ pub mod nil_to_zero_for_string_fields {
     use crate::expr::{Expr, ExprNode, LValue, Literal};
     use crate::ident::Symbol;
     use crate::span::Span;
-    use crate::ty::Ty;
-    use std::collections::HashMap;
+    use crate::ty::{FnTy, Ty};
+    use crate::det::HashMap;
 
     pub fn apply(mut classes: Vec<LibraryClass>) -> Vec<LibraryClass> {
         for class in classes.iter_mut() {
@@ -362,20 +362,23 @@ pub mod nil_to_zero_for_string_fields {
     /// emits as Go `string` — and where `self.Field = nil` would
     /// fail to typecheck.
     fn collect_string_nullable_fields(methods: &[MethodDef]) -> HashMap<String, ()> {
-        let mut out = HashMap::new();
+        let mut out = HashMap::default();
         for m in methods {
             if !matches!(m.receiver, MethodReceiver::Instance) {
                 continue;
             }
             let ty = match m.kind {
                 AccessorKind::AttributeReader => match m.signature.as_ref() {
-                    Some(Ty::Fn { ret, .. }) => (**ret).clone(),
+                    Some(Ty::Fn(fn_ty)) => (*fn_ty.ret).clone(),
                     _ => continue,
                 },
                 AccessorKind::AttributeWriter => match m.signature.as_ref() {
-                    Some(Ty::Fn { params, .. }) => match params.first() {
-                        Some(p) => (*p.ty).clone(),
-                        None => continue,
+                    Some(Ty::Fn(fn_ty)) => {
+                        let FnTy { params, .. } = &**fn_ty;
+                        match params.first() {
+                            Some(p) => (*p.ty).clone(),
+                            None => continue,
+                        }
                     },
                     _ => continue,
                 },

@@ -9,22 +9,24 @@
 //! have been the value's own `to_json`, not the serializer's output.
 //!
 //! Each such render is now a reported residue, an error that keeps the
-//! route with Rails, and the keywords are not emitted. Rendering through
-//! the serializer is not modelled.
+//! route with Rails, and the keywords are not emitted. Since
+//! `ingest::active_model_serializer`, a render through a serializer in
+//! its subset with no other option (`each_serializer:` here) is lowered;
+//! one with `root:` or `adapter:` is still the residue.
 //!
 //! With that in place, `serialization_scope nil` (ActionController::
 //! Serialization's "pass serializers no scope") has nothing left to
 //! drop: the serializer is never reached from a lowered action. It is
 //! consumed instead of being the "class-body macro not recognized" gap.
 
+#[path = "support/scratch.rs"]
+mod scratch;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("roundhouse-ams-render-{name}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
+    let dir = scratch::dir(&format!("roundhouse-ams-render-{name}"));
     dir
 }
 
@@ -89,9 +91,9 @@ fn roundhouse(args: &[&str], out: &Path, src: &Path) -> (bool, String) {
     (run.status.success(), String::from_utf8_lossy(&run.stderr).into_owned())
 }
 
-/// The three serializer renders stay with Rails, each on the render
-/// residue; the plain `render json:` beside them still lowers, and
-/// `serialization_scope nil` is no gap.
+/// The serializer renders with `root:` and `adapter:` stay with Rails,
+/// each on the render residue; the `each_serializer:` one and the plain
+/// `render json:` lower, and `serialization_scope nil` is no gap.
 #[test]
 fn a_serializer_render_keeps_its_route_with_rails() {
     let src = scratch("plan-src");
@@ -100,10 +102,11 @@ fn a_serializer_render_keeps_its_route_with_rails() {
     let (ok, stderr) = roundhouse(&["--target", "futamura", "--survey"], &out, &src);
     assert!(ok, "{stderr}");
     assert!(
-        stderr.contains("whole-route: 1 GET action(s) served by the lowered app; 3 left to Rails"),
+        stderr.contains("whole-route: 2 GET action(s) served by the lowered app; 2 left to Rails"),
         "{stderr}"
     );
-    for option in ["serializer:", "each_serializer:", "adapter:"] {
+    assert!(stderr.contains("lowered     info#index"), "each_serializer: lowers: {stderr}");
+    for option in ["serializer:", "adapter:"] {
         assert!(
             stderr.contains(&format!("`render json:` with `{option}` is not lowered")),
             "{option} is reported: {stderr}"

@@ -1,0 +1,24 @@
+{
+  "actioncable": "8.1.3",
+  "channel_prefix": "depot_production",
+  "publishes": [
+    {
+      "name": "turbo stream fragment",
+      "stream": "Z2lkOi8vZGVwb3QvQ2FyLzE",
+      "channel": "depot_production:Z2lkOi8vZGVwb3QvQ2FyLzE",
+      "payload": "\"\\u003cturbo-stream action=\\\"append\\\" target=\\\"cars\\\"\\u003e\\u003ctemplate\\u003e\\u003cdiv id=\\\"car_1\\\"\\u003eGolf \\u0026amp; \\\"GTI\\\" é\\u003c/div\\u003e\\u003c/template\\u003e\\u003c/turbo-stream\\u003e\""
+    },
+    {
+      "name": "hash",
+      "stream": "user_7_unreads",
+      "channel": "depot_production:user_7_unreads",
+      "payload": "{\"roomId\":1,\"count\":2,\"note\":\"\\u003cb\\u003e\\u0026\\u003c/b\\u003e\"}"
+    },
+    {
+      "name": "coder: nil",
+      "stream": "user_7_unreads",
+      "channel": "depot_production:user_7_unreads",
+      "payload": "{\"roomId\":3}"
+    }
+  ]
+}

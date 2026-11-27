@@ -82,11 +82,18 @@ use crate::ident::Symbol;
 pub fn apply_class_body_new_lowering(app: &mut App) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
     let subclassed = subclassed_names(app);
+    // Giving a Data factory's private constructor a constant receiver changes
+    // visibility. Native Data resolves the implicit receiver itself.
+    let data_classes: crate::det::HashSet<String> = app.library_classes.iter()
+        .filter(|lc| lc.data_define().is_some() && (lc.data_constructor_visibility().is_some()
+            || lc.methods.iter().any(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == "new"
+                && m.visibility != crate::dialect::MethodVisibility::Public)))
+        .map(|lc| lc.name.0.as_str().to_string()).collect();
 
     // Copies FIRST, while every method body still holds its bare `new`:
     // the rewrite below is what binds a receiver, and a copy taken after
     // it would carry the base's name into the subclass.
-    diags.extend(monomorphize_subclassed(app, &subclassed));
+    diags.extend(monomorphize_subclassed(app, &subclassed, &data_classes));
 
     for model in &mut app.models {
         let owner = model.name.0.as_str().to_string();
@@ -120,6 +127,7 @@ pub fn apply_class_body_new_lowering(app: &mut App) -> Vec<Diagnostic> {
     // receiver bound here name the same class.
     let sole_includer = app.sole_includer_of_modules();
     for lc in &mut app.library_classes {
+        if data_classes.contains(lc.name.0.as_str()) { continue; }
         let owner = if lc.is_module {
             sole_includer.get(&lc.name).unwrap_or(&lc.name).0.as_str().to_string()
         } else {
@@ -148,7 +156,8 @@ pub fn apply_class_body_new_lowering(app: &mut App) -> Vec<Diagnostic> {
 /// arm. The diagnostic is what stops it being silent.
 fn monomorphize_subclassed(
     app: &mut App,
-    subclassed: &std::collections::HashSet<String>,
+    subclassed: &crate::det::HashSet<String>,
+    data_classes: &crate::det::HashSet<String>,
 ) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
 
@@ -180,14 +189,14 @@ fn monomorphize_subclassed(
     }
 
     // name -> index, and parent -> children, over library classes.
-    let index: std::collections::HashMap<String, usize> = app
+    let index: crate::det::HashMap<String, usize> = app
         .library_classes
         .iter()
         .enumerate()
         .map(|(i, lc)| (lc.name.0.as_str().to_string(), i))
         .collect();
-    let mut children: std::collections::HashMap<String, Vec<String>> =
-        std::collections::HashMap::new();
+    let mut children: crate::det::HashMap<String, Vec<String>> =
+        crate::det::HashMap::default();
     for lc in &app.library_classes {
         if let Some(p) = &lc.parent {
             children
@@ -201,7 +210,7 @@ fn monomorphize_subclassed(
     let mut planned: Vec<(usize, crate::dialect::MethodDef)> = Vec::new();
     for lc in &app.library_classes {
         let owner = lc.name.0.as_str().to_string();
-        if !subclassed.contains(owner.as_str()) {
+        if !subclassed.contains(owner.as_str()) || data_classes.contains(owner.as_str()) {
             continue;
         }
         for m in &lc.methods {
@@ -230,8 +239,8 @@ fn monomorphize_subclassed(
 fn plan_copies(
     owner: &str,
     method: &crate::dialect::MethodDef,
-    children: &std::collections::HashMap<String, Vec<String>>,
-    index: &std::collections::HashMap<String, usize>,
+    children: &crate::det::HashMap<String, Vec<String>>,
+    index: &crate::det::HashMap<String, usize>,
     classes: &[crate::dialect::LibraryClass],
     planned: &mut Vec<(usize, crate::dialect::MethodDef)>,
 ) {
@@ -272,8 +281,8 @@ fn constructs(expr: &Expr) -> bool {
 /// owner", and one recorded superclass edge is the whole of it. A class
 /// subclassed only OUTSIDE the tree (a gem's) is not in here and does
 /// not need to be: nothing outside the tree calls into it either.
-fn subclassed_names(app: &App) -> std::collections::HashSet<String> {
-    let mut out = std::collections::HashSet::new();
+fn subclassed_names(app: &App) -> crate::det::HashSet<String> {
+    let mut out = crate::det::HashSet::default();
     for m in &app.models {
         if let Some(p) = &m.parent {
             out.insert(p.0.as_str().to_string());

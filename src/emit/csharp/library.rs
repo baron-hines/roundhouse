@@ -18,13 +18,14 @@
 //! classification maps drive lookup only (see `expr.rs`).
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
+use crate::det::HashSet;
 use std::path::PathBuf;
 
 use crate::dialect::{AccessorKind, LibraryClass, MethodDef, MethodReceiver};
 use crate::emit::EmittedFile;
 use crate::expr::{Expr, ExprNode, LValue, Literal};
-use crate::ty::Ty;
+use crate::ty::{FnTy, Ty};
 
 use super::expr::{
     begin_method, emit_expr, emit_stmt, hoisted_decls, register_method_params, set_current_class,
@@ -162,8 +163,8 @@ pub fn emit_test_class(
     }
 
     register_params_for(&class_name, &lc.methods);
-    super::expr::set_object_tl_fields(HashSet::new());
-    set_ivar_renames(std::collections::HashMap::new());
+    super::expr::set_object_tl_fields(HashSet::default());
+    set_ivar_renames(crate::det::HashMap::default());
 
     // Body-only ivars (e.g. `@article` assigned in `setup`) → properties so
     // reads in the test methods resolve.
@@ -202,7 +203,7 @@ pub fn emit_test_class(
     // Property registry so `self.@article` reads emit as a property name.
     let instance_props: HashSet<String> = body_ivars.keys().cloned().collect();
     set_instance_props(instance_props);
-    let prop_ty_map: std::collections::HashMap<String, Ty> =
+    let prop_ty_map: crate::det::HashMap<String, Ty> =
         inferred_ivar_types.iter().map(|(n, t)| (n.clone(), t.clone())).collect();
     set_instance_prop_types(prop_ty_map);
     set_current_class(&class_name);
@@ -298,10 +299,10 @@ fn homogeneous_lit_type<'a>(mut elems: impl Iterator<Item = &'a Expr>) -> &'stat
 
 /// Render a Ruby `module X` (a set of class methods) as a C# `static class`.
 pub fn emit_module(methods: &[MethodDef]) -> Result<String, String> {
-    set_instance_prop_types(std::collections::HashMap::new());
-    super::expr::set_object_tl_fields(HashSet::new());
-    set_instance_props(HashSet::new());
-    set_ivar_renames(std::collections::HashMap::new());
+    set_instance_prop_types(crate::det::HashMap::default());
+    super::expr::set_object_tl_fields(HashSet::default());
+    set_instance_props(HashSet::default());
+    set_ivar_renames(crate::det::HashMap::default());
     let name = methods
         .first()
         .and_then(|m| m.enclosing_class.as_ref())
@@ -332,7 +333,7 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
         return emit_static_class(lc, &class_name);
     }
 
-    super::expr::set_object_tl_fields(HashSet::new());
+    super::expr::set_object_tl_fields(HashSet::default());
 
     // Temporal (Date/DateTime/Time) columns: a reader whose return type is
     // `DateTimeOffset` (`Ty::Time`). These must NOT collapse into an
@@ -364,13 +365,15 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
                 if temporal_cols.contains(&camel(m.name.as_str())) {
                     continue;
                 }
-                if let Some(Ty::Fn { ret, .. }) = m.signature.as_ref() {
+                if let Some(Ty::Fn(fn_ty)) = m.signature.as_ref() {
+                    let FnTy { ret, .. } = &**fn_ty;
                     prop_types.entry(camel(m.name.as_str())).or_insert_with(|| (**ret).clone());
                 }
             }
             AccessorKind::AttributeWriter => {
                 let base = m.name.as_str().trim_end_matches('=');
-                if let Some(Ty::Fn { params, .. }) = m.signature.as_ref() {
+                if let Some(Ty::Fn(fn_ty)) = m.signature.as_ref() {
+                    let FnTy { params, .. } = &**fn_ty;
                     if let Some(p) = params.first() {
                         prop_types.entry(camel(base)).or_insert_with(|| (*p.ty).clone());
                     }
@@ -404,10 +407,8 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
 
     let parent_name = lc.parent.as_ref().map(|p| {
         let last = type_name(p.0.as_str());
-        match last.as_str() {
-            "StandardError" | "RuntimeError" => "Exception".to_string(),
-            other => other.to_string(),
-        }
+        // Not a second table: a raise and a superclass name the same Ruby class, so they map alike
+        super::expr::map_exception_class(&last)
     });
 
     let inherited: HashSet<String> = lc
@@ -428,6 +429,10 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
         None => String::new(),
     };
     let mut out = format!("public class {class_name}{parent_clause} {{\n");
+    // Not left to the implicit constructor: C# inherits none, and `raise X, "message"` builds one with the message
+    if init.is_none() && lc.parent.as_ref().is_some_and(|p| super::expr::derives_from_exception(&type_name(p.0.as_str()))) {
+        out.push_str(&format!("    public {class_name}() {{ }}\n    public {class_name}(string message) : base(message) {{ }}\n"));
+    }
 
     // Properties (auto-properties). Constructor-param-backed properties are
     // assigned in the constructor; column props are plain `public` (leaf, not
@@ -449,7 +454,7 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
     // emits as a private renamed field (`_errors`) that every `@ivar`
     // reference rewrites to. The method keeps the public name.
     let methods_set = instance_method_names(lc);
-    let ivar_renames: std::collections::HashMap<String, String> = body_ivars
+    let ivar_renames: crate::det::HashMap<String, String> = body_ivars
         .keys()
         .filter(|n| methods_set.contains(*n))
         .map(|n| (n.clone(), format!("_{n}")))
@@ -481,7 +486,7 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
     for m in &temporal_sorted {
         let getter = pascal_of_camel(&camel(m.name.as_str()));
         let ret = match m.signature.as_ref() {
-            Some(Ty::Fn { ret, .. }) => (**ret).clone(),
+            Some(Ty::Fn(fn_ty)) => (*fn_ty.ret).clone(),
             _ => Ty::Time,
         };
         out.push_str(&format!(
@@ -496,15 +501,18 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
 
     // Property/type registries for body emit. Renamed (private) ivars are
     // excluded — a self-send of that name resolves to the method, not a prop.
+    // The temporal computed getters are props too (`CreatedAt`, not
+    // `CreatedAt()`).
     let instance_props: HashSet<String> = prop_types
         .keys()
         .chain(body_ivars.keys())
+        .chain(temporal_cols.iter())
         .chain(inherited_props.iter())
         .filter(|n| !ivar_renames.contains_key(*n))
         .cloned()
         .collect();
     set_instance_props(instance_props);
-    let mut prop_ty_map: std::collections::HashMap<String, Ty> =
+    let mut prop_ty_map: crate::det::HashMap<String, Ty> =
         prop_types.iter().map(|(n, t)| (n.clone(), t.clone())).collect();
     for (n, t) in &inferred_ivar_types {
         prop_ty_map.entry(n.clone()).or_insert_with(|| t.clone());
@@ -621,12 +629,12 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
 /// A Ruby `module` → C# `static class`. Class-level `attr_accessor` (from
 /// `class << self`) collapses to a static property.
 fn emit_static_class(lc: &LibraryClass, class_name: &str) -> String {
-    set_instance_prop_types(std::collections::HashMap::new());
+    set_instance_prop_types(crate::det::HashMap::default());
     // `self` in a module function is the static class itself.
     set_current_class(class_name);
-    super::expr::set_object_tl_fields(HashSet::new());
-    set_instance_props(HashSet::new());
-    set_ivar_renames(std::collections::HashMap::new());
+    super::expr::set_object_tl_fields(HashSet::default());
+    set_instance_props(HashSet::default());
+    set_ivar_renames(crate::det::HashMap::default());
     let accessor_props = class_accessor_props(&lc.methods);
     // `partial` so a hand-written C# runtime file can add native overloads to a
     // transpiled module (e.g. `JsonBuilder.EncodeDatetime(DateTimeOffset?)` in
@@ -780,7 +788,7 @@ fn member_name(m: &MethodDef) -> String {
 }
 
 fn instance_member_names(lc: &LibraryClass) -> HashSet<String> {
-    let mut out = HashSet::new();
+    let mut out = HashSet::default();
     for m in &lc.methods {
         if m.receiver != MethodReceiver::Instance {
             continue;
@@ -897,7 +905,7 @@ fn emit_indexer(modifier: &str, getter: Option<&MethodDef>, setter: Option<&Meth
         getter
             .or(setter)
             .and_then(|m| match m.signature.as_ref() {
-                Some(Ty::Fn { params, .. }) => params.first().map(|p| csharp_ty(&p.ty)),
+                Some(Ty::Fn(fn_ty)) => fn_ty.params.first().map(|p| csharp_ty(&p.ty)),
                 _ => None,
             })
             .unwrap_or_else(|| "string".to_string())
@@ -907,7 +915,7 @@ fn emit_indexer(modifier: &str, getter: Option<&MethodDef>, setter: Option<&Meth
     } else {
         getter
             .and_then(|m| match m.signature.as_ref() {
-                Some(Ty::Fn { ret, .. }) => Some(csharp_ty(ret)),
+                Some(Ty::Fn(fn_ty)) => Some(csharp_ty(&fn_ty.ret)),
                 _ => None,
             })
             .unwrap_or_else(|| "object?".to_string())
@@ -992,15 +1000,18 @@ fn emit_method(m: &MethodDef, modifier: &str) -> String {
     // A `yield`ing method takes an explicit block parameter.
     if body_has_yield(&m.body) {
         let bt = match m.signature.as_ref() {
-            Some(Ty::Fn { block: Some(b), .. }) => csharp_ty(b),
+            Some(Ty::Fn(fn_ty)) if let Some(b) = &fn_ty.block => csharp_ty(b),
             _ => "Action<object?>".to_string(),
         };
         params.push(format!("{bt} block"));
     }
 
+    // Not void for a method without a signature: an app method's answer is its body's type
     let ret_ty = match m.signature.as_ref() {
-        Some(Ty::Fn { ret, .. }) => Some((**ret).clone()),
-        _ => None,
+        Some(Ty::Fn(fn_ty)) => Some((*fn_ty.ret).clone()),
+        _ if m.name.as_str() == "initialize" => None,
+        // Not untyped when the body's type is open: a statement-only tail would then leave a value method with no return
+        _ => m.body.ty.clone().filter(|t| !t.is_open()),
     };
     let returns_value = matches!(&ret_ty, Some(t) if !matches!(t, Ty::Nil));
     let ret_decl = match &ret_ty {
@@ -1041,7 +1052,7 @@ fn emit_method(m: &MethodDef, modifier: &str) -> String {
 /// non-constant defaults (`attrs = {}` → `attrs ??= new …()`).
 fn render_params(m: &MethodDef) -> (Vec<String>, Vec<String>) {
     let sig_params = match m.signature.as_ref() {
-        Some(Ty::Fn { params, .. }) => Some(params),
+        Some(Ty::Fn(fn_ty)) => Some(&fn_ty.params),
         _ => None,
     };
     let mut decls = Vec::new();
@@ -1162,6 +1173,9 @@ fn wrap_return(e: &Expr) -> String {
             let els: Vec<String> = elements.iter().map(emit_expr).collect();
             return format!("return new() {{ {} }};", els.join(", "));
         }
+        ExprNode::BeginRescue { body, rescues, else_branch, ensure, .. } => {
+            return super::expr::emit_begin_rescue(body, rescues, else_branch.as_deref(), ensure.as_deref(), &wrap_return);
+        }
         // A value-position `if` → return from each branch (C# has no
         // block-valued `if`). Empty branches return the type default.
         ExprNode::If { cond, then_branch, else_branch } => {
@@ -1181,6 +1195,25 @@ fn wrap_return(e: &Expr) -> String {
                 indent4(&then),
                 indent4(&els)
             );
+        }
+        // Not the assignment alone: Ruby's assignment answers the value, and a value method must return it
+        // The assigned value, not the variable read back: a local or an ivar's
+        // property can be typed wider than the method's return (`long? x` after
+        // `x = nil`, `object?`).
+        ExprNode::Assign { target: crate::expr::LValue::Var { .. } | crate::expr::LValue::Ivar { .. }, value } => {
+            if matches!(&*value.node, ExprNode::Lit { value: Literal::Nil }) {
+                return format!("{}\nreturn default;", emit_stmt(e));
+            }
+            let held = Expr::new(value.span, ExprNode::Var { id: crate::ident::VarId(0), name: crate::ident::Symbol::from("__rh_ret") });
+            let store = Expr::new(e.span, ExprNode::Assign { target: match &*e.node {
+                ExprNode::Assign { target, .. } => target.clone(),
+                _ => unreachable!(),
+            }, value: held });
+            let held = emit_expr(match &*store.node {
+                ExprNode::Assign { value, .. } => value,
+                _ => unreachable!(),
+            });
+            return format!("var {held} = {};\n{}\nreturn {held};", emit_expr(value), emit_stmt(&store));
         }
         _ => {}
     }
@@ -1322,12 +1355,14 @@ fn class_accessor_props(methods: &[MethodDef]) -> BTreeMap<String, Ty> {
         }
         match m.kind {
             AccessorKind::AttributeReader => {
-                if let Some(Ty::Fn { ret, .. }) = m.signature.as_ref() {
+                if let Some(Ty::Fn(fn_ty)) = m.signature.as_ref() {
+                    let FnTy { ret, .. } = &**fn_ty;
                     props.entry(camel(m.name.as_str())).or_insert_with(|| (**ret).clone());
                 }
             }
             AccessorKind::AttributeWriter => {
-                if let Some(Ty::Fn { params, .. }) = m.signature.as_ref() {
+                if let Some(Ty::Fn(fn_ty)) = m.signature.as_ref() {
+                    let FnTy { params, .. } = &**fn_ty;
                     if let Some(p) = params.first() {
                         let base = m.name.as_str().trim_end_matches('=');
                         props.entry(camel(base)).or_insert_with(|| (*p.ty).clone());
@@ -1362,9 +1397,10 @@ fn is_empty_body(e: &Expr) -> bool {
 fn infer_body_ivar_types(methods: &[MethodDef]) -> BTreeMap<String, Ty> {
     let mut out: BTreeMap<String, Ty> = BTreeMap::new();
     for m in methods {
-        if let (Some(ivar), Some(Ty::Fn { ret, .. })) =
+        if let (Some(ivar), Some(Ty::Fn(fn_ty))) =
             (body_returns_ivar(&m.body), m.signature.as_ref())
         {
+            let FnTy { ret, .. } = &**fn_ty;
             if !matches!(&**ret, Ty::Nil) {
                 out.entry(ivar).or_insert_with(|| (**ret).clone());
             }
@@ -1440,7 +1476,7 @@ fn signature_ret_is_time(sig: Option<&Ty>) -> bool {
             _ => false,
         }
     }
-    matches!(sig, Some(Ty::Fn { ret, .. }) if is_time(ret))
+    matches!(sig, Some(Ty::Fn(fn_ty)) if is_time(&fn_ty.ret))
 }
 
 /// Render an auto-property with a default initializer (C# requires non-null

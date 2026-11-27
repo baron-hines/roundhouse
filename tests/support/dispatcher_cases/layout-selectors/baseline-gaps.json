@@ -1,0 +1,37 @@
+{
+  "symbol_layout": {
+    "case": "symbol_layout",
+    "error": "ArgumentError",
+    "message": "wrong number of arguments (given 0, expected 1)"
+  },
+  "dynamic_layout": {
+    "case": "dynamic_layout",
+    "error": "ArgumentError",
+    "message": "wrong number of arguments (given 0, expected 1)"
+  },
+  "nil_layout": {
+    "case": "nil_layout",
+    "error": "ArgumentError",
+    "message": "wrong number of arguments (given 0, expected 1)"
+  },
+  "string_layout": {
+    "case": "string_layout",
+    "error": "ArgumentError",
+    "message": "wrong number of arguments (given 0, expected 1)"
+  },
+  "rescue_dynamic_layout": {
+    "case": "rescue_dynamic_layout",
+    "error": "ArgumentError",
+    "message": "wrong number of arguments (given 0, expected 1)"
+  },
+  "rescue_nil_layout": {
+    "case": "rescue_nil_layout",
+    "error": "ArgumentError",
+    "message": "wrong number of arguments (given 0, expected 1)"
+  },
+  "rescue_symbol_layout": {
+    "case": "rescue_symbol_layout",
+    "error": "ArgumentError",
+    "message": "wrong number of arguments (given 0, expected 1)"
+  }
+}

@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 require_relative "active_record/errors"
 require_relative "active_record/connection_not_established"
+require_relative "active_record/stale_object_error"
 require_relative "active_record/encryption_errors"
 require_relative "active_record/connection_pool"
 require_relative "active_record/registry"

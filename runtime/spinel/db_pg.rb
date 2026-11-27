@@ -1,18 +1,24 @@
 # frozen_string_literal: true
-# Primitive Db surface over PostgreSQL, for spinel-compiled binaries.
+# Primitive Db surface over PostgreSQL, for spinel-compiled binaries and
+# for CRuby.
 #
 # The same `module Db` contract as runtime/spinel/db.rb (SQLite over
 # libsqlite3 FFI) and its gem-backed siblings, typed in
-# runtime/ruby/db.rbs, implemented on the spinel-pg driver
-# (https://github.com/rubys/spinel-pg): a pure spinel-Ruby PostgreSQL
+# runtime/ruby/db.rbs. Under Spinel it runs on the spinel-pg driver
+# (https://github.com/roundhouse-rb/spinel-pg): a pure spinel-Ruby PostgreSQL
 # client over Spinel's own sp_net sockets, so the program links no
 # libpq. A raw compile finds it with `spinel -I <spinel-pg checkout>`;
-# a spin package lists `pg` in `[dependencies]`.
+# a spin package lists `pg` in `[dependencies]`. Under CRuby it runs on
+# the pg gem, whose API spinel-pg mirrors; pg_driver.rb holds the few
+# places the two differ (pg_driver_cruby.rb is the gem's).
 #
-# Nothing selects this file yet. The `--database postgres` wiring for
-# `--target spinel` (shipping this file as runtime/db.rb, the `pg`
-# dependency, PostgreSQL DDL at boot) follows the shared database
-# selection; until then tests/spinel_pg_db.rs compiles it directly.
+# Both targets ship it as runtime/db.rb for an app whose
+# `config/database.yml` names postgresql for the test environment's
+# primary (src/project.rs::apply_postgresql_tree), and lower that app's
+# SQL for PostgreSQL: the Ruby target with pg_driver_cruby.rb, the Spinel
+# target with spinel-pg's pg_driver.rb and `pg` as a spin dependency. The
+# Db contract runs it directly on both runtimes (tests/spinel_pg_db.rs,
+# tests/db_contract.rs).
 #
 # What maps onto what:
 #
@@ -20,6 +26,8 @@
 #                          libpq PG* environment variables as fallbacks.
 #                          No TLS, unix sockets or query parameters; a
 #                          URL that asks for them is refused.
+#                          `schema_search_path:` sets search_path on
+#                          every connection, as Rails' key of that name.
 #   Db.prepare(sql)      — a statement handle (an Integer) on the current
 #                          connection. SQL spells its placeholders $1, $2…
 #   Db.bind_*(h, i, v)   — one-based, as with SQLite; values travel as
@@ -49,9 +57,18 @@
 # connection (Parse once, then Bind/Execute), bounded and least recently
 # used, closed on the server when evicted; `prepare_uncached` uses the
 # unnamed statement. Finalizing a read releases its handle, never the
-# named statement. Not here yet: the request query cache. The
-# SQLite-only entry points the server boot calls are no-ops, except
-# `seed_from_file`, which raises (see below).
+# named statement.
+#
+# The request query cache follows db.rb's: an identical SELECT within one
+# lease (or between query_cache_begin and query_cache_end) replays the
+# first result without a round trip, and any write empties the cache. It
+# is simpler here because a result is buffered whole when it runs, so a
+# replay is the same PgResult under a new handle: no partial captures, no
+# promotion. A result is kept up to QC_CAPTURE_ROWS rows, as db.rb keeps,
+# and SQL with a `$` placeholder never takes part, since its rows depend
+# on binds the key does not carry. The SQLite-only entry points the
+# server boot calls are no-ops, except `seed_from_file`, which raises
+# (see below).
 #
 # The SQL-functions hook: project.rs installs an app's SQLite functions
 # by patching a connection-open anchor in runtime/db.rb. This file does
@@ -64,19 +81,28 @@
 # (typed) before reading anything from a driver error.
 require "pg"
 require_relative "pg_errors"
+require_relative "pg_driver"
 
 # Connection settings from a URL, then the libpq PG* environment
 # variables, then libpq's defaults (localhost:5432, database named after
 # the user).
 class PgConfig
-  def initialize(url)
+  def initialize(url, search_path = "")
     @host = PgUrl.env("PGHOST", "localhost")
     @port = PgUrl.env("PGPORT", "5432").to_i
     @user = PgUrl.env("PGUSER", PgUrl.env("USER", "postgres"))
     @password = PgUrl.env("PGPASSWORD", "")
     @database = PgUrl.env("PGDATABASE", "")
+    @search_path = search_path
     parse(url) if url != ""
     @database = @user if @database == ""
+  end
+
+  # Rails' `schema_search_path`: what its PostgreSQL adapter sets with
+  # `SET search_path TO <value>` on each connection it opens. "" leaves
+  # the server's own.
+  def search_path
+    @search_path
   end
 
   def host
@@ -343,13 +369,73 @@ class PgConn
     # Named statements, least recently used first.
     @named = []
     @name_serial = 0
+    # The request query cache (see the header): off until a lease or
+    # query_cache_begin turns it on.
+    @qc_on = false
+    @qc_by_sql = {}
+  end
+
+  # Results kept by the request query cache are at most this many rows,
+  # as db.rb's are: what it exists for is the point lookup a page repeats.
+  QC_CAPTURE_ROWS = 16
+
+  def qc_on?
+    @qc_on
+  end
+
+  def qc_begin
+    @qc_on = true
+    @qc_by_sql = {}
+    nil
+  end
+
+  def qc_end
+    @qc_on = false
+    @qc_by_sql = {}
+    nil
+  end
+
+  # A write: Rails empties the whole cache.
+  def qc_clear
+    @qc_by_sql = {} if @qc_on
+    nil
+  end
+
+  # A handle over the kept result of `sql`, already run; 0 on a miss.
+  def qc_lookup(sql)
+    return 0 if !@qc_on || sql.include?("$")
+    r = @qc_by_sql[sql]
+    return 0 if r.nil?
+    h = open_stmt(sql, false)
+    stmt(h).finish(r)
+    h
+  end
+
+  # Keep `st`'s result for the next identical SELECT, the first one only.
+  def qc_store(st)
+    return nil if !@qc_on || st.sql.include?("$") || st.params.length > 0
+    r = st.result
+    return nil if r.ntuples > QC_CAPTURE_ROWS
+    @qc_by_sql[st.sql] = r if @qc_by_sql[st.sql].nil?
+    nil
   end
 
   def client
     c = @client
     if c.nil?
       cfg = @config
-      c = PG.connect(cfg.host, cfg.port, cfg.database, cfg.user, cfg.password)
+      c = PgDriver.open(cfg.host, cfg.port, cfg.database, cfg.user, cfg.password)
+      # The configured schema_search_path, on every connection before its
+      # first use, as Rails' adapter sets it; a session that cannot take
+      # it is closed rather than kept.
+      if cfg.search_path != ""
+        begin
+          c.exec("SET search_path TO " + cfg.search_path)
+        rescue PG::Error => e
+          c.close
+          raise e
+        end
+      end
       @client = c
     end
     c
@@ -427,8 +513,9 @@ class PgConn
       else
         st.finish(client.exec_params(st.sql, st.params))
       end
+      qc_store(st)
     rescue PG::Error => e
-      PgErrors.raise_mapped(e.result.error_field(PG::PG_DIAG_SQLSTATE).to_s, e.message)
+      PgErrors.raise_mapped(PgDriver.sqlstate(e), e.message)
       raise e
     end
     nil
@@ -523,7 +610,7 @@ class PgConn
       r = client.exec_prepared(name, st.params)
       return r
     rescue PG::Error => e
-      code = e.result.error_field(PG::PG_DIAG_SQLSTATE).to_s
+      code = PgDriver.sqlstate(e)
       raise e if code != "26000" && code != "0A000"
       forget_named(st.sql)
       if code == "0A000"
@@ -548,14 +635,15 @@ class PgConn
   # A simple query: the result, with its row count and INSERT target
   # recorded for `changes` and `last_insert_rowid`.
   def simple(sql)
+    qc_clear
     begin
       r = client.exec(sql)
-      @last_tag = r.cmd_tag
+      @last_tag = PgDriver.command_tag(r)
       @changes = Db.tag_count(@last_tag)
       @last_insert_table = @last_tag.start_with?("INSERT ") ? Db.insert_target(sql) : ""
       return r
     rescue PG::Error => e
-      PgErrors.raise_mapped(e.result.error_field(PG::PG_DIAG_SQLSTATE).to_s, e.message)
+      PgErrors.raise_mapped(PgDriver.sqlstate(e), e.message)
       raise e
     end
   end
@@ -598,6 +686,7 @@ class PgConn
     c = @client
     @client = nil
     @named = []
+    qc_clear
     release_all
     begin
       c.close if !c.nil?
@@ -718,8 +807,10 @@ module Db
 
   # Pool size: kwarg, overridden by DATABASE_POOL_SIZE as in db.rb. The
   # first connection opens here, so a wrong URL or password fails at
-  # boot rather than on the first request.
-  def self.configure(url, pool_size: 8)
+  # boot rather than on the first request. `schema_search_path:` is
+  # Rails' database.yml key of that name: set on every connection the
+  # pool opens (PgConn#client).
+  def self.configure(url, pool_size: 8, schema_search_path: "")
     @sql_trace = ENV.fetch("RH_SQL_TRACE", "") != ""
     n = pool_size
     ev = ENV["DATABASE_POOL_SIZE"]
@@ -735,7 +826,7 @@ module Db
     stripes = 8 if stripes > 8
     per = n / stripes
     per = 1 if per < 1
-    config = PgConfig.new(url.to_s)
+    config = PgConfig.new(url.to_s, schema_search_path)
     @database = config.database
     pools = []
     i = 0
@@ -803,6 +894,23 @@ module Db
 
   def self.adapter_name
     "postgresql"
+  end
+
+  # One database: a connection handle is the shared one (db.rbs).
+  def self.connection_slot(_base)
+    -1
+  end
+
+  def self.enter_slot(_slot, _base)
+    nil
+  end
+
+  def self.hold_slot(_slot, _base)
+    nil
+  end
+
+  def self.leave_slot
+    nil
   end
 
   def self.transaction_open?
@@ -884,6 +992,25 @@ module Db
     tables
   end
 
+  # The relations whose `scoping { }` block runs on this thread,
+  # innermost last (relation.rb's `Relation.current_scope_for`). Nil
+  # until the first push, which seeds the list with its element, so the
+  # element type is the relation's without a placeholder relation.
+  def self._current_scopes
+    Thread.current[:ar_current_scopes]
+  end
+
+  def self._push_current_scope(scope)
+    scopes = Thread.current[:ar_current_scopes]
+    if scopes.nil?
+      scopes = [scope]
+      Thread.current[:ar_current_scopes] = scopes
+    else
+      scopes << scope
+    end
+    scopes
+  end
+
   # Not PostgreSQL's DISABLE TRIGGER: its DDL here carries no foreign keys yet (emit::shared::schema_sql), so a fixture load has nothing to defer.
   def self.without_foreign_keys
     yield
@@ -909,6 +1036,8 @@ module Db
     idx = pool.lease
     conn = pool.conn(idx)
     Thread.current[:db_conn] = conn
+    # Rails wraps every request in the query cache; so does this lease.
+    conn.qc_begin
     request_error = nil
     begin
       result = yield
@@ -917,6 +1046,7 @@ module Db
     ensure
       cleanup_error = nil
       begin
+        conn.qc_end
         conn.release_all
       rescue StandardError => e
         cleanup_error = e
@@ -959,8 +1089,6 @@ module Db
   #   reads, and READ COMMITTED gives each statement its own snapshot.
   # - The checkpointer keeps SQLite's WAL short; the server checkpoints
   #   its own WAL.
-  # - The request query cache is a later step here; until then every
-  #   read is a round trip.
   def self.read_snapshot_begin
     true
   end
@@ -973,16 +1101,20 @@ module Db
     nil
   end
 
+  # ── The request query cache ──
+  #
+  # On the current connection, as in db.rb: a lease brackets it, and
+  # these bracket it by hand (`ActiveRecord::Base.cache` / `uncached`).
   def self.query_cache_begin
-    nil
+    current_conn.qc_begin
   end
 
   def self.query_cache_end
-    nil
+    current_conn.qc_end
   end
 
   def self.query_cache_enabled?
-    false
+    current_conn.qc_on?
   end
 
   # A page-level copy of a SQLite file has no PostgreSQL meaning. Seed
@@ -1058,7 +1190,7 @@ module Db
   # A write with a RETURNING clause (roundhouse#91): runs once, inline,
   # like `exec`, and answers a handle over the returned rows
   # (step?/column_*/finalize, as for a read). `changes` is its row count.
-  # There is no query cache to invalidate yet.
+  # Being a write, it empties the request query cache (PgConn#simple).
   def self.exec_returning(sql)
     record_query(sql)
     conn = current_conn
@@ -1077,8 +1209,13 @@ module Db
   # Prepare without re-entering prepare_marked. Post-inline SQL may
   # still contain \x01 inside string literals (unmarked values).
   def self.prepare_plain(sql)
+    conn = current_conn
+    # A replay is not a round trip, and `capture_sql` does not count it
+    # (Rails' SQLCounter skips CACHE events), as in db.rb.
+    hit = conn.qc_lookup(sql)
+    return hit if hit > 0
     record_query(sql)
-    h = current_conn.open_stmt(sql, true)
+    h = conn.open_stmt(sql, true)
     h
   end
 
@@ -1093,8 +1230,13 @@ module Db
   # Reads with too many SQL shapes to cache run as the unnamed statement.
   def self.prepare_uncached(sql)
     sql = sql.to_s
+    conn = current_conn
+    # Statement reuse is skipped; the request result cache still applies,
+    # as in db_cruby.rb.
+    hit = conn.qc_lookup(sql)
+    return hit if hit > 0
     record_query(sql)
-    h = current_conn.open_stmt(sql, false)
+    h = conn.open_stmt(sql, false)
     h
   end
 
@@ -1383,6 +1525,69 @@ module Db
 
   def self.escape_string_opt(s)
     s.nil? ? "NULL" : escape_string(s)
+  end
+
+  # `t.binary` columns (the lowerer's `ValueType::Binary`), which are
+  # `bytea` here. A value is written in bytea's hex input format,
+  # `'\x…'` (standard_conforming_strings, on since PostgreSQL 9.1, keeps
+  # the backslash literal), so a NUL or a byte that is not UTF-8 reaches
+  # the column intact. The text result format renders bytea the same
+  # way, so a read decodes the `\x` hex back to the bytes.
+  def self.escape_binary(s)
+    "'\\x" + s.to_s.unpack1("H*") + "'"
+  end
+
+  def self.escape_binary_opt(s)
+    s.nil? ? "NULL" : escape_binary(s)
+  end
+
+  def self.column_binary(stmt, i)
+    v = column_binary_opt(stmt, i)
+    return "" if v.nil?
+    v
+  end
+
+  def self.column_binary_opt(stmt, i)
+    v = Db.cell(stmt, i)
+    return nil if v.nil?
+    Db.bytea_decode(v)
+  end
+
+  # A bytea cell in the text result format, to the bytes it spells, as
+  # an ASCII-8BIT string (what Rails reads a bytea as). The server writes
+  # `\x` + hex pairs by default, and bytea's older escape format (`\\`
+  # for a backslash, `\ooo` octal for a non-printable byte, everything
+  # else as itself) when `bytea_output` is set to `escape`.
+  def self.bytea_decode(s)
+    out = "".dup
+    n = s.bytesize
+    if s.start_with?("\\x")
+      i = 2
+      while i + 1 < n
+        out = out + (PgUrl.hex(s.getbyte(i)) * 16 + PgUrl.hex(s.getbyte(i + 1))).chr
+        i += 2
+      end
+      return out.force_encoding("ASCII-8BIT")
+    end
+    i = 0
+    while i < n
+      b = s.getbyte(i)
+      if b == 92 && i + 1 < n && s.getbyte(i + 1) == 92
+        out = out + 92.chr
+        i += 2
+      elsif b == 92 && i + 3 < n && Db.octal_digit?(s.getbyte(i + 1)) && Db.octal_digit?(s.getbyte(i + 2)) && Db.octal_digit?(s.getbyte(i + 3))
+        out = out + (((s.getbyte(i + 1) - 48) * 64) + ((s.getbyte(i + 2) - 48) * 8) + (s.getbyte(i + 3) - 48)).chr
+        i += 4
+      else
+        out = out + b.chr
+        i += 1
+      end
+    end
+    out.force_encoding("ASCII-8BIT")
+  end
+
+  def self.octal_digit?(b)
+    b >= 48 && b <= 55
   end
 
   def self.escape_int_opt(n)

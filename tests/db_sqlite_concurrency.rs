@@ -119,6 +119,75 @@ end
     );
 }
 
+/// Transaction control and the observer's `PRAGMA data_version` are
+/// compiled once per connection, not on every call (the gem's `execute`
+/// and `get_first_value` prepare and close each time): on campfire's
+/// users profile they were about 10 of the ~14 statements a request
+/// prepared. Reuse must not change what they do: a failing COMMIT still
+/// raises and the statement runs again after it, `data_version` still
+/// moves when another connection commits (the reused statement holds no
+/// snapshot), and `close` finalizes them.
+#[test]
+fn fixed_statements_compile_once_per_connection() {
+    run(
+        "fixed",
+        r#"
+module PrepareCount
+  COUNT = Hash.new(0)
+  def prepare(sql, *args, &block)
+    PrepareCount::COUNT[sql] += 1
+    super
+  end
+end
+SQLite3::Database.prepend(PrepareCount)
+
+Db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+Db.with_connection do
+  50.times do |i|
+    Db.exec("BEGIN")
+    Db.exec("INSERT INTO t VALUES (#{i})")
+    Db.exec("COMMIT")
+  end
+end
+check("every row committed", count("t") == 50)
+check("BEGIN IMMEDIATE compiled once, not per transaction", PrepareCount::COUNT["BEGIN IMMEDIATE"] == 1)
+check("COMMIT compiled once, not per transaction", PrepareCount::COUNT["COMMIT"] == 1)
+
+conn = SQLite3::Database.new(Db.database_path)
+failed = false
+begin
+  conn.execute("COMMIT")
+rescue SQLite3::Exception
+  failed = true
+end
+check("a COMMIT outside a transaction still raises", failed)
+conn.execute("BEGIN")
+conn.execute("INSERT INTO t VALUES (1000)")
+conn.execute("ROLLBACK")
+check("the statements run again after one raised", !conn.transaction_active?)
+check("the rollback rolled back", count("t") == 50)
+conn.execute("BEGIN")
+conn.execute("INSERT INTO t VALUES (1001)")
+conn.execute("COMMIT")
+check("and commit", count("t") == 51)
+
+observer = SQLite3::Database.new(Db.database_path)
+v1 = observer.get_first_value("PRAGMA data_version")
+conn.execute("INSERT INTO t VALUES (1002)")
+v2 = observer.get_first_value("PRAGMA data_version")
+v3 = observer.get_first_value("PRAGMA data_version")
+check("data_version moves when another connection commits", v2 != v1)
+check("and holds when nothing does", v3 == v2)
+check("data_version compiled once", PrepareCount::COUNT["PRAGMA data_version"] == 1)
+check("a block or binds take the gem's own path", conn.execute("SELECT 1", []).first == [1])
+
+observer.close
+conn.close
+check("close closes", conn.closed? && observer.closed?)
+"#,
+    );
+}
+
 /// Writers in one process queue on the permit rather than racing for
 /// SQLite's lock. With every connection's busy handler set to zero, a
 /// second writer reaching SQLite would fail at once; none does.

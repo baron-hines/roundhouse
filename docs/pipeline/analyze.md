@@ -177,6 +177,7 @@ load-bearing:
 | `before_action :m` | The action body is entered with `@post = m()`'s binding in ivar scope | See `src/lower/controller/actions.rs::resolve_before_actions` |
 | `render :name` / implicit render | Binds the view to the action's ivars at the concrete types | View body is typed with the controller's ivar scope pre-populated |
 | `render "partial"` | Collection-partial rendering types the local from the collection's element type | Implicit `local` binding in `_article.html.erb` is `Article` when invoked as `render @article` |
+| `render` inside a partial | The inner partial's locals take the types the outer partial's render passes, filling only locals no view or layout typed (or typed only partly, as `items: []`'s `Array[unknown]`) | `render "field_error", resource: form.object, field: :title` in `articles/_form` types `resource : Article`, `field : Sym` |
 
 These are the conventions ruby2js and railcar also leaned on; they're
 what make zero-annotation typing viable.

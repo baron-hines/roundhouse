@@ -3,3 +3,6 @@ module ActiveRecord
     def _as_json_only: (Array[Symbol] only) -> Hash[String, untyped]
   end
 end
+class Date
+  def as_json: (?untyped _options) -> String
+end

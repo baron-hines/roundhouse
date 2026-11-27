@@ -21,7 +21,7 @@
 //! the pass order, so no later pass ledgers residue for a body that is
 //! not going to emit.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::app::App;
 use crate::diagnostic::Diagnostic;
@@ -33,7 +33,7 @@ pub fn apply_unported_rails_subclass_drop(app: &mut App) -> Vec<Diagnostic> {
     // Each doomed class → the base at the top of its chain. A fixpoint
     // because `library_classes` is in file order, and a subclass's file
     // can sort before its parent's.
-    let mut doomed: HashMap<Symbol, Symbol> = HashMap::new();
+    let mut doomed: HashMap<Symbol, Symbol> = HashMap::default();
     loop {
         let mut grew = false;
         for lc in &app.library_classes {
@@ -41,7 +41,11 @@ pub fn apply_unported_rails_subclass_drop(app: &mut App) -> Vec<Diagnostic> {
                 continue;
             }
             let Some(parent) = lc.parent.as_ref() else { continue };
-            let base = if is_unported_rails_base(parent.0.as_str()) {
+            // A runtime that defines `ActiveModel::Validator` keeps its
+            // subclasses (`validates_with` classes).
+            let ported = app.ports_active_model_validator
+                && matches!(parent.0.as_str(), "ActiveModel::Validator" | "ActiveModel::EachValidator");
+            let base = if is_unported_rails_base(parent.0.as_str()) && !ported {
                 Some(parent.0.clone())
             } else {
                 doomed.get(&parent.0).cloned()

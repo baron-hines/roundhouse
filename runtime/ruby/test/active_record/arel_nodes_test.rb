@@ -64,6 +64,14 @@ class ArelNodesTest < Minitest::Test
     assert_equal "id = 1", sql.to_s
   end
 
+  # Rails' arel/errors.rb: `class BindError < ArelError`, and `ArelError <
+  # StandardError`. An app's `rescue Arel::ArelError` catches the bind error.
+  def test_a_bind_error_is_an_arel_error
+    assert_equal StandardError, Arel::ArelError.superclass
+    assert_equal Arel::ArelError, Arel::BindError.superclass
+    assert_raises(Arel::ArelError) { Arel.sql("id = ?", 1, 2) }
+  end
+
   def test_a_sql_literal_bind_is_embedded_not_quoted
     inner = Arel.sql("lost_kwh > :n", n: 0)
     outer = Arel.sql("SUM(CASE WHEN :scope THEN 1 ELSE 0 END)", scope: inner)

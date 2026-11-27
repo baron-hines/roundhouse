@@ -99,3 +99,28 @@ fn a_view_directory_with_no_matching_class_roots_nothing() {
         "no shadowing here, so nothing should be rooted:\n{out}"
     );
 }
+
+#[test]
+fn a_reference_shadowed_by_a_nested_view_module_is_rooted() {
+    // `app/views/accounts/users/` makes a `Views::Accounts::Users`
+    // module, so inside `Views::Accounts` an unqualified
+    // `Users::ProfilesHelper` resolves to
+    // `Views::Accounts::Users::ProfilesHelper` (campfire's account page:
+    // uninitialized constant). The template has no lexical scope in the
+    // source; the nesting is the emit's, so the reference is rooted.
+    // There is no top-level `app/views/users/` here: the nested module
+    // alone has to be enough.
+    let out = emit_views(vec![
+        ("db/schema.rb", SCHEMA),
+        (
+            "app/helpers/users/profiles_helper.rb",
+            "module Users::ProfilesHelper\n  def share_label\n    \"share\"\n  end\nend\n",
+        ),
+        ("app/views/accounts/_invite.html.erb", "<%= share_label %>\n"),
+        ("app/views/accounts/users/_user.html.erb", "<p>user</p>\n"),
+    ]);
+    assert!(
+        out.contains("::Users::ProfilesHelper.share_label"),
+        "Views::Accounts::Users shadows Users, so the reference must be rooted:\n{out}"
+    );
+}

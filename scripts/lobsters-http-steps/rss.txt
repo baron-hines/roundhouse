@@ -1,0 +1,9 @@
+# the feeds, logged out and with a user's feed token
+#! no-login
+GET /rss
+GET /newest.rss
+GET /comments.rss
+GET /top.rss
+GET /t/ruby.rss
+GET /rss?token=smNVbzSnsKznfeoNwf286te5LegbMDQZBOQL9PSr6uYJaJy7HtJbJ4nIxO2P
+GET /~bob/comments.rss

@@ -1,3 +1,5 @@
+#[path = "support/scratch.rs"]
+mod scratch;
 use roundhouse::emit::ruby::emit_lowered_models;
 use roundhouse::ingest::ingest_app_from_tree;
 
@@ -86,7 +88,7 @@ fn a_form_the_runtime_does_not_take_is_left_alone() {
 fn all_month_is_a_literal_range_for_where_to_render() {
     assert_eq!(
         emit("Event.where(starts_at: starts_at.all_month).count"),
-        "ActiveRecord::Relation.new(Event).where(\"(events.starts_at >= ? AND events.starts_at <= ?)\", ActiveSupport.beginning_of_month(self.starts_at), ActiveSupport.end_of_month(self.starts_at)).count"
+        "ActiveRecord::Relation.new(Event).where(\"(\\\"events\\\".\\\"starts_at\\\" >= ? AND \\\"events\\\".\\\"starts_at\\\" <= ?)\", ActiveSupport.beginning_of_month(self.starts_at), ActiveSupport.end_of_month(self.starts_at)).count"
     );
 }
 
@@ -95,11 +97,11 @@ fn all_month_is_a_literal_range_for_where_to_render() {
 fn a_range_beside_other_keys_splits_into_its_own_where() {
     assert_eq!(
         emit("Event.where(name: name, starts_at: starts_at.all_day).count"),
-        "ActiveRecord::Relation.new(Event).where(\"(events.starts_at >= ? AND events.starts_at <= ?)\", ActiveSupport.beginning_of_day(self.starts_at), ActiveSupport.end_of_day(self.starts_at)).where(name: self.name).count"
+        "ActiveRecord::Relation.new(Event).where(\"(\\\"events\\\".\\\"starts_at\\\" >= ? AND \\\"events\\\".\\\"starts_at\\\" <= ?)\", ActiveSupport.beginning_of_day(self.starts_at), ActiveSupport.end_of_day(self.starts_at)).where(name: self.name).count"
     );
     assert_eq!(
         emit("Event.find_by(name: name, starts_at: starts_at.all_week)"),
-        "ActiveRecord::Relation.new(Event).where(\"(events.starts_at >= ? AND events.starts_at <= ?)\", ActiveSupport.beginning_of_week(self.starts_at), ActiveSupport.end_of_week(self.starts_at)).find_by(name: self.name)"
+        "ActiveRecord::Relation.new(Event).where(\"(\\\"events\\\".\\\"starts_at\\\" >= ? AND \\\"events\\\".\\\"starts_at\\\" <= ?)\", ActiveSupport.beginning_of_week(self.starts_at), ActiveSupport.end_of_week(self.starts_at)).find_by(name: self.name)"
     );
     assert_eq!(emit("Event.where(name: name).count"), "ActiveRecord::Relation.new(Event).where({ name: self.name }).count");
 }
@@ -119,10 +121,7 @@ fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
 
 #[test]
 fn a_controller_where_on_all_month_renders_sql_bounds() {
-    let dir = std::env::temp_dir().join("roundhouse-time-calendar-where");
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).expect("clean scratch");
-    }
+    let dir = scratch::dir("roundhouse-time-calendar-where");
     copy_tree(roundhouse::fixtures::real_blog(), &dir);
     let controller = dir.join("app/controllers/articles_controller.rb");
     let source = std::fs::read_to_string(&controller).expect("read controller").replacen(
@@ -141,7 +140,7 @@ fn a_controller_where_on_all_month_renders_sql_bounds() {
         .expect("controller emitted");
     assert!(
         emitted.contains(
-            "where(\"(articles.created_at >= ? AND articles.created_at <= ?)\", \
+            "where(\"(\\\"articles\\\".\\\"created_at\\\" >= ? AND \\\"articles\\\".\\\"created_at\\\" <= ?)\", \
              ActiveSupport.beginning_of_month(ActiveSupport.now), ActiveSupport.end_of_month(ActiveSupport.now))\
              .where(title: \"x\")"
         ),
@@ -149,7 +148,7 @@ fn a_controller_where_on_all_month_renders_sql_bounds() {
     );
 }
 
-fn time_range_residue(body: &str) -> usize {
+fn time_range_residue(body: &str, target: roundhouse::project::BuildTarget) -> usize {
     let tree = [
         ("db/schema.rb", SCHEMA.to_string()),
         (
@@ -161,7 +160,7 @@ fn time_range_residue(body: &str) -> usize {
     .map(|(p, s)| (std::path::PathBuf::from(p), s.into_bytes()))
     .collect();
     let mut app = ingest_app_from_tree(tree).expect("ingest");
-    roundhouse::session::analyze_and_lower(&mut app)
+    roundhouse::session::analyze_and_lower_for(&mut app, target)
         .iter()
         .filter(|d| matches!(&d.kind,
             roundhouse::diagnostic::DiagnosticKind::LowerResidue { construct, .. } if construct.as_str() == "time_range"))
@@ -169,9 +168,14 @@ fn time_range_residue(body: &str) -> usize {
 }
 
 #[test]
-fn an_all_month_outside_a_condition_is_ledgered() {
-    assert_eq!(time_range_residue("month = starts_at.all_month\n    Event.where(starts_at: month).count"), 1);
-    assert_eq!(time_range_residue("Event.where(name: name, starts_at: starts_at.all_month).count"), 0);
+fn an_all_month_outside_a_condition_is_ledgered_on_a_strict_target() {
+    use roundhouse::project::BuildTarget;
+    let stray = "month = starts_at.all_month\n    Event.where(starts_at: month).count";
+    assert_eq!(time_range_residue(stray, BuildTarget::Rust), 1);
+    assert_eq!(time_range_residue("Event.where(name: name, starts_at: starts_at.all_month).count", BuildTarget::Rust), 0);
+    for target in [BuildTarget::Ruby, BuildTarget::Jruby, BuildTarget::Spinel] {
+        assert_eq!(time_range_residue(stray, target), 0, "{target:?}");
+    }
 }
 
 #[test]

@@ -7,6 +7,9 @@ module ActionDispatch
 
   class Session
     def self.from_signed_cookie: (String raw, String name) -> Session
+    def to_cookie: () -> String
+    def self.from_cookie: (String raw) -> Session
+    def self.json_value: (String text) -> untyped
     def self.signed_cookie: (String plain, String name) -> String
   end
 end

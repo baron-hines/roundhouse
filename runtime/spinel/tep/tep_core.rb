@@ -5,8 +5,8 @@ require_relative "../http_headers"
 
 module Tep
   # The name the server announces itself by. scaffold/main.rb sets
-  # Tep::APP.name to the app's own name (the underscored module that
-  # wraps its Rails::Application, supplied by ingest) before it starts
+  # Tep::APP.name to the app's own name (its GlobalID app name,
+  # supplied by ingest) before it starts
   # the server; the binary's file name is the fallback.
   def self.display_name
     n = Tep::APP.name
@@ -102,6 +102,13 @@ module Tep
         out << k + ": " + v + "\r\n"
       end
     end
+    res.header_fields.each do |field|
+      k = field[0]
+      v = field[1]
+      if HttpHeaders.key_ok?(k) && HttpHeaders.value_ok?(v)
+        out << k + ": " + v + "\r\n"
+      end
+    end
     res.set_cookies.each do |line|
       out << "Set-Cookie: " + line + "\r\n" if HttpHeaders.value_ok?(line)
     end
@@ -130,6 +137,15 @@ module Tep
   # a value that is not a positive byte count below BYTE_COUNT_CEILING
   # leaves the default — an override too large to represent is not a cap.
   MAX_BODY_BYTES_DEFAULT = 100 * 1024 * 1024
+
+  # How long a body drain waits for the next bytes of a request body
+  # before it drops the connection. Each recv starts the wait again, so
+  # this bounds a pause, not the whole upload. 30s is Puma's
+  # first_data_timeout, which Puma also restarts on every wakeup
+  # (Server#reactor_wakeup -> Client#set_timeout). It was 5s: a phone
+  # uploading a photo over a mobile link pauses longer than that, and the
+  # drain closed the connection with half the body read.
+  BODY_READ_TIMEOUT = 30
 
   def self.max_body_from_env
     v = Tep.decimal_byte_count(ENV["TEP_MAX_BODY_BYTES"] || "")
@@ -282,6 +298,19 @@ module Tep
     gz
   end
 
+  # Not the app's spelling: a header Hash is case-sensitive, so a downcased Content-Encoding went unseen and the body was gzipped again
+  HEADER_NAMES = ["Content-Type", "Content-Length", "Content-Encoding", "Transfer-Encoding", "Connection", "Vary", "Location"]
+
+  def self.header_name(name)
+    lower = name.downcase
+    i = 0
+    while i < HEADER_NAMES.length
+      return HEADER_NAMES[i] if HEADER_NAMES[i].downcase == lower
+      i += 1
+    end
+    name
+  end
+
   # Honour Accept-Encoding: gzip the way campfire's `use Rack::Deflater`
   # does on CRuby. Inline bodies only — sendfile/streaming/websocket stay
   # as they are. Mutates res.body and stamps Content-Encoding + Vary.
@@ -333,6 +362,14 @@ module Tep
   # collections without running anything user-visible.
   def self.seed_fiber_noop
     0
+  end
+
+  def self.boot_hooks?
+    false
+  end
+
+  def self.on_booted
+    nil
   end
 
   # Shutdown hook. Tep::Server::Threaded calls Tep.on_shutdown after

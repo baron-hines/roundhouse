@@ -1,0 +1,7 @@
+# Typing for the façade at runtime/spinel/redis_cable.rb. Dropped with
+# the façade when a tree gets the real Redis transport.
+module RedisCable
+  def self.enabled?: () -> bool
+  def self.publish: (String stream, String message_json) -> nil
+  def self.ensure_subscriber: () -> nil
+end

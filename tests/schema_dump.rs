@@ -1,0 +1,623 @@
+//! The test environment's primary may name its schema file with
+//! `schema_dump:`. Roundhouse reads one form of it: a plain or quoted YAML
+//! string, written directly in the configuration, naming a relative `.rb`
+//! or `.sql` file under `db/`, as Rails joins it there. Every other form,
+//! and a `schema_dump` or `schema_format` in a literal `url:`'s query, is
+//! an error naming the configuration and the setting, never a silent
+//! choice of another file. Another database's file is a warning: the
+//! emitted runtime opens only the primary.
+
+#[path = "support/prerequisite.rs"]
+mod prerequisite;
+#[path = "support/scratch.rs"]
+mod scratch;
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::process::Command;
+
+use roundhouse::analyze::{diagnose, Analyzer};
+use roundhouse::diagnostic::Severity;
+use roundhouse::emit::diagnostics::scope;
+use roundhouse::ingest::{ingest_app, ingest_app_from_tree};
+use roundhouse::project::{target_files, BuildTarget};
+use roundhouse::App;
+
+const WIDGETS: &str = "ActiveRecord::Schema[8.1].define(version: 1) do\n  create_table :widgets, force: true do |t|\n    t.string :title, null: false\n  end\nend\n";
+const STALE: &str = "ActiveRecord::Schema[8.1].define(version: 1) do\n  create_table :gadgets, force: true do |t|\n    t.string :name\n  end\nend\n";
+const WIDGET: &str = "class Widget < ActiveRecord::Base\n  def label = title\nend\n";
+const ROUTES: &str = "Rails.application.routes.draw do\nend\n";
+
+/// The synthetic repro: every environment's primary names its schema file.
+fn named_yml(schema_dump: &str) -> String {
+    ["development", "test", "production"]
+        .iter()
+        .map(|env| format!("{env}:\n  primary:\n    adapter: sqlite3\n    database: storage/catalog.sqlite3\n    schema_dump: {schema_dump}\n"))
+        .collect()
+}
+
+fn files(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = vec![("app/models/widget.rb".into(), WIDGET.into()), ("config/routes.rb".into(), ROUTES.into())];
+    for (path, content) in pairs {
+        out.retain(|(existing, _)| existing != path);
+        out.push((path.to_string(), content.to_string()));
+    }
+    out
+}
+
+struct Checked {
+    app: App,
+    /// Rendered `path:line:col: error[code]: message`.
+    errors: Vec<String>,
+    warnings: Vec<String>,
+}
+
+fn check(files: &[(String, String)]) -> Checked {
+    let tree: HashMap<PathBuf, Vec<u8>> = files.iter().map(|(path, content)| (PathBuf::from(path), content.as_bytes().to_vec())).collect();
+    analyzed(ingest_app_from_tree(tree).unwrap_or_else(|error| panic!("ingest failed: {error}")))
+}
+
+fn analyzed(mut app: App) -> Checked {
+    Analyzer::new(&app).analyze(&mut app);
+    let diagnostics = diagnose(&app);
+    let rendered = |severity: Severity| diagnostics.iter().filter(|d| d.severity == severity).map(|d| d.render(&app.sources)).collect::<Vec<_>>();
+    let (errors, warnings) = (rendered(Severity::Error), rendered(Severity::Warning));
+    Checked { app, errors, warnings }
+}
+
+fn tables(app: &App) -> Vec<String> {
+    let mut names: Vec<String> = app.schema.tables.keys().map(|name| name.as_str().to_string()).collect();
+    names.sort();
+    names
+}
+
+fn assert_at(diagnostics: &[String], location: &str, phrases: &[&str]) {
+    let hit = diagnostics.iter().any(|d| d.starts_with(location) && phrases.iter().all(|p| d.contains(p)));
+    assert!(hit, "expected a diagnostic at {location} naming {phrases:?}; got:\n{}", diagnostics.join("\n"));
+}
+
+fn spinel_tree(app: &App) -> Vec<(String, String)> {
+    let (result, diagnostics) = scope(|| target_files(app, std::path::Path::new("not-a-fixture"), BuildTarget::Spinel));
+    result.unwrap_or_else(|error| panic!("spinel emit failed: {error}\n{diagnostics:?}"))
+}
+
+fn file<'a>(tree: &'a [(String, String)], path: &str) -> &'a str {
+    &tree.iter().find(|(p, _)| p == path).unwrap_or_else(|| panic!("no {path} emitted")).1
+}
+
+#[test]
+fn the_schema_file_schema_dump_names_is_the_primary_schema() {
+    let named = check(&files(&[("config/database.yml", &named_yml("catalog_schema.rb")), ("db/catalog_schema.rb", WIDGETS)]));
+    assert!(named.errors.is_empty(), "{}", named.errors.join("\n"));
+    assert_eq!(tables(&named.app), ["widgets"]);
+    let tree = spinel_tree(&named.app);
+    assert!(file(&tree, "config/schema.rb").contains("CREATE TABLE IF NOT EXISTS widgets"), "{}", file(&tree, "config/schema.rb"));
+    assert!(file(&tree, "app/models/widget.rb").contains("def title\n"), "{}", file(&tree, "app/models/widget.rb"));
+
+    // The same app with the schema at Rails' default name emits the same tree.
+    let control = check(&files(&[
+        ("config/database.yml", &named_yml("catalog_schema.rb").replace("    schema_dump: catalog_schema.rb\n", "")),
+        ("db/schema.rb", WIDGETS),
+    ]));
+    assert!(control.errors.is_empty(), "{}", control.errors.join("\n"));
+    let control_tree = spinel_tree(&control.app);
+    assert_eq!(tree.len(), control_tree.len());
+    for ((path, text), (control_path, control_text)) in tree.iter().zip(&control_tree) {
+        assert_eq!(path, control_path);
+        assert!(text == control_text, "{path} differs from the db/schema.rb control");
+    }
+}
+
+/// Also beside the assets initializer `rails new` writes, whose comment
+/// names Sprockets' and Propshaft's `assets.paths`, not Rails' `paths`.
+#[test]
+fn the_named_file_wins_over_a_default_one() {
+    let checked = check(&files(&[
+        ("config/database.yml", &named_yml("catalog_schema.rb")),
+        ("db/catalog_schema.rb", WIDGETS),
+        ("db/schema.rb", STALE),
+        ("config/initializers/assets.rb", "Rails.application.config.assets.version = \"1.0\"\n# Rails.application.config.assets.paths << Emoji.images_path\n"),
+    ]));
+    assert!(checked.errors.is_empty(), "{}", checked.errors.join("\n"));
+    assert_eq!(tables(&checked.app), ["widgets"]);
+}
+
+#[test]
+fn a_named_file_that_is_missing_is_an_error_naming_it() {
+    let checked = check(&files(&[("config/database.yml", &named_yml("catalog_schema.rb"))]));
+    assert_at(&checked.errors, "config/database.yml:10:", &["`test.primary`", "db/catalog_schema.rb", "does not exist"]);
+    assert!(tables(&checked.app).is_empty());
+
+    // Rails joins a relative name to db/, so `db/x.rb` is db/db/x.rb: `schema_dump_path` keeps a
+    // name only when `File.dirname(name) == db_dir`, and `db_dir` is `paths["db"].first`, which is
+    // absolute. Checked against an initialized Rails 8.1.4 app.
+    let prefixed = check(&files(&[("config/database.yml", &named_yml("db/catalog_schema.rb")), ("db/catalog_schema.rb", WIDGETS)]));
+    assert_at(&prefixed.errors, "config/database.yml:10:", &["`schema_dump: db/catalog_schema.rb`", "db/db/catalog_schema.rb", "does not exist"]);
+}
+
+#[test]
+fn another_databases_schema_file_is_reported_and_not_carried() {
+    let yml = "test:\n  primary:\n    adapter: sqlite3\n    database: storage/test.sqlite3\n  catalog:\n    adapter: sqlite3\n    database: storage/catalog.sqlite3\n    schema_dump: catalog_schema.rb\n  audit:\n    adapter: sqlite3\n    database: storage/audit.sqlite3\n  primary_replica:\n    adapter: sqlite3\n    database: storage/test.sqlite3\n    replica: true\n  cache:\n    adapter: sqlite3\n    database: storage/cache.sqlite3\n    schema_dump: false\nproduction:\n  primary:\n    adapter: sqlite3\n    database: storage/production.sqlite3\n  reports:\n    adapter: sqlite3\n    database: storage/reports.sqlite3\n";
+    let checked = check(&files(&[
+        ("config/database.yml", yml),
+        ("db/schema.rb", STALE),
+        ("db/catalog_schema.rb", WIDGETS),
+        ("db/audit_schema.rb", WIDGETS),
+    ]));
+    assert!(checked.errors.is_empty(), "{}", checked.errors.join("\n"));
+    assert_eq!(tables(&checked.app), ["gadgets"], "another database's tables joined the primary's");
+    assert_at(&checked.warnings, "config/database.yml:5:", &["`test.catalog`", "db/catalog_schema.rb", "opens only the primary"]);
+    assert_at(&checked.warnings, "config/database.yml:9:", &["`test.audit`", "db/audit_schema.rb"]);
+    let reported: Vec<&String> = checked.warnings.iter().filter(|w| w.contains("schema_dump")).collect();
+    assert_eq!(reported.len(), 2, "a replica, `schema_dump: false` and another environment are not reported: {reported:#?}");
+
+    // Without its file there are no tables to leave out.
+    let without = check(&files(&[("config/database.yml", yml), ("db/schema.rb", STALE), ("db/catalog_schema.rb", WIDGETS)]));
+    let reported: Vec<&String> = without.warnings.iter().filter(|w| w.contains("schema_dump")).collect();
+    assert_eq!(reported.len(), 1, "{reported:#?}");
+}
+
+/// Another database's default file follows its own `schema_format`, as
+/// Rails names it: `archive_structure.sql` under `sql`, not a stale
+/// `archive_schema.rb` beside it.
+#[test]
+fn another_databases_default_file_follows_its_format() {
+    let yml = "test:\n  primary:\n    adapter: sqlite3\n  archive:\n    adapter: sqlite3\n    schema_format: sql\n";
+    let checked = check(&files(&[
+        ("config/database.yml", yml),
+        ("db/schema.rb", WIDGETS),
+        ("db/archive_schema.rb", STALE),
+        ("db/archive_structure.sql", "CREATE TABLE archived (id integer PRIMARY KEY);\n"),
+    ]));
+    assert!(checked.errors.is_empty(), "{}", checked.errors.join("\n"));
+    assert_at(&checked.warnings, "config/database.yml:4:", &["`test.archive`", "db/archive_structure.sql"]);
+    assert!(checked.warnings.iter().all(|w| !w.contains("archive_schema.rb")), "{:?}", checked.warnings);
+}
+
+#[test]
+fn a_structure_dump_is_read_under_a_literal_sql_format() {
+    let structure = "CREATE TABLE public.widgets (\n    id bigint NOT NULL,\n    title character varying NOT NULL\n);\n";
+    let yml = "test:\n  adapter: postgresql\n  database: app_test\n  schema_format: sql\n  schema_dump: catalog_structure.sql\n";
+    let checked = check(&files(&[("config/database.yml", yml), ("db/catalog_structure.sql", structure), ("db/schema.rb", STALE)]));
+    assert!(checked.errors.is_empty(), "{}", checked.errors.join("\n"));
+    assert_eq!(tables(&checked.app), ["widgets"]);
+}
+
+/// Each form of `schema_dump` this does not read is an error naming the
+/// configuration and the setting; the schema stays empty rather than
+/// falling back to db/schema.rb.
+#[test]
+fn every_other_form_is_refused_by_name() {
+    let base = "test:\n  adapter: sqlite3\n  database: storage/test.sqlite3\n";
+    let cases: &[(&str, String, &[(&str, &str)], &[&str])] = &[
+        ("ERB", format!("{base}  schema_dump: <%= ENV[\"SCHEMA_FILE\"] %>\n"), &[], &["SCHEMA_FILE", "ERB"]),
+        ("no extension", format!("{base}  schema_dump: 'off'\n"), &[("db/off", WIDGETS)], &["`schema_dump: 'off'`", ".rb or .sql"]),
+        ("absolute", format!("{base}  schema_dump: /srv/catalog_schema.rb\n"), &[], &["/srv/catalog_schema.rb", "relative path"]),
+        ("outside db/", format!("{base}  schema_dump: ../catalog_schema.rb\n"), &[("catalog_schema.rb", WIDGETS)], &["../catalog_schema.rb", "relative path"]),
+        ("Symbol key", format!("{base}  :schema_dump: catalog_schema.rb\n"), &[("db/catalog_schema.rb", WIDGETS)], &["Symbol key"]),
+        ("anchor", format!("{base}  schema_dump: &file catalog_schema.rb\n"), &[("db/catalog_schema.rb", WIDGETS)], &["anchor"]),
+        ("` #` in a quoted name", format!("{base}  schema_dump: 'release #1.rb'\n"), &[("db/release #1.rb", WIDGETS)], &["quoted name holding ` #`"]),
+        ("merge", format!("default: &default\n  schema_dump: catalog_schema.rb\ntest:\n  <<: *default\n  adapter: sqlite3\n"), &[("db/catalog_schema.rb", WIDGETS)], &["anchor merge or flow"]),
+        ("flow", "test: { adapter: sqlite3, schema_dump: catalog_schema.rb }\n".to_string(), &[("db/catalog_schema.rb", WIDGETS)], &["anchor merge or flow"]),
+        ("anchored quoted 'off'", format!("{base}  schema_dump: &dump 'off'\n"), &[("db/off", WIDGETS)], &["anchor"]),
+        ("escaped name", format!("{base}  schema_dump: \"\\x6fff\"\n"), &[("db/off", WIDGETS)], &["an escape"]),
+        ("URL schema_dump", format!("{base}  url: 'sqlite3:///tmp/test.sqlite3?schema_dump=catalog_schema.rb'\n"), &[("db/catalog_schema.rb", WIDGETS)], &["`url:`", "`schema_dump`"]),
+        ("URL schema_format", format!("{base}  url: 'sqlite3:///tmp/test.sqlite3?schema_format=sql'\n"), &[], &["`url:`", "`schema_format`"]),
+        ("paths[\"db\"]", format!("{base}  schema_dump: catalog_schema.rb\n"), &[("db/catalog_schema.rb", WIDGETS), ("config/application.rb", "class App < Rails::Application\n  config.paths[\"db\"] = [\"database\"]\nend\n")], &["config/application.rb", "mentions `.paths`"]),
+        ("spaced paths[ \"db\" ]", format!("{base}  schema_dump: catalog_schema.rb\n"), &[("db/catalog_schema.rb", WIDGETS), ("config/application.rb", "class App < Rails::Application\n  config.paths[ \"db\" ] = [\"database\"]\nend\n")], &["config/application.rb", "mentions `.paths`"]),
+        ("paths.add(\"db\")", format!("{base}  schema_dump: catalog_schema.rb\n"), &[("db/catalog_schema.rb", WIDGETS), ("config/application.rb", "class App < Rails::Application\n  config.paths.add(\"db\", with: \"database\")\nend\n")], &["config/application.rb", "mentions `.paths`"]),
+        ("aliased paths", format!("{base}  schema_dump: catalog_schema.rb\n"), &[("db/catalog_schema.rb", WIDGETS), ("config/application.rb", "class App < Rails::Application\n  paths = config.paths\n  paths[ 'db' ] = ['database']\nend\n")], &["config/application.rb", "mentions `.paths`"]),
+        ("aliased receiver", format!("{base}  schema_dump: catalog_schema.rb\n"), &[("db/catalog_schema.rb", WIDGETS), ("config/application.rb", "class App < Rails::Application\n  p = config.paths\n  p[\"db\"] = [\"database\"]\nend\n")], &["config/application.rb", "mentions `.paths`"]),
+        ("DatabaseTasks.db_dir", format!("{base}  schema_dump: catalog_schema.rb\n"), &[("db/catalog_schema.rb", WIDGETS), ("config/initializers/db_dir.rb", "ActiveRecord::Tasks::DatabaseTasks.db_dir = Rails.root.join(\"database\").to_s\n")], &["config/initializers/db_dir.rb", "mentions `.paths`", "`db_dir`"]),
+        ("receiver named db_assets", format!("{base}  schema_dump: catalog_schema.rb\n"), &[("db/catalog_schema.rb", WIDGETS), ("config/application.rb", "class App < Rails::Application\n  db_assets = config\n  db_assets.paths[\"db\"] = [\"database\"]\nend\n")], &["config/application.rb", "mentions `.paths`"]),
+        ("computed paths key", format!("{base}  schema_dump: catalog_schema.rb\n"), &[("db/catalog_schema.rb", WIDGETS), ("config/application.rb", "class App < Rails::Application\n  key = \"db\"\n  config.paths[key] = [\"database\"]\nend\n")], &["config/application.rb", "mentions `.paths`"]),
+        ("quoted ':url' beside url", format!("{base}  schema_dump: catalog_schema.rb\n  url: 'sqlite3:///tmp/test.sqlite3'\n  ':url': 'sqlite3:///tmp/test.sqlite3'\n"), &[("db/catalog_schema.rb", WIDGETS)], &["more than one spelling"]),
+        ("merged :url beside url", format!("defaults: &defaults\n  :url: 'sqlite3:///tmp/test.sqlite3'\ntest:\n  <<: *defaults\n  adapter: sqlite3\n  schema_dump: catalog_schema.rb\n  url: 'sqlite3:///tmp/test.sqlite3'\n"), &[("db/catalog_schema.rb", WIDGETS)], &["more than one spelling"]),
+        ("ERB if around the environment", "<% if ENV[\"CI\"] %>\ntest:\n  adapter: sqlite3\n  schema_dump: catalog_schema.rb\n<% end %>\n".to_string(), &[("db/catalog_schema.rb", WIDGETS)], &["ERB control flow"]),
+        ("ERB if around the key", format!("{base}<% if ENV[\"CI\"] %>\n  schema_dump: catalog_schema.rb\n<% end %>\n"), &[("db/catalog_schema.rb", WIDGETS)], &["ERB control flow"]),
+        ("environment URL string", "test: 'sqlite3:///tmp/test.sqlite3?schema_dump=catalog_schema.rb'\n".to_string(), &[("db/catalog_schema.rb", WIDGETS)], &["`url:`", "`schema_dump`"]),
+        ("`:url:` query", format!("{base}  schema_dump: catalog_schema.rb\n  :url: 'sqlite3:///tmp/test.sqlite3?schema_dump=other.rb'\n"), &[("db/catalog_schema.rb", WIDGETS), ("db/other.rb", WIDGETS)], &["`url:`", "`schema_dump`"]),
+        ("computed url", format!("{base}  schema_dump: catalog_schema.rb\n  url: <%= ENV[\"DATABASE_URL\"] %>\n"), &[("db/catalog_schema.rb", WIDGETS)], &["`url:` is computed"]),
+        ("`.rb` under schema_format: sql", format!("{base}  schema_format: sql\n  schema_dump: catalog.rb\n"), &[("db/catalog.rb", "CREATE TABLE gadgets (id integer PRIMARY KEY, title varchar);")], &["extension"]),
+        ("`.rb` under schema_format: sql, widgets", format!("{base}  schema_format: sql\n  schema_dump: catalog.rb\n"), &[("db/catalog.rb", "CREATE TABLE widgets (id integer PRIMARY KEY, title varchar);")], &["extension"]),
+        ("`.sql` without schema_format", format!("{base}  schema_dump: catalog.sql\n"), &[("db/catalog.sql", "CREATE TABLE widgets (id integer PRIMARY KEY, title varchar);")], &["extension"]),
+        ("app-level schema_format", format!("{base}  schema_dump: catalog_schema.rb\n"), &[("db/catalog_schema.rb", WIDGETS), ("config/application.rb", "class App < Rails::Application\n  config.active_record.schema_format = :ruby\nend\n")], &["config/application.rb", "mentions `schema_format`"]),
+    ];
+    let mut failures = Vec::new();
+    for (name, yml, extra, phrases) in cases {
+        let mut pairs: Vec<(&str, &str)> = vec![("config/database.yml", yml.as_str()), ("db/schema.rb", STALE)];
+        pairs.extend_from_slice(extra);
+        let checked = check(&files(&pairs));
+        let hit = checked.errors.iter().any(|e| e.contains("`test.primary`") && phrases.iter().all(|p| e.contains(p)));
+        if !hit || !tables(&checked.app).is_empty() {
+            failures.push(format!("{name}: tables {:?}, errors {:?}", tables(&checked.app), checked.errors));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The app's likely shape: a three-tier test environment whose other
+/// databases set their own `schema_dump`, `schema_format` and `url`. Only
+/// the primary's keys decide its file; the others keep their warning.
+#[test]
+fn the_primary_reads_its_file_beside_other_databases() {
+    let yml = "test:\n  primary:\n    adapter: sqlite3\n    database: storage/test.sqlite3\n    schema_dump: catalog_schema.rb\n  archive:\n    adapter: sqlite3\n    database: storage/archive.sqlite3\n    schema_format: sql\n    schema_dump: archive_structure.sql\n  cache:\n    adapter: sqlite3\n    url: 'sqlite3:///tmp/cache.sqlite3?schema_dump=other.rb'\n";
+    let checked = check(&files(&[
+        ("config/database.yml", yml),
+        ("db/catalog_schema.rb", WIDGETS),
+        ("db/schema.rb", STALE),
+        ("db/archive_structure.sql", "CREATE TABLE archived (id integer PRIMARY KEY);\n"),
+    ]));
+    assert!(checked.errors.is_empty(), "{}", checked.errors.join("\n"));
+    assert_eq!(tables(&checked.app), ["widgets"]);
+    assert_at(&checked.warnings, "config/database.yml:6:", &["`test.archive`", "db/archive_structure.sql", "opens only the primary"]);
+}
+
+/// A quoted environment or configuration key is located like a plain one.
+#[test]
+fn quoted_environment_and_configuration_keys_are_located() {
+    for yml in [
+        "'test':\n  adapter: sqlite3\n  schema_dump: catalog_schema.rb\n",
+        "\"test\":\n  adapter: sqlite3\n  schema_dump: catalog_schema.rb\n",
+        "test:\n  'primary':\n    adapter: sqlite3\n    schema_dump: catalog_schema.rb\n  archive:\n    adapter: sqlite3\n",
+    ] {
+        let checked = check(&files(&[("config/database.yml", yml), ("db/catalog_schema.rb", WIDGETS), ("db/schema.rb", STALE)]));
+        assert!(checked.errors.is_empty(), "{yml}: {}", checked.errors.join("\n"));
+        assert_eq!(tables(&checked.app), ["widgets"], "{yml}");
+    }
+}
+
+/// An app on solid_queue that reads its records, with `extra` files.
+fn solid_queue_app(extra: &[(&str, &str)]) -> Vec<(String, String)> {
+    let mut pairs = vec![
+        ("config/application.rb", "config.active_job.queue_adapter = :solid_queue"),
+        ("app/models/queue_stats.rb", "class QueueStats; def self.jobs; SolidQueue::Job.count; end; end"),
+        (".bundle/config", "BUNDLE_PATH: vendor/bundle"),
+        ("Gemfile.lock", "GEM\n  remote: https://rubygems.org/\n  specs:\n    solid_queue (1.7.0)\n\nDEPENDENCIES\n  solid_queue\n"),
+        ("vendor/bundle/ruby/3.4.0/gems/solid_queue-1.7.0/app/models/solid_queue/job.rb", "class SolidQueue::Job < ActiveRecord::Base; self.table_name = 'solid_queue_jobs'; end"),
+    ];
+    pairs.extend_from_slice(extra);
+    files(&pairs)
+}
+
+const QUEUE_JOBS: &str = "ActiveRecord::Schema[8.1].define(version: 1) do\n  create_table :solid_queue_jobs do |t|\n    t.text :arguments\n  end\nend\n";
+
+/// solid_queue's records are found from the named primary schema too, read
+/// in its resolved format: `.rb` alone has no extension but is Ruby.
+#[test]
+fn queue_tables_in_the_named_schema_select_solid_queue_models() {
+    for (dump, path) in [("catalog_schema.rb", "db/catalog_schema.rb"), (".rb", "db/.rb")] {
+        let yml = format!("test:\n  adapter: sqlite3\n  schema_dump: {dump}\n");
+        let checked = check(&solid_queue_app(&[("config/database.yml", &yml), (path, QUEUE_JOBS)]));
+        assert_eq!(tables(&checked.app), ["solid_queue_jobs"], "{dump}");
+        assert!(checked.app.models.iter().any(|m| m.name.0.as_str() == "SolidQueue::Job"), "{dump}: SolidQueue::Job was not selected");
+    }
+}
+
+/// The queue database's file drops its warning only once its tables join
+/// the primary's: in survey mode, a queue schema that can't be read keeps it.
+#[cfg(unix)]
+#[test]
+fn a_queue_schema_that_isnt_joined_keeps_its_warning() {
+    use std::os::unix::fs::PermissionsExt;
+    let yml = "test:\n  primary:\n    adapter: sqlite3\n  queue:\n    adapter: sqlite3\n";
+    for readable in [true, false] {
+        let dir = scratch::dir("roundhouse-schema-dump-queue");
+        for (path, content) in solid_queue_app(&[("config/database.yml", yml), ("db/schema.rb", WIDGETS), ("db/queue_schema.rb", QUEUE_JOBS)]) {
+            std::fs::create_dir_all(dir.join(&path).parent().unwrap()).unwrap();
+            std::fs::write(dir.join(&path), content).unwrap();
+        }
+        let queue = dir.join("db/queue_schema.rb");
+        if !readable {
+            std::fs::set_permissions(&queue, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        // A process that can read past the mode (CAP_DAC_OVERRIDE, root) has nothing unreadable.
+        let skip = !readable && std::fs::read(&queue).is_ok();
+        roundhouse::ingest::survey::activate();
+        let result = (!skip).then(|| ingest_app(&dir));
+        std::fs::set_permissions(&queue, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let Some(result) = result else {
+            eprintln!("skipping: this process can read a mode-000 file");
+            return;
+        };
+        let checked = analyzed(result.unwrap_or_else(|error| panic!("ingest failed: {error}")));
+        let warning = checked.warnings.iter().any(|w| w.contains("`test.queue`") && w.contains("db/queue_schema.rb"));
+        assert_eq!(warning, !readable, "readable {readable}: {:?}", checked.warnings);
+        assert_eq!(tables(&checked.app).contains(&"solid_queue_jobs".to_string()), readable, "readable {readable}");
+    }
+}
+
+/// A three-tier test environment whose configurations are named by
+/// non-String keys has no primary this can name: a named file there is
+/// refused, and ingestion doesn't panic.
+#[test]
+fn a_primary_that_cannot_be_named_refuses_a_named_file() {
+    let checked = check(&files(&[("config/database.yml", "test:\n  1:\n    adapter: sqlite3\n    schema_dump: catalog_schema.rb\n"), ("db/catalog_schema.rb", WIDGETS), ("db/schema.rb", STALE)]));
+    assert_at(&checked.errors, "config/database.yml:1:", &["`test.primary`", "can't be named"]);
+    assert!(tables(&checked.app).is_empty());
+}
+
+/// `:schema_dump:` is refused wherever it comes from, merges included.
+#[test]
+fn a_merged_symbol_key_schema_dump_is_refused() {
+    let yml = "defaults: &defaults\n  :schema_dump: other.rb\ntest:\n  <<: *defaults\n  adapter: sqlite3\n";
+    let checked = check(&files(&[("config/database.yml", yml), ("db/other.rb", WIDGETS), ("db/schema.rb", STALE)]));
+    assert_at(&checked.errors, "config/database.yml:3:", &["`test.primary`", "Symbol key"]);
+    assert!(tables(&checked.app).is_empty());
+}
+
+/// A key computed by ERB could be `schema_dump` itself, after or before
+/// the written one: a file that computes a key refuses a named file, and
+/// only a named one.
+#[test]
+fn a_computed_key_refuses_a_named_file() {
+    let yml = "test:\n  adapter: sqlite3\n  schema_dump: catalog_schema.rb\n  <%= \"schema_dump\" %>: other.rb\n";
+    let checked = check(&files(&[("config/database.yml", yml), ("db/catalog_schema.rb", WIDGETS), ("db/other.rb", STALE), ("db/schema.rb", STALE)]));
+    assert!(checked.errors.iter().any(|e| e.contains("`test.primary`") && e.contains("computes a key")), "{:?}", checked.errors);
+    assert!(tables(&checked.app).is_empty());
+
+    // `schema_dump: false` or null names no file, so a computed key elsewhere keeps main's behavior.
+    for dump in ["false", "~"] {
+        let yml = format!("test:\n  adapter: sqlite3\n  schema_dump: {dump}\n  <%= \"pool\" %>: 5\n");
+        let checked = check(&files(&[("config/database.yml", &yml), ("db/schema.rb", WIDGETS)]));
+        assert!(checked.errors.iter().all(|e| !e.contains("schema_dump")), "{yml}: {:?}", checked.errors);
+        assert_eq!(tables(&checked.app), ["widgets"], "{yml}");
+    }
+}
+
+/// Only the test primary's own `schema_dump` matters: another
+/// environment's named file beside a computed key doesn't refuse a test
+/// primary that names none.
+#[test]
+fn a_computed_key_refuses_only_beside_the_test_primarys_named_file() {
+    let yml = "test:\n  adapter: sqlite3\n  schema_dump: false\nproduction:\n  adapter: sqlite3\n  schema_dump: production_schema.rb\n  <%= \"pool\" %>: 5\n";
+    let checked = check(&files(&[("config/database.yml", yml), ("db/schema.rb", WIDGETS), ("db/production_schema.rb", STALE)]));
+    assert!(checked.errors.iter().all(|e| !e.contains("schema_dump")), "{:?}", checked.errors);
+    assert_eq!(tables(&checked.app), ["widgets"]);
+}
+
+/// Two computed keys must not hide a named file: each placeholder is
+/// distinct, so the YAML still parses and the named file is refused.
+/// With `schema_dump: false` or none, the same file builds as on main.
+#[test]
+fn two_computed_keys_still_refuse_a_named_file() {
+    let computed = "  <%= \"pool\" %>: 5\n  <%= \"timeout\" %>: 1000\n";
+    let named = format!("test:\n  adapter: sqlite3\n  schema_dump: catalog_schema.rb\n{computed}");
+    let checked = check(&files(&[("config/database.yml", &named), ("db/catalog_schema.rb", WIDGETS), ("db/schema.rb", STALE)]));
+    assert!(checked.errors.iter().any(|e| e.contains("`test.primary`") && e.contains("computes a key")), "{:?}", checked.errors);
+    assert!(tables(&checked.app).is_empty());
+    for dump in ["  schema_dump: false\n", ""] {
+        let yml = format!("test:\n  adapter: sqlite3\n{dump}{computed}");
+        let checked = check(&files(&[("config/database.yml", &yml), ("db/schema.rb", WIDGETS)]));
+        assert!(checked.errors.iter().all(|e| !e.contains("schema_dump")), "{yml}: {:?}", checked.errors);
+        assert_eq!(tables(&checked.app), ["widgets"], "{yml}");
+    }
+}
+
+/// A file that no longer parses once its ERB is set aside (here an anchor
+/// computed by ERB, aliased later) refuses a named file rather than
+/// reading a stale db/schema.rb. Without `schema_dump`, it builds as on main.
+#[test]
+fn an_unparsed_file_refuses_a_named_file() {
+    let anchored = |dump: &str| format!("defaults: &<%= \"base\" %>\n  adapter: sqlite3\ntest:\n  <<: *<%= \"base\" %>\n{dump}");
+    // The filename on the key's line, on the next line, or as a block scalar.
+    for dump in ["  schema_dump: catalog_schema.rb\n", "  schema_dump:\n    catalog_schema.rb\n", "  schema_dump: >-\n    catalog_schema.rb\n"] {
+        let named = anchored(dump);
+        let checked = check(&files(&[("config/database.yml", &named), ("db/catalog_schema.rb", WIDGETS), ("db/schema.rb", STALE)]));
+        assert!(checked.errors.iter().any(|e| e.contains("couldn't be read to check `test.primary`'s `schema_dump` (unknown anchor")), "{named}: {:?}", checked.errors);
+        assert!(tables(&checked.app).is_empty(), "{named}");
+    }
+    // The word `schema_dump` on any line but a comment line refuses, whatever its value and
+    // wherever it sits: the parser can't say where a value ends, so an inline comment counts too.
+    for dump in [
+        "  schema_dump: false\n",
+        "  schema_dump: false\n    catalog_schema.rb\n",
+        "  extra: { note: 'a #b', schema_dump: catalog_schema.rb }\n",
+        "  extra: { note: a#b, schema_dump: catalog_schema.rb }\n",
+        "  database: db/test.sqlite3 # schema_dump: catalog_schema.rb\n",
+        "  note: don't # schema_dump: catalog_schema.rb\n",
+        "  database: storage/schema_dump.sqlite3\n",
+    ] {
+        let named = anchored(dump);
+        let checked = check(&files(&[("config/database.yml", &named), ("db/catalog_schema.rb", WIDGETS), ("db/schema.rb", STALE)]));
+        assert!(checked.errors.iter().any(|e| e.contains("couldn't be read to check `test.primary`'s `schema_dump`")), "{named}: {:?}", checked.errors);
+        assert!(tables(&checked.app).is_empty(), "{named}");
+    }
+    // A comment line can't hold a key, and a longer word isn't the setting.
+    for dump in ["", "  # schema_dump: catalog_schema.rb\n", "  database: storage/schema_dump_test.sqlite3\n", "  my_schema_dump: catalog_schema.rb\n"] {
+        let yml = anchored(dump);
+        let checked = check(&files(&[("config/database.yml", &yml), ("db/schema.rb", WIDGETS)]));
+        assert!(checked.errors.iter().all(|e| !e.contains("schema_dump")), "{yml}: {:?}", checked.errors);
+        assert_eq!(tables(&checked.app), ["widgets"], "{yml}");
+    }
+}
+
+/// A merge that doesn't apply (`<<:` a scalar, which Psych keeps as a key
+/// and serde_yaml_ng rejects), or a computed key where the test
+/// environment would be, leaves the test primary unread: a `schema_dump`
+/// refuses the file it may name, and without one the file builds as on main.
+#[test]
+fn a_test_primary_the_parser_cant_establish_refuses_a_named_file() {
+    for yml in [
+        "development:\n  <<: unused\n  adapter: sqlite3\ntest:\n  adapter: sqlite3\n  schema_dump: catalog_schema.rb\n",
+        "<%= \"test\" %>:\n  adapter: sqlite3\n  schema_dump: catalog_schema.rb\n",
+    ] {
+        let checked = check(&files(&[("config/database.yml", yml), ("db/catalog_schema.rb", WIDGETS), ("db/schema.rb", STALE)]));
+        assert!(checked.errors.iter().any(|e| e.contains("couldn't be read to check `test.primary`'s `schema_dump`")), "{yml}: {:?}", checked.errors);
+        assert!(tables(&checked.app).is_empty(), "{yml}");
+    }
+    for yml in [
+        "development:\n  <<: unused\n  adapter: sqlite3\ntest:\n  adapter: sqlite3\n",
+        "test:\n  adapter: sqlite3\n<%= \"development\" %>:\n  adapter: sqlite3\n  schema_dump: other.rb\n",
+    ] {
+        let checked = check(&files(&[("config/database.yml", yml), ("db/schema.rb", WIDGETS)]));
+        assert!(checked.errors.iter().all(|e| !e.contains("schema_dump")), "{yml}: {:?}", checked.errors);
+        assert_eq!(tables(&checked.app), ["widgets"], "{yml}");
+    }
+}
+
+/// Rails' YAML applies a merge where it is written: over the keys before
+/// it, and with the configurations it brings ahead of those after it. A
+/// merge after other keys in the primary's block, or one that brings
+/// configurations, refuses a named file; `<<: *default` written first reads it.
+#[test]
+fn a_merge_after_other_keys_refuses_a_named_file() {
+    for yml in [
+        "defaults: &defaults\n  schema_dump: other.rb\ntest:\n  adapter: sqlite3\n  schema_dump: catalog_schema.rb\n  <<: *defaults\n",
+        "defaults: &defaults\n  url: 'sqlite3:///tmp/test.sqlite3?schema_dump=other.rb'\ntest:\n  adapter: sqlite3\n  url: 'sqlite3:///tmp/test.sqlite3'\n  <<: *defaults\n  schema_dump: catalog_schema.rb\n",
+        "multi: &multi\n  catalog:\n    adapter: sqlite3\n    schema_dump: other.rb\ntest:\n  <<: *multi\n  reporting:\n    adapter: sqlite3\n    schema_dump: catalog_schema.rb\n",
+        "defaults: &defaults\n  schema_dump: other.rb\ntest:\n  adapter: sqlite3\n  schema_dump: catalog_schema.rb\n  \"<<\": *defaults\n",
+        "defaults: &defaults\n  schema_dump: other.rb\ntest:\n  adapter: sqlite3\n  schema_dump: catalog_schema.rb\n  '<<': *defaults\n",
+    ] {
+        let checked = check(&files(&[("config/database.yml", yml), ("db/catalog_schema.rb", WIDGETS), ("db/other.rb", STALE), ("db/schema.rb", STALE)]));
+        assert!(checked.errors.iter().any(|e| e.contains("`test.") && e.contains("merge key")), "{yml}: {:?}", checked.errors);
+        assert!(tables(&checked.app).is_empty(), "{yml}");
+    }
+    for merge in ["<<", "\"<<\""] {
+        let yml = format!("defaults: &defaults\n  adapter: sqlite3\n  schema_dump: other.rb\ntest:\n  {merge}: *defaults\n  schema_dump: catalog_schema.rb\n");
+        let checked = check(&files(&[("config/database.yml", &yml), ("db/catalog_schema.rb", WIDGETS), ("db/other.rb", STALE), ("db/schema.rb", STALE)]));
+        assert!(checked.errors.is_empty(), "{yml}: {}", checked.errors.join("\n"));
+        assert_eq!(tables(&checked.app), ["widgets"], "{yml}");
+    }
+}
+
+/// Rails fills each configuration from a top-level `shared:` block, and a
+/// root-level `<<` can replace `test` whole: either refuses a named file.
+/// With no file named, the schema is found as before.
+#[test]
+fn a_shared_block_or_root_merge_refuses_a_named_file() {
+    let other = "other: &other\n  test:\n    adapter: sqlite3\n    schema_dump: other.rb\n";
+    for yml in [
+        format!("{other}test:\n  adapter: sqlite3\n  schema_dump: catalog_schema.rb\n<<: *other\n"),
+        "shared:\n  url: 'sqlite3:///tmp/test.sqlite3?schema_dump=other.rb'\ntest:\n  adapter: sqlite3\n  schema_dump: catalog_schema.rb\n".to_string(),
+        "shared:\n  schema_format: sql\ntest:\n  adapter: sqlite3\n  schema_dump: catalog_schema.rb\n".to_string(),
+    ] {
+        let checked = check(&files(&[("config/database.yml", &yml), ("db/catalog_schema.rb", WIDGETS), ("db/other.rb", STALE), ("db/schema.rb", STALE)]));
+        assert!(checked.errors.iter().any(|e| e.contains("`test.primary`") && e.contains("`shared:` block")), "{yml}: {:?}", checked.errors);
+        assert!(tables(&checked.app).is_empty(), "{yml}");
+    }
+    for yml in [format!("{other}test:\n  adapter: sqlite3\n<<: *other\n"), "shared:\n  pool: 5\ntest:\n  adapter: sqlite3\n  schema_dump: false\n".to_string()] {
+        let checked = check(&files(&[("config/database.yml", &yml), ("db/schema.rb", WIDGETS)]));
+        assert!(checked.errors.iter().all(|e| !e.contains("schema_dump")), "{yml}: {:?}", checked.errors);
+        assert_eq!(tables(&checked.app), ["widgets"], "{yml}");
+    }
+    // A null or `false` `shared:` is skipped, as Rails skips it: the named file is read. An unquoted
+    // `off` or `No` is `false` to Psych too.
+    for shared in ["~", "false", "off", "No  # none"] {
+        let yml = format!("shared: {shared}\ntest:\n  adapter: sqlite3\n  schema_dump: catalog_schema.rb\n");
+        let checked = check(&files(&[("config/database.yml", &yml), ("db/catalog_schema.rb", WIDGETS), ("db/schema.rb", STALE)]));
+        assert!(checked.errors.is_empty(), "{yml}: {}", checked.errors.join("\n"));
+        assert_eq!(tables(&checked.app), ["widgets"], "{yml}");
+    }
+    // A quoted `'off'` is a String Rails would try to merge, so it still refuses.
+    let yml = "shared: 'off'\ntest:\n  adapter: sqlite3\n  schema_dump: catalog_schema.rb\n";
+    let checked = check(&files(&[("config/database.yml", yml), ("db/catalog_schema.rb", WIDGETS), ("db/schema.rb", STALE)]));
+    assert!(checked.errors.iter().any(|e| e.contains("`shared:` block")), "{yml}: {:?}", checked.errors);
+    assert!(tables(&checked.app).is_empty(), "{yml}");
+    // A longer identifier that only contains `db_dir` moves nothing: the named file is read.
+    let yml = "test:\n  adapter: sqlite3\n  schema_dump: catalog_schema.rb\n";
+    let checked = check(&files(&[("config/database.yml", yml), ("db/catalog_schema.rb", WIDGETS), ("db/schema.rb", STALE), ("config/initializers/labels.rb", "db_directory_label = \"Database directory\"\nmy_db_dir_name = 1\n")]));
+    assert!(checked.errors.is_empty(), "{}", checked.errors.join("\n"));
+    assert_eq!(tables(&checked.app), ["widgets"]);
+}
+
+/// A quoted `schema_dump` key is the same String key, so its file is read.
+#[test]
+fn a_quoted_schema_dump_key_reads_its_file() {
+    for key in ["'schema_dump'", "\"schema_dump\""] {
+        let yml = format!("test:\n  adapter: sqlite3\n  {key}: catalog_schema.rb\n");
+        let checked = check(&files(&[("config/database.yml", &yml), ("db/catalog_schema.rb", WIDGETS), ("db/schema.rb", STALE)]));
+        assert!(checked.errors.is_empty(), "{yml}: {}", checked.errors.join("\n"));
+        assert_eq!(tables(&checked.app), ["widgets"], "{yml}");
+    }
+}
+
+/// A scan of config/ that can't list a directory there, or read a file,
+/// can't show that no file moves the db directory, so a named file is refused.
+#[cfg(unix)]
+#[test]
+fn an_incomplete_config_scan_refuses_a_named_file() {
+    use std::os::unix::fs::PermissionsExt;
+    for locked in ["config/locked", "config/locked.rb"] {
+        let dir = scratch::dir("roundhouse-schema-dump-scan");
+        let yml = "test:\n  adapter: sqlite3\n  schema_dump: catalog_schema.rb\n";
+        for (path, content) in files(&[("config/database.yml", yml), ("db/catalog_schema.rb", WIDGETS), ("db/schema.rb", STALE), ("config/locked/settings.rb", "# kept\n"), ("config/locked.rb", "# kept\n")]) {
+            std::fs::create_dir_all(dir.join(&path).parent().unwrap()).unwrap();
+            std::fs::write(dir.join(&path), content).unwrap();
+        }
+        let target = dir.join(locked);
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // A process that can read past the mode (CAP_DAC_OVERRIDE, root) has nothing unreadable.
+        let readable = if target.is_dir() { std::fs::read_dir(&target).is_ok() } else { std::fs::read(&target).is_ok() };
+        let result = (!readable).then(|| ingest_app(&dir));
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let Some(result) = result else {
+            eprintln!("skipping: this process can read a mode-000 path");
+            return;
+        };
+        let checked = analyzed(result.unwrap_or_else(|error| panic!("{locked}: ingest failed: {error}")));
+        assert!(checked.errors.iter().any(|e| e.contains("`test.primary`") && e.contains("couldn't be")), "{locked}: {:?}", checked.errors);
+        assert!(tables(&checked.app).is_empty(), "{locked}");
+    }
+}
+
+/// A blank final value drops the key from Rails' URL options, and a quoted
+/// `':schema_dump'` is a String key Rails ignores. `schema_dump: false`,
+/// null or an unquoted YAML 1.1 boolean names no file. All build as before.
+#[test]
+fn these_forms_build_as_before() {
+    let base = "test:\n  adapter: sqlite3\n  database: storage/test.sqlite3\n";
+    for yml in [
+        format!("{base}  url: 'sqlite3:///tmp/test.sqlite3?schema_format=sql&schema_format='\n"),
+        format!("{base}  url: 'sqlite3:///tmp/test.sqlite3?schema_dump=catalog_schema.rb&schema_dump'\n"),
+        format!("{base}  ':schema_dump': catalog_schema.rb\n"),
+        format!("{base}  schema_dump: false\n"),
+        format!("{base}  schema_dump: ~\n"),
+        format!("{base}  schema_dump: off\n"),
+        format!("{base}  schema_dump: No\n"),
+        "test: { adapter: sqlite3, schema_dump: off }\n".to_string(),
+        "test: { adapter: sqlite3, schema_dump: off }\ndevelopment: { adapter: sqlite3, database: 'off' }\n".to_string(),
+        format!("{base}  schema_dump: &dump off\n"),
+        format!("default: &default\n  schema_dump: false\ntest:\n  <<: *default\n  adapter: sqlite3\n"),
+        format!("{base}  schema_format: sql\n"),
+        "development:\n  adapter: sqlite3\n  schema_dump: catalog_schema.rb\ntest:\n  adapter: sqlite3\n".to_string(),
+    ] {
+        let checked = check(&files(&[("config/database.yml", &yml), ("db/schema.rb", WIDGETS), ("db/catalog_schema.rb", STALE)]));
+        assert!(checked.errors.is_empty(), "{yml}: {}", checked.errors.join("\n"));
+        assert_eq!(tables(&checked.app), ["widgets"], "{yml}");
+    }
+}
+
+fn ruby_with_sqlite3() -> bool {
+    Command::new("ruby").args(["-rsqlite3", "-e", "1"]).output().is_ok_and(|o| o.status.success())
+}
+
+/// What the report ran: the emitted DDL, then an insert, through the
+/// sqlite3 gem.
+#[test]
+fn the_emitted_ddl_takes_an_insert() {
+    if !ruby_with_sqlite3() {
+        prerequisite::missing("ruby with the sqlite3 gem");
+        return;
+    }
+    let named = check(&files(&[("config/database.yml", &named_yml("catalog_schema.rb")), ("db/catalog_schema.rb", WIDGETS)]));
+    let dir = scratch::dir("roundhouse-schema-dump");
+    std::fs::write(dir.join("schema.rb"), file(&spinel_tree(&named.app), "config/schema.rb")).unwrap();
+    let run = Command::new("ruby")
+        .arg("-e")
+        .arg(
+            "require 'sqlite3'\nload ARGV[0]\ndb = SQLite3::Database.new(':memory:')\nSchema.statements.each { |sql| db.execute(sql) }\n\
+             db.execute(\"INSERT INTO widgets (title) VALUES ('kept')\")\nputs db.get_first_value('SELECT title FROM widgets')\n\
+             puts db.execute('PRAGMA table_info(widgets)').select { |row| row[5] == 0 }.map { |row| \"#{row[1]}:#{row[3]}\" }.join(' ')\n",
+        )
+        .arg(dir.join("schema.rb"))
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+    // Each column but the key, with its NOT NULL: the same in the Rails control below.
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "kept\ntitle:1\n");
+}
+

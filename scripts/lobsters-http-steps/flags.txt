@@ -1,0 +1,11 @@
+# flag a story and a comment, read them back, then take the flags back;
+# the seed users may not flag yet, so each flag answers 400
+GET {story_path}
+POST /stories/{story}/flag reason=O -> 400
+GET {story_path}
+POST /stories/{story}/unvote -> 200
+GET {story_path}
+POST /comments/{comment}/flag reason=T -> 400
+GET {story_path}
+POST /comments/{comment}/unvote -> 302
+GET {story_path}

@@ -187,6 +187,67 @@ fn index_with_returns_a_hash_and_durations_stay_typed() {
     assert!(matches!(&decimal.ty, Some(Ty::Class { id, .. }) if id.0.as_str() == "BigDecimal"), "{:?}", decimal.ty);
 }
 
+/// `ActiveSupport.truncate_words` (the grounded module function) and the
+/// CRuby overlay's `String#truncate_words` against Rails' own, over
+/// strings with leading, trailing, tab and newline whitespace, an empty
+/// string and one word, for several counts and a custom omission.
+#[test]
+fn string_truncate_words_matches_rails_814() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = r#"
+require "active_support"
+require "active_support/core_ext/string/filters"
+load ARGV.fetch(0)
+
+def assert(value, message)
+  raise message unless value
+end
+
+texts = [
+  "one two three four",
+  "one two",
+  "one",
+  "",
+  "  leading and trailing  ",
+  "tab\tseparated\twords here",
+  "line one\nline two\n\nline three",
+  "trailing space ",
+  "a b c d e f g h i j k l",
+]
+expected = []
+texts.each do |text|
+  [1, 2, 3, 10].each do |n|
+    [nil, " (more)"].each do |omission|
+      rails = omission ? text.truncate_words(n, omission: omission) : text.truncate_words(n)
+      runtime = ActiveSupport.truncate_words(text, n, omission)
+      assert(runtime == rails, "ActiveSupport.truncate_words(#{text.inspect}, #{n}, #{omission.inspect}) = #{runtime.inspect}, Rails #{rails.inspect}")
+      expected << [text, n, omission, rails]
+    end
+  end
+end
+
+load ARGV.fetch(1)
+expected.each do |text, n, omission, rails|
+  overlay = omission ? text.truncate_words(n, omission: omission) : text.truncate_words(n)
+  assert(overlay == rails, "overlay #{text.inspect}.truncate_words(#{n}, #{omission.inspect}) = #{overlay.inspect}, Rails #{rails.inspect}")
+end
+puts "String#truncate_words 8.1.4 contracts passed"
+"#;
+    let output = Command::new("ruby")
+        .arg("-e")
+        .arg(script)
+        .arg(root.join("runtime/ruby/active_support_ext.rb"))
+        .arg(root.join("runtime/spinel/scaffold/ruby_overlay/runtime/active_support_core_ext.rb"))
+        .output()
+        .expect("ruby is on PATH");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("contracts passed"),
+        "Rails 8.1.4 String#truncate_words contract failed\n=== stdout ===\n{stdout}\n=== stderr ===\n{stderr}"
+    );
+}
+
 /// `ActiveSupport.truncate` (the grounded module function) and the CRuby
 /// overlay's `String#truncate` against Rails' own `String#truncate`, case
 /// by case: the documented examples, a separator that does not occur, an
@@ -252,5 +313,96 @@ puts "String#truncate 8.1.4 contracts passed"
     assert!(
         output.status.success() && stdout.contains("contracts passed"),
         "Rails 8.1.4 String#truncate contract failed\n=== stdout ===\n{stdout}\n=== stderr ===\n{stderr}"
+    );
+}
+
+/// `ActiveSupport.squish` walks its String once. Indexing the String by
+/// character (`text[i]`) on a multibyte String finds each character from
+/// the start, and `out = out + c` copies the result per character: both
+/// quadratic on CRuby. The guard counts those calls instead of timing.
+#[test]
+fn squish_scans_once_and_matches_rails_814() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = r#"
+require "active_support"
+require "active_support/core_ext/string/filters"
+load ARGV.fetch(0)
+
+def assert(value, message)
+  raise message unless value
+end
+
+["", " ", "a", " a  b\tc\n", " x　y  z ", "héllo   wörld\n\nünïcode é", "  lead  trail  ", "a\vb\fc\rd"].each do |text|
+  assert(ActiveSupport.squish(text) == text.squish, "squish(#{text.inspect}) must match Rails 8.1.4")
+end
+
+long = "é " * 2_000
+counted = 0
+trace = TracePoint.new(:c_call) do |tp|
+  counted += 1 if tp.defined_class == String && (tp.method_id == :[] || tp.method_id == :+)
+end
+trace.enable { ActiveSupport.squish(long) }
+assert(counted < 10, "squish indexes or copies the String per character (#{counted} String#[] / String#+ calls for #{long.length} chars)")
+assert(ActiveSupport.squish(long) == long.squish, "long squish must match Rails 8.1.4")
+puts "squish 8.1.4 contracts passed"
+"#;
+    let output = Command::new("ruby")
+        .arg("-e")
+        .arg(script)
+        .arg(root.join("runtime/ruby/active_support_ext.rb"))
+        .output()
+        .expect("ruby is on PATH");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("contracts passed"),
+        "Rails 8.1.4 squish smoke failed\n=== stdout ===\n{stdout}\n=== stderr ===\n{stderr}"
+    );
+}
+
+#[test]
+fn truncate_words_scans_once_and_matches_rails_814() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = r#"
+require "active_support"
+require "active_support/core_ext/string/filters"
+load ARGV.fetch(0)
+
+def assert(value, message)
+  raise message unless value
+end
+
+texts = ["", " ", "a", "one two", "one two three", " lead two three", "héllo   wörld\n\nünïcode é more", "a\vb\fc\rd\te f", "x　y z", "tail  "]
+texts.each do |text|
+  [1, 2, 3, 5].each do |count|
+    [nil, "…", ""].each do |omission|
+      want = omission ? text.truncate_words(count, omission: omission) : text.truncate_words(count)
+      got = ActiveSupport.truncate_words(text, count, omission)
+      assert(got == want, "truncate_words(#{text.inspect}, #{count}, #{omission.inspect}) gave #{got.inspect}, Rails 8.1.4 #{want.inspect}")
+    end
+  end
+end
+
+long = "é" * 20_000 + " tail"
+counted = 0
+trace = TracePoint.new(:c_call) do |tp|
+  counted += 1 if tp.defined_class == String && tp.method_id == :[]
+end
+trace.enable { ActiveSupport.truncate_words(long, 1, nil) }
+assert(counted < 10, "truncate_words indexes the String per character (#{counted} String#[] calls for #{long.length} chars)")
+assert(ActiveSupport.truncate_words(long, 1, nil) == long.truncate_words(1), "long truncate_words must match Rails 8.1.4")
+puts "truncate_words 8.1.4 contracts passed"
+"#;
+    let output = Command::new("ruby")
+        .arg("-e")
+        .arg(script)
+        .arg(root.join("runtime/ruby/active_support_ext.rb"))
+        .output()
+        .expect("ruby is on PATH");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("contracts passed"),
+        "Rails 8.1.4 truncate_words smoke failed\n=== stdout ===\n{stdout}\n=== stderr ===\n{stderr}"
     );
 }

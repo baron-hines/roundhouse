@@ -169,8 +169,10 @@ fn the_legacy_function_form_self_closes() {
 #[test]
 fn the_legacy_form_qualifies_its_escape_receiver() {
     let (out, _) = helper(r#"tag(:meta, name: "x", content: value)"#);
+    // A run-time value renders through `tag_attr` (nil omits it, and the
+    // value is evaluated once); the receiver is the qualified one.
     assert!(
-        out.contains("ActionView::ViewHelpers.html_escape"),
+        out.contains("ActionView::ViewHelpers.tag_attr(\"content\", value)"),
         "the escape receiver is qualified:\n{out}"
     );
 }
@@ -241,16 +243,16 @@ fn button_to_without_a_block_is_left_to_the_runtime() {
 }
 
 #[test]
-fn button_to_with_computed_options_declines() {
+fn button_to_with_computed_options_reads_them_at_run_time() {
     // A `merge` chain has nothing to split `method:`/`form_class:` out
     // of at compile time, and those two decide the FORM rather than the
-    // button. Leave the site loud instead of rendering a POST form for
-    // what the caller meant as a PUT.
+    // button: the runtime's `button_to_html` reads them out as it runs,
+    // so a PUT the caller meant stays a PUT.
     let (out, _) = helper(r#"button_to "/rooms/1", opts.merge(class: "btn") do
       "x"
     end"#);
-    assert!(out.contains("button_to \""), "computed options should decline:\n{out}");
-    assert!(!out.contains("<form action="), "declined site must not expand:\n{out}");
+    assert!(out.contains("button_to_html(\"/rooms/1\""), "computed options go to the runtime:\n{out}");
+    assert!(!out.contains("button_to \""), "no bare button_to is left:\n{out}");
 }
 
 #[test]
@@ -262,4 +264,19 @@ fn an_underscored_name_builds_its_custom_element() {
     assert!(out.contains("<lexxy-prompt trigger="), "{out}");
     assert!(out.contains("></lexxy-prompt>"), "{out}");
     assert_eq!(diags, 0, "{out}");
+}
+
+#[test]
+fn content_tag_keeps_its_content_where_a_forwarded_block_is_nil() {
+    // Rails reads a non-Hash after the name as options only when a block is given; a nil `&block` leaves it content.
+    let out = lower("module H\n  def h(&block)\n    content_tag(:span, \"Save\", &block)\n  end\nend\n").0;
+    assert!(out.contains("block.nil?"), "{out}");
+    assert!(out.contains("\"Save\""), "{out}");
+    assert!(out.contains("</span>"), "{out}");
+}
+
+#[test]
+fn a_textarea_content_tag_keeps_rails_leading_newline() {
+    let (out, _) = helper(r#"content_tag(:textarea, "x", class: "a")"#);
+    assert!(out.contains(">\\n"), "{out}");
 }

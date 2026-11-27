@@ -219,6 +219,8 @@ module Tep
           return false
         end
         req.listener_transport = transport
+        # Rack's REMOTE_ADDR: the peer a connection came from ("" over a UNIX socket).
+        req.remote_host = Sock.sp_net_peer_ip(client)
 
         # Before the drain, which is what held the bytes (Request#body_refusal).
         refusal = req.body_refusal(Tep.max_body_bytes)
@@ -228,7 +230,11 @@ module Tep
           return false
         end
 
-        return false unless req.consume_body_via_scheduler(client)
+        unless req.consume_body_via_scheduler(client, input)
+          failure = req.body_failure_status
+          Tep::Server::Scheduled.send_simple(client, failure, failure == 413 ? "request body too large" : "bad request") if failure != 0
+          return false
+        end
 
         res = Response.new
         begin
@@ -320,7 +326,12 @@ module Tep
           head << "Connection: close\r\n\r\n"
           Sock.sphttp_write_str(client, head)
           out = Tep::Stream.new(client)
-          res.streamer.pump(out)
+          begin
+            res.streamer.pump(out)
+          rescue StandardError, ScriptError => e
+            Tep.log_dispatch_error(req.verb, req.path, e)
+            return false
+          end
           Sock.sphttp_write_chunk_end(client)
           return false
         end
@@ -360,7 +371,12 @@ module Tep
           # browser waits out the difference: campfire's sign-in page
           # hung ~30s on /account/logo until the keep-alive timeout
           # closed the connection under it (ERR_CONTENT_LENGTH_MISMATCH).
-          head << "Content-Length: " + res.body.bytesize.to_s + "\r\n\r\n"
+          # Not for a 204 or a 304: RFC 9110 gives neither a Content-Length of its own body, and Puma writes none.
+          if res.status == 204 || res.status == 304
+            head << "\r\n"
+          else
+            head << "Content-Length: " + res.body.bytesize.to_s + "\r\n\r\n"
+          end
           Sock.sphttp_write_str(client, head)
           # HEAD: the headers GET would send, Content-Length included, and
           # no body (RFC 9110 9.3.2). A body here would be read by the

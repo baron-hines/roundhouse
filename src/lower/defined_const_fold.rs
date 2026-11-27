@@ -13,8 +13,10 @@
 //! modeled gem the Gemfile asks for.
 //!
 //! The rule, per `defined?(A::B::C)` on a plain (possibly `::`-rooted)
-//! constant path. Anything else — a method, ivar, `yield`, `super`,
-//! expression — is never touched.
+//! constant path, and `defined?(Rails.env)` of a class method the runtime
+//! models on a framework root that folds true (`FRAMEWORK_METHODS`).
+//! Anything else — another method, ivar, `yield`, `super`, expression —
+//! is never touched.
 //!
 //! TRUE, folded to `"constant"`:
 //!  * the path (or, for an unrooted path, its name under the owning
@@ -78,7 +80,7 @@
 //! too; the literal is exactly what Ruby's `defined?` returns for a
 //! constant that exists/doesn't, so behaviour is unchanged.
 
-use std::collections::HashSet;
+use crate::det::HashSet;
 
 use crate::app::App;
 use crate::expr::{BoolOpKind, Expr, ExprNode, Literal};
@@ -211,7 +213,7 @@ struct Facts {
 
 impl Facts {
     fn of(app: &App) -> Facts {
-        let mut tree: HashSet<String> = HashSet::new();
+        let mut tree: HashSet<String> = HashSet::default();
         for m in &app.models {
             tree.insert(m.name.0.as_str().to_string());
         }
@@ -226,7 +228,7 @@ impl Facts {
             tree.insert(name);
         }
         let mut tree_and_prefixes = tree.clone();
-        let mut segments = HashSet::new();
+        let mut segments = HashSet::default();
         for name in &tree {
             let mut acc = String::new();
             for seg in name.split("::") {
@@ -253,6 +255,18 @@ impl Facts {
     }
 
     /// `Some(answer)` when decidable; `None` leaves the `defined?`.
+    /// Whether an unrooted `path`'s head names an in-tree constant under one of `owner`'s lexical namespaces
+    /// (`Wrapper::ActiveRecord` for `ActiveRecord::Base` read in `Wrapper`), which Ruby finds before the top level's.
+    fn head_shadowed(&self, owner: Option<&ClassId>, path: &[String]) -> bool {
+        if path.first().is_some_and(|s| s.is_empty()) {
+            return false;
+        }
+        let Some(head) = path.first() else { return false };
+        let Some(owner) = owner else { return false };
+        let parts: Vec<&str> = owner.0.as_str().split("::").collect();
+        (1..=parts.len()).any(|n| self.tree_and_prefixes.contains(&format!("{}::{head}", parts[..n].join("::"))))
+    }
+
     fn decide(&self, owner: Option<&ClassId>, path: &[String], load_time: bool) -> Option<bool> {
         let rooted = path.first().is_some_and(|s| s.is_empty());
         let segs: Vec<&str> = path.iter().filter(|s| !s.is_empty()).map(String::as_str).collect();
@@ -287,6 +301,11 @@ impl Facts {
         if in_tree(&full) {
             return Some(true);
         }
+        // A framework root the application loads, though the tree defines a class under it (`Rails::Railtie`'s
+        // subclasses): Rails loads it before any of them.
+        if segs.len() == 1 && self.frameworks.as_ref().is_some_and(|f| f.iter().any(|f| f == head)) {
+            return Some(true);
+        }
         if self.tree_and_prefixes.contains(head) {
             // Load-time or not, a name in the tree is never provably absent.
             // Prefix resolves, tail does not: a gem or a reopening may add it.
@@ -298,6 +317,8 @@ impl Facts {
                 return match segs.as_slice() {
                     [_] => Some(true),
                     [_, "Base"] if head != "Rails" => Some(true),
+                    // A framework class the runtime itself declares loads before any gem or app file, as Rails' own does.
+                    _ if crate::gems::spinel_runtime_constants().contains(&full) => Some(true),
                     _ => None,
                 };
             }
@@ -317,6 +338,7 @@ impl Facts {
         let Some(lock) = &self.lock else { return false };
         if self.segments.contains(head)
             || RUNTIME_PROVIDED.contains(&head)
+            || crate::gems::preloaded_constant(head)
             || BASE_FRAMEWORKS.contains(&head)
             || FRAMEWORKS.iter().any(|(root, _)| *root == head)
             || self.written_as_definition(head)
@@ -395,8 +417,8 @@ struct LoadTimeRoots {
 
 impl LoadTimeRoots {
     fn of(app: &App) -> LoadTimeRoots {
-        let mut class_stmts: HashSet<usize> = HashSet::new();
-        let mut load_time: HashSet<usize> = HashSet::new();
+        let mut class_stmts: HashSet<usize> = HashSet::default();
+        let mut load_time: HashSet<usize> = HashSet::default();
         for m in &app.models {
             for item in &m.body {
                 if let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item {
@@ -475,13 +497,13 @@ pub fn apply_defined_const_fold(app: &mut App) {
         if class_stmts.contains(&addr(body)) {
             fold_class_statement(body, owner, &facts);
         } else {
-            walk(body, owner, &facts, load_time.contains(&addr(body)));
+            walk(body, owner, &facts, load_time.contains(&addr(body)), false);
         }
     });
     // Templates belong to no class: an unrooted name is looked up from
     // the top level.
     for view in &mut app.views {
-        walk(&mut view.body, None, &facts, false);
+        walk(&mut view.body, None, &facts, false, false);
     }
 }
 
@@ -500,11 +522,11 @@ fn fold_class_statement(e: &mut Expr, owner: Option<&ClassId>, facts: &Facts) {
     // Class-body statements run while the tree loads.
     let guarded = matches!(&*e.node, ExprNode::If { .. } | ExprNode::BoolOp { .. });
     if !guarded {
-        walk(e, owner, facts, true);
+        walk(e, owner, facts, true, false);
         return;
     }
     let mut folded = e.clone();
-    if !walk(&mut folded, owner, facts, true) {
+    if !walk(&mut folded, owner, facts, true, false) {
         return;
     }
     let keep = match &*folded.node {
@@ -518,12 +540,65 @@ fn fold_class_statement(e: &mut Expr, owner: Option<&ClassId>, facts: &Facts) {
 }
 
 fn contains_defined(e: &Expr) -> bool {
-    if matches!(&*e.node, ExprNode::Defined { .. }) {
+    if matches!(&*e.node, ExprNode::Defined { .. }) || framework_answer(e).is_some() {
         return true;
     }
     let mut found = false;
     e.node.for_each_child(&mut |c| found |= contains_defined(c));
     found
+}
+
+/// What a Rails framework module the emitted program models answers to `respond_to?` for a method
+/// a gem probes for to tell Rails versions apart.
+const FRAMEWORK_ANSWERS: &[(&str, &str, bool)] = &[
+    // Rails 7.0 removed the classic autoloader's `constantize` and `reference` with it.
+    ("ActiveSupport::Dependencies", "constantize", false),
+    ("ActiveSupport::Dependencies", "reference", false),
+];
+
+/// The class methods of a framework module the emitted program models (`runtime/ruby/rails.rb`), which
+/// `defined?(Rails.env)` asks for: simple_form's `@@cache_discovery = defined?(Rails.env) && …`.
+const FRAMEWORK_METHODS: &[(&str, &[&str])] = &[("Rails", &["env", "root", "cache", "logger", "application", "configuration"])];
+
+fn framework_method(operand: &Expr) -> Option<(Vec<String>, &'static str)> {
+    let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*operand.node else { return None };
+    let ExprNode::Const { path } = &*r.node else { return None };
+    if !args.is_empty() {
+        return None;
+    }
+    let segments: Vec<String> = path.iter().map(|s| s.as_str().to_string()).collect();
+    let name = segments.iter().filter(|p| !p.is_empty()).cloned().collect::<Vec<_>>().join("::");
+    let (_, methods) = FRAMEWORK_METHODS.iter().find(|(c, _)| *c == name)?;
+    methods.iter().find(|m| **m == method.as_str()).map(|m| (segments, *m))
+}
+
+/// Class methods Rails 8.1 no longer defines, which a gem asks `defined?` for to tell Rails versions apart: Rails 7.2
+/// moved the connection clearing of `ActiveRecord::Base` to its connection handler (message_bus's
+/// `elsif defined? ActiveRecord::Base.clear_active_connections!`).
+const FRAMEWORK_REMOVED_METHODS: &[(&str, &[&str])] = &[(
+    "ActiveRecord::Base",
+    &["clear_active_connections!", "clear_reloadable_connections!", "clear_all_connections!", "flush_idle_connections!"],
+)];
+
+fn removed_framework_method(operand: &Expr) -> Option<Vec<String>> {
+    let ExprNode::Send { recv: Some(r), method, block: None, .. } = &*operand.node else { return None };
+    let ExprNode::Const { path } = &*r.node else { return None };
+    let segments: Vec<String> = path.iter().map(|s| s.as_str().to_string()).collect();
+    let name = segments.iter().filter(|p| !p.is_empty()).cloned().collect::<Vec<_>>().join("::");
+    let (_, methods) = FRAMEWORK_REMOVED_METHODS.iter().find(|(c, _)| *c == name)?;
+    methods.contains(&method.as_str()).then_some(segments)
+}
+
+fn framework_answer(e: &Expr) -> Option<bool> {
+    let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*e.node else { return None };
+    if method.as_str() != "respond_to?" {
+        return None;
+    }
+    let [arg] = args.as_slice() else { return None };
+    let ExprNode::Lit { value: Literal::Sym { value } } = &*arg.node else { return None };
+    let ExprNode::Const { path } = &*r.node else { return None };
+    let name = path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>().join("::");
+    FRAMEWORK_ANSWERS.iter().find(|(c, m, _)| *c == name && *m == value.as_str()).map(|(_, _, has)| *has)
 }
 
 /// Literal truthiness, for the value shapes this pass produces.
@@ -542,17 +617,57 @@ fn lit(like: &Expr, value: Literal, ty: Ty) -> Expr {
     out
 }
 
-/// Fold `e` in place; true when anything under it changed.
-fn walk(e: &mut Expr, owner: Option<&ClassId>, facts: &Facts, lt: bool) -> bool {
+/// Fold `e` in place; true when anything under it changed. `cond`:
+/// only `e`'s truthiness is read (an `if`/`while` condition, the left
+/// of `&&`/`||`, the operand of `!`, or the right of a `&&`/`||` that
+/// is itself one).
+fn walk(e: &mut Expr, owner: Option<&ClassId>, facts: &Facts, lt: bool, cond: bool) -> bool {
+    let child_cond: &[bool] = match &*e.node {
+        ExprNode::If { .. } | ExprNode::While { .. } => &[true],
+        ExprNode::BoolOp { .. } => &[true, cond],
+        ExprNode::Send { recv: Some(_), method, args, .. } if method.as_str() == "!" && args.is_empty() => &[true],
+        _ => &[],
+    };
     let mut changed: Vec<bool> = Vec::new();
-    e.node.for_each_child_mut(&mut |c| changed.push(walk(c, owner, facts, lt)));
+    e.node.for_each_child_mut(&mut |c| {
+        let cond = child_cond.get(changed.len()).copied().unwrap_or(false);
+        changed.push(walk(c, owner, facts, lt, cond))
+    });
     let any = changed.iter().any(|c| *c);
 
+    if let Some(has) = framework_answer(e) {
+        *e = lit(e, Literal::Bool { value: has }, Ty::Bool);
+        return true;
+    }
     if let ExprNode::Defined { operand } = &*e.node {
+        // Only true: an absent framework leaves the call's NameError to Ruby, which `defined?` would answer nil.
+        if let Some((path, _)) = framework_method(operand)
+            && facts.decide(owner, &path, lt) == Some(true)
+        {
+            *e = if cond { lit(e, Literal::Bool { value: true }, Ty::Bool) } else { lit(e, Literal::Str { value: "method".into() }, Ty::Str) };
+            return true;
+        }
+        // nil where the framework is loaded, as Rails answers; an absent one is left to Ruby as above, and so is a head an
+        // enclosing namespace binds to its own constant, which may define the method.
+        if let Some(path) = removed_framework_method(operand)
+            && !facts.head_shadowed(owner, &path)
+            && facts.decide(owner, &path, lt) == Some(true)
+        {
+            *e = lit(e, Literal::Nil, Ty::Nil);
+            return true;
+        }
         if let ExprNode::Const { path } = &*operand.node {
             let path: Vec<String> = path.iter().map(|s| s.as_str().to_string()).collect();
             let answer = facts.decide(owner, &path, lt);
             match answer {
+                // Where only truthiness is read, `true`: a String
+                // literal there is Ruby's "string literal in condition"
+                // warning, which a warnings-as-errors boot raises.
+                // Elsewhere the value is `defined?`'s own.
+                Some(true) if cond => {
+                    *e = lit(e, Literal::Bool { value: true }, Ty::Bool);
+                    return true;
+                }
                 Some(true) => {
                     *e = lit(e, Literal::Str { value: "constant".into() }, Ty::Str);
                     return true;

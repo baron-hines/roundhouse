@@ -16,7 +16,7 @@ fn head_routes_as_get_unless_a_head_route_is_declared() {
         .edit(
             "config/routes.rb",
             "  root \"articles#index\"\n",
-            "  root \"articles#index\"\n  match \"probe\" => \"articles#show\", via: :head, defaults: { id: \"1\" }\n  get \"probe\" => \"articles#index\"\n",
+            "  root \"articles#index\"\n  match \"probe\" => \"articles#show\", via: :head\n  get \"probe\" => \"articles#index\"\n",
         )
         .run_ruby(r#"
 def req(verb, path)

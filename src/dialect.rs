@@ -16,7 +16,7 @@ use crate::effect::EffectSet;
 use crate::expr::{Expr, ExprNode, LValue, Literal};
 use crate::ident::{ClassId, Symbol, TableRef};
 use crate::span::Span;
-use crate::ty::{Row, Ty};
+use crate::ty::{FnTy, Row, Ty};
 
 /// A source comment preserved through the pipeline. We inline comments
 /// on the owning IR node (`leading_comments` / `trailing_comment` fields)
@@ -34,6 +34,16 @@ pub struct Comment {
 }
 
 // Models ----------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SelectAlias {
+    pub name: Symbol,
+    #[serde(default, skip_serializing_if = "Span::is_synthetic")]
+    pub span: Span,
+    // A flag rather than dropping the alias: a declared `attribute` of that name still takes the selected value.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub source_method: bool,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Model {
@@ -101,8 +111,9 @@ pub struct Model {
     pub class_attr_defaults: IndexMap<Symbol, crate::expr::Expr>,
 
     /// An enclosing module (via EnumConstants nesting) defines a `JSON`
-    /// constant that would shadow bare `JSON` in `serialize` coder
-    /// resolution. Fail closed: claim only `::JSON` when set.
+    /// constant, or the body nests a `JSON` class, module or value class,
+    /// that would shadow bare `JSON` in `serialize` coder resolution.
+    /// Fail closed: claim only `::JSON` when set.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub lexical_json_shadow: bool,
 
@@ -114,6 +125,14 @@ pub struct Model {
     /// `Rooms::Open` rows say `rooms_open`, not `room`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sti_subclass_names: Vec<ClassId>,
+    /// The per-column Dirty methods a module the model includes sends (Devise's `DirtyTrackingNewMethods`'
+    /// `will_save_change_to_email?`): run on the model, they are its own demand.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mixin_sends: Vec<Symbol>,
+
+    // Stamped at ingest, not derived per model: the `select` naming them may sit on another model or class.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub select_aliases: Vec<SelectAlias>,
 
     /// The catalog entries this model's messages can reach, its i18n
     /// scope and lookup keys; stamped by `i18n::stamp_models`. Default
@@ -123,6 +142,12 @@ pub struct Model {
 }
 
 impl Model {
+    /// Validation execution order: each prepended callback goes ahead of earlier ones.
+    pub fn validation_order(&self) -> impl Iterator<Item = &ModelBodyItem> {
+        let prepended = |item: &&ModelBodyItem| matches!(item, ModelBodyItem::Validation { validation, .. } if validation.prepend);
+        self.body.iter().filter(prepended).rev().chain(self.body.iter().filter(move |item| !prepended(item)))
+    }
+
     /// Rails' `human_attribute_name(attr)` for this model.
     pub fn human_attribute_name(&self, attr: &str) -> String {
         self.i18n.human_attribute_name(attr)
@@ -149,7 +174,9 @@ impl Model {
     /// match the source by class: a model can have two associations to
     /// one class, and each one gives other rows.
     pub fn through_source(&self, through_assoc: &Association) -> Option<&Association> {
-        let Association::HasMany { name, source, .. } = through_assoc else { return None };
+        let (Association::HasMany { name, source, .. } | Association::HasOne { name, source, .. }) = through_assoc else {
+            return None;
+        };
         let mut candidates = match source {
             Some(source) => vec![source.clone()],
             None => vec![Symbol::from(crate::naming::singularize(name.as_str())), name.clone()],
@@ -225,6 +252,38 @@ impl Model {
             _ => None,
         })
     }
+}
+
+/// Symbol callbacks have identity: a later registration replaces the earlier
+/// one, including its conditions and position. Validator objects do not share
+/// this identity. Keep individual symbols so scheduling can prepend each one.
+pub(crate) fn replace_validation_callbacks(body: &mut Vec<ModelBodyItem>) {
+    let mut registered: Vec<ModelBodyItem> = Vec::with_capacity(body.len());
+    for item in std::mem::take(body) {
+        let ModelBodyItem::Validation { validation, leading_comments, leading_blank_line, span } = &item else {
+            registered.push(item);
+            continue;
+        };
+        if !validation.rules.iter().all(|r| matches!(r, ValidationRule::Custom { .. })) || validation.rules.is_empty() {
+            registered.push(item);
+            continue;
+        }
+        for (i, rule) in validation.rules.iter().enumerate() {
+            let ValidationRule::Custom { method, .. } = rule else { unreachable!() };
+            registered.retain(|previous| !matches!(previous, ModelBodyItem::Validation { validation, .. }
+                if validation.rules.iter().any(|r| matches!(r, ValidationRule::Custom { method: old, .. } if old == method))));
+            let mut validation = validation.clone();
+            validation.attribute = method.clone();
+            validation.rules = vec![rule.clone()];
+            registered.push(ModelBodyItem::Validation {
+                validation,
+                leading_comments: if i == 0 { leading_comments.clone() } else { Vec::new() },
+                leading_blank_line: i == 0 && *leading_blank_line,
+                span: *span,
+            });
+        }
+    }
+    *body = registered;
 }
 
 /// One statement inside a model's class body, in source order. Known DSL
@@ -390,6 +449,9 @@ pub enum Association {
         name: Symbol,
         target: ClassId,
         foreign_key: Symbol,
+        /// See `HasMany::foreign_key_explicit`.
+        #[serde(default, skip_serializing_if = "is_false")]
+        foreign_key_explicit: bool,
         optional: bool,
         /// `belongs_to :notifiable, polymorphic: true` — the target
         /// above is the assoc-name phantom; the real target set is
@@ -431,6 +493,11 @@ pub enum Association {
         /// `None` means `id`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         primary_key: Option<Symbol>,
+        /// `belongs_to :live_author, -> { where(active: true) }` — the
+        /// scope lambda's body. Rails' reader and preload find the record
+        /// through it, so a key whose record the scope excludes reads nil.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<Expr>,
     },
     HasMany {
         name: Symbol,
@@ -484,6 +551,12 @@ pub enum Association {
         /// silently returns the wrong rows.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         primary_key: Option<Symbol>,
+        /// `inverse_of: :author` as written (not `false` or `nil`). Rails
+        /// derives a defaulted foreign key from the inverse association
+        /// (`derive_foreign_key`), which app assembly does once every
+        /// model is ingested (`resolve_inverse_foreign_keys`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inverse_of: Option<Symbol>,
     },
     HasOne {
         name: Symbol,
@@ -493,12 +566,18 @@ pub enum Association {
         #[serde(default, skip_serializing_if = "is_false")]
         foreign_key_explicit: bool,
         dependent: Dependent,
-        /// `has_one :x, through: :y`. Recorded so consumers that would
-        /// treat the association as a direct query can see it is not;
-        /// the reader is still direct (a pre-existing gap), so anything
-        /// that cannot be right for it must refuse.
+        /// `has_one :x, through: :y`. The ruby family's reader and
+        /// preload go through the hop (`apply_through_assoc_lowering`);
+        /// anything else that would treat it as a direct query must
+        /// refuse.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         through: Option<Symbol>,
+        /// See `HasMany::source`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<Symbol>,
+        /// See `HasMany::class_explicit`.
+        #[serde(default, skip_serializing_if = "is_false")]
+        class_explicit: bool,
         /// See `HasMany::as_interface`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         as_interface: Option<Symbol>,
@@ -512,6 +591,11 @@ pub enum Association {
         /// `after_save` that stamps the FK (and `as:` type) then saves.
         #[serde(default, skip_serializing_if = "is_false")]
         autosave: bool,
+        /// `validate: true` — the owner is invalid while its new or changed
+        /// target is (Rails' `validate_single_association`). Default false,
+        /// matching Rails for a has_one.
+        #[serde(default, skip_serializing_if = "is_false")]
+        validate: bool,
         /// `primary_key: :source_id` — the OWNER column the foreign key
         /// matches (Rails' `join_primary_key`). `None` means the owner's
         /// own key, `id`. Every reader of this association must go
@@ -519,6 +603,9 @@ pub enum Association {
         /// silently returns the wrong rows.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         primary_key: Option<Symbol>,
+        /// See `HasMany::inverse_of`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inverse_of: Option<Symbol>,
     },
     HasAndBelongsToMany {
         name: Symbol,
@@ -528,6 +615,15 @@ pub enum Association {
 }
 
 impl Association {
+    pub fn set_target(&mut self, to: ClassId) {
+        match self {
+            Association::BelongsTo { target, .. }
+            | Association::HasMany { target, .. }
+            | Association::HasOne { target, .. }
+            | Association::HasAndBelongsToMany { target, .. } => *target = to,
+        }
+    }
+
     pub fn name(&self) -> &Symbol {
         match self {
             Association::BelongsTo { name, .. }
@@ -585,6 +681,8 @@ pub enum Dependent {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Validation {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub prepend: bool,
     pub attribute: Symbol,
     pub rules: Vec<ValidationRule>,
     /// `if: :pred` / `if: -> { … }` / `if: lambda { … }` / `if: proc { … }`.
@@ -596,7 +694,8 @@ pub struct Validation {
     /// `unless_cond` are set, the rules run only when `if:` holds and
     /// `unless:` does not. Anything else (an arity>0 lambda, a String,
     /// a captured local, a body survey mode had to stub with `nil`) is
-    /// not stored; ingest refuses the whole call instead of checking
+    /// not stored; ingest refuses the whole call (the rule, for a
+    /// condition in the rule's own hash) instead of checking
     /// unconditionally.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub if_cond: Option<Expr>,
@@ -622,6 +721,12 @@ pub struct InclusionRange {
 pub enum ValidationRule {
     Presence,
     Absence,
+    /// `confirmation: true` / `{ case_sensitive: }`: the error is on `<attr>_confirmation`, and a nil confirmation
+    /// passes. `case_sensitive` `None` is Rails' default, `true`.
+    Confirmation {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        case_sensitive: Option<bool>,
+    },
     /// `acceptance: true` / `{ accept:, allow_nil: }`. `accept` holds the
     /// literal values Rails' `AcceptanceValidator` accepts (its default is
     /// `["1", true]`). `allow_nil` is from the validator's own hash or the
@@ -647,6 +752,9 @@ pub enum ValidationRule {
     Length {
         min: Option<u32>,
         max: Option<u32>,
+        /// `is:` — the one length Rails accepts (`wrong_length`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        is: Option<u32>,
         /// `message:` override for the length failure text. Forced by
         /// the Sequel front-end (`validates_min_length 10, :body,
         /// message: "..."`); Rails' `length: { minimum: 10, message:
@@ -720,6 +828,18 @@ pub enum ValidationRule {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         range: Option<InclusionRange>,
     },
+    /// `inclusion: { in: ->(record) { … } }`, `in: -> { … }` or `in: :method`:
+    /// the set Rails asks for at validation time, with the record as
+    /// `self` (a lambda's parameter is `self`). `set.include?(value)`
+    /// decides, so a nil set raises `NoMethodError` as it does in Rails.
+    InclusionCall { set: Expr },
+    /// `exclusion:` with a callable `in:`, as `InclusionCall`.
+    ExclusionCall { set: Expr },
+    /// `comparison:` (Rails' `ComparisonValidator`): each `(option, bound)` in written order, the option one of
+    /// `greater_than`, `greater_than_or_equal_to`, `equal_to`, `less_than`, `less_than_or_equal_to` or `other_than`,
+    /// the bound read on the record as it validates (a lambda's body with `self` the record, a Symbol's method, a
+    /// literal). A nil or blank value is `:blank`.
+    Comparison { checks: Vec<(Symbol, Expr)> },
     Custom {
         method: Symbol,
         /// `validate :m, if: :pred` / `unless: :pred` — the instance
@@ -1150,18 +1270,60 @@ pub struct LibraryClass {
     /// does), so these replay ahead of the method definitions. That
     /// makes position-sensitive markers unsafe to capture — see the
     /// visibility deny-list at the ingest site.
+    /// Class-body `if` / `unless` statements whose branches define
+    /// methods. See [`ConditionalDefinitions`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditional_definitions: Vec<ConditionalDefinitions>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unknown_calls: Vec<Expr>,
 }
 
 impl LibraryClass {
+    /// The first of this opening's spans that points at a source, which
+    /// says the file it was read from. A method's name comes before its
+    /// body: an `attr_reader`'s reader has a synthesized body but the name
+    /// it was written with. A body that only sets a class-level variable
+    /// (`@configured = true`) has that write's span. An opening holding
+    /// nothing but nested classes has none.
+    pub fn source_span(&self) -> Option<Span> {
+        std::iter::once(self.parent_span)
+            .chain(self.include_spans.iter().copied())
+            .chain(self.constants.iter().map(|(_, v)| v.span))
+            .chain(self.methods.iter().map(|m| m.name_span))
+            .chain(self.methods.iter().map(|m| m.body.span))
+            .chain(self.class_ivar_initializers.iter().map(|e| e.span))
+            .chain(self.unknown_calls.iter().map(|c| c.span))
+            .find(|s| !s.is_synthetic())
+    }
+
+    /// A file of constants alone, which declares no class
+    /// (`LibraryClassOrigin::FileConstants`).
+    pub fn is_file_constants(&self) -> bool {
+        matches!(self.origin, Some(LibraryClassOrigin::FileConstants))
+    }
+
     /// The members and the `Data.define` span of a class that a
     /// file-level `X = Data.define(…)` creates.
     pub fn data_define(&self) -> Option<(&[Symbol], Span)> {
         match &self.origin {
-            Some(LibraryClassOrigin::DataDefine { members, span }) => Some((members, *span)),
+            Some(LibraryClassOrigin::DataDefine { members, span, .. }) => Some((members, *span)),
             _ => None,
         }
+    }
+
+    pub(crate) fn data_class_constant(&self, index: usize) -> bool {
+        matches!(&self.origin, Some(LibraryClassOrigin::DataDefine { class_constant_start: Some(start), .. }) if index >= *start)
+    }
+
+    pub(crate) fn data_constructor_visibility(&self) -> Option<Span> {
+        self.data_define()?;
+        self.unknown_calls.iter().find(|call| {
+            let ExprNode::Send { method, args, .. } = &*call.node else { return false };
+            let class_side = method.as_str() == "private_class_method"
+                || (call.decisions & crate::expr::SINGLETON_BODY != 0 && method.as_str() == "private");
+            class_side && args.iter().any(|arg| matches!(&*arg.node, ExprNode::Lit { value: Literal::Sym { value } }
+                if matches!(value.as_str(), "new" | "[]" | "allocate")))
+        }).map(|call| call.span)
     }
 
     /// Direct source `@ivar` / compound `@ivar` writes — the shapes that
@@ -1227,6 +1389,13 @@ pub enum LibraryClassOrigin {
         declaration_span: Span,
         fields: Vec<RepresentableField>,
     },
+    /// An `ActiveModel::Serializer` expanded by
+    /// `ingest::active_model_serializer`: its attributes, in declaration
+    /// order (each read by `ams_<name>`).
+    ActiveModelSerializer {
+        declaration_span: Span,
+        fields: Vec<Symbol>,
+    },
     /// Per-resource params holder synthesized from a controller's
     /// `permit([:f1, :f2, …])` declaration. `resource` is the singular
     /// model name (e.g. `:article`); `fields` is the permitted column
@@ -1257,6 +1426,11 @@ pub enum LibraryClassOrigin {
     StructConstant {
         members: Vec<Symbol>,
         keyword_init: bool,
+        /// `keyword_init: false` written out: Ruby then passes a keyword
+        /// call as one Hash to the first member, as the positional
+        /// constructor does. Omitted, Ruby binds keywords by member name.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        positional_written: bool,
     },
     /// A `Dry::Struct` class lowered into its readers and constructor
     /// (`ingest::dry_struct`). Carried so a target can tell the coercions
@@ -1270,8 +1444,8 @@ pub enum LibraryClassOrigin {
     DryValidation,
     /// dry-monads' Result and do-notation stand-ins (`ingest::dry_monads`).
     DryMonads,
-    /// The class a file-level `X = Data.define(:a, :b)` creates, in a
-    /// file that declares nothing else. `members` are the literal
+    /// The class a file-level `X = Data.define(:a, :b)` creates.
+    /// `members` are the literal
     /// Symbol members in declaration order; `span` is the
     /// `Data.define` call. The statements of a `do … end` block are the
     /// class body, and its constants are the class's `constants`. Ruby
@@ -1281,9 +1455,27 @@ pub enum LibraryClassOrigin {
     DataDefine {
         members: Vec<Symbol>,
         span: Span,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        class_constant_start: Option<usize>,
     },
     /// The `Oj` stand-in an app under `Oj.mimic_JSON` reaches (`ingest::oj`).
     Oj,
+    /// The `MultiJson` stand-in an app on multi_json's oj adapter reaches (`ingest::multi_json`).
+    MultiJson,
+    /// A serializer of an app on active_model_serializers 0.8, its body expanded (`ingest::active_model_serializer_08`).
+    ActiveModelSerializer08,
+    /// Not a class: an autoloaded app file that declares no class or
+    /// module and holds only file-level constants (`RemoteThing =
+    /// Thing`, `Labels = LabelFactory.build(...)`). Named for the
+    /// constant Rails' autoloader maps the file to (else its first), so
+    /// the file keeps that path; `constants` are the file's writes, in
+    /// source order, and a read of any of them requires the file. The
+    /// analyzer gives it no class entry (an alias of a class resolves to
+    /// that class through the source index) and types each
+    /// value as a top-level constant; the CRuby and JRuby trees write the
+    /// constants at the top level of the file, and every other target
+    /// refuses it (`project::refuse_file_constants`).
+    FileConstants,
 }
 
 /// A graphql-ruby object type (a class descending from
@@ -1304,6 +1496,10 @@ pub struct GraphqlObjectType {
     /// methods are checked (search_object calls the rest).
     #[serde(default, skip_serializing_if = "is_false")]
     pub resolver: bool,
+    /// Class-level calls along its chain the ingest pass did not read, so
+    /// the coverage line can name them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unread_macros: Vec<Symbol>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1323,6 +1519,10 @@ pub struct GraphqlField {
     /// The synthesized method holding the value graphql-ruby would
     /// resolve, or why there is none.
     pub resolution: GraphqlResolution,
+    /// Extensions its field class applies to every field that could not be
+    /// shown to keep the value, so the coverage line can name them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unproven_extensions: Vec<Symbol>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1388,7 +1588,7 @@ pub struct LibraryFunction {
 }
 
 fn is_pure_effects(e: &crate::effect::EffectSet) -> bool {
-    e.effects.is_empty()
+    e.is_pure()
 }
 
 // Controllers -----------------------------------------------------------
@@ -1404,11 +1604,9 @@ pub struct Controller {
     /// emitter iterates in order so `private` markers land at the right
     /// position and unknown class-body calls round-trip verbatim.
     pub body: Vec<ControllerBodyItem>,
-    /// Layout declaration from `layout :foo` / `layout "foo"` /
-    /// `layout false`. Absent → `Inherit` (walk parent chain; final
-    /// fallback is `layouts/application` per Rails convention).
-    /// Used by analyze to seed ivar types into layout views from the
-    /// union of actions that render through this controller.
+    /// The class body's last `layout` call, if any. What an action
+    /// renders in is `crate::controller_layout`'s to say; analyze seeds
+    /// each layout view's ivar types from the actions that render in it.
     #[serde(default, skip_serializing_if = "LayoutDecl::is_inherit")]
     pub layout: LayoutDecl,
     /// Empty-bodied top-level classes declared alongside the controller
@@ -1419,6 +1617,10 @@ pub struct Controller {
     /// emit path re-declares these ahead of the controller class.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sibling_classes: Vec<SiblingClass>,
+    /// Rails' Content-Security-Policy middleware answers this controller's responses: the app has a policy, or the
+    /// controller sets one (`ingest::controller_csp`). `process_action` then writes the header after the chain.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub csp_header: bool,
 }
 
 /// An empty-bodied class beside a controller (`class X < Parent; end`).
@@ -1435,45 +1637,59 @@ pub struct SiblingClass {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LayoutDecl {
-    /// No `layout` declaration. Effective layout comes from the parent
-    /// chain or convention default (`layouts/application`).
+    /// No `layout` declaration: the class keeps its parent's, as Rails'
+    /// `_layout` class attribute is inherited.
     #[default]
     Inherit,
-    /// `layout :foo` or `layout "foo"`. Resolves to `layouts/<name>`.
-    Name { name: Symbol },
-    /// `layout false` / `layout nil` — render bare, no layout.
-    ///
-    /// SCOPED like a filter. `layout false, only: :index` is ordinary
-    /// Rails and campfire's `MessagesController` writes exactly it:
-    /// the messages index is a turbo-frame fragment lazily loaded INTO
-    /// a page that already has a layout, so wrapping it ships a second
-    /// `<html>` inside the first. Applying the decl to the whole
-    /// controller would be as wrong in the other direction — `show`
-    /// and `edit` are full pages. Empty vectors mean the whole
-    /// controller, which is the unscoped `layout false`.
-    None {
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        only: Vec<Symbol>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        except: Vec<Symbol>,
-    },
+    /// A `layout` call. A later one replaces an earlier one, scope and all.
+    Declared(LayoutCall),
 }
 
-impl LayoutDecl {
-    /// Does this declaration suppress the layout for `action`?
-    ///
-    /// Unscoped `layout false` covers every action; `only:`/`except:`
-    /// narrow it the way the same options narrow a filter.
-    pub fn suppresses(&self, action: &Symbol) -> bool {
-        match self {
-            LayoutDecl::None { only, except } => {
-                if !only.is_empty() {
-                    return only.contains(action);
-                }
-                !except.contains(action)
-            }
-            _ => false,
+/// One `layout x, only: …, except: …` call, which
+/// `crate::controller_layout` resolves as Rails' `_write_layout_method`
+/// does.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LayoutCall {
+    pub value: LayoutValue,
+    /// `only:` / `except:`, scoped like a filter's. Outside them an
+    /// action takes the default lookup, not no layout: campfire's
+    /// `layout false, only: :index` leaves `show` its layout.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub only: Vec<Symbol>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub except: Vec<Symbol>,
+    /// Whether `only:` was given: Rails' `only: []` matches no action,
+    /// where no `only:` leaves every action to `except:`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub only_present: bool,
+    #[serde(default, skip_serializing_if = "Span::is_synthetic")]
+    pub span: Span,
+}
+
+/// The argument of a `layout` call.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LayoutValue {
+    /// `layout "foo"`: the template `layouts/foo`.
+    Name { name: Symbol },
+    /// `layout :foo`: Rails calls the method `foo` on each render.
+    Method { name: Symbol },
+    /// `layout false`: no layout.
+    None,
+    /// `layout nil`: the default lookup, `layouts/<controller_path>`
+    /// and then the parent's layout.
+    Default,
+    /// A Proc or any other computed value.
+    Computed,
+}
+
+impl LayoutCall {
+    /// Whether the call applies to `action` (Rails' `_conditional_layout?`).
+    pub fn applies_to(&self, action: &str) -> bool {
+        if self.only_present || !self.only.is_empty() {
+            return self.only.iter().any(|a| a.as_str() == action);
         }
+        !self.except.iter().any(|a| a.as_str() == action)
     }
 }
 
@@ -1692,6 +1908,21 @@ pub struct Filter {
     /// Lambda/proc-form `unless:` guard body, negated at the call site.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unless_cond_expr: Option<Expr>,
+    /// An `if:`/`unless:` whose value ingest could not read (an Array, a
+    /// callable object): the filter may not run, but no predicate is
+    /// carried, so the dispatch chain still calls it unguarded. Analysis
+    /// that relies on a filter running treats it as guarded.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unread_guard: bool,
+    /// An options container ingest could not decode completely. It may
+    /// hide scope or ordering as well as a guard, so replay cannot place
+    /// this callback's writes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unread_options: bool,
+    /// Distinguishes `only: []` (no actions) from an absent `only:`.
+    /// Kept separately so existing consumers of `only` retain their contract.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub only_present: bool,
     /// The whole call for a block-form filter — `before_action do … end`
     /// as one `Send` with its block — so a chain entry synthesized for
     /// it can be located (the trace's `file:line`) and named. Never set
@@ -1708,9 +1939,10 @@ pub struct Filter {
     /// (`ActiveSupport::Callbacks::CallbackChain#insert` unshifts a
     /// `prepend: true` entry). `recent_documents_filters.rb` reaches
     /// for it for exactly that reason: "so it happens ahead of the
-    /// inherited validation callback." `false` for the ordinary
-    /// `before_action` most filters are; only meaningful on a `Before`
-    /// filter — `build_filter_preamble` is where the hoist happens.
+    /// inherited validation callback." `prepend_around_action` sets it
+    /// on an `Around` filter the same way. `false` for the ordinary
+    /// filters; only meaningful on a `Before` or `Around` filter —
+    /// `build_filter_preamble` is where the hoist happens.
     #[serde(default)]
     pub prepend: bool,
 }
@@ -1886,6 +2118,10 @@ pub struct RouteTable {
     /// so callers can inspect supported siblings without claiming full support.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<crate::diagnostic::Diagnostic>,
+    /// `root to: …, protocol: …`: the helper stem whose route sets the protocol its `_url` builds, and the option's
+    /// span. Not modeled: a `_url` call that leaves the protocol to the route is reported (`analyze::diagnostics`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub url_protocols: Vec<(String, crate::span::Span)>,
 }
 
 /// One `to: redirect(...)` route, as the action synthesized for it.
@@ -1961,13 +2197,54 @@ impl ResourceScope {
 /// Surface forms of a routes.rb entry. Preserves source structure so
 /// `resources :articles do ... end` round-trips byte-for-byte; a downstream
 /// target emitter that needs concrete routes expands via [`RouteSpec::expand`].
+/// The `constraints` key of a route's requirement on its `(.:format)`
+/// extension (`constraints: { format: /csv|json/ }`, `format: false`).
+/// Kept apart from `format`, which there is the route's forced response
+/// format (`format: "rss"`, `defaults: { format: :json }`): Rails keeps a
+/// requirement and a default apart, and a requirement forces nothing on
+/// a request that sends no extension. Not a name a path param can take.
+pub const FORMAT_REQUIREMENT: &str = "(.:format)";
+
+/// The `FORMAT_REQUIREMENT` value of `format: false`: no extension is
+/// accepted. Not a regex source; the route lowering knows it by name.
+pub const FORMAT_NONE: &str = "";
+
+// Schema-v1 scope defaults were strings before their source spans were kept.
+fn deserialize_scope_defaults<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<IndexMap<Symbol, (String, Span)>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum DefaultValue {
+        Spanned((String, Span)),
+        Legacy(String),
+    }
+    let defaults = IndexMap::<Symbol, DefaultValue>::deserialize(deserializer)?;
+    Ok(defaults.into_iter().map(|(key, value)| {
+        let value = match value {
+            DefaultValue::Spanned(value) => value,
+            DefaultValue::Legacy(value) => (value, Span::synthetic()),
+        };
+        (key, value)
+    }).collect())
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RouteSpec {
+    /// A source-proven in-app Rack endpoint. It has prefix semantics rather
+    /// than a controller action's segment/format matching semantics.
+    RackMount {
+        target: ClassId,
+        path: String,
+        span: Span,
+    },
     /// Direct verb call: `get "/path", to: "controller#action"[, as: :name]`.
     /// The explicit form is the only one that can express arbitrary paths
     /// and custom constraints.
     Explicit {
+        #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+        defaults: IndexMap<Symbol, (Literal, Span)>,
         method: HttpMethod,
         path: String,
         controller: ClassId,
@@ -1982,6 +2259,14 @@ pub enum RouteSpec {
         /// verb declared directly in the block and any other case.
         #[serde(default, skip_serializing_if = "ResourceScope::is_nested")]
         scope: ResourceScope,
+        /// Written as an action symbol (`get :index`) rather than a path
+        /// string (`get "index"`). Rails derives a symbol's path from the
+        /// action, and a canonical action (`index`, `create`, `new`,
+        /// `show`, `update`, `destroy`) on a member or collection scope
+        /// adds no segment: `collection { get :index }` is the
+        /// collection's own path, where `get "index"` is `…/index`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        action_symbol: bool,
     },
     /// `root "controller#action"` — shorthand for `GET /` routed to the
     /// given target. Helper name defaults to `{prefix}root`; `as:`
@@ -2022,6 +2307,10 @@ pub enum RouteSpec {
         /// still `message`/`messages`; only the class changes.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         controller: Option<String>,
+        /// `to: "trends#articles"`: the action every route of the resource dispatches to, with
+        /// `controller` taking the part before `#`, as Rails passes `to:` to each route.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        action: Option<Symbol>,
         /// `resources :tasks, param: :task_id` — the name of the
         /// member segment. Rails binds `/tasks/:task_id` instead of
         /// `/tasks/:id`, and the controller reads `params[:task_id]`;
@@ -2048,6 +2337,10 @@ pub enum RouteSpec {
         /// only the block form this field carries.
         #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
         constraints: IndexMap<Symbol, String>,
+        /// `resource :registration, path_names: { new: "sign_up" }` (devise's): the URL segment of
+        /// the `new` and `edit` actions, in place of the action name (`/users/sign_up`).
+        #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+        path_names: IndexMap<Symbol, String>,
     },
     /// `namespace :admin do … end` / `scope … do … end` — a routing
     /// scope wrapping nested entries. `namespace :x` is `scope` with
@@ -2068,8 +2361,8 @@ pub enum RouteSpec {
         /// under this scope is `/users/:user_id/profile`, and Rails'
         /// `user_profile_path` takes NO argument because the default
         /// supplies the segment.
-        #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
-        defaults: IndexMap<Symbol, String>,
+        #[serde(default, skip_serializing_if = "IndexMap::is_empty", deserialize_with = "deserialize_scope_defaults")]
+        defaults: IndexMap<Symbol, (String, Span)>,
         /// `nested do … end` — Rails' explicit form of the nesting a
         /// `resources` block applies to a child `resources`/verb call
         /// automatically. `scope` is NOT one of the calls that gets it,
@@ -2086,8 +2379,37 @@ pub enum RouteSpec {
         /// to the engine's mounted proxy, which this runtime does not model.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         suppress_helpers: bool,
+        /// An isolated engine's routes under the path it is mounted at: Rails
+        /// joins the mount's script name and the engine's own `/`, so its
+        /// root's helper keeps the trailing slash a scope's root drops.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        mount: bool,
+        /// Set when the scope is written inside a `member do … end` /
+        /// `collection do … end` block: Rails keeps that scope level, so
+        /// the scope's `path` lands AFTER the resource's own segment
+        /// (`collection { scope :approvals { post :approve } }` is
+        /// `/extensions/approvals/approve`, named `approve_extensions`),
+        /// and a `resources` inside it nests under that segment.
+        #[serde(default, skip_serializing_if = "ResourceScope::is_nested")]
+        within: ResourceScope,
         entries: Vec<RouteSpec>,
     },
+    /// A call to a routing method a gem adds to the mapper (doorkeeper's `use_doorkeeper`), kept where it
+    /// is written until its body can run against the expanded program (`ingest::gem_routes`). None
+    /// survives ingest: each becomes the scope of the routes it draws, or is dropped and reported.
+    Deferred {
+        call: crate::expr::Expr,
+        span: Span,
+        /// An enclosing `constraints` block's, applied to what it draws once it is drawn.
+        #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+        constraints: IndexMap<Symbol, String>,
+    },
+    /// Routes a gem's routing method draws under a scope it sets for itself (devise's
+    /// `with_devise_exclusive_scope`): they take none of the enclosing scopes' path, module or name.
+    Exclusive { entries: Vec<RouteSpec> },
+    /// Routes a request constraint guards (`constraints: ->(req) { … }`, `constraints(SomeGuard.new) do … end`):
+    /// a request it refuses goes on to the routes after them, as Rails' router does.
+    Guarded { guard: crate::expr::Expr, entries: Vec<RouteSpec> },
 }
 
 /// One `get "/path", to: "c#a"` entry. Kept as a standalone struct so
@@ -2184,6 +2506,11 @@ pub struct TestModule {
     /// app/models/ and doesn't redefine classes).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inner_classes: Vec<LibraryClass>,
+    /// The `inner_classes` declared inside the test class's own body,
+    /// by name. The rest are top-level classes: a helper class declared
+    /// beside the test class in its file, or a carried module's.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub body_classes: Vec<ClassId>,
     /// Non-test, non-setup instance methods on the test class —
     /// helper methods like `setup_adapter_with_stub_row(id)` that
     /// the test methods invoke. Captured here so the lowerer can
@@ -2214,11 +2541,26 @@ impl TestModule {
     /// a `def` of its own or of a test class it inherits from (among
     /// `modules`), before the framework's method of that name. A `def
     /// self.<method>` is not one: the call is sent to the test instance.
+    /// The instance methods of the carried modules this class includes
+    /// (`include LinkHelper` with `LinkHelper` among `inner_classes`):
+    /// the class answers them as its own, as Ruby's `include` makes it.
+    pub fn included_module_methods(&self) -> impl Iterator<Item = &Symbol> + '_ {
+        self.inner_classes
+            .iter()
+            .filter(|lc| lc.is_module && self.includes.contains(&lc.name))
+            .flat_map(|lc| lc.methods.iter())
+            .filter(|m| m.receiver == MethodReceiver::Instance)
+            .map(|m| &m.name)
+    }
+
     pub fn defines_instance_method(&self, modules: &[TestModule], method: &str) -> bool {
         let mut current = Some(self);
         for _ in 0..32 {
             let Some(tm) = current else { break };
             if tm.helpers.iter().any(|helper| helper.name.as_str() == method && helper.receiver == MethodReceiver::Instance) {
+                return true;
+            }
+            if tm.included_module_methods().any(|name| name.as_str() == method) {
                 return true;
             }
             current = tm.parent.as_ref()
@@ -2345,7 +2687,7 @@ impl Fixture {
         let ret = models.iter().find(|model| model.name == class)
             .map(|model| Ty::Class { id: model.name.clone(), args: vec![].into() })
             .unwrap_or(Ty::Untyped);
-        Ty::Fn {
+        Ty::Fn(Box::new(FnTy {
             params: vec![crate::ty::Param {
                 name: Symbol::from("name"),
                 ty: Ty::Sym.into(),
@@ -2354,7 +2696,7 @@ impl Fixture {
             block: None,
             ret: std::sync::Arc::new(ret),
             effects: EffectSet::pure(),
-        }
+        }))
     }
 }
 
@@ -2384,4 +2726,115 @@ pub fn enum_mapping_reads_label(m: &[(String, crate::expr::Literal)]) -> bool {
 /// The label an enum mapping gives a NULL column (`unknown: nil`), if any.
 pub fn enum_nil_label(m: &[(String, crate::expr::Literal)]) -> Option<&str> {
     m.iter().find(|(_, v)| matches!(v, crate::expr::Literal::Nil)).map(|(l, _)| l.as_str())
+}
+
+/// A class-body (or `class << self`) `if` / `elsif` / `else` or `unless`
+/// / `else` whose branches hold only method definitions:
+///
+/// ```ruby
+/// class << self
+///   if Rails.env.test?
+///     def diagnostic_sampling = "test"
+///   else
+///     def diagnostic_sampling = "other"
+///   end
+/// end
+/// ```
+///
+/// Ruby evaluates the condition when the body runs, at load time, and
+/// only the selected branch defines its methods. Every branch's methods
+/// are ordinary entries of `LibraryClass::methods`, so analysis types
+/// each of them; this record says which branch each belongs to. The Ruby
+/// family writes the conditional around them, where its first member
+/// stands, so the selected branch defines the method as in the source.
+/// Other targets refuse the class by name: they would define every
+/// branch's methods, the last one winning.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ConditionalDefinitions {
+    /// The whole `if` / `unless` statement.
+    pub span: Span,
+    /// `unless`: the first branch runs when its condition is falsy.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub negated: bool,
+    /// The branches in source order: `if`, each `elsif`, then `else`
+    /// (no condition). A branch that defines nothing is kept, so the
+    /// emitted conditional selects what the source selects.
+    pub arms: Vec<ConditionalArm>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ConditionalArm {
+    /// `None` for the `else` branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<Expr>,
+    /// The `methods` entries this branch defines, by identity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<ConditionalMember>,
+    /// The load-time conditionals nested in this branch, which Ruby
+    /// evaluates only when the branch runs; written inside it, ordered by
+    /// their start among the branch's methods.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nested: Vec<ConditionalDefinitions>,
+    /// The classes and modules this branch declares, in source order.
+    /// Each is an ordinary library class (with what it nests), so analysis
+    /// types it; the Ruby family loads its file inside the branch, so it
+    /// exists only when Ruby runs the branch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declarations: Vec<ConditionalDeclaration>,
+    /// The writes through the class's own writers this branch makes as it runs
+    /// (`self.error_status = :ok`), in source order. Kept only once the branch
+    /// Ruby takes is settled, when they join the class body's statements.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub statements: Vec<Expr>,
+}
+
+/// A `class` / `module` statement in a [`ConditionalArm`]: the name it
+/// declares, qualified, and where the statement starts, which orders it
+/// among the branch's methods.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConditionalDeclaration {
+    pub name: ClassId,
+    pub start: u32,
+}
+
+impl ConditionalDefinitions {
+    /// The names every branch (and every nested conditional) declares.
+    pub fn declared_names(&self) -> Vec<&ClassId> {
+        let mut out = Vec::new();
+        for arm in &self.arms {
+            out.extend(arm.declarations.iter().map(|d| &d.name));
+            for nested in &arm.nested {
+                out.extend(nested.declared_names());
+            }
+        }
+        out
+    }
+}
+
+/// One method a [`ConditionalArm`] defines: its name, side and the span
+/// of its name in the `def` header, which tells it from another branch's
+/// definition of the same name.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConditionalMember {
+    pub name: Symbol,
+    pub receiver: MethodReceiver,
+    pub name_span: Span,
+}
+
+impl ConditionalMember {
+    pub fn of(method: &MethodDef) -> Self {
+        Self { name: method.name.clone(), receiver: method.receiver, name_span: method.name_span }
+    }
+
+    pub fn is(&self, method: &MethodDef) -> bool {
+        self.name == method.name && self.receiver == method.receiver && self.name_span == method.name_span
+    }
+}
+
+impl ConditionalDefinitions {
+    /// Whether a branch of this statement, or of a conditional nested in
+    /// one, defines `method`.
+    pub fn contains(&self, method: &MethodDef) -> bool {
+        self.arms.iter().any(|arm| arm.methods.iter().any(|m| m.is(method)) || arm.nested.iter().any(|n| n.contains(method)))
+    }
 }

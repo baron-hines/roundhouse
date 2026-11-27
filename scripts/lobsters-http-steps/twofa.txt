@@ -1,0 +1,4 @@
+# start two-factor enrolment: the password check, then the QR code page
+GET /settings/2fa
+POST /settings/2fa_auth user[password]=fake-pass
+GET /settings/2fa_enroll

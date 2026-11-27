@@ -1,4 +1,5 @@
 # frozen_string_literal: true
+require "cgi/escape"
 # CGI protocol I/O. Reads requests from ENV + stdin; writes responses
 # to stdout. The shape spinel can ingest (no sockets) and the shape
 # any CGI-aware web server (Apache mod_cgi, nginx fcgiwrap, lighttpd)
@@ -19,7 +20,6 @@
 #   \r\n
 #   <body bytes>
 #
-# Pure Ruby; no `cgi` stdlib dependency (which spinel doesn't ship).
 # Keeps the spinel-subset envelope clean: basic regex, string ops,
 # Hash mutation. No metaprogramming.
 
@@ -58,20 +58,21 @@ module CgiIo
     bad_request = false
     parse_form_into(query, params) unless query.empty?
 
+    raw_body = ""
+    # Not for every method: a declined request's env goes on to the host Rails app, which must still find its body unread.
     if method == "POST" || method == "PATCH" || method == "PUT"
       length = (env["CONTENT_LENGTH"] || "0").to_i
       ctype  = env["CONTENT_TYPE"] || ""
+      raw_body = stdin.read(length).to_s if length > 0
       if length > 0 && ctype.start_with?("application/x-www-form-urlencoded")
-        body = stdin.read(length).to_s
-        parse_form_into(body, body_params)
+        parse_form_into(raw_body, body_params)
       elsif length > 0 && ctype.start_with?("multipart/form-data")
         # File parts land in the params tree as UploadedFile objects
         # under their bracket-nested name, the way Rack nests them; see
         # runtime/multipart.rb.
-        body = stdin.read(length).to_s
-        form = ActionDispatch::Http::Multipart.parse(body, ctype)
+        form = ActionDispatch::Http::Multipart.parse(raw_body, ctype)
         form.fields.each { |k, v| assign_form_pair(body_params, k, v) }
-        form.files.each { |k, v| assign_form_pair(body_params, k, v) }
+        form.file_parts.each { |part| assign_form_pair(body_params, part.name, part.file) }
       elsif length > 0 && ctype.start_with?("application/json")
         # `@rails/request.js` with `contentType: "application/json"`
         # (campfire's link unfurl): Rails parses the object into params,
@@ -80,9 +81,8 @@ module CgiIo
         # arrays. A malformed body is Rails' 400 (`bad_request`). The
         # spinel lane's twin is Tep::Request#parse_body_params with
         # `ParamBuilder.from_json`.
-        body = stdin.read(length).to_s
         begin
-          parsed = JSON.parse(body)
+          parsed = JSON.parse(raw_body)
           root = parsed.is_a?(Hash) ? parsed : { "_json" => parsed }
           root.each { |k, v| body_params[k.to_s] = json_munge(v) }
         rescue JSON::ParserError
@@ -115,7 +115,7 @@ module CgiIo
     # same URL typed into the address bar.
     accept = env.fetch("HTTP_ACCEPT", "").to_s
 
-    { method: method, path: path, params: params, body_params: body_params, cookies: cookies, accept: accept, bad_request: bad_request }
+    { method: method, path: path, params: params, body_params: body_params, cookies: cookies, accept: accept, bad_request: bad_request, raw_body: raw_body }
   end
 
   # Rails' deep_munge on one parsed JSON value: nils inside Arrays are
@@ -249,66 +249,19 @@ module CgiIo
     current[key] = val
   end
 
-  # Spinel-friendly URL encode: pass-through for unreserved chars
-  # (RFC 3986 §2.3: ALPHA / DIGIT / `-` / `.` / `_` / `~`); percent-
-  # encode everything else as `%XX`. Used for cookie values; cookies
-  # are Latin-1 in the wire format but our values are ASCII for the
-  # demo, so byte-by-byte is sufficient.
   def self.url_encode(s)
-    out = String.new
-    s.to_s.each_byte do |b|
-      if (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) ||
-         b == 45 || b == 46 || b == 95 || b == 126
-        out << b.chr
-      else
-        out << format("%%%02X", b)
-      end
-    end
-    out
+    CGI.escapeURIComponent(s.to_s)
   end
 
-  # Spinel-friendly URL decode: % escapes + `+` → space.
-  #
-  # CRuby caveat: Integer#chr returns an ASCII-8BIT-encoded single-byte
-  # String, which propagates through concatenation and lands in the DB
-  # as a BLOB rather than TEXT — breaking subsequent `WHERE col = ?`
-  # comparisons against UTF-8 literals. Force the result back to UTF-8.
-  # Spinel itself "assumes UTF-8/ASCII" per its README, so this
-  # encoding dance is a CRuby-only concern.
   def self.url_decode(s)
-    # Fast path: nothing to decode. In the lobsters frozen sequence 84%
-    # of calls land here (every escape-free path segment, query key/val,
-    # and cookie name) — returning the input as-is is byte-identical to
-    # the scan below for `%`/`+`-free strings, at zero allocation.
-    return s unless s.include?("%") || s.include?("+")
-    # Scan by byte: getbyte returns an Integer, so literal bytes cost no
-    # per-character String allocation (the old `s[i]` allocated one for
-    # every character, the dominant cost when decoding the ~124-char
-    # session-cookie value on every request). Build an ASCII-8BIT buffer
-    # — `out << int` appends the raw byte — so a multibyte escape like
-    # %C3%A9 reassembles the exact UTF-8 bytes; reinterpret at the end.
-    out = String.new
-    i = 0
-    n = s.bytesize
-    while i < n
-      b = s.getbyte(i)
-      if b == 43 # "+"
-        out << 32 # " "
-        i += 1
-      elsif b == 37 && i + 2 < n # "%"
-        hex = s.getbyte(i + 1).chr + s.getbyte(i + 2).chr
-        if hex =~ /\A[0-9A-Fa-f]{2}\z/
-          out << hex.to_i(16)
-          i += 3
-        else
-          out << b
-          i += 1
-        end
-      else
-        out << b
-        i += 1
-      end
+    # Not the input as-is: a request body is read as binary, and Rails hands every decoded param over as UTF-8 (commonmarker refuses ASCII-8BIT).
+    unless s.include?("%") || s.include?("+")
+      return s if s.encoding == Encoding::UTF_8
+      utf8 = s.dup.force_encoding(Encoding::UTF_8)
+      # Not retagged when the bytes are not UTF-8: a cookie name so tagged would raise at `to_sym`.
+      return utf8.valid_encoding? ? utf8 : s
     end
-    out.force_encoding("UTF-8")
+    # Retagged, not taken as CGI.unescape tags it: CRuby's follows CGI.accept_charset, which an app may set to binary.
+    CGI.unescape(s).force_encoding(Encoding::UTF_8)
   end
 end

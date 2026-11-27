@@ -45,7 +45,7 @@
 //! ordering.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::span::{FileId, SourceFile};
@@ -61,7 +61,12 @@ struct Registry {
     by_path: HashMap<String, FileId>,
     root: Option<PathBuf>,
     parsed: HashMap<usize, ParsedSource>,
+    type_var_scopes: HashMap<FileId, std::rc::Rc<Vec<TypeVarScope>>>,
 }
+
+/// A byte range of a registered file and the RBS type variables it
+/// declares (`type_ascription::generic_scopes`).
+pub(super) type TypeVarScope = (usize, usize, Vec<String>);
 
 struct ParsedSource {
     /// Byte offset of the start of each line (Prism `line_offsets()`).
@@ -247,6 +252,23 @@ pub fn with_text<R>(path: &str, f: impl FnOnce(&str) -> R) -> Option<R> {
     })
 }
 
+/// `compute` over `path`'s registered text, once per file and ingest.
+pub(super) fn type_var_scopes(
+    path: &str,
+    compute: impl FnOnce(&str) -> Vec<TypeVarScope>,
+) -> Option<std::rc::Rc<Vec<TypeVarScope>>> {
+    let id = file_id(path);
+    if id == FileId(0) {
+        return None;
+    }
+    if let Some(scopes) = SOURCES.with(|s| s.borrow().type_var_scopes.get(&id).cloned()) {
+        return Some(scopes);
+    }
+    let scopes = std::rc::Rc::new(with_text(path, compute)?);
+    SOURCES.with(|s| s.borrow_mut().type_var_scopes.insert(id, scopes.clone()));
+    Some(scopes)
+}
+
 /// The registered path for a `FileId`; `None` for the synthetic
 /// sentinel or an id from another ingest.
 pub fn path_of(id: FileId) -> Option<String> {
@@ -268,6 +290,16 @@ pub fn drain() -> Vec<SourceFile> {
         reg.root = None;
         reg.parsed.clear();
         std::mem::take(&mut reg.files)
+    })
+}
+
+/// Refill a drained registry with the app's files, so a late registration takes the next id rather than one an
+/// earlier file holds; [`drain`] then answers them all, the late ones after `files`.
+pub(super) fn resume(files: &[SourceFile]) {
+    SOURCES.with(|s| {
+        let mut reg = s.borrow_mut();
+        reg.files = files.to_vec();
+        reg.by_path = files.iter().enumerate().map(|(i, f)| (f.path.clone(), FileId(i as u32 + 1))).collect();
     })
 }
 

@@ -351,3 +351,18 @@ fn a_class_nested_in_a_controller_reopens_the_controller_as_a_class() {
         assert!(!nested.contains("module "), "{stem}:\n{nested}");
     }
 }
+
+#[test]
+fn a_class_new_child_loads_after_its_ordinary_sibling_parent() {
+    // `Child = Class.new(Parent)` stores the bare parent name; the nested
+    // emitter must resolve it to `Owner::Parent` when ordering siblings,
+    // or Ruby raises NameError while defining Child.
+    assert_runs(
+        &[(
+            "app/services/owner.rb",
+            "class Owner\n  class Parent; end\n  Child = Class.new(Parent)\nend\n",
+        )],
+        "owner.rb",
+        "raise unless Owner::Child.superclass == Owner::Parent",
+    );
+}

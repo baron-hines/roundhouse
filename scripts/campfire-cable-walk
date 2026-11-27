@@ -28,6 +28,9 @@
 # emitted test harness already uses for the same reason, and it is CLOSER
 # to Rails' request path than inline is. Both divergences are in
 # docs/pipeline/runtime.md; neither is fixed by this script.
+# `--sidekiq` takes the other way out, the one production uses: the
+# jobs go to Redis and the tree's own worker runs them, so nothing is
+# held.
 #
 # Usage:  scripts/campfire-cable-walk [options] [APP_PATH]
 #
@@ -43,6 +46,16 @@
 #                needs `spinel` on PATH. Background jobs run on that
 #                lane's own scheduler fiber; only the ruby lane gets the
 #                job-posture splice below.
+#   --sidekiq    Run campfire on `queue_adapter :sidekiq` with the jobs
+#                out of process, as production does: transpile a copy
+#                whose config/environments/production.rb says :sidekiq,
+#                start a Redis on a free port, and run the tree's own
+#                worker (`ruby sidekiq.rb`) beside the server. No job
+#                hold is spliced. After the drive, the worker must have
+#                run Room::PushMessageJob and
+#                Message::BroadcastUnreadRoomJob, with nothing left
+#                queued and nothing dead. Ruby lane only, and it needs
+#                redis-server and the redis gem.
 #   --out DIR    Emit into DIR and keep it (default: a temp dir, removed).
 #   --keep       Keep the temp emit and print its path.
 #   --reuse DIR  Skip transpiling; run against an emit prepared earlier.
@@ -63,6 +76,7 @@ KEEP=0
 REUSE=""
 PORT=""
 LANE=ruby
+SIDEKIQ=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -71,7 +85,8 @@ while [[ $# -gt 0 ]]; do
         --reuse) REUSE="$2"; shift 2 ;;
         --port)  PORT="$2"; shift 2 ;;
         --spinel) LANE=spinel; shift ;;
-        -h|--help) sed -n '2,52p' "$0"; exit 0 ;;
+        --sidekiq) SIDEKIQ=1; shift ;;
+        -h|--help) sed -n '2,66p' "$0"; exit 0 ;;
         *)       APP="$1"; shift ;;
     esac
 done
@@ -80,15 +95,43 @@ step() { printf '\n\033[1;34m==>\033[0m %s\n' "$1"; }
 fail() { printf '\033[1;31m%s\033[0m\n' "$1"; exit 1; }
 
 SERVER_PID=""
+WORKER_PID=""
+REDIS_PORT=""
+REDIS_PID=""
+SOURCE_COPY=""
 cleanup() {
     # By PID, and only the one this script started.
     if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
         kill "$SERVER_PID" 2>/dev/null || true
         wait "$SERVER_PID" 2>/dev/null || true
     fi
+    if [[ -n "$WORKER_PID" ]] && kill -0 "$WORKER_PID" 2>/dev/null; then
+        kill "$WORKER_PID" 2>/dev/null || true
+        wait "$WORKER_PID" 2>/dev/null || true
+    fi
+    if [[ -n "$REDIS_PID" ]] && kill -0 "$REDIS_PID" 2>/dev/null; then
+        kill "$REDIS_PID" 2>/dev/null || true
+    fi
+    if [[ -n "$SOURCE_COPY" ]]; then rm -rf "$SOURCE_COPY"; fi
     if [[ -n "$OUT" && $KEEP -eq 0 && -z "$REUSE" ]]; then rm -rf "$OUT"; fi
 }
 trap cleanup EXIT INT TERM
+
+if [[ $SIDEKIQ -eq 1 ]]; then
+    [[ "$LANE" == ruby ]] || fail "--sidekiq runs on the ruby lane only"
+    command -v redis-server >/dev/null || fail "--sidekiq needs redis-server on PATH"
+    if [[ -z "$REUSE" ]]; then
+        # A copy, so the app's own checkout is never edited.
+        SOURCE_COPY="$(mktemp -d -t roundhouse-campfire-sidekiq.XXXXXX)"
+        cp -R "$APP/." "$SOURCE_COPY"
+        PROD="$SOURCE_COPY/config/environments/production.rb"
+        grep -q "config.active_job.queue_adapter = " "$PROD" \
+            || fail "$PROD names no queue_adapter to replace"
+        sed -i.orig 's/config\.active_job\.queue_adapter = .*/config.active_job.queue_adapter = :sidekiq/' "$PROD"
+        rm -f "$PROD.orig"
+        APP="$SOURCE_COPY"
+    fi
+fi
 
 if [[ -n "$REUSE" ]]; then
     OUT="$REUSE"
@@ -134,7 +177,7 @@ fi
 # has real threads (`Cable::Workers`), so the answer there is a worker
 # post rather than a fiber.
 BOOT_FILE="$OUT/config.ru"
-if [[ "$LANE" == ruby ]] && ! grep -q "enqueue_without_running" "$BOOT_FILE"; then
+if [[ "$LANE" == ruby && $SIDEKIQ -eq 0 ]] && ! grep -q "enqueue_without_running" "$BOOT_FILE"; then
     step "holding background jobs (see this script's header)"
     python3 - "$BOOT_FILE" <<'PY'
 import sys
@@ -159,6 +202,32 @@ if [[ -z "$PORT" ]]; then
 fi
 
 LOG="$OUT/cable-walk-server.log"
+WORKER_LOG="$OUT/cable-walk-worker.log"
+
+# Under --sidekiq the server pushes each job to this Redis and the
+# tree's worker runs it; config/cable.yml's `adapter: redis` sends the
+# worker's broadcasts to the server through the same Redis.
+if [[ $SIDEKIQ -eq 1 ]]; then
+    grep -qs "def self.processor" "$OUT/runtime/sidekiq_worker.rb" \
+        || fail "the emit at $OUT has no worker role (is it on :sidekiq?)"
+    REDIS_PORT="$(ruby -rsocket -e 's = TCPServer.new("127.0.0.1", 0); print s.addr[1]; s.close')"
+    step "starting Redis on :$REDIS_PORT"
+    redis-server --port "$REDIS_PORT" --save '' --appendonly no --daemonize yes \
+        --pidfile "$OUT/cable-walk-redis.pid" --logfile "$OUT/cable-walk-redis.log"
+    # Ready when the server on the port is the one just started.
+    for _ in $(seq 1 50); do
+        if [[ -s "$OUT/cable-walk-redis.pid" ]]; then
+            REDIS_PID="$(cat "$OUT/cable-walk-redis.pid")"
+            if [[ "$(redis-cli -p "$REDIS_PORT" info server 2>/dev/null | tr -d '\r' | sed -n 's/^process_id://p')" == "$REDIS_PID" ]]; then
+                break
+            fi
+        fi
+        sleep 0.1
+    done
+    [[ -n "$REDIS_PID" && "$(redis-cli -p "$REDIS_PORT" info server 2>/dev/null | tr -d '\r' | sed -n 's/^process_id://p')" == "$REDIS_PID" ]] \
+        || fail "Redis never came up on :$REDIS_PORT (log: $OUT/cable-walk-redis.log)"
+    export REDIS_URL="redis://127.0.0.1:$REDIS_PORT/0"
+fi
 
 if [[ "$LANE" == spinel ]]; then
     step "building the binary (whole-program C compile — minutes, not seconds)"
@@ -187,6 +256,16 @@ else
     SERVER_PID=$!
 fi
 
+if [[ $SIDEKIQ -eq 1 ]]; then
+    step "starting the worker"
+    (
+      cd "$OUT"
+      SECRET_KEY_BASE="$(ruby -e 'print "a" * 64')" \
+      exec ruby sidekiq.rb
+    ) >"$WORKER_LOG" 2>&1 &
+    WORKER_PID=$!
+fi
+
 for _ in $(seq 1 60); do
     if curl -fsS -o /dev/null "http://127.0.0.1:$PORT/first_run" 2>/dev/null; then break; fi
     kill -0 "$SERVER_PID" 2>/dev/null || { cat "$LOG"; fail "the server exited during boot"; }
@@ -200,6 +279,46 @@ set +e
 ruby "$REPO_ROOT/scripts/campfire-cable-drive.rb" "http://127.0.0.1:$PORT"
 STATUS=$?
 set -e
+
+# The jobs the drive's posts enqueued ran in the worker, not the server.
+if [[ $STATUS -eq 0 && $SIDEKIQ -eq 1 ]]; then
+    step "the worker ran the jobs"
+    worker_ran() { grep -q "class=$1 jid=[0-9a-f]* done" "$WORKER_LOG"; }
+    # Every job the worker started has ended (done or fail), not only an
+    # empty queue, which a job still running also leaves.
+    all_ended() {
+        [[ "$(grep -c " start$" "$WORKER_LOG")" == "$(grep -cE " (done|discarded|fail): " "$WORKER_LOG")" ]]
+    }
+    for _ in $(seq 1 50); do
+        worker_ran Room::PushMessageJob && worker_ran Message::BroadcastUnreadRoomJob \
+            && [[ "$(redis-cli -p "$REDIS_PORT" llen queue:default)" == "0" ]] && all_ended && break
+        sleep 0.2
+    done
+    all_ended || { printf '  \033[31mFAIL\033[0m a job the worker started never ended (log: %s)\n' "$WORKER_LOG"; STATUS=1; }
+    # A job that failed ended too, but the walk does not pass with one:
+    # under `retry: false` it leaves nothing in the dead set to catch.
+    if grep -qE " fail: " "$WORKER_LOG"; then
+        printf '  \033[31mFAIL\033[0m a job failed in the worker (log: %s)\n' "$WORKER_LOG"
+        grep -E " fail: " "$WORKER_LOG" | head -5 | sed 's/^/       /'
+        STATUS=1
+    fi
+    for job in Room::PushMessageJob Message::BroadcastUnreadRoomJob; do
+        if worker_ran "$job"; then
+            printf '  \033[32mok\033[0m   the worker ran %s\n' "$job"
+        else
+            printf '  \033[31mFAIL\033[0m the worker never finished %s\n' "$job"
+            STATUS=1
+        fi
+    done
+    QUEUED="$(redis-cli -p "$REDIS_PORT" llen queue:default)"
+    DEAD="$(redis-cli -p "$REDIS_PORT" zcard dead)"
+    if [[ "$QUEUED" == "0" && "$DEAD" == "0" ]]; then
+        printf '  \033[32mok\033[0m   nothing is left on queue:default or in the dead set\n'
+    else
+        printf '  \033[31mFAIL\033[0m queue:default holds %s and dead %s (log: %s)\n' "$QUEUED" "$DEAD" "$WORKER_LOG"
+        STATUS=1
+    fi
+fi
 
 # A 500 in the emit is reported by the driver as a failed probe; the
 # server log is where the exception is, so surface it on failure.
