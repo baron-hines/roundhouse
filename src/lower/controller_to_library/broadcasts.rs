@@ -190,7 +190,7 @@ fn payload(
             Some((_, l)) => hash_entries(l)?,
             None => Vec::new(),
         };
-        return partial_view_call_with_record(name, &locals, recv, module_name, partials, span)
+        return partial_view_call_with_record(name, &locals, recv, module_name, partials, None, span)
             .map(wrap_broadcast_render)
             .or_else(|| decline(span, &format!("partial `{name}` has no def-site contract")));
     }
@@ -200,6 +200,10 @@ fn payload(
     let singular = record_singular(recv)
         .or_else(|| decline(span, "broadcast payload receiver is not a nameable record"))?;
     let plural_camel = crate::naming::camelize(&crate::naming::pluralize_snake(&singular));
+    // The partial's own method, which a template of its name moves.
+    let method = partials
+        .get(&(plural_camel.clone(), singular.clone()))
+        .map_or_else(|| Symbol::from(singular), |c| c.method.clone());
     Some(wrap_broadcast_render(Expr::new(
         span,
         ExprNode::Send {
@@ -207,7 +211,7 @@ fn payload(
                 span,
                 ExprNode::Const { path: vec![Symbol::from("Views"), Symbol::from(plural_camel)] },
             )),
-            method: Symbol::from(singular),
+            method,
             args: vec![recv.clone()],
             block: None,
             parenthesized: true,

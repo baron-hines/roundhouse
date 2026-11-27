@@ -58,6 +58,38 @@ pub fn underscore(class_name: &str) -> String {
         .join("/")
 }
 
+/// ActiveModel's default parameter key keeps namespaces as underscores.
+pub fn model_param_key(class_name: &str) -> String {
+    let class_name = class_name.trim_start_matches("::");
+    let acronyms = APP_INFLECTIONS.with(|a| a.borrow().acronym.clone());
+    if acronyms.is_empty() { return underscore_words(class_name); }
+    class_name.split("::").map(|segment| {
+        let mut word = String::new();
+        let mut offset = 0;
+        let mut previous: Option<char> = None;
+        while offset < segment.len() {
+            let rest = &segment[offset..];
+            let boundary = previous.is_none_or(|c| c.is_ascii_alphanumeric() || !(c.is_alphanumeric() || c == '_'));
+            let acronym = boundary.then(|| acronyms.iter().find(|name| {
+                !name.is_empty() && rest.starts_with(name.as_str())
+                    && rest[name.len()..].chars().next().is_none_or(|c| !c.is_ascii_lowercase())
+            })).flatten();
+            if let Some(name) = acronym {
+                if previous.is_some_and(|c| c.is_ascii_alphanumeric()) { word.push('_'); }
+                word.push_str(&name.to_ascii_lowercase());
+                previous = name.chars().last();
+                offset += name.len();
+            } else {
+                let c = rest.chars().next().unwrap();
+                word.push(c);
+                previous = Some(c);
+                offset += c.len_utf8();
+            }
+        }
+        underscore_words(&word)
+    }).collect::<Vec<_>>().join("_")
+}
+
 pub fn camelize(snake: &str) -> String {
     // An app acronym (`inflect.acronym "API"`) camelizes as itself:
     // `api_keys` → `APIKeys`, `html_parser` → `HTMLParser`.
@@ -452,6 +484,21 @@ fn inflect(word: &str, rules: &[(&str, &str)], from_singular: bool) -> String {
     word.to_string()
 }
 
+/// `String#pluralize`: the rules match case-insensitively, and the word keeps its own case where the plural keeps its letters ("Person" → "People", "API" → "APIs").
+pub fn pluralize(word: &str) -> String {
+    // Not by byte position past ASCII: lowercasing can change a character's width.
+    if !word.is_ascii() {
+        return inflect(word, PLURAL_RULES, true);
+    }
+    let lower = word.to_lowercase();
+    let plural = inflect(&lower, PLURAL_RULES, true);
+    if lower == word {
+        return plural;
+    }
+    let kept = lower.char_indices().zip(plural.chars()).take_while(|((_, a), b)| a == b).last().map_or(0, |((i, c), _)| i + c.len_utf8());
+    format!("{}{}", &word[..kept], &plural[kept..])
+}
+
 pub fn pluralize_snake(class_name: &str) -> String {
     inflect(&snake_case(class_name), PLURAL_RULES, true)
 }
@@ -544,6 +591,13 @@ pub(crate) fn is_sqlite_keyword(name: &str) -> bool {
 
 #[cfg(test)]
 mod string_query_parity {
+    #[test]
+    fn pluralize_matches_any_case_and_keeps_the_words_own() {
+        for (word, plural) in [("User", "Users"), ("Status", "Statuses"), ("Person", "People"), ("Mouse", "Mice"), ("API", "APIs"), ("admin_user", "admin_users")] {
+            assert_eq!(super::pluralize(word), plural, "{word}");
+        }
+    }
+
     use super::{is_reserved_local, RESERVED_LOCALS};
     use ruby_prism::StringQuery;
 

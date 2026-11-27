@@ -20,6 +20,23 @@ fn expr_is_option(expr: &Expr) -> bool {
     column_ty(expr).as_ref().is_some_and(is_option_ty)
 }
 
+/// A zero-argument reader on a record (`article.title`) whose value is
+/// `String | nil`: the reader returns `Option<String>`.
+fn record_reader_is_option_str(expr: &Expr) -> bool {
+    use crate::ty::Ty;
+    let ExprNode::Send { recv: Some(inner), args, block: None, .. } = &*expr.node else {
+        return false;
+    };
+    args.is_empty()
+        && matches!(inner.ty.as_ref().map(peel_nil), Some(Ty::Class { .. }))
+        && matches!(
+            expr.ty.as_ref(),
+            Some(Ty::Union { variants }) if variants.len() == 2
+                && variants.iter().any(|v| matches!(v, Ty::Nil))
+                && variants.iter().any(|v| matches!(v, Ty::Str))
+        )
+}
+
 fn option_column_is_text(expr: &Expr) -> bool {
     column_ty(expr)
         .as_ref()
@@ -57,9 +74,11 @@ pub(super) fn external_class_method_param_tys(
         ("Db", "column_int") => Some(vec![Ty::Int, Ty::Int]),
         ("Db", "column_float") => Some(vec![Ty::Int, Ty::Int]),
         ("Db", "column_text") => Some(vec![Ty::Int, Ty::Int]),
+        ("Db", "column_binary") => Some(vec![Ty::Int, Ty::Int]),
         ("Db", "column_bool") => Some(vec![Ty::Int, Ty::Int]),
         ("Db", "finalize") => Some(vec![Ty::Int]),
         ("Db", "escape_string") => Some(vec![Ty::Str]),
+        ("Db", "escape_binary") => Some(vec![Ty::Str]),
         ("Db", "escape_int") => Some(vec![Ty::Int]),
         ("Db", "escape_bool") => Some(vec![Ty::Bool]),
         // Nullable-column seam: nil renders the SQL keyword NULL. The
@@ -68,8 +87,9 @@ pub(super) fn external_class_method_param_tys(
         ("Db", "column_int_opt") => Some(vec![Ty::Int, Ty::Int]),
         ("Db", "column_float_opt") => Some(vec![Ty::Int, Ty::Int]),
         ("Db", "column_text_opt") => Some(vec![Ty::Int, Ty::Int]),
+        ("Db", "column_binary_opt") => Some(vec![Ty::Int, Ty::Int]),
         ("Db", "column_bool_opt") => Some(vec![Ty::Int, Ty::Int]),
-        ("Db", "escape_string_opt") => {
+        ("Db", "escape_string_opt" | "escape_binary_opt") => {
             Some(vec![Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() }])
         }
         ("Db", "escape_int_opt") => Some(vec![Ty::Union { variants: vec![Ty::Int, Ty::Nil].into() }]),
@@ -201,6 +221,12 @@ fn ruby_to_s_emit(recv: &Expr, recv_s: &str, ufcs: bool) -> String {
                     format!("{recv_s}.clone().unwrap_or_default()")
                 }
                 Some(Ty::Array { .. }) => format!("{recv_s}.to_string()"),
+                // An element of a Value-valued Hash is a Value whatever
+                // the read's own type says: qualified, so a model file
+                // that does not `use RubyToS` compiles.
+                Some(Ty::Hash { value, .. }) if super::super::super::ty::rust_value_shaped(value) => {
+                    format!("<serde_json::Value as crate::http::RubyToS>::ruby_to_s(&({recv_s}))")
+                }
                 Some(ty)
                     if ufcs
                         && (super::super::super::ty::rust_value_shaped(ty)
@@ -306,7 +332,21 @@ pub(super) fn dispatch_method_by_recv_ty(
         }
         None => false,
     };
-    let recv_s = if binding_is_option {
+    // Not the narrowed read's type: a param the signature renders as a Value stays a Value where the read emits as the bare name
+    let bound_value_ty = var_name
+        .filter(|n| raw_recv_s.trim_end_matches(".clone()") == *n)
+        .and_then(super::super::param_ty)
+        .filter(|t| super::super::super::ty::rust_ty(t) == "serde_json::Value")
+        .filter(|_| recv_ty.is_some_and(|t| super::super::super::ty::rust_ty(t) != "serde_json::Value"));
+    let recv_ty = if bound_value_ty.is_some() { bound_value_ty.as_ref() } else { recv_ty };
+    // A record's reader typed `String | nil` (a nullable string column,
+    // `article.title`) returns `Option<String>`. The String methods nil
+    // has no answer for read the value, and a nil column panics, where
+    // Ruby raises `NoMethodError` on nil.
+    let nilable_reader = matches!(method, "empty?" | "length" | "size")
+        && args.is_empty()
+        && record_reader_is_option_str(recv);
+    let recv_s = if binding_is_option || nilable_reader {
         // `.clone().unwrap()` is a method chain — already a primary
         // form. The outer wrap was historically defensive against
         // downstream `.method` chaining; the `NEEDS_PARENS` decide-
@@ -334,6 +374,11 @@ pub(super) fn dispatch_method_by_recv_ty(
             "first" if args.is_empty() => Some(format!("{recv_s}.first().cloned()")),
             "last" if args.is_empty() => Some(format!("{recv_s}.last().cloned()")),
             "to_a" if args.is_empty() => Some(recv_s.clone()),
+            // `ary.index(x)`: the first position holding x, or nil
+            "index" if args.len() == 1 => Some(format!(
+                "{recv_s}.iter().position(|__x| *__x == {}).map(|__i| __i as i64)",
+                args_s[0]
+            )),
             // `reverse` / `sort` return new arrays in Ruby. Clone-
             // then-mutate keeps the receiver intact and produces an
             // owned Vec the caller can pass on.
@@ -473,6 +518,10 @@ pub(super) fn dispatch_method_by_recv_ty(
         // compare rust.
         Some(ty) if super::super::super::ty::rust_value_shaped(ty) => match method {
             "to_s" if args.is_empty() => Some(ruby_to_s_emit(recv, &recv_s, true)),
+            // Ruby's to_f on an Integer, a Float, or a String's leading number; nil and the rest are 0.0
+            "to_f" if args.is_empty() => Some(format!(
+                "{{ let __v = {recv_s}; match &__v {{ serde_json::Value::String(__s) => __s.trim().parse::<f64>().unwrap_or(0.0), _ => __v.as_f64().unwrap_or(0.0) }} }}"
+            )),
             _ => None,
         },
         Some(Ty::Hash { .. }) => match method {
@@ -531,7 +580,6 @@ mod tests {
     use crate::ident::Symbol;
     use crate::span::Span;
     use crate::ty::Ty;
-    use std::collections::HashMap;
     use std::path::PathBuf;
 
     fn rust_emit(expr: &Expr) -> String {
@@ -617,7 +665,7 @@ mod tests {
     }
 
     fn analyze_method(source: &str, method_name: &str) -> Expr {
-        let mut app = crate::ingest::ingest_app_from_tree(HashMap::from([(
+        let mut app = crate::ingest::ingest_app_from_tree(crate::vfs::FileTree::from([(
             PathBuf::from("app/lib/probe.rb"),
             source.as_bytes().to_vec(),
         )]))

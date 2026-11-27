@@ -4,8 +4,11 @@
 //! was "is not a literal regex" and the route stayed out of the lowered
 //! app. A compact `class Feeds::CollectionsController` resolves without a
 //! file declaring `module Feeds`, which Zeitwerk defines from the
-//! directory. Answers are actionpack 8.1.4's (`rails_answers_the_table`).
+//! directory. A constant the route file itself defines folds too. A `format:` constant is a requirement on the extension,
+//! as a literal is. Answers are actionpack 8.1.4's (`rails_answers_the_table`).
 
+#[path = "support/prerequisite.rs"]
+mod prerequisite;
 #[path = "support/emit_and_run.rs"]
 #[allow(dead_code)]
 mod emit_and_run;
@@ -23,18 +26,29 @@ end
 
 const WIDGETS: &str = r#"class WidgetsController < ApplicationController
   ID_RE = /[0-9]+-[a-z]+/
+  EXPORT_FORMAT = /csv/
 
   def show
     render plain: "widget:#{params[:id]}"
   end
+
+  def export
+    render plain: "export:#{params[:id]}"
+  end
 end
 "#;
 
-const ROUTES: &str = r#"Rails.application.routes.draw do
+const ROUTES: &str = r#"TAG_RE = /[a-z]+/
+
+Rails.application.routes.draw do
+  constraints id: TAG_RE do
+    get "/tags/:id", to: "widgets#show"
+  end
   namespace :feeds do
     resources :collections, only: [:show], constraints: { id: Regexp.union(Feeds::CollectionsController::SUPPORTED_COLLECTIONS) }
   end
   get "/widgets/:id", to: "widgets#show", constraints: { id: WidgetsController::ID_RE }
+  get "/exports/:id", to: "widgets#export", constraints: { format: WidgetsController::EXPORT_FORMAT }
 end
 "#;
 
@@ -43,8 +57,17 @@ const CASES: &[(&str, &str)] = &[
     ("/feeds/collections/tags", "200|show:tags"),
     ("/feeds/collections/other", "404|"),
     ("/feeds/collections/featuredx", "404|"),
+    // A constant the route file defines itself (lobsters' DOMAINS_IDENTIFIER).
+    ("/tags/ruby", "200|widget:ruby"),
+    ("/tags/42", "404|"),
     ("/widgets/12-ab", "200|widget:12-ab"),
     ("/widgets/12", "404|"),
+    // A `format:` constant is a requirement on the extension, as a
+    // literal is: an extension it matches, or none, is served; any
+    // other is not routed.
+    ("/exports/1.csv", "200|export:1"),
+    ("/exports/1", "200|export:1"),
+    ("/exports/1.json", "404|"),
 ];
 
 fn assertions() -> String {
@@ -96,7 +119,7 @@ fn a_constant_regex_with_a_modifier_stays_a_gap() {
 fn rails_answers_the_table() {
     let probe = r#"gem "actionpack", "8.1.4"; require "action_controller""#;
     if !Command::new("ruby").args(["-e", probe]).status().is_ok_and(|s| s.success()) {
-        eprintln!("skipping: ruby with actionpack 8.1.4 not available");
+        prerequisite::missing("ruby with actionpack 8.1.4 not available");
         return;
     }
     let script = format!(
@@ -107,6 +130,7 @@ class ApplicationController < ActionController::Base; end
 module Feeds; end
 {COLLECTIONS}
 {WIDGETS}
+{prelude}
 routes = ActionDispatch::Routing::RouteSet.new
 routes.draw do
 {draw}
@@ -120,6 +144,8 @@ define_method(:req) do |path|
 end
 {asserts}puts "Rails agrees"
 "##,
+        // What the route file defines before its `draw` (`TAG_RE`).
+        prelude = ROUTES.lines().take_while(|l| !l.starts_with("Rails.application")).collect::<Vec<_>>().join("\n"),
         draw = ROUTES.lines().filter(|l| l.starts_with("  ")).collect::<Vec<_>>().join("\n"),
         asserts = assertions(),
     );

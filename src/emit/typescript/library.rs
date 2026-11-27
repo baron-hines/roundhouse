@@ -77,8 +77,8 @@ pub(super) fn extras_from_funcs(
     funcs: &[crate::dialect::LibraryFunction],
 ) -> Vec<(crate::ident::ClassId, crate::analyze::ClassInfo)> {
     use crate::ident::{ClassId, Symbol};
-    let mut grouped: std::collections::HashMap<ClassId, crate::analyze::ClassInfo> =
-        std::collections::HashMap::new();
+    let mut grouped: crate::det::HashMap<ClassId, crate::analyze::ClassInfo> =
+        crate::det::HashMap::default();
     for func in funcs {
         let raw = func
             .module_path
@@ -223,6 +223,7 @@ fn synthesize_module_lc(
         nullable_columns: Vec::new(),
         origin: None,
         constants: Vec::new(),
+        conditional_definitions: Vec::new(),
         unknown_calls: Vec::new(),
         class_ivar_initializers: Vec::new(),
     }
@@ -238,10 +239,10 @@ fn synthesize_module_lc(
 pub(super) fn extras_from_lcs(
     lcs: &[LibraryClass],
 ) -> Vec<(crate::ident::ClassId, crate::analyze::ClassInfo)> {
-    let mut grouped: std::collections::HashMap<
+    let mut grouped: crate::det::HashMap<
         crate::ident::ClassId,
         crate::analyze::ClassInfo,
-    > = std::collections::HashMap::new();
+    > = crate::det::HashMap::default();
     for lc in lcs {
         let info = grouped.entry(lc.name.clone()).or_default();
         let from = crate::lower::class_info_from_library_class(lc);
@@ -529,6 +530,7 @@ fn collect_imports_for_function(
         }],
         origin: None,
         constants: Vec::new(),
+        conditional_definitions: Vec::new(),
         unknown_calls: Vec::new(),
         class_ivar_initializers: Vec::new(),
     };
@@ -668,9 +670,14 @@ pub(super) fn emit_class_file_full(
 /// The outermost name a nested app class (`Importer::TooBig`) is declared
 /// under. Its file is that root's, where a namespace carries it: a file of
 /// its own named `importer::too_big.ts` left `Importer.TooBig` undefined.
-pub(super) fn nested_class_root(lc: &LibraryClass) -> Option<&str> {
+pub(crate) fn nested_class_root(lc: &LibraryClass) -> Option<&str> {
     let name = lc.name.0.as_str();
-    if lc.is_module || lc.origin.is_some() || !name.contains("::") {
+    // A serializer the app wrote (`module Api; class ArticleSerializer <
+    // ActiveModel::Serializer`) has an origin only because ingest expanded
+    // it: it is still the app's class, read as `Api.ArticleSerializer`.
+    let app_written =
+        matches!(lc.origin, None | Some(crate::dialect::LibraryClassOrigin::ActiveModelSerializer { .. }));
+    if lc.is_module || !app_written || !name.contains("::") {
         return None;
     }
     name.split("::").next()
@@ -869,6 +876,8 @@ const RUNTIME_SRC_IMPORTS: &[(&str, &str)] = &[
     ("RecordInvalid", "errors"),
     ("ErrorDetail", "active_record_base"),
     ("FormBuilder", "view_helpers"),
+    ("I18n", "i18n_locale"),
+    ("I18nHost", "i18n_host"),
     // Db primitive surface (`Db.prepare`, `Db.step?`, `Db.column_*`,
     // `Db.escape_int`, `Db.last_insert_rowid`, …) backing the
     // lowerer-emitted `_adapter_*` methods and the Arel pass's
@@ -881,6 +890,15 @@ const RUNTIME_SRC_IMPORTS: &[(&str, &str)] = &[
     // Roundhouse::ParamValue]`.
     ("ParamValue", "param_value"),
 ];
+
+/// The class references in a method's parameter defaults.
+fn collect_param_default_refs(m: &crate::dialect::MethodDef, refs: &mut BTreeSet<String>) {
+    for p in &m.params {
+        if let Some(default) = &p.default {
+            collect_class_refs(default, refs);
+        }
+    }
+}
 
 /// Compute the import block for a class: scan method bodies for Const
 /// references, partition into juntos-provided names vs sibling models /
@@ -902,6 +920,10 @@ fn collect_imports_with_companions(
     let mut refs: BTreeSet<String> = BTreeSet::new();
     for m in &lc.methods {
         collect_class_refs(&m.body, &mut refs);
+        // A parameter's default is emitted too (`opts: any = new
+        // Options()`, a keyword's in its destructuring), so the classes it
+        // names are imported like the body's.
+        collect_param_default_refs(m, &mut refs);
         // Also harvest class references from the method's signature
         // (param types + return type). View functions like
         // `function article(article: Article): string` mention
@@ -950,6 +972,7 @@ fn collect_imports_with_companions(
     for companion in companions {
         for m in &companion.methods {
             collect_class_refs(&m.body, &mut refs);
+            collect_param_default_refs(m, &mut refs);
             if let Some(sig) = &m.signature {
                 collect_ty_class_refs(sig, &mut refs);
             }
@@ -1311,7 +1334,7 @@ fn collect_imports_with_companions(
 /// `def self.article(article)` typed as `(Article) -> String`
 /// would have no Const ref to Article anywhere in the IR's body.
 fn collect_ty_class_refs(ty: &crate::ty::Ty, out: &mut BTreeSet<String>) {
-    use crate::ty::Ty;
+    use crate::ty::{FnTy, Ty};
     match ty {
         Ty::Class { id, args } => {
             // Mirror `collect_class_refs` (Const-position): framework-
@@ -1358,7 +1381,8 @@ fn collect_ty_class_refs(ty: &crate::ty::Ty, out: &mut BTreeSet<String>) {
                 collect_ty_class_refs(v, out);
             }
         }
-        Ty::Fn { params, block, ret, .. } => {
+        Ty::Fn(fn_ty) => {
+            let FnTy { params, block, ret, .. } = &**fn_ty;
             for p in params {
                 collect_ty_class_refs(&p.ty, out);
             }
@@ -1817,8 +1841,8 @@ fn rewrite_free(e: &Expr) -> Expr {
                 binding: rc.binding.clone(),
                 body: rewrite_free(&rc.body),
             }).collect(),
-            else_branch: else_branch.as_ref().map(rewrite_free),
-            ensure: ensure.as_ref().map(rewrite_free),
+            else_branch: else_branch.as_deref().map(rewrite_free).map(Box::new),
+            ensure: ensure.as_deref().map(rewrite_free).map(Box::new),
             implicit: *implicit,
         },
         ExprNode::Case { scrutinee, arms } => ExprNode::Case {
@@ -1949,8 +1973,9 @@ fn rewrite(e: &Expr, super_method: Option<&str>) -> Expr {
         // the per-target Send rewriter can map them directly to the
         // host equivalent. Adding SelfRef here would force the typer
         // and emitter to invent a `this.puts` shim on every class.
+        // The class's own `puts` (`expr::APP_KERNEL_NAME`) is a self call.
         ExprNode::Send { recv: None, method, args, block, parenthesized }
-            if is_kernel_call(method.as_str()) =>
+            if is_kernel_call(method.as_str()) && e.decisions & crate::expr::APP_KERNEL_NAME == 0 =>
         {
             ExprNode::Send {
                 recv: None,
@@ -2107,8 +2132,8 @@ fn rewrite(e: &Expr, super_method: Option<&str>) -> Expr {
                         body: rewrite(&rc.body, super_method),
                     })
                     .collect(),
-                else_branch: else_branch.as_ref().map(|b| rewrite(b, super_method)),
-                ensure: ensure.as_ref().map(|b| rewrite(b, super_method)),
+                else_branch: else_branch.as_ref().map(|b| Box::new(rewrite(b, super_method))),
+                ensure: ensure.as_ref().map(|b| Box::new(rewrite(b, super_method))),
                 implicit: *implicit,
             }
         }

@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# scripts/lobsters-http-flows REF_URL CAND_URL --reset CMD [options] [STEP_FILE...]
+#
+# Run every step file (default: scripts/lobsters-http-steps/*.txt) through
+# lobsters-http-compare, one after another, and print one line per flow.
+#
+# A flow writes to the database, so each starts from the same state: before
+# every flow this runs CMD (a shell command), which must restore both
+# servers' databases and leave both servers answering. How that is done
+# depends on how you run them; the command is yours.
+#
+#   --reset CMD        required; run before each flow
+#   --out DIR          where each flow's compare output goes (default
+#                      ./lobsters-http-flows/<flow>)
+#   --email E / --password P   the login every flow uses (the replay's
+#                      LOBSTERS_EMAIL / LOBSTERS_PASSWORD otherwise)
+#   --timeout SECS     per flow (default 400)
+#
+# Exit code = number of flows that did not match. A local tool, not a CI
+# lane.
+set -uo pipefail
+here="$(cd "$(dirname "$0")" && pwd)"
+[[ $# -ge 2 ]] || { sed -n '2,22p' "$0"; exit 2; }
+ref="$1"; cand="$2"; shift 2
+reset=""; out="lobsters-http-flows"; timeout=400; pass=(); files=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --reset) reset="$2"; shift 2 ;;
+    --out) out="$2"; shift 2 ;;
+    --timeout) timeout="$2"; shift 2 ;;
+    --email|--password|--host) pass+=("$1" "$2"); shift 2 ;;
+    *) files+=("$1"); shift ;;
+  esac
+done
+[[ -n "$reset" ]] || { echo "lobsters-http-flows: --reset CMD is required (a flow writes; each must start from the same database)" >&2; exit 2; }
+[[ ${#files[@]} -gt 0 ]] || files=("$here"/lobsters-http-steps/*.txt)
+
+failed=0
+for f in "${files[@]}"; do
+  name="$(basename "$f" .txt)"
+  dir="$out/$name"
+  mkdir -p "$dir"
+  if ! bash -c "$reset" > "$dir/reset.log" 2>&1; then
+    printf '%-24s reset failed (see %s)\n' "$name" "$dir/reset.log"
+    failed=$((failed + 1)); continue
+  fi
+  # Not left to run unbounded: a hung server would stall every flow after it.
+  perl -e 'alarm shift; exec @ARGV' "$timeout" "$here/lobsters-http-compare" "$ref" "$cand" --out "$dir" --steps "$f" ${pass[@]+"${pass[@]}"} > "$dir/compare.log" 2>&1 < /dev/null
+  compared=$?
+  steps="$(grep -E 'steps answer the same' "$dir/compare.log" | tail -1 | sed 's/^ *//')"
+  content="$(grep -E 'content-equivalent to reference' "$dir/compare.log" | tail -1)"
+  differs="$(grep -cE '!= differs' "$dir/compare.log")"
+  same_status=0
+  [[ "$steps" =~ ^([0-9]+)/([0-9]+) ]] && [[ "${BASH_REMATCH[1]}" == "${BASH_REMATCH[2]}" ]] && same_status=1
+  # Not on the summary lines alone: a comparison that stopped early (a missing body, a timeout) prints no `differs` line.
+  if [[ $compared -eq 0 && $same_status -eq 1 && "$differs" -eq 0 ]]; then mark="ok  "; else mark="DIFF"; failed=$((failed + 1)); fi
+  printf '%s %-24s %s | %s\n' "$mark" "$name" "${steps:-no status summary}" "${content:-no content summary}"
+done
+exit "$failed"

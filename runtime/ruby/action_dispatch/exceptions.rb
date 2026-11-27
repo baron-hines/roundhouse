@@ -9,7 +9,9 @@
 # other error the action raises into a NameError that hides the real
 # one (lobsters' ApplicationController rescues both).
 module ActionDispatch
-  module RemoteIp
+  # A class, as in Rails (the middleware), so an app that reopens
+  # `class ActionDispatch::RemoteIp` loads.
+  class RemoteIp
     class IpSpoofAttackError < StandardError
     end
   end

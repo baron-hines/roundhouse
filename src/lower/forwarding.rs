@@ -9,7 +9,7 @@ use crate::analyze::forwarding::{
 use crate::diagnostic::Diagnostic;
 use crate::expr::{Expr, ExprNode};
 use crate::ident::ClassId;
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 pub(super) fn apply(app: &mut App) -> Vec<Diagnostic> {
     let (plans, constructors) = keyword_calls_and_constructor_contracts(app);
@@ -84,7 +84,7 @@ pub(super) fn constructor_names(
 }
 
 fn keyword_initializer_names(app: &App, ambiguous: &HashSet<String>) -> HashSet<String> {
-    let mut out = HashSet::new();
+    let mut out = HashSet::default();
     let classes = app.test_modules.iter().flat_map(|module| module.inner_classes.iter());
     for class in classes {
         let keeps = class.methods.iter().any(|m| {
@@ -109,8 +109,8 @@ fn keyword_initializer_names(app: &App, ambiguous: &HashSet<String>) -> HashSet<
 fn unqualified_constructor_names<'a>(
     class_ids: impl Iterator<Item = &'a ClassId>,
 ) -> (HashMap<String, String>, HashSet<String>) {
-    let mut unqualified_class_ids = HashMap::new();
-    let mut ambiguous_names = HashSet::new();
+    let mut unqualified_class_ids = HashMap::default();
+    let mut ambiguous_names = HashSet::default();
     for class_id in class_ids {
         let full_name = class_id.0.as_str();
         let simple_name = full_name.rsplit("::").next().unwrap_or(full_name);
@@ -147,10 +147,15 @@ pub(super) fn apply_with_plans(
     }
     fn project(
         e: &mut Expr,
-        plans: &std::collections::HashMap<crate::span::Span, KeywordPolicy>,
+        plans: &crate::det::HashMap<crate::span::Span, KeywordPolicy>,
         names: &ConstructorNames,
     ) {
-        if plans.get(&e.span) == Some(&KeywordPolicy::Legacy) {
+        if plans.get(&e.span) == Some(&KeywordPolicy::NativeLibrary) {
+            e.decisions |= crate::expr::NATIVE_KEYWORD_ARGUMENTS;
+        }
+        if matches!(plans.get(&e.span), Some(KeywordPolicy::Legacy | KeywordPolicy::LegacyRubySplat))
+            && e.decisions & crate::expr::NATIVE_KEYWORD_ARGUMENTS == 0
+        {
             // `lower::kwsplat` resolves a callee through the receiver's
             // class (or the enclosing class for a receiverless call) and
             // decides there whether the Hash stays positional, expands
@@ -202,7 +207,7 @@ pub(super) fn apply_with_plans(
                 for arg in args {
                     if let ExprNode::KeywordSplat { value } = &mut *arg.node {
                         *arg = std::mem::replace(value, super::typing::nil_lit());
-                        if callee_unresolved {
+                        if callee_unresolved || plans.get(&e.span) == Some(&KeywordPolicy::LegacyRubySplat) {
                             arg.decisions |= crate::expr::ERASED_KEYWORD_SPLAT;
                         }
                     }

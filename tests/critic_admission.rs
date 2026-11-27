@@ -1,5 +1,7 @@
 //! Regression cases where inference used to certify an unexecutable program.
 //! Both CLI gates must refuse; passing `check` alone is not admission evidence.
+#[path = "support/scratch.rs"]
+mod scratch;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -18,7 +20,7 @@ fn admits(body: &str) {
 }
 
 fn gate(body: &str, expected: &str, extra: &[(&str, &str)], admitted: bool) {
-    let root = std::env::temp_dir().join(format!("rh_admission_{}_{}", std::process::id(), NEXT.fetch_add(1, Ordering::SeqCst)));
+    let root = scratch::dir(&format!("rh_admission_{}", NEXT.fetch_add(1, Ordering::SeqCst)));
     for (path, text) in [
         ("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n".to_string()),
         ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n".to_string()),
@@ -103,9 +105,15 @@ fn non_nil_assertions_require_runtime_support() {
     // literal block has no message to inline and stays refused.
     refuses("T.must_because(1, &blk)", "non-nil assertion");
     refuses("T.must_because(1) { |why| why }", "non-nil assertion");
-    refuses("1.not_nil!", "not_nil!");
+    // type_toolkit's `x.not_nil!` runs on the CRuby tree
+    // (tests/not_nil_type_toolkit.rs); other trees refuse it at emit
+    // (tests/not_nil_bang.rs).
+    admits("1.not_nil!");
 }
 
+/// A `for` opens no scope: ingest writes it as a `while`, so the loop
+/// variable and a body local stay visible after it, as in Ruby (the
+/// answers are pinned by `emit_and_run::for_loops`).
 #[test]
 fn for_scope_is_not_a_block_scope() {
     for body in [
@@ -114,7 +122,13 @@ fn for_scope_is_not_a_block_scope() {
         "for x in [1, 2]; y = x * 10; end; y",
         "for p, q in [[1, 2], [3, 4]]; end; [p, q]",
         "for x in []; y = 1; end; [defined?(y), y]",
-    ] { refuses(body, "for"); }
+    ] { admits(body); }
+}
+
+#[test]
+fn string_to_d_has_its_runtime() {
+    // `ActiveSupport.loose_to_d` (runtime/ruby/active_support_ext.rb), run by tests/emit_and_run/string_to_d.rs.
+    admits("\"1.5\".to_d");
 }
 
 #[test]
@@ -123,7 +137,6 @@ fn registry_signatures_do_not_supply_missing_runtime() {
         ("ActiveRecord::Base.connected_to(role: :reading) { 7 }", "connected_to"),
         ("Benchmark.realtime { 1 }", "Benchmark"),
         ("\"2020-01-02\".to_date", "to_date"),
-        ("\"1.5\".to_d", "to_d"),
         ("{}.to_sentence", "to_sentence"),
     ] { refuses(body, name); }
 }
@@ -225,7 +238,9 @@ fn lambda_parameters_cannot_borrow_outer_class_identity() {
 #[test]
 fn dropped_block_capture_cannot_borrow_outer_identity() {
     refuses("k = Probe; [1].each { |&k| k.define_method(:x) { 1 } }", "block parameter capture");
-    refuses("k = Probe; f = ->(&k) { k.define_method(:x) { 1 } }; f.call", "block parameter capture");
+    // A lambda keeps its named block parameter: `k` there is the block, not the outer class, so `define_method` on it
+    // is refused for its receiver rather than run on `Probe`.
+    refuses("k = Probe; f = ->(&k) { k.define_method(:x) { 1 } }; f.call", "Module protocol");
 }
 
 #[test]

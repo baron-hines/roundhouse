@@ -26,12 +26,31 @@ const ENQUEUE: &str = r##"  validates :title, presence: true
 "##;
 
 const SIDEKIQ: &str = "  config.active_job.queue_adapter = :sidekiq\n";
+/// The `Sidekiq.configure_client` an app on `:sidekiq` must have: ingest
+/// refuses one without a `url:`.
+const REDIS_CLIENT: &str = "Sidekiq.configure_client do |config|\n  config.redis = { url: ENV.fetch(\"REDIS_URL\", \"redis://localhost:6379/0\") }\nend\n";
+
+/// real-blog's Article and Comment declare `broadcasts_to`, whose create
+/// and update broadcasts push `Turbo::Streams::ActionBroadcastJob` on
+/// `:sidekiq`, as Rails does (`tests/broadcast_job.rs` covers that push).
+/// The tests here record their own job's push, or need an app with no
+/// jobs at all, so they start from the blog without those declarations.
+fn real_blog_without_broadcasts() -> emit_and_run::Overlay {
+    emit_and_run::real_blog()
+        .edit("app/models/article.rb", "  broadcasts_to ->(_article) { \"articles\" }, inserts_by: :prepend\n", "")
+        .edit(
+            "app/models/comment.rb",
+            "  broadcasts_to ->(comment) { \"article_#{comment.article_id}_comments\" }, target: \"comments\"\n",
+            "",
+        )
+}
 
 fn on_sidekiq() -> emit_and_run::Overlay {
-    emit_and_run::real_blog()
+    real_blog_without_broadcasts()
         .write("app/jobs/article_job.rb", JOB)
         .edit("app/models/article.rb", "  validates :title, presence: true\n", ENQUEUE)
         .edit("config/environments/production.rb", "  config.active_job.queue_adapter = :solid_queue\n", SIDEKIQ)
+        .write("config/initializers/sidekiq.rb", REDIS_CLIENT)
 }
 
 fn read(emitted: &std::path::Path, path: &str) -> String {
@@ -46,7 +65,7 @@ fn a_spinel_tree_on_sidekiq_gets_spinel_redis() {
     assert!(
         client.contains("require \"redis\"")
             && client.contains(
-                "Redis.new(url: url, connect_timeout: CONNECT_TIMEOUT, read_timeout: READ_TIMEOUT)"
+                "Redis.new(url: url, username: user, password: pass, db: db, connect_timeout: connect_timeout, read_timeout: read_timeout)"
             ),
         "{client}"
     );
@@ -54,7 +73,7 @@ fn a_spinel_tree_on_sidekiq_gets_spinel_redis() {
     let manifest = read(&emitted, "spin.toml");
     assert!(
         manifest.contains(
-            "redis = { git = \"https://github.com/rubys/spinel-redis\", ref = \"v0.3.0\" }"
+            "redis = { git = \"https://github.com/roundhouse-rb/spinel-redis\", ref = \"v0.3.3\" }"
         ),
         "{manifest}"
     );
@@ -95,10 +114,71 @@ fn an_app_not_on_sidekiq_keeps_the_facade_and_no_dependency() {
     assert!(!read(&emitted, "Gemfile").contains("gem \"redis\""));
 }
 
+/// The worker role: a tree on `:sidekiq` gets the real worker in place of
+/// the façade, and the ruby tree its `sidekiq.rb` entry. Every other tree
+/// keeps the façade, whose `cli` says the app isn't on Sidekiq, and no
+/// `sidekiq.rb`.
+#[test]
+fn a_tree_on_sidekiq_gets_the_worker_role() {
+    let (emitted, errors) = on_sidekiq().emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let worker = read(&emitted, "runtime/sidekiq_worker.rb");
+    assert!(worker.contains("def self.processor(index)"), "{worker}");
+    assert!(!emitted.join("runtime/sidekiq_worker.rbs").exists(), "the façade's sidecar must drop");
+    assert!(read(&emitted, "main.rb").contains("SidekiqWorker.cli(ARGV)"));
+    assert!(read(&emitted, "runtime/sidekiq_envelope.rbs").contains("def self.with_error"));
+
+    for target in [BuildTarget::Ruby, BuildTarget::Jruby] {
+        let (emitted, errors) = on_sidekiq().emit(target);
+        assert!(errors.is_empty(), "{errors:#?}");
+        assert!(read(&emitted, "runtime/sidekiq_worker.rb").contains("def self.processor(index)"));
+        assert!(read(&emitted, "sidekiq.rb").contains("SidekiqWorker.cli(ARGV)"));
+    }
+
+    let plain = || {
+        emit_and_run::real_blog()
+            .write("app/jobs/article_job.rb", JOB)
+            .edit("app/models/article.rb", "  validates :title, presence: true\n", ENQUEUE)
+    };
+    for target in [BuildTarget::Spinel, BuildTarget::Ruby] {
+        let (emitted, _) = plain().emit(target);
+        let facade = read(&emitted, "runtime/sidekiq_worker.rb");
+        assert!(facade.contains("doesn't use queue_adapter :sidekiq") && !facade.contains("processor"), "{facade}");
+        assert!(!emitted.join("sidekiq.rb").exists());
+    }
+}
+
+const WORKER_SCRIPT: &str = r##"SidekiqWorker::LOGGING[0] = false
+raise "parse" unless SidekiqWorker.parse(["sidekiq", "-q", "critical,3", "-q", "default", "-c", "4"]) == ""
+raise "queues #{SidekiqWorker::QUEUES.inspect}" unless SidekiqWorker::QUEUES == ["queue:critical"] * 3 + ["queue:default"]
+raise "concurrency" unless SidekiqWorker::CONCURRENCY[0] == 4
+ENV.delete("DATABASE_POOL_SIZE")
+SidekiqWorker.prepare_pool(["sidekiq", "-c", "10"])
+raise "pool #{ENV["DATABASE_POOL_SIZE"]}" unless ENV["DATABASE_POOL_SIZE"] == "12"
+article = Article.create!(title: "Worker title", body: "A long enough article body.")
+json = JobRegistry.payload_article_job(article)
+raise "no outcome" unless ActiveJob.perform_parsed(JSON.parse(json)) == ActiveJob::PERFORM_RAN
+article.destroy
+raise "gone" unless ActiveJob.perform_parsed(JSON.parse(json)) == ActiveJob::PERFORM_FAILED
+raise ActiveJob.failure_class unless ActiveJob.failure_class == "ActiveJob::DeserializationError"
+puts "worker role passed"
+"##;
+
+/// The emitted ruby tree's worker parses Sidekiq's options, sizes the
+/// database pool, and runs the app's own payload job through
+/// `perform_parsed`, a gone record failing as DeserializationError.
+#[test]
+fn the_worker_role_runs_the_apps_jobs() {
+    let run = on_sidekiq().run_ruby(WORKER_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("worker role passed"), "{}", run.stdout);
+}
+
 #[test]
 fn an_app_on_sidekiq_with_no_jobs_gets_no_redis() {
-    let (emitted, errors) = emit_and_run::real_blog()
+    let (emitted, errors) = real_blog_without_broadcasts()
         .edit("config/environments/production.rb", "  config.active_job.queue_adapter = :solid_queue\n", SIDEKIQ)
+        .write("config/initializers/sidekiq.rb", REDIS_CLIENT)
         .emit(BuildTarget::Spinel);
     assert!(errors.is_empty(), "{errors:#?}");
     assert!(read(&emitted, "runtime/sidekiq_redis.rb").contains("this tree has no Redis client"));
@@ -119,7 +199,8 @@ const COMMIT_CALLBACK: &str = r#"  validates :title, presence: true
   end
 "#;
 
-const FAILED_PUSH_SCRIPT: &str = r#"SidekiqRedis.define_singleton_method(:push) { |_url, _queue, _json| raise "redis down" }
+const FAILED_PUSH_SCRIPT: &str = r#"JobRegistry.define_singleton_method(:sidekiq_redis_url) { "redis://localhost:6379/0" }
+SidekiqRedis.define_singleton_method(:push) { |_url, _queue, _json| raise "redis down" }
 begin
   Article.transaction do
     Article.create!(title: "Pushed title", body: "A long enough article body.")
@@ -152,11 +233,201 @@ fn a_failed_push_at_commit_runs_the_record_callbacks_first() {
     assert!(run.stdout.contains("failed push passed"), "{}", run.stdout);
 }
 
+const RAISING_CALLBACK: &str = r#"  validates :title, presence: true
+
+  after_create_commit :refuse
+
+  def refuse
+    raise ArgumentError, "callback failed" if title == "Refused title"
+  end
+"#;
+
+const RAISING_CALLBACK_SCRIPT: &str = r#"SidekiqPush.start_recording
+begin
+  Article.transaction do
+    Article.create!(title: "Refused title", body: "A long enough article body.")
+    SidekiqPush.enqueue_after_commit("ArticleJob", "default", 0.0, "{}")
+  end
+  raise "the callback's error was swallowed"
+rescue ArgumentError => e
+  raise e unless e.message == "callback failed"
+end
+raise "pushed after a raising callback: #{SidekiqPush.recorded.inspect}" unless SidekiqPush.recorded.empty?
+raise "still held: #{SidekiqPush.held.length}" unless SidekiqPush.held.empty?
+raise "the data was not committed" unless Article.where(title: "Refused title").count == 1
+Article.transaction do
+  Article.create!(title: "Next title", body: "Another long enough body.")
+end
+raise "the dropped job was pushed later: #{SidekiqPush.recorded.inspect}" unless SidekiqPush.recorded.empty?
+SidekiqPush.stop_recording
+puts "raising callback passed"
+"#;
+
+/// A record's `after_commit` that raises ends the COMMIT there, as in
+/// Rails 8.1, where `after_all_transactions_commit` (the enqueue) runs
+/// after the record callbacks: the data stays committed, the caller
+/// sees the callback's error, and the held job is dropped, not pushed
+/// then or at the thread's next COMMIT.
+#[test]
+fn a_raising_commit_callback_drops_the_held_push() {
+    let run = emit_and_run::real_blog()
+        .write("app/jobs/article_job.rb", JOB)
+        .edit("app/models/article.rb", "  validates :title, presence: true\n", RAISING_CALLBACK)
+        .run_ruby(RAISING_CALLBACK_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("raising callback passed"), "{}", run.stdout);
+}
+
+const SIDEKIQ_YML: &str = ":concurrency: 3\n:timeout: 9\n:queues:\n  - critical\n  - [default, 2]\n:max_retries: 4\n:dead_max_jobs: 50\n:dead_timeout_in_seconds: 3600\n:poll_interval_average: 2.5\n";
+
+const SIDEKIQ_YML_SCRIPT: &str = r#"SidekiqWorker.parse(["sidekiq"])
+raise "concurrency #{SidekiqWorker::CONCURRENCY[0]}" unless SidekiqWorker::CONCURRENCY[0] == 3
+raise "timeout #{SidekiqWorker::TIMEOUT[0]}" unless SidekiqWorker::TIMEOUT[0] == 9
+raise "queues #{SidekiqWorker::QUEUES.inspect}" unless SidekiqWorker::QUEUES == ["queue:critical", "queue:default", "queue:default"]
+raise "weighted" if SidekiqWorker::STRICT[0]
+SidekiqWorker.parse(["sidekiq", "-c", "7", "-q", "low", "-t", "1"])
+raise "-c #{SidekiqWorker::CONCURRENCY[0]}" unless SidekiqWorker::CONCURRENCY[0] == 7
+raise "-t #{SidekiqWorker::TIMEOUT[0]}" unless SidekiqWorker::TIMEOUT[0] == 1
+raise "-q #{SidekiqWorker::QUEUES.inspect}" unless SidekiqWorker::QUEUES == ["queue:low"] && SidekiqWorker::STRICT[0]
+ENV["RAILS_MAX_THREADS"] = "11"
+SidekiqWorker.parse(["sidekiq"])
+raise "the file beats RAILS_MAX_THREADS: #{SidekiqWorker::CONCURRENCY[0]}" unless SidekiqWorker::CONCURRENCY[0] == 3
+raise "max_retries #{SidekiqWorker.max_retries}" unless SidekiqWorker.max_retries == 4
+raise "dead_max_jobs" unless JobRegistry.sidekiq_worker_dead_max_jobs == 50
+raise "dead_timeout_in_seconds" unless JobRegistry.sidekiq_worker_dead_timeout == 3600
+raise "poll_interval_average" unless JobRegistry.sidekiq_worker_poll_interval_average == 2.5
+raise "average_scheduled_poll_interval" unless JobRegistry.sidekiq_worker_scheduled_poll_interval == -1.0
+puts "sidekiq.yml passed"
+"#;
+
+/// `config/sidekiq.yml` gives the worker its defaults, and the command
+/// line wins over them, key by key, as Sidekiq's CLI merges them; the
+/// file wins over `RAILS_MAX_THREADS`. The retry limit, the dead set's
+/// trims and the poller's interval come from it too; a key it doesn't
+/// give stays at Sidekiq's default (-1 in the registry).
+#[test]
+fn sidekiq_yml_sets_the_worker_defaults() {
+    let run = on_sidekiq().write("config/sidekiq.yml", SIDEKIQ_YML).run_ruby(SIDEKIQ_YML_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("sidekiq.yml passed"), "{}", run.stdout);
+    let registry = read(&run.emitted, "runtime/job_registry.rb");
+    assert!(registry.contains("  def self.sidekiq_worker_queues\n    \"critical default,2\"\n  end\n"), "{registry}");
+}
+
+const REDIS_CONNECTION: &str = "Sidekiq.configure_client do |config|\n  config.redis = {\n    url: ENV.fetch(\"REDIS_URL\", \"redis://localhost:6379/0\"),\n    username: ENV[\"REDIS_USER\"],\n    db: ENV.fetch(\"REDIS_DB\", \"4\"),\n    timeout: 5,\n    read_timeout: 1.5,\n    reconnect_attempts: [0.25, 1],\n    size: 10\n  }\nend\n";
+
+const REDIS_CONNECTION_SCRIPT: &str = r#"ENV["REDIS_USER"] = "jobs"
+raise "username #{SidekiqPush.username.inspect}" unless SidekiqPush.username == "jobs"
+raise "db #{SidekiqPush.db.inspect}" unless SidekiqPush.db == 4
+ENV["REDIS_DB"] = "7"
+raise "db from the environment #{SidekiqPush.db.inspect}" unless SidekiqPush.db == 7
+ENV["REDIS_DB"] = "seven"
+begin
+  SidekiqPush.db
+  raise "a db: that isn't an Integer was read"
+rescue ArgumentError => e
+  raise e.message unless e.message.include?("db: must be an Integer")
+end
+raise "timeouts" unless [SidekiqPush.connect_timeout, SidekiqPush.read_timeout] == [5.0, 1.5]
+raise "delays #{SidekiqPush.reconnect_delays.inspect}" unless SidekiqPush.reconnect_delays == [0.25, 1.0]
+raise "an unset db" unless SidekiqPush.db_setting("") == -1
+puts "redis connection passed"
+"#;
+
+/// The app's `configure_client` connection settings reach the emitted
+/// registry and `SidekiqPush`: `username:` and `db:` read from the
+/// environment when the push first needs them (a `db:` that isn't an
+/// Integer raising, as redis-client's does), `timeout:` the default for
+/// `connect_timeout:`, and `reconnect_attempts:`' delays. `size:` is a
+/// warning, not an error.
+#[test]
+fn configure_client_connection_settings_reach_the_push() {
+    let run = on_sidekiq().write("config/initializers/sidekiq.rb", REDIS_CONNECTION).run_ruby(REDIS_CONNECTION_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("redis connection passed"), "{}", run.stdout);
+    let registry = read(&run.emitted, "runtime/job_registry.rb");
+    for method in [
+        "  def self.sidekiq_redis_username\n    SidekiqPush.setting(\"REDIS_USER\")\n  end\n",
+        "  def self.sidekiq_redis_db\n    SidekiqPush.db_setting(SidekiqPush.setting_or(\"REDIS_DB\", \"4\"))\n  end\n",
+        "  def self.sidekiq_redis_connect_timeout\n    5.0\n  end\n",
+        "  def self.sidekiq_redis_read_timeout\n    1.5\n  end\n",
+        "  def self.sidekiq_redis_reconnect_delays\n    \"0.25 1.0\"\n  end\n",
+    ] {
+        assert!(registry.contains(method), "{method}\n{registry}");
+    }
+
+    // Sidekiq's defaults for an app that sets only url:.
+    let (emitted, errors) = on_sidekiq().emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let registry = read(&emitted, "runtime/job_registry.rb");
+    for method in [
+        "  def self.sidekiq_redis_username\n    \"\"\n  end\n",
+        "  def self.sidekiq_redis_db\n    -1\n  end\n",
+        "  def self.sidekiq_redis_connect_timeout\n    3.0\n  end\n",
+        "  def self.sidekiq_redis_read_timeout\n    3.0\n  end\n",
+        "  def self.sidekiq_redis_reconnect_delays\n    \"0.0\"\n  end\n",
+    ] {
+        assert!(registry.contains(method), "{method}\n{registry}");
+    }
+}
+
+const CABLE_REDIS: &str = "production:\n  adapter: redis\n  url: <%= ENV.fetch(\"REDIS_URL\") { \"redis://localhost:6379/1\" } %>\n  channel_prefix: depot_production\n";
+
+const CABLE_SCRIPT: &str = r##"SENT = []
+RedisCable.define_singleton_method(:publish) { |stream, json| SENT << [RedisCable.channel(stream), json] }
+raise "not on the Redis cable" unless RedisCable.enabled?
+Broadcasts.set_transport(RedisCable::Transport.new)
+Turbo::StreamsChannel.broadcast_append_to("Z2lkOi8vZGVwb3QvQ2FyLzE", target: "cars", html: %(<div id="car_1">Golf &amp; "GTI" \u00e9</div>))
+ActionCable.server.broadcast("user_7_unreads", { "roomId" => 1, "count" => 2, "note" => "<b>&</b>" })
+ActionCable.server.broadcast("user_7_unreads", JSON.generate({ "roomId" => 3 }), coder: nil)
+puts "SENT " + JSON.generate(SENT)
+"##;
+
+/// Under config/cable.yml's `adapter: redis`, a tree on `:sidekiq` sends
+/// each broadcast through Redis on the channel and with the bytes
+/// actioncable 8.1.3's Redis adapter publishes (tests/redis_cable/
+/// rails.json): a Turbo Stream fragment, a Hash, and a `coder: nil`
+/// String. The spinel tree gets the real transport too; a tree on
+/// another cable adapter keeps the façade.
+#[test]
+fn the_redis_cable_publishes_what_rails_does() {
+    let run = on_sidekiq().write("config/cable.yml", CABLE_REDIS).run_ruby(CABLE_SCRIPT);
+    run.assert_passes();
+    let line = run.stdout.lines().find_map(|l| l.strip_prefix("SENT ")).unwrap_or_else(|| panic!("{}", run.stdout));
+    let sent: Vec<(String, String)> = serde_json::from_str(line).unwrap();
+    let oracle: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/redis_cable/rails.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(oracle["actioncable"], "8.1.3");
+    let want: Vec<(String, String)> = oracle["publishes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| (p["channel"].as_str().unwrap().to_string(), p["payload"].as_str().unwrap().to_string()))
+        .collect();
+    assert_eq!(sent, want, "the runtime's publishes differ from Rails'");
+    let registry = read(&run.emitted, "runtime/job_registry.rb");
+    assert!(
+        registry.contains("  def self.cable_redis_url\n    SidekiqPush.setting_or(\"REDIS_URL\", \"redis://localhost:6379/1\")\n  end\n"),
+        "{registry}"
+    );
+
+    let (spinel, errors) = on_sidekiq().write("config/cable.yml", CABLE_REDIS).emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+    assert!(read(&spinel, "runtime/redis_cable.rb").contains("Redis.pubsub(url: url)"));
+    let (plain, _) = on_sidekiq().emit(BuildTarget::Spinel);
+    assert!(read(&plain, "runtime/redis_cable.rb").contains("def self.enabled?\n    false\n"));
+    let (ruby, _) = on_sidekiq().emit(BuildTarget::Ruby);
+    assert!(read(&ruby, "runtime/redis_cable.rb").contains("def self.enabled?\n    false\n"));
+}
+
 const CONFIGURE_CLIENT: &str = "Sidekiq.configure_client do |config|\n  config.redis = { url: ENV.fetch(\"JOBS_REDIS_URL\", \"redis://jobs:6379/1\"), password: ENV[\"JOBS_REDIS_PASSWORD\"] }\nend\n";
 
 /// The app's `configure_client` settings reach the registry the push
-/// reads them from, on every Ruby-family lane; an app without them gets
-/// `""`, so the push falls back to REDIS_PROVIDER, REDIS_URL, localhost.
+/// reads them from, on every Ruby-family lane. An app on `:sidekiq`
+/// without a `url:` is an error: there is no REDIS_PROVIDER, REDIS_URL
+/// or localhost fallback to push to.
 #[test]
 fn configure_client_settings_reach_the_registry() {
     for target in [BuildTarget::Spinel, BuildTarget::Ruby] {
@@ -175,9 +446,11 @@ fn configure_client_settings_reach_the_registry() {
             "{registry}"
         );
     }
-    let (emitted, _) = on_sidekiq().emit(BuildTarget::Ruby);
-    let registry = read(&emitted, "runtime/job_registry.rb");
-    assert!(registry.contains("  def self.sidekiq_redis_url\n    \"\"\n  end\n"), "{registry}");
+    for init in ["Rails.application.config.x.jobs = 1\n", "Sidekiq.configure_client do |config|\n  config.redis = { password: \"hunter2\" }\nend\n"] {
+        let (_, errors) = on_sidekiq().write("config/initializers/sidekiq.rb", init).emit(BuildTarget::Ruby);
+        assert_eq!(errors.len(), 1, "{init}: {errors:#?}");
+        assert!(errors[0].contains("must name its Redis") && errors[0].contains("no fallback"), "{errors:#?}");
+    }
 }
 
 /// `self.queue_adapter = :sidekiq` in ApplicationJob puts the whole app
@@ -192,6 +465,7 @@ fn application_job_on_sidekiq_gets_a_redis_client() {
             "class ApplicationJob < ActiveJob::Base\n",
             "class ApplicationJob < ActiveJob::Base\n  self.queue_adapter = :sidekiq\n",
         )
+        .write("config/initializers/sidekiq.rb", REDIS_CLIENT)
         .emit(BuildTarget::Ruby);
     assert!(errors.is_empty(), "{errors:#?}");
     assert!(read(&emitted, "Gemfile").contains("gem \"redis\""));
@@ -273,10 +547,11 @@ puts "after commit push passed"
 /// same hold Phase 1's in-process queue has.
 #[test]
 fn an_after_commit_job_is_pushed_at_commit() {
-    let run = emit_and_run::real_blog()
+    let run = real_blog_without_broadcasts()
         .write("app/jobs/commit_job.rb", COMMIT_JOB)
         .edit("app/models/article.rb", "  validates :title, presence: true\n", COMMIT_ENQUEUE)
         .edit("config/environments/production.rb", "  config.active_job.queue_adapter = :solid_queue\n", SIDEKIQ)
+        .write("config/initializers/sidekiq.rb", REDIS_CLIENT)
         .run_ruby(COMMIT_SCRIPT);
     run.assert_passes();
     assert!(run.stdout.contains("after commit push passed"), "{}", run.stdout);
@@ -308,6 +583,7 @@ fn an_unplannable_job_is_an_error_only_under_sidekiq() {
     };
     let (_, errors) = overlay()
         .edit("config/environments/production.rb", "  config.active_job.queue_adapter = :solid_queue\n", SIDEKIQ)
+        .write("config/initializers/sidekiq.rb", REDIS_CLIENT)
         .emit(BuildTarget::Ruby);
     assert_eq!(errors.len(), 1, "{errors:#?}");
     assert!(errors[0].contains("OptionsJob") && errors[0].contains("queue_adapter :sidekiq"), "{errors:#?}");
@@ -333,8 +609,9 @@ fn strict_targets_warn_once_and_emit_the_same_tree() {
         assert!(w.message.contains(target.as_str()), "{}", w.message);
     }
 
-    let (_, no_jobs, _) = emit_and_run::real_blog()
+    let (_, no_jobs, _) = real_blog_without_broadcasts()
         .edit("config/environments/production.rb", "  config.active_job.queue_adapter = :solid_queue\n", SIDEKIQ)
+        .write("config/initializers/sidekiq.rb", REDIS_CLIENT)
         .emit_with_app(BuildTarget::Ruby);
     assert!(sidekiq_adapter_target_warning(&no_jobs, BuildTarget::Go).is_none());
 
@@ -357,7 +634,7 @@ fn strict_targets_warn_once_and_emit_the_same_tree() {
         files.sort();
         files
     };
-    let plain = emit_and_run::real_blog()
+    let plain = real_blog_without_broadcasts()
         .write("app/jobs/article_job.rb", JOB)
         .edit("app/models/article.rb", "  validates :title, presence: true\n", ENQUEUE);
     let with = tree(on_sidekiq());
@@ -436,6 +713,17 @@ fn set_options_schedule_and_route_the_push() {
     let job = read(&run.emitted, "app/models/article_job.rb");
     assert!(job.contains("def self.perform_later_with(at, queue, article)"), "{job}");
     assert!(job.contains("JobRegistry.push_article_job(queue, at, article)"), "{job}");
+    let model = read(&run.emitted, "app/models/article.rb");
+    assert!(model.contains("Time.now.to_f + 300.0"), "{model}");
+}
+
+/// A literal Duration `wait:` folds to its seconds, so the strict
+/// targets, which have no Duration, emit the same `set(...)` sites
+/// cleanly under `:sidekiq`.
+#[test]
+fn a_literal_duration_wait_emits_on_go() {
+    let (_, errors) = on_sidekiq().edit("app/models/article.rb", ENQUEUE, SET_ENQUEUE).emit(BuildTarget::Go);
+    assert!(errors.is_empty(), "{errors:#?}");
 }
 
 const COLLIDER_JOB: &str = r##"class ColliderJob < ApplicationJob
@@ -477,10 +765,11 @@ puts "collider passed"
 /// arguments reach the payload unchanged, scheduled or not.
 #[test]
 fn a_job_whose_parameters_are_named_queue_at_and_q_still_pushes_its_arguments() {
-    let run = emit_and_run::real_blog()
+    let run = real_blog_without_broadcasts()
         .write("app/jobs/collider_job.rb", COLLIDER_JOB)
         .edit("app/models/article.rb", "  validates :title, presence: true\n", COLLIDER_ENQUEUE)
         .edit("config/environments/production.rb", "  config.active_job.queue_adapter = :solid_queue\n", SIDEKIQ)
+        .write("config/initializers/sidekiq.rb", REDIS_CLIENT)
         .run_ruby(COLLIDER_SCRIPT);
     run.assert_passes();
     assert!(run.stdout.contains("collider passed"), "{}", run.stdout);
@@ -514,6 +803,7 @@ fn priority_warns_and_a_computed_set_is_an_error() {
         .write("app/jobs/article_job.rb", JOB)
         .edit("app/models/article.rb", "  validates :title, presence: true\n", PRIORITY_ENQUEUE)
         .edit("config/environments/production.rb", "  config.active_job.queue_adapter = :solid_queue\n", SIDEKIQ)
+        .write("config/initializers/sidekiq.rb", REDIS_CLIENT)
         .emit(BuildTarget::Ruby);
     assert!(errors.is_empty(), "{errors:#?}");
 
@@ -521,7 +811,31 @@ fn priority_warns_and_a_computed_set_is_an_error() {
         .write("app/jobs/article_job.rb", JOB)
         .edit("app/models/article.rb", "  validates :title, presence: true\n", DYNAMIC_ENQUEUE)
         .edit("config/environments/production.rb", "  config.active_job.queue_adapter = :solid_queue\n", SIDEKIQ)
+        .write("config/initializers/sidekiq.rb", REDIS_CLIENT)
         .emit(BuildTarget::Ruby);
     assert_eq!(errors.len(), 1, "{errors:#?}");
     assert!(errors[0].contains("can't be honored"), "{errors:#?}");
+}
+
+/// A tree on `:sidekiq` documents its worker role under the README's
+/// `## Run`, as a `###` part so scripts/smoke doesn't start it, with the
+/// cable.yml channel its broadcasts go out on; a tree that isn't on
+/// Sidekiq has no such part.
+#[test]
+fn the_readme_says_how_to_run_the_worker() {
+    for (target, worker) in [(BuildTarget::Spinel, "./build/bin/blog sidekiq"), (BuildTarget::Ruby, "bundle exec ruby sidekiq.rb"), (BuildTarget::Jruby, "jruby -S bundle exec jruby sidekiq.rb")] {
+        let (emitted, errors) = on_sidekiq().write("config/cable.yml", CABLE_REDIS).emit(target);
+        assert!(errors.is_empty(), "{errors:#?}");
+        let readme = read(&emitted, "README.md");
+        let run = readme.find("## Run\n").unwrap_or_else(|| panic!("{readme}"));
+        let jobs = readme.find("### Jobs on Sidekiq\n").unwrap_or_else(|| panic!("{readme}"));
+        let next = readme[run + 1..].find("\n## ").map(|i| run + 1 + i).unwrap_or(readme.len());
+        assert!(run < jobs && jobs < next, "{readme}");
+        assert!(readme[jobs..next].contains(&format!("```sh\n{worker}\n```\n")), "{readme}");
+        assert!(readme[jobs..next].contains("`depot_production:<stream>`"), "{readme}");
+    }
+    let (plain, _) = on_sidekiq().emit(BuildTarget::Ruby);
+    assert!(read(&plain, "README.md").contains("reaches no browser"));
+    let (off, _) = emit_and_run::real_blog().emit(BuildTarget::Ruby);
+    assert!(!read(&off, "README.md").contains("### Jobs on Sidekiq"));
 }

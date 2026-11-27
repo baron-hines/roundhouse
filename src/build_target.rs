@@ -229,6 +229,52 @@ impl BuildTarget {
         }
     }
 
+    /// Does the target store a PostgreSQL array column (`array: true`) as
+    /// the Array Rails reads (JSON text in SQLite), typing it
+    /// `Array[<element>]`? The Ruby-family runtimes do
+    /// (`lower::array_columns`). Every other target that stores rows
+    /// holds one element and reports the column
+    /// (`project::report_array_columns`).
+    /// Does the target's `numericality:` check parse a String the way Rails'
+    /// validator does (`ActiveSupport.numericality_number`)? The
+    /// Ruby-family runtimes do, and `Blog` is the Rails source itself,
+    /// whose validator does; on the others an untyped attribute's
+    /// `numericality:` is the reported gap
+    /// (`ingest::app::refuse_numericality_allow_on_untyped`).
+    pub fn parses_numericality_input(self) -> bool {
+        matches!(self, BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Spinel | BuildTarget::Blog)
+    }
+
+    /// Does the target lower `accepts_nested_attributes_for`
+    /// (`ingest::nested_attributes`)? Its generated model source is
+    /// verified on the Ruby-family runtimes; elsewhere the declaration
+    /// stays the reported gap.
+    pub fn lowers_nested_attributes(self) -> bool {
+        matches!(self, BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Spinel)
+    }
+
+    /// Whether `validates_with` expands to a call of the validator from
+    /// the model's validation (`ingest::validates_with`), and validator
+    /// classes keep their `ActiveModel::Validator` base: the targets whose
+    /// runtime defines that base and whose emit is verified.
+    pub fn lowers_validates_with(self) -> bool {
+        matches!(self, BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Spinel)
+    }
+
+    pub fn applies_route_defaults(self) -> bool {
+        matches!(self, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Spinel)
+    }
+
+    /// Whether the router asks a guarded route's request constraints (`lower::route_guards`)
+    /// once its path matches; elsewhere those routes are refused. `Blog` is the Rails source, which Rails routes.
+    pub fn asks_route_guards(self) -> bool {
+        matches!(self, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Spinel)
+    }
+
+    pub fn stores_array_columns(self) -> bool {
+        matches!(self, BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Spinel)
+    }
+
     /// Does the emitted persistence runtime provide the single-statement
     /// `Db.exec_returning` operation needed to hydrate generated columns
     /// from the INSERT that created them? The Ruby-family runtimes each

@@ -233,42 +233,36 @@ module Rails
   end
 end
 
-# Rails' time helpers stub `Time.now`: under `travel_to` / `freeze_time`
-# app and test code that asks the stdlib clock — `Time.current`, which
-# the lowering grounds to `Time.now.utc`, included — reads the traveled
-# instant, the same one `ActiveSupport.now` (and so every stamped
-# `created_at`) reads. The harness's helpers move `ActiveSupport`'s
-# clock; this lets `Time.now` follow it while one is set, and reads
-# the real clock otherwise. A compiled tree cannot redefine `Time.now`;
-# there the test clock reaches only what goes through `ActiveSupport`.
-class << Time
-  alias_method :__roundhouse_real_now, :now
+# Rails' own ActiveSupport::Testing::TimeHelpers, in place of the shared
+# harness's offset stand-in: `travel_to` / `travel` / `freeze_time` stub
+# `Time.now`, `Time.new`, `Date.today` and `DateTime.now`, so app and
+# test code reading any of them — `Time.current`, which the lowering
+# grounds to `Time.now.utc`, included — sees the traveled instant, held
+# still as Rails holds it. `ActiveSupport.now` (every stamped
+# `created_at`) reads `Time.now`, so it moves with them. The stand-in
+# moved only `ActiveSupport.now` and `Time.now`, so `Date.today` inside
+# `travel_to` answered the real date.
+require_relative "../runtime/active_support_testing_time_helpers"
 
-  def now(**options)
-    traveling = ActiveSupport::FROZEN_AT[0] != 0 || ActiveSupport::TRAVEL_OFFSET[0] != 0
-    return __roundhouse_real_now(**options) unless traveling && options.empty?
-    ActiveSupport.clock
-  end
-end
-
-module ActiveSupport
-  def self.clock
-    frozen = FROZEN_AT[0]
-    return Time.at(frozen) if frozen != 0
-    Time.__roundhouse_real_now + TRAVEL_OFFSET[0]
+# Minitest's `after_teardown`, where TimeHelpers travels back: the
+# emitted driver calls only `__t.teardown`, the test class's own, which
+# need not call super. Prepended to each test class, this runs the hook
+# once that teardown returns or raises, so a stub cannot outlive its
+# test into the next one's fixture reset (which runs before `setup`).
+module RoundhouseAfterTeardown
+  def teardown
+    super
+  ensure
+    after_teardown
   end
 end
 
 class TestBase
-  # Relative to the REAL clock, which is what the offset is kept against;
-  # `Time.now` may already be traveled.
-  def travel_to(target)
-    ActiveSupport.travel(target.to_i - Time.__roundhouse_real_now.to_i)
-    return unless block_given?
-    begin
-      yield
-    ensure
-      travel_back
-    end
+  remove_method :travel_to, :travel, :travel_back, :freeze_time
+  include ActiveSupport::Testing::TimeHelpers
+
+  def self.inherited(subclass)
+    super
+    subclass.prepend(RoundhouseAfterTeardown)
   end
 end

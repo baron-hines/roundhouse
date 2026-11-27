@@ -211,8 +211,8 @@ pub(super) fn body_contains_yield(body: &Expr) -> bool {
         ExprNode::BeginRescue { body: inner, rescues, else_branch, ensure, .. } => {
             body_contains_yield(inner)
                 || rescues.iter().any(|r| body_contains_yield(&r.body))
-                || else_branch.as_ref().is_some_and(body_contains_yield)
-                || ensure.as_ref().is_some_and(body_contains_yield)
+                || else_branch.as_deref().is_some_and(body_contains_yield)
+                || ensure.as_deref().is_some_and(body_contains_yield)
         }
         _ => false,
     }
@@ -223,6 +223,8 @@ pub(super) fn body_contains_yield(body: &Expr) -> bool {
 pub(super) fn emit_body(body: &Expr, return_ty: &Ty) -> String {
     let is_void = matches!(return_ty, Ty::Nil);
     match &*body.node {
+        // Not `return <expr>`: Python has no try-expression, so a whole-body `begin` returns from inside its `try`
+        ExprNode::BeginRescue { .. } => emit_stmt(body, true, is_void),
         ExprNode::Assign { target: LValue::Ivar { .. }, value } => {
             if is_void {
                 // Statement route keeps the store: `self.x = v`. The
@@ -498,9 +500,22 @@ pub(super) fn emit_stmt(e: &Expr, is_last: bool, void_return: bool) -> String {
         {
             match &*then_branch.node {
                 ExprNode::Seq { .. } => {
-                    format!("if {}:\n{}", emit_expr(cond), emit_block_body(then_branch, void_return))
+                    // A body the lowering emptied (`<% x = x %>` dropped) still needs a statement.
+                    format!("if {}:\n{}", emit_expr(cond), block_or_pass(then_branch, void_return))
                 }
-                _ => format!("if {}: {}", emit_expr(cond), emit_stmt(then_branch, false, true)),
+                _ => {
+                    let body = emit_stmt(then_branch, false, true);
+                    // Only a simple statement may follow `if c:` on its
+                    // line; a compound one (a nested `if`, a loop, or
+                    // anything spanning lines) takes the block form.
+                    let compound = body.contains('\n')
+                        || ["if ", "for ", "while ", "with ", "try:", "def ", "class "].iter().any(|k| body.starts_with(k));
+                    if compound {
+                        format!("if {}:\n{}", emit_expr(cond), super::shared::indent_py(&body))
+                    } else {
+                        format!("if {}: {}", emit_expr(cond), body)
+                    }
+                }
             }
         }
         // General `if / elsif / else` in statement position (a non-empty
@@ -524,9 +539,12 @@ pub(super) fn emit_stmt(e: &Expr, is_last: bool, void_return: bool) -> String {
                 && args.is_empty()
                 && matches!(&*block.node, ExprNode::Lambda { .. }) =>
         {
-            let ExprNode::Lambda { params, body, .. } = &*block.node else { unreachable!() };
+            let ExprNode::Lambda { params, rest_param, extra_params, block_param, body, .. } = &*block.node else { unreachable!() };
             let pnames: Vec<String> = params.iter().map(|s| s.to_string()).collect();
-            emit_for_each(r, &pnames, body).unwrap_or_else(|| {
+            // `|*args|` and the other non-positional parameters leave
+            // `params` empty, and the loop wouldn't bind what the body reads.
+            let other_params = rest_param.is_some() || !extra_params.is_empty() || block_param.is_some();
+            (!other_params).then(|| emit_for_each(r, &pnames, body)).flatten().unwrap_or_else(|| {
                 crate::emit::diagnostics::report_unsupported(e.span, "python", "each-block", "")
             })
         }
@@ -539,10 +557,13 @@ pub(super) fn emit_stmt(e: &Expr, is_last: bool, void_return: bool) -> String {
         // An empty `classes` list is Ruby's implicit StandardError;
         // `Exception` is the nearest Python spelling that still catches
         // what the ensure must survive.
-        ExprNode::BeginRescue { body, rescues, else_branch, ensure, .. }
-            if !is_last || void_return =>
-        {
-            let mut out = format!("try:\n{}", emit_block_body(body, true));
+        // Not statement position alone: a method whose last expression is the `begin` returns its value from inside `try`
+        ExprNode::BeginRescue { body, rescues, else_branch, ensure, .. } => {
+            let returning = is_last && !void_return;
+            let arm = |e: &Expr| if returning { emit_block_body_returning(e) } else { emit_block_body(e, true) };
+            // Not returned from the `try` when there is an `else`: a `return` there skips Python's `else:`, whose value is the begin's
+            let body_arm = if else_branch.is_some() { emit_block_body(body, true) } else { arm(body) };
+            let mut out = format!("try:\n{}", body_arm);
             for r in rescues {
                 let classes: Vec<String> = r.classes.iter().map(emit_expr).collect();
                 let head = match (classes.is_empty(), &r.binding) {
@@ -553,10 +574,10 @@ pub(super) fn emit_stmt(e: &Expr, is_last: bool, void_return: bool) -> String {
                         format!("except ({}) as {}:", classes.join(", "), b.as_str())
                     }
                 };
-                out.push_str(&format!("\n{head}\n{}", emit_block_body(&r.body, true)));
+                out.push_str(&format!("\n{head}\n{}", arm(&r.body)));
             }
             if let Some(eb) = else_branch {
-                out.push_str(&format!("\nelse:\n{}", emit_block_body(eb, true)));
+                out.push_str(&format!("\nelse:\n{}", arm(eb)));
             }
             if let Some(en) = ensure {
                 out.push_str(&format!("\nfinally:\n{}", emit_block_body(en, true)));
@@ -574,7 +595,7 @@ pub(super) fn emit_stmt(e: &Expr, is_last: bool, void_return: bool) -> String {
         ExprNode::While { cond, body, until_form } => {
             let c = emit_expr(cond);
             let c = if *until_form { format!("not ({c})") } else { c };
-            format!("while {c}:\n{}", emit_block_body(body, true))
+            format!("while {c}:\n{}", block_or_pass(body, true))
         }
         // Valueless `next`/`break` in statement position: the each/while
         // bodies above emit as native Python loops, where these are
@@ -655,11 +676,41 @@ fn lvalue_str(t: &LValue) -> String {
 /// Kotlin's namespaces-collapse rule. App-level namespaces
 /// (`Views::Articles`) keep their dotted form — the overlay defines
 /// them as real classes.
+/// The Python builtin a Ruby core error raises and is subclassed as.
+pub(super) fn python_core_error(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "StandardError" => "Exception",
+        "ArgumentError" => "ValueError",
+        "NoMethodError" => "AttributeError",
+        "RuntimeError" | "TypeError" | "NameError" | "NotImplementedError" | "KeyError" | "IndexError" => {
+            return Some(match name {
+                "RuntimeError" => "RuntimeError",
+                "TypeError" => "TypeError",
+                "NameError" => "NameError",
+                "NotImplementedError" => "NotImplementedError",
+                "KeyError" => "KeyError",
+                _ => "IndexError",
+            });
+        }
+        _ => return None,
+    })
+}
+
 fn py_const_path(path: &[crate::ident::Symbol]) -> String {
+    // Not passed through: Python has no ArgumentError, and its builtin for the same failure is ValueError
+    if let [only] = path
+        && let Some(builtin) = python_core_error(only.as_str())
+    {
+        return builtin.to_string();
+    }
     match path.first().map(|s| s.as_str()) {
         Some("ActionDispatch" | "ActionController" | "ActionView") if path.len() >= 2 => {
             path.last().unwrap().to_string()
         }
+        // The models the Active Storage and Action Text tables synthesize
+        // are top-level classes (`class Attachment`, `class RichText`);
+        // Python has no `ActiveStorage` / `ActionText` name to qualify them.
+        Some("ActiveStorage" | "ActionText") if path.len() >= 2 => path.last().unwrap().to_string(),
         // A sibling of `Base` in active_record_base.py, not an attribute of its `ActiveRecord` class
         Some("ActiveRecord") if path.len() == 2 && path[1].as_str() == "ErrorDetail" => "ErrorDetail".to_string(),
         _ => path
@@ -707,7 +758,8 @@ fn emit_if_stmt(cond: &Expr, then_branch: &Expr, else_branch: &Expr, void: bool)
 
 /// Emit a `recv.each do |params| body end` call as a native Python `for`
 /// loop. A 2-param block over a Hash iterates `(k, v)` via `.items()`; a
-/// 1-param block over an Array iterates elements directly. Returns `None`
+/// 1-param block over an Array iterates elements directly, and a block
+/// with no parameter over an Array binds `_`. Returns `None`
 /// for shapes outside that (so the caller can degrade rather than emit a
 /// wrong loop) — the block body would otherwise be silently dropped.
 fn emit_for_each(recv: &Expr, params: &[String], body: &Expr) -> Option<String> {
@@ -719,6 +771,8 @@ fn emit_for_each(recv: &Expr, params: &[String], body: &Expr) -> Option<String> 
             (format!("{}, {}", params[0], params[1]), format!("{recv_s}.items()"))
         }
         (1, Some(Ty::Array { .. })) => (params[0].clone(), recv_s),
+        // A block with no parameter runs once per element and binds none.
+        (0, Some(Ty::Array { .. })) => ("_".to_string(), recv_s),
         _ => return None,
     };
     Some(format!("for {vars} in {iter}:\n{}", block_or_pass(body, true)))
@@ -790,6 +844,19 @@ fn block_or_pass(e: &Expr, void: bool) -> String {
 /// (`while`/`if`). A `Seq` becomes one statement per line; anything else
 /// is a single statement. Body statements are never the method's return
 /// value, so `is_last` is false throughout.
+fn emit_block_body_returning(e: &Expr) -> String {
+    let inner = match &*e.node {
+        ExprNode::Seq { exprs } if !exprs.is_empty() => exprs
+            .iter()
+            .enumerate()
+            .map(|(i, s)| emit_stmt(s, i == exprs.len() - 1, false))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => emit_stmt(e, true, false),
+    };
+    super::shared::indent_py(&inner)
+}
+
 fn emit_block_body(e: &Expr, void: bool) -> String {
     let inner = match &*e.node {
         ExprNode::Seq { exprs } => exprs
@@ -850,10 +917,44 @@ pub(super) fn emit_expr(e: &Expr) -> String {
             if matches!(method.as_str(), "map" | "collect")
                 && matches!(&*block.node, ExprNode::Lambda { .. }) =>
         {
-            let ExprNode::Lambda { params, body, .. } = &*block.node else { unreachable!() };
+            let ExprNode::Lambda { params, rest_param, extra_params, block_param, body, .. } = &*block.node else { unreachable!() };
+            let other_params = rest_param.is_some() || !extra_params.is_empty() || block_param.is_some();
+            // An empty block maps each element to nil; it emits no expression.
+            let value = if matches!(&*body.node, ExprNode::Seq { exprs } if exprs.is_empty()) { "None".to_string() } else { emit_expr(body) };
             match params.as_slice() {
-                [p] => format!("[{} for {} in {}]", emit_expr(body), p, emit_expr(recv)),
+                // A comprehension takes one expression: a body of several
+                // statements is refused below, not written into it.
+                [p] if !matches!(&*body.node, ExprNode::Seq { exprs } if exprs.len() > 1) => {
+                    format!("[{} for {} in {}]", value, p, emit_expr(recv))
+                }
+                // A block with no parameter of any kind binds none, as
+                // `each` does (`|*args|` would read an unbound name). A
+                // comprehension takes one expression, so a body of several
+                // statements stays refused below.
+                [] if !other_params && !matches!(&*body.node, ExprNode::Seq { exprs } if exprs.len() > 1) => {
+                    format!("[{} for _ in {}]", value, emit_expr(recv))
+                }
                 _ => crate::emit::diagnostics::report_unsupported(e.span, "python", "map-block", ""),
+            }
+        }
+        // The other one-parameter iterators as comprehensions; any other block is refused, not dropped
+        ExprNode::Send { recv: Some(recv), method, block: Some(block), args, .. }
+            if args.is_empty() && matches!(&*block.node, ExprNode::Lambda { params, .. } if params.len() == 1) =>
+        {
+            let ExprNode::Lambda { params, body, .. } = &*block.node else { unreachable!() };
+            if matches!(&*body.node, ExprNode::Seq { exprs } if exprs.len() > 1) {
+                return crate::emit::diagnostics::report_unsupported(e.span, "python", format!("{method}-block"), "a block of several statements has no comprehension form");
+            }
+            // Parenthesized: a ternary body after a comprehension's `if` is a syntax error bare
+            let (p, b, r) = (&params[0], format!("({})", emit_expr(body)), emit_expr(recv));
+            match method.as_str() {
+                "find" | "detect" => format!("next(({p} for {p} in {r} if {b}), None)"),
+                "select" | "filter" => format!("[{p} for {p} in {r} if {b}]"),
+                "reject" => format!("[{p} for {p} in {r} if not ({b})]"),
+                "any?" => format!("any({b} for {p} in {r})"),
+                "all?" => format!("all({b} for {p} in {r})"),
+                "none?" => format!("not any({b} for {p} in {r})"),
+                other => crate::emit::diagnostics::report_unsupported(e.span, "python", format!("{other}-block"), "no Python expression form for this block"),
             }
         }
         ExprNode::Send { recv, method, args, parenthesized, .. } => {
@@ -897,13 +998,25 @@ pub(super) fn emit_expr(e: &Expr) -> String {
             let else_s = emit_expr(else_branch);
             format!("{then_s} if {cond_s} else {else_s}")
         }
+        // Not a walrus: the binding must come before the condition reads it, and `:=` lives in the condition
+        ExprNode::Let { name, value, body, .. } => {
+            format!("(lambda {}: {})({})", super::shared::py_ident(name.as_str()), emit_expr(body), emit_expr(value))
+        }
         ExprNode::BoolOp { op, left, right, .. } => {
             use crate::expr::BoolOpKind;
             let op_s = match op {
                 BoolOpKind::Or => "or",
                 BoolOpKind::And => "and",
             };
-            format!("{} {op_s} {}", emit_expr(left), emit_expr(right))
+            // `and` binds tighter than `or`, and a conditional expression
+            // looser than both: an `or` under an `and`, or a conditional
+            // on either side, keeps its parentheses.
+            let operand = |e: &Expr| match &*e.node {
+                ExprNode::BoolOp { op: BoolOpKind::Or, .. } if matches!(op, BoolOpKind::And) => format!("({})", emit_expr(e)),
+                ExprNode::If { .. } => format!("({})", emit_expr(e)),
+                _ => emit_expr(e),
+            };
+            format!("{} {op_s} {}", operand(left), operand(right))
         }
         ExprNode::Array { elements, .. } => {
             let parts: Vec<String> = elements.iter().map(emit_expr).collect();
@@ -1407,6 +1520,12 @@ pub(super) fn emit_send(recv: Option<&Expr>, method: &str, args: &[Expr], parent
             }
             // Every other `?`/`!` (and `[]`/`[]=`) name is legalized the
             // same way at the definition site, so calls and defs align.
+            // A writer the analyzer resolved to a `Method`-kind `x=` (a
+            // column's own-typed writer over its `_raw` slot) is the
+            // `x_set` def, not a field: `recv.x=(v)` would only shadow it.
+            if parenthesized && args_s.len() == 1 && method.ends_with('=') && !matches!(method, "==" | "!=" | "<=" | ">=" | "===" | "[]=") {
+                return format!("{recv_s}.{}({})", super::shared::py_def_name(method), args_s[0]);
+            }
             let m = super::shared::py_method_name(method);
             if args_s.is_empty() {
                 // A zero-arg send is either an attribute read (`parent.id`,
@@ -1514,6 +1633,8 @@ fn map_builtin_method(recv: &str, method: &str, ty: Option<&Ty>, args_s: &[Strin
         // in parens since `in` is a comparison-precedence operator and may
         // sit inside a larger boolean expression.
         "include?" if one_arg && is_seq => format!("({} in {recv})", args_s[0]),
+        // Not list.index as it is: Python raises for a miss, and Ruby answers nil
+        "index" if one_arg && is_seq => format!("({recv}.index({a}) if {a} in {recv} else None)", a = args_s[0]),
         // Ruby `Hash#fetch(k)` raises on a missing key — Python `d[k]`
         // raises KeyError, the same contract; `fetch(k, default)` is
         // `d.get(k, default)`. Gated to Hash so Flash#fetch /
@@ -1541,13 +1662,20 @@ fn map_builtin_method(recv: &str, method: &str, ty: Option<&Ty>, args_s: &[Strin
         // element, so non-Str elems go through `map(str, …)` (`[1, 2].join("-")`
         // is "1-2"; bare `"-".join([1, 2])` is a TypeError). Array[String]
         // stays a bare join.
+        // Ruby `Array#sort` answers a new Array; Python's `list.sort()` sorts in place and answers None.
+        "sort" if is_array && args_s.is_empty() => format!("sorted({recv})"),
         "join" if is_array => {
             let str_elems =
                 matches!(ty, Some(Ty::Array { elem }) if matches!(**elem, Ty::Str));
+            // Ruby's `join` reads a nil element as "", and `str(None)` is
+            // "None". Elements of these types are never nil.
+            let never_nil = matches!(ty, Some(Ty::Array { elem }) if matches!(**elem, Ty::Int | Ty::Float | Ty::Sym));
             let items = if str_elems {
                 recv.to_string()
-            } else {
+            } else if never_nil {
                 format!("map(str, {recv})")
+            } else {
+                format!("\"\" if _x is None else str(_x) for _x in {recv}")
             };
             match args_s.first() {
                 Some(sep) => format!("{sep}.join({items})"),
@@ -1631,6 +1759,8 @@ fn emit_operand(e: &Expr, parent: u8, right: bool) -> String {
                 None => false,
             }
         }
+        // A conditional or boolean operand binds looser than any infix here: `out + (html ? a : b)` bare reads as `(out + a) if html else b`
+        ExprNode::If { .. } | ExprNode::BoolOp { .. } => true,
         // `-2 ** 2` is `-(2 ** 2)` in Python.
         ExprNode::Lit { value: Literal::Int { value } } => parent == 7 && !right && *value < 0,
         ExprNode::Lit { value: Literal::Float { value } } => {

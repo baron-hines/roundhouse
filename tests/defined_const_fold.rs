@@ -54,6 +54,7 @@ const PROBE: &str = r#"class Probe
   def ivar; defined?(@memo); end
   def local; defined?(thing); end
   def method_call; defined?(Rails.logger); end
+  def unmodeled_method_call; defined?(Rails.weird); end
   def guard_false; x = 1; x += 1 if defined?(ActsAsTenant); x; end
   def guard_true; x = 1; x += 1 if defined?(ActiveStorage); x; end
   def early_return; return :out unless defined?(::Widget); :in; end
@@ -62,6 +63,10 @@ const PROBE: &str = r#"class Probe
   def negated; !defined?(ActsAsTenant); end
   def compacted; [:a, (:b if defined?(OmniAuth))].compact; end
   def value_of_true; v = defined?(Widget); v; end
+  def trailing_guard; @on && defined?(Widget) && go; end
+  def folded_ternary_label; @on && (defined?(Widget) ? "w" : "x"); end
+  def value_conjunction; @on && defined?(Widget); end
+  def guarded_conjunction; go if @on && defined?(Widget); end
 end
 "#;
 
@@ -70,8 +75,10 @@ fn ingest(lock: Option<&str>) -> roundhouse::App {
         ("config/application.rb", APPLICATION),
         ("lib/probe.rb", PROBE),
         // `defined?` while the tree loads depends on load order.
-        ("lib/early.rb", "class Early\n  SEEN = defined?(Widget)\n  FRAMEWORK = defined?(ActiveStorage)\n  ABSENT = defined?(ActsAsTenant)\n  def later; defined?(Widget); end\nend\n"),
+        ("lib/early.rb", "class Early\n  SEEN = defined?(Widget)\n  FRAMEWORK = defined?(ActiveStorage)\n  RAILS_ENV = defined?(Rails.env)\n  ABSENT = defined?(ActsAsTenant)\n  def later; defined?(Widget); end\nend\n"),
         ("lib/widget.rb", "module Widget\nend\n"),
+        // A class of the tree's under `Rails`, which Rails itself still loads first.
+        ("lib/rails/probe_railtie.rb", "module Rails\n  class ProbeRailtie\n  end\nend\n"),
         ("lib/widget/part.rb", "module Widget\n  class Part\n  end\nend\n"),
         (
             "app/views/widgets/_badge.html.erb",
@@ -110,6 +117,8 @@ fn provable_constants_fold_to_true() {
     }
     // Ruby's value for a defined constant is the string, not `true`.
     assert_eq!(b["value_of_true"], "v = \"constant\"\nv");
+    // A class method the runtime models on a loaded framework root.
+    assert_eq!(b["method_call"], "\"method\"");
 }
 
 #[test]
@@ -136,7 +145,8 @@ fn undecidable_guards_stay_defined() {
     // Not constants.
     assert_eq!(b["ivar"], "defined?(@memo)");
     assert_eq!(b["local"], "defined?(thing)");
-    assert_eq!(b["method_call"], "defined?(Rails.logger)");
+    // A framework method the runtime does not model.
+    assert_eq!(b["unmodeled_method_call"], "defined?(Rails.weird)");
 }
 
 #[test]
@@ -166,6 +176,14 @@ fn folded_guards_prune_their_dead_branch() {
     assert!(!conj.contains("defined?") && conj.contains("Rails.respond_to?(:logger)"), "{conj}");
     assert_eq!(b["disabled_conjunction"], "nil");
     assert_eq!(b["negated"], "true");
+    // A folded operand stays truthy without a string literal in a condition.
+    assert_eq!(b["trailing_guard"], "@on && true && go");
+    // A fold that leaves the source's own String keeps its value.
+    assert_eq!(b["folded_ternary_label"], "@on && \"w\"");
+    // `&&` returns its operand: a value keeps `defined?`'s String, a
+    // condition reads only its truth.
+    assert_eq!(b["value_conjunction"], "@on && \"constant\"");
+    assert!(b["guarded_conjunction"].contains("@on && true"), "{}", b["guarded_conjunction"]);
     assert!(!b["compacted"].contains("OmniAuth") && !b["compacted"].contains(":b"), "{}", b["compacted"]);
 }
 
@@ -189,6 +207,8 @@ fn load_time_references_to_tree_names_do_not_fold_true() {
     // Framework and absent names do not depend on app load order.
     assert_eq!(constant("FRAMEWORK"), "\"constant\"");
     assert_eq!(constant("ABSENT"), "nil");
+    // Rails loads before the tree's own `Rails::ProbeRailtie`.
+    assert_eq!(constant("RAILS_ENV"), "\"method\"");
     // A method body runs after load.
     assert_eq!(emit_expr(&early.methods[0].body), "\"constant\"");
 }

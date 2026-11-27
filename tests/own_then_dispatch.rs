@@ -7,17 +7,15 @@
 //! `load_client.then { |client| … }` as `no known method then on
 //! Promise`.
 
+#[path = "support/scratch.rs"]
+mod scratch;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn check(name: &str, account: &str) -> String {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!(
-        "rh_own_then_dispatch_{}_{name}_{n}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = scratch::dir(&format!("rh_own_then_dispatch_{name}_{n}"));
     let files = [
         ("roundhouse.yml", "test_paths:\n  - test\n"),
         ("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table :accounts do |t|\n    t.string :name\n  end\nend\n"),
@@ -46,9 +44,10 @@ fn the_owner_answers_and_kernel_then_still_hands_back_the_block() {
 
 #[test]
 fn a_class_side_then_answers_its_declaration_not_kernels() {
-    let account = "class Account < ApplicationRecord\n  #: () { (untyped) -> untyped } -> Account\n  def self.then(&block) = self\n  #: -> untyped\n  def use = [Account.then { |v| v }.zzz, \"x\".then { |s| s.upcase }.yyy]\nend\n";
+    // Class-side `self` is the class object, which the return contract names.
+    let account = "class Account < ApplicationRecord\n  #: () { (untyped) -> untyped } -> singleton(Account)\n  def self.then(&block) = self\n  #: -> untyped\n  def use = [Account.then { |v| v }.zzz, \"x\".then { |s| s.upcase }.yyy]\nend\n";
     let text = check("class", account);
     assert!(!text.contains("no known method `then`"), "{text}");
-    assert!(text.contains("no known method `zzz` on Account"), "{text}");
+    assert!(text.contains("no known method `zzz` on Class[Account]"), "{text}");
     assert!(text.contains("no known method `yyy` on String"), "{text}");
 }

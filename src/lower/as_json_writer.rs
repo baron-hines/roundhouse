@@ -292,7 +292,7 @@ fn column_type(table: Option<&Table>, name: &Symbol) -> Option<ColumnType> {
 /// `YYYY-MM-DD`, or nil for NULL and for the "" an unset nonnullable
 /// raw slot (or an adapter's NULL) holds. Same seam as the public
 /// reader, so JSON never disagrees with `record.<col>`.
-fn date_column_text(raw: Expr) -> Expr {
+pub(super) fn date_column_text(raw: Expr) -> Expr {
     let date = with_ty(
         send(Some(const_ref("ActiveSupport")), "parse_db_date", vec![raw], true),
         Ty::Union { variants: vec![Ty::Date, Ty::Nil].into() },

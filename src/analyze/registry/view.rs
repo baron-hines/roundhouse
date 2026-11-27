@@ -4,13 +4,55 @@
 //! and the app/helpers fold), and the `ActionDispatch::Flash::FlashHash`
 //! class. Extracted verbatim from `Analyzer::with_adapter`.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+use crate::det::HashMap;
 
 use crate::analyze::ClassInfo;
 use crate::expr::{ExprNode, Literal};
 use crate::App;
 use crate::ident::{ClassId, Symbol};
 use crate::ty::Ty;
+
+// The index also contains singleton defs and promoted module functions.
+// Only a retained instance body overrides the catalog's instance return;
+// the other spellings keep their existing concern-fold behavior.
+pub(in crate::analyze) fn has_instance_helper(app: &App, name: &Symbol, owner: &ClassId) -> bool {
+    app.library_classes.iter().any(|class| &class.name == owner && class.methods.iter().any(|method| {
+        &method.name == name && method.receiver == crate::dialect::MethodReceiver::Instance
+    })) || app.controllers.iter().any(|controller| {
+        &controller.name == owner && controller.actions().any(|action| &action.name == name)
+    })
+}
+
+/// [`has_instance_helper`] for every owner `helper_method_index` names,
+/// from one walk of the app (the harvest asks it for each helper, each
+/// round).
+pub(in crate::analyze) struct InstanceHelpers<'a> {
+    defined: crate::det::HashSet<(&'a ClassId, &'a Symbol)>,
+}
+
+impl<'a> InstanceHelpers<'a> {
+    pub(in crate::analyze) fn of(app: &'a App) -> Self {
+        let owners: crate::det::HashSet<&ClassId> = app.helper_method_index.values().collect();
+        let mut defined = crate::det::HashSet::default();
+        for class in app.library_classes.iter().filter(|class| owners.contains(&class.name)) {
+            for method in class.methods.iter().filter(|m| m.receiver == crate::dialect::MethodReceiver::Instance) {
+                defined.insert((&class.name, &method.name));
+            }
+        }
+        for controller in app.controllers.iter().filter(|c| owners.contains(&c.name)) {
+            for action in controller.actions() {
+                defined.insert((&controller.name, &action.name));
+            }
+        }
+        Self { defined }
+    }
+
+    /// [`has_instance_helper`] of an owner `helper_method_index` names.
+    pub(in crate::analyze) fn has(&self, name: &Symbol, owner: &ClassId) -> bool {
+        self.defined.contains(&(owner, name))
+    }
+}
 
 pub(in crate::analyze) fn register(
     classes: &mut HashMap<ClassId, ClassInfo>,
@@ -46,6 +88,11 @@ pub(in crate::analyze) fn register(
     // `form.object` is the form's model (unknown model → gradual);
     // nested `fields_for`/`fields` yield another builder.
     form_builder.instance_methods.insert(Symbol::from("object"), Ty::Untyped);
+    // Rails' `class_attribute :field_helpers`, which a builder subclass reads in its body (maybe's `StyledFormBuilder`);
+    // the Ruby family's overlay answers it (`action_view_form_builder.rb`).
+    let symbols = Ty::Array { elem: std::sync::Arc::new(Ty::Sym) };
+    form_builder.class_methods.insert(Symbol::from("field_helpers"), symbols.clone());
+    form_builder.instance_methods.insert(Symbol::from("field_helpers"), symbols);
     for m in ["fields_for", "fields"] {
         form_builder
             .instance_methods
@@ -243,19 +290,42 @@ pub(in crate::analyze) fn register(
             .entry(Symbol::from(m))
             .or_insert_with(|| super::block_fn(&Ty::Untyped, Ty::Str));
     }
-    // Helper-fold: Rails mixes EVERY module under app/helpers into
-    // every view (`helpers :all` default). Declaring them as
-    // `include`s of the view context lets `fold_concern_surfaces`
-    // copy each helper's typed surface onto `ActionView::Base` at
-    // every harvest round — so a bare `material_symbol(…)` in a
-    // template resolves exactly like a concern method on a model,
-    // refining as the fixpoint types helper bodies. Hardcoded
-    // framework entries above win over a same-named app helper
-    // (own-entry-wins in the fold); acceptable, both are Str-shaped
-    // in practice.
+    // Rails mixes app helpers into every view (`helpers :all` default).
+    // Keep their includes for context, but the helper index selects each
+    // method's owner. Until harvest_returns_to_registry projects that
+    // owner's return, calls are gradual, not the framework's answer or
+    // another module's signature selected by the generic concern fold.
+    for (name, owner) in &app.helper_method_index {
+        if has_instance_helper(app, name, owner) {
+            action_view.instance_methods.insert(name.clone(), Ty::Untyped);
+        }
+    }
     let helper_modules: BTreeSet<ClassId> =
         app.helper_method_index.values().cloned().collect();
     action_view.includes.extend(helper_modules);
+    // What a gem's `ActiveSupport.on_load(:action_view) { include M }` mixes into every view (simple_form's
+    // `ActionViewExtensions::FormHelper`): its methods answer a template's receiverless calls, as Rails' do.
+    for lc in app.library_classes.iter().filter(|c| c.name.0.as_str() == "ActionView::Base") {
+        for m in &lc.includes {
+            if !action_view.includes.contains(m) {
+                action_view.includes.push(m.clone());
+            }
+            for name in app.library_classes.iter().filter(|c| c.name == *m).flat_map(|c| c.methods.iter()).filter(|d| d.receiver == crate::dialect::MethodReceiver::Instance).map(|d| d.name.clone()) {
+                action_view.instance_methods.remove(&name);
+            }
+        }
+    }
+    // pagy9.rb's `Pagy::Frontend#pagy_url_for`, for an app whose helper includes the module, as Rails' views see it.
+    if app.gem_lock.as_ref().is_some_and(|lock| lock.has("pagy"))
+        && crate::ingest::pagy_locked_before_43(app)
+        && app
+            .library_classes
+            .iter()
+            .filter(|c| app.helper_modules.contains(&c.name) || c.name.0.as_str() == "ActionView::Base")
+            .any(|c| c.includes.iter().any(|m| m.0.as_str().trim_start_matches("::") == "Pagy::Frontend"))
+    {
+        action_view.instance_methods.insert(Symbol::from("pagy_url_for"), Ty::Str);
+    }
     classes.insert(ClassId(Symbol::from("ActionView::Base")), action_view);
 
     // `ActionView::ViewHelpers` itself, called by its constant — the
@@ -289,6 +359,13 @@ pub(in crate::analyze) fn register(
             args: vec![].into(),
         };
         for (m, ty) in [
+            ("to_session_value", Ty::Union { variants: vec![Ty::Hash {
+                key: std::sync::Arc::new(Ty::Str),
+                value: std::sync::Arc::new(Ty::Union { variants: vec![
+                    Ty::Array { elem: std::sync::Arc::new(Ty::Str) },
+                    Ty::Hash { key: std::sync::Arc::new(Ty::Str), value: std::sync::Arc::new(Ty::Str) },
+                ].into() }),
+            }, Ty::Nil].into() }),
             ("[]", Ty::Str),
             ("[]=", Ty::Nil),
             ("store", Ty::Nil),

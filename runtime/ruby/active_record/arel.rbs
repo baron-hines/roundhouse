@@ -1,5 +1,8 @@
 module Arel
-  class BindError < StandardError
+  class ArelError < StandardError
+  end
+
+  class BindError < ArelError
   end
 
   def self.sql: (String fragment, *(Arel::Nodes::Node | String | Integer | Float | bool | nil) positional, **(Arel::Nodes::Node | String | Integer | Float | bool | nil) named) -> Arel::Nodes::SqlLiteral

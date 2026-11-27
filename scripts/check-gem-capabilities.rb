@@ -197,7 +197,7 @@ class CorpusRun
     relative_source = Pathname.new(source.delete_suffix('.rb')).relative_path_from(Pathname.new(work)).to_s
     File.write("#{work}/driver.rb", requires + "require_relative #{relative_source.inspect}\nrequire_relative \"independent_contract\"\n")
     native_bin = "#{dir}/#{emitted ? 'emitted' : 'original'}-contract"
-    compile = step(stages, "compile", [binary, "--require-gate", *flags, "driver.rb", "-o", native_bin], dir: work, artifacts: [native_bin], failure: "rejected")
+    compile = step(stages, "compile", [binary, "--strict-require", *flags, "driver.rb", "-o", native_bin], dir: work, artifacts: [native_bin], failure: "rejected")
     lane["binary_sha256"] = Evidence.sha(native_bin)
     if compile["status"] == "pass"
       step(stages, "binary_contract", [native_bin], dir: work, expected: row.fetch("expected_stdout"))

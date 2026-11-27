@@ -4,17 +4,37 @@
 //! (active_support/error_reporter.rb); `handle`, `record`, `unexpected`,
 //! `disable`, middleware and the reported-once rule; an event reaches a
 //! subscriber with its name, filtered payload, tags and context
-//! (active_support/event_reporter.rb). `RH_RAILS_ORACLE=<version>` pins the
-//! activesupport the native control loads.
+//! (active_support/event_reporter.rb). The native control loads the Rails
+//! `tests/support/rails_oracle.rb` picks (`RH_RAILS_ORACLE`).
 //!
 //! A report to an error reporter with no subscriber is not here: Rails
 //! drops it and the runtime logs it (`rails_error_report_logs_at_its_severity`
 //! in tests/emit_and_run/active_support_extensions.rs).
 
+#[path = "support/prerequisite.rs"]
+mod prerequisite;
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
 use std::process::Command;
+
+const ORACLE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/rails_oracle.rb");
+
+/// Whether the Rails oracle's activesupport is there; a run without it
+/// says so and passes, as `docs/development/testing.md` asks. A probe that
+/// cannot run (a broken oracle) fails rather than skips.
+fn oracle_available() -> bool {
+    let probe = Command::new("ruby")
+        .args(["-e", &format!("require {ORACLE:?}\nputs RailsOracle.available?(\"activesupport\")")])
+        .output()
+        .expect("ruby");
+    let answer = String::from_utf8_lossy(&probe.stdout).trim().to_string();
+    assert!(probe.status.success() && (answer == "true" || answer == "false"), "oracle probe failed: {answer}\n{}", String::from_utf8_lossy(&probe.stderr));
+    if answer == "false" {
+        prerequisite::missing("the Rails oracle's activesupport is not available");
+    }
+    answer == "true"
+}
 
 /// App code, written once and run both natively and emitted.
 const SURFACE: &str = r####"module ReporterSurface
@@ -143,11 +163,13 @@ with.context payload=nil tags={} context={tenant: "t1"}
 
 #[test]
 fn native_rails_answers() {
-    let pin = std::env::var("RH_RAILS_ORACLE").unwrap_or_else(|_| "8.1.4".to_string());
+    if !oracle_available() {
+        return;
+    }
     let output = Command::new("ruby")
         .args(["-e"])
         .arg(format!(
-            "gem \"activesupport\", \"{pin}\"\nrequire \"active_support\"\nrequire \"active_support/event_reporter\"\nrequire \"active_support/error_reporter\"\nrequire \"active_support/execution_context\"\nrequire \"active_support/core_ext/hash/keys\"\nrequire \"active_support/core_ext/object/deep_dup\"\nmodule Rails\n  def self.error = ActiveSupport.error_reporter\n  def self.event = ActiveSupport.event_reporter\nend\n{SURFACE}\nputs ReporterSurface.report\n"
+            "require {ORACLE:?}\nRailsOracle.activate(\"activesupport\")\nrequire \"active_support\"\nrequire \"active_support/event_reporter\"\nrequire \"active_support/error_reporter\"\nrequire \"active_support/execution_context\"\nrequire \"active_support/core_ext/hash/keys\"\nrequire \"active_support/core_ext/object/deep_dup\"\nmodule Rails\n  def self.error = ActiveSupport.error_reporter\n  def self.event = ActiveSupport.event_reporter\nend\n{SURFACE}\nputs ReporterSurface.report\n"
         ))
         .output()
         .expect("native Ruby control");

@@ -329,11 +329,10 @@ pub(super) fn synthesize<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult<O
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vfs::MapVfs;
-    use std::collections::HashMap;
+    use crate::vfs::{FileTree, MapVfs};
 
     fn synth(files: &[(&str, &str)]) -> IngestResult<Option<String>> {
-        let map: HashMap<PathBuf, Vec<u8>> =
+        let map: FileTree =
             files.iter().map(|(p, s)| (PathBuf::from("/app").join(p), s.as_bytes().to_vec())).collect();
         synthesize(&MapVfs::new(map), Path::new("/app"))
     }

@@ -212,6 +212,43 @@ fn pushes_match_sidekiq() {
     }
 }
 
+/// The real connection (`runtime/spinel/sidekiq/sidekiq_redis.rb`) over
+/// a scripted stand-in for the redis gem: a connection error, the
+/// first connect's included, takes one reconnect by default, or as many
+/// as the app's `reconnect_attempts:` gives, each after its delay; a
+/// command error takes none. `Redis.new` gets the app's `username:`,
+/// `password:`, `db:` and timeouts, and none of the first three that it
+/// doesn't give; a `db:` it gives is also SELECTed.
+#[test]
+fn a_connection_error_takes_one_reconnect() {
+    let base = option_env!("CARGO_TARGET_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let dir = base.join("roundhouse-sidekiq-push-reconnect");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir scratch");
+    for (from, to) in [
+        ("runtime/spinel/sidekiq/sidekiq_redis.rb", "sidekiq_redis.rb"),
+        ("tests/sidekiq_push/reconnect/redis.rb", "redis.rb"),
+        ("tests/sidekiq_push/reconnect/reconnect.rb", "reconnect.rb"),
+    ] {
+        std::fs::copy(root().join(from), dir.join(to)).expect("copy reconnect source");
+    }
+    let out = Command::new("ruby")
+        .args(["-I.", "reconnect.rb"])
+        .current_dir(&dir)
+        .output()
+        .expect("ruby is on PATH");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        out.status.success() && stdout.lines().any(|l| l == "done"),
+        "the reconnect driver did not finish\n=== stdout ===\n{stdout}\n=== stderr ===\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let failures: Vec<&str> = stdout.lines().filter(|l| l.starts_with("FAIL")).collect();
+    assert!(failures.is_empty(), "reconnect checks failed:\n{}", failures.join("\n"));
+}
+
 /// The output with every per-run value masked, for the spinel twin.
 fn masked_output(stdout: &str) -> String {
     stdout

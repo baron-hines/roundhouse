@@ -110,3 +110,64 @@ end
         "non-errors receiver should be left alone:\n{out}"
     );
 }
+
+/// A model's own accumulator folds even when the app owns the name: an app
+/// may define `full_messages` on its own error collections, and a plain
+/// `ActiveModel::Model` class then read `self.errors.full_messages` on the
+/// emitted Array and raised NoMethodError. The owner's `errors` folds; a
+/// class that is not a model still stands down.
+#[test]
+fn a_models_own_errors_fold_although_the_app_defines_full_messages() {
+    let mut app = App::new();
+    let model = roundhouse::ingest::ingest_model(
+        br#"
+class Draft
+  include ActiveModel::Model
+  attr_accessor :title
+
+  def summary
+    errors.full_messages.join(", ")
+  end
+
+  def own
+    self.errors.full_messages
+  end
+end
+"#,
+        "app/models/draft.rb",
+        &Default::default(),
+        &Default::default(),
+    )
+    .expect("ingest model")
+    .expect("a model");
+    app.models.push(model);
+    let classes = ingest_library_classes(
+        br#"
+class Collection
+  def full_messages
+    ["custom"]
+  end
+
+  def report
+    errors.full_messages
+  end
+end
+"#,
+        "collection.rb",
+    )
+    .expect("ingest library");
+    app.library_classes.extend(classes);
+    Analyzer::new(&app).analyze(&mut app);
+    apply_errors_full_messages_lowering(&mut app);
+    let out = roundhouse::emit::ruby::emit_lowered_models(&app)
+        .into_iter()
+        .chain(emit_library(&app))
+        .filter(|f| f.path.extension().is_some_and(|e| e == "rb"))
+        .map(|f| f.content)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(out.contains(r#"errors.join(", ")"#), "the owner's errors should fold:\n{out}");
+    assert!(out.contains("self.errors\n") || out.contains("self.errors "), "self.errors should fold:\n{out}");
+    assert!(out.contains("errors.full_messages"), "the library class should keep its call:\n{out}");
+    assert_eq!(out.replace("error_full_messages_for", "").matches("full_messages").count(), 2, "{out}");
+}

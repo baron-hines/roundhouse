@@ -18,7 +18,7 @@ use std::path::PathBuf;
 
 use super::EmittedFile;
 use crate::App;
-use crate::ty::Ty;
+use crate::ty::{FnTy, Ty};
 
 const JUNTOS_SQLITE_SOURCE: &str = include_str!("../../runtime/typescript/juntos.ts");
 const JUNTOS_LIBSQL_SOURCE: &str = include_str!("../../runtime/typescript/juntos-libsql.ts");
@@ -36,6 +36,7 @@ const BROADCASTS_SOURCE: &str = include_str!("../../runtime/typescript/broadcast
 // `JsonBuilder.encode_datetime` Date branch is injected into the
 // transpiled json_builder unit (see `patch_json_builder_datetime`).
 const DATETIME_SOURCE: &str = include_str!("../../runtime/typescript/datetime.ts");
+const I18N_HOST_SOURCE: &str = include_str!("../../runtime/typescript/i18n_host.ts");
 const DB_SOURCE: &str = include_str!("../../runtime/typescript/db.ts");
 const PARAM_VALUE_SOURCE: &str = include_str!("../../runtime/typescript/param_value.ts");
 const PARAMS_SOURCE: &str = include_str!("../../runtime/typescript/params.ts");
@@ -114,6 +115,7 @@ mod expr;
 pub(crate) use expr::{array_method_handled, numeric_method_handled, string_method_handled};
 pub mod js_ast;
 mod library;
+pub(crate) use library::nested_class_root;
 mod naming;
 mod package;
 pub mod printer;
@@ -142,7 +144,7 @@ pub fn emit_with_profile(
     app: &App,
     profile: &crate::profile::DeploymentProfile,
 ) -> Vec<EmittedFile> {
-    use std::collections::HashSet;
+    use crate::det::HashSet;
     let extern_names: Vec<&'static str> = profile.adapter().async_seed_methods().to_vec();
     let async_set: HashSet<crate::ident::Symbol> = extern_names
         .iter()
@@ -217,6 +219,10 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
         path: PathBuf::from("src/broadcasts.ts"),
         content: BROADCASTS_SOURCE.to_string(),
     });
+    files.push(EmittedFile {
+        path: PathBuf::from("src/i18n_host.ts"),
+        content: I18N_HOST_SOURCE.to_string(),
+    });
     // Datetime seam — `RhDateTime.parse` for temporal-column getters.
     files.push(EmittedFile {
         path: PathBuf::from("src/datetime.ts"),
@@ -284,7 +290,7 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
     let mut view_lcs = crate::lower::preliminary_view_classes(&app.views, &vctx);
     let view_extras = library::extras_from_lcs(&view_lcs);
 
-    let route_helper_funcs = crate::lower::lower_routes_to_library_functions(app);
+    let route_helper_funcs = crate::lower::lower_routes_to_library_functions_without_hash_query(app);
     let route_helper_extras = library::extras_from_funcs(&route_helper_funcs);
 
     // Collect controller `permit(...)` declarations once so the model
@@ -294,9 +300,10 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
     // of the controller-derived metadata.
     let params_specs =
         crate::lower::controller_to_library::params::collect_specs(&app.controllers);
-    let (mut model_lcs, model_registry) = crate::lower::lower_models_with_registry_and_params(
+    let (mut model_lcs, model_registry) = crate::lower::lower_models_with_registry_params_and_views(
         &app.models,
         &app.schema,
+        &app.views,
         view_extras,
         &params_specs,
     );
@@ -354,6 +361,7 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
             &app.models,
             test_extras,
             &crate::lower::routes::helper_id_segments(app),
+            &crate::lower::routes::direct_helper_names(app),
         )
     };
     let mut test_lcs: Vec<crate::dialect::LibraryClass> = test_lowered
@@ -419,6 +427,12 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
         .iter()
         .flat_map(|u| u.classes.iter().cloned())
         .collect();
+    // A method is taken under the name the class emit writes for it too:
+    // `performed?` is `is_performed()` in TypeScript, `save!` is
+    // `save_bang()`, `name=` is `set_name()`.
+    super::controller_ivars::rename_ivars_shadowing_controller_base(&mut controller_lcs, &runtime_seed_classes, |name| {
+        vec![name.clone(), crate::ident::Symbol::from(library::sanitize_identifier(name.as_str()))]
+    }, |name| name.clone(), &[]);
     let mut expanded_extern_storage: Vec<String> =
         extern_async_names.iter().map(|s| s.to_string()).collect();
 
@@ -511,8 +525,8 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
         // sites — both app-marked names (`Article#comments` whose
         // body calls `Comment.where(...)`) and runtime-marked names
         // (`Base#save`, `Base#is_valid`, `Base#destroy`).
-        let mut all_async_names: std::collections::HashSet<crate::ident::Symbol> =
-            std::collections::HashSet::new();
+        let mut all_async_names: crate::det::HashSet<crate::ident::Symbol> =
+            crate::det::HashSet::default();
         for class in &all_classes {
             for method in &class.methods {
                 if method.is_async {
@@ -652,9 +666,9 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
     // (conservative: a dead predicate's body can keep a runtime method
     // alive, never the reverse). Row/proxy classes in `model_lcs`
     // aren't in the map and pass through unchanged.
-    let shakeable_by_model: std::collections::HashMap<
+    let shakeable_by_model: crate::det::HashMap<
         crate::ident::ClassId,
-        std::collections::HashSet<crate::ident::Symbol>,
+        crate::det::HashSet<crate::ident::Symbol>,
     > = app
         .models
         .iter()
@@ -706,7 +720,7 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
     // these marks, the inheritance-driven flips on (e.g.)
     // `Base#instantiate` would be lost between the global pass
     // and the per-file emit.
-    let runtime_async_marks: std::collections::HashSet<(crate::ident::ClassId, crate::ident::Symbol)> =
+    let runtime_async_marks: crate::det::HashSet<(crate::ident::ClassId, crate::ident::Symbol)> =
         runtime_seed_classes
             .iter()
             .flat_map(|c| {
@@ -809,7 +823,7 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
     // the bare name in the app's (#1228).
     {
         let last = |n: &str| n.rsplit("::").next().unwrap_or(n).to_string();
-        let app_classes: std::collections::HashSet<String> = app
+        let app_classes: crate::det::HashSet<String> = app
             .library_classes
             .iter()
             .map(|c| last(c.name.0.as_str()))
@@ -1120,6 +1134,59 @@ fn append_code(file: &mut EmittedFile, text: &str) {
     }
 }
 
+/// How a generated entry file names a controller: the class its file
+/// exports (the last segment: `Admin::StatsController` is `export class
+/// StatsController`), the local binding, and the dispatch key, which is
+/// the route table's own (`controller_symbol`: `admin__stats`).
+///
+/// A top-level controller is bound under its own name. A namespaced one
+/// is bound under its segments joined (`AdminStatsController`), so it
+/// cannot meet a top-level `StatsController`; when that joined name is a
+/// top-level controller's too (`Mod::MailsController` beside
+/// `ModMailsController`), or an earlier namespaced controller's, it takes
+/// the first free numbered form (`ModMailsController2`).
+fn controller_binding(app: &App, c: &crate::dialect::Controller) -> (String, String, String) {
+    let full = c.name.0.as_str();
+    let exported = full.rsplit("::").next().unwrap_or(full).to_string();
+    let key = crate::lower::routes_to_library::controller_symbol(full);
+    let mut taken: crate::det::HashSet<String> = app
+        .controllers
+        .iter()
+        .map(|o| o.name.0.as_str())
+        .filter(|n| !n.contains("::"))
+        .map(str::to_string)
+        .collect();
+    let mut local = String::new();
+    for other in app.controllers.iter().filter(|o| o.name.0.as_str().contains("::")) {
+        let joined = other.name.0.as_str().split("::").collect::<String>();
+        let name = std::iter::once(joined.clone())
+            .chain((2..).map(|n| format!("{joined}{n}")))
+            .find(|n| !taken.contains(n))
+            .unwrap_or_default();
+        taken.insert(name.clone());
+        if other.name == c.name {
+            local = name;
+            break;
+        }
+    }
+    if local.is_empty() {
+        local = full.to_string();
+    }
+    (exported, local, key)
+}
+
+/// The `import { X } from "<prefix><stem>.js";` line for a controller,
+/// aliased when the class is namespaced.
+fn controller_import(app: &App, c: &crate::dialect::Controller, prefix: &str) -> String {
+    let stem = crate::naming::snake_case(c.name.0.as_str());
+    let (exported, local, _) = controller_binding(app, c);
+    if exported == local {
+        format!("import {{ {exported} }} from \"{prefix}{stem}.js\";\n")
+    } else {
+        format!("import {{ {exported} as {local} }} from \"{prefix}{stem}.js\";\n")
+    }
+}
+
 /// Hand-written `main.ts` shell. Wires together the generated
 /// schema, optional seeds, the routes dispatch table, the imported
 /// controller classes, and the runtime's `startServer`. The server
@@ -1158,11 +1225,7 @@ fn emit_main_ts(app: &App, has_seeds: bool) -> EmittedFile {
         );
     }
     for c in &app.controllers {
-        let stem = crate::naming::snake_case(c.name.0.as_str());
-        let class_name = c.name.0.as_str();
-        s.push_str(&format!(
-            "import {{ {class_name} }} from \"./app/controllers/{stem}.js\";\n"
-        ));
+        s.push_str(&controller_import(app, c, "./app/controllers/"));
     }
     s.push('\n');
     s.push_str("await startServer({\n");
@@ -1184,13 +1247,9 @@ fn emit_main_ts(app: &App, has_seeds: bool) -> EmittedFile {
         }
         s.push_str("  controllers: {\n");
         for c in &app.controllers {
-            let class_name = c.name.0.as_str();
-            // `ArticlesController` → `articles` — same convention as
-            // `controller_symbol` in the routes lowerer.
-            let symbol = crate::naming::snake_case(
-                class_name.strip_suffix("Controller").unwrap_or(class_name),
-            );
-            s.push_str(&format!("    {symbol}: {class_name},\n"));
+            // `ArticlesController` → `articles`, the route table's key.
+            let (_, local, symbol) = controller_binding(app, c);
+            s.push_str(&format!("    {symbol}: {local},\n"));
         }
         s.push_str("  },\n");
     } else {
@@ -1259,11 +1318,7 @@ fn emit_worker_app_ts(app: &App, has_seeds: bool) -> EmittedFile {
         );
     }
     for c in &app.controllers {
-        let stem = crate::naming::snake_case(c.name.0.as_str());
-        let class_name = c.name.0.as_str();
-        s.push_str(&format!(
-            "import {{ {class_name} }} from \"./app/controllers/{stem}.js\";\n"
-        ));
+        s.push_str(&controller_import(app, c, "./app/controllers/"));
     }
     // Model imports feed the `globalThis.app` debug handle below, not
     // the dispatcher — controllers already reach models through their
@@ -1303,11 +1358,9 @@ fn emit_worker_app_ts(app: &App, has_seeds: bool) -> EmittedFile {
         }
         s.push_str("  controllers: {\n");
         for c in &app.controllers {
-            let class_name = c.name.0.as_str();
-            let symbol = crate::naming::snake_case(
-                class_name.strip_suffix("Controller").unwrap_or(class_name),
-            );
-            s.push_str(&format!("    {symbol}: {class_name},\n"));
+            // `ArticlesController` → `articles`, the route table's key.
+            let (_, local, symbol) = controller_binding(app, c);
+            s.push_str(&format!("    {symbol}: {local},\n"));
         }
         s.push_str("  },\n");
     } else {
@@ -1582,11 +1635,7 @@ fn emit_test_setup_ts(
         s.push_str("import { installRoutes } from \"./minitest.js\";\n");
         s.push_str("import { RouteTable } from \"../../app/routes.js\";\n");
         for c in &app.controllers {
-            let stem = crate::naming::snake_case(c.name.0.as_str());
-            let class_name = c.name.0.as_str();
-            s.push_str(&format!(
-                "import {{ {class_name} }} from \"../../app/controllers/{stem}.js\";\n",
-            ));
+            s.push_str(&controller_import(app, c, "../../app/controllers/"));
         }
     }
 
@@ -1638,11 +1687,9 @@ fn emit_test_setup_ts(
         }
         s.push_str("  {\n");
         for c in &app.controllers {
-            let class_name = c.name.0.as_str();
-            let symbol = crate::naming::snake_case(
-                class_name.strip_suffix("Controller").unwrap_or(class_name),
-            );
-            s.push_str(&format!("    {symbol}: {class_name},\n"));
+            // `ArticlesController` → `articles`, the route table's key.
+            let (_, local, symbol) = controller_binding(app, c);
+            s.push_str(&format!("    {symbol}: {local},\n"));
         }
         s.push_str("  },\n");
         s.push_str(");\n");
@@ -1711,12 +1758,13 @@ pub fn emit_library_class(class: &crate::dialect::LibraryClass) -> Result<String
 /// The instance field names `js_library_class` declares for `class`:
 /// its attribute readers and the ivars its instance methods assign.
 /// The class-side counterpart of `instance_field_names`: a class-side
-/// attribute reader, and each `@ivar` a class method assigns, which
-/// `js_library_class` declares as a `static` field (`def self.label;
+/// attribute reader, each `@ivar` a class method assigns, and each
+/// `class_body_static_ivars` names, which `js_library_class` declares as
+/// a `static` field (`def self.label;
 /// @label ||= "x"; end` is `static label`, and the method is left out).
-fn static_field_names(class: &crate::dialect::LibraryClass) -> std::collections::HashSet<String> {
+fn static_field_names(class: &crate::dialect::LibraryClass) -> crate::det::HashSet<String> {
     use crate::dialect::{AccessorKind, MethodReceiver};
-    let mut names = std::collections::HashSet::new();
+    let mut names = crate::det::HashSet::default();
     let mut ivars: indexmap::IndexMap<String, Ty> = indexmap::IndexMap::new();
     for m in &class.methods {
         if !matches!(m.receiver, MethodReceiver::Class) {
@@ -1727,13 +1775,14 @@ fn static_field_names(class: &crate::dialect::LibraryClass) -> std::collections:
         }
         collect_ivar_assignments(&m.body, &mut ivars);
     }
+    names.extend(class_body_static_ivars(class, &ivars).into_iter().map(|(name, _, _)| name));
     names.extend(ivars.into_keys());
     names
 }
 
-fn instance_field_names(class: &crate::dialect::LibraryClass) -> std::collections::HashSet<String> {
+fn instance_field_names(class: &crate::dialect::LibraryClass) -> crate::det::HashSet<String> {
     use crate::dialect::{AccessorKind, MethodReceiver};
-    let mut names = std::collections::HashSet::new();
+    let mut names = crate::det::HashSet::default();
     let mut ivars: indexmap::IndexMap<String, Ty> = indexmap::IndexMap::new();
     for m in &class.methods {
         if !matches!(m.receiver, MethodReceiver::Instance) {
@@ -1805,11 +1854,11 @@ pub(super) fn js_library_class(
     };
 
     let mut fields: Vec<(String, String, bool, bool, crate::span::Span)> = Vec::new();
-    let mut field_names_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut field_names_seen: crate::det::HashSet<String> = crate::det::HashSet::default();
     // The same names per side, `[instance, static]`: a field subsumes a
     // method of its name on its own side only (`attr_reader :label` and
     // `def self.label` are both kept).
-    let mut side_field_names: [std::collections::HashSet<String>; 2] = Default::default();
+    let mut side_field_names: [crate::det::HashSet<String>; 2] = Default::default();
     let side = |is_static: bool| usize::from(is_static);
     for m in &class.methods {
         if is_attr_reader(m) {
@@ -1822,7 +1871,7 @@ pub(super) fn js_library_class(
                 continue;
             }
             let ty = match m.signature.as_ref() {
-                Some(Ty::Fn { ret, .. }) => ts_ty(ret),
+                Some(Ty::Fn(fn_ty)) => ts_ty(&fn_ty.ret),
                 _ => m.body.ty.as_ref().map(ts_ty).unwrap_or_else(|| "any".to_string()),
             };
             let is_static = matches!(m.receiver, MethodReceiver::Class);
@@ -1866,6 +1915,15 @@ pub(super) fn js_library_class(
             fields.push((name, ts_ty(&ty), false, true, crate::span::Span::synthetic()));
         }
     }
+    // The class body's own writes (`module M; @flag = false; …; end`):
+    // see `class_body_static_ivars`.
+    let mut static_ivar_initial: crate::det::HashMap<String, &crate::expr::Expr> = crate::det::HashMap::default();
+    for (name, ty, literal) in class_body_static_ivars(class, &static_ivar_assignments) {
+        if let Some(literal) = literal {
+            static_ivar_initial.insert(name.clone(), literal);
+        }
+        static_ivar_assignments.entry(name).or_insert(ty);
+    }
     for (name, ty) in static_ivar_assignments {
         if side_field_names[1].insert(name.clone()) {
             field_names_seen.insert(name.clone());
@@ -1888,7 +1946,8 @@ pub(super) fn js_library_class(
     let parent = class.parent.as_ref().map(|p| {
         let raw = p.0.as_str();
         match raw {
-            "StandardError" => "Error".to_string(),
+            "StandardError" | "RuntimeError" | "ArgumentError" | "TypeError" | "NameError" | "NoMethodError"
+            | "NotImplementedError" | "KeyError" | "IndexError" => "Error".to_string(),
             // Test parents — runtime adapter exports both names.
             "ActiveSupport::TestCase" | "ActionDispatch::IntegrationTest" => "TestCase".to_string(),
             "Minitest::Test" => "Test".to_string(),
@@ -1995,8 +2054,23 @@ pub(super) fn js_library_class(
         // initializer when the field is `declare`d (parent provides
         // backing).
         let memo = memoized.get(&(name.clone(), *is_static));
-        let needs_declare = needs_declare && memo.is_none();
-        let init = if let Some(literal) = memo {
+        // A class-side field the class body writes starts at the body's
+        // value, whichever pass declared it (a class-side `attr_reader`
+        // too), and is this class's own, so never only `declare`d: the
+        // class object's ivar is not its parent's.
+        let body = if *is_static { static_ivar_initial.get(name) } else { None };
+        // A memo (`@armed ||= false`) keeps a truthy body value and
+        // replaces a falsy one (`false`/`nil`) on the first read, which
+        // the field stands for.
+        let body_truthy = body.is_some_and(|b| {
+            !matches!(
+                &*b.node,
+                crate::expr::ExprNode::Lit { value: crate::expr::Literal::Nil | crate::expr::Literal::Bool { value: false } }
+            )
+        });
+        let literal = if body_truthy { body } else { memo.or(body) };
+        let needs_declare = needs_declare && literal.is_none();
+        let init = if let Some(literal) = literal {
             Some(expr::js_expr(literal))
         } else if *is_static && !needs_declare {
             ts_default_for_type(ty)
@@ -2046,7 +2120,7 @@ pub(super) fn js_library_class(
     // `record.persisted` and get the field directly.
     // Per side, as `side_field_names`: a static `ready?` keeps its name
     // beside an instance `is_ready`.
-    let mut sanitized_seen: [std::collections::HashSet<String>; 2] = side_field_names.clone();
+    let mut sanitized_seen: [crate::det::HashSet<String>; 2] = side_field_names.clone();
     for m in &class.methods {
         let raw = m.name.as_str();
         if !raw.ends_with('?') && !raw.ends_with('!') {
@@ -2134,9 +2208,9 @@ pub(super) fn js_library_class(
 /// name, and the value the field starts at.
 fn memoized_literals(
     class: &crate::dialect::LibraryClass,
-) -> std::collections::HashMap<(String, bool), &crate::expr::Expr> {
+) -> crate::det::HashMap<(String, bool), &crate::expr::Expr> {
     use crate::expr::{ExprNode, LValue, OpAssignOp};
-    let mut out = std::collections::HashMap::new();
+    let mut out = crate::det::HashMap::default();
     for m in &class.methods {
         if !m.params.is_empty() {
             continue;
@@ -2225,7 +2299,7 @@ pub(crate) fn signature_ret_is_time(sig: Option<&Ty>) -> bool {
             _ => false,
         }
     }
-    matches!(sig, Some(Ty::Fn { ret, .. }) if is_time(ret))
+    matches!(sig, Some(Ty::Fn(fn_ty)) if is_time(&fn_ty.ret))
 }
 
 /// Emit the body of a `constructor` from an `initialize` method's
@@ -2378,8 +2452,8 @@ fn body_contains_yield(body: &crate::expr::Expr) -> bool {
         } => {
             body_contains_yield(inner)
                 || rescues.iter().any(|r| body_contains_yield(&r.body))
-                || else_branch.as_ref().is_some_and(body_contains_yield)
-                || ensure.as_ref().is_some_and(body_contains_yield)
+                || else_branch.as_deref().is_some_and(body_contains_yield)
+                || ensure.as_deref().is_some_and(body_contains_yield)
         }
         ExprNode::Range { begin, end, .. } => {
             begin.as_ref().is_some_and(body_contains_yield)
@@ -2449,7 +2523,8 @@ fn js_class_member(
         Vec<bool>,
         Ty,
     ) = match m.signature.as_ref() {
-        Some(Ty::Fn { params: sig_params, ret, .. }) => {
+        Some(Ty::Fn(fn_ty)) => {
+            let FnTy { params: sig_params, ret, .. } = &**fn_ty;
             let non_block: Vec<&crate::ty::Param> = sig_params
                 .iter()
                 .filter(|p| !matches!(p.kind, crate::ty::ParamKind::Block))
@@ -2485,9 +2560,14 @@ fn js_class_member(
                 .collect();
             (tys, optionals, is_keyword, (**ret).clone())
         }
+        // Unstamped (an `initialize` always is): a positional default
+        // still makes the argument optional, as it does in Ruby. Without
+        // it `def initialize(object, options = {})` became
+        // `constructor(object: any, options: any)` and `new X(record)` was
+        // TS2554.
         _ => (
             m.params.iter().map(|_| Ty::Untyped).collect(),
-            m.params.iter().map(|_| false).collect(),
+            m.params.iter().map(|p| p.ty_kind() == crate::ty::ParamKind::Optional).collect(),
             m.params.iter().map(|_| false).collect(),
             m.body.ty.clone().unwrap_or(Ty::Nil),
         ),
@@ -2641,7 +2721,7 @@ fn js_class_member(
     // Set enclosing-method parameter names so the await-wrap site
     // can suppress wrapping bare Sends whose name shadows a param
     // (e.g. view function `_form(article)` referencing `article`).
-    let param_set: std::collections::HashSet<crate::ident::Symbol> =
+    let param_set: crate::det::HashSet<crate::ident::Symbol> =
         m.params.iter().map(|p| p.name.clone()).collect();
     let body = expr::with_method_params(param_set, || {
         if is_constructor {
@@ -2715,7 +2795,8 @@ pub(super) fn js_library_function(
 
     let (sig_param_tys, sig_param_optional, ret_ty): (Vec<Ty>, Vec<bool>, Ty) =
         match func.signature.as_ref() {
-            Some(Ty::Fn { params: sig_params, ret, .. }) => {
+            Some(Ty::Fn(fn_ty)) => {
+                let FnTy { params: sig_params, ret, .. } = &**fn_ty;
                 let non_block: Vec<&crate::ty::Param> = sig_params
                     .iter()
                     .filter(|p| !matches!(p.kind, crate::ty::ParamKind::Block))
@@ -2781,7 +2862,7 @@ pub(super) fn js_library_function(
     // bare Sends emit as plain function calls (resolved against
     // imports), and `super` doesn't apply since there's no inheritance.
     let rewritten = crate::emit::typescript::library::rewrite_for_free_function(&func.body);
-    let param_set: std::collections::HashSet<crate::ident::Symbol> =
+    let param_set: crate::det::HashSet<crate::ident::Symbol> =
         func.params.iter().map(|p| p.name.clone()).collect();
     let body = expr::with_method_params(param_set, || expr::js_body(&rewritten, &ret_ty));
 
@@ -2842,6 +2923,61 @@ pub fn emit_module(methods: &[crate::dialect::MethodDef]) -> Result<String, Stri
 /// emitted `export function <x>` parses.
 pub(super) fn escape_for_function_name(raw: &str) -> String {
     escape_reserved(&crate::emit::typescript::library::sanitize_identifier(raw))
+}
+
+/// The class-side ivars the class body itself writes (`module M; @flag =
+/// false; …; end`) that need a `static` field: Ruby creates them at load,
+/// before any method runs, so one a class method reads needs the field
+/// even when no surviving method writes it (the runtime shake can drop
+/// its only writer), and the field starts at the body's value, not its
+/// type's default. Each is `(name, type of the body's value, the value
+/// when it is a literal TypeScript renders as written)`. `assigned` is
+/// the ivars the class methods themselves write; a body write of one of
+/// those is kept for its value. A body write no class method touches
+/// declares nothing.
+fn class_body_static_ivars<'a>(
+    class: &'a crate::dialect::LibraryClass,
+    assigned: &indexmap::IndexMap<String, Ty>,
+) -> Vec<(String, Ty, Option<&'a crate::expr::Expr>)> {
+    use crate::expr::{Expr, ExprNode, LValue, Literal};
+    fn reads(e: &Expr, out: &mut crate::det::HashSet<String>) {
+        if let ExprNode::Ivar { name } = &*e.node {
+            out.insert(name.as_str().to_string());
+        }
+        e.node.for_each_child(&mut |c| reads(c, out));
+    }
+    let mut read = crate::det::HashSet::default();
+    for m in class.methods.iter().filter(|m| matches!(m.receiver, crate::dialect::MethodReceiver::Class)) {
+        reads(&m.body, &mut read);
+        // A parameter default (`def self.status(value = @armed)`) reads
+        // it too.
+        for default in m.params.iter().filter_map(|p| p.default.as_ref()) {
+            reads(default, &mut read);
+        }
+    }
+    let mut out: Vec<(String, Ty, Option<&'a Expr>)> = Vec::new();
+    for init in &class.class_ivar_initializers {
+        let ExprNode::Assign { target: LValue::Ivar { name }, value } = &*init.node else {
+            continue;
+        };
+        let name = name.as_str();
+        if !assigned.contains_key(name) && !read.contains(name) {
+            continue;
+        }
+        // The last body write is the value a method first sees.
+        out.retain(|(n, _, _)| n != name);
+        // The runtime loader leaves a body write untyped; a scalar
+        // literal still says what it is.
+        let ty = value.ty.clone().or_else(|| match &*value.node {
+            ExprNode::Lit { value: Literal::Bool { .. } } => Some(Ty::Bool),
+            ExprNode::Lit { value: Literal::Int { .. } } => Some(Ty::Int),
+            ExprNode::Lit { value: Literal::Float { .. } } => Some(Ty::Float),
+            ExprNode::Lit { value: Literal::Str { .. } } => Some(Ty::Str),
+            _ => None,
+        });
+        out.push((name.to_string(), ty.unwrap_or(Ty::Untyped), declarable_constant_value(value)));
+    }
+    out
 }
 
 /// Walk an Expr collecting every `@ivar = value` assignment, keyed
@@ -3066,9 +3202,10 @@ pub fn emit_method(m: &crate::dialect::MethodDef) -> String {
         .signature
         .as_ref()
         .expect("emit_method requires a signature");
-    let Ty::Fn { params: sig_params, ret, .. } = sig else {
+    let Ty::Fn(fn_ty) = sig else {
         panic!("signature is not Ty::Fn");
     };
+    let FnTy { params: sig_params, ret, .. } = &**fn_ty;
     assert_eq!(
         sig_params.len(),
         m.params.len(),
@@ -3088,7 +3225,7 @@ pub fn emit_method(m: &crate::dialect::MethodDef) -> String {
         })
         .collect();
 
-    let param_set: std::collections::HashSet<crate::ident::Symbol> =
+    let param_set: crate::det::HashSet<crate::ident::Symbol> =
         m.params.iter().map(|p| p.name.clone()).collect();
     let body = expr::with_method_params(param_set, || expr::js_body(&m.body, ret));
 

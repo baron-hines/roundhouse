@@ -1,6 +1,6 @@
 # frozen_string_literal: true
 # Date-column JSON rewrite for Spinel. Omit-when-unused with the Date
-# package (matz/spinel#7334). Default `as_json` lives in the always-on
+# package. Default `as_json` lives in the always-on
 # `active_record_serialization.rb`; this reopen wraps `_as_json_only`
 # after the shared time-aware seam so date columns become ISO
 # `YYYY-MM-DD` (or nil) without taxing shared `connection.rb`.
@@ -19,5 +19,13 @@ module ActiveRecord
       end
       h
     end
+  end
+end
+
+# ActiveSupport's Date#as_json (core_ext/object/json), which Spinel's
+# `date` package does not carry.
+class Date
+  def as_json(_options = nil)
+    strftime("%Y-%m-%d")
   end
 end

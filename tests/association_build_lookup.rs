@@ -52,7 +52,7 @@ fn resolve(
     call: &str,
 ) -> roundhouse::lower::scope_chain::AssocBuildTarget {
     use roundhouse::ident::Symbol;
-    reg.build_target(&owner(written), &Symbol::from(assoc), &Symbol::from(call))
+    reg.build_target(&owner(written), &Symbol::from(assoc), &Symbol::from(call), false)
 }
 
 /// What `<owner>.comments.<call>` builds or finds through.

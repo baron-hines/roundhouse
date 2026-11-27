@@ -140,7 +140,15 @@ pub(super) fn reference(ancestors: &[Node<'_>], node: &Node<'_>) -> Option<(Stri
     }
     // Constant containers/tuples may alias even when a call sits between the
     // assignment and this reference. Preserve that conservative source fact.
-    let context = if ancestors.iter().any(|parent| {
+    // The one exception is a reference that is itself a call's receiver
+    // (`kind, x = [Kind::Standard.serialize, 1]`): the call is recorded as
+    // its own use with its own result role, and that decides whether the
+    // call hands the constant on, so a stored *result* does not.
+    let receiver_of_parent = parent.as_call_node().and_then(|call| call.receiver()).is_some_and(|receiver| {
+        receiver.location().start_offset() == node.location().start_offset()
+            && receiver.location().end_offset() == node.location().end_offset()
+    });
+    let context = if !receiver_of_parent && ancestors.iter().any(|parent| {
         matches!(
             parent,
             Node::ConstantWriteNode { .. }

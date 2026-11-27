@@ -10,7 +10,8 @@
 //! analyzer already stamped make the dynamic dispatch unnecessary at
 //! almost every site, so this pass rewrites, per receiver type:
 //!
-//!   String        blank? → `(r || "").strip.empty?` (see below)
+//!   String        Ruby family: `ActiveSupport.blank?(r)`; other targets:
+//!                 `(r || "").strip.empty?` (see below)
 //!   Array/Hash    blank? → `r.empty?`
 //!   Class w/ own  left as-is when the app class defines the
 //!   definition    predicate itself; grounded via `empty?` when it
@@ -24,7 +25,7 @@
 //! `present?` is the negation; `presence` is `blank? ? nil : r`
 //! (an `If` node), or just `r` where T is never blank.
 //!
-//! ## Why the String case strips first
+//! ## String whitespace by target
 //!
 //! ActiveSupport's `String#blank?` is a whitespace match — the regex is
 //! `\A[[:space:]]*\z` — and not `empty?`, so `" ".blank?` is TRUE in
@@ -32,18 +33,18 @@
 //! site that priced it: a boost posted with a body of three spaces was
 //! accepted and stored where Rails answers 422.
 //!
-//! `strip` rather than the regex because every target emitter carries
-//! it and a POSIX character class is not a shape every regex backend
-//! shares. The divergence that leaves is NON-ASCII whitespace: Ruby's
-//! `String#strip` takes ASCII space plus NUL, where `[[:space:]]` also
-//! takes U+00A0 and friends. No corpus app has one, and the targets
-//! disagree there among themselves anyway — Python's `.strip()` and
-//! JavaScript's `.trim()` do take them.
+//! Ruby, JRuby and Spinel use the shared runtime predicate, including
+//! Unicode whitespace and the encoded-regexp fallback. A typed String
+//! must agree with the same value passed through an untyped receiver.
+//! In particular, Ruby's `strip` strips NUL and leaves NBSP, reversing
+//! Rails' answer for both. Other targets retain their native trim
+//! lowering; their whitespace sets depend on the target's library.
 //!
 //! The nil guard is this `|| ""`, and it is already in the IR. A column
 //! typed `String` can still be nil once nullable hydration runs, and
 //! `nil.strip` would raise before any later wrap could answer. The
-//! guard sits on the value, so the form is `(r || "").strip.empty?`.
+//! guard sits on the value for the other targets, so their form is
+//! `(r || "").strip.empty?`; the Ruby-family helper handles nil itself.
 //! Emitters print that node. Ruby does not wrap `empty?` again on the
 //! way out.
 //!
@@ -70,18 +71,23 @@
 //! either — see the note in [`apply_blank_lowering`].
 
 use crate::app::App;
+use crate::build_target::BuildTarget;
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::expr::{Expr, ExprNode, LValue, Literal};
-use crate::ident::Symbol;
+use crate::ident::{Symbol, VarId};
 use crate::ty::Ty;
-use std::collections::HashSet;
+use crate::det::HashSet;
 
 /// Rewrite blank-predicate sends across every typed body in the app.
 /// Runs after `Analyzer::analyze` (receiver types must be stamped) and
 /// before any emitter. Returns the residue diagnostics — sites left as
 /// dynamic dispatch, with the reason.
 pub fn apply_blank_lowering(app: &mut App) -> Vec<Diagnostic> {
-    let defs = AppDefinitions::collect(app);
+    apply_blank_lowering_for(app, BuildTarget::Ruby)
+}
+
+pub(crate) fn apply_blank_lowering_for(app: &mut App, target: BuildTarget) -> Vec<Diagnostic> {
+    let defs = AppDefinitions::collect(app, matches!(target, BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Spinel));
     let mut diags = Vec::new();
 
     // View bodies are deliberately NOT walked (`for_each_hook_body`
@@ -93,7 +99,7 @@ pub fn apply_blank_lowering(app: &mut App) -> Vec<Diagnostic> {
     // (python's unemittable-cond fallback is a silent `False`; the
     // flash-notice smoke caught it).
     super::for_each_hook_body(app, &mut |body| {
-        walk(body, &defs, &mut diags);
+        walk(body, &received_vars(body), &defs, &mut diags);
     });
 
     // TEST BODIES TOO, asked for by name — the widening
@@ -113,7 +119,7 @@ pub fn apply_blank_lowering(app: &mut App) -> Vec<Diagnostic> {
     // the overlay served these already and the rewrite is neutral — it
     // is the AOT and strict targets that could not dispatch them.
     super::for_each_test_body(app, &mut |body| {
-        walk(body, &defs, &mut diags);
+        walk(body, &received_vars(body), &defs, &mut diags);
     });
 
     diags
@@ -135,7 +141,7 @@ pub fn apply_blank_lowering(app: &mut App) -> Vec<Diagnostic> {
 /// `view_to_library`).
 pub(crate) fn ground_body(body: &mut Expr, defs: &AppDefinitions) -> bool {
     let mut diags = Vec::new();
-    let changed = walk(body, defs, &mut diags);
+    let changed = walk(body, &received_vars(body), defs, &mut diags);
     for d in diags {
         crate::emit::diagnostics::push(d);
     }
@@ -160,21 +166,27 @@ pub(crate) fn ground_body(body: &mut Expr, defs: &AppDefinitions) -> bool {
 /// (`view_to_library::predicates`), and Spinel has no `String#present?`
 /// / `NilClass#present?`, so leaving the call dynamic is a NameError.
 pub(crate) fn ground_jbuilder_values(body: &mut Expr, defs: &AppDefinitions) -> bool {
-    fn walk(expr: &mut Expr, in_value: bool, defs: &AppDefinitions, diags: &mut Vec<Diagnostic>) -> bool {
+    fn walk(
+        expr: &mut Expr,
+        in_value: bool,
+        received: &HashSet<VarId>,
+        defs: &AppDefinitions,
+        diags: &mut Vec<Diagnostic>,
+    ) -> bool {
         if !in_value {
             match &mut *expr.node {
                 ExprNode::If { cond, then_branch, else_branch } => {
                     // Condition is a value for blank predicates; branches
                     // stay template-shaped (pairs / nested ifs).
-                    let cond_changed = walk(cond, true, defs, diags);
-                    let then_changed = walk(then_branch, false, defs, diags);
-                    let else_changed = walk(else_branch, false, defs, diags);
+                    let cond_changed = walk(cond, true, received, defs, diags);
+                    let then_changed = walk(then_branch, false, received, defs, diags);
+                    let else_changed = walk(else_branch, false, received, defs, diags);
                     return cond_changed || then_changed || else_changed;
                 }
                 ExprNode::Seq { exprs } => {
                     let mut changed = false;
                     for e in exprs {
-                        changed |= walk(e, false, defs, diags);
+                        changed |= walk(e, false, received, defs, diags);
                     }
                     return changed;
                 }
@@ -183,17 +195,18 @@ pub(crate) fn ground_jbuilder_values(body: &mut Expr, defs: &AppDefinitions) -> 
         }
         let mut changed = false;
         expr.node.for_each_child_mut(&mut |c| {
-            if walk(c, true, defs, diags) {
+            if walk(c, true, received, defs, diags) {
                 changed = true;
             }
         });
-        if try_rewrite(expr, defs, diags) {
+        if try_rewrite(expr, received, defs, diags) {
             changed = true;
         }
         changed
     }
     let mut diags = Vec::new();
-    let changed = walk(body, false, defs, &mut diags);
+    let received = received_vars(body);
+    let changed = walk(body, false, &received, defs, &mut diags);
     for d in diags {
         crate::emit::diagnostics::push(d);
     }
@@ -207,6 +220,7 @@ pub(crate) fn ground_jbuilder_values(body: &mut Expr, defs: &AppDefinitions) -> 
 pub(crate) struct AppDefinitions {
     own_predicate: HashSet<String>,
     own_empty: HashSet<String>,
+    runtime_strings: bool,
 }
 
 impl AppDefinitions {
@@ -218,10 +232,10 @@ impl AppDefinitions {
     /// its registry itself, at emit time, and that is also the first
     /// moment a test body HAS types (see `ground_body`).
     pub(crate) fn from_class_registry(
-        classes: &std::collections::HashMap<crate::ident::ClassId, crate::analyze::ClassInfo>,
+        classes: &crate::det::HashMap<crate::ident::ClassId, crate::analyze::ClassInfo>,
     ) -> Self {
-        let mut own_predicate = HashSet::new();
-        let mut own_empty = HashSet::new();
+        let mut own_predicate = HashSet::default();
+        let mut own_empty = HashSet::default();
         for (id, info) in classes {
             let last = id.0.as_str().rsplit("::").next().unwrap_or(id.0.as_str()).to_string();
             for name in info.instance_methods.keys() {
@@ -236,12 +250,12 @@ impl AppDefinitions {
                 }
             }
         }
-        Self { own_predicate, own_empty }
+        Self { own_predicate, own_empty, runtime_strings: true }
     }
 
-    pub(crate) fn collect(app: &App) -> Self {
-        let mut own_predicate = HashSet::new();
-        let mut own_empty = HashSet::new();
+    pub(crate) fn collect(app: &App, runtime_strings: bool) -> Self {
+        let mut own_predicate = HashSet::default();
+        let mut own_empty = HashSet::default();
         let mut note = |class: &str, method: &str| {
             let last = class.rsplit("::").next().unwrap_or(class).to_string();
             match method {
@@ -264,14 +278,14 @@ impl AppDefinitions {
                 note(lc.name.0.as_str(), method.name.as_str());
             }
         }
-        Self { own_predicate, own_empty }
+        Self { own_predicate, own_empty, runtime_strings }
     }
 }
 
 /// How a receiver type grounds the predicate.
 enum Grounding {
     /// `empty?` applies (strings and collections). `whitespace` marks
-    /// the STRING case, whose emptiness test is `strip.empty?` — see
+    /// the non-Ruby STRING case, whose test is `strip.empty?` — see
     /// the module header. A collection's is not: `[nil].blank?` is
     /// false in Rails and `" ".blank?` is true, and one `empty_form`
     /// for both would have to be wrong about one of them.
@@ -285,7 +299,7 @@ enum Grounding {
     AlwaysNil,
     /// The class defines the predicate itself — normal dispatch.
     OwnDispatch,
-    /// No static type to ground on: hand the value to the ruby-family
+    /// No static type, or a Ruby-family String: use the ruby-family
     /// runtime predicate, which branches on the value instead. The
     /// receiver becomes an argument, so it is evaluated exactly once —
     /// that is why this arm needs no effect-free gate.
@@ -325,6 +339,7 @@ fn classify(ty: Option<&Ty>, defs: &AppDefinitions) -> Grounding {
     // `Object#present?` does for any record.
     let Some(t) = ty else { return Runtime };
     match t {
+        Ty::Str if defs.runtime_strings => Runtime,
         Ty::Str => Container { nilable: false, whitespace: true },
         Ty::Array { .. } | Ty::Hash { .. } | Ty::Tuple { .. } => {
             Container { nilable: false, whitespace: false }
@@ -425,14 +440,48 @@ pub(crate) fn is_effect_free_reader(e: &Expr) -> bool {
     }
 }
 
-fn walk(expr: &mut Expr, defs: &AppDefinitions, diags: &mut Vec<Diagnostic>) -> bool {
+/// The locals of one body whose first occurrence in source order is a read,
+/// not an assignment: a parameter (method or block), even one the body later
+/// reassigns (`raw = [raw] if raw.is_a?(String)`). An assignment binds its
+/// name after its value ran; a multiple assignment and an `||=` bind it too.
+fn received_vars(body: &Expr) -> HashSet<VarId> {
+    fn visit(e: &Expr, seen: &mut HashSet<VarId>, out: &mut HashSet<VarId>) {
+        match &*e.node {
+            ExprNode::Var { id, .. } => {
+                if seen.insert(*id) {
+                    out.insert(*id);
+                }
+            }
+            ExprNode::Assign { target, value } | ExprNode::OpAssign { target, value, .. } => {
+                visit(value, seen, out);
+                if let LValue::Var { id, .. } = target {
+                    seen.insert(*id);
+                }
+            }
+            ExprNode::MultiAssign { targets, value } => {
+                visit(value, seen, out);
+                for t in targets {
+                    if let LValue::Var { id, .. } = t {
+                        seen.insert(*id);
+                    }
+                }
+            }
+            _ => e.node.for_each_child(&mut |c| visit(c, seen, out)),
+        }
+    }
+    let mut out = HashSet::default();
+    visit(body, &mut HashSet::default(), &mut out);
+    out
+}
+
+fn walk(expr: &mut Expr, received: &HashSet<VarId>, defs: &AppDefinitions, diags: &mut Vec<Diagnostic>) -> bool {
     let mut changed = false;
     expr.node.for_each_child_mut(&mut |c| {
-        if walk(c, defs, diags) {
+        if walk(c, received, defs, diags) {
             changed = true;
         }
     });
-    if try_rewrite(expr, defs, diags) {
+    if try_rewrite(expr, received, defs, diags) {
         changed = true;
     }
     if try_rewrite_compact_blank(expr, defs, diags) {
@@ -450,7 +499,7 @@ enum Pred {
     Presence,
 }
 
-fn try_rewrite(expr: &mut Expr, defs: &AppDefinitions, diags: &mut Vec<Diagnostic>) -> bool {
+fn try_rewrite(expr: &mut Expr, received: &HashSet<VarId>, defs: &AppDefinitions, diags: &mut Vec<Diagnostic>) -> bool {
     use Grounding::*;
 
     // Decision phase: everything read out of the node is owned before
@@ -490,6 +539,19 @@ fn try_rewrite(expr: &mut Expr, defs: &AppDefinitions, diags: &mut Vec<Diagnosti
             }
             (Grounding::NeverBlank { nilable: false }, ExprNode::Ivar { .. }) => {
                 Grounding::NeverBlank { nilable: true }
+            }
+            (g, _) => g,
+        };
+        // A RECEIVED variable keeps its nil arm too. A parameter's type is
+        // the join of the argument types the analyzer typed at its call
+        // sites, and an argument it could not type adds nothing to it: when
+        // one caller passes `Array(x)` and another passes `body["errors"]`,
+        // the parameter is `Array`, and `raw.present?` folded to
+        // `!raw.empty?` raises on the nil the second hands in.
+        let received_var = matches!(&*r.node, ExprNode::Var { id, .. } if received.contains(id));
+        let grounding = match (grounding, received_var) {
+            (Grounding::Container { nilable: false, whitespace }, true) => {
+                Grounding::Container { nilable: true, whitespace }
             }
             (g, _) => g,
         };
@@ -679,6 +741,8 @@ fn try_rewrite_compact_blank(
                 key: (**key).clone(),
                 value: (**value).clone(),
             },
+            // The String-keyed Hash an indifferent one runs as (`params.permit(…).to_h.compact_blank`).
+            Some(ty) if let Some(value) = crate::analyze::indifferent::value_of(ty) => Shape::Hash { key: Ty::Str, value: value.clone() },
             _ => {
                 diags.push(unlowered(
                     expr,

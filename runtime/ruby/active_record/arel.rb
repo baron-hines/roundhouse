@@ -7,8 +7,12 @@
 # WHERE as a correlated subquery (`where.not(<rel>.arel.exists)`).
 module Arel
   # A bind that does not match the fragment. Rails raises this from
-  # `Arel.sql` before the SQL is handed to the connection.
-  class BindError < StandardError
+  # `Arel.sql` before the SQL is handed to the connection. Its parent is
+  # Rails' (arel/errors.rb), so `rescue Arel::ArelError` catches it.
+  class ArelError < StandardError
+  end
+
+  class BindError < ArelError
   end
 
   # A caller-authored fragment. With no binds this is that text, wrapped
@@ -123,14 +127,16 @@ module Arel
       end
     end
 
-    # A SQL literal. nil, numbers, and booleans stay bare. Strings go
-    # through `Db.escape_string`, the same literal `Connection#quote`
-    # used to build itself, so a NUL or a binary value stays one literal.
+    # A SQL literal. nil, numbers, and booleans stay bare: a boolean is
+    # the database's literal (SQLite's 1, PostgreSQL's TRUE), as `Db`
+    # writes it. Strings go through `Db.escape_string`, the same literal
+    # `Connection#quote` used to build itself, so a NUL or a binary value
+    # stays one literal.
     def self.quote_scalar(value)
       return "NULL" if value.nil?
       return value.to_s if value.is_a?(Integer) || value.is_a?(Float)
-      return "1" if value == true
-      return "0" if value == false
+      return Db.escape_bool_opt(true) if value == true
+      return Db.escape_bool_opt(false) if value == false
       Db.escape_string(value.to_s)
     end
 

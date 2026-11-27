@@ -1,3 +1,7 @@
+#[path = "../support/prerequisite.rs"]
+mod prerequisite;
+#[path = "../support/scratch.rs"]
+mod scratch;
 use super::emit_and_run;
 
 /// `validates :attr, acceptance:`. Rails' `AcceptanceValidator` adds
@@ -124,8 +128,7 @@ puts "attribute acceptance passed"
 /// runs it, reports nothing.
 #[test]
 fn acceptance_on_a_boolean_attribute_is_a_strict_target_gap() {
-    let root = std::env::temp_dir().join(format!("roundhouse-acceptance-cli-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = scratch::dir("roundhouse-acceptance-cli");
     for (path, body) in [
         ("app/models/application_record.rb", APPLICATION_RECORD),
         ("app/models/signup.rb", SIGNUP),
@@ -171,28 +174,110 @@ fn acceptance_on_a_string_attribute_is_a_reported_gap() {
     );
 }
 
-/// An attribute the model does not declare is a reported gap that
-/// refuses the whole call: Rails defines a virtual accessor for it, which
-/// this build does not synthesize. The `presence:` beside it goes too.
-#[test]
-fn acceptance_on_an_undeclared_attribute_is_a_reported_gap() {
-    let app = || emit_and_run::empty_app()
-        .write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n")
+const UNDECLARED_MODEL: &str = "class Member < ApplicationRecord\n  validates :agreement, acceptance: true, presence: true\nend\n";
+
+const UNDECLARED: &str = r##"def errs(attrs)
+  m = Member.new({ name: "x" }.merge(attrs))
+  m.valid?
+  m.errors.to_a
+end
+got = [errs(agreement: "1"), errs(agreement: "0"), errs({}), errs(agreement: true), errs(agreement: "yes")]
+want = [[], ["Agreement must be accepted"], ["Agreement can't be blank"], [], ["Agreement must be accepted"]]
+raise "undeclared errors: #{got.inspect}" unless got == want
+m = Member.new(name: "x")
+m.agreement = "1"
+raise "writer: #{m.agreement.inspect}" unless m.agreement == "1" && m.valid?
+c = Member.create!(name: "x", agreement: "1")
+raise "create!: #{c.agreement.inspect}" unless c.persisted? && c.agreement == "1"
+raise "find: #{Member.find(c.id).agreement.inspect}" unless Member.find(c.id).agreement.nil?
+puts "undeclared acceptance passed"
+"##;
+
+fn undeclared_members() -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("app/models/application_record.rb", APPLICATION_RECORD)
         .write(
             "db/schema.rb",
             "ActiveRecord::Schema.define do\n  create_table \"members\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n",
         )
-        .write(
-            "app/models/member.rb",
-            "class Member < ApplicationRecord\n  validates :agreement, acceptance: true, presence: true\nend\n",
-        );
-    let warnings = app().ingest_warnings();
-    assert!(
-        warnings.iter().any(|w| w.contains("validates :agreement, acceptance:") && w.contains("does not declare")),
-        "{warnings:?}"
+        .write("app/models/member.rb", UNDECLARED_MODEL)
+}
+
+/// An attribute the model does not declare: Rails' `AcceptanceValidator`
+/// defines a plain, uncast reader and writer for it, so `new`, the writer
+/// and `create!` take it, the check reads it, and a loaded record has
+/// none. The model gains the same `attr_accessor`; no gap is reported.
+#[test]
+fn acceptance_on_an_undeclared_attribute_matches_rails() {
+    assert!(undeclared_members().ingest_warnings().is_empty());
+    let run = undeclared_members().run_ruby(UNDECLARED);
+    run.assert_passes();
+    assert!(run.stdout.contains("undeclared acceptance passed"), "{}", run.stdout);
+    for target in [roundhouse::project::BuildTarget::Rust, roundhouse::project::BuildTarget::Typescript, roundhouse::project::BuildTarget::Go] {
+        let (_emitted, errors) = undeclared_members().emit(target);
+        assert!(errors.is_empty(), "{target:?}: {errors:#?}");
+    }
+}
+
+/// The same script against activerecord 8.1.4 on sqlite3; skipped when
+/// the gems aren't installed.
+#[test]
+fn rails_answers_the_undeclared_acceptance_table() {
+    let probe = r#"gem "activerecord", "8.1.4"; require "active_record"; require "sqlite3""#;
+    if !std::process::Command::new("ruby").args(["-e", probe]).status().is_ok_and(|s| s.success()) {
+        prerequisite::missing("ruby with activerecord 8.1.4 and sqlite3 not available");
+        return;
+    }
+    let script = format!(
+        r##"gem "activerecord", "8.1.4"
+require "active_record"
+require "sqlite3"
+ActiveRecord::Base.establish_connection(adapter: "sqlite3", database: ":memory:")
+ActiveRecord::Schema.verbose = false
+ActiveRecord::Schema.define do
+  create_table(:members) {{ |t| t.string :name }}
+end
+{APPLICATION_RECORD}
+{UNDECLARED_MODEL}
+{UNDECLARED}"##
     );
-    let (emitted, errors) = app().emit(roundhouse::project::BuildTarget::Ruby);
-    assert!(errors.is_empty(), "{errors:#?}");
-    let member = std::fs::read_to_string(emitted.join("app/models/member.rb")).expect("member.rb");
-    assert!(!member.contains("must be accepted") && !member.contains("can't be blank"), "{member}");
+    let output = std::process::Command::new("ruby").arg("-e").arg(&script).output().expect("ruby is on PATH");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("undeclared acceptance passed"),
+        "activerecord 8.1.4 disagrees\n=== stdout ===\n{stdout}\n=== stderr ===\n{stderr}"
+    );
+}
+
+/// Refused acceptance validations ahead of an undeclared one: the
+/// refusal removes them from the body, and the undeclared name's accessor
+/// still lands ahead of its own validation.
+#[test]
+fn refused_acceptance_ahead_of_an_undeclared_one() {
+    let app = || {
+        emit_and_run::empty_app()
+            .write("app/models/application_record.rb", APPLICATION_RECORD)
+            .write("db/schema.rb", SIGNUP_SCHEMA)
+            .write(
+                "app/models/signup.rb",
+                "class Signup < ApplicationRecord\n  attribute :code, :string\n  attribute :code2, :string\n  validates :code, acceptance: { accept: 'yes' }\n  validates :code2, acceptance: { accept: 'yes' }\n  validates :agreement, acceptance: true\nend\n",
+            )
+    };
+    let warnings = app().ingest_warnings();
+    for attr in ["code", "code2"] {
+        assert!(
+            warnings.iter().any(|w| w.contains(&format!("validates :{attr}, acceptance:")) && w.contains("uncast")),
+            "{attr}: {warnings:?}"
+        );
+    }
+    assert!(!warnings.iter().any(|w| w.contains(":agreement")), "{warnings:?}");
+    let run = app().run_ruby(
+        r##"s = Signup.new(name: "x", agreement: "0")
+raise "rejected: #{s.errors.to_a.inspect}" unless !s.valid? && s.errors.to_a == ["Agreement must be accepted"]
+raise "accepted" unless Signup.new(name: "x", agreement: "1").valid?
+puts "refused ahead passed"
+"##,
+    );
+    run.assert_passes();
 }

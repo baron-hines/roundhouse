@@ -89,10 +89,13 @@ pub fn emit_overlay_files(app: &App) -> Vec<EmittedFile> {
     // dispatch (`record.title.empty?` → `record.title == ""` when
     // `title: Str`) — the body-typer's annotations don't survive the
     // functionalize passes, so the schema type is recorded here instead.
+    // The lowering's own schema copy, whose held columns store under `<col>_raw`.
+    let held_schema = crate::lower::validations::hold_unset_presence_columns(&app.models, &app.schema);
     for model in &app.models {
-        if let Some(table) = app.schema.tables.get(&model.table.0) {
+        if let Some(table) = held_schema.tables.get(&model.table.0) {
             // MODEL struct slots use the STORAGE name (`created_at_raw`
-            // for a temporal column — the shared lowering's split); the
+            // for a temporal column, `<col>_raw` for one held unset until
+            // assigned — the shared lowering's split); the
             // Row class is the raw transport and keeps plain column
             // names. A temporal reader's public name is NOT a slot — it
             // resolves to the emitted parsing function
@@ -193,6 +196,10 @@ pub fn emit_overlay_files(app: &App) -> Vec<EmittedFile> {
         path: output_path(OutputKind::HandWrittenRuntime { name: "rh_datetime.ex" }).path,
         content: include_str!("../../runtime/elixir/v2/rh_datetime.ex").to_string(),
     });
+    out.push(EmittedFile {
+        path: output_path(OutputKind::HandWrittenRuntime { name: "i18n_host.ex" }).path,
+        content: include_str!("../../runtime/elixir/v2/i18n_host.ex").to_string(),
+    });
 
     // Model-support runtime: the portable prepared-cursor DB surface the
     // lowered model emit targets (`Db.prepare/step?/column_*/exec/…`),
@@ -291,17 +298,26 @@ pub fn emit_overlay_files(app: &App) -> Vec<EmittedFile> {
                         .to_string(),
                 );
             }
+            // And the multiparameter record `from_params` / `update_from_*`
+            // read (`lower::controller_to_library::params`).
+            for f in [
+                crate::lower::controller_to_library::params::multiparameter_fields_field(),
+                crate::lower::controller_to_library::params::multiparameter_unsupported_field(),
+            ] {
+                field_names.push(f.as_str().to_string());
+            }
             expr::register_field_names(&class_name, &field_names);
         }
         let (model_lcs, model_registry) =
-            crate::lower::model_to_library::lower_models_with_registry_and_params(
+            crate::lower::model_to_library::lower_models_with_registry_params_and_views(
                 &app.models,
                 &app.schema,
+                &app.views,
                 vec![],
                 &specs,
             );
         expr::register_modules(model_lcs.iter());
-        let model_names: std::collections::HashSet<String> =
+        let model_names: crate::det::HashSet<String> =
             app.models.iter().map(|m| m.name.0.as_str().to_string()).collect();
 
         // Build the view layer (RouteHelpers + Importmap + per-resource
@@ -424,6 +440,7 @@ pub fn emit_overlay_files(app: &App) -> Vec<EmittedFile> {
             // and would get a `create` calling an absent `new`.
             if model_names.contains(lc.name.0.as_str()) {
                 materialize_inherited(&mut lc, &base_methods);
+                crate::lower::model_to_library::primary_key_guard::fold(&mut lc.methods);
                 // Pick up per-model dual methods (the synthesized `update`,
                 // dual by tail-call propagation to `save`) for the
                 // controller field-receiver call sites (`if @article.update`).
@@ -436,6 +453,27 @@ pub fn emit_overlay_files(app: &App) -> Vec<EmittedFile> {
             emit_library_lc(lc, &mut out);
         }
         for lc in view_layer_lcs {
+            emit_library_lc(lc, &mut out);
+        }
+
+        // The app's ActiveModel::Serializer classes, which ingest expanded
+        // into plain classes (`ingest::active_model_serializer`): a
+        // `render json:, serializer:` calls `ArticleSerializer.new`, and
+        // no module of that name was emitted. Their fields are registered
+        // before the controllers emit; their module names are not: the
+        // registry resolves a constant by its last segment, which would
+        // read `Api::ArticleSerializer` as a top-level `ArticleSerializer`.
+        // Unregistered, a constant keeps its full path.
+        let serializer_lcs: Vec<crate::dialect::LibraryClass> = app
+            .library_classes
+            .iter()
+            .filter(|lc| matches!(lc.origin, Some(crate::dialect::LibraryClassOrigin::ActiveModelSerializer { .. })))
+            .cloned()
+            .collect();
+        for class in crate::lower::functionalize::functionalize(serializer_lcs.clone()) {
+            expr::register_field_names(class.name.0.as_str(), &library::struct_fields(&class));
+        }
+        for lc in serializer_lcs {
             emit_library_lc(lc, &mut out);
         }
 
@@ -758,7 +796,7 @@ fn inject_module_attr(content: &str, attr_line: &str) -> String {
 /// becomes a visible `# emit_library_class FAILED` sentinel rather than
 /// a silently-dropped file, so `mix compile` surfaces the gap.
 fn emit_library_lc(lc: crate::dialect::LibraryClass, out: &mut Vec<EmittedFile>) {
-    emit_library_lc_with_duals(lc, out, &std::collections::HashSet::new());
+    emit_library_lc_with_duals(lc, out, &crate::det::HashSet::default());
 }
 
 /// Like [`emit_library_lc`], but seeds the functionalize pass with
@@ -769,7 +807,7 @@ fn emit_library_lc(lc: crate::dialect::LibraryClass, out: &mut Vec<EmittedFile>)
 fn emit_library_lc_with_duals(
     lc: crate::dialect::LibraryClass,
     out: &mut Vec<EmittedFile>,
-    external_duals: &std::collections::HashSet<String>,
+    external_duals: &crate::det::HashSet<String>,
 ) {
     for class in
         crate::lower::functionalize::functionalize_with_external_duals(vec![lc], external_duals)
@@ -829,6 +867,7 @@ fn module_funcs_to_library_class(
         nullable_columns: Vec::new(),
         origin: None,
         constants: Vec::new(),
+        conditional_definitions: Vec::new(),
         unknown_calls: Vec::new(),
         class_ivar_initializers: Vec::new(),
     }
@@ -891,7 +930,7 @@ fn materialize_controller_inherited(
     ctrl: &mut crate::dialect::LibraryClass,
     base: &[crate::dialect::MethodDef],
 ) {
-    let defined: std::collections::HashSet<String> =
+    let defined: crate::det::HashSet<String> =
         ctrl.methods.iter().map(|m| m.name.as_str().to_string()).collect();
     let owner = ctrl.name.0.clone();
     let mut inherited: Vec<crate::dialect::MethodDef> = base
@@ -907,7 +946,7 @@ fn materialize_controller_inherited(
 }
 
 fn materialize_inherited(model: &mut crate::dialect::LibraryClass, base: &[crate::dialect::MethodDef]) {
-    let defined: std::collections::HashSet<String> =
+    let defined: crate::det::HashSet<String> =
         model.methods.iter().map(|m| m.name.as_str().to_string()).collect();
     let owner = model.name.0.clone();
     // `find_by`/`where` are dropped because Elixir rewrites their call

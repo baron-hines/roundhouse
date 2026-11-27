@@ -11,13 +11,10 @@ require_relative "../action_view_number_helper"
 
 module ActionView
   module ViewHelpers
-    # `content_security_policy_nonce` — the per-request CSP script
-    # nonce Rails interpolates into `<script nonce=…>`. No app in the
-    # corpus sets a nonce generator (campfire's policy is hash-based,
-    # so the page stays cacheable), and a stable token keeps a layout
-    # that does interpolate one rendering without a randomness primitive.
+    # `content_security_policy_nonce`: the request's nonce, nil without a generator (lobsters' layout writes it into
+    # `<script nonce=…>`, and the header carries the same value).
     def self.content_security_policy_nonce
-      "roundhouse-nonce"
+      Rails.application.content_security_policy_nonce_current
     end
 
     # Rails' `csp_meta_tag`: a `<meta name="csp-nonce">` when a policy
@@ -43,7 +40,9 @@ module ActionView
     def self.csp_meta_tag
       return "<meta name=\"csp-nonce\" />" if @csp_policy_for_test
       return "" if Rails.application.content_security_policy.nil?
-      "<meta name=\"csp-nonce\" />"
+      nonce = Rails.application.content_security_policy_nonce_current
+      return "<meta name=\"csp-nonce\" />" if nonce.nil?
+      "<meta name=\"csp-nonce\" content=\"" + nonce + "\" />"
     end
 
     # The ruby family's `url_for_path` (see the universal body in
@@ -76,6 +75,70 @@ module ActionView
       )
     end
 
+    # Rails' `url_for(:back)`: the request's referrer, or a step back in the history where it has none or names a
+    # `javascript:` URL.
+    def self.back_url
+      request = ActionController::Current.request
+      referrer = request.nil? ? nil : request.referrer
+      return "javascript:history.back()" if referrer.nil? || referrer.empty? || referrer.start_with?("javascript:")
+      referrer
+    end
+
+    # Not url_for_path's host: a class that defines `default_url_options` names the host its `_url` helpers answer on, as Rails' url_for merges them
+    def self.url_for_options(path, options)
+      host = options[:host]
+      return url_for_path(path) if host.nil?
+      hostport = host.to_s
+      port = ActionController.url_port_of(hostport)
+      if options.key?(:port)
+        given = options[:port]
+        port = given.nil? ? "" : given.to_s
+      end
+      protocol = options[:protocol]
+      ActionController.build_host_url(protocol.nil? ? "http://" : protocol.to_s, hostport, port, path)
+    end
+
+    # The ruby family's `asset_url` and `image_url` (see the universal
+    # bodies in view_helpers.rb): the asset's path on the request's origin,
+    # as Rails' `url_to_asset` answers it with no `asset_host`
+    # (`compute_asset_host`'s `request.base_url`, for an absolute path
+    # too). A full URL, a protocol-relative one and a `data:` or `cid:`
+    # source pass as given, and a blank one answers blank. The origin is
+    # the request's `base_url`, not the app's canonical domain that route
+    # URLs use. Outside a request Rails has no host to add,
+    # and neither does this. With `skip_pipeline:`, a relative source is
+    # under its public directory (`public_compute_asset_path`): `/icon.png`,
+    # and `/images/icon.png` for an image.
+    def self.asset_url(source, skip_pipeline: false)
+      return source if source.empty? || asset_url?(source)
+      path = if source.start_with?("/")
+        source
+      elsif skip_pipeline
+        "/" + source
+      else
+        asset_path(source)
+      end
+      request_asset_url(path)
+    end
+
+    def self.image_url(source, skip_pipeline: false)
+      return source if source.empty? || asset_url?(source)
+      path = if source.start_with?("/")
+        source
+      elsif skip_pipeline
+        "/images/" + source
+      else
+        image_path(source)
+      end
+      request_asset_url(path)
+    end
+
+    def self.request_asset_url(path)
+      request = ActionController::Current.request
+      return path if request.nil?
+      request.base_url + path
+    end
+
     def self.digested_asset_path(source)
       cut = source.length
       query = source.index("?")
@@ -90,25 +153,23 @@ module ActionView
     # Rails `class_names` (alias of `token_list`): strings/arrays add
     # their tokens, hash entries contribute their key when the value is
     # truthy (`class_names("nav", current_page: cur == path)`), nested
-    # arrays recurse, and nil, false and blank tokens drop. Joined with
-    # single spaces.
+    # arrays recurse, and nil, false and blank tokens drop. Each value is
+    # split on whitespace and a token repeated is kept once, as Rails'
+    # `.split(/\s+/)` and `.uniq` do; joined with single spaces.
     def self.class_names(*args)
       tokens = []
       args.each do |arg|
         if arg.is_a?(Hash)
           arg.each do |k, v|
-            key = k.to_s
-            tokens << key if v && !key.strip.empty?
+            k.to_s.split(" ").each { |t| tokens << t } if v
           end
         elsif arg.is_a?(Array)
-          s = class_names(*arg)
-          tokens << s unless s.empty?
+          class_names(*arg).split(" ").each { |t| tokens << t }
         elsif arg
-          s = arg.to_s
-          tokens << s unless s.strip.empty?
+          arg.to_s.split(" ").each { |t| tokens << t }
         end
       end
-      tokens.join(" ")
+      tokens.uniq.join(" ")
     end
 
     def self.number_helper_for_template(method, value, options = {})
@@ -179,6 +240,7 @@ module ActionView
       opts.to_h.each do |k, v|
         attrs[k] = v
       end
+      attrs[:autocomplete] = "off" unless hidden_autocomplete_attr.empty? || attrs.key?(:autocomplete) || attrs.key?("autocomplete")
       "<input#{render_attrs(attrs)} />"
     end
 

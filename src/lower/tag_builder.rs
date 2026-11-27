@@ -90,7 +90,7 @@ use crate::ident::{ClassId, Symbol};
 use crate::lower::view_to_library::attr_parts::{append_attr_parts, string_interp};
 use crate::lower::view_to_library::turbo_frames;
 use crate::lower::view_to_library::{lit_str, view_helpers_call};
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 /// HELPER METHOD BODIES ONLY — views are deliberately not walked.
 ///
@@ -110,7 +110,7 @@ pub fn apply_tag_builder_lowering(
     // For `turbo_frame_tag`'s record test — the same snake-singular set
     // the view lowering's `ViewCtx` carries, built here because a hook
     // body has no view context.
-    let models: std::collections::HashSet<String> = app
+    let models: crate::det::HashSet<String> = app
         .models
         .iter()
         .map(|m| crate::naming::snake_case(m.name.0.as_str()))
@@ -125,39 +125,82 @@ pub fn apply_tag_builder_lowering(
     // on (`sti_scope` has run by this point in the pipeline). A
     // polymorphic URL names its route through the record's CLASS, and
     // for an STI base the class is a runtime question.
-    let sti_stems: std::collections::HashMap<String, Vec<String>> = app
-        .models
-        .iter()
-        .filter(|m| !m.sti_subclass_names.is_empty())
-        .map(|m| {
-            let stems = m
-                .sti_subclass_names
-                .iter()
-                .map(|sub| {
-                    sub.0
-                        .as_str()
-                        .split("::")
-                        .map(crate::naming::snake_case)
-                        .collect::<Vec<_>>()
-                        .join("_")
-                })
-                .collect();
-            (crate::naming::snake_case(m.name.0.as_str()), stems)
-        })
-        .collect();
+    let sti_stems = sti_route_stems(app);
     // A receiver-less `tag` is the builder only where nothing else
     // answers it. A class with its own `tag` — `belongs_to :tag`, a
     // `tag` column, `attr_reader :tag`, a `def tag` — calls ITS reader
     // (`tag.title`), and rewriting that compiled to `"<title></title>"`.
-    let owns_tag = classes_owning_tag(app, registry);
+    let owns_tag = classes_owning(app, registry, "tag", false);
+    let owns_content_tag = classes_owning(app, registry, "content_tag", false);
+    let app_content_tag = app.helper_method_index.contains_key(&Symbol::from("content_tag"));
+    // An app's own `stylesheet_link_tag` (an app/helpers method or a
+    // `helper_method`) is what Rails calls; it is left to the app. So is
+    // a class's own, which its bare call reaches, found as `tag`'s is.
+    let app_stylesheet = app_defines_stylesheet_link_tag(app);
+    // Not a helper module a class includes: in a view, Rails' helper
+    // answers the helper's call (one defining it is `app_stylesheet`).
+    // A class method counts: a class body's bare call reaches it. A
+    // helper is an owner when an app module it includes defines it
+    // (`helpers_including`).
+    let mut owns_stylesheet = classes_owning(app, registry, "stylesheet_link_tag", true);
+    owns_stylesheet.retain(|c| !app.helper_modules.contains(c));
+    owns_stylesheet.extend(helpers_including(app, "stylesheet_link_tag"));
     super::for_each_owned_hook_body(app, &mut |owner, body| {
         let own_tag = owner.is_some_and(|c| owns_tag.contains(c));
-        rewrite(body, own_tag, &models, &helpers, &sti_stems, &mut diags)
+        let own_stylesheet = app_stylesheet || owner.is_some_and(|c| owns_stylesheet.contains(c));
+        // Not where the app's helpers define it: a helper module's bare call reaches theirs through the helper index.
+        let own_content_tag = app_content_tag || owner.is_some_and(|c| owns_content_tag.contains(c));
+        rewrite(body, own_tag, own_content_tag, own_stylesheet, &models, &helpers, &sti_stems, &mut diags)
     });
     diags
 }
 
-/// Classes whose bodies read a bare `tag` as their own method: APP
+/// An app's own `stylesheet_link_tag` that a view's or helper's bare call
+/// reaches: an instance method of an `app/helpers` module, or a
+/// controller's `helper_method`. A helper's `def self.stylesheet_link_tag`
+/// is not one (`helper_method_index` holds both kinds).
+pub(crate) fn app_defines_stylesheet_link_tag(app: &App) -> bool {
+    let name = Symbol::from("stylesheet_link_tag");
+    let in_helper = app.library_classes.iter().filter(|lc| app.helper_modules.contains(&lc.name)).any(|lc| {
+        lc.methods.iter().any(|m| m.name == name && matches!(m.receiver, crate::dialect::MethodReceiver::Instance))
+    });
+    in_helper || app.view_visible_controller_methods.contains(&name)
+}
+
+/// The `app/helpers` modules that include, directly or through other app
+/// modules, a module defining an instance `method`: Ruby's lookup finds
+/// that one ahead of ActionView's. Read from the app's own declarations
+/// (the registry gives a helper module the view surface), instance
+/// methods only, not the helpers themselves.
+pub(crate) fn helpers_including(app: &App, method: &str) -> HashSet<ClassId> {
+    let name = Symbol::from(method);
+    let by_name: HashMap<&ClassId, &crate::dialect::LibraryClass> =
+        app.library_classes.iter().map(|lc| (&lc.name, lc)).collect();
+    let defines = |lc: &crate::dialect::LibraryClass| {
+        lc.methods.iter().any(|m| m.name == name && matches!(m.receiver, crate::dialect::MethodReceiver::Instance))
+    };
+    app.helper_modules
+        .iter()
+        .filter(|helper| {
+            let mut stack: Vec<&ClassId> = by_name.get(helper).map(|lc| lc.includes.iter().collect()).unwrap_or_default();
+            let mut seen = HashSet::default();
+            while let Some(c) = stack.pop() {
+                if !seen.insert(c) {
+                    continue;
+                }
+                let Some(lc) = by_name.get(c) else { continue };
+                if defines(lc) {
+                    return true;
+                }
+                stack.extend(lc.includes.iter());
+            }
+            false
+        })
+        .cloned()
+        .collect()
+}
+
+/// Classes whose bodies read a bare `method` (`tag`) as their own: APP
 /// classes with a `tag` instance method — the registry's
 /// `instance_methods` already hold associations, columns and `attr_*`
 /// readers alongside `def`s — directly or through an app module they
@@ -172,7 +215,15 @@ pub fn apply_tag_builder_lowering(
 /// `include ActionView::Helpers::TagHelper` is dropped by the analyzer
 /// as a view-helper marker, so a model that really uses the builder
 /// keeps the rewrite.
-fn classes_owning_tag(app: &App, registry: &HashMap<ClassId, ClassInfo>) -> HashSet<ClassId> {
+const FRAMEWORK_REOPENS: &[&str] =
+    &["ActionView::Base", "ActionController::Base", "ActionMailer::Base", "ActiveRecord::Base", "ActiveJob::Base"];
+
+fn classes_owning(
+    app: &App,
+    registry: &HashMap<ClassId, ClassInfo>,
+    method: &str,
+    class_side: bool,
+) -> HashSet<ClassId> {
     let app_classes: HashSet<&ClassId> = app
         .models
         .iter()
@@ -180,20 +231,36 @@ fn classes_owning_tag(app: &App, registry: &HashMap<ClassId, ClassInfo>) -> Hash
         .chain(app.library_classes.iter().map(|lc| &lc.name))
         .chain(app.controllers.iter().map(|c| &c.name))
         .collect();
-    let tag = Symbol::from("tag");
+    let tag = Symbol::from(method);
     let has_tag = |class: &ClassId| {
-        // Self, then app ancestors (includes and parents), each once.
-        let mut stack = vec![class];
-        let mut seen = HashSet::new();
-        while let Some(c) = stack.pop() {
+        // Self, then app ancestors (includes and parents), each once. A
+        // class method counts on the class and its parents only: an
+        // included module's `def self.…` isn't the includer's.
+        let mut stack = vec![(class, false)];
+        let mut seen = HashSet::default();
+        while let Some((c, included)) = stack.pop() {
             if !app_classes.contains(c) || !seen.insert(c) {
                 continue;
             }
             let Some(info) = registry.get(c) else { continue };
-            if info.instance_methods.contains_key(&tag) {
+            // Not the framework's own `tag` on a framework class the app or a gem reopens (`class ActionView::Base;
+            // include M; end` from an `on_load` or a Railtie): the reopen's methods only, and what it mixes in.
+            if FRAMEWORK_REOPENS.contains(&c.0.as_str()) {
+                let parts = app.library_classes.iter().filter(|lc| lc.name == *c);
+                for lc in parts {
+                    if lc.methods.iter().any(|m| m.name == tag && (m.receiver == crate::dialect::MethodReceiver::Instance || (class_side && !included))) {
+                        return true;
+                    }
+                    stack.extend(lc.includes.iter().map(|m| (m, true)));
+                }
+                continue;
+            }
+            if info.instance_methods.contains_key(&tag)
+                || (class_side && !included && info.class_methods.contains_key(&tag))
+            {
                 return true;
             }
-            stack.extend(info.includes.iter().chain(info.parent.iter()));
+            stack.extend(info.includes.iter().map(|m| (m, true)).chain(info.parent.iter().map(|p| (p, included))));
         }
         false
     };
@@ -365,19 +432,22 @@ fn is_tag_helper(recv: &Expr) -> bool {
 }
 
 /// `own_tag`: the body's class answers `tag` itself, so neither `tag.x`
-/// nor `tag(:x)` is the builder there (see [`classes_owning_tag`]). The
+/// nor `tag(:x)` is the builder there (see [`classes_owning`]). The
 /// other helpers this pass expands have names of their own and still
 /// apply.
+#[allow(clippy::too_many_arguments)]
 fn rewrite(
     expr: &mut Expr,
     own_tag: bool,
-    models: &std::collections::HashSet<String>,
-    helpers: &std::collections::HashSet<String>,
-    sti_stems: &std::collections::HashMap<String, Vec<String>>,
+    own_content_tag: bool,
+    own_stylesheet: bool,
+    models: &crate::det::HashSet<String>,
+    helpers: &crate::det::HashSet<String>,
+    sti_stems: &crate::det::HashMap<String, Vec<String>>,
     diags: &mut Vec<Diagnostic>,
 ) {
     expr.node.for_each_child_mut(&mut |child| {
-        rewrite(child, own_tag, models, helpers, sti_stems, diags)
+        rewrite(child, own_tag, own_content_tag, own_stylesheet, models, helpers, sti_stems, diags)
     });
 
     if rewrite_turbo_frame_tag(expr, models) {
@@ -389,10 +459,16 @@ fn rewrite(
     if rewrite_button_tag(expr) {
         return;
     }
+    if !own_stylesheet && rewrite_stylesheet_link_tag(expr) {
+        return;
+    }
     if rewrite_button_to_block(expr) {
         return;
     }
     if rewrite_link_to_block(expr, models, helpers, sti_stems, diags) {
+        return;
+    }
+    if !own_content_tag && rewrite_content_tag(expr, diags) {
         return;
     }
 
@@ -438,8 +514,15 @@ fn rewrite(
     // 200 and a green suite, because no gate reads the attributes of a tag.
     // `computed_attrs` did not catch it: it required `args.len() > 1`, and
     // a call whose arguments are entirely keywords has exactly one.
+    // With a block, Rails reads a lone Hash as the options (`tag.dialog class: "x", **opts do`, whose merge chain starts
+    // at the literal rather than at the splat). Not any other value: `tag.div(label) { … }` is content.
+    let block_options = block.is_some()
+        && args.len() == 1
+        && opts.is_none()
+        && matches!(&*args[0].node, ExprNode::Send { recv: Some(head), method, .. }
+            if method.as_str() == "merge" && matches!(&*head.node, ExprNode::Hash { .. }));
     let lone_computed_attrs =
-        args.len() == 1 && opts.is_none() && is_kwsplat_merge_chain(&args[0]);
+        args.len() == 1 && opts.is_none() && (is_kwsplat_merge_chain(&args[0]) || block_options);
     if lone_computed_attrs {
         content = None;
     }
@@ -563,6 +646,54 @@ fn rewrite_button_tag(expr: &mut Expr) -> bool {
     true
 }
 
+/// `stylesheet_link_tag(name[, opts])` written in a HELPER body: the same
+/// `ViewHelpers.stylesheet_link_tag(name, opts)` the view walker lowers
+/// the ERB spelling to (`view_to_library::helpers`), qualified for a
+/// helper module. A helper module never reached the walker, so the call
+/// stayed bare, with no module defining it (#1593).
+///
+/// Left as written, and refused at analyze (`analyze::diagnostics::
+/// helper_stylesheet_link_tags`): a Symbol name, which in a view is a
+/// stylesheet group (`:app`, `:all`) expanded from the view's stylesheet
+/// list, which a helper body doesn't have; and arguments other than a
+/// name and an optional literal options hash (a splat, forwarded
+/// arguments, a computed options expression).
+fn rewrite_stylesheet_link_tag(expr: &mut Expr) -> bool {
+    let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node else {
+        return false;
+    };
+    if method.as_str() != "stylesheet_link_tag" || expr.span.is_synthetic() {
+        return false;
+    }
+    let opaque = |e: &Expr| {
+        matches!(
+            &*e.node,
+            ExprNode::Splat { .. }
+                | ExprNode::KeywordSplat { .. }
+                | ExprNode::ForwardArgs
+                | ExprNode::ForwardKeywords
+                | ExprNode::ForwardKeywordsWithPairs { .. }
+        )
+    };
+    let shape_ok = match &args[..] {
+        [name] => !opaque(name) && !matches!(&*name.node, ExprNode::Hash { .. }),
+        [name, opts] => {
+            !opaque(name)
+                && matches!(&*opts.node, ExprNode::Hash { entries, .. } if !entries.iter().any(|(k, v)| opaque(k) || opaque(v)))
+        }
+        _ => false,
+    };
+    // Declined shapes are refused at analyze (`helper_stylesheet_link_tags`).
+    if !shape_ok || matches!(&*args[0].node, ExprNode::Lit { value: Literal::Sym { .. } }) {
+        return false;
+    }
+    let span = expr.span;
+    let mut built = view_helpers_call("stylesheet_link_tag", args.clone());
+    qualify_view_helpers(&mut built);
+    *expr = html_safe(built, span);
+    true
+}
+
 /// `button_to url, opts do … end` written in a HELPER body — Rails'
 /// BLOCK spelling, where the first argument is the URL and the block
 /// supplies the button's content.
@@ -590,12 +721,21 @@ fn rewrite_button_to_block(expr: &mut Expr) -> bool {
         return false;
     }
     let Some(url) = args.first() else { return false };
+    let span = expr.span;
     let opts = match args.get(1).map(|a| &*a.node) {
         None => Vec::new(),
         Some(ExprNode::Hash { entries, .. }) => entries.clone(),
+        // Computed options (maybe's `button_to(href, **merged_opts, &block)`): the runtime reads `method:` and
+        // `form_class:` out of them as this reads a literal Hash's.
+        Some(_) if args.len() == 2 => {
+            let call = view_helpers_call("button_to_html", vec![url.clone(), capture_call(block.clone(), span), args[1].clone()]);
+            let mut built = html_safe(call, span);
+            qualify_view_helpers(&mut built);
+            *expr = built;
+            return true;
+        }
         Some(_) => return false,
     };
-    let span = expr.span;
     let block = block.clone();
     let (mut parts, suffix) =
         crate::lower::view_to_library::helpers::button_to_wrapper_markup(url.clone(), opts);
@@ -637,9 +777,9 @@ fn rewrite_button_to_block(expr: &mut Expr) -> bool {
 /// would be a second, independently-maintained copy of that rule.
 fn polymorphic_route_call(
     url: &Expr,
-    models: &std::collections::HashSet<String>,
-    helpers: &std::collections::HashSet<String>,
-    sti_stems: &std::collections::HashMap<String, Vec<String>>,
+    models: &crate::det::HashSet<String>,
+    helpers: &crate::det::HashSet<String>,
+    sti_stems: &crate::det::HashMap<String, Vec<String>>,
 ) -> Option<Expr> {
     let ExprNode::Array { elements, .. } = &*url.node else {
         return None;
@@ -763,9 +903,9 @@ fn polymorphic_route_call(
 /// rather than guessed at.
 fn rewrite_link_to_block(
     expr: &mut Expr,
-    models: &std::collections::HashSet<String>,
-    helpers: &std::collections::HashSet<String>,
-    sti_stems: &std::collections::HashMap<String, Vec<String>>,
+    models: &crate::det::HashSet<String>,
+    helpers: &crate::det::HashSet<String>,
+    sti_stems: &crate::det::HashMap<String, Vec<String>>,
     diags: &mut Vec<Diagnostic>,
 ) -> bool {
     let ExprNode::Send { recv: None, method, args, block: Some(block), .. } = &*expr.node else {
@@ -865,6 +1005,77 @@ fn rewrite_link_to_block(
 /// Void-ness does not enter into it: the legacy form self-closes
 /// whatever it is handed, which is why it takes no block and no
 /// content argument here.
+/// `content_tag(name[, content][, opts]) [do … end]` written in a hook body (a helper, a component's method): the
+/// element `tag.<name>` builds, through the same attribute renderer. Rails reads the argument after the name as the
+/// OPTIONS when a block is given (maybe's `content_tag(:button, **merged_opts, &block)`), and closes even a void element.
+fn rewrite_content_tag(expr: &mut Expr, diags: &mut Vec<Diagnostic>) -> bool {
+    let ExprNode::Send { recv: None, method, args, block, .. } = &*expr.node else {
+        return false;
+    };
+    if method.as_str() != "content_tag" || args.is_empty() || args.len() > 3 {
+        return false;
+    }
+    let name = match &*args[0].node {
+        ExprNode::Lit { value: Literal::Sym { value } } => value.as_str().to_string(),
+        ExprNode::Lit { value: Literal::Str { value } } => value.clone(),
+        _ => return false,
+    };
+    if !is_html_element(&name) && !is_custom_element(&name) {
+        return false;
+    }
+    // With a block, a Hash after the name is the options; anything else there is content only when a passed-through
+    // `&block` turns out nil (maybe's `content_tag(:button, label, id:, &block)`), which Rails' `block_given?` reads.
+    let (content, opts) = match block {
+        Some(_) if args.len() > 2 => (args.get(1).cloned(), args.get(2).cloned()),
+        // `content_tag(:span, "Save", &block)`: not options unless a Hash, so the content a nil block leaves. Only a
+        // literal: a lone `**opts` reads here as the bare value, which is the options.
+        Some(b)
+            if matches!(&*b.node, ExprNode::Var { .. })
+                && args.get(1).is_some_and(|a| {
+                    matches!(&*a.node, ExprNode::StringInterp { .. } | ExprNode::Lit { value: Literal::Str { .. } | Literal::Sym { .. } })
+                }) =>
+        {
+            (args.get(1).cloned(), None)
+        }
+        Some(_) => (None, args.get(1).cloned()),
+        None => (args.get(1).cloned(), args.get(2).cloned()),
+    };
+    let block = block.clone();
+    let span = expr.span;
+
+    let entries = match opts.as_ref().map(|o| &*o.node) {
+        None => Vec::new(),
+        Some(ExprNode::Hash { entries, .. }) => entries.clone(),
+        Some(_) => {
+            diags.push(residue(expr, "attributes are a computed expression, not a literal hash"));
+            *expr = content_tag_fallback(&name, content, opts, block, span);
+            return true;
+        }
+    };
+    let mut parts: Vec<InterpPart> = vec![InterpPart::Text { value: format!("<{name}") }];
+    append_attr_parts(&mut parts, &entries);
+    parts.push(InterpPart::Text { value: ">".to_string() });
+    // Rails' `PRE_CONTENT_STRINGS`: the newline the parser drops, so a textarea's own leading one survives.
+    if name == "textarea" {
+        parts.push(InterpPart::Text { value: "\n".to_string() });
+    }
+    match (block, content) {
+        (Some(block), Some(content)) if matches!(&*block.node, ExprNode::Var { .. }) => {
+            let given = Expr::new(span, ExprNode::Send { recv: Some(block.clone()), method: Symbol::from("nil?"), args: vec![], block: None, parenthesized: false });
+            let captured = Expr::new(span, ExprNode::Send { recv: None, method: Symbol::from("capture"), args: vec![], block: Some(block), parenthesized: false });
+            parts.push(InterpPart::Expr { expr: Expr::new(span, ExprNode::If { cond: given, then_branch: escaped_content(content), else_branch: captured }) });
+        }
+        (Some(block), _) => parts.push(InterpPart::Expr { expr: capture_call(block, span) }),
+        (None, Some(content)) => parts.push(InterpPart::Expr { expr: escaped_content(content) }),
+        (None, None) => {}
+    }
+    parts.push(InterpPart::Text { value: format!("</{name}>") });
+    let mut built = string_interp(parts);
+    qualify_view_helpers(&mut built);
+    *expr = html_safe(built, span);
+    true
+}
+
 fn rewrite_legacy_tag(expr: &mut Expr, diags: &mut Vec<Diagnostic>) -> bool {
     let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node else {
         return false;
@@ -908,7 +1119,7 @@ fn rewrite_legacy_tag(expr: &mut Expr, diags: &mut Vec<Diagnostic>) -> bool {
     true
 }
 
-fn rewrite_turbo_frame_tag(expr: &mut Expr, models: &std::collections::HashSet<String>) -> bool {
+fn rewrite_turbo_frame_tag(expr: &mut Expr, models: &crate::det::HashSet<String>) -> bool {
     let ExprNode::Send { recv: None, method, args, block, .. } = &*expr.node else {
         return false;
     };
@@ -1055,9 +1266,14 @@ fn content_tag_fallback(
         ExprNode::Lit { value: Literal::Sym { value: Symbol::from(name) } },
     );
     sym.ty = Some(crate::ty::Ty::Sym);
-    let body = match block {
-        Some(block) => capture_call(block, span),
-        None => content.unwrap_or_else(|| lit_str(String::new())),
+    let body = match (block, content) {
+        (Some(block), Some(content)) if matches!(&*block.node, ExprNode::Var { .. }) => {
+            let given = Expr::new(span, ExprNode::Send { recv: Some(block.clone()), method: Symbol::from("nil?"), args: vec![], block: None, parenthesized: false });
+            let captured = Expr::new(span, ExprNode::Send { recv: None, method: Symbol::from("capture"), args: vec![], block: Some(block), parenthesized: false });
+            Expr::new(span, ExprNode::If { cond: given, then_branch: content, else_branch: captured })
+        }
+        (Some(block), _) => capture_call(block, span),
+        (None, content) => content.unwrap_or_else(|| lit_str(String::new())),
     };
     let mut args = vec![sym, body];
     if let Some(opts) = opts {
@@ -1140,7 +1356,7 @@ mod tests {
         )
     }
 
-    fn set(names: &[&str]) -> std::collections::HashSet<String> {
+    fn set(names: &[&str]) -> crate::det::HashSet<String> {
         names.iter().map(|s| s.to_string()).collect()
     }
 
@@ -1214,7 +1430,7 @@ mod tests {
     /// `inspect` into every room page's nav.
     /// No STI in play for most of these — the empty map is the plain
     /// (non-dispatching) shape.
-    fn no_sti() -> std::collections::HashMap<String, Vec<String>> {
+    fn no_sti() -> crate::det::HashMap<String, Vec<String>> {
         Default::default()
     }
 
@@ -1293,7 +1509,7 @@ mod tests {
     /// arm — ending in the base helper.
     #[test]
     fn an_sti_base_dispatches_on_its_subclass_stems() {
-        let mut sti = std::collections::HashMap::new();
+        let mut sti = crate::det::HashMap::default();
         sti.insert(
             "room".to_string(),
             vec!["rooms_open".to_string(), "rooms_closed".to_string()],
@@ -1334,7 +1550,7 @@ mod tests {
     /// a route, the plain base call comes back with no dispatch at all.
     #[test]
     fn a_routeless_subclass_folds_into_the_base_arm() {
-        let mut sti = std::collections::HashMap::new();
+        let mut sti = crate::det::HashMap::default();
         sti.insert("room".to_string(), vec!["rooms_open".to_string()]);
         let call = polymorphic_route_call(
             &array(vec![sym("edit"), ivar("room")]),
@@ -1348,4 +1564,19 @@ mod tests {
         };
         assert_eq!(method.as_str(), "edit_room_path");
     }
+}
+
+/// STI base → subclass route stems (`room` → `["rooms_open", …]`), the
+/// names `dom_prefix` answers for each subclass.
+pub(crate) fn sti_route_stems(app: &crate::App) -> crate::det::HashMap<String, Vec<String>> {
+    app.models
+        .iter()
+        .filter(|m| !m.sti_subclass_names.is_empty())
+        .map(|m| (crate::naming::snake_case(m.name.0.as_str()), m.sti_subclass_names.iter().map(|sub| class_route_stem(sub.0.as_str())).collect()))
+        .collect()
+}
+
+/// `Rooms::Open` → `rooms_open`, the stem of its route helpers.
+pub(crate) fn class_route_stem(class: &str) -> String {
+    class.split("::").map(crate::naming::snake_case).collect::<Vec<_>>().join("_")
 }

@@ -90,9 +90,8 @@ module ActionDispatch
 
     # The messages the session carries in from the previous request, for
     # `ActionDispatch::Flash.new`: Rails' `FlashHash.from_session_value`,
-    # the "flashes" less the "discard" list. A message the flash cannot
-    # hold (neither `notice` nor `alert`, or not a String) is not one any
-    # code in the app can read, and is dropped with the rest at the end.
+    # the "flashes" less the "discard" list, any key and any JSON value
+    # (lobsters' `flash[:error]`, a Hash a JSON flash carries).
     def self.inbound_flash(session)
       out = {}
       value = session["flash"]
@@ -102,11 +101,8 @@ module ActionDispatch
       discard = value["discard"]
       flashes.each do |k, v|
         key = k.to_s
-        next unless key == "notice" || key == "alert"
-        next unless v.is_a?(String)
         next if discard.is_a?(Array) && discard.include?(key)
-        # to_s: Spinel keeps the boxed value boxed past is_a?, and Flash.new takes a String Hash
-        out[key] = v.to_s
+        out[key] = v
       end
       out
     end

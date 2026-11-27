@@ -96,11 +96,12 @@ fn accessors_render_over_the_serialized_column() {
         ),
         "boolean writer casts rather than storing the form value verbatim:\n{src}"
     );
-    // The column accessor pair is NOT replaced: `@settings` stays the
-    // serialized text every synthesized path already moves (hydration,
-    // `[]`, the adapter's escape).
+    // The column reader stays a storage read: `@settings` holds the
+    // serialized text hydration and the adapter move. Schema-key reads
+    // use their separate typed accessors. A partial select's left-out
+    // column raises first (`lower::missing_attribute`).
     assert!(
-        src.contains("def settings\n    @settings\n  end"),
+        src.contains("def settings\n    _missing_attribute(:settings) if @__unloaded_columns\n    @settings\n  end"),
         "the column reader stays the storage read:\n{src}"
     );
 }

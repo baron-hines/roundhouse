@@ -1,0 +1,5 @@
+# log out; a page that needs a login then redirects
+GET /settings
+POST /logout -> 302
+GET /settings -> 302
+GET /newest

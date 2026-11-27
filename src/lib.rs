@@ -7,13 +7,21 @@
 pub mod adapter;
 pub mod analyze;
 pub mod app;
+mod app_answers;
+#[cfg(feature = "memory-census")]
+pub mod memory_census;
 pub mod builder;
 pub mod bytecode;
 pub mod catalog;
 /// Machine-readable `roundhouse check` inventory + ranked hotspot report.
 pub mod check_report;
+pub mod controller_layout;
 pub mod diagnostic;
+pub mod database;
 pub mod dialect;
+pub mod det;
+/// Shared parent/include ordering for library classes that share a file.
+pub mod library_class_order;
 pub mod effect;
 pub mod emit;
 pub mod erb;
@@ -57,6 +65,8 @@ pub mod lsp;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod mcp;
 pub mod naming;
+pub mod observed_shapes;
+pub mod par;
 pub mod profile;
 /// Target identity and the policies lowering reads (`param_binds_enabled`,
 /// `has_runtime_relation`). Compiled for wasm: `project` is host-only, but
@@ -80,6 +90,7 @@ pub mod runtime_src;
 pub mod session;
 pub mod timings;
 pub mod treeshake;
+pub mod source_gem_shake;
 pub mod version;
 pub mod schema;
 pub mod span;
@@ -91,7 +102,7 @@ pub use app::{App, ControllerResolution, ResolvedFilter};
 pub use profile::{Database, DeploymentProfile, HttpShim, ProfileError, Target};
 pub use dialect::{
     Action, Association, Callback, CallbackHook, Comment, Controller, ControllerBodyItem,
-    Dependent, Filter, FilterKind, HttpMethod, LayoutDecl, MethodDef, MethodReceiver, Model,
+    Dependent, Filter, FilterKind, HttpMethod, LayoutCall, LayoutDecl, LayoutValue, MethodDef, MethodReceiver, Model,
     ModelBodyItem,
     InclusionRange, RenderTarget, ResourceScope, Route, RouteSpec, RouteTable, Scope, Validation,
     ValidationRule,
@@ -106,3 +117,12 @@ pub use span::{FileId, Span};
 pub use ty::{Param, ParamKind, Row, Ty};
 
 pub mod shared;
+
+// Linux builds allocate Rust's heap through mimalloc: with glibc's
+// allocator, malloc and free were 28% of the samples of a one-worker
+// Mastodon transpile, and mimalloc runs it in 30% less time, with the
+// same output. Other targets, not measured, keep the system allocator,
+// and so does the `memory-census` build, whose counting allocator wraps it.
+#[cfg(all(target_os = "linux", not(feature = "memory-census")))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;

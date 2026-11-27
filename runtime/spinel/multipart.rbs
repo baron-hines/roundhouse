@@ -13,15 +13,25 @@ module ActionDispatch
       def to_s: () -> String
       def self.from_params: (Hash[String, untyped] sub, String key) -> ActionDispatch::Http::UploadedFile?
       def self.provided: (Hash[String, untyped] sub, String key) -> bool
+      def self.scalar_list: (Hash[String, untyped] sub, String key) -> Array[String | ActionDispatch::Http::UploadedFile]
       def self.name_of: (ActionDispatch::Http::UploadedFile? file) -> String
     end
 
     module Multipart
+      class FilePart
+        @name: String
+        @file: ActionDispatch::Http::UploadedFile
+        attr_reader name: String
+        attr_reader file: ActionDispatch::Http::UploadedFile
+        def initialize: (String name, ActionDispatch::Http::UploadedFile file) -> void
+      end
       class Form
         @fields: Hash[String, String]
         @files: Hash[String, ActionDispatch::Http::UploadedFile]
+        @file_parts: Array[ActionDispatch::Http::Multipart::FilePart]
         attr_reader fields: Hash[String, String]
         attr_reader files: Hash[String, ActionDispatch::Http::UploadedFile]
+        attr_reader file_parts: Array[ActionDispatch::Http::Multipart::FilePart]
         def initialize: () -> void
         def add_field: (String name, String value) -> nil
         def add_file: (String name, ActionDispatch::Http::UploadedFile file) -> nil

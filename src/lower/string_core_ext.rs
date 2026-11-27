@@ -1,11 +1,15 @@
 //! String core-ext grounding, one table.
 //!
 //! `(name, receiver shape, arity, runtime receiver, runtime name)` for
-//! `humanize`, `titleize`, `underscore`, `demodulize`, `singularize`,
-//! `remove`, `ordinalize`, and `parameterize`. The bodies stay in
+//! `humanize`, `titleize`/`titlecase`, `underscore`, `demodulize`,
+//! `singularize`, `camelize`/`camelcase`, `classify`, `dasherize`,
+//! `deconstantize`, `foreign_key`, `remove`, `strip_heredoc`,
+//! `ordinalize`, and `parameterize`. The bodies stay in
 //! `runtime/ruby/active_support_inflections.rb` and
 //! `runtime/ruby/inflector_ext.rb` (`Inflector.parameterize`); this
-//! pass only rewrites the call.
+//! pass only rewrites the call. `tableize` has no runtime body, so
+//! analysis refuses it (`String extension`) instead of typing it as a
+//! String.
 //!
 //! `parameterize` stays on model `def` bodies and unknown model-body
 //! expressions. The fused view walk does not apply that row, which is
@@ -112,6 +116,75 @@ const STRING_CORE_EXT: &[StringCoreExt] = &[
         site: Site::Fused,
         stamp_string: true,
     },
+    // Rails' alias of `titleize`, its own runtime method so a nil
+    // receiver's error names `titlecase`, as Rails' does.
+    StringCoreExt {
+        name: "titlecase",
+        receiver: ReceiverShape::StringOrNil,
+        arity: 0,
+        runtime_receiver: &["ActiveSupport"],
+        runtime_name: "titlecase",
+        site: Site::Fused,
+        stamp_string: true,
+    },
+    // The String methods over the `ActiveSupport::Inflector` bodies: nil
+    // raises in the runtime, as it does in Rails.
+    StringCoreExt {
+        name: "camelize",
+        receiver: ReceiverShape::StringOrNil,
+        arity: 0,
+        runtime_receiver: &["ActiveSupport"],
+        runtime_name: "camelize",
+        site: Site::Fused,
+        stamp_string: true,
+    },
+    // Rails' alias of `camelize`, its own runtime method for the same
+    // reason as `titlecase`.
+    StringCoreExt {
+        name: "camelcase",
+        receiver: ReceiverShape::StringOrNil,
+        arity: 0,
+        runtime_receiver: &["ActiveSupport"],
+        runtime_name: "camelcase",
+        site: Site::Fused,
+        stamp_string: true,
+    },
+    StringCoreExt {
+        name: "classify",
+        receiver: ReceiverShape::StringOrNil,
+        arity: 0,
+        runtime_receiver: &["ActiveSupport"],
+        runtime_name: "classify",
+        site: Site::Fused,
+        stamp_string: true,
+    },
+    StringCoreExt {
+        name: "dasherize",
+        receiver: ReceiverShape::StringOrNil,
+        arity: 0,
+        runtime_receiver: &["ActiveSupport"],
+        runtime_name: "dasherize",
+        site: Site::Fused,
+        stamp_string: true,
+    },
+    StringCoreExt {
+        name: "deconstantize",
+        receiver: ReceiverShape::StringOrNil,
+        arity: 0,
+        runtime_receiver: &["ActiveSupport"],
+        runtime_name: "deconstantize",
+        site: Site::Fused,
+        stamp_string: true,
+    },
+    StringCoreExt {
+        name: "foreign_key",
+        receiver: ReceiverShape::StringOrNil,
+        arity: 0,
+        runtime_receiver: &["ActiveSupport"],
+        runtime_name: "foreign_key",
+        site: Site::Fused,
+        stamp_string: true,
+    },
     // ActiveSupport's `String#remove` takes one or more patterns; the
     // runtime helper takes one. Multi-arg calls stay dynamic.
     StringCoreExt {
@@ -120,6 +193,15 @@ const STRING_CORE_EXT: &[StringCoreExt] = &[
         arity: 1,
         runtime_receiver: &["ActiveSupport"],
         runtime_name: "remove",
+        site: Site::Fused,
+        stamp_string: true,
+    },
+    StringCoreExt {
+        name: "strip_heredoc",
+        receiver: ReceiverShape::StringOrNil,
+        arity: 0,
+        runtime_receiver: &["ActiveSupport"],
+        runtime_name: "strip_heredoc",
         site: Site::Fused,
         stamp_string: true,
     },
@@ -189,7 +271,29 @@ pub(crate) fn rewrite_fused_node(expr: &mut Expr) -> bool {
     rewrite_node(expr, Site::Fused)
 }
 
+/// ActiveSupport's underscore-style aliases of a String's own predicates.
+/// Analysis types them as the predicates they alias, and no runtime
+/// defines them, so they become the core method on the same receiver.
+const STRING_ALIASES: &[(&str, &str)] = &[("starts_with?", "start_with?"), ("ends_with?", "end_with?")];
+
+fn rewrite_alias(expr: &mut Expr) -> bool {
+    let ExprNode::Send { recv: Some(receiver), method, block: None, .. } = &mut *expr.node else {
+        return false;
+    };
+    let Some((_, core)) = STRING_ALIASES.iter().find(|(alias, _)| *alias == method.as_str()) else {
+        return false;
+    };
+    if !ReceiverShape::StringOrNil.matches(receiver.ty.as_ref()) {
+        return false;
+    }
+    *method = Symbol::from(*core);
+    true
+}
+
 fn rewrite_node(expr: &mut Expr, site: Site) -> bool {
+    if site == Site::Fused && rewrite_alias(expr) {
+        return true;
+    }
     let Some(matched) = match_rule(expr, site) else {
         return false;
     };
@@ -262,7 +366,15 @@ mod tests {
         "underscore",
         "demodulize",
         "singularize",
+        "titlecase",
+        "camelize",
+        "camelcase",
+        "classify",
+        "dasherize",
+        "deconstantize",
+        "foreign_key",
         "remove",
+        "strip_heredoc",
         "ordinalize",
         "parameterize",
     ];
@@ -382,6 +494,37 @@ mod tests {
             Some(&["ActiveSupport".to_string(), "Inflector".to_string()][..])
         );
 
+        // An alias keeps its own name, so the runtime's nil error can name it.
+        let mut camelcase = call(Some(Ty::Str), "camelcase", 0);
+        assert!(rewrite_node(&mut camelcase, Site::Fused));
+        assert_eq!(
+            const_path(&camelcase).as_deref(),
+            Some(&["ActiveSupport".to_string()][..])
+        );
+        assert!(
+            matches!(&*camelcase.node, ExprNode::Send { method, .. } if method.as_str() == "camelcase")
+        );
+        let mut titlecase = call(Some(Ty::Str), "titlecase", 0);
+        assert!(rewrite_node(&mut titlecase, Site::Fused));
+        assert!(
+            matches!(&*titlecase.node, ExprNode::Send { method, .. } if method.as_str() == "titlecase")
+        );
+        assert_eq!(
+            const_path(&titlecase).as_deref(),
+            Some(&["ActiveSupport".to_string()][..])
+        );
+
+        // A nullable receiver grounds too: the runtime raises on nil, as Rails does.
+        let mut nullable_classify = call(
+            Some(Ty::Union {
+                variants: vec![Ty::Str, Ty::Nil].into(),
+            }),
+            "classify",
+            0,
+        );
+        assert!(rewrite_node(&mut nullable_classify, Site::Fused));
+        assert_eq!(nullable_classify.ty, Some(Ty::Str));
+
         let mut remove = call(Some(Ty::Str), "remove", 1);
         assert!(rewrite_node(&mut remove, Site::Fused));
         let mut multi = call(Some(Ty::Str), "remove", 2);
@@ -412,10 +555,9 @@ mod tests {
 
     #[test]
     fn views_keep_parameterize_and_still_ground_humanize() {
-        use std::collections::HashMap;
         use std::path::PathBuf;
 
-        let files: HashMap<PathBuf, Vec<u8>> = [
+        let files: crate::vfs::FileTree = [
             (
                 "db/schema.rb",
                 "ActiveRecord::Schema.define do\n  create_table \"stories\", force: :cascade do |t|\n    t.string \"title\"\n  end\nend\n",
@@ -427,7 +569,7 @@ mod tests {
             ),
             (
                 "app/views/stories/show.html.erb",
-                "<p><%= \"Hello World\".parameterize %></p>\n<p><%= \"Hello World\".humanize %></p>\n",
+                "<p><%= \"Hello World\".parameterize %></p>\n<p><%= \"Hello World\".humanize %></p>\n<p><%= \"gear_boxes\".classify %></p>\n",
             ),
         ]
         .into_iter()
@@ -470,6 +612,10 @@ mod tests {
         assert!(
             view.contains("ActiveSupport.humanize(\"Hello World\")"),
             "views still ground humanize:\n{view}"
+        );
+        assert!(
+            view.contains("ActiveSupport.classify(\"gear_boxes\")"),
+            "views ground classify too:\n{view}"
         );
     }
 }

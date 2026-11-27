@@ -1,8 +1,12 @@
 //! `validates` / `validates_*_of` option parsing.
 //!
 //! Recognized rules become `Validation` items. An option this build
-//! does not lower is a warning and a survey gap, and the call is not
-//! turned into a partial check.
+//! does not lower is a warning and a survey gap. In a rule's own options
+//! it drops that rule, and the call keeps its other rules, as Rails runs
+//! each validator on its own. Outside them (a call-level `if:`,
+//! `allow_nil:`, `message:`) it reaches every rule, and the call is
+//! dropped. A message option drops nothing: the rule runs with its
+//! default message.
 
 use ruby_prism::Node;
 
@@ -50,20 +54,27 @@ pub(super) enum ValidatesKind {
 }
 
 pub(super) enum ParsedValidates {
-    /// Every option on the call is lowered. Empty rules are a real
-    /// no-op (`presence: false`), not a dropped validator.
+    /// The call's lowered rules, without any it reported as a gap.
+    /// Empty rules are a real no-op (`presence: false`), not a dropped
+    /// validator.
     Modeled(Vec<crate::dialect::Validation>),
-    /// An option this build does not lower. The call is not a
-    /// `Validation` and not an `Unknown` re-warning: the other rules
-    /// must not run while this one vanishes, and a condition must not
-    /// become an unconditional check.
+    /// A gap outside the rules, or in every one of them. The call is not
+    /// a `Validation` and not an `Unknown` re-warning: a condition must
+    /// not become an unconditional check.
     Gap,
     /// Not a shape this parser claims (`validates` with a block). The
     /// call stays on the unsupported-DSL ledger.
     Decline,
+    /// The lowered rules, and some keys that name no built-in
+    /// validator (`domain: true` for an app's `DomainValidator`): the rules
+    /// that are, those keys, and the lowered rules' keys. Which keys name an
+    /// app validator is known only once the whole app is ingested
+    /// (`ingest::each_validator`), which lowers them or reports them.
+    Custom(Vec<crate::dialect::Validation>, Vec<String>, Vec<String>),
 }
 
 struct BuiltRule {
+    prepend: bool,
     rule: crate::dialect::ValidationRule,
     if_cond: Option<Expr>,
     unless_cond: Option<Expr>,
@@ -71,8 +82,12 @@ struct BuiltRule {
     /// `None` unset, `Some(guard)` as `context_guard` reads it.
     on_guard: Option<Option<Expr>>,
     /// A call-level `allow_nil: true` on a rule that stores no flag of its
-    /// own (presence): the rule runs only when the attribute is not nil.
+    /// own (presence, inclusion, exclusion): the rule runs only when the
+    /// attribute is not nil.
     nil_skip: bool,
+    /// The same for `allow_blank: true`: the rule runs only when the
+    /// attribute is not blank (nil, `""`, `"  "`).
+    blank_skip: bool,
     /// A literal String `message:` in the rule's own hash.
     message: Option<String>,
     /// The rule's own hash named `allow_nil:` / `allow_blank:`, which
@@ -80,11 +95,35 @@ struct BuiltRule {
     /// under each validator's own).
     own_allow_nil: bool,
     own_allow_blank: bool,
+    /// Message options this build does not lower (`too_long:`, a Symbol
+    /// `message:`). The rule still runs, with its default message: it
+    /// accepts and rejects the records Rails does, and only the error
+    /// text differs, where dropping it would save records Rails rejects.
+    message_gaps: Vec<String>,
 }
 
 impl BuiltRule {
     fn bare(rule: crate::dialect::ValidationRule) -> Self {
-        Self { rule, if_cond: None, unless_cond: None, on_guard: None, nil_skip: false, message: None, own_allow_nil: false, own_allow_blank: false }
+        Self {
+            prepend: false,
+            rule,
+            if_cond: None,
+            unless_cond: None,
+            on_guard: None,
+            nil_skip: false,
+            blank_skip: false,
+            message: None,
+            own_allow_nil: false,
+            own_allow_blank: false,
+            message_gaps: Vec::new(),
+        }
+    }
+
+    /// The rule as a gap: its options, and the message options it would
+    /// have run without.
+    fn gap(mut self, mut gaps: Vec<String>) -> RuleParse {
+        gaps.append(&mut self.message_gaps);
+        RuleParse::Gap(gaps)
     }
 }
 
@@ -93,6 +132,54 @@ enum RuleParse {
     Skip,
     Rule(BuiltRule),
     Gap(Vec<String>),
+}
+
+/// A mixed call registers every rule in Hash order, before callback scheduling.
+/// Expand one key at a time so an app validator occupies its written position
+/// beside built-ins, even though its class is resolved later in ingest.
+pub(super) fn split_custom_call(
+    call: &ruby_prism::CallNode<'_>,
+    owner: &crate::ClassId,
+    file: &str,
+    leading_comments: Vec<Comment>,
+    class_consts: &super::ClassConsts,
+    custom: &[String],
+    kept: &[String],
+) -> super::IngestResult<Vec<ModelBodyItem>> {
+    let text = |node: &Node<'_>| String::from_utf8_lossy(node.location().as_slice()).into_owned();
+    let mut shared = Vec::new();
+    let mut rules = Vec::new();
+    for arg in call.arguments().unwrap().arguments().iter() {
+        if let Some(elements) = hash_elements(&arg) {
+            for el in elements.iter() {
+                let Some(assoc) = el.as_assoc_node() else { continue };
+                let Some(key) = symbol_value(&assoc.key()) else { continue };
+                if custom.contains(&key) || kept.contains(&key) {
+                    rules.push((el.location().start_offset(), text(&el)));
+                } else if matches!(key.as_str(), "if" | "unless" | "on" | "allow_nil" | "allow_blank") {
+                    shared.push(text(&el));
+                }
+            }
+        } else {
+            shared.push(text(&arg));
+        }
+    }
+    let mut items = Vec::new();
+    for (offset, rule) in rules {
+        let source = format!("{}validates {}, {}", " ".repeat(offset), shared.join(", "), rule);
+        let parsed = super::super::prism::parse_silent(source.as_bytes());
+        let root = parsed.node();
+        let statement = root.as_program_node().unwrap().statements().body().iter().next().unwrap();
+        let comments = if items.is_empty() { leading_comments.clone() } else { Vec::new() };
+        let split = super::ingest_model_body_items(&statement, owner, file, comments, None, class_consts)?;
+        for item in &split {
+            if let ModelBodyItem::Unknown { expr, .. } = item {
+                super::super::each_validator::keep_diagnostic_context(expr.span, custom, kept);
+            }
+        }
+        items.extend(split);
+    }
+    Ok(items)
 }
 
 /// The attribute names a `*CONST` splat expands to: a list constant the
@@ -139,6 +226,12 @@ pub(super) fn parse_validates_call(
     let mut attrs: Vec<Symbol> = Vec::new();
     let mut option_node: Option<Node<'_>> = None;
     let mut gaps: Vec<String> = Vec::new();
+    // Keys naming no built-in validator: an app's `EachValidator`, maybe.
+    let mut custom: Vec<String> = Vec::new();
+    // A rule this build does not lower, by key, with its options' gaps.
+    let mut rule_gaps: Vec<(String, Vec<String>)> = Vec::new();
+    // The keys of the lowered rules, for the gaps' warnings.
+    let mut kept: Vec<String> = Vec::new();
     for arg in args.arguments().iter() {
         if let Some(name) = super::super::util::symbol_or_string_value(&arg) {
             attrs.push(Symbol::from(name.as_str()));
@@ -208,8 +301,18 @@ pub(super) fn parse_validates_call(
                         "strict" | "message" => gaps.push(key),
                         other => match parse_validator(other, &value, file, class_consts) {
                             RuleParse::Skip => {}
-                            RuleParse::Rule(built) => drafts.push(built),
-                            RuleParse::Gap(more) => gaps.extend(more),
+                            RuleParse::Rule(built) => {
+                                kept.push(other.to_string());
+                                drafts.push(built);
+                            }
+                            RuleParse::Gap(more) if !BUILT_IN_VALIDATORS.contains(&other) && more == [other] => {
+                                custom.push(other.to_string())
+                            }
+                            // A gap in the rule's own options drops that
+                            // rule, not the call. Dropping just the option
+                            // would not do: without `conditions:` a
+                            // uniqueness rule rejects records Rails accepts.
+                            RuleParse::Gap(more) => rule_gaps.push((other.to_string(), more)),
                         },
                     }
                 }
@@ -259,39 +362,63 @@ pub(super) fn parse_validates_call(
     };
     // Acceptance stores `allow_nil` (below); `allow_blank` stays the gap.
     let stores_nil = |draft: &BuiltRule| matches!(draft.rule, ValidationRule::Acceptance { .. });
-    if allow_blank
-        && drafts
-            .iter()
-            .any(|draft| !blank_safe(&draft.rule) && !is_uniqueness(draft) && !stores_flags(draft))
-    {
-        gaps.push("allow_blank".to_string());
+    // Call-level `allow_blank: true` on a rule that stores no flag of its
+    // own: Rails skips a blank value for every validator in the call, so
+    // the rule runs only when the value is not blank. Its own option wins.
+    if allow_blank {
+        for draft in &mut drafts {
+            if !blank_safe(&draft.rule) && !is_uniqueness(draft) && !stores_flags(draft) && !draft.own_allow_blank {
+                draft.blank_skip = true;
+            }
+        }
     }
     // Call-level `allow_nil: true` is Rails' skip-when-nil for every
     // validator in the call. Length, Uniqueness, Numericality and Format store it, and
     // Presence skips nil (`nil_skip` below). The other
     // rules this build lowers reject nil, so applying them would reject
     // records Rails accepts.
-    if allow_nil == Some(true)
-        && drafts
-            .iter()
-            .any(|draft| {
-                !matches!(draft.rule, ValidationRule::Length { .. } | ValidationRule::Presence)
-                    && !is_uniqueness(draft)
-                    && !stores_flags(draft)
-                    && !stores_nil(draft)
-            })
-    {
-        gaps.push("allow_nil".to_string());
+    if allow_nil == Some(true) {
+        for draft in &mut drafts {
+            if !matches!(draft.rule, ValidationRule::Length { .. } | ValidationRule::Presence)
+                && !is_uniqueness(draft)
+                && !stores_flags(draft)
+                && !stores_nil(draft)
+                && !draft.own_allow_nil
+            {
+                draft.nil_skip = true;
+            }
+        }
     }
 
-    if !gaps.is_empty() {
+    // A gap outside the rules (a call-level condition, `allow_nil:`,
+    // `message:`, an argument) reaches every rule, so it drops the call.
+    // The rules' own gaps and the custom keys are reported with it.
+    if !gaps.is_empty() || (attrs.is_empty() && !rule_gaps.is_empty()) {
+        let lost: Vec<String> = kept.iter().chain(&custom).cloned().collect();
+        gaps.extend(custom);
+        gaps.extend(rule_gaps.into_iter().flat_map(|(_, more)| more));
+        gaps.extend(drafts.into_iter().flat_map(|draft| draft.message_gaps));
         gaps.sort();
         gaps.dedup();
-        record_validation_gaps(file, span, method, &attrs, &gaps);
+        let note = if lost.is_empty() { String::new() } else { format!("; the whole call is dropped, including {}", rule_list(&lost)) };
+        record_validation_gaps(file, span, method, &attrs, &gaps, None, &note);
         return ParsedValidates::Gap;
     }
     if attrs.is_empty() {
         return ParsedValidates::Decline;
+    }
+    let others: Vec<String> = kept.iter().chain(&custom).cloned().collect();
+    let all_dropped = drafts.is_empty() && custom.is_empty() && !rule_gaps.is_empty();
+    for (key, mut more) in rule_gaps {
+        more.sort();
+        more.dedup();
+        record_validation_gaps(file, span, method, &attrs, &more, None, &dropped_rule_note(&key, &others));
+    }
+    for draft in &drafts {
+        record_validation_gaps(file, span, method, &attrs, &draft.message_gaps, Some(MESSAGE_GAP), "");
+    }
+    if all_dropped {
+        return ParsedValidates::Gap;
     }
 
     if allow_blank {
@@ -347,9 +474,11 @@ pub(super) fn parse_validates_call(
     }
 
     let mut out = Vec::new();
-    for attr in &attrs {
+    let mut prepended = Vec::new();
+    for (attr_index, attr) in attrs.iter().enumerate() {
         if drafts.is_empty() {
             out.push(Validation {
+                prepend: false,
                 attribute: attr.clone(),
                 rules: Vec::new(),
                 if_cond: and_guard(on_guard.clone(), call_if_cond.clone()),
@@ -359,15 +488,28 @@ pub(super) fn parse_validates_call(
             continue;
         }
         let mut grouped: Option<Validation> = None;
-        for draft in &drafts {
+        for (rule_index, draft) in drafts.iter().enumerate() {
             // A condition inside the rule hash replaces the call-level
             // one for that key — the other key still merges in.
             // The rule's own `on:` replaces the call's, as Rails merges the
             // call's options under each validator's own.
             let rule_on = draft.on_guard.clone().unwrap_or_else(|| on_guard.clone());
             let rule_on = if draft.nil_skip { and_guard(Some(not_nil(attr)), rule_on) } else { rule_on };
+            let rule_on = if draft.blank_skip { and_guard(Some(not_blank(attr)), rule_on) } else { rule_on };
             let if_cond = and_guard(rule_on, draft.if_cond.clone().or_else(|| call_if_cond.clone()));
             let unless_cond = draft.unless_cond.clone().or_else(|| call_unless_cond.clone());
+            let validation = Validation {
+                prepend: draft.prepend,
+                attribute: attr.clone(),
+                rules: vec![draft.rule.clone()],
+                if_cond: if_cond.clone(),
+                unless_cond: unless_cond.clone(),
+                message: draft.message.clone(),
+            };
+            if draft.prepend {
+                prepended.push((rule_index, std::cmp::Reverse(attr_index), validation));
+                continue;
+            }
             if let Some(current) = grouped.as_mut() {
                 if current.if_cond == if_cond && current.unless_cond == unless_cond && current.message == draft.message {
                     current.rules.push(draft.rule.clone());
@@ -375,20 +517,27 @@ pub(super) fn parse_validates_call(
                 }
                 out.push(grouped.take().unwrap());
             }
-            grouped = Some(Validation {
-                attribute: attr.clone(),
-                rules: vec![draft.rule.clone()],
-                if_cond,
-                unless_cond,
-                message: draft.message.clone(),
-            });
+            grouped = Some(validation);
         }
         if let Some(validation) = grouped {
             out.push(validation);
         }
     }
-    ParsedValidates::Modeled(out)
+    // A validator registers once for all its attributes. The scheduler reverses
+    // callbacks, so reverse its attribute expansion here to keep those together.
+    prepended.sort_by_key(|(rule, attr, _)| (*rule, *attr));
+    out.extend(prepended.into_iter().map(|(_, _, validation)| validation));
+    if custom.is_empty() {
+        ParsedValidates::Modeled(out)
+    } else {
+        ParsedValidates::Custom(out, custom, kept)
+    }
 }
+
+/// The validators Rails defines for a `validates` key, whether or not
+/// this parser lowers them: never an app's `EachValidator`.
+const BUILT_IN_VALIDATORS: &[&str] =
+    &["presence", "absence", "acceptance", "length", "numericality", "inclusion", "exclusion", "uniqueness", "format", "comparison", "confirmation", "associated"];
 
 /// `message: "…"` in a validator's own hash: Rails' text in place of the
 /// default (after a model-specific translation, which the message lookup
@@ -458,6 +607,28 @@ fn push_condition(
 /// spelling `model_to_library::markers` uses, for the same reason).
 /// `!self.<attr>.nil?`, the guard a call-level `allow_nil:` puts on a rule
 /// that stores no flag (presence).
+/// `!self.<attr>.blank?`: Rails' `allow_blank:` skips nil, `""` and `"  "`.
+fn not_blank(attr: &Symbol) -> Expr {
+    let read = Expr::new(
+        Span::synthetic(),
+        ExprNode::Send {
+            recv: Some(Expr::new(Span::synthetic(), ExprNode::SelfRef)),
+            method: attr.clone(),
+            args: Vec::new(),
+            block: None,
+            parenthesized: false,
+        },
+    );
+    let blank = Expr::new(
+        Span::synthetic(),
+        ExprNode::Send { recv: Some(read), method: Symbol::from("blank?"), args: Vec::new(), block: None, parenthesized: false },
+    );
+    Expr::new(
+        Span::synthetic(),
+        ExprNode::Send { recv: Some(blank), method: Symbol::from("!"), args: Vec::new(), block: None, parenthesized: false },
+    )
+}
+
 fn not_nil(attr: &Symbol) -> Expr {
     let read = Expr::new(
         Span::synthetic(),
@@ -568,6 +739,7 @@ fn parse_uniqueness(value: &Node<'_>, file: &str, _class_consts: &super::ClassCo
         };
         let child = assoc.value();
         match key.as_str() {
+            "prepend" => {} // Read once by parse_validator.
             "scope" => {
                 let names: Option<Vec<Symbol>> = if let Some(array) = child.as_array_node() {
                     array.elements().iter().map(|e| symbol_value(&e).map(|s| Symbol::from(s.as_str()))).collect()
@@ -603,12 +775,12 @@ fn parse_uniqueness(value: &Node<'_>, file: &str, _class_consts: &super::ClassCo
             },
             "if" => push_condition(&child, file, &mut built.if_cond, "if", &mut gaps),
             "unless" => push_condition(&child, file, &mut built.unless_cond, "unless", &mut gaps),
-            "message" => push_message(&child, "uniqueness", false, &mut built.message, &mut gaps),
+            "message" => push_message(&child, "uniqueness", false, &mut built.message, &mut built.message_gaps),
             other => gaps.push(format!("uniqueness: {other}")),
         }
     }
     if !gaps.is_empty() {
-        return RuleParse::Gap(gaps);
+        return built.gap(gaps);
     }
     built.rule = rule(scope, case_sensitive, allow_nil, allow_blank);
     RuleParse::Rule(built)
@@ -623,18 +795,43 @@ fn parse_uniqueness(value: &Node<'_>, file: &str, _class_consts: &super::ClassCo
 fn blank_safe(rule: &crate::dialect::ValidationRule) -> bool {
     use crate::dialect::ValidationRule;
     match rule {
+        // A blank value passes absence, and presence under `allow_blank:` is
+        // dropped. A maximum-only length is not safe: `"  "` is blank and
+        // two characters long, so `maximum: 1` would reject what Rails skips.
         ValidationRule::Presence | ValidationRule::Absence => true,
-        ValidationRule::Length { min: None, .. } => true,
         _ => false,
     }
 }
 
+/// The detail of a message option a kept rule runs without.
+const MESSAGE_GAP: &str =
+    "message option not lowered; the rule runs with its default message, so it accepts and rejects the records Rails does, but the error text differs";
+
+/// `` `presence:`, `length:` ``.
+fn rule_list(keys: &[String]) -> String {
+    keys.iter().map(|key| format!("`{key}:`")).collect::<Vec<_>>().join(", ")
+}
+
+/// What a dropped rule's warning adds when the call keeps other rules
+/// (`kept`, by key): nothing when it keeps none, the rule being the call.
+pub(in crate::ingest) fn dropped_rule_note(rule: &str, kept: &[String]) -> String {
+    if kept.is_empty() {
+        String::new()
+    } else {
+        format!("; only the `{rule}:` rule is dropped, the call keeps {}", rule_list(kept))
+    }
+}
+
+/// One warning per attribute and option: `detail`, or the condition or
+/// option one the option names, then `note`.
 fn record_validation_gaps(
     file: &str,
     span: Span,
     method: &str,
     attrs: &[Symbol],
     options: &[String],
+    detail: Option<&str>,
+    note: &str,
 ) {
     let targets: Vec<(String, String)> = if attrs.is_empty() {
         options
@@ -652,7 +849,9 @@ fn record_validation_gaps(
             .collect()
     };
     for (construct, option) in targets {
-        let detail = if matches!(
+        let detail = if let Some(detail) = detail {
+            detail
+        } else if matches!(
             option.as_str(),
             "if" | "unless" | "on" | "allow_nil" | "allow_blank"
         ) || option.ends_with(": if")
@@ -663,7 +862,7 @@ fn record_validation_gaps(
             "validation option not lowered; Rails rejects records this build saves"
         };
         let mut diagnostic =
-            crate::diagnostic::Diagnostic::unsupported(span, None, construct, detail);
+            crate::diagnostic::Diagnostic::unsupported(span, None, construct, format!("{detail}{note}"));
         diagnostic.severity = crate::diagnostic::Severity::Warning;
         let message = diagnostic.message.clone();
         super::super::prism::push(diagnostic);
@@ -703,6 +902,7 @@ fn parse_of_options<'a>(
     let mut inclusion: Option<InclusionSpec> = None;
     let mut pattern: Option<(String, String)> = None;
     let mut saw_rule_key = false;
+    let mut prepend = false;
     for el in elements.iter() {
         let Some(assoc) = el.as_assoc_node() else {
             gaps.push("options".to_string());
@@ -714,6 +914,10 @@ fn parse_of_options<'a>(
         };
         let value = assoc.value();
         match key.as_str() {
+            "prepend" => match class_consts.truthiness(&value) {
+                Some(flag) => prepend = flag,
+                None => gaps.push("prepend".to_string()),
+            },
             "allow_blank" => match super::super::util::bool_value(&value) {
                 Some(true) => *allow_blank = true,
                 Some(false) => {}
@@ -829,14 +1033,17 @@ fn parse_of_options<'a>(
         },
         ValidatesKind::Map => return,
     };
-    drafts.push(BuiltRule::bare(rule));
+    let mut built = BuiltRule::bare(rule);
+    built.prepend = prepend;
+    drafts.push(built);
 }
 
 fn parse_validator(key: &str, value: &Node<'_>, file: &str, class_consts: &super::ClassConsts) -> RuleParse {
     use crate::dialect::ValidationRule;
-    match key {
+    let mut parsed = match key {
         "presence" => parse_bool_or_hash(value, ValidationRule::Presence, "presence", file),
         "absence" => parse_bool_or_hash(value, ValidationRule::Absence, "absence", file),
+        "confirmation" => parse_confirmation(value, file),
         "acceptance" => parse_acceptance(value, file),
         "length" => parse_length_rule(value, file, class_consts),
         "numericality" => parse_numericality(value, file, class_consts),
@@ -844,8 +1051,22 @@ fn parse_validator(key: &str, value: &Node<'_>, file: &str, class_consts: &super
         "exclusion" => parse_set(value, file, true, class_consts),
         "uniqueness" => parse_uniqueness(value, file, class_consts),
         "format" => parse_format(value, file, class_consts),
+        "comparison" => parse_comparison(value, file),
         other => RuleParse::Gap(vec![other.to_string()]),
+    };
+    // Scheduling is shared by every validator, independently of its own options.
+    if let (RuleParse::Rule(built), Some(elements)) = (&mut parsed, hash_elements(value)) {
+        for el in elements.iter() {
+            let Some(assoc) = el.as_assoc_node() else { continue };
+            if symbol_value(&assoc.key()).as_deref() == Some("prepend") {
+                match class_consts.truthiness(&assoc.value()) {
+                    Some(flag) => built.prepend = flag,
+                    None => return RuleParse::Gap(vec![format!("{key}: prepend")]),
+                }
+            }
+        }
     }
+    parsed
 }
 
 /// `acceptance: true`, `acceptance: false`, or `acceptance: { accept:,
@@ -882,6 +1103,7 @@ fn parse_acceptance(value: &Node<'_>, file: &str) -> RuleParse {
         };
         let child = assoc.value();
         match key.as_str() {
+            "prepend" => {} // Read once by parse_validator.
             "accept" => match acceptance_values(&child) {
                 Some(values) => accept = Some(values),
                 None => gaps.push("acceptance: accept".to_string()),
@@ -899,12 +1121,12 @@ fn parse_acceptance(value: &Node<'_>, file: &str) -> RuleParse {
             },
             "if" => push_condition(&child, file, &mut built.if_cond, "if", &mut gaps),
             "unless" => push_condition(&child, file, &mut built.unless_cond, "unless", &mut gaps),
-            "message" => push_message(&child, "acceptance", false, &mut built.message, &mut gaps),
+            "message" => push_message(&child, "acceptance", false, &mut built.message, &mut built.message_gaps),
             other => gaps.push(format!("acceptance: {other}")),
         }
     }
     if !gaps.is_empty() {
-        return RuleParse::Gap(gaps);
+        return built.gap(gaps);
     }
     built.rule = ValidationRule::Acceptance { accept: accept.unwrap_or_else(default_accept), allow_nil };
     RuleParse::Rule(built)
@@ -923,6 +1145,20 @@ fn acceptance_values(node: &Node<'_>) -> Option<Vec<Literal>> {
 }
 
 /// `presence: true`, `presence: false`, or `presence: { if: :live? }`.
+fn parse_confirmation(value: &Node<'_>, file: &str) -> RuleParse {
+    let mut case_sensitive = None;
+    for el in hash_elements(value).iter().flat_map(|e| e.iter()) {
+        let Some(assoc) = el.as_assoc_node() else { continue };
+        if symbol_value(&assoc.key()).as_deref() == Some("case_sensitive") {
+            match super::super::util::bool_value(&assoc.value()) {
+                Some(b) => case_sensitive = Some(b),
+                None => return RuleParse::Gap(vec!["confirmation: case_sensitive".to_string()]),
+            }
+        }
+    }
+    parse_bool_or_hash(value, crate::dialect::ValidationRule::Confirmation { case_sensitive }, "confirmation", file)
+}
+
 fn parse_bool_or_hash(
     value: &Node<'_>,
     rule: crate::dialect::ValidationRule,
@@ -950,6 +1186,7 @@ fn parse_bool_or_hash(
         };
         let child = assoc.value();
         match key.as_str() {
+            "prepend" => {} // Read once by parse_validator.
             "on" => match context_guard(&child) {
                 Some(guard) => built.on_guard = Some(guard),
                 None => gaps.push("on".to_string()),
@@ -964,14 +1201,16 @@ fn parse_bool_or_hash(
                 Some(false) => built.own_allow_nil = true,
                 _ => gaps.push("allow_nil".to_string()),
             },
-            "message" => push_message(&child, name, false, &mut built.message, &mut gaps),
-            other => gaps.push(format!("{name}: {other}")),
+            "message" => push_message(&child, name, false, &mut built.message, &mut built.message_gaps),
+            "allow_blank" | "strict" | "except_on" => gaps.push(format!("{name}: {key}")),
+            // Not a gap: Rails' presence and absence validators read no other key (lobsters' `presence: { with: true }`)
+            _ => {}
         }
     }
     if gaps.is_empty() {
         RuleParse::Rule(built)
     } else {
-        RuleParse::Gap(gaps)
+        built.gap(gaps)
     }
 }
 
@@ -1082,6 +1321,7 @@ fn parse_numericality(value: &Node<'_>, file: &str, class_consts: &super::ClassC
         };
         let child = assoc.value();
         match key.as_str() {
+            "prepend" => {} // Read once by parse_validator.
             "only_integer" => match super::super::util::bool_value(&child) {
                 Some(flag) => only_integer = flag,
                 None => gaps.push("numericality: only_integer".to_string()),
@@ -1123,13 +1363,13 @@ fn parse_numericality(value: &Node<'_>, file: &str, class_consts: &super::ClassC
                 Some(flag) => allow_blank = Some(flag),
                 None => gaps.push("allow_blank".to_string()),
             },
-            "message" => push_message(&child, "numericality", false, &mut built.message, &mut gaps),
+            "message" => push_message(&child, "numericality", false, &mut built.message, &mut built.message_gaps),
             other if NUMERICALITY_OPTIONS.contains(&other) => gaps.push(format!("numericality: {other}")),
             other => ignored_validator_option("numericality", other, NUMERICALITY_OPTIONS, &assoc, file),
         }
     }
     if !gaps.is_empty() {
-        return RuleParse::Gap(gaps);
+        return built.gap(gaps);
     }
     built.rule = ValidationRule::Numericality {
         only_integer,
@@ -1173,7 +1413,8 @@ fn parse_set(value: &Node<'_>, file: &str, exclusion: bool, class_consts: &super
         };
         let child = assoc.value();
         match key.as_str() {
-            "in" | "within" => match inclusion_values(&child, class_consts) {
+            "prepend" => {} // Read once by parse_validator.
+            "in" | "within" => match inclusion_values(&child, class_consts).or_else(|| inclusion_call(&child, file)) {
                 Some(spec) => values = Some(spec),
                 None => gaps.push(format!("{label}: in")),
             },
@@ -1185,24 +1426,160 @@ fn parse_set(value: &Node<'_>, file: &str, exclusion: bool, class_consts: &super
             "unless" => {
                 push_condition(&child, file, &mut built.unless_cond, "unless", &mut gaps)
             }
+            // The rule's own option wins over the call's, as Rails merges
+            // the call's options under each validator's own.
             "allow_nil" => match super::super::util::bool_value(&child) {
-                Some(false) => {}
-                _ => gaps.push("allow_nil".to_string()),
+                Some(flag) => {
+                    built.nil_skip = flag;
+                    built.own_allow_nil = true;
+                }
+                None => gaps.push("allow_nil".to_string()),
             },
-            "message" => push_message(&child, label, false, &mut built.message, &mut gaps),
+            "allow_blank" => match super::super::util::bool_value(&child) {
+                Some(flag) => {
+                    built.blank_skip = flag;
+                    built.own_allow_blank = true;
+                }
+                None => gaps.push("allow_blank".to_string()),
+            },
+            "message" => push_message(&child, label, false, &mut built.message, &mut built.message_gaps),
             other => gaps.push(format!("{label}: {other}")),
         }
     }
     if !gaps.is_empty() {
-        return RuleParse::Gap(gaps);
+        return built.gap(gaps);
     }
     match values {
         Some(spec) => {
             built.rule = set_rule(spec, exclusion);
             RuleParse::Rule(built)
         }
-        None => RuleParse::Gap(vec![format!("{label}: in")]),
+        None => built.gap(vec![format!("{label}: in")]),
     }
+}
+
+/// `comparison:` — Rails' `ComparisonValidator` options, each bound a literal, a Symbol (the record's method) or a
+/// lambda (`-> { min_supported_date }`, its body run on the record), with the guards and flags `inclusion:` takes.
+fn parse_comparison(value: &Node<'_>, file: &str) -> RuleParse {
+    use crate::dialect::ValidationRule;
+    let Some(elements) = hash_elements(value) else {
+        return RuleParse::Gap(vec!["comparison".to_string()]);
+    };
+    let mut checks: Vec<(Symbol, crate::expr::Expr)> = Vec::new();
+    let mut built = BuiltRule::bare(ValidationRule::Comparison { checks: Vec::new() });
+    let mut gaps = Vec::new();
+    for el in elements.iter() {
+        let Some(assoc) = el.as_assoc_node() else {
+            gaps.push("comparison".to_string());
+            continue;
+        };
+        let Some(key) = symbol_value(&assoc.key()) else {
+            gaps.push("comparison".to_string());
+            continue;
+        };
+        let child = assoc.value();
+        match key.as_str() {
+            "greater_than" | "greater_than_or_equal_to" | "equal_to" | "less_than" | "less_than_or_equal_to" | "other_than" => {
+                let bound = match class_side_lambda_body(&child, file) {
+                    Some(body) => Some(body),
+                    None => match inclusion_call(&child, file) {
+                        Some(InclusionSpec::Call(bound)) => Some(bound),
+                        _ => super::super::expr::ingest_expr(&child, file)
+                            .ok()
+                            .filter(|e| matches!(&*e.node, crate::expr::ExprNode::Lit { .. })),
+                    },
+                };
+                // A repeated option is the last one written, as a Ruby Hash keeps it.
+                match bound {
+                    Some(bound) => {
+                        checks.retain(|(option, _)| option.as_str() != key.as_str());
+                        checks.push((Symbol::from(key.as_str()), bound));
+                    }
+                    None => gaps.push(format!("comparison: {key}")),
+                }
+            }
+            "prepend" => {}
+            "on" => match context_guard(&child) {
+                Some(guard) => built.on_guard = Some(guard),
+                None => gaps.push("on".to_string()),
+            },
+            "if" => push_condition(&child, file, &mut built.if_cond, "if", &mut gaps),
+            "unless" => push_condition(&child, file, &mut built.unless_cond, "unless", &mut gaps),
+            "allow_nil" => match super::super::util::bool_value(&child) {
+                Some(flag) => {
+                    built.nil_skip = flag;
+                    built.own_allow_nil = true;
+                }
+                None => gaps.push("allow_nil".to_string()),
+            },
+            "allow_blank" => match super::super::util::bool_value(&child) {
+                Some(flag) => {
+                    built.blank_skip = flag;
+                    built.own_allow_blank = true;
+                }
+                None => gaps.push("allow_blank".to_string()),
+            },
+            other => gaps.push(format!("comparison: {other}")),
+        }
+    }
+    if checks.is_empty() {
+        gaps.push("comparison".to_string());
+    }
+    if !gaps.is_empty() {
+        return built.gap(gaps);
+    }
+    // Rails checks in its own order (`options.slice(*COMPARE_CHECKS.keys)`), not the order written.
+    const ORDER: [&str; 6] = ["greater_than", "greater_than_or_equal_to", "equal_to", "less_than", "less_than_or_equal_to", "other_than"];
+    checks.sort_by_key(|(option, _)| ORDER.iter().position(|o| *o == option.as_str()));
+    built.rule = ValidationRule::Comparison { checks };
+    RuleParse::Rule(built)
+}
+
+/// Rails' `resolve_value`: a lambda of no parameters is called as it is, so its body runs on the class it was written
+/// in (maybe's `-> { min_supported_date }`, a class method). Read from the record that validates: what the body calls
+/// without a receiver, and `self`, are `self.class`.
+fn class_side_lambda_body(node: &Node<'_>, file: &str) -> Option<crate::expr::Expr> {
+    use crate::expr::{Expr, ExprNode};
+    fn to_class(e: &mut Expr) {
+        e.node.for_each_child_mut(&mut |c| to_class(c));
+        let class_of_self = |span| {
+            Expr::new(span, ExprNode::Send { recv: Some(Expr::new(span, ExprNode::SelfRef)), method: Symbol::from("class"), args: vec![], block: None, parenthesized: false })
+        };
+        match &mut *e.node {
+            ExprNode::SelfRef => *e = class_of_self(e.span),
+            ExprNode::Send { recv: recv @ None, .. } => *recv = Some(class_of_self(e.span)),
+            _ => {}
+        }
+    }
+    let expr = super::super::expr::ingest_expr(node, file).ok()?;
+    let lambda = match &*expr.node {
+        ExprNode::Lambda { .. } => expr,
+        ExprNode::Send { recv: None, method, args, block: Some(block), .. }
+            if args.is_empty() && matches!(method.as_str(), "lambda" | "proc") && matches!(&*block.node, ExprNode::Lambda { .. }) =>
+        {
+            block.clone()
+        }
+        _ => return None,
+    };
+    let ExprNode::Lambda { params, rest_param: None, extra_params, block_param: None, body, .. } = &*lambda.node else { return None };
+    if !params.is_empty() || !extra_params.is_empty() || numbered_parameters(node).is_some_and(|n| n > 0) {
+        return None;
+    }
+    // Not a body that reads an ivar (the class's, there) or leaves the lambda (`return`), which no assignment can hold.
+    fn unmovable(e: &Expr) -> bool {
+        if matches!(&*e.node, ExprNode::Ivar { .. } | ExprNode::Return { .. } | ExprNode::Next { .. } | ExprNode::Break { .. }) {
+            return true;
+        }
+        let mut found = false;
+        e.node.for_each_child(&mut |c| found = found || unmovable(c));
+        found
+    }
+    if unmovable(body) {
+        return None;
+    }
+    let mut body = body.clone();
+    to_class(&mut body);
+    Some(body)
 }
 
 fn parse_format(value: &Node<'_>, file: &str, class_consts: &super::ClassConsts) -> RuleParse {
@@ -1242,6 +1619,7 @@ fn parse_format(value: &Node<'_>, file: &str, class_consts: &super::ClassConsts)
         };
         let child = assoc.value();
         match key.as_str() {
+            "prepend" => {} // Read once by parse_validator.
             "with" => match resolve_format_regex(&child, class_consts) {
                 Some(resolved) => pattern = Some(resolved),
                 None => gaps.push("format: with".to_string()),
@@ -1262,19 +1640,19 @@ fn parse_format(value: &Node<'_>, file: &str, class_consts: &super::ClassConsts)
                 Some(flag) => allow_blank = Some(flag),
                 None => gaps.push("allow_blank".to_string()),
             },
-            "message" => push_message(&child, "format", false, &mut built.message, &mut gaps),
+            "message" => push_message(&child, "format", false, &mut built.message, &mut built.message_gaps),
             other => gaps.push(format!("format: {other}")),
         }
     }
     if !gaps.is_empty() {
-        return RuleParse::Gap(gaps);
+        return built.gap(gaps);
     }
     match pattern {
         Some((pattern, flags)) => {
             built.rule = ValidationRule::Format { pattern, flags, allow_nil, allow_blank };
             RuleParse::Rule(built)
         }
-        None => RuleParse::Gap(vec!["format: with".to_string()]),
+        None => built.gap(vec!["format: with".to_string()]),
     }
 }
 
@@ -1410,11 +1788,13 @@ fn parse_length_rule(value: &ruby_prism::Node<'_>, file: &str, class_consts: &su
     };
     let mut min: Option<u32> = None;
     let mut max: Option<u32> = None;
+    let mut is: Option<u32> = None;
     let mut allow_nil: Option<bool> = None;
     let mut message: Option<String> = None;
     let mut built = BuiltRule::bare(ValidationRule::Length {
         min: None,
         max: None,
+        is: None,
         message: None,
         allow_nil: None,
     });
@@ -1430,6 +1810,7 @@ fn parse_length_rule(value: &ruby_prism::Node<'_>, file: &str, class_consts: &su
         };
         let child = assoc.value();
         match key.as_str() {
+            "prepend" => {} // Read once by parse_validator.
             "minimum" | "maximum" => match class_consts.integer(&child) {
                 Some(n) if n >= 0 => {
                     let n = n as u32;
@@ -1447,8 +1828,9 @@ fn parse_length_rule(value: &ruby_prism::Node<'_>, file: &str, class_consts: &su
             },
             "message" => match string_value(&child) {
                 Some(text) => message = Some(text),
-                None => gaps.push("length: message".to_string()),
+                None => built.message_gaps.push("length: message".to_string()),
             },
+            "too_long" | "too_short" | "wrong_length" => built.message_gaps.push(format!("length: {key}")),
             "on" => match context_guard(&child) {
                 Some(guard) => built.on_guard = Some(guard),
                 None => gaps.push("on".to_string()),
@@ -1457,19 +1839,32 @@ fn parse_length_rule(value: &ruby_prism::Node<'_>, file: &str, class_consts: &su
             "unless" => {
                 push_condition(&child, file, &mut built.unless_cond, "unless", &mut gaps)
             }
-            "is" | "in" | "within" => gaps.push(format!("length: {key}")),
+            "is" => match class_consts.integer(&child) {
+                Some(n) if n >= 0 => is = Some(n as u32),
+                _ => gaps.push("length: is".to_string()),
+            },
+            // Rails reads `in:`/`within:` as the minimum and maximum, with their messages
+            "in" | "within" => match bound_range(&child, class_consts) {
+                // Not an empty exclusive range (`0...0`): its max is nil, which Rails rejects at load.
+                Some(range) if range.begin >= 0.0 && range.end >= range.begin && !(range.exclusive && range.end <= range.begin) => {
+                    min = Some(range.begin as u32);
+                    max = Some(if range.exclusive { range.end as u32 - 1 } else { range.end as u32 });
+                }
+                _ => gaps.push(format!("length: {key}")),
+            },
             other => gaps.push(format!("length: {other}")),
         }
     }
     if !gaps.is_empty() {
-        return RuleParse::Gap(gaps);
+        return built.gap(gaps);
     }
-    if min.is_none() && max.is_none() {
-        return RuleParse::Gap(vec!["length".to_string()]);
+    if min.is_none() && max.is_none() && is.is_none() {
+        return built.gap(vec!["length".to_string()]);
     }
     built.rule = ValidationRule::Length {
         min,
         max,
+        is,
         message,
         allow_nil,
     };
@@ -1521,6 +1916,8 @@ fn number_value(node: &Node<'_>) -> Option<f64> {
 enum InclusionSpec {
     List(Vec<Literal>),
     Range(crate::dialect::InclusionRange),
+    /// A set the record answers at validation time (`in: ->(r) { … }`).
+    Call(crate::expr::Expr),
 }
 
 /// The membership (`inclusion:`) or non-membership (`exclusion:`) rule for
@@ -1530,6 +1927,8 @@ fn set_rule(spec: InclusionSpec, exclusion: bool) -> crate::dialect::ValidationR
     let (values, range) = match spec {
         InclusionSpec::List(values) => (values, None),
         InclusionSpec::Range(range) => (Vec::new(), Some(range)),
+        InclusionSpec::Call(set) if exclusion => return ValidationRule::ExclusionCall { set },
+        InclusionSpec::Call(set) => return ValidationRule::InclusionCall { set },
     };
     if exclusion {
         ValidationRule::Exclusion { values, range }
@@ -1586,6 +1985,136 @@ fn inclusion_values(node: &Node<'_>, class_consts: &super::ClassConsts) -> Optio
     }))
 }
 
+/// `in: ->(record) { body }`, `in: -> { body }`, `lambda { |r| … }`,
+/// `proc { … }` or `in: :method` (Rails' `ResolveValue`): a zero-arity
+/// callable runs on the record (`instance_exec`), so its body reads as
+/// written in the record's method; a one-parameter callable is called
+/// with the record (`value.call(record)`), so its parameter becomes
+/// `self`; a Symbol is that method of the record. A one-parameter body
+/// keeps the class body's `self` in Rails, so one that calls a method
+/// without a receiver or reads `self` would run on the record here, not
+/// the class: it stays a gap, as does anything else (more parameters, a
+/// body ingest can't read).
+fn inclusion_call(node: &Node<'_>, file: &str) -> Option<InclusionSpec> {
+    use crate::expr::{Expr, ExprNode};
+    if let Some(name) = symbol_value(node) {
+        return Some(InclusionSpec::Call(Expr::new(
+            crate::span::Span::synthetic(),
+            ExprNode::Send { recv: None, method: Symbol::from(name.as_str()), args: vec![], block: None, parenthesized: false },
+        )));
+    }
+    let expr = super::super::expr::ingest_expr(node, file).ok()?;
+    let lambda = match &*expr.node {
+        ExprNode::Lambda { .. } => expr.clone(),
+        // `lambda { |r| … }` / `proc { … }` / `Proc.new { … }`.
+        ExprNode::Send { recv, method, args, block: Some(block), .. }
+            if args.is_empty()
+                && matches!(&*block.node, ExprNode::Lambda { .. })
+                && match recv {
+                    None => matches!(method.as_str(), "lambda" | "proc"),
+                    Some(r) => method.as_str() == "new" && matches!(&*r.node, ExprNode::Const { path } if path.len() == 1 && path[0].as_str() == "Proc"),
+                } =>
+        {
+            block.clone()
+        }
+        // A set computed from constants (`in: DATE_FORMATS.map(&:last)`, `I18n.available_locales.map(&:to_s)`): Rails
+        // evaluates it once as the class loads; with no read of self it is the same set at validation time. Not one
+        // rooted at a class (`PtySession.drivers.keys`): an enum recipient's stored values may not be the labels Rails
+        // validates, which the enum fold decides.
+        ExprNode::Send { recv: Some(_), .. } if !reads_implicit_self(&expr) && rooted_at_a_value_constant(&expr) => {
+            return Some(InclusionSpec::Call(expr));
+        }
+        _ => return None,
+    };
+    let ExprNode::Lambda { params, rest_param: None, extra_params, block_param: None, body, .. } = &*lambda.node else {
+        return None;
+    };
+    if !extra_params.is_empty() || params.len() > 1 {
+        return None;
+    }
+    // `-> { _1.allowed }` takes one parameter (arity 1, so Rails calls it
+    // with the record), which the parsed lambda does not list. Two or more
+    // (`_1`, `_2`) make Rails raise `ArgumentError`: a gap.
+    let numbered = match numbered_parameters(node) {
+        Some(0) | None => None,
+        Some(1) => Some(Symbol::from("_1")),
+        Some(_) => return None,
+    };
+    let mut body = body.clone();
+    if let Some(param) = params.first().or(numbered.as_ref()) {
+        if reads_implicit_self(&body) {
+            return None;
+        }
+        replace_var_with_self(&mut body, param);
+    }
+    Some(InclusionSpec::Call(body))
+}
+
+/// The receiver chain under `e` starts at a constant holding a value (`DATE_FORMATS`, `Period::PERIODS`) or at
+/// `I18n.available_locales`, not at a class.
+fn rooted_at_a_value_constant(e: &crate::expr::Expr) -> bool {
+    use crate::expr::ExprNode;
+    match &*e.node {
+        // Not `I18n.t(…)`, whose value is the request's locale's: only the locale list is the same set however late.
+        ExprNode::Send { recv: Some(r), method, .. }
+            if method.as_str() == "available_locales" && matches!(&*r.node, ExprNode::Const { path } if path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).eq(["I18n"])) =>
+        {
+            true
+        }
+        ExprNode::Send { recv: Some(r), .. } => rooted_at_a_value_constant(r),
+        ExprNode::Const { path } => {
+            let names: Vec<&str> = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect();
+            names.last().is_some_and(|n| n.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
+        }
+        _ => false,
+    }
+}
+
+/// The highest numbered parameter (`_1`, `_2`, …) a lambda literal or a
+/// `lambda`/`proc`/`Proc.new` block reads, or `None` when it declares none.
+fn numbered_parameters(node: &Node<'_>) -> Option<u8> {
+    let params = if let Some(lambda) = node.as_lambda_node() {
+        lambda.parameters()
+    } else {
+        node.as_call_node()?.block()?.as_block_node()?.parameters()
+    };
+    Some(params?.as_numbered_parameters_node()?.maximum())
+}
+
+/// Whether `e` calls a method without a receiver or reads `self`.
+fn reads_implicit_self(e: &crate::expr::Expr) -> bool {
+    use crate::expr::ExprNode;
+    if matches!(&*e.node, ExprNode::SelfRef | ExprNode::Send { recv: None, .. }) {
+        return true;
+    }
+    let mut found = false;
+    e.node.for_each_child(&mut |c| found = found || reads_implicit_self(c));
+    found
+}
+
+/// The record a callable `in:` is given is the validating record itself.
+/// A nested block that names a parameter the same rebinds it, so its body
+/// is left alone.
+fn replace_var_with_self(e: &mut crate::expr::Expr, name: &Symbol) {
+    use crate::expr::ExprNode;
+    match &*e.node {
+        ExprNode::Var { name: n, .. } if n == name => {
+            *e = crate::expr::Expr::new(e.span, ExprNode::SelfRef);
+            return;
+        }
+        ExprNode::Lambda { params, rest_param, extra_params, block_param, .. }
+            if params.contains(name)
+                || rest_param.as_ref() == Some(name)
+                || block_param.as_ref() == Some(name)
+                || extra_params.iter().any(|p| p.name == *name) =>
+        {
+            return;
+        }
+        _ => {}
+    }
+    e.node.for_each_child_mut(&mut |c| replace_var_with_self(c, name));
+}
+
 fn literal_atom(node: &Node<'_>) -> Option<Literal> {
     if let Some(text) = string_value(node) {
         return Some(Literal::Str { value: text });
@@ -1609,3 +2138,56 @@ fn literal_atom(node: &Node<'_>) -> Option<Literal> {
     node.as_nil_node().is_some().then_some(Literal::Nil)
 }
 
+
+/// `validates_length_of :password, within: 6..128, allow_blank: true` as the `validates` call Rails makes of it
+/// (`validates_with LengthValidator, _merge_attributes(attr_names)`): the validator's own options in its hash, the
+/// ones `validates` hands every validator beside it. Padded to the call's offset in its file, so the spans read back
+/// land where it is written.
+pub(super) fn validates_of_as_validates(call: &ruby_prism::CallNode<'_>, file: &str) -> Option<String> {
+    const SHARED: &[&str] = &["if", "unless", "on", "allow_blank", "allow_nil", "strict"];
+    let name = String::from_utf8_lossy(call.name().as_slice()).into_owned();
+    let kind = name.strip_prefix("validates_")?.strip_suffix("_of")?;
+    let kind = match kind {
+        "size" => "length",
+        "presence" | "absence" | "uniqueness" | "length" | "acceptance" | "confirmation" | "comparison" => kind,
+        _ => return None,
+    };
+    let text = |n: &Node<'_>| String::from_utf8_lossy(n.location().as_slice()).into_owned();
+    let mut attrs = Vec::new();
+    let mut own = Vec::new();
+    let mut shared = Vec::new();
+    let args: Vec<Node<'_>> = call.arguments()?.arguments().iter().collect();
+    for (i, arg) in args.iter().enumerate() {
+        if super::super::util::symbol_or_string_value(arg).is_some() {
+            attrs.push(text(arg));
+            continue;
+        }
+        let elements: Vec<Node<'_>> = if let Some(h) = arg.as_keyword_hash_node() {
+            h.elements().iter().collect()
+        } else if let Some(h) = arg.as_hash_node() {
+            h.elements().iter().collect()
+        } else {
+            return None;
+        };
+        if i + 1 != args.len() {
+            return None;
+        }
+        for element in elements {
+            let assoc = element.as_assoc_node()?;
+            let key = symbol_value(&assoc.key())?;
+            if SHARED.contains(&key.as_str()) { shared.push(text(&element)) } else { own.push(text(&element)) }
+        }
+    }
+    if attrs.is_empty() {
+        return None;
+    }
+    let rule = if own.is_empty() { format!("{kind}: true") } else { format!("{kind}: {{ {} }}", own.join(", ")) };
+    let written = std::iter::once(attrs.join(", ")).chain(std::iter::once(rule)).chain(shared).collect::<Vec<_>>().join(", ");
+    let start = call.location().start_offset();
+    let padding = super::super::sources::with_text(file, |t| {
+        t.as_bytes().get(..start).map(|b| b.iter().map(|&c| if c == b'\n' { '\n' } else { ' ' }).collect::<String>())
+    })
+    .flatten()
+    .unwrap_or_default();
+    Some(format!("{padding}validates {written}\n"))
+}

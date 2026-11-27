@@ -1,8 +1,11 @@
 //! A constant an initializer assigns is defined at boot, so the app's
-//! reads of it are sound; with no home for it in the ingested tree yet,
-//! those reads are coverage notes naming the initializer, while an
-//! unrelated or namespaced namesake stays an error.
+//! reads of it are sound. A top-level assignment is the boot program's and
+//! resolves; one in a class body has no home in the ingested tree yet, so
+//! its reads are coverage notes naming the initializer, while an unrelated
+//! or namespaced namesake stays an error.
 
+#[path = "support/scratch.rs"]
+mod scratch;
 use std::process::Command;
 
 fn check_continue(root: &std::path::Path) -> String {
@@ -16,7 +19,7 @@ fn check_continue(root: &std::path::Path) -> String {
 
 #[test]
 fn reads_of_a_constant_an_initializer_assigns_are_coverage_notes() {
-    let root = std::env::temp_dir().join(format!("roundhouse-initializer-constants-{}", std::process::id()));
+    let root = scratch::dir("roundhouse-initializer-constants");
     for (path, source) in [
         ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n"),
         ("config/initializers/000-stats.rb", "::STATS = Object.new\nclass Rack::Attack\n  ADMIN_ROLES = []\nend\n"),
@@ -38,9 +41,8 @@ fn reads_of_a_constant_an_initializer_assigns_are_coverage_notes() {
     let out = check_continue(&root);
     let line = |needle: &str| out.lines().find(|l| l.contains(needle)).unwrap_or_else(|| panic!("no `{needle}` line:\n{out}"));
 
-    let stats = line("constant not supported (all targets): STATS");
-    assert!(stats.contains("note[unsupported]"), "{stats}");
-    assert!(stats.contains("assigned in config/initializers/000-stats.rb, config/initializers/010-stats.rb"), "{stats}");
+    // Assigned at the top level of an initializer: the boot program defines it (`ingest::boot_program`), so the read resolves.
+    assert!(!out.lines().any(|l| l.contains("constant not supported (all targets): STATS")), "{out}");
     // Assigned in a class body, which runs with the file.
     let roles = line("constant not supported (all targets): Rack::Attack::ADMIN_ROLES");
     assert!(roles.contains("note[unsupported]") && roles.contains("000-stats.rb"), "{roles}");
@@ -61,7 +63,7 @@ fn reads_of_a_constant_an_initializer_assigns_are_coverage_notes() {
 
 #[test]
 fn an_initializer_class_named_only_in_a_comment_is_not_kept() {
-    let root = std::env::temp_dir().join(format!("roundhouse-initializer-comment-{}", std::process::id()));
+    let root = scratch::dir("roundhouse-initializer-comment");
     for (path, source) in [
         ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n"),
         // Kept, its body would report the constant nothing defines.

@@ -1,6 +1,8 @@
 //! Full forwarding has a positional/keyword/block contract, not a naming convention.
 //! Native controls deliberately distinguish all three from plausible miscompiles.
 
+#[path = "support/scratch.rs"]
+mod scratch;
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
@@ -496,6 +498,12 @@ fn keyword_target_gates_distinguish_ordinary_super_from_full_forwarding() {
                     if construct.as_str() == "keyword splat in ordinary super"
                         || construct.as_str() == "keyword splat into full argument forwarding")
             }).collect();
+            if target == BuildTarget::Spinel
+                && expected == "keyword splat into full argument forwarding"
+            {
+                assert!(gates.is_empty(), "{diagnostics:?}");
+                continue;
+            }
             assert_eq!(gates.len(), 1, "{target:?}: {source}: {diagnostics:?}");
             let gate = gates[0];
             assert_eq!(gate.severity, Severity::Error);
@@ -517,8 +525,7 @@ fn source_archive_copies_unrepresented_formals_without_a_transpile_error() {
     for formal in ["(a,b)", "**nil"] {
         let source = format!("class Probe; def call({formal}); 7; end; end\n");
         let app = analyzed(&source);
-        let fixture = std::env::temp_dir().join(format!("roundhouse-source-archive-{}-{}", std::process::id(), formal.len()));
-        std::fs::create_dir(&fixture).unwrap();
+        let fixture = scratch::dir(&format!("roundhouse-source-archive-{}", formal.len()));
         std::fs::write(fixture.join("probe.rb"), &source).unwrap();
         for target in [BuildTarget::Blog, BuildTarget::Ruby] {
             let (files, diagnostics) = roundhouse::emit::diagnostics::scope(|| {
@@ -547,7 +554,6 @@ fn declaration_only_forwarders_are_gated_on_unverified_targets() {
     for target in [
         BuildTarget::Rust,
         BuildTarget::Typescript,
-        BuildTarget::Spinel,
         BuildTarget::Roda,
     ] {
         let (files, diags) = roundhouse::emit::diagnostics::scope(|| {
@@ -682,21 +688,37 @@ fn a_nested_def_forwarding_its_own_rest_leaves_the_outer_rest_represented() {
     assert!(errors[0].contains("nested def"), "{errors:?}");
 }
 
-/// A body that forwards the anonymous rest (`g(*)`) keeps the recorded
-/// fact: the bare splat would ingest as `*nil`, and forwarding it is not
-/// modeled yet.
+/// A body that forwards the anonymous rest (`g(*)`) binds it to the same
+/// generated name as an unforwarded one, and its bare splats read that
+/// name. Refused as `AnonymousRest` before; with `--allow-unsupported` it
+/// emitted `def f(**, &__blk)` / `g(*nil, **, &__blk)`, so a method that
+/// forwards `(*, **, &)` took no positional argument and every call raised
+/// "wrong number of arguments (given 1, expected 0)".
 #[test]
-fn a_forwarded_anonymous_rest_stays_unsupported() {
-    let source = "class Probe; def target(*); inner(*); end; def inner(*a); a.size; end; end";
+fn a_forwarded_anonymous_rest_binds_a_generated_name_and_forwards() {
+    let source = "class Base; def read(value, scale = 1, **opts, &blk); [value, scale, opts, blk&.call]; end; end; \
+class Probe < Base; def read(*, **, &); inner(*, **, &); end; def inner(*a, **o, &b); [a, o, b&.call]; end; end; \
+class Wrapper < Base; def read(*, **, &); super; end; end; \
+class Sub; def self.pass(*); new.count(*); end; def count(*a); a.size; end; end";
+    let script = "p Probe.new.read(1, 2, k: 3) { :blk }; p Probe.new.read; p Wrapper.new.read(5, 6, z: 1) { :b }; p Sub.pass(1, 2, 3)";
+    let native = Command::new("ruby")
+        .args(["-e", &format!("{source}; {script}")])
+        .output()
+        .unwrap();
+    assert!(native.status.success(), "{}", String::from_utf8_lossy(&native.stderr));
+    let expected = String::from_utf8_lossy(&native.stdout).into_owned();
+    assert_eq!(expected, "[[1, 2], {k: 3}, :blk]\n[[], {}, nil]\n[5, 6, {z: 1}, :b]\n3\n");
     let app = analyzed(source);
     let errors: Vec<_> = diagnose(&app)
         .into_iter()
-        .filter(|d| d.severity == Severity::Error)
+        .filter(|d| d.severity == Severity::Error && d.message.contains("anonymous positional rest"))
         .collect();
-    assert!(
-        errors.iter().any(|d| d.message.contains("anonymous positional rest")),
-        "{errors:?}"
-    );
+    assert!(errors.is_empty(), "{errors:?}");
+    let run = emit_and_run::real_blog()
+        .write("app/lib/probe.rb", source)
+        .run_ruby(script);
+    run.assert_passes();
+    assert_eq!(run.stdout, expected);
 }
 
 #[test]
@@ -1183,4 +1205,62 @@ end
         forwards.is_empty(),
         "extend-module super(...) must not residual: {forwards:?}"
     );
+}
+
+
+#[test]
+fn spinel_preserves_verified_full_forwarding_declarations_and_calls() {
+    use roundhouse::project::{BuildTarget, target_files};
+    let source = "class Probe; def self.call(...); 17; end; def self.run; options={value:7}; call(**options); end; end";
+    let mut app = analyzed(source);
+    roundhouse::session::analyze_and_lower_for(&mut app, BuildTarget::Spinel);
+    let (files, diagnostics) = roundhouse::emit::diagnostics::scope(|| {
+        target_files(&app, roundhouse::fixtures::real_blog(), BuildTarget::Spinel)
+    });
+    assert!(diagnostics.iter().all(|d| d.severity != Severity::Error), "{diagnostics:?}");
+    let files = files.expect("native project");
+    let output = files.iter().find(|(p, _)| p == "app/models/probe.rb").unwrap().1.as_str();
+    assert!(output.contains("def self.call(...)"), "{output}");
+    assert!(output.contains("call(**options)"), "{output}");
+}
+
+
+#[test]
+fn spinel_keeps_full_forwarding_to_an_unrepresented_super_refused() {
+    use roundhouse::project::{BuildTarget, target_files};
+    let source = "class ErrorPacket < StandardError; def initialize(...); super(...); end; end";
+    let mut app = analyzed(source);
+    roundhouse::session::analyze_and_lower_for(&mut app, BuildTarget::Spinel);
+    let (_, diagnostics) = roundhouse::emit::diagnostics::scope(|| {
+        target_files(&app, roundhouse::fixtures::real_blog(), BuildTarget::Spinel)
+    });
+    assert!(diagnostics.iter().any(|d| d.severity == Severity::Error
+        && d.message.contains("full argument forwarding")), "{diagnostics:?}");
+}
+
+
+#[test]
+fn spinel_refuses_unrepresented_super_in_a_default() {
+    use roundhouse::project::{BuildTarget, target_files};
+    let app = analyzed("class ErrorPacket < StandardError; def initialize(message = super, ...); end; end");
+    let (_, diagnostics) = roundhouse::emit::diagnostics::scope(|| {
+        target_files(&app, roundhouse::fixtures::real_blog(), BuildTarget::Spinel)
+    });
+    assert!(diagnostics.iter().any(|d| d.severity == Severity::Error
+        && d.message.contains("full argument forwarding")), "{diagnostics:?}");
+}
+
+#[test]
+fn spinel_refuses_unrepresented_super_in_a_controller() {
+    use roundhouse::project::{BuildTarget, target_files};
+    let mut app = ingest_app_from_tree(HashMap::from([(
+        PathBuf::from("app/controllers/packet_controller.rb"),
+        b"class PacketController < ActionController::Base; def show(...); super; end; end".to_vec(),
+    )])).unwrap();
+    Analyzer::new(&app).analyze(&mut app);
+    let (_, diagnostics) = roundhouse::emit::diagnostics::scope(|| {
+        target_files(&app, roundhouse::fixtures::real_blog(), BuildTarget::Spinel)
+    });
+    assert!(diagnostics.iter().any(|d| d.severity == Severity::Error
+        && d.message.contains("full argument forwarding")), "{diagnostics:?}");
 }

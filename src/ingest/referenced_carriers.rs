@@ -6,7 +6,7 @@
 //! program reads as a constant. Each one named by a qualified path from
 //! outside its owner is ingested again from its source as that module.
 
-use std::collections::HashSet;
+use crate::det::HashSet;
 
 use crate::App;
 use crate::dialect::ModelBodyItem;
@@ -20,7 +20,7 @@ const CARRIER: &str = "ClassMethods";
 
 pub(super) fn surface_referenced_carriers(app: &mut App, sources: &[SourceFile]) {
     let known: HashSet<String> = app.library_classes.iter().map(|c| c.name.0.as_str().to_string()).collect();
-    let mut wanted: HashSet<String> = HashSet::new();
+    let mut wanted: HashSet<String> = HashSet::default();
     let mut note = |site: Option<&str>, expr: &Expr| {
         visit(expr, &mut |e| {
             let ExprNode::Const { path } = &*e.node else { return };
@@ -29,9 +29,18 @@ pub(super) fn surface_referenced_carriers(app: &mut App, sources: &[SourceFile])
             if *last != CARRIER || owner.is_empty() {
                 return;
             }
-            let owner = owner.join("::");
+            let written = owner.join("::");
+            // Not only the written path: a relative one is looked up from each namespace of the site, innermost first.
+            let scopes: Vec<&str> = site.map(|s| s.split("::").collect()).unwrap_or_default();
+            let Some(owner) = (0..=scopes.len())
+                .rev()
+                .map(|k| if k == 0 { written.clone() } else { format!("{}::{written}", scopes[..k].join("::")) })
+                .find(|candidate| known.contains(candidate))
+            else {
+                return;
+            };
             // The owner's own `base.extend Owner::ClassMethods` is the bridge the fold already stands for
-            if site == Some(owner.as_str()) || !known.contains(&owner) {
+            if site == Some(owner.as_str()) {
                 return;
             }
             let name = format!("{owner}::{CARRIER}");

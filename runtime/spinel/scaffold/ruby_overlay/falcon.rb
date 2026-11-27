@@ -30,6 +30,13 @@
 # the first request in a new pid, as it does under Puma.
 #
 # ROUNDHOUSE_PRELOAD=0 restores the per-child load, for A/B measurement.
+#
+# ONE CABLE, MANY WORKERS. Each child's Cable::Registry holds only its own
+# sockets, so with more than one worker a broadcast would reach only the
+# people connected to the worker that sent it. A hub process relays every
+# broadcast to the other workers (runtime/cable_hub.rb), as Redis does for
+# campfire's own deployment. ROUNDHOUSE_CABLE_HUB=0 leaves each worker on
+# its own Registry, for A/B measurement.
 
 require "etc"
 require "async"
@@ -38,6 +45,8 @@ require "async/http/endpoint"
 require "falcon/server"
 require "protocol/rack"
 require "rack/builder"
+require "tmpdir"
+require_relative "runtime/cable_hub"
 
 ROOT = __dir__
 URL = "http://#{ENV.fetch("BIND", "0.0.0.0")}:#{ENV.fetch("PORT", "3000")}"
@@ -46,6 +55,8 @@ COUNT = Integer(ENV.fetch("WEB_CONCURRENCY", Etc.nprocessors.to_s))
 # config.ru's per-worker thread, as under Puma.
 CHECKPOINTER = ENV["ROUNDHOUSE_CHECKPOINTER"] != "0"
 PRELOAD = ENV["ROUNDHOUSE_PRELOAD"] != "0"
+CABLE_HUB = COUNT > 1 && ENV["ROUNDHOUSE_CABLE_HUB"] != "0"
+CABLE_HUB_PATH = File.join(Dir.tmpdir, "roundhouse-cable-hub-#{Process.pid}.sock")
 
 # async-container's controller owns the children: INT/TERM stop them
 # (gracefully first) before the parent exits, so the port is free when
@@ -59,6 +70,13 @@ class FalconController < Async::Container::Controller
 
   def setup(container)
     endpoint, bound = @endpoint, @bound
+    # The hub first: workers wait for it to listen (Cable::Hub.connect).
+    if CABLE_HUB
+      container.spawn(name: "cable-hub", restart: true) do |instance|
+        instance.ready!
+        Cable::Hub.serve(CABLE_HUB_PATH)
+      end
+    end
     container.run(count: COUNT, restart: true) do |instance|
       Sync do
         Dir.chdir(ROOT)
@@ -71,6 +89,23 @@ class FalconController < Async::Container::Controller
         # would take the GVL from it (active_job_cruby.rb's start_drainer).
         if defined?(ActiveJob) && ActiveJob.respond_to?(:start_drainer)
           ActiveJob.start_drainer { |work| Async(transient: true) { work.call } }
+        end
+        # Redis relays between the workers already when cable.yml says so.
+        if CABLE_HUB && defined?(Broadcasts) && defined?(Cable::Registry) && !RedisCable.enabled?
+          Broadcasts.set_transport(Cable::Hub.connect(CABLE_HUB_PATH))
+        end
+        if defined?(Cable::Stats) && Cable::Stats::ON
+          Cable::Stats.ensure_reporting
+          # How late the event loop runs a timer: what blocks it, every
+          # request on this worker waits out.
+          Async(transient: true) do
+            loop do
+              due = Cable::Stats.now + 0.01
+              sleep 0.01
+              Cable::Stats.record("loop_lag", due)
+              Cable::Stats.note_gc
+            end
+          end
         end
         front = ThrusterCache::Front.new(Protocol::Rack::Adapter.new(app))
         server = Falcon::Server.new(front, bound, protocol: endpoint.protocol, scheme: endpoint.scheme)
@@ -88,7 +123,7 @@ class FalconController < Async::Container::Controller
         sleep
       end
     end
-    $stdout.puts "falcon: #{COUNT} workers on #{URL}"
+    $stdout.puts "falcon: #{COUNT} workers on #{URL}#{" (cable hub #{CABLE_HUB_PATH})" if CABLE_HUB}"
     $stdout.flush
   end
 end

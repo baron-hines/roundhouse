@@ -37,28 +37,71 @@ module ActionDispatch
     # runtime/ruby/action_dispatch/request.rb.
     attr_accessor :request_parameters
     attr_reader :path_parameters
+    # Rails' `request.flash`, the flash of the controller serving this request — see the twin in
+    # runtime/ruby/action_dispatch/request.rb.
+    attr_accessor :flash
+
+    # Rails' `Request.new(env)`, a wrapper over the env whose state is the request's: the one the routes serve for
+    # this env (Warden's `request`, which Devise's strategies read the params of), else one over the env's params.
+    def self.for_env(env)
+      found = env["roundhouse.request"]
+      return found if found.is_a?(ActionDispatch::Request)
+      parsed = env["roundhouse.parsed_request"]
+      new(env, parsed.nil? ? {} : parsed[:params])
+    end
 
     def initialize(env, params = {})
       @env = env
       @params = params
       @request_parameters = {}
       @path_parameters = RequestPathParameters.new({})
-      @session_options = {}
     end
 
     # Rack's per-request session options — see the twin in
     # runtime/ruby/action_dispatch/request.rb. `:skip` is the one key
     # read: the dispatcher writes no session cookie when it is set.
-    attr_reader :session_options
+    # Not an ivar: the session commit above the gems' middleware reads Rails' `rack.session.options` from the env.
+    def session_options
+      @env["rack.session.options"] ||= {}
+    end
 
     def session_skip?
-      @session_options[:skip] == true
+      session_options[:skip] == true
+    end
+
+    # Not a slot as in the twin: Rails reads the Rack env's, the one Warden's proxy holds too.
+    def session
+      @env["rack.session"] ||= ActionDispatch::Session.new
+    end
+
+    def session=(value)
+      @env["rack.session"] = value
+    end
+
+    # Rails' `Request#reset_session`, as the twin's.
+    def reset_session
+      session.clear
     end
 
     # `request.headers["Accept-Encoding"]` — the shared
     # `ActionDispatch::Http::Headers` over this request's env.
     def headers
       ActionDispatch::Http::Headers.new(env)
+    end
+
+    def request_id
+      value = @env["action_dispatch.request_id"]
+      return nil if value.nil?
+      value.to_s
+    end
+
+    def request_id=(value)
+      @env["action_dispatch.request_id"] = value
+      value
+    end
+
+    def uuid
+      request_id
     end
 
     def [](key)
@@ -93,6 +136,7 @@ module ActionDispatch
     # `"put"` must stay false). Shared `runtime/ruby` `put?` is likewise
     # case-sensitive on `@request_method` (no upcase on assign).
     def put? = @env["REQUEST_METHOD"] == "PUT"
+    def patch? = @env["REQUEST_METHOD"] == "PATCH"
     # Rails' "is this a safe request" idiom is `request.get? ||
     # request.head?`, and campfire writes exactly that in
     # `BlockBannedRequests#safe_request?`. This overlay is the Request
@@ -122,6 +166,11 @@ module ActionDispatch
       query_string.empty? ? path : "#{path}?#{query_string}"
     end
 
+    # Rack's PATH_INFO, which `path` reads here.
+    def path_info
+      path
+    end
+
     # No middleware rewrites paths here, so original_* == current.
     def original_fullpath = fullpath
 
@@ -143,6 +192,35 @@ module ActionDispatch
     # host authority. `config.hosts` is not applied yet.
     def host
       raw_host_with_port
+    end
+
+    # The twins of runtime/ruby/action_dispatch/request.rb's: Rails'
+    # `domain`/`subdomains` at `tld_length` 1, and the negotiated format.
+    def domain
+      parts = named_host_parts
+      parts.empty? ? nil : parts.last(2).join(".")
+    end
+
+    def subdomains
+      parts = named_host_parts
+      parts.length < 3 ? [] : parts[0, parts.length - 2]
+    end
+
+    def subdomain
+      subdomains.join(".")
+    end
+
+    def named_host_parts
+      name = host.sub(/:[0-9]+\z/, "")
+      name.match?(/\A[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\z/) ? [] : name.split(".")
+    end
+
+    def format=(value)
+      @format = value.to_s
+    end
+
+    def format
+      Mime::Type.lookup_by_extension(@format.to_s) || Mime::Type.new("text/html", :html)
     end
 
     def raw_host_with_port
@@ -190,8 +268,11 @@ module ActionDispatch
       @env["rack.url_scheme"].to_s.downcase == "https"
     end
 
+    # Memoized, as Rails' `ActionDispatch::Request#protocol` is: the env
+    # does not change under a request, and a page asks for the scheme
+    # once per absolute URL.
     def protocol
-      ssl? ? "https://" : "http://"
+      @protocol ||= ssl? ? "https://" : "http://"
     end
 
     # Twin of the shared class's: the port from the Host header, nil at
@@ -224,11 +305,17 @@ module ActionDispatch
     # Without the scheme's standard port, as the shared twin's: Rails'
     # `host_with_port` writes no `:443`/`:80`, and the CSRF check
     # compares this with an Origin a browser serializes the same way.
+    #
+    # Memoized like `protocol`: campfire's fragment keys name the base URL,
+    # once per message on a page, and each answer re-read the scheme and
+    # re-split X-Forwarded-Host from the env.
     def base_url
-      h = host
-      default = ssl? ? ":443" : ":80"
-      h = h[0, h.length - default.length] if h.end_with?(default)
-      "#{protocol}#{h}"
+      @base_url ||= begin
+        h = host
+        default = ssl? ? ":443" : ":80"
+        h = h[0, h.length - default.length] if h.end_with?(default)
+        "#{protocol}#{h}"
+      end
     end
 
     # Twin of the shared Request: scheme stripped, standard port already
@@ -248,6 +335,19 @@ module ActionDispatch
       src = Rails.application.content_security_policy
       @content_security_policy = src.nil? ? nil : src.dup
       @content_security_policy
+    end
+
+    # Rails' `content_security_policy_nonce`: nil without a generator, else generated once per request.
+    def content_security_policy_nonce
+      return nil unless Rails.application.content_security_policy_nonce_generator?
+      @csp_nonce = Rails.application.content_security_policy_nonce_generated(self) if @csp_nonce.nil?
+      @csp_nonce
+    end
+
+    # A controller's `content_security_policy` block on a request whose app has no policy: Rails starts a new one.
+    def content_security_policy=(policy)
+      @csp_ready = true
+      @content_security_policy = policy
     end
 
     def remote_ip
@@ -295,12 +395,20 @@ module ActionDispatch
       @body ||= StringIO.new(@env["RAW_POST_DATA"].to_s)
     end
 
+    # Rails' `/XMLHttpRequest/i.match?`: anywhere in the header, any case.
     def xhr?
-      @env["HTTP_X_REQUESTED_WITH"] == "XMLHttpRequest"
+      @env["HTTP_X_REQUESTED_WITH"].to_s.downcase.include?("xmlhttprequest")
     end
 
     def inertia?
       !@env["HTTP_X_INERTIA"].to_s.empty?
+    end
+
+    # Rails' `parameters`: every param the request carries, by a String or a Symbol, the same Hash `params` answers
+    # from then on, so a write through either is seen by both.
+    def parameters
+      @params = @params.with_indifferent_access unless @params.is_a?(ActiveSupport::HashWithIndifferentAccess)
+      @params
     end
 
     # Query-string params only (Rails' GET-vs-POST split); lobsters'
@@ -317,7 +425,15 @@ end
 # `cookies` (runtime/action_controller_cookies.rb).
 module ActionController
   class Base
-    attr_accessor :request
+    # In `@_request`, as Rails keeps it: an app's controller may use
+    # `@request` for itself.
+    def request
+      @_request
+    end
+
+    def request=(value)
+      @_request = value
+    end
   end
 
   # Per-request context reachable from module-function helpers. Rails
@@ -333,8 +449,8 @@ module ActionController
       attr_accessor :request
       # The dispatching controller, parked so module-function helpers
       # can reach per-request session state. Held as the controller
-      # (not the session object) because `reset_session` swaps the
-      # controller's @session for a fresh instance mid-action — a
+      # (not the session object) because the controller's @session can be
+      # swapped for another instance (a test's `session=`) — a
       # parked session reference would go stale, and a CSRF token
       # generated during the post-logout render would land in the
       # discarded session instead of the one the dispatch persists.

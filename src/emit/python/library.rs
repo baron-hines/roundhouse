@@ -20,7 +20,7 @@ use super::shared::indent_py;
 use super::ty::python_ty;
 use crate::dialect::{AccessorKind, LibraryClass, MethodDef, MethodReceiver};
 use crate::expr::Expr;
-use crate::ty::Ty;
+use crate::ty::{FnTy, Ty};
 
 /// Python is a flat-module target: a `Foo::Bar` library class emits as a
 /// top-level `Bar`, with cross-file references wired through
@@ -35,10 +35,8 @@ fn last_segment(qualified: &str) -> &str {
 /// class — `Exception` is the equivalent base. Other names pass through
 /// as their last namespace segment.
 fn python_base_class(qualified: &str) -> String {
-    match last_segment(qualified) {
-        "StandardError" => "Exception".to_string(),
-        other => other.to_string(),
-    }
+    let last = last_segment(qualified);
+    super::expr::python_core_error(last).map(str::to_string).unwrap_or_else(|| last.to_string())
 }
 
 /// True for the synthetic reader/writer methods `attr_accessor` /
@@ -53,8 +51,9 @@ fn is_accessor(m: &MethodDef) -> bool {
 /// sole-parameter type, falling back to the body's inferred type.
 fn accessor_field_ty(m: &MethodDef) -> Ty {
     match (&m.kind, &m.signature) {
-        (AccessorKind::AttributeReader, Some(Ty::Fn { ret, .. })) => (**ret).clone(),
-        (AccessorKind::AttributeWriter, Some(Ty::Fn { params, .. })) if !params.is_empty() => {
+        (AccessorKind::AttributeReader, Some(Ty::Fn(fn_ty))) => (*fn_ty.ret).clone(),
+        (AccessorKind::AttributeWriter, Some(Ty::Fn(fn_ty))) if !fn_ty.params.is_empty() => {
+            let FnTy { params, .. } = &**fn_ty;
             (*params[0].ty).clone()
         }
         _ => m.body.ty.clone().unwrap_or(Ty::Untyped),
@@ -73,7 +72,7 @@ fn signature_ret_is_time(sig: Option<&Ty>) -> bool {
             _ => false,
         }
     }
-    matches!(sig, Some(Ty::Fn { ret, .. }) if is_time(ret))
+    matches!(sig, Some(Ty::Fn(fn_ty)) if is_time(&fn_ty.ret))
 }
 
 /// Render a method's parameter list and return type. Prefers the
@@ -81,7 +80,8 @@ fn signature_ret_is_time(sig: Option<&Ty>) -> bool {
 /// falls back to bare, un-annotated names when a method carries none.
 fn params_and_ret(m: &MethodDef) -> (Vec<String>, Ty) {
     match &m.signature {
-        Some(Ty::Fn { params, ret, .. }) if params.len() == m.params.len() => {
+        Some(Ty::Fn(fn_ty)) if fn_ty.params.len() == m.params.len() => {
+            let FnTy { params, ret, .. } = &**fn_ty;
             let ps = m
                 .params
                 .iter()
@@ -185,6 +185,22 @@ pub fn emit_library_class(class: &LibraryClass) -> Result<String, String> {
     } else {
         writeln!(out, "class {name}({}):", bases.join(", ")).unwrap();
     }
+    // Not left to the first assignment: Ruby reads an unassigned ivar as nil, and a Python class attribute read before its first write raises
+    {
+        fn class_ivars(e: &crate::expr::Expr, out: &mut std::collections::BTreeSet<String>) {
+            if let crate::expr::ExprNode::Assign { target: crate::expr::LValue::Ivar { name }, .. } = &*e.node {
+                out.insert(name.as_str().to_string());
+            }
+            e.node.for_each_child(&mut |c| class_ivars(c, out));
+        }
+        let mut ivars = std::collections::BTreeSet::new();
+        for m in class.methods.iter().filter(|m| m.receiver == MethodReceiver::Class) {
+            class_ivars(&m.body, &mut ivars);
+        }
+        for n in ivars {
+            writeln!(out, "    {n} = None").unwrap();
+        }
+    }
 
     // Temporal (Date/DateTime/Time) columns arrive from the shared
     // lowering already split: storage is an ordinary `<col>_raw` String
@@ -200,7 +216,7 @@ pub fn emit_library_class(class: &LibraryClass) -> Result<String, String> {
             m.kind == AccessorKind::AttributeReader && signature_ret_is_time(m.signature.as_ref())
         })
         .collect();
-    let temporal_set: std::collections::HashSet<String> = temporal_readers
+    let temporal_set: crate::det::HashSet<String> = temporal_readers
         .iter()
         .map(|m| super::shared::py_method_name(m.name.as_str()))
         .collect();
@@ -210,7 +226,7 @@ pub fn emit_library_class(class: &LibraryClass) -> Result<String, String> {
     // one `notice` field). Everything else emits as a method. Temporal
     // readers are skipped — they emit as `@property` getters below.
     let mut fields: Vec<(String, Ty)> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen: crate::det::HashSet<String> = crate::det::HashSet::default();
     for m in class.methods.iter().filter(|m| is_accessor(m)) {
         // Legalize the attribute name for a Python identifier — a
         // predicate accessor (`abstract?`) must become `abstract_p`, not

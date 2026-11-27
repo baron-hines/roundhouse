@@ -93,8 +93,9 @@ const SHIMS: &[Shim] = &[
         map_entry: false,
         type_before_name: false,
     },
-    // PostgreSQL over spinel-pg; not yet selected by any target, but it
-    // implements the same contract (tests/spinel_pg_db.rs runs it).
+    // PostgreSQL, over spinel-pg on Spinel and the pg gem on CRuby; not
+    // yet selected by any target, but it implements the same contract
+    // (tests/spinel_pg_db.rs and tests/db_contract.rs run it).
     Shim {
         path: "runtime/spinel/db_pg.rb",
         naming: Naming::Snake,

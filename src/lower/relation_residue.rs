@@ -35,7 +35,7 @@
 //! is not folded and is correctly counted: it lowers to a call on the
 //! runtime `ActiveRecord::Relation` (`__rel.limit(10)`).
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::analyze::ClassInfo;
 use crate::app::App;
@@ -114,11 +114,32 @@ fn walk(e: &Expr, in_chain: bool, ctx: &FoldCtx, diags: &mut Vec<Diagnostic>) {
                 ),
             ));
         }
+        // Not only Relation-typed heads: a query on an untyped receiver (a Pundit `scope.where`) reaches a strict target as a call nothing defines.
+        let untyped_query = !in_chain
+            && !folds
+            && !is_relation_head
+            && QUERY_ONLY_METHODS.contains(&method.as_str())
+            && recv.as_ref().is_some_and(|r| receiver_unknown(r.ty.as_ref()));
+        if untyped_query {
+            diags.push(crate::lower::residue_diagnostic(
+                "relation_residue",
+                "dynamic_relation",
+                e.span,
+                "untyped_relation_query",
+                format!(
+                    "relation query `{}` on a receiver of unknown type — not folded \
+                     to SQL at transpile time; executes on the runtime Relation in \
+                     ruby-family targets, unsupported at strict-target emit",
+                    method.as_str(),
+                ),
+            ));
+        }
         // The receiver spine below a Relation-typed Send is the same
         // chain — suppress duplicate entries. Everything else starts
         // a fresh chain.
         let spine = in_chain
             || folds
+            || untyped_query
             || matches!(e.ty.as_ref(), Some(Ty::Relation { .. }));
         if let Some(r) = recv {
             walk(r, spine, ctx, diags);
@@ -132,6 +153,26 @@ fn walk(e: &Expr, in_chain: bool, ctx: &FoldCtx, diags: &mut Vec<Diagnostic>) {
         return;
     }
     e.node.for_each_child(&mut |c| walk(c, false, ctx, diags));
+}
+
+/// ActiveRecord's query methods that no Array, Hash or String answers, so a call to one on an untyped receiver is a relation query.
+const QUERY_ONLY_METHODS: &[&str] = &[
+    "where", "rewhere", "order", "reorder", "limit", "offset", "joins", "left_joins",
+    "left_outer_joins", "includes", "preload", "eager_load", "references", "pluck", "pick",
+    "group", "having", "distinct", "unscope", "find_by", "find_by!", "find_each", "find_in_batches",
+    "in_batches", "update_all", "delete_all", "destroy_all", "none",
+];
+
+fn receiver_unknown(ty: Option<&Ty>) -> bool {
+    match ty {
+        None | Some(Ty::Untyped) | Some(Ty::Var { .. }) => true,
+        // An ivar read is the value or nil: `@scope` is `Var | nil`.
+        Some(Ty::Union { variants }) => {
+            variants.iter().any(|v| matches!(v, Ty::Untyped | Ty::Var { .. }))
+                && variants.iter().all(|v| matches!(v, Ty::Untyped | Ty::Var { .. } | Ty::Nil))
+        }
+        _ => false,
+    }
 }
 
 /// Act on what the residue message says, for the target actually being
@@ -161,11 +202,13 @@ fn walk(e: &Expr, in_chain: bool, ctx: &FoldCtx, diags: &mut Vec<Diagnostic>) {
 ///
 /// Host-only: the CLI is the emit gate that raises these, and the
 /// playground has no emit gate to raise anything for.
-/// `validates :attr, uniqueness: …` needs a query at validation time,
-/// which only the targets that ship the runtime Relation lower
-/// (`model_to_library::RuntimeRelation::Present`). Elsewhere the rule is
-/// not lowered, and this reports it, as the gap it was before, once per
-/// validation, so the emit says what it leaves out.
+/// `validates :attr, uniqueness: …` needs a query at validation time.
+/// The targets that ship the runtime Relation run Rails' own; the others
+/// lower a fixed `SELECT 1 … LIMIT 1` probe per rule
+/// (`adapter_emit::uniqueness`), which compares plain scalar columns
+/// only (`validations::strict_uniqueness_columns`). A rule over any other
+/// column is not lowered there, and this reports it once per validation,
+/// so the emit says what it leaves out.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn uniqueness_gaps_for_target(app: &App, target: crate::build_target::BuildTarget) -> Vec<Diagnostic> {
     if target.has_runtime_relation() {
@@ -173,16 +216,25 @@ pub fn uniqueness_gaps_for_target(app: &App, target: crate::build_target::BuildT
     }
     let mut out = Vec::new();
     for model in &app.models {
+        let table = app.schema.tables.get(&model.table.0);
         for item in &model.body {
             let crate::dialect::ModelBodyItem::Validation { validation, .. } = item else { continue };
-            if !validation.rules.iter().any(|r| matches!(r, crate::dialect::ValidationRule::Uniqueness { .. })) {
+            // The strict lowering queries a plain-scalar comparison itself
+            // (`model_to_library::validations`, `Exists` over the columns).
+            let unsupported = validation.rules.iter().any(|r| match r {
+                crate::dialect::ValidationRule::Uniqueness { scope, .. } => table.is_none_or(|table| {
+                    crate::lower::validations::strict_uniqueness_columns(model, table, &validation.attribute, scope).is_none()
+                }),
+                _ => false,
+            });
+            if !unsupported {
                 continue;
             }
             let mut d = Diagnostic::unsupported(
                 item.span(),
                 Some(crate::ident::Symbol::from(target.as_str())),
                 format!("validates :{}, uniqueness:", validation.attribute.as_str()),
-                "the uniqueness query needs the runtime Relation, which this target does not ship; Rails rejects records this build saves",
+                "this target compares a uniqueness query over plain scalar columns of a keyed table only, and one of these is temporal, JSON, a float or decimal, an enum, an array, a polymorphic association or a column the model reads itself, or the table has no key; Rails rejects records this build saves",
             );
             d.severity = crate::diagnostic::Severity::Warning;
             out.push(d);
@@ -202,7 +254,7 @@ pub fn default_scope_gaps_for_target(app: &App, target: crate::build_target::Bui
     }
     let mut out = Vec::new();
     for model in &app.models {
-        if crate::lower::default_scope::static_default_scope(model).is_none() {
+        if crate::lower::default_scope::default_scope(model).is_none() {
             continue;
         }
         let Some(item) = model.body.iter().find(|item| {

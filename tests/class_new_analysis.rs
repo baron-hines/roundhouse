@@ -140,7 +140,7 @@ fn raise_and_rescue_share_the_existing_exception_surface() {
     let owner = &analyzer.class_registry()[&ClassId(Symbol::from("Owner"))];
     let returned = owner.class_methods.get(&Symbol::from("run")).unwrap();
     let return_type = match returned {
-        Ty::Fn { ret, .. } => ret.as_ref(),
+        Ty::Fn(fn_ty) => fn_ty.ret.as_ref(),
         ty => ty,
     };
     assert_eq!(return_type, &Ty::Str);
@@ -462,6 +462,17 @@ fn inherited_hooks_exclude_factories_through_the_entire_ancestry() {
             "Owner::Parent",
             None,
         ),
+        // An included module's own hook can give its includer one.
+        (
+            "module Tracking; def self.included(base) = base.define_singleton_method(:inherited) { |child| child.name.split(\"::\") }; end; class Parent; include Tracking; end",
+            "Parent",
+            None,
+        ),
+        (
+            "module Tracking; class << self; def append_features(base) = super; end; end; class Grandparent; include Tracking; end; class Parent < Grandparent; end",
+            "Parent",
+            None,
+        ),
     ] {
         let factory = format!("{declarations}\nclass Owner; Child = Class.new({parent}) {{}}; end");
         let raw = ingest(&factory, "Owner::Child.new", extra);
@@ -549,6 +560,10 @@ fn ruby_inherited_hooks_observe_anonymous_factories_and_named_headers() {
         (
             "class Parent < StandardError; def self.inherited(child); child.define_singleton_method(:new) { 7 } if child.name.nil?; end; end",
             "Owner::Child.new.message",
+        ),
+        (
+            "module Tracking; def self.included(base) = base.define_singleton_method(:inherited) { |child| child.name.split(\"::\") }; end; class Parent; include Tracking; end",
+            "Owner::Child.new",
         ),
     ] {
         let factory =
@@ -1062,6 +1077,168 @@ fn assert_refused_factory(declarations: &str, parent: &str) {
     );
 }
 
+// Mixins into a constructor ancestor of a module that defines no
+// construction method (`new`, `allocate`, `initialize`, `inherited`) and no
+// mixin hook. action_policy runs the last one, guarded for JRuby.
+const MIXINS_WITHOUT_CONSTRUCTION: &[&str] = &[
+    "module Ext\n def namespace = name\nend\nModule.include(Ext)",
+    "module Ext\n def namespace = name\nend\n::Module.include(Ext)",
+    "module Ext\n def namespace = name\nend\nModule.send(:include, Ext)",
+    "module Ext\n def namespace = name\nend\nModule.public_send(:include, Ext)",
+    "module Ext\n def namespace = name\nend\nModule.method(:include).call(Ext)",
+    "module Ext\n def namespace = name\nend\nModule.prepend(Ext)",
+    "module Ext\n def namespace = name\nend\nModule.extend(Ext)",
+    "module Ext\n def namespace = name\nend\nModule.singleton_class.include(Ext)",
+    "module Ext\n def namespace = name\nend\nclass Module\n include Ext\nend",
+    "module Ext\n def namespace = name\nend\nClass.include(Ext)",
+    "module Ext\n def namespace = name\nend\nClass.prepend(Ext)",
+    "module Ext\n def namespace = name\nend\nObject.include(Ext)",
+    "module Ext\n def namespace = name\nend\nBasicObject.include(Ext)",
+    "module Base\n def label = 1\nend\nmodule Ext\n include Base\nend\nModule.include(Ext)",
+    "module Outer\n module Ext\n def namespace = name\n end\n ::Module.include(Ext) if RUBY_PLATFORM.match?(/java/i)\nend",
+];
+
+#[test]
+fn mixins_without_construction_methods_keep_factories() {
+    for &extra in MIXINS_WITHOUT_CONSTRUCTION {
+        let raw = ingest(
+            "class Owner\n Child = Class.new(StandardError) {}\nend",
+            "Owner::Child.new.message",
+            Some(extra),
+        );
+        let (source, analyzer) = analyzed(raw, true);
+        assert!(
+            analyzer
+                .class_registry()
+                .contains_key(&ClassId(Symbol::from("Owner::Child"))),
+            "{extra}"
+        );
+        assert_eq!(
+            send_type(
+                &source.controllers[0].actions().next().unwrap().body,
+                "message"
+            ),
+            Some(Ty::Str),
+            "{extra}"
+        );
+    }
+}
+
+#[test]
+fn a_dead_jruby_mixin_keeps_model_factory_constants() {
+    let boom_errors = |ext: &str| {
+        let app = ingest_files(&[
+            (
+                "db/schema.rb",
+                "ActiveRecord::Schema.define(version: 1) do\n  create_table \"articles\" do |t|\n    t.string \"title\"\n  end\nend\n",
+            ),
+            (
+                "config/routes.rb",
+                "Rails.application.routes.draw do\nend\n",
+            ),
+            (
+                "app/models/application_record.rb",
+                "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n",
+            ),
+            (
+                "app/models/article.rb",
+                "class Article < ApplicationRecord\n  Boom = Class.new(StandardError)\n\n  def explode!\n    raise Boom, \"no\"\n  end\nend\n",
+            ),
+            (
+                "lib/namespace.rb",
+                &format!(
+                    "module Namespace\n  module Ext\n{ext}\n  end\n\n  ::Module.include(Ext) if RUBY_PLATFORM.match?(/java/i)\nend\n"
+                ),
+            ),
+        ]);
+        let (app, _) = analyzed(app, true);
+        errors(&app)
+            .into_iter()
+            .filter(|error| error.to_string().contains("Boom"))
+            .count()
+    };
+    assert_eq!(boom_errors("    def namespace = name"), 0);
+    assert_ne!(boom_errors("    def new(*) = 7"), 0);
+}
+
+#[test]
+fn mixins_that_may_change_construction_refuse_factories() {
+    for declarations in [
+        // Each construction method, and its other spellings.
+        "module Ext\n def new(*) = 7\nend\nModule.include(Ext)",
+        "module Ext\n def allocate = 7\nend\nModule.include(Ext)",
+        "module Ext\n def initialize(*) = nil\nend\nClass.prepend(Ext)",
+        "module Ext\n def inherited(child) = nil\nend\nObject.extend(Ext)",
+        "module Ext\n def build = 7\n alias new build\nend\nModule.extend(Ext)",
+        "module Ext\n attr_reader :new\nend\nModule.extend(Ext)",
+        "module Ext\n def new(*) = 7\nend\n::Module.include(Ext)",
+        "module Ext\n def new(*) = 7\nend\nModule.send(:include, Ext)",
+        "module Ext\n def new(*) = 7\nend\nModule.method(:include).call(Ext)",
+        "module Ext\n def new(*) = 7\nend\nclass Module\n include Ext\nend",
+        "module Ext\n def new(*) = 7\nend\nClass.include(Ext)",
+        "module Ext\n def new(*) = 7\nend\nObject.include(Ext)",
+        // A hook of the module runs when it is mixed in.
+        "module Ext\n def self.included(base) = base.singleton_class.define_method(:new) { |*| 7 }\nend\nModule.include(Ext)",
+        "module Ext\n class << self\n def extended(base) = nil\n end\nend\nModule.extend(Ext)",
+        "module Hooks\n def included(base) = nil\nend\nmodule Ext\n extend Hooks\nend\nModule.include(Ext)",
+        "class Module\n def included(base) = nil\nend\nmodule Ext; end\nModule.include(Ext)",
+        // A module it includes, a later opening, or a mutation elsewhere.
+        "module Base\n def new(*) = 7\nend\nmodule Ext\n include Base\nend\nModule.extend(Ext)",
+        "module Ext; end\nModule.include(Ext)\nmodule Ext\n def inherited(child) = nil\nend",
+        "module Ext; end\nExt.define_method(:new) { |*| 7 }\nModule.include(Ext)",
+        // No source body shows the module's methods.
+        "Module.include(External::Ext)",
+        "Ext = Module.new { def new(*) = 7 }\nModule.include(Ext)",
+        "ext = Module.new { def new(*) = 7 }\nModule.include(ext)",
+        "Module.include(*[Comparable])",
+        // A reopening shows only part of a core or framework module.
+        "module Kernel\n def namespace = name\nend\nModule.include(Kernel)",
+        "module ActiveRecord\n module SignedId\n def namespace = name\n end\nend\nObject.include(ActiveRecord::SignedId)",
+        "module ActiveRecord\n module SignedId\n def namespace = name\n end\nend\nmodule Ext\n include ActiveRecord::SignedId\nend\nModule.include(Ext)",
+    ] {
+        assert_refused_factory(declarations, "Object");
+    }
+}
+
+#[test]
+fn ruby_keeps_class_new_under_mixins_without_construction_methods() {
+    for mixin in MIXINS_WITHOUT_CONSTRUCTION {
+        let program = format!(
+            "{mixin}\nclass Owner; Child = Class.new(StandardError) {{}}; end\nraise 'changed' unless Owner::Child.superclass == StandardError && Owner::Child.new('x').message == 'x'\nputs 'kept'"
+        );
+        let output = std::process::Command::new("ruby")
+            .args(["-e", &program])
+            .output()
+            .expect("Ruby mixin control");
+        assert!(
+            output.status.success(),
+            "{mixin}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "kept\n", "{mixin}");
+    }
+    for mixin in [
+        "module Ext\n def new(*) = 7\nend\nClass.prepend(Ext)",
+        "module Ext\n def new(*) = 7\nend\nModule.extend(Ext)",
+        "module Ext\n def inherited(child) = raise('hook')\nend\nObject.extend(Ext)",
+        "module Ext\n def self.included(base) = base.singleton_class.define_method(:new) { |*| 7 }\nend\nModule.include(Ext)",
+        "module Base\n def new(*) = 7\nend\nmodule Ext\n include Base\nend\nModule.extend(Ext)",
+    ] {
+        let program = format!(
+            "{mixin}\nbegin\n class Owner; Child = Class.new(StandardError) {{}}; end\n puts Owner::Child.is_a?(Class) ? 'kept' : 'changed'\nrescue RuntimeError\n puts 'changed'\nend"
+        );
+        let output = std::process::Command::new("ruby")
+            .args(["-e", &program])
+            .output()
+            .expect("Ruby mixin control");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "changed\n",
+            "{mixin}"
+        );
+    }
+}
+
 #[test]
 fn parallel_assignments_follow_literal_constructor_aliases() {
     for declarations in [
@@ -1351,4 +1528,322 @@ fn superclass_limits_remain_at_ordinary_class_parity() {
             "{declarations}, {parent}"
         );
     }
+}
+
+fn ingest_files(files: &[(&str, &str)]) -> roundhouse::App {
+    let tree: HashMap<PathBuf, Vec<u8>> = files
+        .iter()
+        .map(|(path, text)| (PathBuf::from(path), text.as_bytes().to_vec()))
+        .collect();
+    roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest")
+}
+
+fn class_method_return(analyzer: &Analyzer, class: &str, method: &str) -> Ty {
+    match &analyzer.class_registry()[&ClassId(Symbol::from(class))].class_methods[&Symbol::from(method)] {
+        Ty::Fn(fn_ty) => fn_ty.ret.as_ref().clone(),
+        ty => ty.clone(),
+    }
+}
+
+#[test]
+fn file_level_factories_are_top_level_classes() {
+    const READER: &str = "class Probe\n  def self.value = ExampleError\nend\n";
+    for files in [
+        // Ahead of a class in the same file: not that class's constant.
+        vec![(
+            "app/models/probe.rb",
+            "TIMEOUT = 5\nExampleError = Class.new(StandardError)\nclass Probe\n  def self.value = ExampleError\n  def self.timeout = TIMEOUT\nend\n",
+        )],
+        // A file of its own under app/models: not a model.
+        vec![
+            ("app/models/example_error.rb", "ExampleError = Class.new(StandardError)\n"),
+            ("app/models/probe.rb", READER),
+        ],
+        // A support directory, read from a module's rescue and a class body.
+        vec![
+            ("app/errors/example_errors.rb", "BaseError = Class.new(StandardError)\nExampleError = Class.new(BaseError)\n"),
+            (
+                "app/services/limiter.rb",
+                "module Limiter\n  def self.check(n)\n    raise ExampleError, \"too many\" if n > 3\n    \"ok\"\n  rescue BaseError => e\n    e.message\n  end\nend\n",
+            ),
+            ("app/models/probe.rb", "class Probe\n  ERRORS = [BaseError, ExampleError].freeze\n  def self.value = ERRORS\nend\n"),
+        ],
+    ] {
+        let (app, analyzer) = analyzed(ingest_files(&files), true);
+        assert!(errors(&app).is_empty(), "{files:?}: {:?}", errors(&app));
+        let class = &analyzer.class_registry()[&ClassId(Symbol::from("ExampleError"))];
+        assert!(class.parent.is_some(), "{files:?}");
+        assert!(
+            !analyzer.class_registry().contains_key(&ClassId(Symbol::from("Probe::ExampleError"))),
+            "{files:?}"
+        );
+    }
+}
+
+#[test]
+fn a_factory_block_of_class_body_statements_gives_the_class_its_methods() {
+    const BLOCK: &str = "Class.new(StandardError) do\n  attr_reader :details\n  def code = 42\n  private\n  def hidden = 1\nend";
+    for (files, id) in [
+        (
+            vec![(
+                "app/models/probe.rb",
+                "class Probe\n  ExampleError = Class.new(StandardError) do\n    def code = 42\n  end\n  def self.value = ExampleError.new(\"x\").code\nend\n",
+            )],
+            "Probe::ExampleError",
+        ),
+        (
+            vec![
+                ("app/models/example_error.rb", "ExampleError = Class.new(StandardError) do\n  def code = 42\nend\n"),
+                ("app/models/probe.rb", "class Probe\n  def self.value = ExampleError.new(\"x\").code\nend\n"),
+            ],
+            "ExampleError",
+        ),
+    ] {
+        let (app, analyzer) = analyzed(ingest_files(&files), true);
+        assert!(errors(&app).is_empty(), "{files:?}: {:?}", errors(&app));
+        let class = &analyzer.class_registry()[&ClassId(Symbol::from(id))];
+        assert_eq!(class.parent, Some(ClassId(Symbol::from("StandardError"))));
+        assert!(class.instance_methods.contains_key(&Symbol::from("code")), "{id}");
+        assert_eq!(class_method_return(&analyzer, "Probe", "value"), Ty::Int, "{id}");
+    }
+    let files = [
+        ("app/models/example_error.rb", format!("ExampleError = {BLOCK}\n")),
+        ("app/models/probe.rb", "class Probe\n  def self.value = ExampleError.new(\"x\").code\nend\n".to_string()),
+    ];
+    let files: Vec<(&str, &str)> = files.iter().map(|(path, text)| (*path, text.as_str())).collect();
+    let (app, analyzer) = analyzed(ingest_files(&files), true);
+    assert!(errors(&app).is_empty(), "{:?}", errors(&app));
+    let class = &app.library_classes.iter().find(|class| class.name.0.as_str() == "ExampleError").unwrap();
+    let visibility = |name: &str| class.methods.iter().find(|method| method.name.as_str() == name).map(|method| method.visibility);
+    assert_eq!(visibility("details"), Some(roundhouse::dialect::MethodVisibility::Public));
+    assert_eq!(visibility("hidden"), Some(roundhouse::dialect::MethodVisibility::Private));
+    assert_eq!(class_method_return(&analyzer, "Probe", "value"), Ty::Int);
+}
+
+#[test]
+fn other_file_level_factories_stay_unresolved_constants() {
+    // A parent the source does not name, or a block whose constant is the
+    // enclosing scope's, is not the class a `class` header would make.
+    for factory in [
+        "ExampleError = Class.new(Object.const_get(:StandardError))",
+        "ExampleError = Class.new(StandardError) do\n  CODE = 42\nend",
+    ] {
+        let files = [("app/models/probe.rb", format!("{factory}\nclass Probe\n  def self.value = ExampleError\nend\n"))];
+        let files: Vec<(&str, &str)> = files.iter().map(|(path, text)| (*path, text.as_str())).collect();
+        let (app, analyzer) = analyzed(ingest_files(&files), true);
+        assert!(
+            errors(&app).iter().any(|error| error.code() == "unsupported"),
+            "{factory}: {:?}",
+            errors(&app)
+        );
+        assert!(!analyzer.class_registry().contains_key(&ClassId(Symbol::from("ExampleError"))), "{factory}");
+    }
+}
+
+#[test]
+fn file_level_constants_hoist_onto_a_class_new_only_file() {
+    // A library file of only Class.new factories still needs sibling
+    // constants on Object; hoist them onto the first factory.
+    let files = [(
+        "app/models/limit_errors.rb",
+        "TIMEOUT = 5\nBaseError = Class.new(StandardError)\nLimitError = Class.new(BaseError) do\n  def self.code = TIMEOUT\nend\n",
+    )];
+    let (app, analyzer) = analyzed(ingest_files(&files), true);
+    assert!(errors(&app).is_empty(), "{:?}", errors(&app));
+    let base = app
+        .library_classes
+        .iter()
+        .find(|class| class.name.0.as_str() == "BaseError")
+        .expect("BaseError");
+    assert!(
+        base.constants.iter().any(|(name, _)| name.as_str() == "TIMEOUT"),
+        "TIMEOUT missing on BaseError: {:?}",
+        base.constants.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
+    );
+    assert_eq!(class_method_return(&analyzer, "LimitError", "code"), Ty::Int);
+}
+
+#[test]
+fn file_level_constants_refuse_a_sibling_factory_reader() {
+    // Hoisting TIMEOUT onto A leaves B's bare read unreachable at runtime.
+    let source = "TIMEOUT = 5\nA = Class.new(StandardError)\nB = Class.new(StandardError) do\n  def self.t = TIMEOUT\nend\n";
+    roundhouse::ingest::survey::activate();
+    let tree: HashMap<PathBuf, Vec<u8>> =
+        [(PathBuf::from("app/models/errors.rb"), source.as_bytes().to_vec())]
+            .into_iter()
+            .collect();
+    let app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest");
+    let gaps = roundhouse::ingest::survey::drain();
+    assert!(
+        gaps.iter().any(|gap| gap.to_string().contains("cannot see it after hoisting")),
+        "{gaps:?}"
+    );
+    assert!(
+        !app.library_classes.iter().any(|class| class.name.0.as_str() == "B"),
+        "refused file must not keep the sibling factory: {:?}",
+        app.library_classes.iter().map(|c| c.name.0.as_str()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn file_level_constants_refuse_an_unrelated_host_reader() {
+    let source = "TIMEOUT = 5\nclass Foo; end\nE = Class.new(StandardError) do\n  def self.t = TIMEOUT\nend\n";
+    roundhouse::ingest::survey::activate();
+    let tree: HashMap<PathBuf, Vec<u8>> =
+        [(PathBuf::from("app/models/errors.rb"), source.as_bytes().to_vec())]
+            .into_iter()
+            .collect();
+    let _app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest");
+    let gaps = roundhouse::ingest::survey::drain();
+    assert!(
+        gaps.iter().any(|gap| gap.to_string().contains("cannot see it after hoisting")),
+        "{gaps:?}"
+    );
+}
+
+#[test]
+fn file_level_constants_refuse_a_value_naming_a_later_class() {
+    let source = "BaseError = Class.new(StandardError)\nLimitError = Class.new(BaseError)\nALL = [LimitError]\n";
+    roundhouse::ingest::survey::activate();
+    let tree: HashMap<PathBuf, Vec<u8>> =
+        [(PathBuf::from("app/models/errors.rb"), source.as_bytes().to_vec())]
+            .into_iter()
+            .collect();
+    let _app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest");
+    let gaps = roundhouse::ingest::survey::drain();
+    assert!(
+        gaps.iter().any(|gap| gap.to_string().contains("defined after host")),
+        "{gaps:?}"
+    );
+}
+
+
+#[test]
+fn file_level_constants_refuse_a_sibling_param_default_reader() {
+    // A default is evaluated in the callee's scope, not the host's.
+    let source = "TIMEOUT = 5\nA = Class.new(StandardError)\nB = Class.new(StandardError) do\n  def self.t(x = TIMEOUT) = x\nend\n";
+    roundhouse::ingest::survey::activate();
+    let tree: HashMap<PathBuf, Vec<u8>> =
+        [(PathBuf::from("app/models/errors.rb"), source.as_bytes().to_vec())]
+            .into_iter()
+            .collect();
+    let _app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest");
+    let gaps = roundhouse::ingest::survey::drain();
+    assert!(
+        gaps.iter().any(|gap| gap.to_string().contains("cannot see it after hoisting")),
+        "{gaps:?}"
+    );
+}
+
+#[test]
+fn file_level_constants_refuse_a_sibling_rooted_const_reader() {
+    // `::TIMEOUT` is Object::TIMEOUT; after hoist onto A it is gone.
+    let source = "TIMEOUT = 5\nA = Class.new(StandardError)\nB = Class.new(StandardError) do\n  def self.t = ::TIMEOUT\nend\n";
+    roundhouse::ingest::survey::activate();
+    let tree: HashMap<PathBuf, Vec<u8>> =
+        [(PathBuf::from("app/models/errors.rb"), source.as_bytes().to_vec())]
+            .into_iter()
+            .collect();
+    let _app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest");
+    let gaps = roundhouse::ingest::survey::drain();
+    assert!(
+        gaps.iter().any(|gap| gap.to_string().contains("cannot see it after hoisting")),
+        "{gaps:?}"
+    );
+}
+
+#[test]
+fn file_level_constants_refuse_a_host_rooted_const_reader() {
+    // Even the host cannot keep Object::TIMEOUT after the hoist.
+    let source = "TIMEOUT = 5\nA = Class.new(StandardError) do\n  def self.t = ::TIMEOUT\nend\n";
+    roundhouse::ingest::survey::activate();
+    let tree: HashMap<PathBuf, Vec<u8>> =
+        [(PathBuf::from("app/models/errors.rb"), source.as_bytes().to_vec())]
+            .into_iter()
+            .collect();
+    let _app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest");
+    let gaps = roundhouse::ingest::survey::drain();
+    assert!(
+        gaps.iter().any(|gap| gap.to_string().contains("cannot see it after hoisting")),
+        "{gaps:?}"
+    );
+}
+
+#[test]
+fn file_level_constants_refuse_a_rooted_value() {
+    let source = "TIMEOUT = 5\nA = Class.new(StandardError)\nALL = [::TIMEOUT]\n";
+    roundhouse::ingest::survey::activate();
+    let tree: HashMap<PathBuf, Vec<u8>> =
+        [(PathBuf::from("app/models/errors.rb"), source.as_bytes().to_vec())]
+            .into_iter()
+            .collect();
+    let _app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest");
+    let gaps = roundhouse::ingest::survey::drain();
+    assert!(
+        gaps.iter().any(|gap| gap.to_string().contains("roots `::")),
+        "{gaps:?}"
+    );
+}
+
+#[test]
+fn file_level_constants_refuse_a_qualified_later_class_value() {
+    let source = "class BaseError; end\nclass LimitError < BaseError; TOKEN = 1; end\nALL = [LimitError::TOKEN]\n";
+    roundhouse::ingest::survey::activate();
+    let tree: HashMap<PathBuf, Vec<u8>> =
+        [(PathBuf::from("app/models/errors.rb"), source.as_bytes().to_vec())]
+            .into_iter()
+            .collect();
+    let _app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest");
+    let gaps = roundhouse::ingest::survey::drain();
+    assert!(
+        gaps.iter().any(|gap| gap.to_string().contains("defined after host")),
+        "{gaps:?}"
+    );
+}
+
+#[test]
+fn file_level_constants_refuse_a_qualified_hoisted_reader() {
+    let source = "CONFIG = { PI: 3 }\nA = Class.new(StandardError) do\n  def self.t = CONFIG::PI\nend\nB = Class.new(StandardError) do\n  def self.t = CONFIG::PI\nend\n";
+    roundhouse::ingest::survey::activate();
+    let tree: HashMap<PathBuf, Vec<u8>> =
+        [(PathBuf::from("app/models/errors.rb"), source.as_bytes().to_vec())]
+            .into_iter()
+            .collect();
+    let _app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest");
+    let gaps = roundhouse::ingest::survey::drain();
+    assert!(
+        gaps.iter().any(|gap| gap.to_string().contains("cannot see it after hoisting")),
+        "{gaps:?}"
+    );
+}
+
+#[test]
+fn a_file_level_factory_follows_its_in_file_parent_class() {
+    // `NotFound = Class.new(AppError)` after `class AppError` must not
+    // prepend the factory ahead of AppError: Ruby resolves the superclass
+    // while defining NotFound.
+    let files = [(
+        "app/models/errors.rb",
+        "class AppError < StandardError; end\nNotFound = Class.new(AppError)\n",
+    )];
+    let (app, _) = analyzed(ingest_files(&files), true);
+    assert!(errors(&app).is_empty(), "{:?}", errors(&app));
+    let names: Vec<&str> = app.library_classes.iter().map(|class| class.name.0.as_str()).collect();
+    let app_error = names.iter().position(|name| *name == "AppError").expect("AppError");
+    let not_found = names.iter().position(|name| *name == "NotFound").expect("NotFound");
+    assert!(app_error < not_found, "expected AppError before NotFound, got {names:?}");
+}
+
+#[test]
+fn a_nested_factory_is_the_sibling_of_its_ordinary_parent() {
+    let files = [(
+        "app/models/owner.rb",
+        "class Owner\n  class Parent; end\n  Child = Class.new(Parent)\nend\n",
+    )];
+    let (app, analyzer) = analyzed(ingest_files(&files), true);
+    assert!(errors(&app).is_empty(), "{:?}", errors(&app));
+    assert!(app.library_classes.iter().any(|class| class.name.0.as_str() == "Owner::Child"));
+    assert!(app.library_classes.iter().any(|class| class.name.0.as_str() == "Owner::Parent"));
+    let child = &analyzer.class_registry()[&ClassId(Symbol::from("Owner::Child"))];
+    assert_eq!(child.parent, Some(ClassId(Symbol::from("Owner::Parent"))));
 }

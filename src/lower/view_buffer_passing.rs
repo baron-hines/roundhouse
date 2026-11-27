@@ -35,13 +35,13 @@
 //! buffer" at all, and lowering it for everyone would put a construct
 //! in the shared IR that the weakest emitter cannot spell.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::dialect::{LibraryClass, MethodDef, Param};
 use crate::expr::{Expr, ExprNode, IrHint, LValue, Literal};
 use crate::ident::{Symbol, VarId};
 use crate::span::Span;
-use crate::ty::{ParamKind, Ty};
+use crate::ty::{FnTy, ParamKind, Ty};
 
 /// Suffix for the buffer-taking variant. `_into` reads as the Ruby
 /// convention for "write into what I hand you" (`Marshal.dump(obj, io)`
@@ -221,7 +221,8 @@ fn split(m: &MethodDef, module_path: &[Symbol], acc: &str) -> (MethodDef, Method
     // message`). The wrapper still declares the public shape; this one
     // is an internal ABI.
     let into_signature = match &m.signature {
-        Some(Ty::Fn { params, block, effects, .. }) => {
+        Some(Ty::Fn(fn_ty)) => {
+            let FnTy { params, block, effects, .. } = &**fn_ty;
             let mut ps = vec![crate::ty::Param {
                 name: Symbol::from(acc),
                 ty: Ty::Str.into(),
@@ -232,12 +233,12 @@ fn split(m: &MethodDef, module_path: &[Symbol], acc: &str) -> (MethodDef, Method
                 ty: into_param_ty(&p.ty).into(),
                 kind: ParamKind::Required,
             }));
-            Some(Ty::Fn {
+            Some(Ty::Fn(Box::new(FnTy {
                 params: ps.into(),
                 block: block.clone(),
                 ret: std::sync::Arc::new(Ty::Nil),
                 effects: effects.clone(),
-            })
+            })))
         }
         _ => None,
     };
@@ -338,7 +339,7 @@ fn rewrite_appends(e: &mut Expr, variants: &HashMap<(String, String), Vec<Option
 /// Give every convertible view method a buffer-taking variant and point
 /// view-to-view appends at it.
 pub fn apply(lcs: &mut [LibraryClass]) {
-    let mut variants: HashMap<(String, String), Vec<Option<Expr>>> = HashMap::new();
+    let mut variants: HashMap<(String, String), Vec<Option<Expr>>> = HashMap::default();
     for lc in lcs.iter() {
         for m in &lc.methods {
             if accumulator_name(m).is_some() && forwardable(m) {

@@ -1,7 +1,9 @@
 # frozen_string_literal: true
 # Instance-method facade of ActionView::Helpers::NumberHelper, separated
 # from its module-function implementation for runtime source typing.
-require_relative "action_view_number_helper"
+# Loaded by action_view_number_helper.rb, after the module functions
+# these call: requiring that file back from here was a circular require,
+# which warns under $VERBOSE.
 
 module ActionView
   module Helpers
