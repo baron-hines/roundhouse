@@ -11,6 +11,8 @@
 //! drops it and the runtime logs it (`rails_error_report_logs_at_its_severity`
 //! in tests/emit_and_run/active_support_extensions.rs).
 
+#[path = "support/prerequisite.rs"]
+mod prerequisite;
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
@@ -29,7 +31,7 @@ fn oracle_available() -> bool {
     let answer = String::from_utf8_lossy(&probe.stdout).trim().to_string();
     assert!(probe.status.success() && (answer == "true" || answer == "false"), "oracle probe failed: {answer}\n{}", String::from_utf8_lossy(&probe.stderr));
     if answer == "false" {
-        eprintln!("skipping: the Rails oracle's activesupport is not available");
+        prerequisite::missing("the Rails oracle's activesupport is not available");
     }
     answer == "true"
 }

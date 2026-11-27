@@ -27,8 +27,8 @@ end
 }
 
 const ASSERTIONS: &str = r#"now = Time.at(100000)
-raise "day" unless UploadClock.cutoff(now).to_i == 13600
-raise "shift" unless UploadClock.shifted(now).to_i == 100002
+raise "day" unless UploadClock.cutoff(now: now).to_i == 13600
+raise "shift" unless UploadClock.shifted(now: now).to_i == 100002
 puts "PASS"
 "#;
 
@@ -37,8 +37,8 @@ fn named_durations_are_converted_for_time_arithmetic() {
     let (emitted, errors) = app().emit(roundhouse::project::BuildTarget::Spinel);
     assert!(errors.is_empty(), "{errors:?}");
     let source = std::fs::read_to_string(emitted.join("app/models/upload_clock.rb")).unwrap();
-    assert!(source.contains("MAX_AGE.to_i"), "{source}");
-    assert!(source.contains("SHIFT.to_i"), "{source}");
+    assert!(source.contains("MAX_AGE.value"), "{source}");
+    assert!(source.contains("SHIFT.value"), "{source}");
 }
 
 #[test]
@@ -72,7 +72,7 @@ fn named_durations_are_converted_in_emitted_test_bodies() {
     let (emitted, errors) = test_app().emit(roundhouse::project::BuildTarget::Spinel);
     assert!(errors.is_empty(), "{errors:?}");
     let source = std::fs::read_to_string(emitted.join("test/upload_clock_test.rb")).unwrap();
-    assert!(source.matches("UploadClock::SHIFT.to_i").count() >= 3, "{source}");
+    assert!(source.matches("UploadClock::SHIFT.value").count() >= 3, "{source}");
 }
 
 #[test]

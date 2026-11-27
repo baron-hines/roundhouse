@@ -356,3 +356,16 @@ fn an_object_method_keeps_the_nil_guard() {
     )]);
     assert!(!src.contains("is_a?(User)"), "{src}");
 }
+
+/// A receiver whose class is not known may be a runtime object that answers the name as well as the app class
+/// that defines it: `Rails.application.config` answers `relative_url_root` (Devise's FailureApp asks it), which
+/// `is_a?` on the app's definers alone answered nil for. Past the arms the narrowing writes, the nil guard stands.
+#[test]
+fn an_untyped_receiver_counts_the_runtime_classes_that_answer_the_name() {
+    let src = emit(&[(
+        "app/models/user.rb",
+        "class User < ApplicationRecord\n  def relative_url_root\n    \"/u\"\n  end\n\n  def root_of(config)\n    config.try(:relative_url_root)\n  end\nend\n",
+    )]);
+    assert!(!src.contains("config.is_a?(User)"), "Rails' config answers `relative_url_root` too:\n{src}");
+    assert!(src.contains("config && config.relative_url_root"), "{src}");
+}

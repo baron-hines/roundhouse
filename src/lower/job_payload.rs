@@ -12,8 +12,8 @@
 //!   in every corpus app; the sites are typed (Switchyard spikes/t1).
 //!   Target-neutral data, run from `job_class_side` on every target.
 //! - [`apply_ruby`] rewrites the enqueue arm of each planned job's
-//!   `perform_later` from `ActiveJob.enqueue(-> { … })` to
-//!   `ActiveJob.enqueue_payload(JobRegistry.payload_<job>(args))` and
+//!   `perform_later` from `ActiveJob.enqueue_on(queue, -> { … })` to
+//!   `ActiveJob.enqueue_payload_on(queue, JobRegistry.payload_<job>(args))` and
 //!   ledgers each job that keeps its Proc; [`push_model_to_gid_uri`]
 //!   gives every model the GlobalID a payload writes. Called by the Ruby
 //!   emitter only: the other targets have no drain, so their enqueue arm
@@ -60,6 +60,12 @@ pub struct JobParam {
     /// `*name`: every argument from this position on, each written as
     /// its own element of the argument list, as Rails flattens a splat.
     pub rest: bool,
+    /// `name:`: written in the trailing keyword Hash Rails flags with `_aj_ruby2_keywords`, and passed back by name.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keyword: bool,
+    /// A keyword's literal default, as Ruby text: what `perform` binds when a payload leaves the key out, as Rails' do for a defaulted keyword.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
     pub codec: Codec,
 }
 
@@ -68,6 +74,43 @@ pub struct JobParam {
 pub struct JobFallback {
     pub param: Option<Symbol>,
     pub reason: String,
+}
+
+/// How long `retry_on` waits before the next try.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum RetryWait {
+    /// A literal number of seconds (`wait: 5`, `wait: 5.minutes`).
+    Seconds(f64),
+    /// `wait: :polynomially_longer`: `n**4 + 2` for the n-th try.
+    PolynomiallyLonger,
+}
+
+/// One `retry_on` or `discard_on` of a job, as ActiveJob searches them.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum JobHandler {
+    Retry {
+        /// The exception classes, as written (`Sticky`, `Net::ReadTimeout`).
+        exceptions: Vec<String>,
+        wait: RetryWait,
+        /// `attempts:`, 0 for `:unlimited`.
+        attempts: i64,
+        /// `queue:`, "" to keep the job's own.
+        queue: String,
+        priority: Option<i64>,
+        /// `jitter:`, `None` for the job's `retry_jitter`.
+        jitter: Option<f64>,
+    },
+    Discard {
+        exceptions: Vec<String>,
+    },
+}
+
+impl JobHandler {
+    pub fn exceptions(&self) -> &[String] {
+        match self {
+            JobHandler::Retry { exceptions, .. } | JobHandler::Discard { exceptions } => exceptions,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -88,6 +131,20 @@ pub struct JobPlan {
     pub params: Vec<JobParam>,
     /// Set when the job keeps its Proc; `params` is then empty.
     pub fallback: Option<JobFallback>,
+    /// Under `queue_adapter :sidekiq`, the job's `retry_on` and
+    /// `discard_on` handlers in the order ActiveJob searches them: the
+    /// job's own, last declared first, then each ancestor's the same way.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub handlers: Vec<JobHandler>,
+    /// `self.retry_jitter =` on the job or a job ancestor, else the
+    /// app's `config.active_job.retry_jitter`.
+    #[serde(default)]
+    pub retry_jitter: f64,
+    /// Under `queue_adapter :sidekiq`, the job's `sidekiq_options`,
+    /// ancestors' first and a later key replacing an earlier one in
+    /// place: each key and its value as JSON text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sidekiq_options: Vec<(String, String)>,
 }
 
 impl JobPlan {
@@ -112,11 +169,14 @@ fn suffix(class_name: &str) -> String {
 /// synthesized `perform_later`), in name order.
 pub fn plan_jobs(app: &App, jobs: &BTreeSet<String>, wrapped: &BTreeSet<String>) -> Vec<JobPlan> {
     let sites = call_site_types(app, jobs);
+    let recurring_with_args: BTreeSet<String> = recurring_task_classes(app, true).into_iter().collect();
     let unattributed = unattributed_jobs(app, jobs);
     let sti = crate::lower::sti_scope::sti_bases(app);
+    let sidekiq = app.queue_adapter.as_deref() == Some("sidekiq");
     let mut plans = Vec::new();
     for name in wrapped {
-        let Some(lc) = app.library_classes.iter().find(|lc| lc.name.0.as_str() == name) else {
+        let Some(lc) = app.library_classes.iter().rev().find(|lc| lc.name.0.as_str() == name
+            && lc.methods.iter().any(|m| m.receiver == crate::dialect::MethodReceiver::Instance && m.name.as_str() == "perform")) else {
             continue;
         };
         let Some(perform) = lc.methods.iter().find(|m| {
@@ -128,6 +188,7 @@ pub fn plan_jobs(app: &App, jobs: &BTreeSet<String>, wrapped: &BTreeSet<String>)
         let discards = discards_deserialization_error(app, lc);
         let empty = Vec::new();
         let job_sites = sites.get(name).unwrap_or(&empty);
+        let recurring_args = recurring_with_args.contains(name);
         let planned = if unattributed.contains(name) || unattributed.contains("*") {
             Err(JobFallback {
                 param: None,
@@ -135,7 +196,7 @@ pub fn plan_jobs(app: &App, jobs: &BTreeSet<String>, wrapped: &BTreeSet<String>)
                     .to_string(),
             })
         } else {
-            plan_params(app, &sti, &perform.params, job_sites)
+            plan_params(app, &sti, &perform.params, job_sites, recurring_args)
         };
         let (params, fallback) = match planned {
             Ok(params) => (params, None),
@@ -148,20 +209,56 @@ pub fn plan_jobs(app: &App, jobs: &BTreeSet<String>, wrapped: &BTreeSet<String>)
             enqueue_after_commit: enqueues_after_commit(app, lc),
             params,
             fallback,
+            handlers: if sidekiq { handlers(app, lc) } else { Vec::new() },
+            retry_jitter: retry_jitter(app, lc),
+            sidekiq_options: if sidekiq { sidekiq_options(app, lc) } else { Vec::new() },
         });
     }
     plans
 }
 
-/// Each site is the argument types, in order; `None` for an argument
-/// whose type is unknown or which is a splat or a keyword hash.
-type Site = Vec<Option<Ty>>;
+/// One call site: the positional argument types, in order (`None` for an
+/// argument whose type is unknown or which is a splat or a Hash), and the
+/// keywords it passes by name.
+#[derive(Default)]
+struct Site {
+    args: Vec<Option<Ty>>,
+    keywords: Vec<(Symbol, Option<Ty>)>,
+}
 
 fn call_site_types(app: &App, jobs: &BTreeSet<String>) -> BTreeMap<String, Vec<Site>> {
     let mut out: BTreeMap<String, Vec<Site>> = BTreeMap::new();
     crate::lower::for_each_hook_body_ref(app, &mut |body| {
         collect_sites(body, jobs, &mut out);
     });
+    for job in recurring_task_classes(app, false) {
+        if jobs.contains(&job) {
+            out.entry(job).or_default().push(Site::default());
+        }
+    }
+    out
+}
+
+/// The `class:` tasks of `config/recurring.yml` that give `args:` or not: solid_queue's `RecurringTask` enqueues
+/// each with `perform_later(*arguments)`, so one without is a call site with no arguments; one with is a site whose
+/// argument types are not read.
+fn recurring_task_classes(app: &App, with_args: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    for source in app.sources.iter().filter(|s| s.path.ends_with("config/recurring.yml")) {
+        let Ok(doc) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&source.text) else { continue };
+        let Some(envs) = doc.as_mapping() else { continue };
+        for tasks in envs.values().filter_map(|v| v.as_mapping()) {
+            for task in tasks.values().filter_map(|v| v.as_mapping()) {
+                let get = |k: &str| task.get(serde_yaml_ng::Value::String(k.to_string()));
+                if get("args").is_some() != with_args {
+                    continue;
+                }
+                if let Some(class) = get("class").and_then(|c| c.as_str()) {
+                    out.push(class.trim_start_matches("::").to_string());
+                }
+            }
+        }
+    }
     out
 }
 
@@ -250,9 +347,25 @@ fn collect_sites(e: &Expr, jobs: &BTreeSet<String>, out: &mut BTreeMap<String, V
                 let name = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
                 if jobs.contains(&name) {
                     let skip = if method.as_str() == "perform_later_with" { 2 } else { 0 };
-                    let site = args
+                    let mut given: Vec<&Expr> = args.iter().skip(skip).collect();
+                    let mut site = Site::default();
+                    if let Some(last) = given.last()
+                        && let ExprNode::Hash { entries, kwargs: true } = &*last.node
+                    {
+                        let named: Option<Vec<(Symbol, Option<Ty>)>> = entries
+                            .iter()
+                            .map(|(k, v)| match &*k.node {
+                                ExprNode::Lit { value: Literal::Sym { value } } => Some((value.clone(), v.ty.clone())),
+                                _ => None,
+                            })
+                            .collect();
+                        if let Some(named) = named {
+                            site.keywords = named;
+                            given.pop();
+                        }
+                    }
+                    site.args = given
                         .iter()
-                        .skip(skip)
                         .map(|a| match &*a.node {
                             ExprNode::Splat { .. } | ExprNode::KeywordSplat { .. } => None,
                             ExprNode::Hash { .. } => None,
@@ -272,6 +385,7 @@ fn plan_params(
     sti: &crate::det::HashMap<ClassId, ClassId>,
     params: &[crate::dialect::Param],
     sites: &[Site],
+    recurring_args: bool,
 ) -> Result<Vec<JobParam>, JobFallback> {
     let gap = |param: Option<&Symbol>, reason: String| JobFallback { param: param.cloned(), reason };
     if params.is_empty() {
@@ -280,52 +394,117 @@ fn plan_params(
     if sites.is_empty() {
         return Err(gap(None, "no call site types its arguments".to_string()));
     }
-    let rest_at = params.iter().position(|p| p.rest);
-    if rest_at.is_some_and(|k| k != params.len() - 1) {
+    let positional: Vec<&crate::dialect::Param> = params.iter().filter(|p| !p.keyword).collect();
+    let keywords: Vec<&crate::dialect::Param> = params.iter().filter(|p| p.keyword).collect();
+    let rest_at = positional.iter().position(|p| p.rest);
+    if rest_at.is_some_and(|k| k != positional.len() - 1) {
         return Err(gap(None, "a rest parameter that is not last".to_string()));
     }
-    let fixed = rest_at.unwrap_or(params.len());
-    let mut out = Vec::new();
-    for (i, p) in params.iter().enumerate() {
-        if p.keyword || p.forwarding {
-            return Err(gap(Some(&p.name), "keyword or forwarding parameter".to_string()));
+    // Not a rest beside keywords: the rest readers run to the end of the list, where the keyword Hash sits.
+    if rest_at.is_some() && !keywords.is_empty() {
+        return Err(gap(None, "a rest parameter beside keyword parameters".to_string()));
+    }
+    if let Some(p) = params.iter().find(|p| p.forwarding || (p.keyword && p.rest)) {
+        return Err(gap(Some(&p.name), "keyword rest or forwarding parameter".to_string()));
+    }
+    for site in sites {
+        if let Some((name, _)) = site.keywords.iter().find(|(n, _)| !keywords.iter().any(|k| &k.name == n)) {
+            return Err(gap(Some(name), "a call site passes a keyword perform does not take".to_string()));
         }
+    }
+    let fixed = rest_at.unwrap_or(positional.len());
+    let mut out = Vec::new();
+    let mut join_codec = |p: &crate::dialect::Param, codec: Option<Codec>, ty: &Ty| -> Result<Option<Codec>, JobFallback> {
+        let Some(c) = codec_of(app, sti, ty) else {
+            return Err(gap(Some(&p.name), format!("no codec for `{}`", describe(ty))));
+        };
+        Ok(Some(match codec {
+            None => c,
+            Some(prev) => join(prev, c).ok_or_else(|| gap(Some(&p.name), "call sites disagree on its type".to_string()))?,
+        }))
+    };
+    for (i, p) in positional.iter().enumerate() {
         let mut codec: Option<Codec> = None;
         for site in sites {
-            if rest_at.is_none() && site.len() != params.len() {
+            if rest_at.is_none() && site.args.len() != positional.len() {
                 return Err(gap(Some(&p.name), "a call site passes a different number of arguments".to_string()));
             }
-            if site.len() < fixed {
+            if site.args.len() < fixed {
                 return Err(gap(Some(&p.name), "a call site passes too few arguments".to_string()));
             }
-            let slots: Vec<&Option<Ty>> = if p.rest { site[i..].iter().collect() } else { vec![&site[i]] };
+            let slots: Vec<&Option<Ty>> = if p.rest { site.args[i..].iter().collect() } else { vec![&site.args[i]] };
             for slot in slots {
                 let Some(ty) = slot else {
                     return Err(gap(Some(&p.name), "an argument's type is unknown".to_string()));
                 };
-                let Some(c) = codec_of(app, sti, ty) else {
-                    return Err(gap(Some(&p.name), format!("no codec for `{}`", describe(ty))));
-                };
-                codec = match codec.take() {
-                    None => Some(c),
-                    Some(prev) => match join(prev, c) {
-                        Some(j) => Some(j),
-                        None => {
-                            return Err(gap(Some(&p.name), "call sites disagree on its type".to_string()));
-                        }
-                    },
-                };
+                codec = join_codec(p, codec, ty)?;
             }
         }
-        let Some(codec) = codec else {
-            return Err(gap(Some(&p.name), "no call site passes it".to_string()));
+        // A rest no call site passes anything to is always empty: no element is ever written or read back, so any
+        // element codec reads it alike (a recurring `class:` task with no `args:`). Not when a task gives `args:`,
+        // whose values would go through that codec.
+        let codec = match codec {
+            Some(codec) => codec,
+            None if p.rest && !recurring_args => Codec::Str,
+            None => return Err(gap(Some(&p.name), "no call site passes it".to_string())),
         };
         if p.rest && matches!(codec, Codec::NullableRecord { .. }) {
             return Err(gap(Some(&p.name), "a rest parameter of nullable records".to_string()));
         }
-        out.push(JobParam { name: p.name.clone(), rest: p.rest, codec });
+        out.push(JobParam { name: p.name.clone(), rest: p.rest, keyword: false, default: None, codec });
+    }
+    for p in &keywords {
+        let mut codec: Option<Codec> = None;
+        for site in sites {
+            match site.keywords.iter().find(|(n, _)| n == &p.name) {
+                Some((_, Some(ty))) => codec = join_codec(p, codec, ty)?,
+                Some((_, None)) => return Err(gap(Some(&p.name), "an argument's type is unknown".to_string())),
+                None if p.default.is_none() => return Err(gap(Some(&p.name), "a call site omits a required keyword".to_string())),
+                None => {}
+            }
+        }
+        // Not a `nil` default's type: a value equal to the default is never written (`keywords_expr`), so `note: nil` needs no codec for nil.
+        if let Some(ty) = p.default.as_ref().and_then(|d| d.ty.as_ref()).filter(|t| !matches!(t, Ty::Nil)) {
+            codec = join_codec(p, codec, ty)?;
+        }
+        let Some(codec) = codec else {
+            return Err(gap(Some(&p.name), "no call site passes it".to_string()));
+        };
+        // Not a default that is no literal: the payload reader would evaluate it outside `perform`, where it may read what only `perform` sees.
+        let default = match p.default.as_ref() {
+            None => None,
+            Some(d) => Some(literal_ruby(app, d).ok_or_else(|| gap(Some(&p.name), "a keyword default that is not a literal".to_string()))?),
+        };
+        out.push(JobParam { name: p.name.clone(), rest: false, keyword: true, default, codec });
     }
     Ok(out)
+}
+
+fn literal_ruby(app: &App, e: &Expr) -> Option<String> {
+    let frozen = !matches!(e.hint(), Some(crate::expr::IrHint::MutableStringLiteral))
+        && (e.span.file.0 as usize)
+            .checked_sub(1)
+            .and_then(|i| app.sources.get(i))
+            .is_some_and(|f| crate::ingest::expr::freezes_literals(&f.text));
+    match &*e.node {
+        ExprNode::Lit { value } => match value {
+            Literal::Nil => Some("nil".to_string()),
+            Literal::Bool { value } => Some(value.to_string()),
+            Literal::Int { value } => Some(value.to_string()),
+            Literal::Float { value } if value.is_finite() => Some(format!("{value:?}")),
+            // Not a bare `"…"` unless the job's own file freezes its literals: the registry does, and elsewhere Ruby hands the job a String it may append to.
+            Literal::Str { value } if frozen => Some(ruby_str(value)),
+            Literal::Str { value } => Some(format!("+{}", ruby_str(value))),
+            Literal::Sym { value }
+                if value.as_str().chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                    && value.as_str().chars().all(|c| c.is_ascii_alphanumeric() || c == '_') =>
+            {
+                Some(format!(":{}", value.as_str()))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn describe(ty: &Ty) -> String {
@@ -433,7 +612,7 @@ fn join(a: Codec, b: Codec) -> Option<Codec> {
 
 /// `queue_as :name` in the job's class body or a job ancestor's,
 /// nearest first; "default" when none says.
-fn queue_name(app: &App, lc: &LibraryClass) -> String {
+pub(super) fn queue_name(app: &App, lc: &LibraryClass) -> String {
     for class in ancestry(app, lc) {
         for call in &class.unknown_calls {
             let ExprNode::Send { recv: None, method, args, .. } = &*call.node else { continue };
@@ -496,15 +675,322 @@ fn is_literal_queue_as(call: &Expr) -> bool {
         && matches!(&*args[0].node, ExprNode::Lit { value: Literal::Sym { .. } | Literal::Str { .. } })
 }
 
+/// The exception classes `rescue` can name in an emitted tree without
+/// the app defining them.
+const RUNTIME_EXCEPTIONS: &[&str] = &[
+    "StandardError",
+    "RuntimeError",
+    "ArgumentError",
+    "ActiveJob::DeserializationError",
+    "ActiveRecord::RecordNotFound",
+    "ActiveRecord::RecordInvalid",
+];
+
+fn handlers(app: &App, lc: &LibraryClass) -> Vec<JobHandler> {
+    let mut out = Vec::new();
+    for class in ancestry(app, lc) {
+        for call in class.unknown_calls.iter().rev() {
+            if let Some(h) = handler_literal(app, class, call) {
+                out.push(h);
+            }
+        }
+    }
+    out
+}
+
+/// A `retry_on` or `discard_on` the runtime can carry.
+fn handler_literal(app: &App, owner: &LibraryClass, call: &Expr) -> Option<JobHandler> {
+    handler_form(app, owner, call)?.ok()
+}
+
+/// `None` for a call that is neither `retry_on` nor `discard_on`; else
+/// the handler, or why the runtime can't carry it: a block, an option
+/// that isn't literal or isn't known, or an exception class the emitted
+/// tree doesn't define. Under `:sidekiq` that is an error
+/// ([`handler_diagnostics`]): the job would behave differently in
+/// production.
+fn handler_form(app: &App, owner: &LibraryClass, call: &Expr) -> Option<Result<JobHandler, String>> {
+    let ExprNode::Send { recv: None, method, args, block, .. } = &*call.node else { return None };
+    let retry = match method.as_str() {
+        "retry_on" => true,
+        "discard_on" => false,
+        _ => return None,
+    };
+    Some(handler_parts(app, owner, method.as_str(), retry, args, block.is_some()))
+}
+
+fn handler_parts(
+    app: &App,
+    owner: &LibraryClass,
+    method: &str,
+    retry: bool,
+    args: &[Expr],
+    block: bool,
+) -> Result<JobHandler, String> {
+    if block {
+        return Err(format!("a block on `{method}` isn't supported"));
+    }
+    let (opts, classes): (&[(Expr, Expr)], &[Expr]) = match args.split_last() {
+        Some((last, rest)) => match &*last.node {
+            ExprNode::Hash { entries, .. } => (entries.as_slice(), rest),
+            _ => (&[], args),
+        },
+        None => (&[], args),
+    };
+    if classes.is_empty() {
+        return Err(format!("`{method}` names no exception class"));
+    }
+    let mut exceptions = Vec::new();
+    for c in classes {
+        exceptions.push(exception_class(app, owner, c).ok_or_else(|| match &*c.node {
+            ExprNode::Const { path } => format!(
+                "`{}` isn't an exception class the emitted app defines",
+                path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::")
+            ),
+            _ => format!("`{method}`'s exception classes must be constants"),
+        })?);
+    }
+    let mut wait = RetryWait::Seconds(3.0);
+    let mut attempts = 5;
+    let mut queue = String::new();
+    let mut priority = None;
+    let mut jitter = None;
+    for (k, v) in opts {
+        let ExprNode::Lit { value: Literal::Sym { value: key } } = &*k.node else {
+            return Err(format!("`{method}`'s options must have Symbol keys"));
+        };
+        let key = key.as_str();
+        let not_literal = || format!("`{method}`'s `{key}:` isn't a literal");
+        // `report: true` sends the error to Rails.error before the retry
+        // or discard; the worker has no error reporter to send it to.
+        if key == "report" {
+            match &*v.node {
+                ExprNode::Lit { value: Literal::Bool { value: false } } => continue,
+                ExprNode::Lit { value: Literal::Bool { value: true } } => {
+                    return Err(format!("`{method}`'s `report: true` isn't supported: the worker has no error reporter"));
+                }
+                _ => return Err(not_literal()),
+            }
+        }
+        if !retry {
+            return Err(format!("`discard_on`'s `{key}:` isn't supported"));
+        }
+        match key {
+            "wait" => {
+                wait = match &*v.node {
+                    ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "polynomially_longer" => {
+                        RetryWait::PolynomiallyLonger
+                    }
+                    ExprNode::Lit { value: Literal::Float { value } } => RetryWait::Seconds(*value),
+                    _ => RetryWait::Seconds(super::duration::literal_seconds(v).ok_or_else(not_literal)? as f64),
+                }
+            }
+            "attempts" => {
+                attempts = match &*v.node {
+                    ExprNode::Lit { value: Literal::Int { value } } if *value > 0 => *value,
+                    ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "unlimited" => 0,
+                    _ => return Err(not_literal()),
+                }
+            }
+            "queue" => {
+                queue = match &*v.node {
+                    ExprNode::Lit { value: Literal::Sym { value } } => value.as_str().to_string(),
+                    ExprNode::Lit { value: Literal::Str { value } } => value.clone(),
+                    _ => return Err(not_literal()),
+                }
+            }
+            "priority" => {
+                let ExprNode::Lit { value: Literal::Int { value } } = &*v.node else { return Err(not_literal()) };
+                priority = Some(*value);
+            }
+            "jitter" => jitter = Some(literal_number(v).ok_or_else(not_literal)?),
+            _ => return Err(format!("`retry_on`'s `{key}:` isn't supported")),
+        }
+    }
+    Ok(if retry {
+        JobHandler::Retry { exceptions, wait, attempts, queue, priority, jitter }
+    } else {
+        JobHandler::Discard { exceptions }
+    })
+}
+
+/// Under `:sidekiq`, an error for each `retry_on` or `discard_on` a
+/// payload job (or an ancestor of one) declares that the runtime can't
+/// carry, at its call. Each class once.
+pub fn handler_diagnostics(app: &App) -> Vec<crate::diagnostic::Diagnostic> {
+    let mut out = Vec::new();
+    if app.queue_adapter.as_deref() != Some("sidekiq") {
+        return out;
+    }
+    for lc in &app.library_classes {
+        if !used_by_payload_jobs(app, lc) {
+            continue;
+        }
+        for call in &lc.unknown_calls {
+            let Some(Err(reason)) = handler_form(app, lc, call) else { continue };
+            let mut d = crate::lower::residue_diagnostic(
+                "job_payload",
+                "job-handler-unsupported",
+                call.span,
+                "handler not carried",
+                format!(
+                    "job_payload: `{}`: {reason}; under queue_adapter :sidekiq the job would behave \
+                     differently in production",
+                    lc.name.0.as_str()
+                ),
+            );
+            d.severity = crate::diagnostic::Severity::Error;
+            out.push(d);
+        }
+    }
+    out
+}
+
+/// Whether `lc` is a payload job or an ancestor of one.
+fn used_by_payload_jobs(app: &App, lc: &LibraryClass) -> bool {
+    app.job_plans.iter().filter(|p| p.is_payload()).any(|p| {
+        p.job == lc.name.0.as_str()
+            || app
+                .library_classes
+                .iter()
+                .find(|c| c.name.0.as_str() == p.job)
+                .is_some_and(|c| ancestry(app, c).iter().any(|a| a.name == lc.name))
+    })
+}
+
+/// The exception class a handler names, as written, when the emitted
+/// tree defines it: one of the app's classes (looked up from the
+/// handler's class outward, as Ruby resolves a constant) or one the
+/// runtime raises.
+fn exception_class(app: &App, owner: &LibraryClass, e: &Expr) -> Option<String> {
+    let ExprNode::Const { path } = &*e.node else { return None };
+    let name = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+    let rooted = name.starts_with("::");
+    let name = name.trim_start_matches("::").to_string();
+    // Ruby's lexical lookup: the job's own namespace first (a class
+    // declared inside the job), then each enclosing one, then the top;
+    // a rooted `::Name` names the top-level class only. An app class
+    // shadows a runtime one of the same name, so those come last.
+    let mut scope: Vec<&str> =
+        if rooted { Vec::new() } else { owner.name.0.as_str().split("::").collect() };
+    loop {
+        let candidate =
+            if scope.is_empty() { name.clone() } else { format!("{}::{}", scope.join("::"), name) };
+        if app.library_classes.iter().any(|c| c.name.0.as_str() == candidate) {
+            return Some(candidate);
+        }
+        if scope.is_empty() {
+            return RUNTIME_EXCEPTIONS.contains(&name.as_str()).then_some(name);
+        }
+        scope.pop();
+    }
+}
+
+fn literal_number(e: &Expr) -> Option<f64> {
+    match &*e.node {
+        ExprNode::Lit { value: Literal::Float { value } } => Some(*value),
+        ExprNode::Lit { value: Literal::Int { value } } => Some(*value as f64),
+        _ => None,
+    }
+}
+
+/// `self.retry_jitter = <number>`, nearest class first and the last
+/// assignment in a class winning; else the app's.
+fn retry_jitter(app: &App, lc: &LibraryClass) -> f64 {
+    for class in ancestry(app, lc) {
+        for call in class.unknown_calls.iter().rev() {
+            if let Some(v) = retry_jitter_literal(call) {
+                return v;
+            }
+        }
+    }
+    app.active_job_retry_jitter
+}
+
+fn retry_jitter_literal(call: &Expr) -> Option<f64> {
+    let ExprNode::Send { method, args, .. } = &*call.node else { return None };
+    if method.as_str() != "retry_jitter=" || args.len() != 1 {
+        return None;
+    }
+    literal_number(&args[0])
+}
+
+/// The `sidekiq_options` keys Sidekiq's retry rules read, which the
+/// worker honors. `queue` is left out: the ActiveJob queue wins over it.
+const SIDEKIQ_OPTION_KEYS: &[&str] = &["retry", "retry_queue", "retry_for", "dead"];
+
+fn sidekiq_options(app: &App, lc: &LibraryClass) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for class in ancestry(app, lc).iter().rev() {
+        for call in &class.unknown_calls {
+            for (k, v) in sidekiq_options_literal(call).map(|(pairs, _)| pairs).unwrap_or_default() {
+                match out.iter_mut().find(|(key, _)| *key == k) {
+                    Some(slot) => slot.1 = v,
+                    None => out.push((k, v)),
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A `sidekiq_options` with literal keys and values: each key the worker
+/// honors and its value as JSON text, and whether those are all its keys.
+/// The honored keys are carried even beside others (`queue:`, `tags:`);
+/// the call then stays on the dropped ledger for the rest.
+fn sidekiq_options_literal(call: &Expr) -> Option<(Vec<(String, String)>, bool)> {
+    let ExprNode::Send { recv: None, method, args, block: None, .. } = &*call.node else { return None };
+    if method.as_str() != "sidekiq_options" {
+        return None;
+    }
+    let [opts] = args.as_slice() else { return None };
+    let ExprNode::Hash { entries, .. } = &*opts.node else { return None };
+    let mut out = Vec::new();
+    let mut all = true;
+    for (k, v) in entries {
+        let key = match &*k.node {
+            ExprNode::Lit { value: Literal::Sym { value } } => value.as_str().to_string(),
+            ExprNode::Lit { value: Literal::Str { value } } => value.clone(),
+            _ => return None,
+        };
+        if !SIDEKIQ_OPTION_KEYS.contains(&key.as_str()) {
+            all = false;
+            continue;
+        }
+        let json = match &*v.node {
+            ExprNode::Lit { value: Literal::Bool { value } } => value.to_string(),
+            ExprNode::Lit { value: Literal::Int { value } } => value.to_string(),
+            ExprNode::Lit { value: Literal::Sym { value } } => json_str(value.as_str()),
+            ExprNode::Lit { value: Literal::Str { value } } => json_str(value),
+            _ => return None,
+        };
+        out.push((key, json));
+    }
+    Some((out, all))
+}
+
+fn json_str(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
+}
+
 /// Whether a class-body call of a job is carried by the payload plan
-/// rather than dropped: a literal `queue_as`, or `discard_on
-/// ActiveJob::DeserializationError`, on a job that has a payload — or on
+/// rather than dropped: a literal `queue_as`, `discard_on
+/// ActiveJob::DeserializationError` or `retry_jitter`, and under
+/// `:sidekiq` a `retry_on`, `discard_on` or `sidekiq_options` the plan
+/// carries, on a job that has a payload — or on
 /// an ancestor (`ApplicationJob`) every one of whose job descendants
 /// does. The Ruby emitter skips its "dropped" ledger line for these.
 pub fn modelled_class_body_call(app: &App, lc: &LibraryClass, call: &Expr) -> bool {
+    let sidekiq = app.queue_adapter.as_deref() == Some("sidekiq");
+    // A handler the runtime can't carry is an error under `:sidekiq`
+    // (`handler_diagnostics`), not a dropped call as well.
+    let carried_by_sidekiq =
+        sidekiq && (handler_form(app, lc, call).is_some() || sidekiq_options_literal(call).is_some_and(|(_, all)| all));
     if !is_literal_queue_as(call)
         && !is_discard_on_deserialization(call)
         && enqueue_after_commit_literal(call).is_none()
+        && retry_jitter_literal(call).is_none()
+        && !carried_by_sidekiq
     {
         return false;
     }
@@ -529,7 +1015,8 @@ fn ancestry<'a>(app: &'a App, lc: &'a LibraryClass) -> Vec<&'a LibraryClass> {
     let mut out = vec![lc];
     let mut cursor = lc.parent.clone();
     while let Some(p) = cursor {
-        if out.len() > 8 {
+        // A cycle in the ingested parents ends the walk.
+        if out.iter().any(|c| c.name == p) {
             break;
         }
         let Some(parent) = app.library_classes.iter().find(|c| c.name == p) else { break };
@@ -542,19 +1029,29 @@ fn ancestry<'a>(app: &'a App, lc: &'a LibraryClass) -> Vec<&'a LibraryClass> {
 // ---- The Ruby-family rewrite ----------------------------------------
 
 /// Rewrite each payload job's enqueue arm, and ledger the jobs that keep
-/// their Proc.
+/// their Proc and, under `:sidekiq`, the handlers the runtime can't carry.
 pub fn apply_ruby(lcs: &mut [LibraryClass], app: &App) {
     let sidekiq = app.queue_adapter.as_deref() == Some("sidekiq");
+    let solid_queue = app.queue_adapter.as_deref() == Some("solid_queue");
+    let durable = if sidekiq || (solid_queue && app.models.iter().any(|m| m.name.0.as_str() == "SolidQueue::Job")) {
+        app.queue_adapter.as_deref()
+    } else {
+        None
+    };
+    for d in handler_diagnostics(app) {
+        crate::emit::diagnostics::push(d);
+    }
     for lc in lcs.iter_mut() {
         let own_name = lc.name.0.as_str().to_string();
+        if matches!(job_adapter(app, &own_name).as_deref(), Some("inline" | "test")) { continue; }
         let Some(plan) = app.job_plans.iter().find(|p| p.job == own_name) else { continue };
-        if sidekiq && plan.is_payload() {
+        if (sidekiq || solid_queue) && plan.is_payload() {
             if let Some(with) = lc.methods.iter_mut().find(|m| {
                 m.receiver == crate::dialect::MethodReceiver::Class && m.name.as_str() == "perform_later_with"
             }) {
                 let span = with.name_span;
                 let (lead, args) = wrapper_vars(with, 2);
-                if !rewrite_enqueue(&mut with.body, plan, args, Some(lead)) {
+                if !rewrite_enqueue(&mut with.body, plan, args, sidekiq.then_some(lead)) {
                     crate::emit::diagnostics::push(fallback_diagnostic(
                         plan,
                         &JobFallback {
@@ -563,7 +1060,7 @@ pub fn apply_ruby(lcs: &mut [LibraryClass], app: &App) {
                                 .to_string(),
                         },
                         span,
-                        sidekiq,
+                        durable,
                     ));
                 }
             }
@@ -575,7 +1072,13 @@ pub fn apply_ruby(lcs: &mut [LibraryClass], app: &App) {
         };
         let span = wrapper.name_span;
         if let Some(f) = &plan.fallback {
-            crate::emit::diagnostics::push(fallback_diagnostic(plan, f, span, sidekiq));
+            let mut spans = if durable.is_some() { fallback_spans(app, plan) } else { vec![span] };
+            // An unused wrapper (including a perform_now-only job) needs no payload.
+            let durable = durable.filter(|_| sidekiq || !spans.is_empty());
+            if spans.is_empty() { spans.push(span); }
+            for span in spans {
+                crate::emit::diagnostics::push(fallback_diagnostic(plan, f, span, durable));
+            }
             continue;
         }
         let (_, args) = wrapper_vars(wrapper, 0);
@@ -595,10 +1098,91 @@ pub fn apply_ruby(lcs: &mut [LibraryClass], app: &App) {
                     reason: "the generated perform_later is not the shape this pass rewrites".to_string(),
                 },
                 span,
-                sidekiq,
+                durable,
             ));
         }
     }
+}
+
+/// Point at actual enqueues and recurring task class declarations.
+fn fallback_spans(app: &App, plan: &JobPlan) -> Vec<crate::span::Span> {
+    use crate::span::{FileId, Span};
+    use yaml_rust2::parser::{Event, Parser};
+    fn visit(e: &Expr, job: &str, owner: Option<&str>, spans: &mut Vec<Span>) {
+        if let ExprNode::Send { recv, method, args, .. } = &*e.node {
+            let reflected = matches!(method.as_str(), "send" | "public_send" | "__send__");
+            let method = if reflected { args.first().and_then(|a| match &*a.node {
+                ExprNode::Lit { value: Literal::Sym { value } } => Some(value.as_str()),
+                ExprNode::Lit { value: Literal::Str { value } } => Some(value.as_str()),
+                _ => None,
+            }) } else { Some(method.as_str()) };
+            let receiver = match recv.as_ref().map(|r| &*r.node) {
+                Some(ExprNode::Const { path }) => path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::").trim_start_matches("::") == job,
+                None | Some(ExprNode::SelfRef) => owner == Some(job),
+                // An unknown class receiver already makes every possible job's plan conservative.
+                Some(_) => true,
+            };
+            if receiver && matches!(method, Some("perform_later" | "perform_later_with")) { spans.push(e.span); }
+        }
+        e.node.for_each_child(&mut |c| visit(c, job, owner, spans));
+    }
+    let mut spans = Vec::new();
+    crate::lower::for_each_hook_body_ref(app, &mut |body| visit(body, &plan.job, None, &mut spans));
+    for lc in &app.library_classes {
+        for m in &lc.methods { visit(&m.body, &plan.job, Some(lc.name.0.as_str()), &mut spans); }
+    }
+    for (i, source) in app.sources.iter().enumerate().filter(|(_, s)| s.path.ends_with("config/recurring.yml")) {
+        let mut parser = Parser::new_from_str(&source.text);
+        // A recurring class is a value in the task mapping, never inside args.
+        // None denotes a sequence; Some(key) a mapping awaiting a key/value.
+        let mut stack: Vec<Option<Option<String>>> = Vec::new();
+        while let Ok((event, marker)) = parser.next_token() {
+            if event == Event::StreamEnd { break; }
+            if matches!(event, Event::MappingStart(..) | Event::SequenceStart(..)) {
+                stack.push(if matches!(event, Event::MappingStart(..)) { Some(None) } else { None });
+            } else if matches!(event, Event::MappingEnd | Event::SequenceEnd) {
+                stack.pop();
+                if let Some(Some(key)) = stack.last_mut() { *key = None; }
+            } else if let Event::Alias(..) = event {
+                if let Some(Some(key)) = stack.last_mut() { *key = None; }
+            } else if let Event::Scalar(value, ..) = &event {
+                if stack.len() == 3 && stack.last() == Some(&Some(Some("class".into()))) && value.trim_start_matches("::") == plan.job {
+                    let line = source.text.split_inclusive('\n').take(marker.line() - 1).map(str::len).sum::<usize>();
+                    let start = line + source.text[line..].char_indices().nth(marker.col()).map_or(0, |(i, _)| i);
+                    spans.push(Span { file: FileId(i as u32 + 1), start: start as u32, end: (start + value.len()) as u32 });
+                }
+                if let Some(Some(key)) = stack.last_mut() { *key = if key.is_none() { Some(value.clone()) } else { None }; }
+            }
+        }
+    }
+    spans.sort_by_key(|s| (s.file.0, s.start, s.end));
+    spans.dedup();
+    spans
+}
+
+/// A literal adapter set on this exact job, across its reopenings.
+pub(super) fn job_adapter(app: &App, name: &str) -> Option<String> {
+    for lc in app.library_classes.iter().rev().filter(|lc| lc.name.0.as_str() == name) {
+        for call in lc.unknown_calls.iter().rev() {
+            if let ExprNode::Send { recv: Some(recv), method, args, .. } = &*call.node
+                && method.as_str() == "queue_adapter=" && args.len() == 1 {
+                let own = match &*recv.node {
+                    ExprNode::SelfRef => true,
+                    // The class Ruby looks it up to from this body (`ingest::written_names`).
+                    ExprNode::Const { path } => path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::").trim_start_matches("::") == name,
+                    _ => false,
+                };
+                if !own { continue; }
+                let value = &args[0];
+                return match &*value.node {
+                    ExprNode::Lit { value: Literal::Sym { value } } => Some(value.as_str().into()),
+                    ExprNode::Lit { value: Literal::Str { value } } => Some(value.clone()),
+                    _ => None,
+                };
+            }
+        }
+    }
+    None
 }
 
 /// A wrapper's parameters as typed reads: the first `lead` of them, then
@@ -614,7 +1198,7 @@ fn wrapper_vars(wrapper: &crate::dialect::MethodDef, lead: usize) -> (Vec<Expr>,
                 ExprNode::Var { id: crate::ident::VarId(i as u32), name: p.name.clone() },
             );
             v.ty = match &wrapper.signature {
-                Some(Ty::Fn { params, .. }) => params.get(i).map(|tp| (*tp.ty).clone()),
+                Some(Ty::Fn(fn_ty)) => fn_ty.params.get(i).map(|tp| (*tp.ty).clone()),
                 _ => None,
             };
             v
@@ -628,27 +1212,28 @@ fn wrapper_vars(wrapper: &crate::dialect::MethodDef, lead: usize) -> (Vec<Expr>,
 }
 
 /// The ledger line for a job that keeps its Proc. Under `queue_adapter
-/// :sidekiq` it is an error: a Proc can't be pushed to Redis, so the job
-/// would silently run in process instead of where the app sends it.
+/// :sidekiq` or the SQL-backed Solid Queue runner it is an error: a Proc
+/// cannot reach the durable store that drains the app's jobs.
 fn fallback_diagnostic(
     plan: &JobPlan,
     f: &JobFallback,
     span: crate::span::Span,
-    sidekiq: bool,
+    durable: Option<&str>,
 ) -> crate::diagnostic::Diagnostic {
     let what = match &f.param {
         Some(p) => format!("`{}`'s parameter `{}`: {}", plan.job, p.as_str(), f.reason),
         None => format!("`{}`: {}", plan.job, f.reason),
     };
-    if sidekiq {
+    if let Some(adapter) = durable {
+        let store = if adapter == "sidekiq" { "Redis" } else { "solid_queue_jobs" };
         let mut d = crate::lower::residue_diagnostic(
             "job_payload",
             "job-closure-fallback",
             span,
             "argument not serializable",
             format!(
-                "job_payload: {what}; under queue_adapter :sidekiq the job must be pushed to Redis \
-                 as an ActiveJob payload, and a closure can't be"
+                "job_payload: {what}; under queue_adapter :{adapter} the job must be stored in {store} \
+                 as an ActiveJob payload; a closure cannot be stored there"
             ),
         );
         d.severity = crate::diagnostic::Severity::Error;
@@ -663,7 +1248,7 @@ fn fallback_diagnostic(
     )
 }
 
-/// Find `ActiveJob.enqueue(<lambda>)` in the wrapper `job_class_side`
+/// Find `ActiveJob.enqueue_on(<queue>, <lambda>)` in the wrapper `job_class_side`
 /// writes — `if !ActiveJob.enqueue_only; if ActiveJob.drain_registered;
 /// <here> else <inline> end else <hold> end` — and replace it. The shape
 /// is a contract with that pass; anything else is left alone and
@@ -681,10 +1266,15 @@ fn rewrite_enqueue(body: &mut Expr, plan: &JobPlan, args: Vec<Expr>, sidekiq: Op
         if !is_active_job_call(cond, "drain_registered") {
             continue;
         }
-        if !is_active_job_call(enqueue, "enqueue") {
+        if !is_active_job_call(enqueue, "enqueue_on") {
             continue;
         }
         let span = enqueue.span;
+        let queue = match &*enqueue.node {
+            ExprNode::Send { args, .. } => args.first().cloned(),
+            _ => None,
+        };
+        let Some(queue) = queue else { continue };
         if let Some(mut push_args) = sidekiq {
             push_args.extend(args);
             let mut call = Expr::new(
@@ -719,11 +1309,11 @@ fn rewrite_enqueue(body: &mut Expr, plan: &JobPlan, args: Vec<Expr>, sidekiq: Op
                 // `enqueue_payload_after_commit` holds it while a
                 // transaction is open (`runtime/job_registry.rb`).
                 method: Symbol::from(if plan.enqueue_after_commit {
-                    "enqueue_payload_after_commit"
+                    "enqueue_payload_after_commit_on"
                 } else {
-                    "enqueue_payload"
+                    "enqueue_payload_on"
                 }),
-                args: vec![payload],
+                args: vec![queue, payload],
                 block: None,
                 parenthesized: true,
             },
@@ -804,12 +1394,16 @@ pub fn push_model_to_gid_uri(methods: &mut Vec<crate::dialect::MethodDef>, model
 /// one writer per fixed parameter, and a rest parameter's elements
 /// appended, as Rails flattens a splat.
 fn arguments_list(plan: &JobPlan) -> String {
-    let fixed: Vec<String> = plan
+    let mut fixed: Vec<String> = plan
         .params
         .iter()
-        .filter(|p| !p.rest)
+        .filter(|p| !p.rest && !p.keyword)
         .map(|p| write_expr(&p.codec, p.name.as_str()))
         .collect();
+    let keywords: Vec<&JobParam> = plan.params.iter().filter(|p| p.keyword).collect();
+    if !keywords.is_empty() {
+        fixed.push(keywords_expr(&keywords));
+    }
     let mut list = format!("[{}]", fixed.join(", "));
     if let Some(rest) = plan.params.iter().find(|p| p.rest) {
         let elems = format!("{}.map {{ |a| {} }}", rest.name.as_str(), write_expr(&rest.codec, "a"));
@@ -818,19 +1412,66 @@ fn arguments_list(plan: &JobPlan) -> String {
     list
 }
 
+/// The keywords as the one trailing Hash ActiveJob writes for them,
+/// `{"count":2,"_aj_ruby2_keywords":["count"]}`: the names and the
+/// values' JSON, each name "" (left out) for an optional keyword whose
+/// value is its default. With every one left out there is no Hash, as
+/// Rails writes none for a call without keywords; the reader's
+/// `keyword_given?` then answers false and `perform` binds the default.
+fn keywords_expr(keywords: &[&JobParam]) -> String {
+    let mut names = Vec::new();
+    let mut values = Vec::new();
+    for p in keywords {
+        let name = ruby_str(p.name.as_str());
+        let value = write_expr(&p.codec, p.name.as_str());
+        match &p.default {
+            Some(d) => {
+                let at_default = format!("{} == {d}", p.name.as_str());
+                names.push(format!("({at_default} ? \"\" : {name})"));
+                values.push(format!("({at_default} ? \"\" : {value})"));
+            }
+            None => {
+                names.push(name);
+                values.push(value);
+            }
+        }
+    }
+    format!("ActiveJob::Arguments.keywords([{}], [{}])", names.join(", "), values.join(", "))
+}
+
 /// The text between the `job-registry` markers in
 /// `runtime/job_registry.rb`: the payload writers, `perform`,
-/// `discards_deserialization_error`, and the record locators. Valid
-/// Ruby for an app with no payload jobs too: `perform` answers false
-/// and nothing else is written.
+/// `discards_deserialization_error`, the handler table and push options
+/// ([`retry_source`]), and the record locators. Valid Ruby for an app
+/// with no payload jobs too: `perform` answers false and the rest their
+/// defaults.
 ///
 /// With `sidekiq` (the app is on `queue_adapter :sidekiq`), each payload
 /// job also gets `push_<job>(queue, at, args)`, which the job's
 /// `perform_later` calls instead of queueing in process: the payload,
 /// with `scheduled_at` when `at` is set, handed to `SidekiqPush`.
 pub fn registry_source(plans: &[JobPlan], sidekiq: bool) -> String {
+    registry_source_with_broadcasts(plans, sidekiq, &[])
+}
+
+/// [`registry_source`], with the `Turbo::Streams::ActionBroadcastJob`
+/// half (`lower::broadcast_job`) for the models whose `broadcasts_to`
+/// enqueues it: its push, its `perform` arm, and its place in the
+/// discard table (the job says `discard_on ActiveJob::DeserializationError`).
+pub fn registry_source_with_broadcasts(
+    plans: &[JobPlan],
+    sidekiq: bool,
+    broadcasts: &[crate::lower::broadcast_job::BroadcastModel],
+) -> String {
+    let broadcasts = if sidekiq { broadcasts } else { &[] };
     let payload: Vec<&JobPlan> = plans.iter().filter(|p| p.is_payload()).collect();
     let mut s = String::new();
+    let turbo = crate::lower::broadcast_job::JOB_CLASS;
+    let turbo_source = crate::lower::broadcast_job::registry_source(broadcasts);
+    if !turbo_source.is_empty() {
+        s.push_str(&turbo_source);
+        s.push('\n');
+    }
 
     for plan in &payload {
         let list = arguments_list(plan);
@@ -864,16 +1505,27 @@ pub fn registry_source(plans: &[JobPlan], sidekiq: bool) -> String {
     }
 
     s.push_str("  def self.perform(job_class, args)\n");
-    if payload.is_empty() {
+    if payload.is_empty() && broadcasts.is_empty() {
         s.push_str("    false\n");
     } else {
         s.push_str("    case job_class\n");
+        if !broadcasts.is_empty() {
+            s.push_str(&format!("    when {}\n      perform_turbo_broadcast(args)\n      true\n", ruby_str(turbo)));
+        }
         for plan in &payload {
             s.push_str(&format!("    when {}\n", ruby_str(&plan.job)));
             let mut call_args: Vec<String> = Vec::new();
             for (i, p) in plan.params.iter().enumerate() {
                 if p.rest {
                     call_args.push(format!("*{}", read_rest(&p.codec, i)));
+                } else if p.keyword {
+                    let key = ruby_str(p.name.as_str());
+                    let read = read_expr(&p.codec, &format!("ActiveJob::Arguments.keyword_args(args, {key}), 0"));
+                    let value = match &p.default {
+                        Some(default) => format!("(ActiveJob::Arguments.keyword_given?(args, {key}) ? {read} : {default})"),
+                        None => read,
+                    };
+                    call_args.push(format!("{}: {value}", p.name.as_str()));
                 } else {
                     call_args.push(read_expr(&p.codec, &format!("args, {i}")));
                 }
@@ -889,16 +1541,34 @@ pub fn registry_source(plans: &[JobPlan], sidekiq: bool) -> String {
     }
     s.push_str("  end\n\n");
 
+    // `ActiveJob::Base.deserialize`'s job, by name: a closed-world `case`, as `perform`'s.
+    s.push_str("  def self.instantiate(job_class)\n");
+    if payload.is_empty() {
+        s.push_str("    nil\n");
+    } else {
+        s.push_str("    case job_class\n");
+        for plan in &payload {
+            s.push_str(&format!("    when {}\n      {}.new\n", ruby_str(&plan.job), plan.job));
+        }
+        s.push_str("    end\n");
+    }
+    s.push_str("  end\n\n");
+
     s.push_str("  def self.discards_deserialization_error(job_class)\n");
     let discarding: Vec<&&JobPlan> =
         payload.iter().filter(|p| p.discards_deserialization_error).collect();
-    if discarding.is_empty() {
+    if discarding.is_empty() && broadcasts.is_empty() {
         s.push_str("    false\n");
     } else {
-        let names: Vec<String> = discarding.iter().map(|p| format!("job_class == {}", ruby_str(&p.job))).collect();
+        let mut names: Vec<String> = discarding.iter().map(|p| format!("job_class == {}", ruby_str(&p.job))).collect();
+        if !broadcasts.is_empty() {
+            names.push(format!("job_class == {}", ruby_str(turbo)));
+        }
         s.push_str(&format!("    {}\n", names.join(" || ")));
     }
     s.push_str("  end\n");
+
+    s.push_str(&retry_source(&payload, sidekiq));
 
     // One locator per record model a payload job reads, and a list
     // reader where a rest or Array parameter reads several.
@@ -947,6 +1617,88 @@ pub fn registry_source(plans: &[JobPlan], sidekiq: bool) -> String {
     s
 }
 
+/// The handler table and the push options, read by `ActiveJob.perform_parsed_from`
+/// and `SidekiqPush.enqueue`:
+///
+/// - `handler_for(job_class, e)`: the first of the job's handlers that
+///   matches `e`, in ActiveJob's search order. A `retry_on`'s rule id
+///   (from 1), the negated id of a `discard_on`, 0 for none.
+/// - `retry_rule(id)`: the `retry_on`'s options as an
+///   `ActiveJob::RetryRule`, its jitter resolved against the job's
+///   `retry_jitter`.
+/// - `sidekiq_retry(job_class)` and `sidekiq_extra(job_class)`: the
+///   envelope's `retry` value and the job's other `sidekiq_options`, as
+///   JSON text, in the place Sidekiq writes them.
+///
+/// Off `:sidekiq` every job has no handlers and the defaults.
+fn retry_source(payload: &[&JobPlan], sidekiq: bool) -> String {
+    let mut s = String::new();
+    let mut rules: Vec<String> = Vec::new();
+    s.push_str("\n  def self.handler_for(job_class, e)\n");
+    for plan in payload.iter().filter(|p| sidekiq && !p.handlers.is_empty()) {
+        s.push_str(&format!("    if job_class == {}\n", ruby_str(&plan.job)));
+        for h in &plan.handlers {
+            let id = match h {
+                JobHandler::Retry { exceptions, wait, attempts, queue, priority, jitter } => {
+                    let (seconds, poly) = match wait {
+                        RetryWait::Seconds(n) => (*n, false),
+                        RetryWait::PolynomiallyLonger => (0.0, true),
+                    };
+                    rules.push(format!(
+                        "ActiveJob::RetryRule.new({}, {}, {poly}, {attempts}, {}, {}, {}, {})",
+                        ruby_str(&format!("[{}]", exceptions.join(", "))),
+                        ruby_float(seconds),
+                        ruby_str(queue),
+                        priority.is_some(),
+                        priority.unwrap_or(0),
+                        ruby_float(jitter.unwrap_or(plan.retry_jitter)),
+                    ));
+                    rules.len() as i64
+                }
+                JobHandler::Discard { .. } => -1,
+            };
+            let test: Vec<String> = h.exceptions().iter().map(|e| format!("e.is_a?({e})")).collect();
+            s.push_str(&format!("      return {id} if {}\n", test.join(" || ")));
+        }
+        s.push_str("    end\n");
+    }
+    s.push_str("    0\n  end\n");
+
+    s.push_str("\n  def self.retry_rule(id)\n");
+    for (i, rule) in rules.iter().enumerate() {
+        s.push_str(&format!("    return {rule} if id == {}\n", i + 1));
+    }
+    s.push_str("    ActiveJob::RetryRule.new(\"\", 0.0, false, 0, \"\", false, 0, 0.0)\n  end\n");
+
+    let mut retry_arms = String::new();
+    let mut extra_arms = String::new();
+    for plan in payload.iter().filter(|_| sidekiq) {
+        let mut extra = String::new();
+        for (k, v) in &plan.sidekiq_options {
+            if k == "retry" {
+                retry_arms.push_str(&format!("    return {} if job_class == {}\n", ruby_str(v), ruby_str(&plan.job)));
+            } else {
+                extra.push_str(&format!(",{}:{v}", json_str(k)));
+            }
+        }
+        if !extra.is_empty() {
+            extra_arms.push_str(&format!(
+                "    return {} if job_class == {}\n",
+                ruby_str(&extra),
+                ruby_str(&plan.job)
+            ));
+        }
+    }
+    s.push_str(&format!("\n  def self.sidekiq_retry(job_class)\n{retry_arms}    \"true\"\n  end\n"));
+    s.push_str(&format!("\n  def self.sidekiq_extra(job_class)\n{extra_arms}    \"\"\n  end\n"));
+    s
+}
+
+fn ruby_float(v: f64) -> String {
+    let s = v.to_string();
+    if s.contains('.') || s.contains('e') { s } else { format!("{s}.0") }
+}
+
 /// `(room, message)`, or nothing for a job without parameters. A rest
 /// parameter is a plain one here: `perform_later(*comments)` hands the
 /// writer `comments`, the Array it collected, not its elements.
@@ -975,7 +1727,23 @@ pub(crate) fn fresh_name(base: &str, taken: &[&str]) -> String {
 }
 
 fn ruby_str(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            // Not `#` as written: `#{`, `#@` and `#$` interpolate in a double-quoted literal.
+            '#' => out.push_str("\\#"),
+            '\n' => out.push_str("\\n"),
+            // Not a raw CR: Ruby reads a CRLF in source as LF.
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn write_expr(codec: &Codec, v: &str) -> String {
@@ -1016,7 +1784,7 @@ fn read_expr(codec: &Codec, at: &str) -> String {
             Codec::Str => format!("{a}.str_array_at({at})"),
             Codec::Sym => format!("{a}.sym_array_at({at})"),
             Codec::Record { model, .. } => {
-                let (args, i) = at.split_once(", ").unwrap_or((at, "0"));
+                let (args, i) = at.rsplit_once(", ").unwrap_or((at, "0"));
                 format!("locate_{}_from({args}[{i}], 0)", suffix(model))
             }
             // Excluded by `codec_of`.
@@ -1032,7 +1800,7 @@ fn read_rest(codec: &Codec, from: usize) -> String {
         Codec::Record { model, .. } => format!("locate_{}_from(args, {from})", suffix(model)),
         other => {
             let one = read_expr(other, "args, j");
-            format!("(({from})...{a}.count(args)).map {{ |j| {one} }}")
+            format!("(({from})...{a}.arg_count(args)).map {{ |j| {one} }}")
         }
     }
 }
@@ -1040,15 +1808,14 @@ fn read_rest(codec: &Codec, from: usize) -> String {
 /// The one warning a target that doesn't honor `queue_adapter :sidekiq`
 /// files for an app on it: the strict targets have no Sidekiq push, so
 /// the app's jobs run in process there. Only for an app with ActiveJob
-/// jobs; one whose background work is all native Sidekiq workers has
-/// nothing to say it about. Decided by the host, which knows the target
-/// (`src/bin/roundhouse.rs`), as `elevate_nested_params_for_target` is.
+/// jobs or native Sidekiq workers. Decided by the host, which knows the
+/// target (`src/bin/roundhouse.rs`), as `elevate_nested_params_for_target` is.
 pub fn sidekiq_adapter_target_warning(
     app: &App,
     target: crate::build_target::BuildTarget,
 ) -> Option<crate::diagnostic::Diagnostic> {
     use crate::build_target::BuildTarget;
-    if app.queue_adapter.as_deref() != Some("sidekiq") || app.job_plans.is_empty() {
+    if app.queue_adapter.as_deref() != Some("sidekiq") || (app.job_plans.is_empty() && app.native_plans.is_empty()) {
         return None;
     }
     if matches!(target, BuildTarget::Spinel | BuildTarget::Ruby | BuildTarget::Jruby) {
@@ -1065,4 +1832,21 @@ pub fn sidekiq_adapter_target_warning(
             target.as_str()
         ),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every environment's `class:` task without `args:` (lobsters' `ResticJob`, `WalCheckpointJob`), and none with them.
+    #[test]
+    fn a_recurring_class_task_without_args_is_an_argless_call_site() {
+        let yaml = "production:\n  restic:\n    class: ResticJob\n    schedule: every day at 1 am\n  pinged:\n    class: PingJob\n    args: [1]\n    schedule: every minute\n  cleanup:\n    command: SolidQueue::Job.clear_finished_in_batches\n    schedule: every day\ndevelopment:\n  wal:\n    class: \"::WalCheckpointJob\"\n    schedule: every minute\n";
+        let app = App {
+            sources: vec![crate::span::SourceFile { path: "/app/config/recurring.yml".to_string(), text: yaml.to_string() }],
+            ..App::default()
+        };
+        assert_eq!(recurring_task_classes(&app, false), ["ResticJob", "WalCheckpointJob"]);
+        assert_eq!(recurring_task_classes(&app, true), ["PingJob"]);
+    }
 }

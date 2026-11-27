@@ -48,6 +48,7 @@ module ActionView
     def self.url_encode: (String s) -> String
     def self.erb_url_encode: (String s) -> String
     def self.erb_url_byte: (Array[Integer] bytes, Integer i) -> Integer
+    def self.escape_segment: (String s) -> String
     # `Hash#to_query`: one string per value, `&`-joined. Scalar values
     # in insertion order here; runtime/spinel/hash_to_query.rb reopens
     # both with the nested bracket grammar and Rails' per-level sort.
@@ -138,6 +139,11 @@ module ActionView
       Integer n,
       String w
     ) -> String
+    def self.simple_format: (String text, Symbol wrapper_tag, ?Hash[Symbol, untyped] opts) -> String
+    def self.simple_format_blank?: (String text) -> bool
+    def self.simple_format_paragraphs: (String text, Symbol wrapper_tag, Hash[Symbol, untyped] opts) -> String
+    def self.simple_format_break: (String para) -> String
+    def self.simple_format_join: (String out, String paragraph) -> String
   
     # ── DOM helpers ─────────────────────────────────────────────────
     # Monomorphic record-shape: dom_id takes an ActiveRecord::Base
@@ -160,6 +166,7 @@ module ActionView
     # Callers passing a record or other value handle the stringify at
     # the call site. `href` is the URL path. `opts` is the attribute
     # hash (Symbol or String keys; values flatten through render_attrs).
+    def self.back_url: () -> String
     def self.link_to: (String text, String href, ?Hash[Symbol, untyped] opts) -> String
     def self.button_to: (String text, String href, ?Hash[Symbol, untyped] opts) -> String
 
@@ -183,9 +190,16 @@ module ActionView
     def self.form_authenticity_token: () -> String
     def self.token_fields_omitted?: () -> bool
     def self.csp_meta_tag: () -> String
+    def self.content_security_policy_nonce: () -> String?
   
     # `name` is the asset stem (e.g., "application" → /assets/application.css).
     def self.stylesheet_link_tag: (String name, ?Hash[Symbol, untyped] opts) -> String
+    def self.stylesheet_href: (String source) -> String
+    def self.asset_url?: (String source) -> bool
+    def self.scheme_letter_count: (String s) -> Integer
+    def self.blank_source?: (String s) -> bool
+    def self.css_extname?: (String path) -> bool
+    def self.first_char_index: (String s, String ch) -> Integer
     def self.javascript_include_tag: (String | Symbol source, ?Hash[Symbol, untyped] opts) -> String
 
     # Asset helpers. `source` is the image path/name; `skip_pipeline`
@@ -195,11 +209,16 @@ module ActionView
     def self.digested_asset_path: (String source) -> String
     def self.url_for: (String target) -> String
     def self.image_url: (String source, ?skip_pipeline: bool) -> String
+    def self.asset_url: (String source, ?skip_pipeline: bool) -> String
     def self.image_tag: (String source, ?Hash[Symbol, untyped] opts) -> String
     def self.path_to_javascript: (String source, ?skip_pipeline: bool) -> String
     def self.javascript_path: (String source, ?skip_pipeline: bool) -> String
 
     def self.content_tag: (Symbol name, ?(String | Integer | nil) content, ?Hash[Symbol, untyped] opts) -> String
+    def self.content_tag_html: (Symbol name, String html, ?Hash[Symbol, untyped] opts) -> String
+    def self.button_to_html: (String url, String html, ?Hash[Symbol, untyped] opts) -> String
+    def self.content_tag_name: (String name) -> String
+    def self.content_tag_pre: (String name) -> String
   
     # `pins` is the importmap pin array — each entry a record with
     # fixed `:name` and `:path` fields. Record (not `Hash[Symbol,
@@ -222,6 +241,8 @@ module ActionView
     # expansions. See view_helpers.rb for the runtime/macro split
     # rationale.
     def self.csrf_token_hidden_input: () -> String
+    def self.hidden_autocomplete_attr: () -> String
+    def self.keep_hidden_autocomplete: () -> String
     def self.cache_scope: () -> String
     def self.begin_broadcast_render: () -> String
     def self.broadcast_render: (String _armed, String html) -> String
@@ -235,6 +256,21 @@ module ActionView
     def self.form_with: (?Hash[Symbol, untyped] opts) -> String
     # Schema column union (plus nil). Bodies nil-check and stringify.
     def self.optional_value_attr: (String | Integer | Float | bool | nil value) -> String
+    def self.color_value_attr: (String | Integer | Float | bool | nil value) -> String
+    def self.color_field_value_attr: (String | Integer | Float | bool | nil option, String | Integer | Float | bool | nil value) -> String
+    def self.validated_color: (String s) -> String
+    def self.datetime_local_value_attr: (String | Integer | Float | bool | nil value) -> String
+    def self.hex_digits?: (String s) -> bool
+    def self.current_page_match?: (String request_method, String request_path, String request_fullpath, String request_origin, String path) -> bool
+    def self.scheme_at_line_start?: (Array[Integer] bytes) -> bool
+    def self.word_byte?: (Integer byte) -> bool
+    def self.joined_bytes: (Array[Integer] a, Array[Integer] b) -> Array[Integer]
+    def self.percent_decoded: (Array[Integer] bytes) -> Array[Integer]
+    def self.byte_at: (Array[Integer] bytes, Integer i) -> Integer
+    def self.hex_value: (Integer byte) -> Integer
+    def self.first_byte_index: (Array[Integer] bytes, Integer byte) -> Integer
+    def self.trailing_slash_trimmed: (Array[Integer] bytes) -> Array[Integer]
+    def self.same_bytes?: (Array[Integer] a, Array[Integer] b) -> bool
     def self.escape_or_empty: (String | Integer | Float | bool | nil value) -> String
 
     # ── attribute rendering ────────────────────────────────────────
@@ -258,11 +294,22 @@ module ActionView
     # Crystal's already-Symbol-keyed callers finally match the param.
     def self.render_attrs: (Hash[Symbol, untyped] attrs) -> String
     def self.attr_value_text: (String name, untyped v) -> String
+    # Rails' ERB::Util.xml_name_escape on an attribute name (ASCII
+    # rule exact; a non-ASCII character becomes "_").
+    def self.xml_name_escape: (String name) -> String
     def self.haml_class: (String static_classes, untyped value) -> String
 
     # Rails' BOOLEAN_ATTRIBUTES membership — presence-is-the-value
     # attributes render `name="name"` when truthy and vanish when
     # false; `render_attrs` consults this per attribute name.
     def self.boolean_attr?: (String name) -> bool
+  end
+end
+
+module Turbo
+  module FramesHelper
+  end
+
+  module StreamsHelper
   end
 end

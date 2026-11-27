@@ -60,12 +60,16 @@ module ActiveRecord
     text == "" ? nil : enum_int(text, labels, values, texts, attr)
   end
 
+  # A label wins over a stored value of the same spelling, whichever the
+  # declaration lists first, as Rails' enum type casts: with
+  # `{ sent: "done", queued: "sent" }`, "sent" is the label `sent` and
+  # stores "done". A stored value is taken only while no entry matched.
   def self.enum_str(text, labels, values, attr)
     result = text + ""
     found = text == ""
     i = 0
     while i < labels.length
-      if labels[i] == text || values[i] == text
+      if labels[i] == text || (!found && values[i] == text)
         result = values[i]
         found = true
       end
@@ -143,12 +147,43 @@ module ActiveRecord
 
   # Thin reflection surface for `Model.reflect_on_association(:name)`.
   # Campfire asks `counter_cache_column` (nil when the belongs_to did not
-  # declare `counter_cache:`). Deeper Rails reflection stays unmodeled.
+  # declare `counter_cache:`); orm_adapter asks `belongs_to?`,
+  # `foreign_key` and `options[:polymorphic]`. Deeper Rails reflection
+  # stays unmodeled.
   module Reflection
     class AssociationReflection
-      def initialize(name, counter_cache_column)
+      def initialize(name, counter_cache_column, macro, foreign_key, polymorphic)
         @name = name
         @counter_cache_column = counter_cache_column
+        @macro = macro
+        @foreign_key = foreign_key
+        @polymorphic = polymorphic
+      end
+
+      def macro
+        @macro
+      end
+
+      def belongs_to?
+        @macro == :belongs_to
+      end
+
+      def foreign_key
+        @foreign_key
+      end
+
+      def polymorphic?
+        @polymorphic
+      end
+
+      # Not every option the association was declared with: only `polymorphic:` is kept, as Rails holds it (present only when given).
+      def options
+        @polymorphic ? { polymorphic: true } : {}
+      end
+
+      # Rails' `"#{name}_type"`, of a polymorphic belongs_to only.
+      def foreign_type
+        @polymorphic ? "#{@name}_type" : nil
       end
 
       def name
@@ -159,16 +194,12 @@ module ActiveRecord
         @counter_cache_column
       end
 
-      # Catalog also types `.klass` / `.macro`; presence-only callers get
-      # nil rather than a NameError until those halves are synthesized.
+      # Catalog also types `.klass`; presence-only callers get nil rather
+      # than a NameError until that half is synthesized.
       # Bare `nil` (return-tail untyped) — not `result = nil; result`,
       # which rust emits as `Option`/`None` against a Value return
       # (issue #832). Same shape as `request_for_csrf`.
       def klass
-        nil
-      end
-
-      def macro
         nil
       end
     end
@@ -325,6 +356,13 @@ module ActiveRecord
       raise NotImplementedError, "to_param: subclasses must override"
     end
 
+    # ActiveModel::Conversion's `to_key`: the key in a list, nil for a record not yet saved (Devise keeps it in the
+    # session as `[[id], salt]`).
+    def to_key
+      return nil unless persisted?
+      [id]
+    end
+
     # Error message accumulator populated by the lowerer-emitted
     # `validate` method (one `errors << "..."` per failed rule). Lives
     # on Base directly — Phase 2.5(a) inlined every `validates :x, …`
@@ -351,6 +389,14 @@ module ActiveRecord
     def error_messages_for(attribute)
       out = []
       error_details.each { |error| out << error.message if error.attribute == attribute }
+      out
+    end
+
+    # Rails' `errors.full_messages_for(attribute)`: the full messages of the errors on one attribute.
+    # The ruby-family connection.rb reopen answers them frozen, as Rails does; a strict target has no frozen Array.
+    def error_full_messages_for(attribute)
+      out = []
+      error_details.each { |error| out << error.full_message if error.attribute == attribute }
       out
     end
 
@@ -445,6 +491,11 @@ module ActiveRecord
       table_name
     end
 
+    # A concrete STI subclass overrides this with its descendant names.
+    def self._sti_type_names
+      []
+    end
+
     def self.schema_columns
       raise NotImplementedError, "#{name}.schema_columns must be overridden"
     end
@@ -462,6 +513,19 @@ module ActiveRecord
     # lowerer (`_association_names`). Empty on Base so an unknown model
     # answers `reflect_on_association` with nil the way Rails does.
     def self._association_names
+      []
+    end
+
+    # Each association's macro, foreign key and `polymorphic:`, in `_association_names`' order (the lowerer's too).
+    def self._association_macros
+      []
+    end
+
+    def self._association_foreign_keys
+      []
+    end
+
+    def self._association_polymorphic
       []
     end
 
@@ -483,7 +547,9 @@ module ActiveRecord
       end
       assoc = names[i]
       if assoc.to_s == needle
-        return ActiveRecord::Reflection::AssociationReflection.new(assoc, nil)
+        return ActiveRecord::Reflection::AssociationReflection.new(
+          assoc, nil, _association_macros[i], _association_foreign_keys[i].to_s, _association_polymorphic[i] == true
+        )
       end
       reflect_on_association_at(needle, i + 1)
     end
@@ -532,6 +598,19 @@ module ActiveRecord
       []
     end
 
+    # The enum columns, which `where` casts through `_enum_where_value`.
+    def self.schema_enum_columns
+      []
+    end
+
+    # A `where` value on enum column `col` as its stored value. Only a
+    # column `schema_enum_columns` names reaches it, and a model with an
+    # enum overrides both, so this default never casts.
+    def self._enum_where_value(_col, _value)
+      stored = nil
+      stored
+    end
+
     def self.instantiate(_row)
       raise NotImplementedError, "#{name}.instantiate must be overridden"
     end
@@ -543,6 +622,12 @@ module ActiveRecord
     # models without one fall back to this no-op, which leaves the lazy
     # association readers doing the work (correct, just N+1).
     def self.preload_associations(_records, _specs)
+    end
+
+    # Not left to `preload_associations` alone: an `includes` whose association a condition names is a JOIN in Rails
+    # (`includes(:article).where(article: {…})`); models with such associations answer theirs.
+    def self._eager_load_joins(_specs, _conditions, _joined)
+      []
     end
 
     # Per-model adapter primitives — public AR API delegates here.
@@ -673,6 +758,11 @@ module ActiveRecord
       {}
     end
 
+    # Not the answer a record gives: each model overrides it with its columns' readers (`synth_serializable_hash`).
+    def serializable_hash
+      {}
+    end
+
     # Column-name indexer. Subclasses override with a per-column case
     # dispatch over the typed ivars (each model has a fixed set of
     # columns from the schema). The Base implementation raises so a
@@ -768,6 +858,12 @@ module ActiveRecord
     def mark_persisted!
       @persisted = true
       @destroyed = false
+    end
+
+    # Seat this record on `records`, loaded by a relation built off its
+    # has_many `name`, through that association's inverse. A model whose
+    # has_many has one answers it (generated); any other seats nothing.
+    def _set_inverse_from_queries(name, records)
     end
 
     # ---- Class-level CRUD -------------------------------------------
@@ -1117,11 +1213,31 @@ module ActiveRecord
       changes.key?(name)
     end
 
+    # `to_s`: the pending diff is keyed by column-name String, and
+    # callers usually pass a Symbol.
+    def will_save_change_to_attribute?(name)
+      attribute_changed?(name.to_s)
+    end
+
     # Rails' `changed?` / `has_changes_to_save?`: any column pending.
     # campfire's `RecordCache` snapshots only records with none.
     def changed?
       changes = changes_to_save
       !changes.empty?
+    end
+
+    # ActiveModel::Dirty's names over the same diffs: `changes` is the pending one (`changes_to_save`), keyed by column
+    # String as Rails' indifferent Hash reads it; `previous_changes` the last save's; `changed` the pending columns.
+    def changes
+      changes_to_save
+    end
+
+    def previous_changes
+      saved_changes
+    end
+
+    def changed
+      changes_to_save.keys
     end
 
     def has_changes_to_save?
@@ -1143,6 +1259,12 @@ module ActiveRecord
 
     def restore_attribute!(name)
       nil
+    end
+
+    # Rails' `restore_attributes`: every pending change written back, the
+    # names it restored. None here, for the same reason.
+    def restore_attributes
+      changes_to_save.keys
     end
 
     # `id` never appears in the subclass `attributes` hash, so the
@@ -1220,6 +1342,16 @@ module ActiveRecord
       touch
     end
 
+    # Whether the update that just ran wrote the row, which is what
+    # Rails' `belongs_to …, touch: true` asks (`if: :saved_changes?`)
+    # before touching the parent from `after_update`. A strict target's
+    # `save` writes the whole row every time, so the answer is always
+    # yes; the ruby-family reopen (connection.rb) skips an update with
+    # nothing pending and answers from `saved_changes`.
+    def _wrote_on_update?
+      true
+    end
+
     # `touch` after a call-site column write (`touch :connected_at`,
     # `increment!(:connections, touch: true)`): the whole row, so the
     # assigned column is written with the timestamp.
@@ -1284,11 +1416,12 @@ module ActiveRecord
     # transaction a plain `reload` already gives the guarantee Rails
     # extracts from the row lock: the enclosing `BEGIN` serializes
     # writers, so nothing can land between this read and a following
-    # write in the same transaction. A Postgres adapter would spell
-    # the `lock` argument as `FOR UPDATE` / `FOR SHARE` here; this
-    # runtime keeps the Rails signature — `lock` may be `true` or a
-    # String locking clause (`lock!("FOR UPDATE NOWAIT")`) — but
-    # doesn't need either under SQLite; both are accepted and ignored.
+    # write in the same transaction. This runtime keeps the Rails
+    # signature — `lock` may be `true` or a String locking clause
+    # (`lock!("FOR UPDATE NOWAIT")`) — but doesn't need either under
+    # SQLite; both are accepted and ignored. On PostgreSQL the ruby
+    # family's reopen (active_record/connection.rb) takes the row lock
+    # the clause names before this reload.
     def lock!(lock = nil)
       # Rails passes `reload(lock: lock)`; this runtime ignores the
       # clause under SQLite, so a bare reload keeps the same guarantee.
@@ -1384,6 +1517,12 @@ module ActiveRecord
       ok = @errors.empty?
       after_validation
       ok
+    end
+
+    # Not ActiveModel's `ValidationError`: on a record Rails raises the `RecordInvalid` that `save!` does.
+    def validate!
+      raise RecordInvalid, self unless valid?
+      true
     end
 
     # ---- Equality ---------------------------------------------------

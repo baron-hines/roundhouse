@@ -268,13 +268,14 @@ fn handle_create_table(
     let body = &after_name[open + 1..close];
 
     let mut columns: Vec<Column> = Vec::new();
+    let mut primary_key_columns: Vec<Symbol> = Vec::new();
     for seg in top_level_split(body, b',') {
         let seg = seg.trim();
         if seg.is_empty() {
             continue;
         }
         if is_table_level_constraint(seg) {
-            handle_inline_table_constraint(seg, &table_name, &mut columns, gaps, file);
+            handle_inline_table_constraint(seg, &mut columns, &mut primary_key_columns);
             continue;
         }
         match parse_column_def(seg, &table_name, file, enum_types) {
@@ -293,8 +294,10 @@ fn handle_create_table(
         columns,
         indexes: Vec::new(),
         foreign_keys: Vec::new(),
+        check_constraints: Vec::new(),
         virtual_module: None,
         known_keyless: false,
+        primary_key_columns,
     };
     let invalid_generated = crate::schema::generated::validate_table_with_dialect(&table, dialect);
     for (column, reason) in &invalid_generated {
@@ -325,17 +328,12 @@ fn is_table_level_constraint(seg: &str) -> bool {
 }
 
 /// `[CONSTRAINT name] PRIMARY KEY (cols)` inside the column-list parens
-/// sets the primary-key flag on the matching column(s); every other
-/// table-level constraint form (`UNIQUE`, `CHECK`, `EXCLUDE`, an
+/// sets the primary-key flag on a single key column, or records a
+/// composite key in `composite` (`Table.primary_key_columns`); every
+/// other table-level constraint form (`UNIQUE`, `CHECK`, `EXCLUDE`, an
 /// inline `FOREIGN KEY`) is recognized and skipped — it costs the DDL
 /// nothing schema.rb would have captured either.
-fn handle_inline_table_constraint(
-    seg: &str,
-    table_name: &str,
-    columns: &mut [Column],
-    gaps: &mut Vec<IngestError>,
-    file: &str,
-) {
+fn handle_inline_table_constraint(seg: &str, columns: &mut [Column], composite: &mut Vec<Symbol>) {
     let words = top_level_words(seg);
     let Some(pos) = word_seq_pos_after(&words, 0, &["PRIMARY", "KEY"]) else { return };
     let Some(open) = find_first_open_paren(seg, pos) else { return };
@@ -351,13 +349,7 @@ fn handle_inline_table_constraint(
                 col.primary_key = true;
             }
         }
-        _ => gaps.push(IngestError::Unsupported {
-            file: file.into(),
-            message: format!(
-                "primary key dropped: composite key ({table_name}({}))",
-                cols.join(", ")
-            ),
-        }),
+        _ => *composite = cols.iter().map(|c| Symbol::from(c.as_str())).collect(),
     }
 }
 
@@ -411,12 +403,17 @@ fn parse_column_def(
         col_type,
         nullable,
         default,
-        primary_key: false,
+        default_expression: None,
+        legacy_default_persistence: false,
+        primary_key: top_level_words(modifiers).windows(2)
+            .any(|words| words[0].1 == "PRIMARY" && words[1].1 == "KEY"),
         generated,
         generated_text_compatible,
         generated_int4_compatible,
         array: false,
         array_stored: false,
+        unset_until_assigned: false,
+        collated: top_level_words(modifiers).iter().any(|(_, word)| word == "COLLATE"),
     }))
 }
 
@@ -700,6 +697,7 @@ fn handle_create_index(stmt: &str, file: &str, schema: &mut Schema, gaps: &mut V
             table.indexes.push(Index {
                 name: Symbol::from(index_name),
                 columns: cols,
+                expression: None,
                 unique,
                 using,
                 predicate,
@@ -745,7 +743,7 @@ fn handle_alter_table(
     let words = top_level_words(after);
 
     if let Some(pos) = word_seq_pos_after(&words, 0, &["PRIMARY", "KEY"]) {
-        handle_add_primary_key(after, pos, &table_name, table_sym, schema, gaps, file);
+        handle_add_primary_key(after, pos, table_sym, schema);
         return;
     }
     if let Some(pos) = word_seq_pos_after(&words, 0, &["FOREIGN", "KEY"]) {
@@ -771,17 +769,10 @@ fn handle_alter_table(
 /// `ADD CONSTRAINT [name] PRIMARY KEY (cols)`. A composite key is a
 /// real shape in this dialect (Postgres partitioned tables routinely
 /// key on `(id, partition_key)`) that the single-column `Column.
-/// primary_key` flag cannot hold — ledgered rather than narrowed to
-/// one column, which would silently misrepresent the table's key.
-fn handle_add_primary_key(
-    after: &str,
-    pk_pos: usize,
-    table_name: &str,
-    table_sym: Symbol,
-    schema: &mut Schema,
-    gaps: &mut Vec<IngestError>,
-    file: &str,
-) {
+/// primary_key` flag cannot hold — kept whole in
+/// `Table.primary_key_columns` rather than narrowed to one column,
+/// which would silently misrepresent the table's key.
+fn handle_add_primary_key(after: &str, pk_pos: usize, table_sym: Symbol, schema: &mut Schema) {
     // A retracted partition shard (see `handle_attach_partition`) has
     // no table entry left to set a pk flag on — and, just as
     // importantly, no business ledgering a composite-key gap for a
@@ -808,13 +799,11 @@ fn handle_add_primary_key(
                 }
             }
         }
-        _ => gaps.push(IngestError::Unsupported {
-            file: file.into(),
-            message: format!(
-                "primary key dropped: composite key ({table_name}({}))",
-                cols.join(", ")
-            ),
-        }),
+        _ => {
+            if let Some(table) = schema.tables.get_mut(&table_sym) {
+                table.primary_key_columns = cols.iter().map(|c| Symbol::from(c.as_str())).collect();
+            }
+        }
     }
 }
 
@@ -859,13 +848,26 @@ fn handle_add_foreign_key(
     if from_cols.len() == 1 && to_cols.len() == 1 {
         let on_delete = action_after(words, close2, "DELETE");
         let on_update = action_after(words, close2, "UPDATE");
+        // PostgreSQL: `NOT DEFERRABLE` is the default, `DEFERRABLE` starts
+        // immediate, and `INITIALLY DEFERRED` implies `DEFERRABLE`.
+        let after_refs = |seq: &[&str]| word_seq_pos_after(words, close2, seq).is_some();
+        let deferrable = if after_refs(&["NOT", "DEFERRABLE"]) {
+            None
+        } else if after_refs(&["INITIALLY", "DEFERRED"]) {
+            Some(crate::schema::Deferrable::Deferred)
+        } else if after_refs(&["DEFERRABLE"]) {
+            Some(crate::schema::Deferrable::Immediate)
+        } else {
+            None
+        };
         if let Some(table) = schema.tables.get_mut(&table_sym) {
             table.foreign_keys.push(ForeignKey {
-                from_column: Symbol::from(from_cols[0].clone()),
+                from_columns: vec![Symbol::from(from_cols[0].clone())],
                 to_table: TableRef(Symbol::from(ref_table_raw)),
-                to_column: Symbol::from(to_cols[0].clone()),
+                to_columns: vec![Symbol::from(to_cols[0].clone())],
                 on_delete,
                 on_update,
+                deferrable,
             });
         }
     } else {
@@ -1022,6 +1024,29 @@ fn skip_quoted_or_comment(bytes: &[u8], i: usize) -> Option<usize> {
                     return Some(j + 1);
                 }
                 j += 1;
+            }
+        }
+        // PostgreSQL's escape string, `E'…'`: a backslash escapes the next
+        // byte, so `E'it\'s'` is one literal. Only where the `E` starts a
+        // token, not where it ends an identifier (which may hold `$` or non-ASCII).
+        Some(b'E' | b'e')
+            if bytes.get(i + 1) == Some(&b'\'')
+                && (i == 0
+                    || !(bytes[i - 1].is_ascii_alphanumeric()
+                        || matches!(bytes[i - 1], b'_' | b'$')
+                        || bytes[i - 1] >= 0x80)) =>
+        {
+            let mut j = i + 2;
+            loop {
+                if j >= bytes.len() {
+                    return Some(bytes.len());
+                }
+                match bytes[j] {
+                    b'\\' => j += 2,
+                    b'\'' if bytes.get(j + 1) == Some(&b'\'') => j += 2,
+                    b'\'' => return Some(j + 1),
+                    _ => j += 1,
+                }
             }
         }
         Some(b'"') => {
@@ -1458,7 +1483,7 @@ fn parse_generated_modifier(modifiers: &str) -> Result<Option<GeneratedColumn>, 
         return Err("only NULL or NOT NULL may follow the generated storage mode".into());
     }
 
-    Ok(Some(GeneratedColumn { expression, storage }))
+    Ok(Some(GeneratedColumn { expression, storage, native: false }))
 }
 
 /// Consume only an optional `NULL` or `NOT NULL` clause plus SQL trivia.

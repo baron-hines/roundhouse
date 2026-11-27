@@ -78,6 +78,15 @@ struct Names {
     top_level: std::rc::Rc<crate::det::HashSet<String>>,
     /// Every segment (`EnumConstants::defines_name`).
     segments: crate::det::HashSet<String>,
+    /// Each segment below the first, by the qualified owner before it.
+    by_owner: crate::det::HashMap<String, crate::det::HashSet<String>>,
+    /// Every recorded name, by its last segment.
+    by_last: crate::det::HashMap<String, Vec<String>>,
+}
+
+struct ResolvedAncestry {
+    edges: crate::det::HashMap<String, Vec<String>>,
+    unknown: crate::det::HashSet<String>,
 }
 
 #[derive(Default)]
@@ -86,6 +95,15 @@ pub(in crate::ingest) struct EnumConstants {
     /// [`Names`] of `values`' keys, with how many keys that was: names are
     /// only ever added, so the count says whether it is still current.
     names: std::cell::RefCell<Option<(usize, std::rc::Rc<Names>)>>,
+    /// Each class's superclass and each owner's `include`/`extend`/`prepend`
+    /// arguments (`Object`'s at a file's top level): (owner, target), each as
+    /// its spellings ([`EnumConstants::resolve_spellings`]). Resolved when
+    /// asked, after every source is recorded.
+    ancestor_edges: Vec<(Vec<String>, Vec<String>)>,
+    /// Owners, as their spellings, that include an argument this pass cannot name.
+    unknown_ancestors: Vec<Vec<String>>,
+    /// `ancestor_edges` and `unknown_ancestors` resolved, with the counts they were resolved at.
+    resolved_ancestry: std::cell::RefCell<Option<((usize, usize, usize), std::rc::Rc<ResolvedAncestry>)>>,
     /// Lexical owners at each class/module open, keyed by (file, start).
     /// Concern `included do` resolution reads the same table models use.
     pub(in crate::ingest) nesting: crate::det::HashMap<(String, usize), Vec<String>>,
@@ -106,6 +124,9 @@ pub(in crate::ingest) struct EnumConstants {
     /// `NAME = …`, mutates, or lets a variable hold ([`super::ConstTaint`]
     /// over the whole file). By name, whatever owner the write names.
     foreign_taint: crate::det::HashSet<String>,
+    snapshot_taint: crate::det::HashSet<String>,
+    snapshot_aliases: Vec<(String, String)>,
+    snapshot_reflected: crate::det::HashSet<String>,
     /// `ALIAS = KINDS` edges the boot sources write, across all of them:
     /// closed over `foreign_taint` once they are all recorded, in
     /// `finish`, so an alias one initializer writes and a later one
@@ -146,13 +167,87 @@ impl EnumConstants {
     }
 
     /// Every name the app's recorded sources define BELOW the top level
-    /// (`URI` for `Admin::URI` or `ApplicationRecord::URI`). An unrooted
-    /// path starting with one of these could resolve to the app's own
-    /// constant through a lexical owner or an ancestor (superclass or
-    /// included module), so callers that fold a well-known top-level
-    /// constant treat it as possibly shadowed.
+    /// (`URI` for `Admin::URI` or `ApplicationRecord::URI`).
     pub(in crate::ingest) fn nested_names(&self) -> std::rc::Rc<crate::det::HashSet<String>> {
         self.names().nested.clone()
+    }
+
+    /// The names the recorded sources define directly in one of `class`'s
+    /// possible ancestors (`URI` for `ApplicationRecord::URI` when `class`
+    /// inherits `ApplicationRecord`, not for `Addressable::URI` unless an
+    /// ancestor includes `Addressable`). An unrooted path starting with one
+    /// of these could resolve to the app's own constant, so callers that
+    /// fold a well-known top-level constant treat it as possibly shadowed.
+    /// An ancestor that includes what this pass cannot name gives every
+    /// nested name. A lexical owner is the caller's to rule out.
+    pub(in crate::ingest) fn ancestor_names(&self, class: &str) -> std::rc::Rc<crate::det::HashSet<String>> {
+        let names = self.names();
+        let ancestry = self.resolved_ancestry(&names);
+        let (edges, unknown) = (&ancestry.edges, &ancestry.unknown);
+        // Object, Kernel and BasicObject are every class's ancestors without being named as one.
+        let mut pending: Vec<String> = vec![class.to_string(), "Object".into(), "Kernel".into(), "BasicObject".into()];
+        let mut seen = crate::det::HashSet::default();
+        let mut found = crate::det::HashSet::default();
+        while let Some(owner) = pending.pop() {
+            if !seen.insert(owner.clone()) {
+                continue;
+            }
+            if unknown.contains(&owner) {
+                return names.nested.clone();
+            }
+            if let Some(defined) = names.by_owner.get(&owner) {
+                found.extend(defined.iter().cloned());
+            }
+            pending.extend(edges.get(&owner).into_iter().flatten().cloned());
+        }
+        std::rc::Rc::new(found)
+    }
+
+    fn resolved_ancestry(&self, names: &Names) -> std::rc::Rc<ResolvedAncestry> {
+        let state = (self.values.len(), self.ancestor_edges.len(), self.unknown_ancestors.len());
+        if let Some((counted, resolved)) = &*self.resolved_ancestry.borrow() {
+            if *counted == state {
+                return resolved.clone();
+            }
+        }
+        let mut edges: crate::det::HashMap<String, Vec<String>> = Default::default();
+        let mut unknown: crate::det::HashSet<String> = self.unknown_ancestors.iter().flat_map(|o| self.resolve_spellings(o, names)).collect();
+        for (owner, target) in &self.ancestor_edges {
+            let targets = self.resolve_spellings(target, names);
+            // A constant written a value (`Contactable = EmailRules`) holds a module this pass does not follow.
+            let aliased = targets.iter().any(|t| self.values.get(t).is_some_and(|v| !matches!(v, EnumConstant::Namespace | EnumConstant::Sorbet { .. })));
+            for owner in self.resolve_spellings(owner, names) {
+                if aliased {
+                    unknown.insert(owner.clone());
+                }
+                edges.entry(owner).or_default().extend(targets.iter().cloned());
+            }
+        }
+        let resolved = std::rc::Rc::new(ResolvedAncestry { edges, unknown });
+        *self.resolved_ancestry.borrow_mut() = Some((state, resolved.clone()));
+        resolved
+    }
+
+    /// The recorded names a path written in a body may name. `spellings` is
+    /// the path under each enclosing namespace, innermost first, then as
+    /// written; a rooted path is the one spelling `::X`. The innermost
+    /// spelling a source defines is Ruby's lexical answer. Without one, the
+    /// path may come through an ancestor's constants (`include Contactable`
+    /// finding `ApplicationRecord::Contactable`), so every recorded name it
+    /// ends is a candidate, as is the top-level one.
+    fn resolve_spellings(&self, spellings: &[String], names: &Names) -> Vec<String> {
+        let Some(written) = spellings.last() else { return Vec::new() };
+        if let Some(rooted) = written.strip_prefix("::") {
+            return vec![rooted.to_string()];
+        }
+        if let Some(lexical) = spellings[..spellings.len() - 1].iter().find(|s| self.values.contains_key(*s)) {
+            return vec![lexical.clone()];
+        }
+        let last = written.rsplit("::").next().unwrap_or(written);
+        let suffix = format!("::{written}");
+        let mut out: Vec<String> = names.by_last.get(last).into_iter().flatten().filter(|k| k.ends_with(&suffix)).cloned().collect();
+        out.push(written.clone());
+        out
     }
 
     /// The first segment of every name the app's recorded sources define
@@ -176,31 +271,39 @@ impl EnumConstants {
         let mut nested = crate::det::HashSet::default();
         let mut top_level = crate::det::HashSet::default();
         let mut segments = crate::det::HashSet::default();
+        let mut by_owner: crate::det::HashMap<String, crate::det::HashSet<String>> = Default::default();
+        let mut by_last: crate::det::HashMap<String, Vec<String>> = Default::default();
         for key in self.values.keys() {
-            let mut parts = key.split("::");
-            if let Some(first) = parts.next() {
-                top_level.insert(first.to_string());
-                segments.insert(first.to_string());
-            }
-            for part in parts {
-                nested.insert(part.to_string());
-                segments.insert(part.to_string());
+            let parts: Vec<&str> = key.split("::").collect();
+            by_last.entry(parts[parts.len() - 1].to_string()).or_default().push(key.clone());
+            top_level.insert(parts[0].to_string());
+            segments.insert(parts[0].to_string());
+            for i in 1..parts.len() {
+                nested.insert(parts[i].to_string());
+                segments.insert(parts[i].to_string());
+                by_owner.entry(parts[..i].join("::")).or_default().insert(parts[i].to_string());
             }
         }
-        let names = std::rc::Rc::new(Names { nested: nested.into(), top_level: top_level.into(), segments });
+        let names = std::rc::Rc::new(Names { nested: nested.into(), top_level: top_level.into(), segments, by_owner, by_last });
         *self.names.borrow_mut() = Some((self.values.len(), names.clone()));
         names
     }
 
     /// Only already-consumed original Ruby can add mutation facts here.
     /// Declaration admission remains the prepass's input roots. Revalidate
-    /// enum declarations only: no model replacement or unrelated diagnostics.
+    /// enum declarations and derived validation lists: no model replacement
+    /// or unrelated diagnostics.
     pub(in crate::ingest) fn validate_consumed_sources(
         &mut self,
         app: &crate::App,
         sources: &[crate::span::SourceFile],
         input_files: &crate::det::HashSet<std::path::PathBuf>,
     ) -> super::super::IngestResult<()> {
+        let validation_lists: Vec<_> = app.models.iter().filter_map(|model| {
+            let source = model.span.file.0.checked_sub(1).and_then(|index| sources.get(index as usize))?;
+            let lists = super::folded_enum_validation_lists(model, source, self);
+            (!lists.is_empty()).then_some((model, source, lists))
+        }).collect();
         for source in sources {
             let path = std::path::Path::new(&source.path);
             if path.extension().is_some_and(|extension| extension == "rb")
@@ -210,6 +313,15 @@ impl EnumConstants {
             }
         }
         self.finish();
+        for (model, source, before) in validation_lists {
+            let after = super::folded_enum_validation_lists(model, source, self);
+            if before.iter().any(|(span, values)| after.get(span) != Some(values)) {
+                super::super::survey::unwrap_or_record::<()>(Err(super::super::IngestError::Unsupported {
+                    file: source.path.clone(),
+                    message: "enum-derived inclusion list changed after loading source; validation cannot be statically lowered".into(),
+                }))?;
+            }
+        }
         for model in app.models.iter().filter(|model| !model.enums.is_empty()) {
             if let Some(source) = model.span.file.0.checked_sub(1)
                 .and_then(|index| sources.get(index as usize))
@@ -328,6 +440,62 @@ impl EnumConstants {
         Some((owner.to_string(), member.to_string(), table))
     }
 
+    pub(in crate::ingest) fn snapshot_constant_is_stable(&self, key: &str, owners: &[String]) -> bool {
+        let Some(name) = self.resolve_name(key, owners) else { return false };
+        let Some((owner, member)) = name.rsplit_once("::") else { return false };
+        let mut tainted = self.snapshot_taint.clone();
+        super::ConstTaint::close_aliases(&mut tainted, &self.snapshot_aliases);
+        self.namespace_chain_valid(&name)
+            && self.write_counts.get(&name) == Some(&1)
+            && self.owner_consts.get(owner).is_some_and(Option::is_some)
+            && !tainted.contains(member)
+            && !self.reflected.contains("Object")
+            && !owner.split("::").any(|segment| self.reflected.contains(segment))
+            && !self.snapshot_reflected.contains("Object")
+            && !owner.split("::").any(|segment| self.snapshot_reflected.contains(segment))
+    }
+
+    /// What the recorded sources (the app's, its path gems' and its source
+    /// gems') say `defined?(written)` answers in a class body whose lexical
+    /// owners are `owners`, innermost first: `Some(true)` when the constant
+    /// Ruby's lookup reaches is recorded, `Some(false)` when no recorded name
+    /// could be it (none ends in `written`), and `None` when one could only be
+    /// reached some other way (an ancestor's constant), is one segment
+    /// (Ruby predefines such names), or a nearer owner's
+    /// or one of `class`'s ancestors' first segment shadows the top level's.
+    /// The caller rules out what Ruby or the framework define without a source.
+    pub(in crate::ingest) fn guarded_constant(&self, written: &str, owners: &[String], class: &str) -> Option<bool> {
+        let bare = written.trim_start_matches("::");
+        if !written.starts_with("::") {
+            // Ruby reads the first segment lexically, innermost owner first: a
+            // nearer `Tracking` (`Post::Tracking`) is the one the rest is read
+            // under, whatever the top level holds.
+            let first = bare.split("::").next().unwrap_or(bare);
+            if let Some(owner) = owners.iter().find(|owner| self.values.contains_key(&format!("{owner}::{first}"))) {
+                return self.values.contains_key(&format!("{owner}::{bare}")).then_some(true);
+            }
+            // Then through the class's ancestors (its superclasses and what they
+            // and it include), before the top level: an ancestor's own `Tracking`
+            // (`ApplicationRecord::Tracking`) is not settled here.
+            if self.ancestor_names(class).contains(first) {
+                return None;
+            }
+        }
+        if self.values.contains_key(bare) {
+            return Some(true);
+        }
+        // One segment is never settled absent: Ruby predefines names no source
+        // records (`RUBY_VERSION`, `ENV`, `ARGV`, `DATA`, …).
+        if !bare.contains("::") {
+            return None;
+        }
+        let last = bare.rsplit("::").next().unwrap_or(bare);
+        let suffix = format!("::{bare}");
+        let names = self.names();
+        let reachable = names.by_last.get(last).into_iter().flatten().any(|k| k == bare || k.ends_with(&suffix));
+        (!reachable).then_some(false)
+    }
+
     /// Whether any recorded source defines a constant, class or module
     /// named `name` at any depth (`Regexp`, `Admin::Regexp`).
     pub(in crate::ingest) fn defines_name(&self, name: &str) -> bool {
@@ -385,7 +553,7 @@ mod names_tests {
 
     fn record(constants: &mut EnumConstants, names: &[&str]) {
         for name in names {
-            constants.values.insert(name.to_string(), EnumConstant::Unsupported);
+            constants.values.insert(name.to_string(), EnumConstant::Namespace);
         }
     }
 
@@ -414,6 +582,38 @@ mod names_tests {
             record(&mut constants, &["Billing::Regexp"]);
         }
         assert!(constants.defines_name("Regexp"));
+    }
+
+    #[test]
+    fn a_name_is_an_ancestors_only_under_an_owner_the_class_inherits_or_includes() {
+        let mut constants = EnumConstants::default();
+        record(&mut constants, &[
+            "Addressable::URI", "ROTP::OTP", "ROTP::TOTP", "ROTP::OTP::URI", "Kernel::Shade", "Concern", "Concern::Inner",
+            "User", "ViewComponent::Base", "ViewComponent::Slotable", "ViewComponent::Slotable::Slot",
+            "ApplicationRecord", "ApplicationRecord::Contactable", "ApplicationRecord::Contactable::Mark", "Person",
+        ]);
+        let edge = |c: &mut EnumConstants, owner: &[&str], target: &[&str]| {
+            c.ancestor_edges.push((owner.iter().map(|s| s.to_string()).collect(), target.iter().map(|s| s.to_string()).collect()));
+        };
+        edge(&mut constants, &["ROTP::TOTP"], &["ROTP::TOTP::OTP", "ROTP::OTP", "OTP"]);
+        edge(&mut constants, &["User"], &["User::ApplicationRecord", "ApplicationRecord"]);
+        edge(&mut constants, &["User"], &["User::Concern", "Concern"]);
+        edge(&mut constants, &["ApplicationRecord"], &["ApplicationRecord::ActiveRecord::Base", "ActiveRecord::Base"]);
+        edge(&mut constants, &["ViewComponent::Base"], &["ViewComponent::Base::Slotable", "ViewComponent::Slotable", "Slotable"]);
+        // `include Contactable` in Person finds ApplicationRecord's through the superclass.
+        edge(&mut constants, &["Person"], &["Person::ApplicationRecord", "ApplicationRecord"]);
+        edge(&mut constants, &["Person"], &["Person::Contactable", "Contactable"]);
+        let user = constants.ancestor_names("User");
+        assert!(!user.contains("URI") && !user.contains("Slot"));
+        assert!(user.contains("Shade") && user.contains("Inner"));
+        assert!(constants.ancestor_names("ROTP::TOTP").contains("URI"));
+        assert!(constants.ancestor_names("ViewComponent::Base").contains("Slot"));
+        assert!(constants.ancestor_names("Person").contains("Mark"));
+        constants.values.insert("Aliased".into(), EnumConstant::Unsupported);
+        edge(&mut constants, &["Aliasing"], &["Aliasing::Aliased", "Aliased"]);
+        assert!(constants.ancestor_names("Aliasing").contains("URI"), "an alias's module is not followed");
+        constants.unknown_ancestors.push(vec!["Concern".into()]);
+        assert!(constants.ancestor_names("User").contains("URI"));
     }
 
     #[test]

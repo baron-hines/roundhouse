@@ -24,6 +24,10 @@ pub(super) fn emit_assign(target: &LValue, value: &Expr) -> String {
         emit_expr(value)
     };
     match target {
+        // `_ = x`: Ruby's discard, which evaluates `x` and keeps nothing.
+        // Rust's `_` is a pattern, not a binding (`let mut _` is a
+        // syntax error), and it is never declared or read.
+        LValue::Var { name, .. } if name.as_str() == "_" => format!("let _ = {rhs}"),
         LValue::Var { name, .. } => {
             let name_str = name.as_str().to_string();
             // `local = @field`: Ruby copies a reference; Rust would move
@@ -114,9 +118,9 @@ pub(super) fn emit_assign(target: &LValue, value: &Expr) -> String {
                 // body = ""` declared as `&str` collides with the
                 // `String`-typed field at the Self literal site.
                 let annot = field_let_annotation(name.as_str());
-                return format!("let mut {name}{annot} = {rhs_coerced}");
+                return format!("let mut {}{annot} = {rhs_coerced}", crate::emit::rust::expr::util::escape_rust_keyword(name.as_str()));
             }
-            format!("self.{name} = {rhs_coerced}")
+            format!("self.{} = {rhs_coerced}", crate::emit::rust::expr::util::escape_rust_keyword(name.as_str()))
         }
         LValue::Attr { recv, name } => {
             // `self.x = ...` inside a module-singleton class method

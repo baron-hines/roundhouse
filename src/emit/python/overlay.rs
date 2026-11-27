@@ -57,9 +57,10 @@ pub struct OverlayLcs {
 pub fn lower_overlay(app: &App) -> OverlayLcs {
     let params_specs =
         crate::lower::controller_to_library::params::collect_specs(&app.controllers);
-    let (models, model_registry) = crate::lower::lower_models_with_registry_and_params(
+    let (models, model_registry) = crate::lower::lower_models_with_registry_params_and_views(
         &app.models,
         &app.schema,
+        &app.views,
         vec![],
         &params_specs,
     );
@@ -127,6 +128,7 @@ pub fn lower_overlay(app: &App) -> OverlayLcs {
         &app.models,
         fixture_extras,
         &crate::lower::routes::helper_id_segments(app),
+        &crate::lower::routes::direct_helper_names(app),
     );
     OverlayLcs { controllers, models, views, route_helpers, importmap, route_table, fixtures, tests }
 }
@@ -431,8 +433,12 @@ fn emit_fixtures(
 ) -> Result<String, String> {
     let mut body = String::new();
     for lc in fixtures {
+        let mut lc = lc.clone();
+        for m in &mut lc.methods {
+            call_method_writers(&mut m.body, models);
+        }
         body.push('\n');
-        body.push_str(&emit_library_class(lc)?);
+        body.push_str(&emit_library_class(&lc)?);
     }
     let mut out = String::from(HEADER);
     out.push_str(&stdlib_imports(&body));
@@ -452,6 +458,24 @@ fn emit_fixtures(
         ));
     }
     Ok(out)
+}
+
+/// A fixture's `record.x = v` where the models define `x=` only as a
+/// method (a column's own-typed writer over its `_raw` slot): the call
+/// the analyzer marks in an analyzed body, which a fixture body is not,
+/// so it reaches `x_set` rather than shadowing it with a field.
+fn call_method_writers(expr: &mut crate::expr::Expr, models: &[LibraryClass]) {
+    use crate::dialect::AccessorKind;
+    expr.node.for_each_child_mut(&mut |c| call_method_writers(c, models));
+    if let crate::expr::ExprNode::Send { recv: Some(recv), method, args, parenthesized, .. } = &mut *expr.node
+        && args.len() == 1
+        && method.as_str().ends_with('=')
+        && let Some(crate::ty::Ty::Class { id, .. }) = &recv.ty
+        && let Some(model) = models.iter().find(|lc| lc.name == *id)
+        && model.methods.iter().any(|m| m.name == *method && m.kind == AccessorKind::Method)
+    {
+        *parenthesized = true;
+    }
 }
 
 /// One emitted unittest file per test-module LC —
@@ -617,29 +641,24 @@ fn emit_dispatch(
          \x20   `flash` is the carried-in Flash (from the cookie); the\n\
          \x20   response's `flash` dict is what the action newly set\n\
          \x20   (Flash.to_persisted's diff), for the server to persist.\"\"\"\n\
-         \x20   # Strip a known format extension BEFORE matching, like the\n\
-         \x20   # crystal/ts server glue: an unconstrained `:id` segment\n\
-         \x20   # would otherwise capture \"1.json\" on the exact-match\n\
-         \x20   # pass (Router.match's own ext-retry only runs after an\n\
-         \x20   # exact miss).\n\
+         \x20   # The path as requested, extension included: Router.match\n\
+         \x20   # peels a registered `.ext` first, checks it against the\n\
+         \x20   # route's format requirement, and reports it as\n\
+         \x20   # params[\"format\"], as Rails' `(.:format)` does.\n\
          \x20   qs = \"\"\n\
          \x20   if \"?\" in path:\n\
          \x20       path, qs = path.split(\"?\", 1)\n\
-         \x20   fmt = None\n\
-         \x20   last = path.rsplit(\"/\", 1)[-1]\n\
-         \x20   if \".\" in last:\n\
-         \x20       base, ext = path.rsplit(\".\", 1)\n\
-         \x20       if Router.format_extension(ext):\n\
-         \x20           path, fmt = base, ext\n\
          \x20   m = Router.match(method, path, _route_table())\n\
          \x20   if m is None:\n\
          \x20       return None\n\
          \x20   p = _nest_params(dict(params or {}))\n\
          \x20   p.update(m.path_params)\n\
-         \x20   # Format: the stripped `.ext`; else the route's default\n\
-         \x20   # format; else anything the matcher's own ext-retry put in\n\
-         \x20   # params[\"format\"].\n\
-         \x20   fmt = fmt or m.req_format or p.get(\"format\") or \"html\"\n\
+         \x20   # Format: the path's extension, then the route's default,\n\
+         \x20   # then a `format` in the request's own params, as Rails'\n\
+         \x20   # path parameters win over request parameters\n\
+         \x20   # (`/feeds/1.xml` on `defaults: { format: :json }` is xml;\n\
+         \x20   # a body `format=html` on `/feeds/1` is json).\n\
+         \x20   fmt = m.path_params.get(\"format\") or m.req_format or p.get(\"format\") or \"html\"\n\
          \x20   c = dispatch(m.controller, m.action, params=p, flash=flash,\n\
          \x20                request_method=method, request_path=path,\n\
          \x20                request_format=fmt, query_string=qs)\n\

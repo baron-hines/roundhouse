@@ -86,6 +86,7 @@ module Cable
   # dispatch, cable branch included.
   def self.identify(req)
     conn = Cable.build_connection(ActionController::CookieJar.new(req.cookies))
+    conn.request = Cable.request_for(req)
     refused = false
     begin
       conn.connect
@@ -100,6 +101,31 @@ module Cable
       return nil
     end
     conn
+  end
+
+  def self.request_for(req)
+    request = ActionDispatch::Request.new
+    request.request_method = req.verb
+    request.path = req.path
+    request.query_string = req.raw_query
+    request.remote_ip = req.remote_host
+    request.host = req.req_headers.fetch("host", "localhost")
+    request.referer = req.req_headers.fetch("referer", "")
+    request.user_agent = req.req_headers.fetch("user-agent", "")
+    request.env["REQUEST_METHOD"] = req.verb
+    request.env["PATH_INFO"] = req.path
+    request.env["QUERY_STRING"] = req.raw_query
+    request.env["REMOTE_ADDR"] = req.remote_host
+    request.env["roundhouse.listener"] = req.listener_transport
+    req.req_headers.each do |name, value|
+      request.env[ActionDispatch::Http::Headers.env_name_from_header(name)] = value
+    end
+    query = ParamBuilder.from_query_string(req.raw_query)
+    unless query.nil?
+      request.query_parameters = query
+      query.each { |key, value| request.params[key] = value }
+    end
+    request
   end
 
   # THE CHANNEL A SUBSCRIBE FRAME NAMES — `ActionCable::Channel.build`,
@@ -135,7 +161,7 @@ module Cable
   # its subscription table on the identifier and retries a subscription
   # it never heard back about, so a dropped frame is a reconnect loop.
   def self.subscribe(ws, connection, identifier, holder)
-    name = ActionCable::Channel::Parameters.read(identifier, "channel")
+    name = ActionCable::Channel::Parameters.read(identifier, "channel").to_s
     if name.length == 0
       return Cable.reject(ws, identifier)
     end
@@ -172,7 +198,7 @@ module Cable
       Tep::APP.cable_lock.synchronize do
         Tep::APP.cable_identifiers[stream] = identifier
       end
-      Tep::Broadcast.subscribe_ws(stream, ws)
+      Tep::Broadcast.subscribe_ws(stream, ws, identifier)
     end
     # REMEMBERED, and only once the subscription is confirmed. The
     # unsubscribe callbacks are the other half of a connect storm —
@@ -733,6 +759,11 @@ module Cable
   # under the heartbeat's database lease.
   class Socket
     attr_accessor :ws
+
+    def stop_streams(identifier)
+      Tep::Broadcast.unsubscribe_ws(@ws, identifier)
+      nil
+    end
 
     def transmit(data)
       @ws.text(ActionCable.payload_json(data))

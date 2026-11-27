@@ -10,6 +10,10 @@
 //! only reads the constant, defines a top-level constant of its own, or
 //! calls the owner, leaves the fold alone.
 
+#[path = "support/prerequisite.rs"]
+mod prerequisite;
+#[path = "support/scratch.rs"]
+mod scratch;
 #[path = "support/emit_and_run.rs"]
 #[allow(dead_code)]
 mod emit_and_run;
@@ -102,7 +106,7 @@ fn an_initializer_that_only_reads_keeps_the_fold() {
 fn rails_reads_the_initializers_value() {
     let probe = r#"gem "activerecord", "8.1.4"; gem "actionpack", "8.1.4"; require "active_record"; require "action_controller"; require "sqlite3""#;
     if !Command::new("ruby").args(["-e", probe]).status().is_ok_and(|s| s.success()) {
-        eprintln!("skipping: ruby with activerecord/actionpack 8.1.4 and sqlite3 not available");
+        prerequisite::missing("ruby with activerecord/actionpack 8.1.4 and sqlite3 not available");
         return;
     }
     let expected = [("news", true, true), ("news", false, false), ("news", false, false), ("news", false, false), ("news", false, false), ("news", false, false)];
@@ -189,8 +193,7 @@ fn an_alias_one_initializer_writes_and_another_mutates() {
 #[test]
 fn an_unreadable_boot_directory_is_an_error() {
     use std::os::unix::fs::PermissionsExt;
-    let root = std::env::temp_dir().join(format!("roundhouse-boot-unreadable-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = scratch::dir("roundhouse-boot-unreadable");
     let routes = "Rails.application.routes.draw do\nend\n";
     for (path, body) in [
         ("db/schema.rb", "ActiveRecord::Schema[8.1].define(version: 1) do\n  create_table \"widgets\", force: :cascade do |t|\n    t.string \"kind\"\n  end\nend\n"),

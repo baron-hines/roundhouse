@@ -1,3 +1,7 @@
+#[path = "../support/prerequisite.rs"]
+mod prerequisite;
+#[path = "../support/scratch.rs"]
+mod scratch;
 use super::emit_and_run;
 
 /// `validates :attr, acceptance:`. Rails' `AcceptanceValidator` adds
@@ -124,8 +128,7 @@ puts "attribute acceptance passed"
 /// runs it, reports nothing.
 #[test]
 fn acceptance_on_a_boolean_attribute_is_a_strict_target_gap() {
-    let root = std::env::temp_dir().join(format!("roundhouse-acceptance-cli-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = scratch::dir("roundhouse-acceptance-cli");
     for (path, body) in [
         ("app/models/application_record.rb", APPLICATION_RECORD),
         ("app/models/signup.rb", SIGNUP),
@@ -222,7 +225,7 @@ fn acceptance_on_an_undeclared_attribute_matches_rails() {
 fn rails_answers_the_undeclared_acceptance_table() {
     let probe = r#"gem "activerecord", "8.1.4"; require "active_record"; require "sqlite3""#;
     if !std::process::Command::new("ruby").args(["-e", probe]).status().is_ok_and(|s| s.success()) {
-        eprintln!("skipping: ruby with activerecord 8.1.4 and sqlite3 not available");
+        prerequisite::missing("ruby with activerecord 8.1.4 and sqlite3 not available");
         return;
     }
     let script = format!(

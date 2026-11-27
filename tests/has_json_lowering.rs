@@ -98,9 +98,10 @@ fn accessors_render_over_the_serialized_column() {
     );
     // The column reader stays a storage read: `@settings` holds the
     // serialized text hydration and the adapter move. Schema-key reads
-    // use their separate typed accessors.
+    // use their separate typed accessors. A partial select's left-out
+    // column raises first (`lower::missing_attribute`).
     assert!(
-        src.contains("def settings\n    @settings\n  end"),
+        src.contains("def settings\n    _missing_attribute(:settings) if @__unloaded_columns\n    @settings\n  end"),
         "the column reader stays the storage read:\n{src}"
     );
 }

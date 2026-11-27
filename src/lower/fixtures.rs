@@ -168,6 +168,9 @@ fn resolve_field_inner(
                     // — which compares against `1` — answered false, so
                     // every test that signs in as an admin failed its
                     // first assertion.
+                    if let Some(array) = stored_array_value(model, key, raw, ty, app) {
+                        return Some(vec![LoweredFixtureField { column: key.clone(), value: LoweredFixtureValue::Ruby(array) }]);
+                    }
                     let (ty, raw) = enum_stored_value(model, key, raw)
                         .unwrap_or_else(|| (ty.clone(), raw.clone()));
                     LoweredFixtureValue::Literal { ty, raw }
@@ -372,6 +375,36 @@ fn is_string_column(ty: &Ty) -> bool {
 /// still gets wrong, and it is named here rather than silently rounded
 /// off — the cast is a runtime branch on the value, not a wrap the
 /// lowering can apply statically.
+/// A YAML sequence for a stored array column (`lower::array_columns`),
+/// which ingest carries as its JSON text, as the Array literal the
+/// record keeps: the loader's save then writes it through
+/// `ArrayColumn.dump`, as Rails casts it through the column type. Only
+/// elements of the column's kind (integers or strings) are carried.
+fn stored_array_value(model: &Model, column: &Symbol, raw: &str, ty: &Ty, app: &App) -> Option<Expr> {
+    use crate::lower::typing::{lit_int, lit_str, with_ty};
+    let col = app.schema.tables.get(&model.table.0)?.columns.iter().find(|c| &c.name == column)?;
+    if !col.array_stored {
+        return None;
+    }
+    let serde_json::Value::Array(elements) = serde_json::from_str::<serde_json::Value>(raw).ok()? else { return None };
+    let ints = matches!(col.col_type, crate::schema::ColumnType::Integer | crate::schema::ColumnType::BigInt);
+    let elements = elements
+        .iter()
+        .map(|e| match e {
+            serde_json::Value::String(s) if !ints => Some(lit_str(s.clone())),
+            _ if ints => e.as_i64().map(lit_int),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(with_ty(
+        Expr::new(
+            crate::span::Span::synthetic(),
+            crate::expr::ExprNode::Array { elements, style: crate::expr::ArrayStyle::Brackets },
+        ),
+        ty.clone(),
+    ))
+}
+
 fn erb_value_for_column(expr: &Expr, ty: &Ty) -> Expr {
     if !is_string_column(ty) {
         return expr.clone();

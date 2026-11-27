@@ -11,18 +11,21 @@ use crate::effect::EffectSet;
 use crate::expr::{Expr, ExprNode, Literal};
 use crate::ident::{ClassId, Symbol, VarId};
 use crate::span::Span;
-use crate::ty::{ParamKind, Ty};
+use crate::ty::{FnTy, ParamKind, Ty};
 
 /// A single builder-yielding call, with the caller's block forwarded through.
 pub(crate) struct FormWrapperHelper {
     pub(super) params: Vec<(Symbol, Option<Expr>)>,
+    pub(super) keyword_rest: bool,
     pub(super) call: Expr,
 }
 
-fn wrapped_call(m: &MethodDef) -> Option<&Expr> {
+fn wrapped_call(m: &MethodDef, native_keywords: bool) -> Option<&Expr> {
     let blk = m.block_param.as_ref()?;
     if m.unsupported_formals.is_some()
-        || m.params.iter().any(|p| p.rest || p.keyword || p.forwarding)
+        || m.params.iter().any(|p| {
+            p.forwarding || if native_keywords { p.rest != p.keyword } else { p.rest || p.keyword }
+        })
     {
         return None;
     }
@@ -52,7 +55,7 @@ pub(super) fn form_wrapper_helpers(app: &App) -> HashMap<String, FormWrapperHelp
             if app.helper_method_index.get(&m.name) != Some(&lc.name) {
                 continue;
             }
-            let Some(body) = wrapped_call(m) else { continue };
+            let Some(body) = wrapped_call(m, app.native_library_keywords) else { continue };
             let mut call = body.clone();
             if let ExprNode::Send { block, .. } = &mut *call.node {
                 *block = None;
@@ -60,7 +63,15 @@ pub(super) fn form_wrapper_helpers(app: &App) -> HashMap<String, FormWrapperHelp
             out.insert(
                 m.name.as_str().to_string(),
                 FormWrapperHelper {
-                    params: m.params.iter().map(|p| (p.name.clone(), p.default.clone())).collect(),
+                    params: m.params.iter().map(|p| {
+                        let default = if p.keyword && p.rest {
+                            Some(Expr::new(m.name_span, ExprNode::Hash { entries: vec![], kwargs: false }))
+                        } else {
+                            p.default.clone()
+                        };
+                        (p.name.clone(), default)
+                    }).collect(),
+                    keyword_rest: m.params.last().is_some_and(|p| p.keyword && p.rest),
                     call,
                 },
             );
@@ -105,7 +116,7 @@ pub(crate) fn preserve_argument_owners(app: &mut App, registry: &HashMap<ClassId
             {
                 continue;
             }
-            let Some(call) = wrapped_call(m) else { continue };
+            let Some(call) = wrapped_call(m, app.native_library_keywords) else { continue };
             let ExprNode::Send { args, .. } = &*call.node else { unreachable!() };
             let mut args = args.clone();
             for arg in &mut args {
@@ -131,12 +142,15 @@ pub(crate) fn preserve_argument_owners(app: &mut App, registry: &HashMap<ClassId
                         continue;
                     }
                     let Some(ret) = value.ty.clone() else { continue };
-                    let Some(Ty::Fn { params: sig_params, .. }) = &m.signature else { continue };
+                    let Some(Ty::Fn(fn_ty)) = &m.signature else { continue };
+                    let FnTy { params: sig_params, .. } = &**fn_ty;
                     let mut bridge = m.clone();
                     bridge.params.retain(|p| reads.contains(&p.name));
                     let mut params = Vec::new();
                     for p in &mut bridge.params {
                         p.default = None;
+                        p.keyword = false;
+                        p.rest = false;
                         p.from_keyword = false;
                         p.from_kwrest = false;
                         let Some(sig) = sig_params.iter().find(|sig| sig.name == p.name) else {
@@ -180,12 +194,12 @@ pub(crate) fn preserve_argument_owners(app: &mut App, registry: &HashMap<ClassId
                             arg
                         })
                         .collect();
-                    bridge.signature = Some(Ty::Fn {
+                    bridge.signature = Some(Ty::Fn(Box::new(FnTy {
                         params: params.into(),
                         block: None,
                         ret: std::sync::Arc::new(ret),
                         effects: effects.clone(),
-                    });
+                    })));
                     let recv = Expr::new(
                         value.span,
                         ExprNode::Const {
@@ -265,7 +279,7 @@ fn inspect_argument(
         | ExprNode::StringInterp { .. } => {}
         _ => return false,
     }
-    effects.effects.extend(e.effects.effects.iter().cloned());
+    effects.extend(e.effects.effects().iter().cloned());
     let mut valid = true;
     e.node.for_each_child(&mut |child| {
         valid &= inspect_argument(child, own_names, reads, needs_owner, effects);

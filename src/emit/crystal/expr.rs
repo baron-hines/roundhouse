@@ -202,11 +202,74 @@ fn renders_as_trailing_modifier(e: &Expr) -> bool {
 }
 
 fn emit_arg(e: &Expr) -> String {
+    wrap_arg(e, emit_expr(e))
+}
+
+/// Make `s`, the rendering of `e`, parse as a call argument, index,
+/// array element or hash value. A postfix `if` gets parentheses. A
+/// value-position `if` that rendered as a block (`if c\n a\nelse\n
+/// b\nend`) is a Crystal syntax error inside `[...]`, so it becomes
+/// `(c ? a : b)` when every part is a one-line expression, and the
+/// parenthesized block `(if ... end)` otherwise. Assignment and
+/// statement positions keep the block form.
+fn wrap_arg(e: &Expr, s: String) -> String {
     if renders_as_trailing_modifier(e) {
-        format!("({})", emit_expr(e))
-    } else {
-        emit_expr(e)
+        return format!("({s})");
     }
+    if let ExprNode::If { cond, then_branch, else_branch } = &*e.node {
+        if let Some(t) = inline_ternary(cond, then_branch, else_branch) {
+            return t;
+        }
+        if s.contains('\n') {
+            return format!("({s})");
+        }
+    }
+    s
+}
+
+/// A setter call (`obj.value = 1`, `h[k] = v`): an assignment that `?:`
+/// would bind wrongly. The comparison operators that end in `=` are not
+/// setters.
+fn is_setter_send(e: &Expr) -> bool {
+    match &*e.node {
+        ExprNode::Send { method, .. } => {
+            let m = method.as_str();
+            m.ends_with('=') && !matches!(m, "==" | "!=" | "<=" | ">=" | "===")
+        }
+        _ => false,
+    }
+}
+
+/// `(c ? a : b)` for an `if`/`else` whose condition and branches each
+/// render as one plain line; `None` when any part would need the block
+/// form (multi-line, empty, an `if` / rescue modifier, or a statement
+/// such as an assignment, range or jump that `?:` would bind wrongly).
+fn inline_ternary(cond: &Expr, then_branch: &Expr, else_branch: &Expr) -> Option<String> {
+    let plain = |x: &Expr| {
+        !matches!(
+            &*x.node,
+            ExprNode::If { .. }
+                | ExprNode::RescueModifier { .. }
+                | ExprNode::Seq { .. }
+                | ExprNode::Assign { .. }
+                | ExprNode::OpAssign { .. }
+                | ExprNode::MultiAssign { .. }
+                | ExprNode::Range { .. }
+                | ExprNode::Return { .. }
+                | ExprNode::Next { .. }
+                | ExprNode::Break { .. }
+                | ExprNode::Raise { .. }
+        ) && !is_setter_send(x)
+    };
+    if is_empty_branch(else_branch) || ![cond, then_branch, else_branch].into_iter().all(plain) {
+        return None;
+    }
+    let parts = [emit_expr(cond), emit_expr(then_branch), emit_expr(else_branch)];
+    if parts.iter().any(|p| p.is_empty() || p.contains('\n')) {
+        return None;
+    }
+    let [c, a, b] = parts;
+    Some(format!("({c} ? {a} : {b})"))
 }
 
 /// Map Ruby stdlib type names that don't exist in Crystal to their
@@ -372,7 +435,9 @@ fn emit_node(n: &ExprNode) -> String {
             emit_bool_op(*op, *surface, left, right)
         }
         ExprNode::Let { name, value, body, .. } => {
-            format!("{name} = {}\n{}", emit_expr(value), emit_expr(body))
+            // Parenthesized, so the binding and its body are one value
+            // inside an array, a call's arguments or a Hash.
+            format!("({name} = {}\n{})", emit_expr(value), emit_expr(body))
         }
         ExprNode::Lambda { params, block_param, body, .. } => {
             // Crystal procs require typed params. The lowered IR
@@ -535,7 +600,7 @@ fn emit_node(n: &ExprNode) -> String {
             // simple-Symbol literals. Hand-written calls that
             // already pass a typed Hash variable, or non-Hash args,
             // fall through to the standard emit.
-            if (method.as_str() == "new" || method.as_str() == "create")
+            if matches!(method.as_str(), "new" | "create" | "create!")
                 && args.len() == 1
             {
                 if let Some(r) = recv {
@@ -843,7 +908,13 @@ fn emit_bool_op(
     if matches!(op, BoolOpKind::Or) {
         return format!("{} {} {}", emit_or_left(left), op_s, emit_expr(right));
     }
-    format!("{} {} {}", emit_expr(left), op_s, emit_expr(right))
+    // `&&` binds tighter than `||` here as in Ruby, so an `||` operand
+    // (`a && (b || c)`, `(a || b) && c`) keeps its parentheses.
+    let operand = |e: &Expr| match &*e.node {
+        ExprNode::BoolOp { op: BoolOpKind::Or, .. } => format!("({})", emit_expr(e)),
+        _ => emit_expr(e),
+    };
+    format!("{} {} {}", operand(left), op_s, operand(right))
 }
 
 /// The left side of `||`, a Hash read as `hash[k]?` so a missing key is nil and the default runs.
@@ -852,7 +923,7 @@ fn emit_or_left(left: &Expr) -> String {
         if method.as_str() == "[]" && !args.is_empty() {
             let recv_ty = recv.ty.as_ref().map(unwrap_nilable_union);
             if matches!(recv_ty, Some(crate::ty::Ty::Hash { .. })) {
-                let arg_strs: Vec<String> = args.iter().map(emit_expr).collect();
+                let arg_strs: Vec<String> = args.iter().map(emit_arg).collect();
                 return format!("{}[{}]?", emit_expr(recv), arg_strs.join(", "));
             }
         }
@@ -925,9 +996,9 @@ fn emit_array(elements: &[Expr], _style: &crate::expr::ArrayStyle) -> String {
 ///   - A single argument that's a non-empty Hash literal with all
 ///     simple-Symbol keys.
 ///
-/// `.new` produces: `(__inst = Cls.new(hash); __inst.k1 = v1; …; __inst)`
+/// `.new` produces: `(__v_k1 = v1; …; __inst = Cls.new({:k1 => __v_k1, …}); __inst.k1 = __v_k1; …; __inst)`
 /// `.create` adds an explicit `.save` after the assigns and still
-/// returns the instance.
+/// returns the instance; `.create!` raises `RecordInvalid` when it fails.
 ///
 /// The hash is passed through to `.new` (in addition to the per-
 /// field assigns) so classes with a user-defined `initialize(attrs)`
@@ -991,22 +1062,31 @@ fn try_emit_new_or_create_per_field(
         if !is_simple_method_name(name) {
             return None;
         }
-        field_assigns.push((name.to_string(), emit_expr(v)));
+        field_assigns.push((name.to_string(), emit_expr_with_form_hint(v, true)));
     }
-    // Emit the original hash literal (in hashrocket form so it
-    // satisfies AR-inherited `Hash[Symbol, _]` signatures rather
-    // than Crystal's NamedTuple shorthand) so user-defined
-    // `initialize(attrs)` still sees the data. Use the existing
-    // forced-hash emitter via `emit_expr_with_form_hint` so nested
-    // hash values flip too.
-    let hash_arg_s = emit_expr_with_form_hint(arg, true);
+    // Pass the hash too (in hashrocket form so it satisfies
+    // AR-inherited `Hash[Symbol, _]` signatures rather than Crystal's
+    // NamedTuple shorthand) so user-defined `initialize(attrs)` still
+    // sees the data; each value goes through the forced-hash emitter so
+    // a nested hash flips too. Each is evaluated once, into a local the
+    // hash and its setter both read (`create!(code: next_code)` calls
+    // it once).
     let mut body = String::new();
-    body.push_str(&format!("__inst = {}.new({})\n", class_name, hash_arg_s));
     for (field, value_s) in &field_assigns {
-        body.push_str(&format!("__inst.{} = {}\n", field, value_s));
+        body.push_str(&format!("__v_{field} = {value_s}\n"));
+    }
+    let hash_arg_s = format!(
+        "{{{}}}",
+        field_assigns.iter().map(|(field, _)| format!(":{field} => __v_{field}")).collect::<Vec<_>>().join(", ")
+    );
+    body.push_str(&format!("__inst = {}.new({})\n", class_name, hash_arg_s));
+    for (field, _) in &field_assigns {
+        body.push_str(&format!("__inst.{field} = __v_{field}\n"));
     }
     if method == "create" {
         body.push_str("__inst.save\n");
+    } else if method == "create!" {
+        body.push_str("raise ActiveRecord::RecordInvalid.new(__inst) unless __inst.save\n");
     }
     body.push_str("__inst");
     Some(format!("begin\n{}\nend", indent_lines(&body, 1)))
@@ -1312,14 +1392,21 @@ pub(super) fn emit_send_base(
     args: &[Expr],
     parenthesized: bool,
 ) -> String {
+    // Operator sends (`a + b`, `parts << x`) render infix, and the
+    // value of `h[k] = v` is an assignment position: a block `if`
+    // parses there, so only a postfix `if` needs wrapping. Index and
+    // call-argument positions get the full `wrap_arg` treatment.
+    let m = method.as_str();
+    let infix = !m.starts_with(|c: char| c.is_alphabetic() || c == '_') && m != "[]" && m != "[]=";
     let args_s: Vec<String> = args
         .iter()
-        .map(|a| {
+        .enumerate()
+        .map(|(i, a)| {
             let s = emit_expr_with_form_hint(a, force_hash_form_for_arg(recv, method));
-            if renders_as_trailing_modifier(a) {
-                format!("({s})")
+            if infix || (m == "[]=" && i + 1 == args.len()) {
+                if renders_as_trailing_modifier(a) { format!("({s})") } else { s }
             } else {
-                s
+                wrap_arg(a, s)
             }
         })
         .collect();
@@ -1663,9 +1750,15 @@ pub(super) fn emit_send_base(
             // `parent.nil?` check turns into `parent.not_nil!.nil?`
             // — always false — and the surrounding `return if` is
             // dead code.
-            let recv_s = if is_nilable_class_union(r.ty.as_ref())
+            // A nilable String (a nullable string column, `String | Nil`)
+            // takes the same `.not_nil!` for the String methods nil has
+            // no answer for in Ruby: they raise on nil there too.
+            let nilable_string_method = is_nilable_str_union(r.ty.as_ref())
+                && matches!(method.as_str(), "empty?" | "length" | "size");
+            let recv_s = if (is_nilable_class_union(r.ty.as_ref())
                 && is_simple_method_name(method.as_str())
-                && !is_nil_safe_dispatch(method.as_str())
+                && !is_nil_safe_dispatch(method.as_str()))
+                || nilable_string_method
             {
                 format!("{recv_s}.not_nil!")
             } else {
@@ -1720,6 +1813,14 @@ fn is_nilable_class_union(ty: Option<&Ty>) -> bool {
     let has_nil = variants.iter().any(|v| matches!(v, Ty::Nil));
     let has_class = variants.iter().any(|v| matches!(v, Ty::Class { .. }));
     has_nil && has_class
+}
+
+/// `String | Nil`: a nilable String, such as a nullable string column.
+fn is_nilable_str_union(ty: Option<&Ty>) -> bool {
+    let Some(Ty::Union { variants }) = ty else { return false; };
+    variants.len() == 2
+        && variants.iter().any(|v| matches!(v, Ty::Nil))
+        && variants.iter().any(|v| matches!(v, Ty::Str))
 }
 
 /// Method names that are part of Crystal's / Ruby's null-safety
@@ -1910,7 +2011,7 @@ fn emit_lvalue(lv: &LValue) -> String {
         LValue::Var { name, .. } => escape_ident(name.as_str()),
         LValue::Ivar { name } => format!("@{name}"),
         LValue::Attr { recv, name } => format!("{}.{name}", emit_expr(recv)),
-        LValue::Index { recv, index } => format!("{}[{}]", emit_expr(recv), emit_expr(index)),
+        LValue::Index { recv, index } => format!("{}[{}]", emit_expr(recv), emit_arg(index)),
         LValue::Const { path } => path.iter().map(|s| s.as_str().to_string()).collect::<Vec<_>>().join("::"),
     }
 }

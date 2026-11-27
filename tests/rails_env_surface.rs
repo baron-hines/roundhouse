@@ -5,6 +5,8 @@
 //! `File.dirname`; `warn`. The native control loads the Rails
 //! `tests/support/rails_oracle.rb` picks (`RH_RAILS_ORACLE`).
 
+#[path = "support/prerequisite.rs"]
+mod prerequisite;
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
@@ -23,7 +25,7 @@ fn oracle_available() -> bool {
     let answer = String::from_utf8_lossy(&probe.stdout).trim().to_string();
     assert!(probe.status.success() && (answer == "true" || answer == "false"), "oracle probe failed: {answer}\n{}", String::from_utf8_lossy(&probe.stderr));
     if answer == "false" {
-        eprintln!("skipping: the Rails oracle's activesupport is not available");
+        prerequisite::missing("the Rails oracle's activesupport is not available");
     }
     answer == "true"
 }

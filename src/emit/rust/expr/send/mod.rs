@@ -13,7 +13,7 @@ mod index;
 mod ops;
 
 pub(crate) use coerce::coerce_arg_for_param_ty;
-pub(super) use coerce::{cast_via_value_for_union, coerce_arg_for_field_ty};
+pub(super) use coerce::{cast_via_value_for_union, coerce_arg_for_field_ty, time_into_value};
 
 use coerce::coerce_arg_for_class_method;
 use dispatch::external_class_method_param_tys;
@@ -38,6 +38,9 @@ pub(super) fn emit_send(
     if let Some(recv) = crate::emit::shared::fn_call::function_receiver(recv, method, block) {
         let args_s: Vec<String> = args.iter().map(emit_expr).collect();
         return format!("{}({})", emit_expr(recv), args_s.join(", "));
+    }
+    if let Some(answer) = model_respond_to(recv, method, args, block) {
+        return answer;
     }
     // Ruby implicit-self resolves a bare identifier to the enclosing
     // method's parameter when one shares the name (e.g. view partial
@@ -77,7 +80,7 @@ pub(super) fn emit_send(
             if let ExprNode::Const { path } = &*r.node {
                 if path.last().map(|s| s.as_str()) == Some("ActiveSupport") {
                     let arg = match &*args[0].node {
-                        ExprNode::Ivar { name } => format!("&self.{}", name.as_str()),
+                        ExprNode::Ivar { name } => format!("&self.{}", crate::emit::rust::expr::util::escape_rust_keyword(name.as_str())),
                         _ => format!("&({})", emit_expr(&args[0])),
                     };
                     return format!("crate::rh_datetime::parse_db_time({arg})");
@@ -296,7 +299,9 @@ pub(super) fn emit_send(
             _ => false,
         };
         if recv_is_option {
-            return format!("{}.map(|v| v.to_string()).unwrap_or_default()", emit_expr(r));
+            // `.as_ref()` borrows: a param read again later (a partial
+            // handed the caller's `notice`) must not be moved by `map`.
+            return format!("{}.as_ref().map(|v| v.to_string()).unwrap_or_default()", emit_expr(r));
         }
     }
     // Static-method routing: `self.method(args)` where `method` was
@@ -344,10 +349,12 @@ pub(super) fn emit_send(
                 }
             }
         }
-        if coerced.is_empty() {
-            return format!("Self::{rewritten_method}()");
-        }
-        return format!("Self::{rewritten_method}({})", coerced.join(", "));
+        // A module-mode method is a free function: there is no `Self`
+        // to dispatch through, and its siblings are reached through the
+        // module — `self::name`, which a parameter or local of the same
+        // name cannot shadow, as it would a bare `name(…)`.
+        let path = if super::in_free_function() { "self::" } else { "Self::" };
+        return format!("{path}{rewritten_method}({})", coerced.join(", "));
     }
     // Callee-back-propagation for two recv shapes:
     //
@@ -805,4 +812,41 @@ fn raised_class_name(path: &[crate::ident::Symbol]) -> String {
 
 fn is_core_exception(name: &str) -> bool {
     matches!(name, "StandardError" | "Exception" | "TypeError" | "NameError" | "NoMethodError" | "KeyError" | "RangeError" | "ZeroDivisionError" | "FrozenError" | "StopIteration")
+}
+
+/// `record.respond_to?(:name)` on a model, answered at emit time from
+/// the emitted program, as `defined_const_fold` answers `defined?`: the
+/// model's lowered methods (its column readers and writers, associations
+/// and the app's own `def`s), the transpiled `ActiveRecord::Base`, and
+/// the methods the Rust model shim adds. A Rust struct has no runtime
+/// method table to ask. The receiver is still evaluated once, for any
+/// effect it has. Anything else (a computed name, a receiver that is not
+/// a model) keeps the ordinary dispatch.
+fn model_respond_to(recv: Option<&Expr>, method: &str, args: &[Expr], block: Option<&Expr>) -> Option<String> {
+    use crate::expr::Literal;
+    if method != "respond_to?" || block.is_some() {
+        return None;
+    }
+    let recv = recv?;
+    let [arg] = args else { return None };
+    let ExprNode::Lit { value: Literal::Sym { value: name } } = &*arg.node else { return None };
+    let Some(crate::ty::Ty::Class { id, .. }) = recv.ty.as_ref() else { return None };
+    let ctx = super::current_emit_ctx()?;
+    let class = id.0.as_str().rsplit("::").next().unwrap_or(id.0.as_str());
+    let methods = ctx.global_class_methods.get(class)?;
+    // A model: the lowered class carries its table.
+    if !methods.contains_key("table_name") {
+        return None;
+    }
+    // Instance methods only: `global_class_methods` also holds class
+    // methods (`Shelf.labelled`, `Base.find`), which an instance does
+    // not respond to.
+    let name = name.as_str();
+    let instance_has = |class: &str| {
+        ctx.global_instance_methods.get(class).is_some_and(|ms| ms.contains(name))
+    };
+    let responds = instance_has(class)
+        || instance_has("Base")
+        || crate::emit::rust::MODEL_SHIM_INSTANCE_METHODS.contains(&name);
+    Some(format!("{{ let _ = &({}); {responds} }}", emit_expr(recv)))
 }

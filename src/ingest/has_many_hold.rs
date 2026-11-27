@@ -5,19 +5,60 @@
 //! foreign key. `<<` on a persisted owner sets the key and saves the
 //! record at once (an invalid one stays unsaved); on a new owner it is
 //! held like a built one. A new owner's reader answers the records it
-//! holds.
+//! holds, and a record created through the association is held too, so a
+//! read answers the same object. On a LOADED association the created
+//! record joins the loaded target as Rails' `add_to_target` adds it, so
+//! the reader that answers `@<name>_cache` shows it. A held UNSAVED one
+//! stays out of that cache: the terminals and `destroy_all` reach it
+//! through `__held_<name>_unsaved`, and counting it in both places would
+//! count it twice.
 //!
-//! On the ruby family ([`expand`]), each has_many that app code builds on
-//! or pushes onto (`<name>.build` / `<name> << record`, by name) gets
+//! Only a record that is still NEW is validated and saved with a
+//! persisted owner, as Rails' `associated_records_to_validate_or_save`
+//! answers the whole target for a new owner and otherwise just
+//! `target.find_all(&:new_record?)`. A held record that is already
+//! persisted is therefore neither re-validated nor re-saved when the
+//! owner saves.
+//!
+//! On the ruby family ([`expand`]), each has_many that app code creates,
+//! builds, pushes onto or updates in place, by name (`<name>.build`,
+//! `<name> << record`, `<name>.create!`, `<name>.update(…)`), gets
 //! model source, after its declaration:
 //!
 //! ```ruby
 //! def __hold_tasks(record)        # a lowered `tasks.build(…)` passes its record
 //! def __push_tasks(record)        # a lowered `tasks << record`
-//! validate :__held_tasks_valid    # each held record valid, else `errors.add(:tasks, :invalid)`
-//! after_save :__held_tasks_save   # each held record saved, with the key
+//! def __tasks_update(attrs)       # a lowered `tasks.update(…)`
+//! validate :__held_tasks_valid    # each held record still new is valid, else `errors.add(:tasks, :invalid)`
+//! after_save :__held_tasks_save   # each held record still new is saved, with the key
 //! after_save_commit :__held_tasks_committed  # the held list cleared once the save commits
+//! def __tasks_first(rel)          # and _last, _size, _length, _empty?, _any?, _destroy_all
+//! def tasks=(records)             # app code assigns it: Rails' replace
 //! ```
+//!
+//! Rails answers a collection's `first`/`last` from its loaded target
+//! when unsaved records are in it (`find_from_target?`), adds them to
+//! `size` (`unsaved_records.size + count_records`), and destroys them
+//! with the rest in `destroy_all`. The terminals take the seeded relation
+//! and answer the held records that are still new along with it;
+//! `count` and the finders stay the query's, as Rails' do. A new owner's
+//! target is the held list alone (Rails doesn't query for an unsaved
+//! owner), and `destroy_all` leaves the association unloaded.
+//!
+//! The writer is Rails' `replace`: on a new owner the records are held,
+//! as pushed ones are. On a persisted owner, in a transaction, each
+//! current record not among them is removed per `dependent:` (destroyed,
+//! deleted, or else its key nulled in the table without callbacks, as
+//! Rails' nullify is, the loaded record left as it was), and each new one is pushed (key set, saved), raising
+//! `RecordNotSaved` when a save fails. A `dependent: :destroy` removal
+//! is `destroy!`, so a callback's abort raises and rolls it all back. A
+//! built record is already in the target: one the list keeps stays held
+//! and unsaved, and one it leaves out is dropped. The association is then
+//! loaded with the records, held ones included, so a read enumerates them;
+//! the terminals add only the held records the loaded target doesn't
+//! already have. A record pushed onto a persisted owner is saved and the
+//! association unloaded, so the next read sees it. A scoped has_many
+//! keeps no writer here.
 //!
 //! `lower::scope_chain` routes the calls there, and the reader's unsaved
 //! guard answers the held records, for a model that has them.
@@ -25,16 +66,19 @@
 use std::collections::BTreeSet;
 
 use crate::app::App;
-use crate::dialect::{Association, ModelBodyItem};
+use crate::dialect::{Association, Dependent, ModelBodyItem};
 use crate::expr::{Expr, ExprNode};
 
-/// The has_many names app code builds on or pushes onto.
+/// The has_many names app code creates on, builds on, pushes onto or
+/// updates in place (`owner.items.create!`, `build`, `<<`,
+/// `owner.items.update(attrs)`).
 fn used_names(app: &App) -> BTreeSet<String> {
     fn walk(e: &Expr, out: &mut BTreeSet<String>) {
-        if let ExprNode::Send { recv: Some(recv), method, .. } = &*e.node
-            && matches!(method.as_str(), "build" | "<<")
-            && let ExprNode::Send { method: name, args, .. } = &*recv.node
-            && args.is_empty()
+        if let ExprNode::Send { recv: Some(recv), method, args, .. } = &*e.node
+            && matches!(method.as_str(), "build" | "<<" | "create" | "create!" | "update")
+            && let ExprNode::Send { method: name, args: assoc_args, .. } = &*recv.node
+            && assoc_args.is_empty()
+            && (method.as_str() != "update" || args.len() == 1)
         {
             out.insert(name.as_str().to_string());
         }
@@ -58,7 +102,12 @@ fn used_names(app: &App) -> BTreeSet<String> {
 }
 
 pub(crate) fn expand(app: &mut App) {
-    let used = used_names(app);
+    // A has_many app code assigns (`owner.tasks = records`) holds too: a
+    // new owner holds what it's handed, and the writer pushes through
+    // `__push_<name>`.
+    let assigned = super::has_one_write::assigned_names(app);
+    let mut used = used_names(app);
+    used.extend(assigned.iter().cloned());
     if used.is_empty() {
         return;
     }
@@ -70,7 +119,9 @@ pub(crate) fn expand(app: &mut App) {
         let mut inserts: Vec<(usize, Vec<ModelBodyItem>)> = Vec::new();
         for (index, item) in model.body.iter().enumerate() {
             let ModelBodyItem::Association { assoc, .. } = item else { continue };
-            let Association::HasMany { name, target, foreign_key, through: None, as_interface, primary_key: None, .. } = assoc
+            let Association::HasMany {
+                name, target, foreign_key, through: None, as_interface, primary_key: None, dependent, scope, ..
+            } = assoc
             else {
                 continue;
             };
@@ -118,9 +169,45 @@ pub(crate) fn expand(app: &mut App) {
             // (matz/spinel#10291).
             let owner = model.name.0.as_str();
             let src = format!(
-                "class Generated\n  def __hold_{n}(record)\n    @__held_{n} = [] if @__held_{n}.nil?\n    @__held_{n} << record\n    record\n  end\n\n  def __push_{n}(record)\n    if new_record?\n{set_owner}{set_type}      __hold_{n}(record)\n      {n}\n    else\n      record.{fk} = id\n{set_type}      record.save ? {n} : nil\n    end\n  end\n\n  def __push_all_{n}(records)\n    if new_record?\n      records.each {{ |record| __push_{n}(record) }}\n      return {n}\n    end\n    pushed = true\n    {owner}.transaction do\n      records.each do |record|\n        next unless __push_{n}(record).nil?\n        pushed = false\n        raise ActiveRecord::Rollback\n      end\n    end\n    pushed ? {n} : nil\n  end\n\n  def __held_{n}_list\n    @__held_{n}.nil? ? [] : @__held_{n}\n  end\n\n  def __held_{n}_valid\n    return if @__held_{n}.nil?\n    invalid = false\n    __held_{n}_list.each do |child|\n      next if child.valid?\n{counts}    end\n    errors.add(:{n}, :invalid) if invalid\n  end\n\n  validate :__held_{n}_valid\n\n  def __held_{n}_save\n    return if @__held_{n}.nil? || @__held_{n}_saving\n    @__held_{n}_saving = true\n    begin\n      __held_{n}_list.each do |child|\n        child.{fk} = id\n        child.save!\n      end\n    ensure\n      @__held_{n}_saving = false\n    end\n  end\n\n  after_save :__held_{n}_save\n\n  def __held_{n}_committed\n    @__held_{n} = nil\n  end\n\n  after_save_commit :__held_{n}_committed\nend\n"
+                "class Generated\n  def __hold_{n}(record)\n    @__held_{n} = [] if @__held_{n}.nil?\n    @__held_{n} << record\n    if @{n}_loaded && !record.new_record?\n      loaded = {n}_target\n      unless loaded.any? {{ |c| c.equal?(record) }}\n        cache = []\n        loaded.each {{ |c| cache << c }}\n        cache << record\n        @{n}_cache = cache\n      end\n    end\n    record\n  end\n\n  def __push_{n}(record)\n    if new_record?\n{set_owner}{set_type}      __hold_{n}(record)\n      {n}\n    else\n      record.{fk} = id\n{set_type}      return nil unless record.save\n      @{n}_loaded = false\n      {n}\n    end\n  end\n\n  def __push_all_{n}(records)\n    if new_record?\n      records.each {{ |record| __push_{n}(record) }}\n      return {n}\n    end\n    pushed = true\n    {owner}.transaction do\n      records.each do |record|\n        next unless __push_{n}(record).nil?\n        pushed = false\n        raise ActiveRecord::Rollback\n      end\n    end\n    pushed ? {n} : nil\n  end\n\n  def __{n}_update(attrs)\n    records = {n}\n    records.each {{ |record| record.update(attrs) }}\n    records\n  end\n\n  def __held_{n}_list\n    @__held_{n}.nil? ? [] : @__held_{n}\n  end\n\n  def __held_{n}_unsaved\n    unsaved = __held_{n}_list.select {{ |record| record.new_record? }}\n    return unsaved unless {n}_loaded?\n    loaded = {n}_target\n    unsaved.reject {{ |record| loaded.any? {{ |c| c.equal?(record) }} }}\n  end\n\n  def __{n}_first(rel)\n    return __held_{n}_list.first if new_record?\n    unsaved = __held_{n}_unsaved\n    return rel.first if unsaved.empty?\n    found = rel.first\n    found.nil? ? unsaved.first : found\n  end\n\n  def __{n}_last(rel)\n    return __held_{n}_list.last if new_record?\n    unsaved = __held_{n}_unsaved\n    unsaved.empty? ? rel.last : unsaved.last\n  end\n\n  def __{n}_size(rel)\n    return __held_{n}_list.size if new_record?\n    rel.size + __held_{n}_unsaved.size\n  end\n\n  def __{n}_length(rel)\n    return __held_{n}_list.size if new_record?\n    rel.length + __held_{n}_unsaved.size\n  end\n\n  def __{n}_empty?(rel)\n    return __held_{n}_list.empty? if new_record?\n    __held_{n}_unsaved.empty? && rel.empty?\n  end\n\n  def __{n}_any?(rel)\n    return !__held_{n}_list.empty? if new_record?\n    !__held_{n}_unsaved.empty? || rel.any?\n  end\n\n  def __{n}_destroy_all(rel)\n    if new_record?\n      destroyed = __held_{n}_list\n      destroyed.each {{ |record| record.destroy }}\n    else\n      unsaved = __held_{n}_unsaved\n      destroyed = rel.destroy_all\n      unsaved.each do |record|\n        record.destroy\n        destroyed << record\n      end\n    end\n    @__held_{n} = nil\n    @{n}_loaded = false\n    destroyed\n  end\n\n  def __held_{n}_valid\n    return if @__held_{n}.nil?\n    invalid = false\n    __held_{n}_list.each do |child|\n      next if !new_record? && !child.new_record?\n      next if child.valid?\n{counts}    end\n    errors.add(:{n}, :invalid) if invalid\n  end\n\n  validate :__held_{n}_valid\n\n  def __held_{n}_save\n    return if @__held_{n}.nil? || @__held_{n}_saving\n    @__held_{n}_saving = true\n    begin\n      __held_{n}_list.each do |child|\n        next if !previously_new_record? && !child.new_record?\n        child.{fk} = id\n        child.save!\n      end\n    ensure\n      @__held_{n}_saving = false\n    end\n  end\n\n  after_save :__held_{n}_save\n\n  def __held_{n}_committed\n    @__held_{n} = nil\n  end\n\n  after_save_commit :__held_{n}_committed\nend\n"
             );
-            if let Some(items) = super::validates_with::ingest_source(&src, &model.name) {
+            let writer = format!("{n}=");
+            let writes = assigned.contains(n)
+                && scope.is_none()
+                && !matches!(dependent, Dependent::DestroyAsync)
+                && !model.methods().any(|m| m.name.as_str() == writer);
+            let src = if writes {
+                let remove = match dependent {
+                    Dependent::Destroy => "        old.destroy!\n".to_string(),
+                    Dependent::Delete | Dependent::DeleteAll => "        old.delete\n".to_string(),
+                    // Rails nullifies with a scoped `update_all`, leaving the
+                    // loaded record as it was: a rolled-back replacement
+                    // keeps its key, and so does a removed one in memory.
+                    _ => {
+                        let t = target.0.as_str();
+                        match as_interface {
+                            Some(i) => format!("        {t}.where(id: old.id).update_all({fk}: nil, {i}_type: nil)\n"),
+                            None => format!("        {t}.where(id: old.id).update_all({fk}: nil)\n"),
+                        }
+                    }
+                };
+                let writer_src = format!(
+                    "  def {n}=(records)\n    if new_record?\n      @__held_{n} = nil\n      records.each {{ |record| __push_{n}(record) }}\n      return records\n    end\n    held = __held_{n}_list\n    current = {n}\n    {owner}.transaction do\n      current.each do |old|\n        next if records.any? {{ |record| record.id == old.id }}\n{remove}      end\n      records.each do |record|\n        next if !record.new_record? && current.any? {{ |old| old.id == record.id }}\n        next if record.new_record? && held.any? {{ |h| h.equal?(record) }}\n        if __push_{n}(record).nil?\n          raise ActiveRecord::RecordNotSaved, \"Failed to replace {n} because one or more of the new records could not be saved.\"\n        end\n      end\n    end\n    kept = held.select {{ |h| h.new_record? && records.any? {{ |record| record.equal?(h) }} }}\n    @__held_{n} = kept.empty? ? nil : kept\n    @{n}_cache = records.dup\n    @{n}_loaded = true\n    records\n  end\nend\n"
+                );
+                format!("{}\n{writer_src}", src.strip_suffix("end\n").unwrap_or(&src))
+            } else {
+                src
+            };
+            if let Some(mut items) = super::validates_with::ingest_source(&src, &model.name) {
+                // The association's own writer, not an app def overriding
+                // it (`diagnostics::overridden_synthesized_accessors`).
+                for item in &mut items {
+                    if let ModelBodyItem::Method { method, .. } = item
+                        && method.name.as_str() == writer
+                    {
+                        method.name_span = crate::span::Span::synthetic();
+                    }
+                }
                 inserts.push((index + 1, items));
                 signatures.push((model.name.clone(), n.to_string(), target.clone()));
             }
@@ -132,8 +219,9 @@ pub(crate) fn expand(app: &mut App) {
         }
     }
     for (model, name, target) in signatures {
+        let relation = crate::ty::Ty::Relation { of: target.clone() };
         let record = crate::ty::Ty::Class { id: target, args: vec![].into() };
-        let takes = |ret: crate::ty::Ty| crate::ty::Ty::Fn {
+        let takes = |ret: crate::ty::Ty| crate::ty::Ty::Fn(Box::new(crate::ty::FnTy {
             params: vec![crate::ty::Param {
                 name: crate::ident::Symbol::from("record"),
                 ty: record.clone().into(),
@@ -143,7 +231,7 @@ pub(crate) fn expand(app: &mut App) {
             block: None,
             ret: ret.into(),
             effects: Default::default(),
-        };
+        }));
         let table = app.rbs_signatures.entry(model).or_default();
         table.insert(crate::ident::Symbol::from(format!("__hold_{name}")), takes(record.clone()));
         // `<<` answers the association; the record is what callers chain
@@ -155,7 +243,7 @@ pub(crate) fn expand(app: &mut App) {
         // `<<` with an Array adds each element (`concat(records.flatten)`).
         table.insert(
             crate::ident::Symbol::from(format!("__push_all_{name}")),
-            crate::ty::Ty::Fn {
+            crate::ty::Ty::Fn(Box::new(crate::ty::FnTy {
                 params: vec![crate::ty::Param {
                     name: crate::ident::Symbol::from("records"),
                     ty: crate::ty::Ty::Array { elem: record.clone().into() }.into(),
@@ -165,16 +253,61 @@ pub(crate) fn expand(app: &mut App) {
                 block: None,
                 ret: pushed.into(),
                 effects: Default::default(),
-            },
+            })),
         );
+        // `owner.items.update(attrs)` — Rails' `CollectionProxy#update`
+        // updates every record the association holds and answers them.
+        table.insert(
+            crate::ident::Symbol::from(format!("__{name}_update")),
+            crate::ty::Ty::Fn(Box::new(crate::ty::FnTy {
+                params: vec![crate::ty::Param {
+                    name: crate::ident::Symbol::from("attrs"),
+                    ty: crate::ty::Ty::Hash {
+                        key: std::sync::Arc::new(crate::ty::Ty::Sym),
+                        value: std::sync::Arc::new(crate::ty::Ty::Untyped),
+                    }
+                    .into(),
+                    kind: crate::ty::ParamKind::Required,
+                }]
+                .into(),
+                block: None,
+                ret: crate::ty::Ty::Array { elem: record.clone().into() }.into(),
+                effects: Default::default(),
+            })),
+        );
+        // The collection terminals that answer the held records too
+        // (`lower::scope_chain` hands them the seeded relation).
+        let on_relation = |ret: crate::ty::Ty| crate::ty::Ty::Fn(Box::new(crate::ty::FnTy {
+            params: vec![crate::ty::Param {
+                name: crate::ident::Symbol::from("rel"),
+                ty: relation.clone().into(),
+                kind: crate::ty::ParamKind::Required,
+            }]
+            .into(),
+            block: None,
+            ret: ret.into(),
+            effects: Default::default(),
+        }));
+        let maybe = crate::ty::Ty::Union { variants: vec![record.clone(), crate::ty::Ty::Nil].into() };
+        for (terminal, ret) in [
+            ("first", maybe.clone()),
+            ("last", maybe),
+            ("size", crate::ty::Ty::Int),
+            ("length", crate::ty::Ty::Int),
+            ("empty?", crate::ty::Ty::Bool),
+            ("any?", crate::ty::Ty::Bool),
+            ("destroy_all", crate::ty::Ty::Array { elem: record.clone().into() }),
+        ] {
+            table.insert(crate::ident::Symbol::from(format!("__{name}_{terminal}")), on_relation(ret));
+        }
         table.insert(
             crate::ident::Symbol::from(format!("__held_{name}_list")),
-            crate::ty::Ty::Fn {
+            crate::ty::Ty::Fn(Box::new(crate::ty::FnTy {
                 params: vec![].into(),
                 block: None,
                 ret: crate::ty::Ty::Array { elem: record.clone().into() }.into(),
                 effects: Default::default(),
-            },
+            })),
         );
     }
 }

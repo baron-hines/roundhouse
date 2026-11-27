@@ -19,6 +19,8 @@
 //!
 //!     cargo test --test swift_toolchain -- --ignored --nocapture
 
+#[path = "support/scratch.rs"]
+mod scratch;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -28,12 +30,18 @@ mod emit_and_run;
 #[path = "support/i18n_locales_app.rs"]
 #[allow(dead_code)]
 mod i18n_locales_app;
+#[path = "support/record_slice_app.rs"]
+#[allow(dead_code)]
+mod record_slice_app;
+#[path = "support/ts_controller_ivars.rs"]
+#[allow(dead_code)]
+mod ts_controller_ivars;
 
 use roundhouse::emit::swift;
 use roundhouse::ingest::ingest_app;
 
 fn scratch_dir(fixture: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("roundhouse-swift-check-{fixture}"))
+    scratch::dir(&format!("roundhouse-swift-check-{fixture}"))
 }
 
 fn generate_project(fixture_path: &Path, out: &Path) {
@@ -200,6 +208,34 @@ final class I18nProbeTests: XCTestCase {
 
 #[test]
 #[ignore]
+fn real_blog_record_slice_runs() {
+    // The answers `emit_and_run::record_slice` checks on CRuby.
+    let (emitted, errors) = record_slice_app::probe_app().emit(roundhouse::project::BuildTarget::Swift);
+    assert!(errors.is_empty(), "{errors:?}");
+    std::fs::write(emitted.join("Tests/AppTests/RecordSliceProbeTests.swift"), r#"import XCTest
+@testable import App
+
+final class RecordSliceProbeTests: XCTestCase {
+    func testSliceAnswersAsRails() throws {
+        XCTAssertEqual(try Article.sliced(), ["2", "Sliced", "7", "1", "Other", "3", "Bound", "5", "4", "A comment body."])
+    }
+}
+"#).expect("write probe test");
+    let output = Command::new("swift")
+        .args(["test", "--filter", "RecordSliceProbeTests"])
+        .current_dir(&emitted)
+        .output()
+        .expect("run swift test");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore]
 fn real_blog_rescue_modifier_runs() {
     // A raise that throws is what `expr rescue fallback` catches; a nil answered without one is kept, as CRuby keeps it.
     let (emitted, errors) = emit_and_run::real_blog()
@@ -227,6 +263,50 @@ final class RescueModifierTests: XCTestCase {
 "#).expect("write test");
     let output = Command::new("swift")
         .args(["test", "--filter", "RescueModifierTests"])
+        .current_dir(&emitted)
+        .output()
+        .expect("run swift test");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore]
+fn controller_ivars_named_like_base_state_build() {
+    // An app controller's `@status`, `@location` and `@headers` (its own,
+    // ApplicationController's and a concern's) build next to the runtime
+    // base's members of those names (#1625).
+    let (emitted, errors) = ts_controller_ivars::overlay().emit(roundhouse::project::BuildTarget::Swift);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_swift_builds("an app controller with ivars named like the base's state", &emitted);
+}
+
+const PROBES_TEST: &str = "require \"test_helper\"\n\nclass ProbesControllerTest < ActionDispatch::IntegrationTest\n  test \"show renders\" do\n    get \"/show\"\n    assert_response :success\n  end\nend\n";
+
+#[test]
+#[ignore]
+fn controller_ivars_named_like_base_state_render() {
+    // The three names render on the page, and the response is as Rails
+    // leaves it: 200, no Location (#1625).
+    // A test file, so the emit writes the test sources the probe joins.
+    let (emitted, errors) = ts_controller_ivars::overlay()
+        .write("test/controllers/probes_controller_test.rb", PROBES_TEST)
+        .emit(roundhouse::project::BuildTarget::Swift);
+    assert!(errors.is_empty(), "{errors:?}");
+    let body = serde_json::to_string(ts_controller_ivars::BODY).unwrap();
+    std::fs::write(
+        emitted.join("Tests/AppTests/ControllerIvarsProbeTests.swift"),
+        format!(
+            "import XCTest\n@testable import App\n\nfinal class ControllerIvarsProbeTests: XCTestCase {{\n    func testRendersAsRails() throws {{\n        let c = ProbesController()\n        c.requestMethod = \"GET\"\n        try c.processAction(\"show\")\n        XCTAssertEqual(c.status, 200)\n        XCTAssertNil(c.location)\n        XCTAssertEqual(c.body, {body})\n    }}\n}}\n"
+        ),
+    )
+    .expect("write probe test");
+    let output = Command::new("swift")
+        .args(["test", "--filter", "ControllerIvarsProbeTests"])
         .current_dir(&emitted)
         .output()
         .expect("run swift test");

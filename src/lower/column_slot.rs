@@ -251,10 +251,14 @@ pub fn json_hydration_method(col: &Column) -> Symbol {
     Symbol::from(format!("_write_{}_json_raw", col.name.as_str()))
 }
 
-/// The ivar a column is stored in. Temporal text lives at `<col>_raw`;
-/// every other column, including JSON, uses its own name.
+/// The ivar a column is stored in. Temporal text lives at `<col>_raw`,
+/// and so does a column held nilable for its presence check
+/// (`Column::unset_until_assigned`), whose reader answers another type
+/// than its slot: a target that folds a reader into its stored property
+/// (Swift) keeps the two apart. Every other column, including JSON,
+/// uses its own name.
 pub fn storage_name(col: &Column) -> Symbol {
-    if temporal_codec(&col.col_type).is_some() {
+    if temporal_codec(&col.col_type).is_some() || col.unset_until_assigned {
         Symbol::from(format!("{}_raw", col.name.as_str()))
     } else {
         col.name.clone()
@@ -385,12 +389,16 @@ mod tests {
             col_type,
             nullable: true,
             default: None,
+            default_expression: None,
+            legacy_default_persistence: false,
             primary_key: false,
             generated: None,
             generated_text_compatible: None,
             generated_int4_compatible: None,
             array: false,
             array_stored: false,
+            unset_until_assigned: false,
+            collated: false,
         }
     }
 

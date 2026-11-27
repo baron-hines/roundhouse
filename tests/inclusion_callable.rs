@@ -301,3 +301,50 @@ fn two_numbered_parameters_stay_a_gap() {
         .ingest_warnings();
     assert!(warnings.iter().any(|w| w.contains("inclusion: in")), "{warnings:#?}");
 }
+
+// A set computed from constants (maybe's `in: DATE_FORMATS.map(&:last)`): Rails evaluates the expression once as the
+// class loads and asks it `include?`; with no read of self, evaluating it as the record validates is the same set.
+const COMPUTED_COLUMNS: &str = "create_table \"articles\", force: :cascade do |t|\n    t.string \"fmt\"\n    t.string \"sep\"";
+
+const COMPUTED_MODEL: &str = r#"class Article < ApplicationRecord
+  has_many :comments, dependent: :destroy
+  FORMATS = [["US", "%m/%d"], ["EU", "%d.%m"]].freeze
+  SEPARATORS = { comma: ",", semicolon: ";" }.freeze
+  validates :fmt, inclusion: { in: FORMATS.map(&:last) }
+  validates :sep, inclusion: { in: SEPARATORS.values.map { |s| s } }, allow_nil: true
+"#;
+
+fn computed_app() -> emit_and_run::Overlay {
+    emit_and_run::real_blog()
+        .edit("db/schema.rb", "create_table \"articles\", force: :cascade do |t|", COMPUTED_COLUMNS)
+        .edit("app/models/article.rb", "class Article < ApplicationRecord\n  has_many :comments, dependent: :destroy\n", COMPUTED_MODEL)
+}
+
+const COMPUTED_SCRIPT: &str = r##"
+valid = { title: "Computed", body: "A body long enough to validate.", fmt: "%d.%m" }
+def check(label, got, want)
+  raise "#{label}: #{got.inspect} (want #{want.inspect})" unless got == want
+end
+check("in the computed set", Article.new(**valid).valid?, true)
+bad = Article.new(**valid, fmt: "US")
+check("not in it", bad.valid?, false)
+check("message", bad.errors.to_a, ["Fmt is not included in the list"])
+check("block-computed", Article.new(**valid, sep: ";").valid?, true)
+check("block-computed rejects", Article.new(**valid, sep: "|").valid?, false)
+puts "computed in: passed"
+"##;
+
+#[test]
+fn a_set_computed_from_constants_is_asked_on_ruby() {
+    let run = computed_app().run_ruby(&format!("Db.configure(\":memory:\")\nSchema.statements.each {{ |sql| Db.exec(sql) }}\n{COMPUTED_SCRIPT}"));
+    run.assert_passes();
+    assert!(run.stdout.contains("computed in: passed"), "{}", run.stdout);
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn a_set_computed_from_constants_is_asked_on_spinel() {
+    let run = computed_app().run_spinel_with_db(COMPUTED_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("computed in: passed"), "{}", run.stdout);
+}

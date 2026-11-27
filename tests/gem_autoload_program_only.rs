@@ -4,6 +4,8 @@
 //! Ported from the Shopify/roundhouse-1 fork's tests, with the gem written
 //! as a PATH gem of `Gemfile.lock`. A test the compiler does not pass yet
 //! is ignored with the group of behavior it waits on (`fork spec: ...`).
+#[path = "support/scratch.rs"]
+mod scratch;
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
@@ -110,8 +112,7 @@ fn a_gem_autoload_of_a_file_that_only_requires_its_children_loads_that_file_when
 }
 
 fn program_only_autoload(eager: bool) {
-    let root = std::env::temp_dir().join(format!("roundhouse-gem-autoload-program-only-{}-{eager}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = scratch::dir(&format!("roundhouse-gem-autoload-program-only-{eager}"));
     let lib = root.join("trackkit/lib");
     for (path, text) in FILES {
         let file = lib.join(path);
@@ -134,13 +135,7 @@ fn program_only_autoload(eager: bool) {
         app = app.write(&format!("vendor/gems/trackkit-1.0.0/lib/{path}"), text);
     }
     let run = app.run_ruby(SCRIPT);
-    assert!(
-        run.success,
-        "emitted tree failed in {}\n=== stdout ===\n{}\n=== stderr ===\n{}",
-        run.emitted.display(),
-        run.stdout,
-        run.stderr
-    );
+    run.assert_passes();
     assert_eq!(lines(run.stdout.as_bytes()), EXPECTED, "emitted boot diverges from CRuby\n{}", run.stderr);
     // Track's autoload, as the gem's own, loads the program of the file
     // that only requires its children; the program drops that autoload

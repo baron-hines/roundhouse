@@ -134,15 +134,15 @@ pub(super) fn push_dom_prefix_method(methods: &mut Vec<MethodDef>, model: &Model
 /// `User#to_param` answers the username). Skipped for abstract models
 /// like the other instance-shaped synthesizers.
 ///
-/// `@id.to_s`, not `id&.to_s`: the ivar is the lowered id slot every
-/// model carries, and on a persisted record — the only kind a URL
+/// `@id.to_s` (the declared key's slot, under `self.primary_key = …`),
+/// not `id&.to_s`: the ivar is the lowered id slot every model carries, and on a persisted record — the only kind a URL
 /// helper ever renders — the two are byte-identical. (For an unsaved
 /// record Rails answers nil where this answers ""; no corpus call
 /// site reaches that.) Belongs to every target: the definition that
 /// existed before lived in the CRuby overlay's core_ext, which the
 /// strict targets never apply — so campfire's avatar helper
 /// (`Zlib.crc32(user.to_param)`) 500'd every avatar on the binary.
-pub(super) fn push_to_param_method(methods: &mut Vec<MethodDef>, model: &Model) {
+pub(super) fn push_to_param_method(methods: &mut Vec<MethodDef>, model: &Model, table: Option<&crate::schema::Table>) {
     if is_primary_abstract_class(model) {
         return;
     }
@@ -164,9 +164,11 @@ pub(super) fn push_to_param_method(methods: &mut Vec<MethodDef>, model: &Model) 
             Expr::new(
                 Span::synthetic(),
                 ExprNode::Send {
+                    // The key column's slot: `@cityhash` under `self.primary_key = "cityhash"`,
+                    // or under a composite table whose key a reopen or ancestor declared.
                     recv: Some(Expr::new(
                         Span::synthetic(),
-                        ExprNode::Ivar { name: Symbol::from("id") },
+                        ExprNode::Ivar { name: model.primary_key.clone().or_else(|| composite_key(table)).unwrap_or_else(|| Symbol::from("id")) },
                     )),
                     method: Symbol::from("to_s"),
                     args: Vec::new(),
@@ -266,15 +268,37 @@ pub(super) fn push_dom_record_key_method(methods: &mut Vec<MethodDef>, model: &M
 /// Primary abstract bases omit instance-shaped synthesis, unless a later
 /// literal marker makes them concrete. Intermediate abstract bases still
 /// emit methods for their concrete children to inherit.
+///
+/// A primary base is one marked `primary_abstract_class`, or an abstract
+/// class directly under `ActiveRecord::Base` — `self.abstract_class =
+/// true` on `ApplicationRecord`, the spelling Rails generated before 7.0
+/// and still accepts. Either way it has no table and no `id`, so a
+/// synthesized `to_param` reading `@id` has nothing to read.
 fn is_primary_abstract_class(model: &Model) -> bool {
-    model.body.iter().any(|item| {
+    let marked_primary = model.body.iter().any(|item| {
         if let ModelBodyItem::Unknown { expr, .. } = item {
             if let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node {
                 return args.is_empty() && method.as_str() == "primary_abstract_class";
             }
         }
         false
-    }) && is_abstract_class(model)
+    });
+    let under_base = model
+        .parent
+        .as_ref()
+        .is_some_and(|p| matches!(p.0.as_str(), "ActiveRecord::Base" | "::ActiveRecord::Base"));
+    (marked_primary || under_base) && is_abstract_class(model)
+}
+
+/// `self.abstract_class = true` or `= false`: a literal write
+/// [`is_abstract_class`] reads.
+pub(super) fn is_literal_abstract_class_write(expr: &crate::expr::Expr) -> bool {
+    let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*expr.node else {
+        return false;
+    };
+    matches!(&*recv.node, ExprNode::SelfRef)
+        && method.as_str() == "abstract_class="
+        && matches!(args.as_slice(), [arg] if matches!(&*arg.node, ExprNode::Lit { value: Literal::Bool { .. } }))
 }
 
 /// Literal abstract markers take effect in declaration order. Admission
@@ -360,7 +384,7 @@ fn const_symbol_array(model: &Model, path: &[Symbol]) -> Vec<Symbol> {
 /// `ModelBodyItem::Unknown`), so the fold reads the assignment where it
 /// sits. Unexpanded, the class emitted NO accessors at all and every
 /// read of `title` was a NoMethodError.
-fn accessor_names(model: &Model, args: &[Expr]) -> Vec<Symbol> {
+pub(super) fn accessor_names(model: &Model, args: &[Expr]) -> Vec<Symbol> {
     let mut names: Vec<Symbol> = Vec::new();
     for arg in args {
         match &*arg.node {
@@ -403,10 +427,64 @@ pub(crate) fn declared_attr_names(model: &Model) -> Vec<Symbol> {
     out
 }
 
+pub(crate) fn readonly_attr_types(model: &Model) -> crate::det::HashMap<Symbol, Ty> {
+    let mut readers = crate::det::HashSet::default();
+    let mut writers = crate::det::HashSet::default();
+    for item in &model.body {
+        let ModelBodyItem::Unknown { expr, .. } = item else { continue };
+        let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node else { continue };
+        let names = accessor_names(model, args);
+        match method.as_str() {
+            "attr_reader" => readers.extend(names),
+            "attr_accessor" | "attr_writer" => writers.extend(names),
+            _ => {}
+        }
+    }
+    let mut writes = crate::det::HashMap::default();
+    let mut unknown_writes = crate::det::HashSet::default();
+    fn collect_unknown(expr: &Expr, out: &mut crate::det::HashSet<Symbol>) {
+        match &*expr.node {
+            ExprNode::Assign { target: LValue::Ivar { name }, value }
+            | ExprNode::OpAssign { target: LValue::Ivar { name }, value, .. }
+                if value.ty.as_ref().is_none_or(Ty::mentions_unknown)
+                    || value.decisions & crate::expr::CLASS_OBJECT_VALUE != 0 =>
+            {
+                out.insert(name.clone());
+            }
+            ExprNode::MultiAssign { targets, .. } => {
+                out.extend(targets.iter().filter_map(|t| match t {
+                    LValue::Ivar { name } => Some(name.clone()),
+                    _ => None,
+                }));
+            }
+            _ => {}
+        }
+        expr.node.for_each_child(&mut |e| collect_unknown(e, out));
+    }
+    for method in model.methods().filter(|m| m.receiver == MethodReceiver::Instance) {
+        crate::analyze::extract_ivar_assignments(&method.body, &mut writes);
+        collect_unknown(&method.body, &mut unknown_writes);
+    }
+    readers.into_iter().filter_map(|name| {
+        if writers.contains(&name) || unknown_writes.contains(&name)
+            || crate::lower::model_to_library::model_defines_instance_method(model, &name)
+            || crate::lower::model_to_library::model_defines_instance_method(model, &Symbol::from(format!("{}=", name.as_str())))
+        {
+            return None;
+        }
+        let ty = writes.remove(&name)?;
+        if !matches!(ty.peel_nilable(), Ty::Class { .. }) {
+            return None;
+        }
+        Some((name, crate::analyze::union_of(ty, Ty::Nil)))
+    }).collect()
+}
+
 pub(super) fn push_attr_accessor_methods(methods: &mut Vec<MethodDef>, model: &Model) {
     if is_primary_abstract_class(model) {
         return;
     }
+    let reader_types = readonly_attr_types(model);
     for item in &model.body {
         let ModelBodyItem::Unknown { expr, .. } = item else { continue };
         let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node else {
@@ -463,8 +541,11 @@ pub(super) fn push_attr_accessor_methods(methods: &mut Vec<MethodDef>, model: &M
                     name: name.clone(),
                     receiver: MethodReceiver::Instance,
                     params: Vec::new(),
-                    body: Expr::new(expr.span, ExprNode::Ivar { name: name.clone() }),
-                    signature: None,
+                    body: reader_types.get(name).map_or_else(
+                        || Expr::new(expr.span, ExprNode::Ivar { name: name.clone() }),
+                        |ty| with_ty(Expr::new(expr.span, ExprNode::Ivar { name: name.clone() }), ty.clone()),
+                    ),
+                    signature: reader_types.get(name).map(|ty| fn_sig(Vec::new(), ty.clone())),
                     effects: EffectSet::default(),
                     enclosing_class: Some(model.name.0.clone()),
                     kind: AccessorKind::AttributeReader,
@@ -539,57 +620,77 @@ pub(crate) fn attribute_matches_column(ty: &str, col: &crate::schema::Column) ->
     )
 }
 
-/// `attribute :name, :type` declarations (the Rails Attributes API) in
-/// a model body — `(name, type)` pairs, both symbol literals. The
-/// 2-arg form only; `default:`-carrying declarations stay unclaimed
-/// (and warned) until a fixture demands them. Shared with the view
-/// lowerer's `bool_reader_names` (a `:boolean` attribute is a bool
-/// reader for `f.check_box`) and the permit-writer filter (an
-/// `attribute` writer is assignable).
-/// `attribute :name, :type, default: v` beside the model's own `def name=`.
+pub(crate) struct AttributeApiDecl<'a> {
+    pub name: &'a Symbol,
+    pub ty: Option<&'a Symbol>,
+    pub options: Option<&'a Expr>,
+}
+
+pub(crate) fn attribute_api_decl(args: &[Expr]) -> Option<AttributeApiDecl<'_>> {
+    let (name, ty, options) = match args {
+        [name] => (name, None, None),
+        [name, ty] if matches!(&*ty.node, ExprNode::Lit { value: Literal::Sym { .. } }) => {
+            (name, Some(ty), None)
+        }
+        [name, options] => (name, None, Some(options)),
+        [name, ty, options] => (name, Some(ty), Some(options)),
+        _ => return None,
+    };
+    let ExprNode::Lit { value: Literal::Sym { value: name } } = &*name.node else { return None };
+    let ty = match ty {
+        Some(ty) => {
+            let ExprNode::Lit { value: Literal::Sym { value } } = &*ty.node else { return None };
+            Some(value)
+        }
+        None => None,
+    };
+    if let Some(options) = options {
+        attribute_api_default(options)?;
+        if ty.is_none()
+            && matches!(&*options.node, ExprNode::Hash { entries, .. }
+                if entries.iter().any(|(_, value)| matches!(&*value.node, ExprNode::Lit { value: Literal::Str { .. } })))
+        {
+            return None;
+        }
+    }
+    Some(AttributeApiDecl { name, ty, options })
+}
+
+/// `attribute :name, default: v` (with or without a type) beside the
+/// model's own `def name=`.
 /// Rails applies the default without that writer, and the writer's `super`
 /// reaches the attribute's generated one; here a source `def` replaces a
 /// generated writer or is dropped by it, so the declaration stays unclaimed
 /// and reported.
 pub(crate) fn default_beside_source_writer(body: &[ModelBodyItem], args: &[Expr]) -> bool {
-    let [name, _, options] = args else { return false };
-    let ExprNode::Lit { value: Literal::Sym { value: name } } = &*name.node else { return false };
-    if attribute_api_default(options).is_none() {
+    let Some(decl) = attribute_api_decl(args) else { return false };
+    if decl.options.is_none() {
         return false;
     }
-    let setter = format!("{}=", name.as_str());
+    let setter = format!("{}=", decl.name.as_str());
     body.iter().any(|item| {
         matches!(item, ModelBodyItem::Method { method, .. }
             if method.name.as_str() == setter && method.receiver == MethodReceiver::Instance)
     })
 }
 
-pub(crate) fn attribute_api_decls(body: &[ModelBodyItem]) -> Vec<(Symbol, Symbol)> {
+pub(crate) fn attribute_api_decls(body: &[ModelBodyItem]) -> Vec<(Symbol, Option<Symbol>)> {
     let mut out = Vec::new();
     for item in body {
         let ModelBodyItem::Unknown { expr, .. } = item else { continue };
         let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node else {
             continue;
         };
-        if method.as_str() != "attribute"
-            || !(args.len() == 2 || (args.len() == 3 && attribute_api_default(&args[2]).is_some()))
-            || default_beside_source_writer(body, args)
-        {
+        if method.as_str() != "attribute" || default_beside_source_writer(body, args) {
             continue;
         }
-        let (
-            ExprNode::Lit { value: Literal::Sym { value: name } },
-            ExprNode::Lit { value: Literal::Sym { value: ty } },
-        ) = (&*args[0].node, &*args[1].node)
-        else {
-            continue;
-        };
-        out.push((name.clone(), ty.clone()));
+        let Some(decl) = attribute_api_decl(args) else { continue };
+        out.push((decl.name.clone(), decl.ty.cloned()));
     }
     out
 }
 
-/// The `default:` of a 3-arg `attribute :name, :type, default: v`, when
+/// The `default:` of an `attribute` declaration, when
 /// this lowering reads it: `Some(None)` for `nil` (no default), `Some(Some(
 /// e))` for a literal (`true`, `false`, a number, a String, a Symbol) or a
 /// zero-arity lambda's body. `None` for any other option or default.
@@ -613,7 +714,7 @@ pub(crate) fn attribute_api_default(options: &Expr) -> Option<Option<Expr>> {
     }
 }
 
-/// Each `attribute :name, :type, default: v` with a default this lowering
+/// Each `attribute` declaration with a default this lowering
 /// reads (`attribute_api_default`), as `(name, the literal or lambda body)`.
 pub(crate) fn attribute_api_defaults(body: &[ModelBodyItem]) -> Vec<(Symbol, Expr)> {
     let mut out = Vec::new();
@@ -622,12 +723,12 @@ pub(crate) fn attribute_api_defaults(body: &[ModelBodyItem]) -> Vec<(Symbol, Exp
         let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node else {
             continue;
         };
-        if method.as_str() != "attribute" || args.len() != 3 || default_beside_source_writer(body, args) {
+        if method.as_str() != "attribute" || default_beside_source_writer(body, args) {
             continue;
         }
-        let ExprNode::Lit { value: Literal::Sym { value: name } } = &*args[0].node else { continue };
-        if let Some(Some(default)) = attribute_api_default(&args[2]) {
-            out.push((name.clone(), default));
+        let Some(decl) = attribute_api_decl(args) else { continue };
+        if let Some(Some(default)) = decl.options.and_then(attribute_api_default) {
+            out.push((decl.name.clone(), default));
         }
     }
     out
@@ -649,7 +750,7 @@ pub(crate) fn default_method_name(name: &Symbol) -> Symbol {
 /// what `push_attribute_api_methods`' Boolean cast stores.
 pub(crate) fn synthesized_boolean_attribute(model: &Model, attr: &Symbol) -> bool {
     let setter = Symbol::from(format!("{}=", attr.as_str()));
-    attribute_api_decls(&model.body).iter().any(|(name, ty)| name == attr && ty.as_str() == "boolean")
+    attribute_api_decls(&model.body).iter().any(|(name, ty)| name == attr && ty.as_ref().is_some_and(|ty| ty.as_str() == "boolean"))
         && !crate::lower::model_to_library::model_defines_instance_method(model, attr)
         && !crate::lower::model_to_library::model_defines_instance_method(model, &setter)
 }
@@ -687,7 +788,7 @@ pub(super) fn push_attribute_api_methods(methods: &mut Vec<MethodDef>, model: &M
     }
     let defaults = attribute_api_defaults(&model.body);
     for (name, ty_sym) in attribute_api_decls(&model.body) {
-        let is_bool = ty_sym.as_str() == "boolean";
+        let is_bool = ty_sym.as_ref().is_some_and(|ty| ty.as_str() == "boolean");
         let setter = Symbol::from(format!("{}=", name.as_str()));
         let default = defaults.iter().find(|(n, _)| *n == name).map(|(_, d)| d.clone());
         // `attribute :x, :type, default: v` (Rails 8.1.4): the default is
@@ -1511,10 +1612,10 @@ fn str_method(model: &Model, name: &str, body: Expr) -> MethodDef {
 /// `attached.rs` already uses for the same reason.
 ///
 /// Rails guards the update hook with `if: :saved_changes?` and skips
-/// the touch when nothing actually changed. This runtime's `save`
-/// issues an unconditional UPDATE, so there is no no-op save to skip
-/// and the guard would never be false — omitted rather than emitted
-/// as a constant true.
+/// the touch when nothing actually changed. The update hook here asks
+/// `_wrote_on_update?`: the ruby-family runtime skips an update with
+/// nothing pending and answers from `saved_changes`; a strict target's
+/// `save` writes the whole row every time and answers true.
 fn push_belongs_to_touches(methods: &mut Vec<MethodDef>, model: &Model) {
     for assoc in model.associations() {
         let crate::dialect::Association::BelongsTo { name, touch: Some(touch), .. } = assoc else {
@@ -1613,7 +1714,29 @@ fn push_belongs_to_touches(methods: &mut Vec<MethodDef>, model: &Model) {
         );
 
         for hook in ["after_create", "after_update", "after_destroy", "after_touch"] {
-            fold_into_or_push(methods, model, hook, seq(vec![bind.clone(), stmt.clone()]));
+            let body = seq(vec![bind.clone(), stmt.clone()]);
+            let body = if hook == "after_update" {
+                Expr::new(
+                    span,
+                    ExprNode::If {
+                        cond: Expr::new(
+                            span,
+                            ExprNode::Send {
+                                recv: None,
+                                method: Symbol::from("_wrote_on_update?"),
+                                args: vec![],
+                                block: None,
+                                parenthesized: false,
+                            },
+                        ),
+                        then_branch: body,
+                        else_branch: Expr::new(span, ExprNode::Lit { value: Literal::Nil }),
+                    },
+                )
+            } else {
+                body
+            };
+            fold_into_or_push(methods, model, hook, body);
         }
     }
 }
@@ -1652,7 +1775,11 @@ pub(super) const BLOCK_CALLBACK_HOOKS: &[&str] = &[
 /// Unknown items — into `def <hook>` overrides of the runtime Base's
 /// no-op hooks. One body walk so declaration order is preserved
 /// across both forms when they target the same hook.
-pub(super) fn push_callback_methods(methods: &mut Vec<MethodDef>, model: &Model) {
+pub(super) fn push_callback_methods(
+    methods: &mut Vec<MethodDef>,
+    model: &Model,
+    stems: &crate::lower::view_to_library::PartialStems,
+) {
     // AHEAD of the declared callbacks: Rails registers the
     // `belongs_to … default:` callback when the association is
     // declared, and campfire declares its associations above its
@@ -1666,7 +1793,7 @@ pub(super) fn push_callback_methods(methods: &mut Vec<MethodDef>, model: &Model)
                 push_symbol_callback(methods, model, callback, item.span());
             }
             ModelBodyItem::Unknown { expr, .. } => {
-                push_block_callback(methods, model, expr);
+                push_block_callback(methods, model, expr, stems);
             }
             _ => {}
         }
@@ -2084,7 +2211,12 @@ fn rename_callback_locals(expr: &mut Expr, renames: &crate::det::HashMap<Symbol,
     }
 }
 
-fn push_block_callback(methods: &mut Vec<MethodDef>, model: &Model, expr: &Expr) {
+fn push_block_callback(
+    methods: &mut Vec<MethodDef>,
+    model: &Model,
+    expr: &Expr,
+    stems: &crate::lower::view_to_library::PartialStems,
+) {
     {
         let Some((callback, hook_name, on)) = block_callback_shape(expr) else {
             return;
@@ -2169,6 +2301,7 @@ fn push_block_callback(methods: &mut Vec<MethodDef>, model: &Model, expr: &Expr)
         let mut lambda_body = super::broadcasts::rewrite_rails_broadcast_calls(
             lambda_body.clone(),
             model,
+            stems,
         );
         // `self.<col> ||= v` on a string column → blank-guarded assign.
         // Rails' new-record attributes are nil, so `||=` means "set
@@ -2226,4 +2359,11 @@ fn push_block_callback(methods: &mut Vec<MethodDef>, model: &Model, expr: &Expr)
             });
         }
     }
+}
+
+/// The column `ingest::app::key_composite_tables` keyed a composite table
+/// on: it was declared by the model, a reopen of it, or a model ancestor.
+fn composite_key(table: Option<&crate::schema::Table>) -> Option<Symbol> {
+    let table = table.filter(|t| !t.primary_key_columns.is_empty())?;
+    table.columns.iter().find(|c| c.primary_key).map(|c| c.name.clone())
 }

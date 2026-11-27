@@ -220,9 +220,10 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
     let route_helper_funcs_for_extras = crate::lower::lower_routes_to_library_functions(app);
     let route_helper_extras = crate::lower::extras_from_funcs(&route_helper_funcs_for_extras);
 
-    let (model_lcs, model_registry) = crate::lower::lower_models_with_registry_and_params(
+    let (model_lcs, model_registry) = crate::lower::lower_models_with_registry_params_and_views(
         &app.models,
         &app.schema,
+        &app.views,
         view_extras,
         &params_specs,
     );
@@ -310,13 +311,24 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
     controller_extras.extend(crate::lower::extras_from_lcs(&view_lcs));
     controller_extras.extend(route_helper_extras);
     let assocs = crate::lower::model_associations::compute_association_graph(app);
-    let controller_lcs = crate::lower::lower_controllers_with_arel_views_and_assocs(
+    let mut controller_lcs = crate::lower::lower_controllers_with_arel_views_and_assocs(
         &app.controllers,
         controller_extras,
         Some(&app.schema),
         &app.views,
         &assocs,
     );
+    // Crystal names a method as Ruby does (`performed?`, `status=`).
+    // With no app ApplicationController, this emit writes one under
+    // ActionController::Base (above), which the controllers under it reach.
+    let implied: &[(&str, &str)] = if needs_app_controller {
+        &[("ApplicationController", "ActionController::Base")]
+    } else {
+        &[]
+    };
+    super::controller_ivars::rename_ivars_shadowing_controller_base(&mut controller_lcs, &runtime_classes_for_typing, |name| {
+        vec![name.clone()]
+    }, |name| name.clone(), implied);
     let controller_synth: Vec<(String, String)> = controller_lcs
         .iter()
         .filter(|lc| lc.origin.is_some())
@@ -495,6 +507,7 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
             &app.models,
             test_extras,
             &crate::lower::routes::helper_id_segments(app),
+            &crate::lower::routes::direct_helper_names(app),
         );
         for lowered in &test_lowered {
             let lc = &lowered.test_class;
@@ -629,11 +642,23 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
     }
 
     // src/app.cr — aggregator that requires every emitted .cr file
-    // (plus the upcoming primitive runtime layer). Crystal's compiler
-    // does whole-program analysis after parsing all sources, so the
-    // require ordering doesn't have to follow the dependency graph;
-    // we sort alphabetically for determinism.
-    files.push(emit_app_cr(&files));
+    // (plus the upcoming primitive runtime layer), alphabetically for
+    // determinism, except that a model's superclass is required first:
+    // Crystal resolves `class Note < ApplicationRecord` when it parses
+    // it, so `models/admin::note` or `models/account` ahead of
+    // `models/application_record` was `undefined constant`.
+    let model_parents: Vec<(String, String)> = app
+        .models
+        .iter()
+        .filter_map(|m| {
+            let parent = m.parent.as_ref()?;
+            Some((
+                format!("models/{}", crate::naming::snake_case(m.name.0.as_str())),
+                format!("models/{}", crate::naming::snake_case(parent.0.as_str())),
+            ))
+        })
+        .collect();
+    files.push(emit_app_cr(&files, &model_parents));
 
     // src/main.cr — the binary entry point. `scripts/compare crystal`
     // builds this; `crystal_toolchain` tests target src/app.cr (just
@@ -783,7 +808,7 @@ fn controller_symbol(class_name: &str) -> String {
     crate::naming::underscore(base).replace('/', "__")
 }
 
-fn emit_app_cr(emitted: &[EmittedFile]) -> EmittedFile {
+fn emit_app_cr(emitted: &[EmittedFile], model_parents: &[(String, String)]) -> EmittedFile {
     // Framework runtime files in dependency order. Each must be
     // loaded before any file that `include`s its module.
     const RUNTIME_ORDER: &[&str] = &[
@@ -794,6 +819,10 @@ fn emit_app_cr(emitted: &[EmittedFile]) -> EmittedFile {
         "param_value",
         "hash_with_indifferent_access",
         "inflector",
+        // Ruby's core error classes (`NoMethodError`, `NameError`): errors
+        // subclasses them (`ActiveModel::UnknownAttributeError <
+        // NoMethodError`), and a superclass resolves at parse time.
+        "core_errors",
         // active_record_base → errors keeps the forward-ref chain
         // resolvable at parse time. Base is referenced by errors'
         // RecordInvalid as a property type (parse-time class macro);
@@ -825,10 +854,23 @@ fn emit_app_cr(emitted: &[EmittedFile]) -> EmittedFile {
             ordered.push((*name).to_string());
         }
     }
-    // Everything else alphabetical.
+    // Everything else alphabetical, a model's superclass file ahead of it.
+    fn place(stem: &str, all: &[String], parents: &[(String, String)], ordered: &mut Vec<String>, seen: &mut Vec<String>) {
+        if seen.iter().any(|s| s == stem) {
+            return;
+        }
+        seen.push(stem.to_string());
+        if let Some((_, parent)) = parents.iter().find(|(s, _)| s == stem)
+            && all.iter().any(|s| s == parent)
+        {
+            place(parent, all, parents, ordered, seen);
+        }
+        ordered.push(stem.to_string());
+    }
+    let mut seen: Vec<String> = Vec::new();
     for stem in &all_stems {
         if !RUNTIME_ORDER.contains(&stem.as_str()) {
-            ordered.push(stem.clone());
+            place(stem, &all_stems, model_parents, &mut ordered, &mut seen);
         }
     }
 
@@ -837,7 +879,7 @@ fn emit_app_cr(emitted: &[EmittedFile]) -> EmittedFile {
     s.push_str("# Requires the framework runtime in dependency order\n");
     s.push_str("# (Crystal processes `include` at parse time, so modules\n");
     s.push_str("# included by classes must be loaded first), then app code\n");
-    s.push_str("# alphabetically.\n\n");
+    s.push_str("# alphabetically, each model after its superclass.\n\n");
     for p in &ordered {
         s.push_str(&format!("require \"./{p}\"\n"));
     }

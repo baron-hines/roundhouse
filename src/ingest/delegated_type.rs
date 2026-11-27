@@ -10,7 +10,8 @@
 //! `dependent: :destroy`, plus `optional`/`touch`/`default` forwarded
 //! to `belongs_to`) are honored; other `dependent:` values and
 //! unmodeled belongs_to kwargs (`class_name`, `autosave`, …) stay
-//! unexpanded so the unsupported ledger remains honest.
+//! unexpanded, and `analyze::diagnostics` reports the unexpanded call,
+//! so the unsupported ledger remains honest.
 
 use ruby_prism::Node;
 
@@ -23,7 +24,7 @@ use crate::expr::{ArrayStyle, Expr, ExprNode, Literal};
 use crate::ident::{ClassId, Symbol};
 use crate::naming::{pluralize_snake, underscore};
 use crate::span::Span;
-use crate::ty::Ty;
+use crate::ty::{FnTy, Ty};
 
 use super::util::{bool_value, constant_id_str, string_value, symbol_or_string_value, symbol_value};
 use super::IngestResult;
@@ -244,6 +245,7 @@ fn is_class_name(s: &str) -> bool {
 fn expand(decl: Declaration, leading_comments: &[Comment]) -> Vec<ModelBodyItem> {
     let span = Span::synthetic();
     let mut items = Vec::new();
+    let build = builder(&decl);
     let targets: Vec<ClassId> = decl
         .types
         .iter()
@@ -254,6 +256,7 @@ fn expand(decl: Declaration, leading_comments: &[Comment]) -> Vec<ModelBodyItem>
             name: decl.role.clone(),
             target: ClassId(Symbol::from(crate::naming::camelize(decl.role.as_str()))),
             foreign_key: decl.foreign_key.clone(),
+            foreign_key_explicit: false,
             optional: decl.optional,
             polymorphic: true,
             polymorphic_targets: targets,
@@ -261,6 +264,7 @@ fn expand(decl: Declaration, leading_comments: &[Comment]) -> Vec<ModelBodyItem>
             touch: decl.touch,
             foreign_type: Some(decl.foreign_type.clone()),
             primary_key: Some(decl.primary_key.clone()),
+            scope: None,
         },
         leading_comments: leading_comments.to_vec(),
         leading_blank_line: false,
@@ -300,19 +304,32 @@ fn expand(decl: Declaration, leading_comments: &[Comment]) -> Vec<ModelBodyItem>
             )
         }),
     ));
+    // Rails answers `model_name.singular.inquiry`; ending the body in
+    // `.inquiry` is what lets `analyze::inquiry` and `lower::inquiry`
+    // fold `entry.entryable_name.message?` to a comparison.
     items.push(instance_method(
         format!("{}_name", decl.role.as_str()),
-        class_case(&decl.foreign_type, &decl.types, |t| {
-            Expr::new(
-                span,
-                ExprNode::Lit {
-                    value: Literal::Str {
-                        value: underscore(t).replace('/', "_"),
-                    },
-                },
-            )
-        }),
+        Expr::new(
+            span,
+            ExprNode::Send {
+                recv: Some(class_case(&decl.foreign_type, &decl.types, |t| {
+                    Expr::new(
+                        span,
+                        ExprNode::Lit {
+                            value: Literal::Str {
+                                value: underscore(t).replace('/', "_"),
+                            },
+                        },
+                    )
+                })),
+                method: Symbol::from("inquiry"),
+                args: vec![],
+                block: None,
+                parenthesized: false,
+            },
+        ),
     ));
+    items.push(build);
 
     for type_name in &decl.types {
         let (scope_name, singular) = delegated_names(type_name);
@@ -410,6 +427,57 @@ fn expand(decl: Declaration, leading_comments: &[Comment]) -> Vec<ModelBodyItem>
         });
     }
     items
+}
+
+/// `build_<role>(attributes = {})`: Rails assigns
+/// `<role>_class.new(attributes)` to the role, the class read from the
+/// type column already set.
+fn builder(decl: &Declaration) -> ModelBodyItem {
+    let span = Span::synthetic();
+    let attributes = Symbol::from("attributes");
+    let body = class_case(&decl.foreign_type, &decl.types, |t| {
+        let new = Expr::new(
+            span,
+            ExprNode::Send {
+                recv: Some(Expr::new(
+                    span,
+                    ExprNode::Const {
+                        path: t.split("::").map(Symbol::from).collect(),
+                    },
+                )),
+                method: Symbol::from("new"),
+                args: vec![Expr::new(
+                    span,
+                    ExprNode::Var {
+                        id: crate::ident::VarId(0),
+                        name: attributes.clone(),
+                    },
+                )],
+                block: None,
+                parenthesized: true,
+            },
+        );
+        Expr::new(
+            span,
+            ExprNode::Assign {
+                target: crate::expr::LValue::Attr {
+                    recv: Expr::new(span, ExprNode::SelfRef),
+                    name: decl.role.clone(),
+                },
+                value: new,
+            },
+        )
+    });
+    let ModelBodyItem::Method { mut method, leading_comments, leading_blank_line } =
+        instance_method(format!("build_{}", decl.role.as_str()), body)
+    else {
+        unreachable!()
+    };
+    method.params = vec![crate::dialect::Param::with_default(
+        attributes,
+        Expr::new(span, ExprNode::Hash { entries: vec![], kwargs: false }),
+    )];
+    ModelBodyItem::Method { method, leading_comments, leading_blank_line }
 }
 
 fn delegated_names(type_name: &str) -> (String, String) {
@@ -521,12 +589,12 @@ fn instance_method_typed(name: String, body: Expr, ret: Ty) -> ModelBodyItem {
         name,
         MethodReceiver::Instance,
         body,
-        Some(Ty::Fn {
+        Some(Ty::Fn(Box::new(FnTy {
             params: Vec::new().into(),
             block: None,
             ret: std::sync::Arc::new(ret),
             effects: EffectSet::pure(),
-        }),
+        }))),
     )
 }
 

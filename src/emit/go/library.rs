@@ -24,7 +24,7 @@
 use crate::dialect::{AccessorKind, LibraryClass, MethodDef, MethodReceiver};
 use crate::expr::Expr;
 use crate::ident::Symbol;
-use crate::ty::{ParamKind, Ty};
+use crate::ty::{FnTy, ParamKind, Ty};
 
 use super::shared::go_field_name;
 
@@ -213,7 +213,7 @@ pub fn emit_library_class_with_registry(
         let is_temporal_reader = m.kind == AccessorKind::AttributeReader
             && matches!(
                 m.signature.as_ref(),
-                Some(Ty::Fn { ret, .. }) if ret.contains_time()
+                Some(Ty::Fn(fn_ty)) if fn_ty.ret.contains_time()
             );
         if !is_temporal_reader
             && matches!(
@@ -352,6 +352,16 @@ fn emit_ar_class_method_wrappers(name: &str) -> String {
     out
 }
 
+/// The instance methods `class`'s Go type has as methods, by the same
+/// rule the class emit uses: not attr readers or writers, and not a
+/// trivial ivar reader that a struct field already serves.
+pub(super) fn emitted_instance_methods(class: &LibraryClass) -> Vec<String> {
+    let fields = collect_fields(&class.methods, &class.nullable_columns);
+    let mut names: Vec<String> = collect_self_methods(&class.methods, &fields).iter().cloned().collect();
+    names.sort();
+    names
+}
+
 /// Collect the names of real (non-attr) instance methods on a
 /// class. Class methods are excluded because implicit-self calls to
 /// them inside another method body route through the bare-fn path
@@ -423,7 +433,8 @@ fn collect_fields(methods: &[MethodDef], nullable_columns: &[Symbol]) -> Vec<Fie
         let col_ptr = nullable_columns.iter().any(|c| c.as_str() == name);
         let go_ty = match m.kind {
             AccessorKind::AttributeReader => {
-                if let Some(Ty::Fn { ret, .. }) = m.signature.as_ref() {
+                if let Some(Ty::Fn(fn_ty)) = m.signature.as_ref() {
+                    let FnTy { ret, .. } = &**fn_ty;
                     // Temporal reader (`Ty::Time` return): NO struct
                     // field. Storage is the `<col>_raw` String accessor
                     // pair from the shared lowering, which collapses to
@@ -445,7 +456,8 @@ fn collect_fields(methods: &[MethodDef], nullable_columns: &[Symbol]) -> Vec<Fie
                 }
             }
             AccessorKind::AttributeWriter => {
-                if let Some(Ty::Fn { params, .. }) = m.signature.as_ref() {
+                if let Some(Ty::Fn(fn_ty)) = m.signature.as_ref() {
+                    let FnTy { params, .. } = &**fn_ty;
                     params
                         .first()
                         .map(|p| {
@@ -495,7 +507,7 @@ fn collect_fields(methods: &[MethodDef], nullable_columns: &[Symbol]) -> Vec<Fie
 /// `@foo = ...` write already serves as the Go reader, so emitting
 /// the method on top of it would collide. Detect this de-facto
 /// attr_reader shape and let the field stand alone.
-fn is_trivial_ivar_reader(m: &MethodDef) -> bool {
+pub(super) fn is_trivial_ivar_reader(m: &MethodDef) -> bool {
     use crate::expr::ExprNode;
     // Predicate-suffixed reader: `def persisted?; @persisted; end`.
     // Ivar names never carry `?`/`!`/`=` — strip suffixes from the
@@ -676,38 +688,97 @@ fn render_constructor_params(m: &MethodDef) -> (String, String) {
     let sig_tys = signature_param_tys(m);
     let split = trailing_optional_split(&m.params);
     let mut params_out: Vec<String> = Vec::new();
-    let mut unpack = String::new();
-    for (i, p) in m.params.iter().enumerate() {
+    for (i, p) in m.params[..split].iter().enumerate() {
         let ty = sig_tys.as_ref().and_then(|tys| tys.get(i));
-        if i < split {
-            params_out.push(format!("{} {}", sanitize(p.name.as_str()), go_ty_stub(ty)));
-        } else if i == split {
-            let go_ty = go_ty_stub(ty);
-            params_out.push(format!("_opts ...{go_ty}"));
-            // Per-param unpack — first variadic slot = the original
-            // param's name, subsequent params (also defaulted) pull
-            // from successive slots.
-            for (j, opt) in m.params[split..].iter().enumerate() {
-                // Ruby's `_X` convention signals an intentionally
-                // unused parameter. Go allows unused PARAMS (not
-                // unused LOCALS), and our variadic emit lowers
-                // optional params to locals. Skip the unpack for
-                // `_`-prefixed names so vet doesn't error on the
-                // unused declaration — the body never references
-                // them anyway.
-                if opt.name.as_str().starts_with('_') {
-                    continue;
-                }
-                let opt_ty = sig_tys.as_ref().and_then(|tys| tys.get(split + j));
-                let opt_go_ty = go_ty_stub(opt_ty);
-                let opt_name = sanitize(opt.name.as_str());
-                unpack.push_str(&format!("\tvar {opt_name} {opt_go_ty}\n"));
-                unpack.push_str(&format!("\tif len(_opts) > {j} {{ {opt_name} = _opts[{j}] }}\n"));
-            }
-            break;
-        }
+        params_out.push(format!("{} {}", sanitize(p.name.as_str()), go_ty_stub(ty)));
     }
+    if split == m.params.len() {
+        return (params_out.join(", "), String::new());
+    }
+    let (variadic, unpack) = fold_optional_tail(m, sig_tys.as_deref(), split);
+    params_out.push(variadic);
     (params_out.join(", "), unpack)
+}
+
+/// The trailing defaulted params from `split` on, folded into one
+/// variadic catch-all (`_opts ...T`) plus the unpack that binds each to
+/// its local. Shared by constructors and methods. When every trailing
+/// param has the same Go type the slice carries it; otherwise it widens
+/// to `interface{}` and each slot is read back with a type assertion
+/// (`Route.new(..., req_format, int_params, seg_constraints, guard)`
+/// mixes `string` and `int64`). An omitted param starts at its literal
+/// Ruby default where one fits (`guard = -1`), not Go's zero value.
+fn fold_optional_tail(m: &MethodDef, sig_tys: Option<&[Ty]>, split: usize) -> (String, String) {
+    let trailing_tys: Vec<String> = (split..m.params.len())
+        .map(|i| go_ty_stub(sig_tys.and_then(|tys| tys.get(i))))
+        .collect();
+    let go_ty = if trailing_tys.iter().all(|t| t == &trailing_tys[0]) {
+        trailing_tys[0].clone()
+    } else {
+        "interface{}".to_string()
+    };
+    let mut unpack = String::new();
+    for (j, opt) in m.params[split..].iter().enumerate() {
+        // Ruby's `_X` marks an intentionally unused param; the body never reads it
+        if opt.name.as_str().starts_with('_') {
+            continue;
+        }
+        let opt_name = sanitize(opt.name.as_str());
+        let opt_go_ty = if go_ty == "interface{}" { trailing_tys[j].clone() } else { go_ty.clone() };
+        unpack.push_str(&format!("\tvar {opt_name} {opt_go_ty}\n"));
+        let opt_sig = sig_tys.and_then(|tys| tys.get(split + j));
+        let bind = optional_read(&opt_name, j, &opt_go_ty, &go_ty, nilable_numeric(opt_sig));
+        let omitted = opt.default.as_ref().and_then(|d| go_param_default(d, &opt_go_ty, nilable_numeric(opt_sig)));
+        match omitted {
+            Some(default) => unpack.push_str(&format!(
+                "\tif len(_opts) > {j} {{ {bind} }} else {{ {opt_name} = {default} }}\n"
+            )),
+            None => unpack.push_str(&format!("\tif len(_opts) > {j} {{ {bind} }}\n")),
+        }
+        // Go rejects a declared-and-unused local; a body may ignore an optional param
+        unpack.push_str(&format!("\t_ = {opt_name}\n"));
+    }
+    (format!("_opts ...{go_ty}"), unpack)
+}
+
+/// The statement that binds slot `j` of a folded optional tail. A caller's
+/// bare integer literal boxes as `int`, so a numeric read converts it, and
+/// an explicit `nil` asserts to the zero value, the types' empty-as-absent
+/// convention. A nilable numeric stays `interface{}` for its nil, and a nil
+/// guard narrows it with a plain assertion, so it holds the type asserted.
+fn optional_read(name: &str, j: usize, opt_go_ty: &str, tail_ty: &str, nilable: Option<&str>) -> String {
+    match nilable {
+        Some("float64") => {
+            return format!(
+                "{name} = _opts[{j}]; switch v := {name}.(type) {{ case int: {name} = float64(v); case int64: {name} = float64(v) }}"
+            );
+        }
+        Some(_) => return format!("{name} = _opts[{j}]; if v, ok := {name}.(int); ok {{ {name} = int64(v) }}"),
+        None => {}
+    }
+    if opt_go_ty == "interface{}" || tail_ty == opt_go_ty {
+        return format!("{name} = _opts[{j}]");
+    }
+    match opt_go_ty {
+        "int64" => format!("switch v := _opts[{j}].(type) {{ case int64: {name} = v; case int: {name} = int64(v) }}"),
+        "float64" => format!("switch v := _opts[{j}].(type) {{ case float64: {name} = v; case int64: {name} = float64(v); case int: {name} = float64(v) }}"),
+        _ => format!("{name}, _ = _opts[{j}].({opt_go_ty})"),
+    }
+}
+
+/// The Go type a nilable numeric param (`Integer?`, `Float?`) holds in
+/// its `interface{}`.
+fn nilable_numeric(ty: Option<&Ty>) -> Option<&'static str> {
+    let Some(Ty::Union { variants }) = ty else { return None };
+    let non_nil: Vec<&Ty> = variants.iter().filter(|v| !matches!(v, Ty::Nil)).collect();
+    if non_nil.len() == variants.len() {
+        return None;
+    }
+    match non_nil.as_slice() {
+        [Ty::Int] => Some("int64"),
+        [Ty::Float] => Some("float64"),
+        _ => None,
+    }
 }
 
 /// Index of the first trailing-defaulted param. Returns
@@ -847,6 +918,12 @@ fn embedded_parent_type(class: &LibraryClass) -> Option<String> {
     if is_core_exception_root(raw) || matches!(raw, "Object" | "BasicObject") {
         return None;
     }
+    // `ActionController::API` has the runtime's one controller base, as
+    // the ruby emit gives it: Rails' API leaves out view, cookie and CSRF
+    // modules, which an API app's controllers don't call.
+    if raw == "ActionController::API" {
+        return Some(sanitize_type_name("ActionController::Base"));
+    }
     Some(sanitize_type_name(raw))
 }
 
@@ -942,7 +1019,7 @@ pub(super) fn sanitize_method_name(name: &str) -> String {
 /// `sanitize_method_name` (`[]` → `op_get`, lowercase) — the index/
 /// operator peepholes in expr.rs invoke these via Go index syntax,
 /// not method-call, so the casing doesn't have to match.
-fn pascalize_instance_method_name(name: &str) -> String {
+pub(super) fn pascalize_instance_method_name(name: &str) -> String {
     // Operator-shape names route through sanitize_method_name (`[]`
     // → `op_get`, `[]=` → `op_set`, ...) then pascalize via
     // `go_method_name` (`op_get` → `OpGet`). The call-site emit for
@@ -983,7 +1060,7 @@ pub fn emit_module(methods: &[MethodDef]) -> Result<String, String> {
         // for the func decl's return type.
         let returns_void = matches!(
             m.signature.as_ref(),
-            Some(Ty::Fn { ret, .. }) if matches!(ret.as_ref(), Ty::Nil)
+            Some(Ty::Fn(fn_ty)) if matches!(fn_ty.ret.as_ref(), Ty::Nil)
         );
         let mut ctx = EmitCtx::none();
         ctx.void_method = returns_void;
@@ -1082,10 +1159,10 @@ fn emit_method(
     // body walker can suppress the implicit `return X` wrap.
     let returns_void = matches!(
         m.signature.as_ref(),
-        Some(Ty::Fn { ret, .. }) if matches!(ret.as_ref(), Ty::Nil)
+        Some(Ty::Fn(fn_ty)) if matches!(fn_ty.ret.as_ref(), Ty::Nil)
     );
     let return_ty = match m.signature.as_ref() {
-        Some(Ty::Fn { ret, .. }) => Some((**ret).clone()),
+        Some(Ty::Fn(fn_ty)) => Some((*fn_ty.ret).clone()),
         _ => None,
     };
     let ctx = EmitCtx {
@@ -1130,7 +1207,7 @@ fn render_params(m: &MethodDef) -> String {
 /// function, its parameter types read from the first `yield`'s values.
 pub(super) fn yield_block_param(m: &MethodDef) -> Option<String> {
     let args = first_yield_args(&m.body)?;
-    let void = matches!(m.signature.as_ref(), Some(Ty::Fn { ret, .. }) if matches!(ret.as_ref(), Ty::Nil));
+    let void = matches!(m.signature.as_ref(), Some(Ty::Fn(fn_ty)) if matches!(fn_ty.ret.as_ref(), Ty::Nil));
     report_valued_yields(&m.body, void);
     let tys: Vec<String> = args.iter().map(|a| go_ty_stub(a.ty.as_ref())).collect();
     Some(format!("block func({})", tys.join(", ")))
@@ -1219,63 +1296,51 @@ fn render_params_with_unpack(m: &MethodDef) -> (String, String) {
         if i < split {
             params_out.push(format!("{} {}", sanitize(p.name.as_str()), go_ty_stub(ty)));
         } else if i == split {
-            // Pick the trailing-slot variadic type. If every trailing
-            // defaulted param has the same Ty stub, use it; otherwise
-            // fall back to `interface{}` (the safe widening).
-            let trailing_tys: Vec<String> = m.params[split..]
-                .iter()
-                .enumerate()
-                .map(|(j, _)| {
-                    let opt_ty = sig_tys.as_ref().and_then(|tys| tys.get(split + j));
-                    go_ty_stub(opt_ty)
-                })
-                .collect();
-            let go_ty = if trailing_tys.iter().all(|t| t == &trailing_tys[0]) {
-                trailing_tys[0].clone()
-            } else {
-                "interface{}".to_string()
-            };
             // Not after the variadic: Go accepts a variadic only as the last parameter
             params_out.extend(yield_block_param(m));
-            params_out.push(format!("_opts ...{go_ty}"));
-            for (j, opt) in m.params[split..].iter().enumerate() {
-                if opt.name.as_str().starts_with('_') {
-                    continue;
-                }
-                let opt_name = sanitize(opt.name.as_str());
-                let opt_go_ty = if go_ty == "interface{}" {
-                    let opt_ty = sig_tys.as_ref().and_then(|tys| tys.get(split + j));
-                    go_ty_stub(opt_ty)
-                } else {
-                    go_ty.clone()
-                };
-                unpack.push_str(&format!("\tvar {opt_name} {opt_go_ty}\n"));
-                let read = if opt_go_ty == "interface{}" || go_ty == opt_go_ty {
-                    format!("_opts[{j}]")
-                } else {
-                    format!("_opts[{j}].({opt_go_ty})")
-                };
-                unpack.push_str(&format!(
-                    "\tif len(_opts) > {j} {{ {opt_name} = {read} }}\n"
-                ));
-                // Suppress Go's "declared and not used" error for
-                // optional params the body doesn't reference. Many
-                // view methods accept `notice`/`alert` from the
-                // controller but don't render them when no flash is
-                // set; the variadic-unpack still declares the
-                // locals.
-                unpack.push_str(&format!("\t_ = {opt_name}\n"));
-            }
+            let (variadic, tail_unpack) = fold_optional_tail(m, sig_tys.as_deref(), split);
+            params_out.push(variadic);
+            unpack = tail_unpack;
             break;
         }
     }
     (params_out.join(", "), unpack)
 }
 
-fn signature_param_tys(m: &MethodDef) -> Option<Vec<Ty>> {
-    let Some(Ty::Fn { params, .. }) = m.signature.as_ref() else {
+/// The Go value an omitted optional param starts with: its literal Ruby
+/// default when that literal fits the param's Go type. `None` keeps Go's
+/// zero value: right for `nil` (the types' empty-as-absent convention)
+/// and, for reads, for an empty-hash default such as `{}` or
+/// `EMPTY_HTML_OPTS` (a nil map reads as empty); not yet right for other
+/// non-literal defaults.
+fn go_param_default(default: &Expr, go_ty: &str, boxed_as: Option<&str>) -> Option<String> {
+    use crate::expr::{ExprNode, Literal};
+    let ExprNode::Lit { value } = &*default.node else {
         return None;
     };
+    let fits = match value {
+        Literal::Nil | Literal::Regex { .. } => false,
+        Literal::Str { .. } | Literal::Sym { .. } => matches!(go_ty, "string" | "interface{}"),
+        Literal::Int { .. } => matches!(go_ty, "int64" | "float64" | "interface{}"),
+        Literal::Float { .. } => matches!(go_ty, "float64" | "interface{}"),
+        Literal::Bool { .. } => matches!(go_ty, "bool" | "interface{}"),
+    };
+    if !fits {
+        return None;
+    }
+    let lit = super::expr::emit_literal(value);
+    // An untyped Go constant in an `interface{}` would box as `int`, not the `int64` the reads assert
+    Some(match value {
+        Literal::Int { .. } if go_ty == "interface{}" => format!("{}({lit})", boxed_as.unwrap_or("int64")),
+        _ => lit,
+    })
+}
+
+fn signature_param_tys(m: &MethodDef) -> Option<Vec<Ty>> {
+    let Some(Ty::Fn(fn_ty)) = m.signature.as_ref() else {
+        return None;
+    };
+    let FnTy { params, .. } = &**fn_ty;
     Some(
         params
             .iter()
@@ -1312,7 +1377,8 @@ fn render_body(ctx: &EmitCtx, m: &MethodDef) -> String {
         _ => false,
     };
     if !ctx.void_method && body_is_effectively_nil {
-        if let Some(Ty::Fn { ret, .. }) = m.signature.as_ref() {
+        if let Some(Ty::Fn(fn_ty)) = m.signature.as_ref() {
+            let FnTy { ret, .. } = &**fn_ty;
             return format!("\treturn {}\n", go_zero_value(ret));
         }
     }
@@ -1323,7 +1389,8 @@ fn render_body(ctx: &EmitCtx, m: &MethodDef) -> String {
     // Without this, AR::Base's `def attributes; {}; end` (declared
     // `Hash[Symbol, untyped]`) would emit `map[string]string{}` via
     // the all-empty heuristic and clash with the declared return.
-    let body = if let Some(Ty::Fn { ret, .. }) = m.signature.as_ref() {
+    let body = if let Some(Ty::Fn(fn_ty)) = m.signature.as_ref() {
+        let FnTy { ret, .. } = &**fn_ty;
         backprop_return_ty_to_tail(&m.body, ret)
     } else {
         m.body.clone()
@@ -1499,7 +1566,8 @@ pub(super) fn sanitize(name: &str) -> String {
 }
 
 fn render_return(m: &MethodDef) -> String {
-    if let Some(Ty::Fn { ret, .. }) = m.signature.as_ref() {
+    if let Some(Ty::Fn(fn_ty)) = m.signature.as_ref() {
+        let FnTy { ret, .. } = &**fn_ty;
         // Ty::Nil → Go void (no return type).
         if matches!(ret.as_ref(), Ty::Nil) {
             return String::new();
@@ -1597,14 +1665,17 @@ fn collect_module_singleton_slots(methods: &[MethodDef]) -> Vec<(String, Ty)> {
         let raw_name = m.name.as_str().trim_end_matches('=').to_string();
         let ty = match m.kind {
             AccessorKind::AttributeReader => match m.signature.as_ref() {
-                Some(Ty::Fn { ret, .. }) => (**ret).clone(),
+                Some(Ty::Fn(fn_ty)) => (*fn_ty.ret).clone(),
                 _ => Ty::Untyped,
             },
             AccessorKind::AttributeWriter => match m.signature.as_ref() {
-                Some(Ty::Fn { params, .. }) => params
-                    .first()
-                    .map(|p| (*p.ty).clone())
-                    .unwrap_or(Ty::Untyped.into()),
+                Some(Ty::Fn(fn_ty)) => {
+                    let FnTy { params, .. } = &**fn_ty;
+                    params
+                        .first()
+                        .map(|p| (*p.ty).clone())
+                        .unwrap_or(Ty::Untyped.into())
+                },
                 _ => Ty::Untyped.into(),
             },
             _ => continue,
@@ -1633,10 +1704,10 @@ fn emit_module_singleton_method(class_name: &str, m: &MethodDef) -> String {
     let method = sanitize_method_name(m.name.as_str());
     let returns_void = matches!(
         m.signature.as_ref(),
-        Some(Ty::Fn { ret, .. }) if matches!(ret.as_ref(), Ty::Nil)
+        Some(Ty::Fn(fn_ty)) if matches!(fn_ty.ret.as_ref(), Ty::Nil)
     );
     let return_ty = match m.signature.as_ref() {
-        Some(Ty::Fn { ret, .. }) => Some((**ret).clone()),
+        Some(Ty::Fn(fn_ty)) => Some((*fn_ty.ret).clone()),
         _ => None,
     };
     let ctx = EmitCtx {
@@ -1712,5 +1783,33 @@ mod predicate_naming_tests {
             send.contains("return \"inline\"") && send.contains("return \"attachment\""),
             "void send_data IIFE must return disposition strings:\n{send}"
         );
+    }
+
+    /// A constructor whose trailing optionals mix types (`Route`'s
+    /// `req_format`/`int_params`/`seg_constraints` strings, then the
+    /// `guard` Integer) widens `_opts` to `interface{}` and asserts each
+    /// slot back; an omitted `guard` starts at its Ruby default -1.
+    #[test]
+    fn router_ctor_mixed_optionals_widen_and_keep_defaults() {
+        let ruby = include_str!("../../../runtime/ruby/action_dispatch/router.rb");
+        let rbs = include_str!("../../../runtime/ruby/action_dispatch/router.rbs");
+        let classes = crate::runtime_src::parse_library_with_rbs(
+            ruby.as_bytes(),
+            rbs,
+            "action_dispatch/router.rb",
+        )
+        .expect("action_dispatch/router parses and types");
+        let mut src = String::new();
+        for c in &classes {
+            src.push_str(&emit_library_class(c).expect("emits"));
+            src.push('\n');
+        }
+        let ctor = src
+            .find("func NewActionDispatchRouterRoute(")
+            .map(|i| &src[i..i + src[i..].find("\n}\n").unwrap_or(src.len() - i)])
+            .expect("Route constructor");
+        assert!(ctor.contains("_opts ...interface{}"), "mixed tail must widen:\n{ctor}");
+        assert!(ctor.contains("case int64: guard = v; case int: guard = int64(v)"), "guard slot reads int64:\n{ctor}");
+        assert!(ctor.contains("else { guard = -1 }"), "omitted guard keeps Ruby's -1:\n{ctor}");
     }
 }

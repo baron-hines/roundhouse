@@ -100,6 +100,7 @@ use super::app::{
     load_defaults_version, queue_adapter_line, raise_on_missing_line, read_rb_files, wrap_parameters_line,
     FilterParametersLine, InflectEffect, VideoPreviewArgsExtract, FRAMEWORK_CONFIG_KEYS,
 };
+use super::after_initialize::{carried_block, server_guarded_hooks, Site};
 use super::util::{
     class_name_path, constant_id_str, constant_path_of, find_all_classes_with_scope,
     flatten_statements,
@@ -158,6 +159,9 @@ struct Probe<'a> {
     src: &'a str,
     /// `config.autoload_lib(ignore: …)` directories, before any filtering.
     lib_ignores: &'a [String],
+    /// The file, as it is named for spans and for the passes that answer a
+    /// statement by its place in it.
+    path: &'a str,
 }
 
 /// One existing recognizer, how to ask it about a single statement, and
@@ -175,6 +179,30 @@ struct Recognizer {
 /// direction; `tests/initializer_ledger.rs` pins each entry against the
 /// effect it has on the `App`.
 const RECOGNIZERS: &[Recognizer] = &[
+    Recognizer {
+        name: "after_initialize (Rails.application.config.after_initialize do … end, run at boot)",
+        origins: INIT,
+        levels: TOP,
+        reads: |p| carried(p, Site::Initializer),
+    },
+    Recognizer {
+        name: "after_initialize (under if defined?(Rails::Server), run by the server entries)",
+        origins: INIT,
+        levels: TOP,
+        reads: |p| server_guarded_hooks(p.node).is_some(),
+    },
+    Recognizer {
+        name: "after_initialize (config.after_initialize inside Rails.application.configure, run at boot)",
+        origins: INIT,
+        levels: &[Level::Nested],
+        reads: |p| carried(p, Site::Configure),
+    },
+    Recognizer {
+        name: "after_initialize (config.after_initialize in the Application class body, run at boot)",
+        origins: APP,
+        levels: TOP,
+        reads: |p| carried(p, Site::Application),
+    },
     Recognizer {
         name: "session_store (config.session_store key:)",
         origins: INIT_APP,
@@ -208,6 +236,12 @@ const RECOGNIZERS: &[Recognizer] = &[
         reads: |p| extract_collection_cache_store(p.text.as_bytes(), PROBE).is_some(),
     },
     Recognizer {
+        name: "view_paths (X.prepend_view_path / X.append_view_path / X.view_paths =, bare or in ActiveSupport.on_load)",
+        origins: INIT,
+        levels: TOP_HOOK,
+        reads: |p| super::view_paths::reads_initializer_statement(p.text.as_bytes()),
+    },
+    Recognizer {
         name: "initializer_filters (X.before_action :m, only:)",
         origins: INIT,
         levels: TOP_HOOK,
@@ -233,6 +267,16 @@ const RECOGNIZERS: &[Recognizer] = &[
         origins: INIT,
         levels: TOP_HOOK,
         reads: |p| super::gem_package_settings::extract(p.text.as_bytes(), PROBE).iter().any(|s| s.carried()),
+    },
+    Recognizer {
+        name: "pagy settings (Pagy::DEFAULT[:overflow] = for a pagy before 43)",
+        origins: INIT,
+        levels: TOP_HOOK,
+        reads: |p| {
+            let mut state = super::pagy::Settings::default();
+            super::pagy::read_settings(p.text.as_bytes(), PROBE, &mut state);
+            state.recognized
+        },
     },
     Recognizer {
         name: "default_per_page (Kaminari.configure { |c| c.default_per_page = })",
@@ -320,6 +364,12 @@ const RECOGNIZERS: &[Recognizer] = &[
         },
     },
     Recognizer {
+        name: "JSON response escaping (action_controller.escape_json_responses / active_support.escape_js_separators_in_json)",
+        origins: INIT_APP,
+        levels: ANY,
+        reads: |p| super::json_response_config::reads(p.node),
+    },
+    Recognizer {
         name: "forgery_protection_verification_strategy",
         origins: INIT_APP,
         levels: ANY,
@@ -396,6 +446,23 @@ const RECOGNIZERS: &[Recognizer] = &[
                 l == "Oj.mimic_JSON" || l.starts_with("Oj.mimic_JSON(") || l == "Oj.optimize_rails"
             })
         },
+    },
+    Recognizer {
+        name: "multi_json (MultiJson.use(:oj): ingest/multi_json reads the adapter)",
+        origins: INIT,
+        levels: ANY,
+        reads: |p| {
+            code_lines(p.text).any(|l| {
+                let l = l.trim_start_matches("::");
+                ["MultiJson.use(:oj)", "MultiJSON.use(:oj)", "MultiJson.use :oj", "MultiJSON.use :oj"].contains(&l.trim_end())
+            })
+        },
+    },
+    Recognizer {
+        name: "load_hooks (ActiveSupport.on_load(:name) a model's run_load_hooks(:name, self) runs as its class body)",
+        origins: INIT,
+        levels: TOP,
+        reads: |p| super::load_hooks::spliced(p.path, p.node).is_some(),
     },
     Recognizer {
         name: "content_security_policy (config.content_security_policy do |policy|)",
@@ -652,6 +719,11 @@ struct Stmt<'a> {
     text: &'a str,
 }
 
+/// An `after_initialize` block `ingest::after_initialize` carries to boot.
+fn carried(p: &Probe<'_>, site: Site) -> bool {
+    p.node.as_call_node().is_some_and(|call| carried_block(&call, site).is_some())
+}
+
 /// `X.to_prepare { … }` / `X.to_run { … }` with a statement body: the
 /// wrapper `initializer_statements` unwraps.
 fn hook_body<'a>(node: &Node<'a>) -> Option<Node<'a>> {
@@ -720,7 +792,7 @@ fn is_not_a_statement(node: &Node<'_>) -> bool {
 }
 
 /// Judge one host statement against the recognizer table.
-fn judge(origin: Origin, st: &Stmt<'_>, lib_ignores: &[String], src: &str) -> Verdict {
+fn judge(origin: Origin, st: &Stmt<'_>, lib_ignores: &[String], src: &str, path: &str) -> Verdict {
     if is_not_a_statement(&st.node) {
         return Verdict::NotAStatement;
     }
@@ -729,6 +801,7 @@ fn judge(origin: Origin, st: &Stmt<'_>, lib_ignores: &[String], src: &str) -> Ve
         node: &st.node,
         src,
         lib_ignores,
+        path,
     };
     if st.level == Level::Inflections {
         // Re-ingesting the statement goes through `ingest_expr`, which in
@@ -900,11 +973,16 @@ fn judge_all(
                 Verdict::Consumed("isolate_namespace (literal, admitted engine)")
             } else if let Some(reason) = inert_reason(&st.node, src) {
                 Verdict::Inert(reason)
+            } else if let Some(read) = super::engine_config::engine_statement(&st.node, path) {
+                match read {
+                    super::engine_config::EngineStatement::Consumed(reason) => Verdict::Consumed(reason),
+                    super::engine_config::EngineStatement::Inert(reason) => Verdict::Inert(reason),
+                }
             } else {
                 Verdict::Unconsumed
             }
         } else {
-            judge(origin, &st, lib_ignores, src)
+            judge(origin, &st, lib_ignores, src, path)
         };
         if verdict == Verdict::Unconsumed {
             // `Const.configure do |c| … end` is a container: nothing reads
@@ -1255,7 +1333,7 @@ impl Holder {
 /// The receiver-and-method target of each call or write in `node`, by
 /// syntax: `config.middleware.use`, `Rack::Attack.throttle`, `self.at_exit`,
 /// `def`, `const=NAME`. A conditional answers its branches' statements.
-fn targets_of(node: &Node<'_>, src: &str) -> Vec<String> {
+pub(super) fn targets_of(node: &Node<'_>, src: &str) -> Vec<String> {
     let text_of = |n: &Node<'_>| {
         let loc = n.location();
         let text = normalize_target(&src[loc.start_offset()..loc.end_offset()]);
@@ -1422,12 +1500,20 @@ pub(super) fn record<V: Vfs + ?Sized>(
     admitted: &HashSet<String>,
     lock: Option<&crate::gems::Lockfile>,
     app_namespaces: &HashSet<String>,
+    carried_rate_limit_stores: &[Span],
+    boot_taken: &super::boot_program::Taken,
 ) {
     let findings = ledger(vfs, dir, path_gems, admitted);
     for f in findings.into_iter().flat_map(|l| l.findings) {
+        if boot_taken.contains(&(f.path.clone(), f.start)) {
+            continue;
+        }
         let holder = holder_of(&f.targets, lock, app_namespaces);
         let location = format!("{}:{}:{}", f.path, f.line, f.column);
         let file = sources::file_id(&absolute(dir, &f.path));
+        if carried_rate_limit_stores.iter().any(|value| value.file == file && value.start >= f.start && value.end <= f.end) {
+            continue;
+        }
         let span = if file.0 == 0 { Span::synthetic() } else { Span { file, start: f.start, end: f.end } };
         let kind = DiagnosticKind::UnconsumedInitializer {
             owner: Symbol::from(f.owner.as_str()),
@@ -1449,6 +1535,32 @@ fn absolute(dir: &Path, relative: &str) -> String {
 
 /// The whole ledger, file by file, in report order: host initializers,
 /// `config/application.rb`, then each engine's initializers and class body.
+/// The boot statements of the engine `engine_name` at `engine_dir` that
+/// nothing accounts for, as `statement (path:line)`, read as if its mount
+/// were admitted: its `config/initializers` and its class body.
+pub(super) fn engine_unaccounted<V: Vfs + ?Sized>(vfs: &V, engine_dir: &Path, engine_name: &str) -> Vec<String> {
+    let mut ledgers = Vec::new();
+    let initializers = engine_dir.join("config/initializers");
+    if vfs.is_dir(&initializers) {
+        for entry in read_rb_files(vfs, &initializers).unwrap_or_default() {
+            let Ok(bytes) = vfs.read(&entry) else { continue };
+            ledgers.push(initializer_ledger(Origin::EngineInitializer, engine_name, &entry, &bytes, &[]));
+        }
+    }
+    let admitted: HashSet<String> = std::iter::once(engine_name.to_string()).collect();
+    for entry in read_rb_files(vfs, &engine_dir.join("lib")).unwrap_or_default() {
+        let Ok(bytes) = vfs.read(&entry) else { continue };
+        if bytes.windows(10).any(|w| w == b"Rails::Eng") {
+            ledgers.extend(engine_class_ledgers(&entry, &bytes, &admitted, &[]));
+        }
+    }
+    ledgers
+        .into_iter()
+        .flat_map(|l| l.findings)
+        .map(|f| format!("`{}` ({}:{})", f.statement, f.path, f.line))
+        .collect()
+}
+
 pub fn ledger<V: Vfs + ?Sized>(
     vfs: &V,
     dir: &Path,

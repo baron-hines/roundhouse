@@ -1,4 +1,5 @@
-//! Rails 8.1.4's non-mutating, no-block Hash#deep_merge pilot.
+//! Rails 8.1.4's no-block Hash#deep_merge, and its mutating deep_merge! where
+//! the receiver's type already holds the argument's keys and values.
 
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
@@ -39,6 +40,22 @@ const SOURCE: &str = r#"class HashDeepMergeProbe
     defaulted_right = { missing: { nested: { right: true } } }
     raise "merged an absent key's default" unless defaulted_left.deep_merge(defaulted_right) == defaulted_right
     puts "Hash#deep_merge caller contract passed"
+    BangProbe.run
+  end
+end
+
+class BangProbe
+  def self.run
+    inner = { a: 1 }
+    target = { nested: inner, keep: { k: 1 } }
+    extra = { nested: { b: 2 }, added: { z: 3 } }
+    answer = target.deep_merge!(extra)
+    raise "bang answered another Hash" unless answer.equal?(target)
+    raise "bang value: #{target.inspect}" unless target == { nested: { a: 1, b: 2 }, keep: { k: 1 }, added: { z: 3 } }
+    raise "nested Hash mutated in place" unless inner == { a: 1 }
+    raise "nested Hash not replaced" if target[:nested].equal?(inner)
+    raise "key order" unless target.keys == [:nested, :keep, :added]
+    puts "Hash#deep_merge! caller contract passed"
   end
 end
 "#;
@@ -56,6 +73,7 @@ fn emitted_cruby_caller_observes_deep_merge_contract() {
         run.stdout
             .contains("Hash#deep_merge caller contract passed")
     );
+    assert!(run.stdout.contains("Hash#deep_merge! caller contract passed"));
     let emitted = std::fs::read_to_string(run.emitted.join("app/models/hash_deep_merge_probe.rb"))
         .expect("emitted HashDeepMergeProbe");
     assert!(
@@ -63,6 +81,8 @@ fn emitted_cruby_caller_observes_deep_merge_contract() {
         "{emitted}"
     );
     assert!(!emitted.contains("left.deep_merge(right)"), "{emitted}");
+    let bang = std::fs::read_to_string(run.emitted.join("app/models/bang_probe.rb")).expect("emitted BangProbe");
+    assert!(bang.contains("ActiveSupport.deep_merge!(target, extra)"), "{bang}");
 }
 
 #[test]
@@ -76,24 +96,19 @@ fn emitted_spinel_caller_observes_deep_merge_contract_natively() {
         run.stdout
             .contains("Hash#deep_merge caller contract passed")
     );
-    let emitted = std::fs::read_to_string(run.emitted.join("app/models/hash_deep_merge_probe.rb"))
-        .expect("emitted HashDeepMergeProbe");
-    assert!(
-        emitted.contains("ActiveSupport.deep_merge(left, right)"),
-        "{emitted}"
-    );
-    assert!(!emitted.contains("left.deep_merge(right)"), "{emitted}");
+    assert!(run.stdout.contains("Hash#deep_merge! caller contract passed"));
 }
 
 #[test]
-fn deep_merge_block_and_bang_forms_remain_unsupported() {
+fn deep_merge_block_and_widening_bang_forms_remain_unsupported() {
     for (name, expected_construct, expression) in [
         (
             "block",
             "Hash#deep_merge conflict block",
             "left.deep_merge(right) { |_key, old, new| new }",
         ),
-        ("bang", "Hash#deep_merge!", "left.deep_merge!(right)"),
+        ("bang_widening", "Hash#deep_merge!", "left.deep_merge!({ key: \"two\" })"),
+        ("bang_block", "Hash#deep_merge!", "left.deep_merge!(right) { |_key, old, new| new }"),
     ] {
         let (_, _, diagnostics) = emit_and_run::real_blog()
             .write(

@@ -14,6 +14,9 @@ use serde_yaml_ng::Value;
 pub mod gems;
 pub mod plural;
 pub mod rails_i18n;
+pub mod table;
+
+use table::{Entries, Order};
 
 /// Rails 8.1.4's bundled English, in the order its frameworks load it.
 const RAILS_EN: &[(&str, &str)] = &[
@@ -34,7 +37,7 @@ pub struct Catalog {
     /// `config.i18n.default_locale`, `en` when the app sets none.
     pub locale: String,
     /// Dotted key (`activerecord.attributes.user.email`) → string leaf.
-    pub entries: BTreeMap<String, String>,
+    pub entries: Entries,
     /// Keys whose value is not a String (an Array, a number, a boolean):
     /// I18n answers them as they are, which `entries` cannot hold.
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
@@ -44,8 +47,8 @@ pub struct Catalog {
     pub values: BTreeMap<String, Opaque>,
     /// Each node's children in the order the files give them, as the
     /// deep merge of Ruby Hashes keeps it ("" for the locale's root).
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub order: BTreeMap<String, Vec<String>>,
+    #[serde(default, skip_serializing_if = "Order::is_empty")]
+    pub order: Order,
     /// What a translation the locale lacks does, per environment.
     #[serde(default)]
     pub missing: MissingPolicy,
@@ -324,6 +327,46 @@ impl Catalog {
         self.fallbacks = fallbacks;
     }
 
+    /// The bytes this catalog and the other locales' catalogs hold. A
+    /// clone shares the frozen locales' key table rather than copying it,
+    /// so each distinct table is added once on top of the clone.
+    #[cfg(feature = "memory-census")]
+    pub(crate) fn census_bytes(&self) -> i64 {
+        let mut tables: Vec<&std::sync::Arc<table::KeyTable>> = Vec::new();
+        for catalog in std::iter::once(self).chain(self.others.iter()) {
+            for keys in catalog.entries.key_table().into_iter().chain(catalog.order.key_table()) {
+                if !tables.iter().any(|seen| std::sync::Arc::ptr_eq(seen, keys)) {
+                    tables.push(keys);
+                }
+            }
+        }
+        crate::memory_census::live_delta(|| self.clone()) + tables.iter().map(|keys| keys.census_bytes()).sum::<i64>()
+    }
+
+    /// Packs this catalog and the other locales' catalogs against one
+    /// shared, sorted table of their keys, once loading is done: the
+    /// locales repeat nearly every key and node, and only the values
+    /// differ (see [`table`]). Every read answers as before; a later
+    /// merge unpacks the catalog it merges into.
+    pub fn freeze(&mut self) {
+        let shared = {
+            let mut keys = std::collections::BTreeSet::new();
+            let mut paths = std::collections::BTreeSet::new();
+            for catalog in std::iter::once(&*self).chain(self.others.iter()) {
+                catalog.entries.key_set(&mut keys);
+                catalog.order.key_set(&mut paths);
+            }
+            keys.extend(paths.iter().map(String::as_str));
+            std::sync::Arc::new(table::KeyTable::new(keys))
+        };
+        self.entries = self.entries.freeze(&shared);
+        self.order = self.order.freeze(&shared);
+        for other in &mut self.others {
+            other.entries = other.entries.freeze(&shared);
+            other.order = other.order.freeze(&shared);
+        }
+    }
+
     fn merge_source(&mut self, source: &str) -> Result<(), String> {
         let top = format!("{}:", self.locale);
         let quoted = [format!("\"{}\":", self.locale), format!("'{}':", self.locale)];
@@ -335,13 +378,13 @@ impl Catalog {
         value.apply_merge().map_err(|e| e.to_string())?;
         if let Some(tree) = value.get(self.locale.as_str()) {
             let colons = Colons::of(source);
-            flatten(tree, String::new(), &mut Flat { entries: &mut self.entries, opaque: &mut self.opaque, values: &mut self.values, order: &mut self.order, colons: &colons });
+            flatten(tree, String::new(), &mut Flat { entries: self.entries.building(), opaque: &mut self.opaque, values: &mut self.values, order: self.order.building(), colons: &colons });
         }
         Ok(())
     }
 
     pub fn lookup(&self, key: &str) -> Option<&str> {
-        self.entries.get(key).map(String::as_str)
+        self.entries.get(key)
     }
 
     /// `key`, or with a `count` its plural form for English (`zero` when
@@ -381,12 +424,11 @@ impl Catalog {
         // test every key of the catalog (every locale file of every gem) per model.
         let mut entries = BTreeMap::new();
         for prefix in &prefixes {
-            let from = (std::ops::Bound::Included(prefix.as_str()), std::ops::Bound::Unbounded);
-            for (k, v) in self.entries.range::<str, _>(from).take_while(|(k, _)| k.starts_with(prefix.as_str())) {
-                entries.insert(k.clone(), v.clone());
+            for (k, v) in self.entries.range_from(prefix.as_str()).take_while(|(k, _)| k.starts_with(prefix.as_str())) {
+                entries.insert(k.to_string(), v.to_string());
             }
         }
-        Catalog { locale: self.locale.clone(), entries, ..Default::default() }
+        Catalog { locale: self.locale.clone(), entries: entries.into_iter().collect(), ..Default::default() }
     }
 
     /// `Model.human_attribute_name(attr)`: the first of
@@ -509,7 +551,7 @@ pub fn format_full(format: &str, attribute: &str, message: &str) -> String {
 }
 
 /// A `t` / `I18n.t` call reduced to what its lookup needs.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Translate {
     /// The key as written; a leading `.` is a view's lazy lookup.
     pub key: String,
@@ -555,7 +597,7 @@ impl Translate {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Fallback {
     Key(String),
     Text(String),
@@ -716,7 +758,7 @@ impl Catalog {
 /// Whether `key` has entries beneath it.
     pub fn is_subtree(&self, key: &str) -> bool {
         let below = format!("{key}.");
-        self.order.contains_key(key) || self.entries.range(below.clone()..).next().is_some_and(|(k, _)| k.starts_with(&below))
+        self.order.contains_key(key) || self.entries.range_from(&below).next().is_some_and(|(k, _)| k.starts_with(&below))
     }
 
     /// Whether `key` is a subtree holding only Strings (and empty
@@ -728,12 +770,13 @@ impl Catalog {
 
     /// Every String leaf and every empty mapping (`None`), in the order
     /// the files give them, as a Ruby Hash built from them iterates.
-    pub fn ordered_nodes(&self) -> Vec<(String, Option<&String>)> {
+    pub fn ordered_nodes(&self) -> Vec<(String, Option<&str>)> {
         let mut out = Vec::new();
         let mut seen = crate::det::HashSet::default();
-        fn walk<'a>(c: &'a Catalog, node: &str, out: &mut Vec<(String, Option<&'a String>)>, seen: &mut crate::det::HashSet<String>) {
-            for child in c.order.get(node).into_iter().flatten() {
-                let path = if node.is_empty() { child.clone() } else { format!("{node}.{child}") };
+        fn walk<'a>(c: &'a Catalog, node: &str, out: &mut Vec<(String, Option<&'a str>)>, seen: &mut crate::det::HashSet<String>) {
+            let Some(children) = c.order.get(node) else { return };
+            for child in children.iter() {
+                let path = table::child_path(node, child);
                 if let Some(v) = c.entries.get(&path) {
                     if seen.insert(path.clone()) {
                         out.push((path, Some(v)));
@@ -748,9 +791,9 @@ impl Catalog {
             }
         }
         walk(self, "", &mut out, &mut seen);
-        for (k, v) in &self.entries {
-            if seen.insert(k.clone()) {
-                out.push((k.clone(), Some(v)));
+        for (k, v) in self.entries.iter() {
+            if seen.insert(k.to_string()) {
+                out.push((k.to_string(), Some(v)));
             }
         }
         out
@@ -767,10 +810,10 @@ impl Catalog {
         let under = |k: &str| k.starts_with(base) || k == stem;
         let mut nodes: Vec<String> = Vec::new();
         // Not every key filtered: the ones under `base` sit together in the sorted map, and `stem` (base without its dot) sorts before them.
-        let within = self.entries.range(base.to_string()..).map(|(k, _)| k).take_while(|k| k.starts_with(base));
+        let within = self.entries.range_from(base).map(|(k, _)| k).take_while(|k| k.starts_with(base));
         let at_stem = self.entries.get_key_value(stem).map(|(k, _)| k).filter(|k| !k.starts_with(base));
         for key in at_stem.into_iter().chain(within) {
-            let mut node = key.as_str();
+            let mut node = key;
             nodes.push(node.to_string());
             while let Some((parent, _)) = node.rsplit_once('.') {
                 if !under(parent) {
@@ -922,14 +965,14 @@ impl ModelI18n {
         let mut out: Vec<(String, String)> = Vec::new();
         for key in &self.keys {
             let prefix = format!("{scope}.errors.models.{key}.");
-            for (entry, text) in &self.catalog().entries {
+            for (entry, text) in self.catalog().entries.iter() {
                 let Some(rest) = entry.strip_prefix(prefix.as_str()) else { continue };
                 let name = match rest.strip_prefix("attributes.") {
                     Some(attr_kind) => attr_kind.to_string(),
                     None => rest.to_string(),
                 };
                 if !out.iter().any(|(k, _)| *k == name) {
-                    out.push((name, text.clone()));
+                    out.push((name, text.to_string()));
                 }
             }
         }
@@ -1000,23 +1043,69 @@ fn merge_text(parts: Vec<Part>) -> Vec<Part> {
 }
 
 /// What form helpers translate: the app's catalog, and each model's i18n
-/// by the param key a form names it with (`article`, `admin_user`).
+/// by class identity. Parameter keys only select metadata when unambiguous.
 #[derive(Clone, Debug, Default)]
 pub struct FormI18n {
-    catalog: Catalog,
+    catalog: std::sync::Arc<Catalog>,
     models: crate::det::HashMap<String, ModelI18n>,
+    classes_by_parameter: crate::det::HashMap<String, Option<String>>,
 }
 
 impl FormI18n {
     pub fn of(app: &crate::app::App) -> Self {
-        FormI18n {
-            catalog: app.i18n.clone(),
-            models: app
-                .models
-                .iter()
-                .map(|m| (crate::naming::underscore(m.name.0.as_str()).replace('/', "_"), m.i18n.clone()))
-                .collect(),
+        let mut models: crate::det::HashMap<_, _> = app.models.iter()
+            .map(|m| (m.name.0.as_str().to_owned(), m.i18n.clone())).collect();
+        let bases: crate::det::HashMap<_, _> = app.models.iter().map(|m| (&m.name, m)).collect();
+        let parents: crate::det::HashMap<_, _> = app.library_classes.iter()
+            .filter_map(|class| class.parent.as_ref().map(|parent| (&class.name, parent))).collect();
+        for class in app.library_classes.iter().filter(|class| !class.is_module) {
+            let key = class.name.0.as_str().to_owned();
+            if models.contains_key(&key) { continue; }
+            let mut keys = vec![i18n_key(class.name.0.as_str())];
+            let mut parent = class.parent.as_ref();
+            let mut seen = crate::det::HashSet::default();
+            while let Some(id) = parent {
+                if !seen.insert(id) { break; }
+                if let Some(base) = bases.get(id) {
+                    let mut metadata = base.i18n.clone();
+                    keys.extend(metadata.keys.iter().cloned());
+                    let scope = metadata.scope().to_owned();
+                    metadata.keys = keys;
+                    metadata.catalog = app.i18n.subset_for(&scope, &metadata.keys);
+                    models.insert(key, metadata);
+                    break;
+                }
+                keys.push(i18n_key(id.0.as_str()));
+                parent = parents.get(id).copied();
+            }
         }
+        let mut classes_by_parameter = crate::det::HashMap::<String, Option<String>>::default();
+        for class in models.keys() {
+            classes_by_parameter.entry(app.model_param_key(class))
+                .and_modify(|known| { if known.as_ref() != Some(class) { *known = None; } })
+                .or_insert_with(|| Some(class.clone()));
+        }
+        FormI18n { catalog: app.i18n.clone(), models, classes_by_parameter }
+    }
+
+    pub(crate) fn model_class(&self, object_name: &str) -> Option<&str> {
+        self.classes_by_parameter.get(object_name.split('[').next().unwrap_or(object_name))?.as_deref()
+    }
+
+    fn model_for_parameter(&self, object_name: &str) -> Option<&ModelI18n> {
+        self.model_class(object_name).and_then(|class| self.models.get(class))
+    }
+
+    pub(crate) fn label_for(&self, class: &str, object_name: &str, method: &str) -> String {
+        self.label_with_model(object_name, method, self.models.get(class))
+    }
+
+    pub(crate) fn submit_for(&self, class: &str, object_name: &str, key: &str) -> String {
+        self.submit_with_model(object_name, key, self.models.get(class))
+    }
+
+    pub(crate) fn has_errors_for(&self, class: &str) -> bool {
+        self.models.contains_key(class)
     }
 
     /// `form.label :method`'s text, as `Tags::Label#translation` finds it:
@@ -1024,8 +1113,11 @@ impl FormI18n {
     /// `helpers.label.<i18n_key>.<method>`, then its `human_attribute_name`,
     /// then `method.humanize`.
     pub fn label(&self, object_name: &str, method: &str) -> String {
+        self.label_with_model(object_name, method, self.model_for_parameter(object_name))
+    }
+
+    fn label_with_model(&self, object_name: &str, method: &str, model: Option<&ModelI18n>) -> String {
         let catalog = self.catalog.or_rails_default();
-        let model = self.models.get(object_name);
         let keys = std::iter::once(format!("helpers.label.{object_name}.{method}"))
             .chain(model.and_then(|m| m.keys.first()).map(|k| format!("helpers.label.{k}.{method}")));
         keys.filter_map(|k| catalog.lookup(&k))
@@ -1038,7 +1130,7 @@ impl FormI18n {
     /// Whether the form's record is one of the app's models, or a record
     /// nested under one, so it answers `errors` as Rails' wrapper requires.
     pub fn has_errors(&self, object_name: &str) -> bool {
-        self.models.contains_key(object_name.split('[').next().unwrap_or(object_name))
+        self.model_for_parameter(object_name).is_some()
     }
 
     /// The app's own `field_error_proc`, which this wrapper does not model.
@@ -1050,11 +1142,12 @@ impl FormI18n {
     /// `submit_default_value` finds it: `helpers.submit.<object_name>.<key>`,
     /// `helpers.submit.<key>`, then "<Key> <model>", over the model's human name.
     pub fn submit(&self, object_name: &str, key: &str) -> String {
+        self.submit_with_model(object_name, key, self.model_for_parameter(object_name))
+    }
+
+    fn submit_with_model(&self, object_name: &str, key: &str, model: Option<&ModelI18n>) -> String {
         let catalog = self.catalog.or_rails_default();
-        let model = self
-            .models
-            .get(object_name)
-            .map(|m| m.model_human_name())
+        let model = model.map(|m| m.model_human_name())
             .unwrap_or_else(|| humanize(object_name));
         [format!("helpers.submit.{object_name}.{key}"), format!("helpers.submit.{key}")]
             .iter()
@@ -1113,7 +1206,8 @@ pub fn stamp_models(app: &mut crate::app::App) {
 
 /// `Admin::User` → `admin/user`, ActiveModel::Name#i18n_key.
 pub fn i18n_key(class_name: &str) -> String {
-    crate::naming::underscore(class_name)
+    class_name.trim_start_matches("::").split("::")
+        .map(crate::naming::model_param_key).collect::<Vec<_>>().join("/")
 }
 
 /// ActiveSupport's `String#humanize` on an attribute name: drop leading
@@ -1218,9 +1312,14 @@ mod tests {
 
     fn catalog(files: &[(&str, &str)]) -> Catalog {
         let mut files = files.iter().map(|(p, s)| (p.to_string(), s.to_string())).collect();
-        let (catalog, problems) = Catalog::load("en", &mut files);
+        let (loaded, problems) = Catalog::load("en", &mut files);
         assert!(problems.is_empty(), "{problems:?}");
-        catalog
+        // Every test reads the packed form ingest leaves; it must answer as the loaded one does.
+        let mut frozen = loaded.clone();
+        frozen.freeze();
+        assert_eq!(frozen, loaded);
+        assert_eq!(frozen.ordered_nodes(), loaded.ordered_nodes());
+        frozen
     }
 
     fn keys(k: &[&str]) -> Vec<String> {
@@ -1339,9 +1438,8 @@ mod tests {
         assert!(c.is_subtree("feed"));
         assert!(c.plain_subtree("feed"));
         assert!(c.plain_subtree("menu"));
-        let home = "Home".to_string();
         let ours: Vec<_> = c.ordered_nodes().into_iter().filter(|(k, _)| k == "feed" || k.starts_with("menu.")).collect();
-        assert_eq!(ours, vec![("feed".to_string(), None), ("menu.more".to_string(), None), ("menu.home".to_string(), Some(&home))]);
+        assert_eq!(ours, vec![("feed".to_string(), None), ("menu.more".to_string(), None), ("menu.home".to_string(), Some("Home"))]);
     }
 
     #[test]
@@ -1397,6 +1495,7 @@ mod tests {
         let (mut c, _) = Catalog::load("en", &mut files);
         let policy = FallbackPolicy { app: Some(keys(&["en"])), ..Default::default() };
         c.load_locales(keys(&["en", "pl"]), policy, &[], &mut files);
+        c.freeze();
         let en = Some(&["en".to_string()][..]);
         let t = |key: &str, defaults: Vec<Fallback>| Translate { key: key.into(), defaults, ..Default::default() };
         let one = |s: &str| Ok(Translation::One(s.into()));
@@ -1439,11 +1538,11 @@ mod tests {
             c.entries
                 .iter()
                 .filter(|(k, _)| prefixes.iter().any(|p| k.starts_with(p.as_str())))
-                .map(|(k, v)| (k.clone(), v.clone()))
+                .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect::<BTreeMap<_, _>>()
         };
         for keys in [keys(&[]), keys(&["user"]), keys(&["user", "user_group"]), keys(&["account", "absent"])] {
-            assert_eq!(c.subset_for("activerecord", &keys).entries, wanted("activerecord", &keys), "{keys:?}");
+            assert_eq!(c.subset_for("activerecord", &keys).entries.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<BTreeMap<_, _>>(), wanted("activerecord", &keys), "{keys:?}");
         }
         assert!(c.subset_for("activerecord", &keys(&["user"])).entries.contains_key("activerecord.models.users"));
         assert!(!c.subset_for("activerecord", &keys(&["user"])).entries.contains_key("zz"));

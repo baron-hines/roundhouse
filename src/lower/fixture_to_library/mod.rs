@@ -34,6 +34,20 @@ use crate::App;
 /// LibraryClass. Returns an empty Vec when the app has no fixtures
 /// (apps without test fixtures skip the artifact).
 pub fn lower_fixtures_to_library_classes(app: &App) -> Vec<LibraryClass> {
+    lower_fixtures(app, false)
+}
+
+/// [`lower_fixtures_to_library_classes`] for the Ruby family, whose
+/// insert writes an integer key the record was given (the models it
+/// lowers with `RuntimeRelation::Present`): a row's own `id:` is the key
+/// it is stored and found under, as in Rails. Every other target's
+/// insert leaves the key to the database, so its rows keep being found
+/// by position, where the next rowid puts them.
+pub fn lower_fixtures_to_library_classes_keeping_keys(app: &App) -> Vec<LibraryClass> {
+    lower_fixtures(app, true)
+}
+
+fn lower_fixtures(app: &App, keeps_keys: bool) -> Vec<LibraryClass> {
     let lowered = crate::lower::lower_fixtures(app);
     // `by_label` is DEMAND-GATED — emitted only for a fixture some test
     // body reaches with a variable label. Unconditionally is wrong, and
@@ -52,7 +66,8 @@ pub fn lower_fixtures_to_library_classes(app: &App) -> Vec<LibraryClass> {
                         .filter(|c| m.enum_defaults.contains_key(&c.name)).collect()))
                 .unwrap_or_default();
             let temporal = temporal_columns(app, &f.class);
-            build_fixture_class(f, &lowered, dynamic.contains(&f.name), &defaults, &temporal)
+            let sequence = sequence_reset(app, &f.class);
+            build_fixture_class(f, &lowered, dynamic.contains(&f.name), &defaults, &temporal, sequence.as_deref(), keeps_keys)
         })
         .collect()
 }
@@ -175,6 +190,8 @@ fn build_fixture_class(
     wants_by_label: bool,
     defaults: &[&Column],
     temporal: &HashMap<Symbol, bool>,
+    sequence: Option<&str>,
+    keeps_keys: bool,
 ) -> LibraryClass {
     let owner_name = format!("{}Fixtures", camelize(f.name.as_str()));
     let owner_id = ClassId(Symbol::from(owner_name.clone()));
@@ -189,8 +206,7 @@ fn build_fixture_class(
         .iter()
         .enumerate()
         .map(|(idx, r)| {
-            let id = (idx + 1) as i64;
-            let body = build_find_call(&f.class, id);
+            let body = build_find_call(&f.class, record_id(idx, r, keeps_keys));
             MethodDef {
                 visibility: crate::dialect::MethodVisibility::Public,
                 unsupported_formals: None,
@@ -241,7 +257,7 @@ fn build_fixture_class(
             from_keyword: false,
             from_kwrest: false,
         }],
-        body: build_by_label_body(&f.class, &f.records),
+        body: build_by_label_body(&f.class, &f.records, keeps_keys),
         signature: Some(fn_sig(
             vec![(Symbol::from("label"), Ty::Untyped)],
             class_ty.clone(),
@@ -259,7 +275,10 @@ fn build_fixture_class(
     // the DB by `<Class>.new({...attrs...}).save`. Inserts happen in
     // 1-indexed file order so the autoincrement column matches the
     // ids the label methods look up. Body is a Seq of Sends.
-    let load_body = build_load_method_body(&f.class, &f.records, &f.preamble, &f.file_blobs, all, defaults, temporal);
+    let mut load_body = build_load_method_body(&f.class, &f.records, &f.preamble, &f.file_blobs, all, defaults, temporal, keeps_keys);
+    if let (Some(sql), ExprNode::Seq { exprs }) = (sequence, &mut *load_body.node) {
+        exprs.push(db_exec(sql));
+    }
     methods.push(MethodDef {
         visibility: crate::dialect::MethodVisibility::Public,
         unsupported_formals: None,
@@ -295,6 +314,60 @@ fn build_fixture_class(
     }
 }
 
+/// On PostgreSQL, the statement that moves a keyed table's id sequence
+/// past the rows its fixtures inserted, as Rails' `reset_pk_sequence!`
+/// does once fixtures are loaded: the rows carry explicit ids, which
+/// the sequence does not see, so a create in a test would take one of
+/// them again. The sequence is set to the largest id, marked called so
+/// the next value is past it: `MAX(id) + 1` would overflow a bigint key
+/// at its largest value. With no positive id (an empty table, or rows
+/// keyed below zero) it is set to 1, uncalled: the sequence's minimum,
+/// below which `setval` raises.
+///
+/// None for SQLite, whose rowid follows the table, and for a table with
+/// no integer key (a uuid, a composite key, none).
+fn sequence_reset(app: &App, class: &ClassId) -> Option<String> {
+    use crate::emit::shared::schema_sql::Dialect;
+    if Dialect::current() != Dialect::Postgres {
+        return None;
+    }
+    let model = app.models.iter().find(|m| &m.name == class)?;
+    let table = app.schema.tables.get(&model.table.0)?;
+    let key = table
+        .columns
+        .iter()
+        .find(|c| c.primary_key && matches!(c.col_type, crate::schema::ColumnType::Integer | crate::schema::ColumnType::BigInt))?;
+    // Quoted, as the PostgreSQL truncate beside it quotes them.
+    let quote = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
+    let table = quote(table.name.as_str());
+    let column = quote(key.name.as_str());
+    Some(format!(
+        "SELECT setval(pg_get_serial_sequence('{table}', '{}'), GREATEST(COALESCE(MAX({column}), 0), 1), COALESCE(MAX({column}), 0) >= 1) FROM {table}",
+        key.name.as_str()
+    ))
+}
+
+/// `Db.exec(<sql>)`.
+fn db_exec(sql: &str) -> Expr {
+    let db = with_ty(
+        Expr::new(Span::synthetic(), ExprNode::Const { path: vec![Symbol::from("Db")] }),
+        Ty::Class { id: ClassId(Symbol::from("Db")), args: vec![].into() },
+    );
+    with_ty(
+        Expr::new(
+            Span::synthetic(),
+            ExprNode::Send {
+                recv: Some(db),
+                method: Symbol::from("exec"),
+                args: vec![lit_str(sql.to_string())],
+                block: None,
+                parenthesized: true,
+            },
+        ),
+        Ty::Nil,
+    )
+}
+
 /// Body of `by_label(label)`: an if/elsif chain comparing
 /// `label.to_s` against each known label, answering that label's
 /// record, and raising on a name no fixture defines.
@@ -302,7 +375,7 @@ fn build_fixture_class(
 /// `.to_s` on the way in so a Symbol and a String both hit — Rails'
 /// accessor takes `users(:david)` and `users("david")` alike, and the
 /// variable that reaches here has already lost which one it was.
-fn build_by_label_body(cls: &ClassId, records: &[LoweredFixtureRecord]) -> Expr {
+fn build_by_label_body(cls: &ClassId, records: &[LoweredFixtureRecord], keeps_keys: bool) -> Expr {
     let label_var = with_ty(
         Expr::new(
             Span::synthetic(),
@@ -352,12 +425,31 @@ fn build_by_label_body(cls: &ClassId, records: &[LoweredFixtureRecord]) -> Expr 
             Span::synthetic(),
             ExprNode::If {
                 cond,
-                then_branch: build_find_call(cls, (idx + 1) as i64),
+                then_branch: build_find_call(cls, record_id(idx, r, keeps_keys)),
                 else_branch: chain,
             },
         );
     }
     chain
+}
+
+/// The id a fixture row is stored and found under: on a target that
+/// `keeps_keys`, the integer its own `id:` gives, as Rails' `FixtureSet`
+/// keeps a row's explicit key; else its 1-based position in the file.
+/// An `id:` the YAML does not give as an integer literal (an ERB tag)
+/// keeps the position.
+fn record_id(idx: usize, r: &LoweredFixtureRecord, keeps_keys: bool) -> i64 {
+    if !keeps_keys {
+        return (idx + 1) as i64;
+    }
+    r.fields
+        .iter()
+        .find(|f| f.column.as_str() == "id")
+        .and_then(|f| match &f.value {
+            LoweredFixtureValue::Literal { raw, .. } => raw.trim().parse::<i64>().ok(),
+            _ => None,
+        })
+        .unwrap_or((idx + 1) as i64)
 }
 
 /// `<Class>.find(<id>)` — used by each label method to return the
@@ -366,7 +458,7 @@ fn build_find_call(cls: &ClassId, id: i64) -> Expr {
     let class_const = with_ty(
         Expr::new(
             Span::synthetic(),
-            ExprNode::Const { path: vec![cls.0.clone()] },
+            ExprNode::Const { path: cls.const_path() },
         ),
         Ty::Class { id: cls.clone(), args: vec![].into() },
     );
@@ -407,6 +499,7 @@ fn build_load_method_body(
     all: &LoweredFixtureSet,
     defaults: &[&Column],
     temporal: &HashMap<Symbol, bool>,
+    keeps_keys: bool,
 ) -> Expr {
     let class_ty = Ty::Class { id: cls.clone(), args: vec![].into() };
     let instance_sym = Symbol::from("instance");
@@ -419,7 +512,7 @@ fn build_load_method_body(
     exprs.extend(preamble.iter().cloned());
 
     for (idx, r) in records.iter().enumerate() {
-        let id = (idx + 1) as i64;
+        let id = record_id(idx, r, keeps_keys);
         if let Some(blob) = file_blobs.get(&r.label) {
             exprs.push(load_file_blob(id, blob));
             continue;
@@ -428,7 +521,7 @@ fn build_load_method_body(
         let class_const = with_ty(
             Expr::new(
                 Span::synthetic(),
-                ExprNode::Const { path: vec![cls.0.clone()] },
+                ExprNode::Const { path: cls.const_path() },
             ),
             class_ty.clone(),
         );
@@ -690,6 +783,11 @@ fn literal_value_to_expr(ty: &Ty, raw: &str) -> Expr {
 
 /// FK resolution: find the target fixture's record by label,
 /// substitute its 1-indexed position as the literal Int id.
+///
+/// The position even when the target sets its own `id:`, which Rails
+/// does not follow either: its label reference is the label's hash
+/// (`FixtureSet.identify`), so the row it names is not there and the
+/// foreign key check after loading fails (ActiveRecord 8.1.4.1).
 fn resolve_fk_id(
     target_fixture: &Symbol,
     target_label: &Symbol,

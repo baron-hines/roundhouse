@@ -483,6 +483,12 @@ module ActionCable
         nil
       end
 
+      def stop_all_streams
+        @connection.stop_streams(@identifier) unless @connection.nil?
+        @streams.clear
+        nil
+      end
+
       # `broadcasting_for` is spelled ONCE, on the class, because
       # `stream_for` subscribes to that name and `broadcast_to`
       # publishes on it: two spellings would be a subscription nobody
@@ -638,19 +644,10 @@ module ActionCable
     # it names — campfire's seven ask for `signed_stream_name` and
     # `room_id` — so nothing keeps the object around.
     #
-    # A STRING EVERY TIME, INCLUDING FOR A NUMBER. `RoomChannel` does
-    # `Room.find_by(id: params[:room_id])` and the client writes
-    # `{"room_id":5}` — a JSON number. Answering it as its digits is
-    # what makes the find work: the column is an integer and the
-    # adapter casts a numeric string, where a Ruby Integer and a Ruby
-    # String cannot both come out of one slot on a strict target.
-    # Rails' own `params` is string-valued for the same reason one hop
-    # earlier (a query string has no types), so this is the Rails
-    # answer rather than a concession.
-    #
-    # "" for a key the identifier does not carry, which is what a
-    # channel testing `if params[:signed_stream_name]` needs — a nil
-    # would make the slot nullable for every reader.
+    # Present values retain String conversion, including JSON numbers,
+    # so native channel readers keep their existing ID representation.
+    # Missing/null values stay nil: an empty String is truthy and would
+    # make `if params[:flag]` take the present branch.
     class Parameters
       def initialize(identifier)
         @identifier = identifier
@@ -670,16 +667,16 @@ module ActionCable
         h.is_a?(Hash) ? h : nil
       end
 
-      # One key of `text` as a String: "" when the key is absent or
+      # One key of `text` as a String, or nil when it is absent/null or
       # `text` is not an object; a number reads as its digits. The
       # cable glue reads subscribe frames through this too.
       def self.read(text, name)
         h = Parameters.object(text)
         if h.nil?
-          return ""
+          return nil
         end
         v = h[name]
-        v.nil? ? "" : v.to_s
+        v.nil? ? nil : v.to_s
       end
 
       def [](key)
@@ -762,8 +759,16 @@ module ActionCable
         @cookies
       end
 
+      attr_writer :request
+
+      def request
+        @request = ActionDispatch::Request.for({}) if @request.nil?
+        @request
+      end
+
       def initialize(cookies)
         @cookies = cookies
+        @request = nil
       end
 
       # Rails' Base does not define `connect`; a subclass that wants
@@ -789,6 +794,12 @@ module ActionCable
       # `Connection::TestCase`'s `TestSocket`. Rails 8.2 hands both
       # `close` and `perform_work` to the socket, and so does this.
       attr_accessor :transport
+
+      def stop_streams(identifier)
+        live = @transport
+        live.stop_streams(identifier) unless live.nil?
+        nil
+      end
 
       def transmit(data)
         live = @transport

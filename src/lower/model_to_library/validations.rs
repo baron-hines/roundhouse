@@ -27,16 +27,23 @@ pub(super) fn push_validate_method(
     errors_readers: ErrorsReaders,
     runtime_relation: super::RuntimeRelation,
     primary_key: &Symbol,
+    table: Option<&crate::schema::Table>,
+    schema: &crate::schema::Schema,
 ) {
     let model_msgs = Messages(Some(model), None);
     let mut stmts: Vec<Expr> = Vec::new();
+    // The strict targets' uniqueness probes (`adapter_emit::uniqueness`),
+    // added beside `validate`, which calls them.
+    let mut probes: Vec<MethodDef> = Vec::new();
     let store_attrs: crate::det::HashSet<Symbol> = crate::lower::typed_store::typed_store_decls(&model.body)
         .into_iter()
         .flat_map(|(_, attrs)| attrs.into_iter().map(|a| a.name))
         .collect();
+    let defaulted_attrs: crate::det::HashSet<Symbol> =
+        super::markers::attribute_api_defaults(&model.body).into_iter().map(|(name, _)| name).collect();
 
-    // One pass in declaration order: Rails checks a `belongs_to` where it is declared, among the `validates`, so its error lists there.
-    for item in &model.body {
+    // Unprepended validations and belongs_to checks keep declaration order.
+    for item in model.validation_order() {
         let span = item.span();
         match item {
             crate::dialect::ModelBodyItem::Validation { validation: v, .. } => {
@@ -47,7 +54,9 @@ pub(super) fn push_validate_method(
                 // for fields the schema declares as `Str` — tsc narrows
                 // `Array.isArray(stringField)` to `never` and rejects the
                 // subsequent `.length` access.
-                let attr_ty = model.attributes.fields.get(&v.attribute);
+                // Not the column's type where the model writes its own reader over it: that reader answers what Rails validates, of any type.
+                let own_reader = model.methods().any(|d| d.receiver == MethodReceiver::Instance && d.name == v.attribute);
+                let attr_ty = model.attributes.fields.get(&v.attribute).filter(|_| !own_reader);
                 // `validates :user, presence: true` on a `belongs_to :user` (or
                 // `has_one`) names the ASSOCIATION, and Rails asks its reader —
                 // `user.blank?`, nil for a record. There is no `@user` slot: the
@@ -128,13 +137,58 @@ pub(super) fn push_validate_method(
                             super::RuntimeRelation::Present => vec![inline_uniqueness_check(
                                 msgs, model, primary_key, &v.attribute, scope, *case_sensitive, *allow_nil, *allow_blank,
                             )],
-                            // Reported per target by
-                            // `relation_residue::uniqueness_gaps_for_target`.
-                            super::RuntimeRelation::Absent => Vec::new(),
+                            super::RuntimeRelation::Absent => {
+                                match table.and_then(|table| {
+                                    crate::lower::validations::strict_uniqueness_columns(model, table, &v.attribute, scope)
+                                        .map(|columns| (table, columns))
+                                }) {
+                                    Some((table, (column, scoped))) => {
+                                        let name = super::adapter_emit::uniqueness::probe_name(&v.attribute, probes.len());
+                                        probes.push(super::adapter_emit::uniqueness::synth_uniqueness_probe(
+                                            &model.name, table, schema, name.clone(), &column, &scoped, primary_key, *case_sensitive,
+                                        ));
+                                        let nilable = super::adapter_emit::uniqueness::nilable(table, &column);
+                                        let slot_ty = super::adapter_emit::uniqueness::slot_ty(table, &column);
+                                        vec![strict_uniqueness_check(
+                                            msgs, &v.attribute, &column, name, nilable, slot_ty.as_ref(), *allow_nil, *allow_blank,
+                                        )]
+                                    }
+                                    // Reported per target by
+                                    // `relation_residue::uniqueness_gaps_for_target`.
+                                    None => Vec::new(),
+                                }
+                            }
                         }
                     } else {
                         validation_rule_to_calls(msgs, &v.attribute, rule, attr_ty, runtime_relation)
                     };
+                    // Not the `@attr` slot a column has: a typed_store attribute lives in its store column, behind the reader Rails validates through.
+                    // A defaulted `attribute` holds nil in `@attr` until its reader applies the default.
+                    // Nor for an attribute no column holds (Devise's `password`): Rails validates what its reader answers.
+                    let virtual_attr = attr_ty.is_none() && !is_assoc && attachment.is_none() && !is_collection && !own_ivar_accessor(model, &v.attribute);
+                    // Nor where the model writes its own reader over the column's or the accessor's: Rails validates what that answers.
+                    if store_attrs.contains(&v.attribute) || defaulted_attrs.contains(&v.attribute) || virtual_attr || own_reader {
+                        for check in &mut produced {
+                            read_through_reader(check, &v.attribute);
+                        }
+                    }
+                    // A column held unset for its presence check is validated
+                    // in its nilable slot, as Rails validates the nil an
+                    // unassigned attribute holds (its reader answers 0) —
+                    // the validated attribute's, and a `scope:` column's.
+                    for col in table.iter().flat_map(|t| t.columns.iter()).filter(|c| c.unset_until_assigned) {
+                        let storage = super::schema::col_storage_name(col);
+                        for check in &mut produced {
+                            rename_ivar(check, &col.name, &storage);
+                        }
+                    }
+                    // Rails reads the confirmation through its reader (`public_send("#{attr}_confirmation")`).
+                    if matches!(rule, ValidationRule::Confirmation { .. }) {
+                        let confirmation = Symbol::from(format!("{}_confirmation", v.attribute.as_str()));
+                        for check in &mut produced {
+                            read_through_reader(check, &confirmation);
+                        }
+                    }
                     if v.if_cond.is_some() || v.unless_cond.is_some() {
                         let body = if produced.len() == 1 {
                             produced.pop().unwrap()
@@ -142,12 +196,6 @@ pub(super) fn push_validate_method(
                             seq(produced)
                         };
                         produced = vec![with_condition_guard(body, &v.if_cond, &v.unless_cond)];
-                    }
-                    // Not the `@attr` slot a column has: a typed_store attribute lives in its store column, behind the reader Rails validates through.
-                    if store_attrs.contains(&v.attribute) {
-                        for check in &mut produced {
-                            read_through_reader(check, &v.attribute);
-                        }
                     }
                     for mut check in produced {
                         // Each expanded check attributes to its `validates` line.
@@ -161,10 +209,48 @@ pub(super) fn push_validate_method(
                 // record to exist before save, checked through the association
                 // reader (`inline_belongs_to_check`).
                 if let Association::BelongsTo {
-                    name, foreign_key, optional: false, polymorphic, ..
+                    name, foreign_key, optional: false, polymorphic, polymorphic_targets, foreign_type, ..
                 } = assoc
                 {
-                    let mut check = inline_belongs_to_check(model_msgs, name, foreign_key, *polymorphic);
+                    // A foreign key held unset for its presence check
+                    // (`hold_unset_presence_columns`) is checked in its slot.
+                    let held = table
+                        .iter()
+                        .flat_map(|t| t.columns.iter())
+                        .find(|c| c.name == *foreign_key && c.unset_until_assigned)
+                        .map(super::schema::col_storage_name);
+                    // A polymorphic association whose implementors never
+                    // resolved has no reader and no writer to synthesize
+                    // (`associations::synth_methods`): its key pair is all
+                    // the check can read. One that resolved is checked
+                    // through its reader, which is where the writer keeps
+                    // the record it was given.
+                    // The writer keeps the record only on the Ruby family
+                    // (`emit::ruby::library::apply_belongs_to_autosave`), and a
+                    // strict target's polymorphic reader may be a stub that
+                    // raises: there the key pair stays the check. A plain
+                    // association's unsaved record leaves its key unset too,
+                    // so there the Ruby family asks the reader alone.
+                    let source = if !*polymorphic {
+                        if runtime_relation == super::RuntimeRelation::Present && held.is_none() {
+                            PresenceSource::ReaderOnly
+                        } else {
+                            PresenceSource::KeyAndReader
+                        }
+                    } else if polymorphic_targets.is_empty()
+                        || runtime_relation != super::RuntimeRelation::Present
+                    {
+                        PresenceSource::Key
+                    } else {
+                        PresenceSource::Reader {
+                            type_column: foreign_type
+                                .clone()
+                                .unwrap_or_else(|| Symbol::from(format!("{}_type", name.as_str()))),
+                            classes: polymorphic_targets.iter().map(|t| t.0.as_str().to_string()).collect(),
+                        }
+                    };
+                    let mut check =
+                        inline_belongs_to_check(model_msgs, name, foreign_key, held.as_ref(), source);
                     // `accepts_nested_attributes_for` (`ingest::nested_attributes`)
                     // builds the record before the save, which writes its id:
                     // Rails checks the object it built, so a pending one passes,
@@ -214,6 +300,7 @@ pub(super) fn push_validate_method(
             block_param: None,
         });
     }
+    methods.extend(probes);
 
     // A validating model OUTSIDE the ActiveRecord hierarchy (`class
     // Search` + `include ActiveModel::Validations`, no superclass)
@@ -496,6 +583,49 @@ fn push_active_model_validation_surface(methods: &mut Vec<MethodDef>, model: &Mo
             block_param: None,
         });
     }
+    // Rails' `validate!`: `valid? || raise ActiveModel::ValidationError`, whose message joins the full messages.
+    // Not a `def self.validate!`: the instance method is what Rails defines, and the class-side one leaves it.
+    let defines_instance = |name: &str| {
+        model.body.iter().any(|item| matches!(
+            item,
+            crate::dialect::ModelBodyItem::Method { method, .. }
+                if method.name.as_str() == name && method.receiver == MethodReceiver::Instance
+        ))
+    };
+    if !defines_instance("validate!") {
+        let send = |recv: Option<Expr>, method: &str, args: Vec<Expr>| {
+            Expr::new(span, ExprNode::Send { recv, method: Symbol::from(method), args, block: None, parenthesized: true })
+        };
+        let lit_str = |s: &str| Expr::new(span, ExprNode::Lit { value: Literal::Str { value: s.to_string() } });
+        let message = send(Some(lit_str("Validation failed: ")), "+", vec![send(Some(send(None, "errors", vec![])), "join", vec![lit_str(", ")])]);
+        let error = send(
+            Some(Expr::new(span, ExprNode::Const { path: vec![Symbol::from(""), Symbol::from("ActiveModel"), Symbol::from("ValidationError")] })),
+            "new",
+            vec![message, Expr::new(span, ExprNode::SelfRef)],
+        );
+        let body = Expr::new(span, ExprNode::If {
+            cond: send(None, "valid?", vec![]),
+            then_branch: Expr::new(span, ExprNode::Lit { value: Literal::Bool { value: true } }),
+            else_branch: send(None, "raise", vec![error]),
+        });
+        methods.push(MethodDef {
+            visibility: crate::dialect::MethodVisibility::Public,
+            unsupported_formals: None,
+            has_anonymous_block: false,
+            name_span: crate::span::Span::synthetic(),
+            name: Symbol::from("validate!"),
+            receiver: MethodReceiver::Instance,
+            params: Vec::new(),
+            body,
+            signature: Some(fn_sig(vec![], Ty::Bool)),
+            effects: EffectSet::default(),
+            enclosing_class: Some(model.name.0.clone()),
+            kind: AccessorKind::Method,
+            is_async: false,
+            mutates_self: true,
+            block_param: None,
+        });
+    }
     if !defines("errors") {
         methods.push(MethodDef {
             visibility: crate::dialect::MethodVisibility::Public,
@@ -533,16 +663,20 @@ fn push_active_model_validation_surface(methods: &mut Vec<MethodDef>, model: &Mo
             mutates_self: false,
             block_param: None,
         });
-    }    if !defines("error_messages_for") {
+    }
+    for (name, message) in [("error_messages_for", "message"), ("error_full_messages_for", "full_message")] {
+        if defines(name) {
+            continue;
+        }
         methods.push(MethodDef {
             visibility: crate::dialect::MethodVisibility::Public,
             unsupported_formals: None,
             has_anonymous_block: false,
             name_span: crate::span::Span::synthetic(),
-            name: Symbol::from("error_messages_for"),
+            name: Symbol::from(name),
             receiver: MethodReceiver::Instance,
             params: vec![crate::dialect::Param::positional(Symbol::from("attribute"))],
-            body: error_messages_for_body(span, errors_readers),
+            body: error_messages_for_body(span, errors_readers, message),
             signature: Some(fn_sig(vec![(Symbol::from("attribute"), Ty::Str)], Ty::Array { elem: std::sync::Arc::new(Ty::Str) })),
             effects: EffectSet::default(),
             enclosing_class: Some(model.name.0.clone()),
@@ -575,10 +709,12 @@ fn errors_reader(span: Span, errors_readers: ErrorsReaders, name: &str, ty: Ty) 
     read
 }
 
-/// `out = []; error_details.each { |e| out << e.message if e.attribute == attribute }; out`,
-/// the body `ActiveRecord::Base#error_messages_for` has in the shared runtime
-/// (`@error_details.each` for `ErrorsReaders::FieldRead`).
-fn error_messages_for_body(span: Span, errors_readers: ErrorsReaders) -> Expr {
+/// `out = []; error_details.each { |e| out << e.<message> if e.attribute == attribute }; out`,
+/// the body `ActiveRecord::Base#error_messages_for` (`message`) and
+/// `#error_full_messages_for` (`full_message`) have in the shared runtime
+/// (`@error_details.each` for `ErrorsReaders::FieldRead`). The ruby family answers the full
+/// messages frozen, as its connection.rb reopen does; a strict target has no frozen Array.
+fn error_messages_for_body(span: Span, errors_readers: ErrorsReaders, message: &str) -> Expr {
     let str_array = Ty::Array { elem: std::sync::Arc::new(Ty::Str) };
     let typed = |node: ExprNode, ty: Ty| {
         let mut e = Expr::new(span, node);
@@ -594,7 +730,7 @@ fn error_messages_for_body(span: Span, errors_readers: ErrorsReaders) -> Expr {
     let picked = typed(
         ExprNode::If {
             cond: call(call(error(), "attribute", vec![], Ty::Str), "==", vec![var("attribute", Ty::Str)], Ty::Bool),
-            then_branch: call(var("out", str_array.clone()), "<<", vec![call(error(), "message", vec![], Ty::Str)], str_array.clone()),
+            then_branch: call(var("out", str_array.clone()), "<<", vec![call(error(), message, vec![], Ty::Str)], str_array.clone()),
             else_branch: typed(ExprNode::Lit { value: Literal::Nil }, Ty::Nil),
         },
         Ty::Nil,
@@ -628,7 +764,12 @@ fn error_messages_for_body(span: Span, errors_readers: ErrorsReaders) -> Expr {
             value: typed(ExprNode::Array { elements: vec![], style: ArrayStyle::default() }, str_array.clone()),
         },
     );
-    seq(vec![init, each, var("out", str_array)])
+    let answer = if message == "full_message" && errors_readers == ErrorsReaders::CreatedOnFirstRead {
+        call(var("out", str_array.clone()), "freeze", vec![], str_array)
+    } else {
+        var("out", str_array)
+    };
+    seq(vec![init, each, answer])
 }
 
 /// Produce the list of helper-call expressions for one `ValidationRule` on
@@ -645,6 +786,7 @@ fn validation_rule_to_calls(
     match rule {
         ValidationRule::Presence => vec![inline_presence_check(msgs, attr, attr_ty, runtime_relation)],
         ValidationRule::Absence => vec![inline_absence_check(msgs, attr, attr_ty, runtime_relation)],
+        ValidationRule::Confirmation { case_sensitive } => vec![inline_confirmation_check(msgs, attr, *case_sensitive != Some(false), attr_ty)],
         ValidationRule::Acceptance { accept, allow_nil } => {
             vec![inline_acceptance_check(msgs, attr, accept, *allow_nil != Some(false), attr_ty, runtime_relation)]
         }
@@ -695,6 +837,7 @@ fn validation_rule_to_calls(
             vec![inline_exclusion_check(msgs, attr, values, range.as_ref())]
         }
         ValidationRule::InclusionCall { set } => vec![inline_set_call_check(msgs, attr, set, false, attr_ty)],
+        ValidationRule::Comparison { checks } => vec![inline_comparison_check(msgs, attr, checks)],
         ValidationRule::ExclusionCall { set } => vec![inline_set_call_check(msgs, attr, set, true, attr_ty)],
         // `validate :validate_url` — a method the model defines, which
         // adds to `errors` itself. The synthesized `validate` just
@@ -745,11 +888,12 @@ fn validation_rule_to_calls(
 /// A POLYMORPHIC association keeps only the first two terms. The class
 /// to query is in the row's `<assoc>_type` COLUMN, and `target` for a
 /// polymorphic belongs_to is the assoc-name phantom (`Record` for
-/// `belongs_to :record`), a class that does not exist and has no typed
-/// reader. Dropping the existence half is a strict SUBSET of Rails'
-/// check — it can fail a save Rails would fail, never one Rails would
-/// pass — and the id-presence half is the part that catches the real
-/// error (an unset owner).
+/// `belongs_to :record`). Its type-switched reader keeps no target the
+/// writer assigned, so asking it would fail a save of a record Rails
+/// checks as present (one the scope hides, or not yet saved). Without the
+/// existence half the check never fails a save Rails would pass, and
+/// passes one whose key names a missing or scoped-out row, which Rails
+/// fails: the id-presence half catches the common error (an unset owner).
 /// Inline `validates :attr, uniqueness: …`, as Rails 8.1's
 /// `UniquenessValidator` queries (on a target with the runtime Relation):
 ///   if Model.unscoped.where(attr: @attr).not(<pk>: @<pk>)[.where(scope_col: @scope_col)…].exists?
@@ -767,6 +911,48 @@ fn validation_rule_to_calls(
 /// itself when it names a non-polymorphic `belongs_to` (`validates
 /// :reblog, uniqueness:` queries `reblog_of_id`; the error stays on
 /// `reblog`).
+/// The strict targets' uniqueness check: `validate` asks the probe
+/// (`adapter_emit::uniqueness`), skipping a nil value under `allow_nil:`
+/// and a blank one under `allow_blank:`, as `inline_uniqueness_check`
+/// does on the runtime Relation.
+fn strict_uniqueness_check(
+    msgs: Messages,
+    attr: &Symbol,
+    column: &Symbol,
+    probe: Symbol,
+    nilable: bool,
+    slot_ty: Option<&Ty>,
+    allow_nil: bool,
+    allow_blank: bool,
+) -> Expr {
+    let mut taken = with_bool(Expr::new(
+        Span::synthetic(),
+        ExprNode::Send { recv: None, method: probe, args: vec![], block: None, parenthesized: false },
+    ));
+    let value = ivar(column);
+    let not = |e: Expr| {
+        with_bool(Expr::new(
+            Span::synthetic(),
+            ExprNode::Send { recv: Some(e), method: Symbol::from("!"), args: vec![], block: None, parenthesized: false },
+        ))
+    };
+    let is_nil = || with_bool(send(value.clone(), "nil?", vec![]));
+    if allow_blank {
+        // Narrowed past its `nil?` (Swift reads an optional String's
+        // `strip` no other way); a number is blank only when nil.
+        let blank = with_bool(allow_blank_cond(column, slot_ty, super::RuntimeRelation::Absent));
+        taken = with_bool(bool_op(BoolOpKind::And, not(blank), taken));
+    } else if allow_nil && nilable {
+        taken = with_bool(bool_op(BoolOpKind::And, not(is_nil()), taken));
+    }
+    let push_err = errors_push(attr.as_str(), msgs.error(attr.as_str(), "taken", &Default::default()));
+    if_with_nil_else(taken, push_err)
+}
+
+fn with_bool(e: Expr) -> Expr {
+    crate::lower::typing::with_ty(e, Ty::Bool)
+}
+
 fn inline_uniqueness_check(
     msgs: Messages,
     model: &Model,
@@ -872,11 +1058,42 @@ fn inline_uniqueness_check(
     if_with_nil_else(taken, push_err)
 }
 
+/// What a required `belongs_to`'s presence check can read.
+enum PresenceSource {
+    /// The key column's unset state, then the association reader.
+    KeyAndReader,
+    /// The reader alone, where the writer keeps the record it is given
+    /// (the Ruby family): an unsaved one has no key yet, and the reader
+    /// already answers nil for an unset key.
+    ReaderOnly,
+    /// The reader, for a polymorphic association: its writer keeps an
+    /// unsaved record under the runtime's 0 key, so the key cannot decide
+    /// whether the record is there — the reader can, because it holds
+    /// what the writer was given. The reader finds only the `classes` it
+    /// dispatches on, so a set key whose `type_column` names any other
+    /// class passes, as the key alone decided before; Rails loads that
+    /// class's row.
+    Reader { type_column: Symbol, classes: Vec<String> },
+    /// The key column alone. A polymorphic association whose implementors
+    /// never resolved has no synthesized reader to call (`Record.find_by`
+    /// would name a phantom class), so its key pair is all there is.
+    Key,
+}
+
+/// `if @fk.nil? || @fk == 0 || <assoc>.nil?` — a required `belongs_to`'s
+/// presence check, `"<Assoc> must exist"` (type `:blank`, as Rails adds
+/// it for `message: :required`); `if <assoc>.nil?` alone where the writer
+/// keeps the record (`PresenceSource::ReaderOnly`). The reader is what
+/// Rails validates, so assigning the record itself makes the check pass
+/// before either side is saved, and a key pair naming no row makes it fail. For a polymorphic
+/// association the reader is also what picks the class — from the row's
+/// `<assoc>_type` column — so the check never names one.
 fn inline_belongs_to_check(
     msgs: Messages,
     assoc_name: &Symbol,
     foreign_key: &Symbol,
-    polymorphic: bool,
+    held: Option<&Symbol>,
+    source: PresenceSource,
 ) -> Expr {
     let fk_ivar = ivar(foreign_key);
     // `@fk.nil?`
@@ -894,10 +1111,15 @@ fn inline_belongs_to_check(
     let mut message = msgs.error(assoc_name.as_str(), "required", &Default::default());
     message.kind = "blank".to_string();
     let push_err = errors_push(assoc_name.as_str(), message);
-    if polymorphic {
-        return if_with_nil_else(bool_op(BoolOpKind::Or, nil_check, zero_check), push_err);
+    // A held key's slot is nil until assigned, so it needs no 0 sentinel.
+    let unset = match held {
+        Some(storage) => send(ivar(storage), "nil?", vec![]),
+        None => bool_op(BoolOpKind::Or, nil_check, zero_check),
+    };
+    if matches!(source, PresenceSource::Key) {
+        return if_with_nil_else(unset, push_err);
     }
-    // `article.nil?` — the association reader, on self.
+    // `<assoc>.nil?` — the association reader, on self.
     let reader = Expr::new(
         Span::synthetic(),
         ExprNode::Send {
@@ -909,11 +1131,28 @@ fn inline_belongs_to_check(
         },
     );
     let missing = send(reader, "nil?", vec![]);
-    let cond = bool_op(
-        BoolOpKind::Or,
-        bool_op(BoolOpKind::Or, nil_check, zero_check),
-        missing,
-    );
+    let cond = match source {
+        PresenceSource::KeyAndReader => bool_op(BoolOpKind::Or, unset, missing),
+        PresenceSource::ReaderOnly => missing,
+        // `<assoc>.nil? && (<unset> || @<type>.nil? || [<classes>].include?(@<type>))`
+        PresenceSource::Reader { type_column, classes } => {
+            let names = Expr::new(
+                Span::synthetic(),
+                ExprNode::Array {
+                    elements: classes
+                        .into_iter()
+                        .map(|value| Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Str { value } }))
+                        .collect(),
+                    style: crate::expr::ArrayStyle::Brackets,
+                },
+            );
+            let untyped = send(ivar(&type_column), "nil?", vec![]);
+            let known = send(names, "include?", vec![ivar(&type_column)]);
+            let checked = bool_op(BoolOpKind::Or, bool_op(BoolOpKind::Or, unset, untyped), known);
+            bool_op(BoolOpKind::And, missing, checked)
+        }
+        PresenceSource::Key => unreachable!("answered above"),
+    };
     if_with_nil_else(cond, push_err)
 }
 
@@ -995,10 +1234,28 @@ fn with_condition_guard(body: Expr, if_cond: &Option<Expr>, unless_cond: &Option
 
 /// `@<attr>` — direct ivar read passed as the `value` positional arg
 /// to every validates_* helper.
+/// The model's own file declares `attr` by `attr_accessor` / `attr_reader`, whose reader is the ivar itself.
+fn own_ivar_accessor(model: &Model, attr: &Symbol) -> bool {
+    model.body.iter().any(|item| matches!(item, crate::dialect::ModelBodyItem::Unknown { expr, .. }
+        if expr.span.file == model.span.file
+            && matches!(&*expr.node, ExprNode::Send { recv: None, method, args, .. }
+                if matches!(method.as_str(), "attr_accessor" | "attr_reader")
+                    && args.iter().any(|a| matches!(&*a.node, ExprNode::Lit { value: Literal::Sym { value } } if value == attr)))))
+}
+
 fn read_through_reader(expr: &mut Expr, attr: &Symbol) {
     expr.node.for_each_child_mut(&mut |c| read_through_reader(c, attr));
     if matches!(&*expr.node, ExprNode::Ivar { name } if name == attr) {
         *expr.node = ExprNode::Send { recv: None, method: attr.clone(), args: vec![], block: None, parenthesized: false };
+    }
+}
+
+fn rename_ivar(expr: &mut Expr, from: &Symbol, to: &Symbol) {
+    expr.node.for_each_child_mut(&mut |c| rename_ivar(c, from, to));
+    if let ExprNode::Ivar { name } = &mut *expr.node
+        && name == from
+    {
+        *name = to.clone();
     }
 }
 
@@ -1353,6 +1610,131 @@ fn inline_set_call_check(msgs: Messages, attr: &Symbol, set: &Expr, exclusion: b
     if_with_nil_else(cond, push_err)
 }
 
+/// Rails' `ComparisonValidator#validate_each`: a nil or blank value is `:blank` (once, as its loop returns there);
+/// otherwise each bound is read on the record and the value compared with it, an error of the option's kind whose
+/// `%{count}` is the bound as I18n interpolates it (`to_s`).
+fn inline_comparison_check(msgs: Messages, attr: &Symbol, checks: &[(Symbol, Expr)]) -> Expr {
+    const COUNT: &str = "\u{1}comparison-count\u{1}";
+    const RAISED: &str = "\u{1}comparison-raised\u{1}";
+    let var = |name: &str| Expr::new(Span::synthetic(), ExprNode::Var { id: crate::ident::VarId(0), name: Symbol::from(name) });
+    let assign = |name: &str, value: Expr| {
+        Expr::new(Span::synthetic(), ExprNode::Assign { target: crate::expr::LValue::Var { id: crate::ident::VarId(0), name: Symbol::from(name) }, value })
+    };
+    // Read once, before any bound, as Rails reads it: the reader, not the ivar (a date or time column keeps its raw
+    // text there).
+    let reader = Expr::new(
+        Span::synthetic(),
+        ExprNode::Send { recv: None, method: attr.clone(), args: vec![], block: None, parenthesized: false },
+    );
+    let value = || var("__comparison_value");
+    // `ActiveSupport.blank?`, not `blank?` on the value: Spinel's Date answers no `blank?`.
+    let support = Expr::new(Span::synthetic(), ExprNode::Const { path: vec![Symbol::from("ActiveSupport")] });
+    let blank = bool_op(BoolOpKind::Or, send(value(), "nil?", vec![]), send(support, "blank?", vec![value()]));
+    let blank_err = errors_push(attr.as_str(), msgs.error(attr.as_str(), "blank", &Default::default()));
+    let mut stmts = Vec::new();
+    for (i, (option, bound)) in checks.iter().enumerate() {
+        let name = format!("__comparison_bound_{i}");
+        let op = match option.as_str() {
+            "greater_than" => ">",
+            "greater_than_or_equal_to" => ">=",
+            "equal_to" => "==",
+            "less_than" => "<",
+            "less_than_or_equal_to" => "<=",
+            _ => "!=",
+        };
+        let holds = send(value(), op, vec![var(&name)]);
+        let fails = Expr::new(
+            Span::synthetic(),
+            ExprNode::Send { recv: Some(holds), method: Symbol::from("!"), args: vec![], block: None, parenthesized: false },
+        );
+        let mut msg = msgs.error(attr.as_str(), option.as_str(), &ErrorOpts::count(COUNT));
+        let count = send(var(&name), "to_s", vec![]);
+        fill_count(&mut msg.full, COUNT, &count);
+        fill_count(&mut msg.bare, COUNT, &count);
+        let compare = if_with_nil_else(fails, errors_push(attr.as_str(), msg));
+        // Rails resolves the first bound before it asks whether the value is blank, and a blank value ends the
+        // checks there with `:blank` (`validate_each` returns), so only the first check asks.
+        let decided = if i == 0 {
+            Expr::new(Span::synthetic(), ExprNode::If { cond: blank.clone(), then_branch: blank_err.clone(), else_branch: compare })
+        } else {
+            compare
+        };
+        let check = Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![assign(&name, bound.clone()), decided] });
+        // Rails rescues an ArgumentError of each check (`5 > nil`) into an error of its message, and goes on.
+        let mut raised = msgs.error(attr.as_str(), option.as_str(), &ErrorOpts { message: Some(RAISED.to_string()), ..Default::default() });
+        let message = send(var("__comparison_error"), "message", vec![]);
+        fill_count(&mut raised.full, RAISED, &message);
+        fill_count(&mut raised.bare, RAISED, &message);
+        let argument_error = Expr::new(Span::synthetic(), ExprNode::Const { path: vec![Symbol::from("ArgumentError")] });
+        stmts.push(Expr::new(
+            Span::synthetic(),
+            ExprNode::BeginRescue {
+                body: check,
+                rescues: vec![crate::expr::RescueClause {
+                    classes: vec![argument_error],
+                    binding: Some(Symbol::from("__comparison_error")),
+                    body: errors_push(attr.as_str(), raised),
+                }],
+                else_branch: None,
+                ensure: None,
+                implicit: false,
+            },
+        ));
+    }
+    let mut exprs = vec![assign("__comparison_value", reader)];
+    let mut rest = stmts.into_iter();
+    exprs.extend(rest.next());
+    let later: Vec<Expr> = rest.collect();
+    if !later.is_empty() {
+        let not_blank = Expr::new(
+            Span::synthetic(),
+            ExprNode::Send { recv: Some(blank), method: Symbol::from("!"), args: vec![], block: None, parenthesized: false },
+        );
+        exprs.push(if_with_nil_else(not_blank, Expr::new(Span::synthetic(), ExprNode::Seq { exprs: later })));
+    }
+    Expr::new(Span::synthetic(), ExprNode::Seq { exprs })
+}
+
+/// A message built with `marker` for its `%{count}`, the marker read as `count` where it stands.
+fn fill_count(e: &mut Expr, marker: &str, count: &Expr) {
+    let split = |text: &str| -> Option<Vec<crate::expr::InterpPart>> {
+        if !text.contains(marker) {
+            return None;
+        }
+        let mut parts = Vec::new();
+        for (i, piece) in text.split(marker).enumerate() {
+            if i > 0 {
+                parts.push(crate::expr::InterpPart::Expr { expr: count.clone() });
+            }
+            if !piece.is_empty() {
+                parts.push(crate::expr::InterpPart::Text { value: piece.to_string() });
+            }
+        }
+        Some(parts)
+    };
+    match &mut *e.node {
+        ExprNode::Lit { value: Literal::Str { value } } => {
+            if let Some(parts) = split(value) {
+                *e = Expr::new(e.span, ExprNode::StringInterp { parts });
+            }
+        }
+        ExprNode::StringInterp { parts } => {
+            let mut out = Vec::new();
+            for part in std::mem::take(parts) {
+                match part {
+                    crate::expr::InterpPart::Text { value } => match split(&value) {
+                        Some(pieces) => out.extend(pieces),
+                        None => out.push(crate::expr::InterpPart::Text { value }),
+                    },
+                    other => out.push(other),
+                }
+            }
+            *parts = out;
+        }
+        _ => e.node.for_each_child_mut(&mut |c| fill_count(c, marker, count)),
+    }
+}
+
 /// An Array slot, nullable or not (`ty_of_column_slot`'s stored array
 /// column, `Array[T] | nil` when the column allows null).
 fn is_array_ty(ty: Option<&Ty>) -> bool {
@@ -1421,6 +1803,32 @@ fn inline_exclusion_check(
     let push_err =
         errors_push(attr.as_str(), msgs.error(attr.as_str(), "exclusion", &Default::default()));
     if_with_nil_else(reserved, push_err)
+}
+
+/// Rails' `ConfirmationValidator`: a `<attr>_confirmation` that was given and differs (by `casecmp` for a String
+/// when not case-sensitive) is an error on the confirmation, naming the attribute.
+fn inline_confirmation_check(msgs: Messages, attr: &Symbol, case_sensitive: bool, attr_ty: Option<&Ty>) -> Expr {
+    let confirmation_name = format!("{}_confirmation", attr.as_str());
+    let confirmation = ivar(&Symbol::from(confirmation_name.as_str()));
+    let value = ivar(attr);
+    let casecmp = send(send(value.clone(), "casecmp", vec![confirmation.clone()]), "==", vec![Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Int { value: 0 } })]);
+    let equal = send(value.clone(), "==", vec![confirmation.clone()]);
+    // Not the column's type alone: Rails asks the value `is_a?(String)`, and a nil one compares by `==`.
+    let same = match (case_sensitive, peel_nilable(attr_ty).0) {
+        (true, _) => equal,
+        (false, Some(Ty::Str)) => bool_op(BoolOpKind::And, send(send(value, "nil?", vec![]), "!", vec![]), casecmp),
+        (false, None) => Expr::new(
+            Span::synthetic(),
+            ExprNode::If { cond: is_a_check(&value, "String"), then_branch: casecmp, else_branch: equal },
+        ),
+        (false, Some(_)) => equal,
+    };
+    let differs = bool_op(BoolOpKind::And, send(send(confirmation, "nil?", vec![]), "!", vec![]), send(same, "!", vec![]));
+    let human = msgs.0.map(|m| m.human_attribute_name(attr.as_str())).unwrap_or_else(|| crate::i18n::humanize(attr.as_str()));
+    if_with_nil_else(
+        differs,
+        errors_push(&confirmation_name, msgs.error(&confirmation_name, "confirmation", &ErrorOpts { attribute: Some(human), ..Default::default() })),
+    )
 }
 
 /// Inline `validates :attr, acceptance: { accept: [...], allow_nil: }`.
@@ -2375,7 +2783,13 @@ mod tests {
     fn belongs_to_inline_emits_must_exist_error() {
         let assoc_name = Symbol::from("article");
         let foreign_key = Symbol::from("article_id");
-        let expr = inline_belongs_to_check(Messages::default(), &assoc_name, &foreign_key, false);
+        let expr = inline_belongs_to_check(
+            Messages::default(),
+            &assoc_name,
+            &foreign_key,
+            None,
+            PresenceSource::KeyAndReader,
+        );
         assert_eq!(collect_error_messages(&expr), vec!["Article must exist"]);
     }
 
@@ -2386,7 +2800,13 @@ mod tests {
         // reader goes by the association's `primary_key:` itself.
         let assoc_name = Symbol::from("product");
         let foreign_key = Symbol::from("product_uuid");
-        let expr = inline_belongs_to_check(Messages::default(), &assoc_name, &foreign_key, false);
+        let expr = inline_belongs_to_check(
+            Messages::default(),
+            &assoc_name,
+            &foreign_key,
+            None,
+            PresenceSource::KeyAndReader,
+        );
         let rendered = format!("{expr:?}");
         assert!(!rendered.contains("exists?"), "the check must not probe with exists?: {rendered}");
         assert!(rendered.contains("method: Symbol(\"product\")"), "the check reads the association: {rendered}");
@@ -2394,19 +2814,57 @@ mod tests {
     }
 
     #[test]
-    fn polymorphic_belongs_to_checks_the_id_but_names_no_class() {
+    fn polymorphic_belongs_to_checks_the_record_through_its_reader() {
         // The class to query lives in the row's `<assoc>_type` column,
         // and `target` is the assoc-name phantom — writing it out was an
-        // uninitialized-constant NameError on the first save.
+        // uninitialized-constant NameError on the first save. The reader
+        // dispatches on that column, so the check asks it.
         let assoc_name = Symbol::from("record");
         let foreign_key = Symbol::from("record_id");
-        let expr = inline_belongs_to_check(Messages::default(), &assoc_name, &foreign_key, true);
+        let expr = inline_belongs_to_check(
+            Messages::default(),
+            &assoc_name,
+            &foreign_key,
+            None,
+            PresenceSource::Reader { type_column: Symbol::from("record_type"), classes: vec!["Post".to_string()] },
+        );
         assert_eq!(collect_error_messages(&expr), vec!["Record must exist"]);
         let rendered = format!("{expr:?}");
         assert!(
             !rendered.contains("exists?"),
             "a polymorphic check must not query a class: {rendered}"
         );
+        assert!(
+            !rendered.contains("path: [Symbol(\"Record\")]"),
+            "a polymorphic check names no class constant: {rendered}"
+        );
+        assert!(
+            rendered.contains("method: Symbol(\"record\")"),
+            "the check reads the association: {rendered}"
+        );
+        // A nil reader fails the check when the key is unset or the type
+        // names a class the reader dispatches on; a kept unsaved record,
+        // under the runtime's 0 key, is not nil, so it passes.
+        assert!(rendered.contains("method: Symbol(\"include?\")"), "the type is checked: {rendered}");
+        assert!(rendered.contains("Ivar { name: Symbol(\"record_type\") }"), "the type column: {rendered}");
+    }
+
+    #[test]
+    fn a_polymorphic_belongs_to_with_no_reader_checks_only_its_key() {
+        // An association whose implementors never resolved has no
+        // synthesized reader to call.
+        let assoc_name = Symbol::from("record");
+        let foreign_key = Symbol::from("record_id");
+        let expr = inline_belongs_to_check(
+            Messages::default(),
+            &assoc_name,
+            &foreign_key,
+            None,
+            PresenceSource::Key,
+        );
+        let rendered = format!("{expr:?}");
+        assert!(!rendered.contains("method: Symbol(\"record\")"), "no reader call: {rendered}");
+        assert_eq!(collect_error_messages(&expr), vec!["Record must exist"]);
     }
 }
 

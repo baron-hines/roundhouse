@@ -43,6 +43,7 @@ pub enum GemTy {
     Bool,
     Float,
     Sym,
+    Nil,
     /// Gradual escape: the gem returns an object we don't model
     /// structurally. Dispatch resolves and the choice propagates.
     Untyped,
@@ -61,6 +62,7 @@ impl GemTy {
             GemTy::Bool => Ty::Bool,
             GemTy::Float => Ty::Float,
             GemTy::Sym => Ty::Sym,
+            GemTy::Nil => Ty::Nil,
             GemTy::Untyped => Ty::Untyped,
             GemTy::Instance(path) => Ty::Class {
                 id: ClassId(Symbol::from(path)),
@@ -87,6 +89,17 @@ pub struct GemClass {
 /// The catalog. One entry per gem class/module; add a gem by adding a
 /// row.
 pub const GEM_CATALOG: &[GemClass] = &[
+    GemClass {
+        name: "Faye::WebSocket",
+        class_methods: &[("websocket?", GemTy::Bool)],
+        instance_methods: &[("on", GemTy::Nil), ("send", GemTy::Bool),
+            ("close", GemTy::Untyped), ("rack_response", GemTy::Untyped)],
+    },
+    GemClass {
+        name: "EventMachine",
+        class_methods: &[("schedule", GemTy::Untyped)],
+        instance_methods: &[],
+    },
     // Faker — synthetic data. Production code shouldn't call it, but
     // lobsters' /cabinet dev-tools page renders sample content
     // inline; every generator returns a String.
@@ -143,6 +156,8 @@ pub const GEM_CATALOG: &[GemClass] = &[
             ("available_locales", GemTy::Untyped),
             ("locale_available?", GemTy::Bool),
             ("exists?", GemTy::Bool),
+            ("config", GemTy::Instance("I18n::Config")),
+            ("config=", GemTy::Instance("I18n::Config")),
         ],
         instance_methods: &[],
     },
@@ -150,7 +165,8 @@ pub const GEM_CATALOG: &[GemClass] = &[
     // surface (`relation.async_count`, `async_sum`, …; see
     // `array_method`'s relation branch). `value` blocks until the
     // background query resolves; its type depends on the originating
-    // call, so gradual.
+    // call, so gradual here. A Promise whose call site knows its value
+    // (`relation.async_count`) is typed by `analyze::promise`.
     GemClass {
         name: "ActiveRecord::Promise",
         class_methods: &[],
@@ -568,6 +584,91 @@ pub const GEM_CATALOG: &[GemClass] = &[
     GemClass { name: "JWT::MissingRequiredClaim", class_methods: &[], instance_methods: JWT_ERROR },
     GemClass { name: "JWT::Base64DecodeError", class_methods: &[], instance_methods: JWT_ERROR },
     GemClass { name: "JWT::JWKError", class_methods: &[], instance_methods: JWT_ERROR },
+    // RestClient — the HTTP client (rest-client). As Faraday: the real gem
+    // on ruby and jruby, refused elsewhere (`lower::ruby_family_gems`).
+    GemClass {
+        name: "RestClient",
+        class_methods: &[
+            ("get", GemTy::Instance("RestClient::Response")),
+            ("post", GemTy::Instance("RestClient::Response")),
+            ("put", GemTy::Instance("RestClient::Response")),
+            ("patch", GemTy::Instance("RestClient::Response")),
+            ("delete", GemTy::Instance("RestClient::Response")),
+            ("head", GemTy::Instance("RestClient::Response")),
+            ("options", GemTy::Instance("RestClient::Response")),
+        ],
+        instance_methods: &[],
+    },
+    GemClass {
+        name: "RestClient::Request",
+        // Gradual: `raw_response: true` answers a `RestClient::RawResponse`.
+        class_methods: &[("execute", GemTy::Untyped)],
+        instance_methods: &[("execute", GemTy::Untyped)],
+    },
+    GemClass {
+        name: "RestClient::Response",
+        class_methods: &[],
+        instance_methods: &[
+            ("body", GemTy::Str),
+            ("code", GemTy::Int),
+            ("headers", GemTy::Untyped),
+            ("raw_headers", GemTy::Untyped),
+            ("cookies", GemTy::Untyped),
+            ("to_s", GemTy::Str),
+            ("to_str", GemTy::Str),
+            ("request", GemTy::Untyped),
+        ],
+    },
+    GemClass { name: "RestClient::Exceptions", class_methods: &[], instance_methods: &[] },
+    GemClass { name: "RestClient::Exception", class_methods: &[], instance_methods: REST_CLIENT_ERROR },
+    GemClass { name: "RestClient::ExceptionWithResponse", class_methods: &[], instance_methods: REST_CLIENT_ERROR },
+    GemClass { name: "RestClient::RequestFailed", class_methods: &[], instance_methods: REST_CLIENT_ERROR },
+    GemClass { name: "RestClient::RequestTimeout", class_methods: &[], instance_methods: REST_CLIENT_ERROR },
+    GemClass { name: "RestClient::ServerBrokeConnection", class_methods: &[], instance_methods: REST_CLIENT_ERROR },
+    GemClass { name: "RestClient::SSLCertificateNotVerified", class_methods: &[], instance_methods: REST_CLIENT_ERROR },
+    GemClass { name: "RestClient::Exceptions::Timeout", class_methods: &[], instance_methods: REST_CLIENT_ERROR },
+    GemClass { name: "RestClient::Exceptions::OpenTimeout", class_methods: &[], instance_methods: REST_CLIENT_ERROR },
+    GemClass { name: "RestClient::Exceptions::ReadTimeout", class_methods: &[], instance_methods: REST_CLIENT_ERROR },
+    GemClass { name: "RestClient::BadRequest", class_methods: &[], instance_methods: REST_CLIENT_ERROR },
+    GemClass { name: "RestClient::Unauthorized", class_methods: &[], instance_methods: REST_CLIENT_ERROR },
+    GemClass { name: "RestClient::Forbidden", class_methods: &[], instance_methods: REST_CLIENT_ERROR },
+    GemClass { name: "RestClient::NotFound", class_methods: &[], instance_methods: REST_CLIENT_ERROR },
+    GemClass { name: "RestClient::ResourceNotFound", class_methods: &[], instance_methods: REST_CLIENT_ERROR },
+    GemClass { name: "RestClient::MethodNotAllowed", class_methods: &[], instance_methods: REST_CLIENT_ERROR },
+    GemClass { name: "RestClient::Conflict", class_methods: &[], instance_methods: REST_CLIENT_ERROR },
+    GemClass { name: "RestClient::UnprocessableEntity", class_methods: &[], instance_methods: REST_CLIENT_ERROR },
+    GemClass { name: "RestClient::TooManyRequests", class_methods: &[], instance_methods: REST_CLIENT_ERROR },
+    GemClass { name: "RestClient::InternalServerError", class_methods: &[], instance_methods: REST_CLIENT_ERROR },
+    GemClass { name: "RestClient::BadGateway", class_methods: &[], instance_methods: REST_CLIENT_ERROR },
+    GemClass { name: "RestClient::ServiceUnavailable", class_methods: &[], instance_methods: REST_CLIENT_ERROR },
+    GemClass { name: "RestClient::GatewayTimeout", class_methods: &[], instance_methods: REST_CLIENT_ERROR },
+    // ElasticAPM — the elastic-apm agent. As Faraday: the real gem on
+    // ruby and jruby, refused elsewhere (`lower::ruby_family_gems`). An
+    // app that never starts the agent gets the pass-through it has in
+    // Ruby: no transaction, `with_span` answers its block.
+    GemClass {
+        name: "ElasticAPM",
+        class_methods: &[
+            ("running?", GemTy::Bool),
+            ("current_transaction", GemTy::Untyped),
+            ("current_span", GemTy::Untyped),
+            ("start_transaction", GemTy::Untyped),
+            ("end_transaction", GemTy::Untyped),
+            ("with_transaction", GemTy::Untyped),
+            ("start_span", GemTy::Untyped),
+            ("end_span", GemTy::Untyped),
+            ("with_span", GemTy::Untyped),
+            ("set_label", GemTy::Untyped),
+            ("set_custom_context", GemTy::Untyped),
+            ("set_user", GemTy::Untyped),
+            ("report", GemTy::Untyped),
+            ("report_message", GemTy::Untyped),
+        ],
+        instance_methods: &[],
+    },
+    // `include ElasticAPM::SpanHelpers` gives the includer `span_method`
+    // and `span_class_method`; the Ruby emit replays those calls.
+    GemClass { name: "ElasticAPM::SpanHelpers", class_methods: &[], instance_methods: &[] },
 ];
 
 const FARADAY_FILE_PART: &[(&str, GemTy)] = &[
@@ -589,3 +690,12 @@ const FARADAY_ERROR: &[(&str, GemTy)] = &[
 ];
 
 const JWT_ERROR: &[(&str, GemTy)] = &[("message", GemTy::Str), ("to_s", GemTy::Str)];
+
+const REST_CLIENT_ERROR: &[(&str, GemTy)] = &[
+    ("message", GemTy::Str),
+    ("to_s", GemTy::Str),
+    ("http_code", GemTy::Untyped),
+    ("http_body", GemTy::Untyped),
+    ("http_headers", GemTy::Untyped),
+    ("response", GemTy::Untyped),
+];

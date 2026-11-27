@@ -1,5 +1,7 @@
 //! Extension facts must describe the gem that runs, not just a typed name.
 
+#[path = "support/scratch.rs"]
+mod scratch;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -16,10 +18,7 @@ struct Scratch(PathBuf);
 impl Scratch {
     fn new() -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "roundhouse-extension-gems-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed),
-        ));
-        std::fs::create_dir_all(&path).unwrap();
+        let path = scratch::dir(&format!("roundhouse-extension-gems-{}", NEXT.fetch_add(1, Ordering::Relaxed)));
         Self(path)
     }
 
@@ -360,4 +359,29 @@ fn an_rbi_patch_does_not_own_a_framework_class() {
         "class Report\n  def self.value\n    ActiveRecord::Base\n  end\nend\n");
     assert!(!diagnose(&app).iter().any(|diagnostic| diagnostic.severity == Severity::Error));
     assert!(project::target_files(&app, Path::new("."), BuildTarget::Ruby).is_ok());
+}
+
+/// A gem the app depends on that depends on railties reads as
+/// `rails_dependent` from the lockfile alone. On a target whose run analyzes
+/// the app, the reference is analysis's error and the target files are
+/// written (`--allow-unsupported` keeps them); Roda runs no analysis, so its
+/// target files refuse the reference themselves (#2280).
+#[test]
+fn an_inferred_rails_plugin_refuses_only_the_target_that_skips_analysis() {
+    let files: HashMap<PathBuf, Vec<u8>> = [
+        ("Gemfile.lock", "GEM\n  specs:\n    gadget-engine (1.0.0)\n      railties (>= 7.0)\n    railties (8.1.0)\n\nDEPENDENCIES\n  gadget-engine\n"),
+        ("app/models/widget.rb", "class Widget\n  def self.token_for(id)\n    GadgetEngine::Token.find_by(id: id)\n  end\nend\n"),
+    ].into_iter().map(|(path, text)| (path.into(), text.as_bytes().to_vec())).collect();
+    let mut app = ingest_app_from_tree(files).expect("ingest inferred plugin app");
+    Analyzer::new(&app).analyze(&mut app);
+    assert!(app.extensions.rails_dependent.iter().any(|row| row.gem == "gadget-engine" && row.inferred),
+        "{:?}", app.extensions.rails_dependent.iter().map(|row| &row.gem).collect::<Vec<_>>());
+    assert!(diagnose(&app).iter().any(|diagnostic| matches!(&diagnostic.kind,
+        DiagnosticKind::Unsupported { construct, .. } if construct.as_str() == "gem_requires_rails")));
+    let message = project::target_files(&app, Path::new("."), BuildTarget::Roda)
+        .expect_err("roda refuses an inferred Rails plugin's reference");
+    assert!(message.contains("GadgetEngine::Token") && message.contains("gem gadget-engine it depends on railties"), "{message}");
+    if let Err(message) = project::target_files(&app, Path::new("."), BuildTarget::Ruby) {
+        panic!("ruby leaves the reference to analysis: {message}");
+    }
 }

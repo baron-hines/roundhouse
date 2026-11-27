@@ -7,6 +7,8 @@
 //! proposal is refused and reported. A test pass that swaps literal text
 //! makes rewrites observable.
 
+#[path = "support/scratch.rs"]
+mod scratch;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -61,6 +63,10 @@ end
 const CURRENT_REOPENED: &str = r#"class Current
   def room
     @room
+  end
+
+  def room=(value)
+    @room = value
   end
 end
 "#;
@@ -151,9 +157,7 @@ fn base_files() -> Vec<(&'static str, &'static str)> {
 }
 
 fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("roundhouse-fractal-{name}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
+    let dir = scratch::dir(&format!("roundhouse-fractal-{name}"));
     dir
 }
 
@@ -327,7 +331,7 @@ fn knowledge_reports_types_and_effects() {
     assert!(label.no_recorded_effects && !label.writes_state, "{label:?}");
     // `Account.first` reads the database.
     assert!(!method(&plan, "Current#account").knowledge.no_recorded_effects);
-    // An ivar read the analyzer cannot type.
+    // An ivar read the analyzer cannot type: a writer nothing calls sets it (an ivar nothing writes reads as nil).
     let room = &method(&plan, "Current#room").knowledge;
     assert!(room.typed < room.expressions, "{room:?}");
 }
@@ -504,9 +508,7 @@ impl Pass for Scoped {
 /// not take.
 const UNREAD: &str = r#"class Unread < ActiveRecord::Migration[7.0]
   def change
-    change_table :accounts do |t|
-      t.string :slug
-    end
+    create_join_table :accounts, :tags
   end
 end
 "#;

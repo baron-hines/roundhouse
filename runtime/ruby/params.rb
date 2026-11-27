@@ -28,6 +28,24 @@
 # per-target FFI and this is pure logic over the union — so it belongs
 # in the transpiled runtime rather than in twelve hand-written copies.
 module Params
+  def self.expect_array(params, key, fields, scalar_array_fields)
+    children = {}
+    modes = {}
+    scalar_array_fields.each do |field|
+      children[field] = Params.no_fields
+      modes[field] = "scalars"
+    end
+    out = []
+    value = params.fetch(key, nil)
+    if value.is_a?(Array)
+      value.each do |item|
+        out.push(Params.filtered_values(item, fields, children, modes)) if item.is_a?(Hash)
+      end
+    end
+    raise(ActionController::ParameterMissing.new(key)) if out.empty?
+    out
+  end
+
   def self.filtered_values(sub, fields, children, modes)
     filtered = Params.allowed_scalars(sub, fields)
     children.each do |key, allowed|
@@ -40,6 +58,25 @@ module Params
       end
     end
     filtered
+  end
+
+  def self.record_list(sub, key, allowed)
+    value = Params.nested(sub, key, allowed, "list")
+    if value.is_a?(Array)
+      records = []
+      value.each do |item|
+        records.push(item) if item.is_a?(Hash)
+      end
+      records
+    elsif value.is_a?(Hash)
+      numbered = {}
+      value.each do |name, item|
+        numbered[name] = item if item.is_a?(Hash)
+      end
+      numbered
+    else
+      nil
+    end
   end
 
   def self.nested_key(key)
@@ -343,6 +380,30 @@ module Params
   end
 
   # Permitted scalar keys, including matching multiparameter keys.
+  # A Symbol read of a value that may be Rails' Parameters (String-keyed here) or a Symbol-keyed Hash: the key as
+  # given, else its String.
+  # `delete(:name)` on Parameters, which removes the String key a request's Hash holds as well as a Symbol one.
+  # Not `key?` asked of a value that is no Hash: a controller's typed params object answers `delete` and `[]` by
+  # either key itself.
+  def self.indifferent_delete(hash, key)
+    return nil if hash.nil?
+    return hash.delete(key) unless hash.is_a?(Hash)
+    return hash.delete(key) if hash.key?(key)
+    hash.delete(key.to_s)
+  end
+
+  def self.indifferent_read(hash, key)
+    return nil if hash.nil?
+    return hash[key] unless hash.is_a?(Hash)
+    return hash[key] if hash.key?(key)
+    hash[key.to_s]
+  end
+
+  # `params.permit(*names)` over names a program computes (Symbols or Strings): the scalars under them.
+  def self.permitted_names(hash, names)
+    Params.allowed_scalars(hash, names.map { |name| name.to_s })
+  end
+
   def self.allowed_scalars(hash, allowed)
     out = {}
     i = 0

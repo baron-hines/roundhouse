@@ -53,7 +53,7 @@ fn an_unmodeled_mail_is_an_error() {
         .emit(roundhouse::project::BuildTarget::Ruby);
     // A Proc `default` is computed on the ruby family
     // (`ingest::mailer_defaults`, tests/mailer_proc_default.rs).
-    for needle in ["`mail { |format| … }`", "no `odd_mailer/missing` template", "`template_name:`"] {
+    for needle in ["`mail { |format| … }`", "no `odd_mailer/missing` template", "no `odd_mailer/other` template"] {
         assert!(errors.iter().any(|e| e.contains(needle)), "{needle}: {errors:#?}");
     }
     assert_eq!(errors.len(), 3, "{errors:#?}");
@@ -69,3 +69,28 @@ fn a_mailer_is_unsupported_on_strict_targets() {
     }
 }
 
+
+/// A mailer under one whose included module calls `mail` looks its template up under its own directory, by the
+/// action it runs (`action_name`), as ActionMailer's lookup does.
+#[test]
+fn a_subclass_of_a_mailer_whose_module_mails_renders_its_own_template() {
+    let run = emit_and_run::real_blog()
+        .write("app/mailers/concerns/notifying.rb", "module Notifying\n  def notify(to)\n    mail(to: to, subject: action_name)\n  end\nend\n")
+        .write("app/mailers/base_notice_mailer.rb", "class BaseNoticeMailer < ApplicationMailer\n  include Notifying\nend\n")
+        .write("app/mailers/welcome_mailer.rb", "class WelcomeMailer < BaseNoticeMailer\n  def hello(name)\n    @name = name\n    notify(\"w@example.com\")\n  end\nend\n")
+        .write("app/views/welcome_mailer/hello.text.erb", "Hello <%= @name %>\n")
+        .run_ruby("m = WelcomeMailer.hello(\"Ann\").deliver_now\nraise \"body #{m.body.to_s.inspect}\" unless m.body.to_s.include?(\"Hello Ann\")\nraise \"subject #{m.subject.inspect}\" unless m.subject == \"hello\"\nputs \"inherited module mail passed\"\n");
+    run.assert_passes();
+    assert!(run.stdout.contains("inherited module mail passed"), "{}", run.stdout);
+}
+
+/// `template_name:` / `template_path:` naming a template under another directory, by a name no action has, render it.
+#[test]
+fn a_spelled_template_path_and_name_render_that_template() {
+    let run = emit_and_run::real_blog()
+        .write("app/mailers/shared_mailer.rb", "class SharedMailer < ApplicationMailer\n  def welcome(name)\n    @name = name\n    mail(to: \"s@example.com\", subject: \"hi\", template_name: \"special\", template_path: \"shared\")\n  end\nend\n")
+        .write("app/views/shared/special.text.erb", "Special <%= @name %>\n")
+        .run_ruby("m = SharedMailer.welcome(\"Bo\").deliver_now\nraise \"body #{m.body.to_s.inspect}\" unless m.body.to_s.include?(\"Special Bo\")\nputs \"spelled template passed\"\n");
+    run.assert_passes();
+    assert!(run.stdout.contains("spelled template passed"), "{}", run.stdout);
+}

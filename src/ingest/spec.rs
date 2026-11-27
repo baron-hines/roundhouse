@@ -634,6 +634,7 @@ impl Reader<'_> {
             tests,
             setup,
             inner_classes: Vec::new(),
+            body_classes: Vec::new(),
             helpers,
             constants: Vec::new(),
             includes: Vec::new(),
