@@ -176,6 +176,7 @@ fn a_nested_build_and_find_through_a_declared_foreign_key_use_that_key() {
             "    t.integer \"article_id\"\n    t.integer \"reviewed_article_id\"\n",
         )
         .edit("app/models/comment.rb", "  belongs_to :article\n", "  belongs_to :article, optional: true\n")
+        .edit("app/views/comments/_comment.html.erb", DELETE_BUTTON_FOR_A_COMMENT_WITH_AN_ARTICLE.0, DELETE_BUTTON_FOR_A_COMMENT_WITH_AN_ARTICLE.1)
         .edit(
             "app/models/article.rb",
             "  has_many :comments, dependent: :destroy",
@@ -204,6 +205,16 @@ fn a_nested_build_and_find_through_a_declared_foreign_key_use_that_key() {
         .run_test("test/controllers/comments_controller_test.rb")
         .assert_passes();
 }
+
+/// A comment these tests key by another column has no article, and the
+/// comment partial its broadcast renders builds the delete button's
+/// nested route from `comment.article`, which Rails (and the route guard)
+/// refuses for a nil segment. The partial shows the button only for a
+/// comment with an article; the tests are about the declared key.
+const DELETE_BUTTON_FOR_A_COMMENT_WITH_AN_ARTICLE: (&str, &str) = (
+    "  <%= button_to \"Delete\", [comment.article, comment], method: :delete,\n      class: \"text-red-600 text-sm mt-2\",\n      data: { turbo_confirm: \"Are you sure?\" } %>\n",
+    "  <% if comment.article %>\n  <%= button_to \"Delete\", [comment.article, comment], method: :delete,\n      class: \"text-red-600 text-sm mt-2\",\n      data: { turbo_confirm: \"Are you sure?\" } %>\n  <% end %>\n",
+);
 
 const COMMENTABLE: &str = "module Commentable\n  extend ActiveSupport::Concern\n\n  included do\n    has_many :comments, dependent: :destroy\n  end\nend\n";
 
@@ -234,6 +245,7 @@ fn a_nested_build_and_find_through_a_redeclared_association_use_the_later_declar
             "    t.integer \"article_id\"\n    t.integer \"legacy_article_id\"\n",
         )
         .edit("app/models/comment.rb", "  belongs_to :article\n", "  belongs_to :article, optional: true\n")
+        .edit("app/views/comments/_comment.html.erb", DELETE_BUTTON_FOR_A_COMMENT_WITH_AN_ARTICLE.0, DELETE_BUTTON_FOR_A_COMMENT_WITH_AN_ARTICLE.1)
         .write("app/models/concerns/commentable.rb", COMMENTABLE)
         .edit(
             "app/models/article.rb",
@@ -505,6 +517,80 @@ fn a_nested_find_by_through_an_ordering_scope_is_not_expanded() {
     assert!(controller.contains("Comment.find("), "{controller}");
 }
 
+/// The same ordering scope, but a `find_by` naming `id`: at most one row
+/// matches, so the order cannot change which is taken and the rewrite
+/// expands it as it expands `find`. The Roda front-end writes every
+/// `comments_dataset.with_pk(id)` this way, over a `one_to_many` that
+/// orders (fixtures/roda-blog).
+#[test]
+fn a_nested_find_by_id_through_an_ordering_scope_is_expanded() {
+    let (emitted, _errors) = emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "  has_many :comments, dependent: :destroy",
+            "  has_many :comments, dependent: :destroy\n  has_many :remarks, -> { order(created_at: :desc) }, class_name: \"Comment\"",
+        )
+        .edit(
+            "app/controllers/comments_controller.rb",
+            "    @comment = @article.comments.find(params.expect(:id))",
+            "    @comment = @article.remarks.find_by(id: params.expect(:id))",
+        )
+        .emit(roundhouse::project::BuildTarget::Ruby);
+    let controller = std::fs::read_to_string(emitted.join("app/controllers/comments_controller.rb"))
+        .expect("emitted controller");
+    assert!(!controller.contains("@article.remarks.find_by("), "{controller}");
+    assert!(controller.contains("Comment.find_by("), "{controller}");
+    assert!(controller.contains("article_id: @article.id"), "{controller}");
+}
+
+/// An Array or a Range of ids, written out or typed on a local, can match
+/// several rows, so the ordering scope still picks the first: the lookup
+/// is not judged by id.
+#[test]
+fn a_nested_find_by_several_ids_through_an_ordering_scope_is_not_expanded() {
+    for (setup, ids) in [("", "[1, 2]"), ("", "1..2"), ("    ids = [1, 2]\n", "ids")] {
+        let (emitted, _errors) = emit_and_run::real_blog()
+            .edit(
+                "app/models/article.rb",
+                "  has_many :comments, dependent: :destroy",
+                "  has_many :comments, dependent: :destroy\n  has_many :remarks, -> { order(created_at: :desc) }, class_name: \"Comment\"",
+            )
+            .edit(
+                "app/controllers/comments_controller.rb",
+                "    @comment = @article.comments.find(params.expect(:id))",
+                &format!("{setup}    @comment = @article.remarks.find_by(id: {ids})"),
+            )
+            .emit(roundhouse::project::BuildTarget::Ruby);
+        let controller = std::fs::read_to_string(emitted.join("app/controllers/comments_controller.rb"))
+            .expect("emitted controller");
+        assert!(controller.contains("@article.remarks.find_by("), "{ids}: {controller}");
+        assert!(!controller.contains("Comment.find_by("), "{ids}: {controller}");
+    }
+}
+
+/// `self.primary_key = "id"` declares the default key, so `find_by(id:)`
+/// is still at most one row.
+#[test]
+fn a_nested_find_by_id_on_a_target_declaring_the_id_key_is_expanded() {
+    let (emitted, _errors) = emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "  has_many :comments, dependent: :destroy",
+            "  has_many :comments, dependent: :destroy\n  has_many :remarks, -> { order(created_at: :desc) }, class_name: \"Comment\"",
+        )
+        .edit("app/models/comment.rb", "  belongs_to :article", "  self.primary_key = \"id\"\n  belongs_to :article")
+        .edit(
+            "app/controllers/comments_controller.rb",
+            "    @comment = @article.comments.find(params.expect(:id))",
+            "    @comment = @article.remarks.find_by(id: params.expect(:id))",
+        )
+        .emit(roundhouse::project::BuildTarget::Ruby);
+    let controller = std::fs::read_to_string(emitted.join("app/controllers/comments_controller.rb"))
+        .expect("emitted controller");
+    assert!(!controller.contains("@article.remarks.find_by("), "{controller}");
+    assert!(controller.contains("Comment.find_by("), "{controller}");
+}
+
 /// `@story` of no analyzed type, while Story and Article both declare
 /// `comments`: the name says Story, as it does for the association seed,
 /// so the typed-params build expands under `story_id` rather than being
@@ -532,8 +618,8 @@ fn a_nested_build_on_an_untyped_parent_named_after_a_declarer_uses_its_key() {
     let controller = std::fs::read_to_string(emitted.join("app/controllers/comments_controller.rb"))
         .expect("emitted controller");
     assert!(controller.contains("Comment.from_params"), "{controller}");
-    assert!(controller.contains("__rh_build_owner_0 = @story"), "{controller}");
-    assert!(controller.contains("__rh_build_record_0.story_id = __rh_build_owner_0.id"), "{controller}");
+    assert!(controller.contains("rh_build_owner_0 = @story"), "{controller}");
+    assert!(controller.contains("rh_build_record_0.story_id = rh_build_owner_0.id"), "{controller}");
     assert!(!controller.contains("@story.comments.build("), "{controller}");
 }
 
@@ -585,8 +671,8 @@ fn a_new_through_an_inherited_association_is_build() {
     let controller = std::fs::read_to_string(emitted.join("app/controllers/comments_controller.rb"))
         .expect("emitted controller");
     assert!(
-        controller.contains("__rh_build_owner_1 = @article")
-            && controller.contains("draft = Comment.new({ commenter: \"amy\" }.merge(article_id: __rh_build_owner_1.id))"),
+        controller.contains("rh_build_owner_1 = @article")
+            && controller.contains("draft = Comment.new({ commenter: \"amy\" }.merge(article_id: rh_build_owner_1.id))"),
         "{controller}"
     );
 }
@@ -604,6 +690,7 @@ fn a_nested_create_and_find_by_through_a_declared_foreign_key_use_that_key() {
             "    t.integer \"article_id\"\n    t.integer \"reviewed_article_id\"\n",
         )
         .edit("app/models/comment.rb", "  belongs_to :article\n", "  belongs_to :article, optional: true\n")
+        .edit("app/views/comments/_comment.html.erb", DELETE_BUTTON_FOR_A_COMMENT_WITH_AN_ARTICLE.0, DELETE_BUTTON_FOR_A_COMMENT_WITH_AN_ARTICLE.1)
         .edit(
             "app/models/article.rb",
             "  has_many :comments, dependent: :destroy",

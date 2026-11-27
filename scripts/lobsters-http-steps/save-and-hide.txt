@@ -1,0 +1,11 @@
+# save a story, see it on /saved, unsave, see it gone
+GET /newest
+POST /stories/{story}/save
+GET /saved
+POST /stories/{story}/unsave
+GET /saved
+GET /newest
+POST /stories/{story}/hide
+GET /hidden
+POST /stories/{story}/unhide
+GET /hidden

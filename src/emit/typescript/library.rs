@@ -77,8 +77,8 @@ pub(super) fn extras_from_funcs(
     funcs: &[crate::dialect::LibraryFunction],
 ) -> Vec<(crate::ident::ClassId, crate::analyze::ClassInfo)> {
     use crate::ident::{ClassId, Symbol};
-    let mut grouped: std::collections::HashMap<ClassId, crate::analyze::ClassInfo> =
-        std::collections::HashMap::new();
+    let mut grouped: crate::det::HashMap<ClassId, crate::analyze::ClassInfo> =
+        crate::det::HashMap::default();
     for func in funcs {
         let raw = func
             .module_path
@@ -223,6 +223,7 @@ fn synthesize_module_lc(
         nullable_columns: Vec::new(),
         origin: None,
         constants: Vec::new(),
+        conditional_definitions: Vec::new(),
         unknown_calls: Vec::new(),
         class_ivar_initializers: Vec::new(),
     }
@@ -238,10 +239,10 @@ fn synthesize_module_lc(
 pub(super) fn extras_from_lcs(
     lcs: &[LibraryClass],
 ) -> Vec<(crate::ident::ClassId, crate::analyze::ClassInfo)> {
-    let mut grouped: std::collections::HashMap<
+    let mut grouped: crate::det::HashMap<
         crate::ident::ClassId,
         crate::analyze::ClassInfo,
-    > = std::collections::HashMap::new();
+    > = crate::det::HashMap::default();
     for lc in lcs {
         let info = grouped.entry(lc.name.clone()).or_default();
         let from = crate::lower::class_info_from_library_class(lc);
@@ -529,6 +530,7 @@ fn collect_imports_for_function(
         }],
         origin: None,
         constants: Vec::new(),
+        conditional_definitions: Vec::new(),
         unknown_calls: Vec::new(),
         class_ivar_initializers: Vec::new(),
     };
@@ -668,9 +670,14 @@ pub(super) fn emit_class_file_full(
 /// The outermost name a nested app class (`Importer::TooBig`) is declared
 /// under. Its file is that root's, where a namespace carries it: a file of
 /// its own named `importer::too_big.ts` left `Importer.TooBig` undefined.
-pub(super) fn nested_class_root(lc: &LibraryClass) -> Option<&str> {
+pub(crate) fn nested_class_root(lc: &LibraryClass) -> Option<&str> {
     let name = lc.name.0.as_str();
-    if lc.is_module || lc.origin.is_some() || !name.contains("::") {
+    // A serializer the app wrote (`module Api; class ArticleSerializer <
+    // ActiveModel::Serializer`) has an origin only because ingest expanded
+    // it: it is still the app's class, read as `Api.ArticleSerializer`.
+    let app_written =
+        matches!(lc.origin, None | Some(crate::dialect::LibraryClassOrigin::ActiveModelSerializer { .. }));
+    if lc.is_module || !app_written || !name.contains("::") {
         return None;
     }
     name.split("::").next()
@@ -869,6 +876,8 @@ const RUNTIME_SRC_IMPORTS: &[(&str, &str)] = &[
     ("RecordInvalid", "errors"),
     ("ErrorDetail", "active_record_base"),
     ("FormBuilder", "view_helpers"),
+    ("I18n", "i18n_locale"),
+    ("I18nHost", "i18n_host"),
     // Db primitive surface (`Db.prepare`, `Db.step?`, `Db.column_*`,
     // `Db.escape_int`, `Db.last_insert_rowid`, …) backing the
     // lowerer-emitted `_adapter_*` methods and the Arel pass's
@@ -881,6 +890,15 @@ const RUNTIME_SRC_IMPORTS: &[(&str, &str)] = &[
     // Roundhouse::ParamValue]`.
     ("ParamValue", "param_value"),
 ];
+
+/// The class references in a method's parameter defaults.
+fn collect_param_default_refs(m: &crate::dialect::MethodDef, refs: &mut BTreeSet<String>) {
+    for p in &m.params {
+        if let Some(default) = &p.default {
+            collect_class_refs(default, refs);
+        }
+    }
+}
 
 /// Compute the import block for a class: scan method bodies for Const
 /// references, partition into juntos-provided names vs sibling models /
@@ -902,6 +920,10 @@ fn collect_imports_with_companions(
     let mut refs: BTreeSet<String> = BTreeSet::new();
     for m in &lc.methods {
         collect_class_refs(&m.body, &mut refs);
+        // A parameter's default is emitted too (`opts: any = new
+        // Options()`, a keyword's in its destructuring), so the classes it
+        // names are imported like the body's.
+        collect_param_default_refs(m, &mut refs);
         // Also harvest class references from the method's signature
         // (param types + return type). View functions like
         // `function article(article: Article): string` mention
@@ -926,6 +948,7 @@ fn collect_imports_with_companions(
             "StandardError" => String::new(),
             "ActiveSupport::TestCase" | "ActionDispatch::IntegrationTest" => "TestCase".to_string(),
             "Minitest::Test" => "Test".to_string(),
+            _ if let Some(alias) = super::expr::runtime_base_alias(raw) => alias,
             // All other framework parents (`ActiveRecord::Base`,
             // `ActionController::Base`, mixins like `ActiveRecord::
             // Validations`) collapse to the last segment — the
@@ -949,6 +972,7 @@ fn collect_imports_with_companions(
     for companion in companions {
         for m in &companion.methods {
             collect_class_refs(&m.body, &mut refs);
+            collect_param_default_refs(m, &mut refs);
             if let Some(sig) = &m.signature {
                 collect_ty_class_refs(sig, &mut refs);
             }
@@ -999,6 +1023,9 @@ fn collect_imports_with_companions(
     let mut fixture_imports: Vec<(String, String)> = Vec::new();
     let mut controller_imports: Vec<(String, String)> = Vec::new();
     let mut controller_base_import: bool = false;
+    // The runtime base classes under their #1228 aliases.
+    let mut controller_base_alias_import: bool = false;
+    let mut active_record_base_alias_import: bool = false;
     let mut active_record_base_import: bool = false;
     let mut active_record_namespace_import: bool = false;
     let mut route_helpers_import: bool = false;
@@ -1032,6 +1059,8 @@ fn collect_imports_with_companions(
     let datetime_import =
         has_temporal_reader(lc) || companions.iter().any(has_temporal_reader);
 
+    let record_base_alias = super::expr::runtime_base_alias("ActiveRecord::Base");
+    let controller_base_alias = super::expr::runtime_base_alias("ActionController::Base");
     for r in refs {
         let r_str: &str = &r;
         if JUNTOS_EXPORTS.contains(&r_str) {
@@ -1040,7 +1069,11 @@ fn collect_imports_with_companions(
             runtime_src_imports.push((r, stem.to_string()));
         } else if r == "Test" || r == "TestCase" {
             runtime_imports.push(r);
-        } else if r == "Base" {
+        } else if record_base_alias.as_deref() == Some(r_str) {
+            active_record_base_alias_import = true;
+        } else if controller_base_alias.as_deref() == Some(r_str) {
+            controller_base_alias_import = true;
+        } else if r == "Base" && record_base_alias.is_none() {
             // Bare `Base` — disambiguate via canonical parent inspection
             // above. ApplicationController extends ActionController::Base
             // → controller_base_import; everything else (record-typed
@@ -1204,11 +1237,12 @@ fn collect_imports_with_companions(
         };
         out.push(named(vec![n.clone()], import_path));
     }
-    if controller_base_import {
+    if controller_base_import || controller_base_alias_import {
         let runtime_path = relative_to_root(out_path, "src/action_controller_base.js");
-        out.push(named(vec!["Base".to_string()], runtime_path));
+        let alias = if controller_base_alias_import { controller_base_alias.clone() } else { None };
+        out.push(JsImport::Named { names: vec![("Base".to_string(), alias)], from: runtime_path });
     }
-    if active_record_base_import || active_record_namespace_import {
+    if active_record_base_import || active_record_base_alias_import || active_record_namespace_import {
         // ActiveRecord::Base lives in the runtime as `Base` from
         // `src/active_record_base.ts`. The `ActiveRecord` namespace
         // class (with the `static adapter` slot) lives in the same
@@ -1217,12 +1251,15 @@ fn collect_imports_with_companions(
         let runtime_path = relative_to_root(out_path, "src/active_record_base.js");
         let mut names = Vec::new();
         if active_record_base_import {
-            names.push("Base".to_string());
+            names.push(("Base".to_string(), None));
+        }
+        if active_record_base_alias_import {
+            names.push(("Base".to_string(), record_base_alias.clone()));
         }
         if active_record_namespace_import {
-            names.push("ActiveRecord".to_string());
+            names.push(("ActiveRecord".to_string(), None));
         }
-        out.push(named(names, runtime_path));
+        out.push(JsImport::Named { names, from: runtime_path });
     }
     if route_helpers_import {
         // routes_to_library emits the per-app helpers to
@@ -1297,7 +1334,7 @@ fn collect_imports_with_companions(
 /// `def self.article(article)` typed as `(Article) -> String`
 /// would have no Const ref to Article anywhere in the IR's body.
 fn collect_ty_class_refs(ty: &crate::ty::Ty, out: &mut BTreeSet<String>) {
-    use crate::ty::Ty;
+    use crate::ty::{FnTy, Ty};
     match ty {
         Ty::Class { id, args } => {
             // Mirror `collect_class_refs` (Const-position): framework-
@@ -1321,7 +1358,10 @@ fn collect_ty_class_refs(ty: &crate::ty::Ty, out: &mut BTreeSet<String>) {
             ];
             let raw = id.0.as_str();
             let segs: Vec<&str> = raw.split("::").collect();
-            let segment = if segs.len() >= 2 && FRAMEWORK_NAMESPACES.contains(&segs[0]) {
+            let alias = super::expr::runtime_base_alias(raw);
+            let segment = if let Some(alias) = alias.as_deref() {
+                alias
+            } else if segs.len() >= 2 && FRAMEWORK_NAMESPACES.contains(&segs[0]) {
                 segs.last().copied().unwrap_or(raw)
             } else {
                 segs.first().copied().unwrap_or(raw)
@@ -1341,7 +1381,8 @@ fn collect_ty_class_refs(ty: &crate::ty::Ty, out: &mut BTreeSet<String>) {
                 collect_ty_class_refs(v, out);
             }
         }
-        Ty::Fn { params, block, ret, .. } => {
+        Ty::Fn(fn_ty) => {
+            let FnTy { params, block, ret, .. } = &**fn_ty;
             for p in params {
                 collect_ty_class_refs(&p.ty, out);
             }
@@ -1461,7 +1502,9 @@ fn collect_class_refs(e: &Expr, out: &mut BTreeSet<String>) {
                 "Roundhouse",
             ];
             let segs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
-            if segs.len() >= 2 && FRAMEWORK_NAMESPACES.contains(&segs[0]) {
+            if let Some(alias) = super::expr::runtime_base_alias(&segs.join("::")) {
+                out.insert(alias);
+            } else if segs.len() >= 2 && FRAMEWORK_NAMESPACES.contains(&segs[0]) {
                 if let Some(last) = segs.last() {
                     out.insert((*last).to_string());
                 }
@@ -1798,8 +1841,8 @@ fn rewrite_free(e: &Expr) -> Expr {
                 binding: rc.binding.clone(),
                 body: rewrite_free(&rc.body),
             }).collect(),
-            else_branch: else_branch.as_ref().map(rewrite_free),
-            ensure: ensure.as_ref().map(rewrite_free),
+            else_branch: else_branch.as_deref().map(rewrite_free).map(Box::new),
+            ensure: ensure.as_deref().map(rewrite_free).map(Box::new),
             implicit: *implicit,
         },
         ExprNode::Case { scrutinee, arms } => ExprNode::Case {
@@ -1930,8 +1973,9 @@ fn rewrite(e: &Expr, super_method: Option<&str>) -> Expr {
         // the per-target Send rewriter can map them directly to the
         // host equivalent. Adding SelfRef here would force the typer
         // and emitter to invent a `this.puts` shim on every class.
+        // The class's own `puts` (`expr::APP_KERNEL_NAME`) is a self call.
         ExprNode::Send { recv: None, method, args, block, parenthesized }
-            if is_kernel_call(method.as_str()) =>
+            if is_kernel_call(method.as_str()) && e.decisions & crate::expr::APP_KERNEL_NAME == 0 =>
         {
             ExprNode::Send {
                 recv: None,
@@ -2088,8 +2132,8 @@ fn rewrite(e: &Expr, super_method: Option<&str>) -> Expr {
                         body: rewrite(&rc.body, super_method),
                     })
                     .collect(),
-                else_branch: else_branch.as_ref().map(|b| rewrite(b, super_method)),
-                ensure: ensure.as_ref().map(|b| rewrite(b, super_method)),
+                else_branch: else_branch.as_ref().map(|b| Box::new(rewrite(b, super_method))),
+                ensure: ensure.as_ref().map(|b| Box::new(rewrite(b, super_method))),
                 implicit: *implicit,
             }
         }

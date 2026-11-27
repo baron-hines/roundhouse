@@ -147,7 +147,7 @@ mod tests {
     /// sign-in on the CRuby compare lane the same way.
     #[test]
     fn every_typed_cache_seam_method_exists_on_all_three_stores() {
-        const SEAM: &[&str] = &["fetch_str", "read_str", "write_str", "increment_str"];
+        const SEAM: &[&str] = &["fetch_str", "read_str", "write_str", "increment_str", "increment"];
         // The overlay is its own class: the whole seam, by itself.
         for path in ["runtime/ruby/rails.rb", "runtime/spinel/scaffold/ruby_overlay/runtime/rails_cache.rb"] {
             let src = read(path).unwrap_or_else(|| panic!("{path} is embedded"));

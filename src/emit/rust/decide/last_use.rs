@@ -26,7 +26,7 @@
 //! read of each multi-read var now moves instead of cloning. Same
 //! HTTP-response semantics, byte-different emitted Rust.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::dialect::LibraryClass;
 use crate::expr::{Expr, ExprNode, InterpPart, LValue};
@@ -53,8 +53,8 @@ fn stamp_method(body: &mut Expr) {
     collect_var_reads(body, &mut seq, &mut reads);
 
     // Aggregate: read count + max sequence per name.
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    let mut last_seq: HashMap<String, usize> = HashMap::new();
+    let mut counts: HashMap<String, usize> = HashMap::default();
+    let mut last_seq: HashMap<String, usize> = HashMap::default();
     for (name, s) in &reads {
         *counts.entry(name.clone()).or_insert(0) += 1;
         last_seq
@@ -300,15 +300,15 @@ fn stamp_var_reads(
             // one." Skipping `is_last` looks like a free improvement
             // but exposes a latent issue: peepholes that call
             // `emit_expr` on a recv (e.g. the `.each` / `.iter_mut()`
-            // bridge in `expr/mod.rs::emit_send_inner`) currently
-            // rely on the Var-arm's multi-read clone to produce a
+            // bridge in `expr/mod.rs::emit_send_inner`) were written
+            // against the Var-arm's multi-read clone producing a
             // mutable temporary for non-mut-declared bindings (e.g.
-            // function params `articles: Vec<Article>`). Preserve
-            // the over-clone until a follow-on either routes those
-            // bridges through `emit_send_recv` + a separate
-            // mutable-temp insertion, or promotes params to `mut`
-            // in the method signature when consumed by `iter_mut()`-
-            // shaped peepholes. The `LAST_USE` bit stays available
+            // function params `articles: Vec<Article>`). The `.each`
+            // bridge now has its own answer — a param it borrows
+            // with no clone is declared `mut` in the signature (see
+            // `EmitCtx::iter_mut_params`) — but the other peepholes
+            // haven't been audited, so the over-clone stays until a
+            // follow-on retires it. The `LAST_USE` bit stays available
             // for future consumers (Swift `consume`, etc.); it's
             // informational at Stage 3.
             if count > 1 && non_copy {
@@ -395,7 +395,12 @@ fn stamp_var_reads(
                 stamp_var_reads(x, seq, counts, last_seq);
             }
         }
-        ExprNode::Lambda { body, .. } => stamp_var_reads(body, seq, counts, last_seq),
+        ExprNode::Lambda { params, body, .. } => {
+            stamp_var_reads(body, seq, counts, last_seq);
+            let mut bound: Vec<String> = params.iter().map(|p| p.as_str().to_string()).collect();
+            collect_assigned(body, &mut bound);
+            stamp_captured_reads(body, &mut bound);
+        }
         ExprNode::MethodRef { recv, .. } => {
             if let Some(r) = recv.as_mut() {
                 stamp_var_reads(r, seq, counts, last_seq);
@@ -483,6 +488,58 @@ fn stamp_var_reads(
         | ExprNode::Defined { .. }
         | ExprNode::SelfRef => {}
     }
+}
+
+/// Stamp `CLONE_AT` on every non-Copy read in a closure body of a
+/// binding from outside it. A closure may run many times (`for_each`
+/// over a collection), so moving a captured value out of it fails to
+/// compile even where that read is the binding's last lexical one —
+/// the partial render inside `render @articles` passing the caller's
+/// `notice`. `bound` holds the names the closure binds itself: its
+/// params, the locals it assigns, and a nested closure's params while
+/// walking that closure.
+fn stamp_captured_reads(e: &mut Expr, bound: &mut Vec<String>) {
+    let skip_recv = matches!(e.hint(), Some(crate::expr::IrHint::StringBuilderAppend));
+    match &mut *e.node {
+        ExprNode::Var { name, .. } => {
+            let non_copy = e.ty.as_ref().map(|t| !is_copy_ty(t)).unwrap_or(false);
+            if non_copy && !bound.iter().any(|b| b == name.as_str()) {
+                e.decisions |= CLONE_AT;
+            }
+        }
+        ExprNode::Lambda { params, body, .. } => {
+            let depth = bound.len();
+            bound.extend(params.iter().map(|p| p.as_str().to_string()));
+            stamp_captured_reads(body, bound);
+            bound.truncate(depth);
+        }
+        // The accumulator a template appends to is mutated in place,
+        // never read by value (the same skip as `stamp_var_reads`).
+        ExprNode::Send { args, block, .. } if skip_recv => {
+            for a in args.iter_mut() {
+                stamp_captured_reads(a, bound);
+            }
+            if let Some(b) = block.as_mut() {
+                stamp_captured_reads(b, bound);
+            }
+        }
+        node => node.for_each_child_mut(&mut |c| stamp_captured_reads(c, bound)),
+    }
+}
+
+/// The locals `e` assigns anywhere in it, appended to `out`.
+fn collect_assigned(e: &Expr, out: &mut Vec<String>) {
+    let mut add = |t: &LValue| {
+        if let LValue::Var { name, .. } = t {
+            out.push(name.as_str().to_string());
+        }
+    };
+    match &*e.node {
+        ExprNode::Assign { target, .. } | ExprNode::OpAssign { target, .. } => add(target),
+        ExprNode::MultiAssign { targets, .. } => targets.iter().for_each(add),
+        _ => {}
+    }
+    e.node.for_each_child(&mut |c| collect_assigned(c, out));
 }
 
 fn walk_lvalue_stamp(

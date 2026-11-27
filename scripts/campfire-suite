@@ -293,12 +293,12 @@ if [[ "$TARGET" == spinel ]]; then
     #
     # `tail -1` because a COLD cache prints its `cc bcrypt/...` progress
     # above the flag line, and `$(shell)` would fold those into the
-    # arguments too. `--require-gate` is stripped for the reason the
+    # arguments too. `--strict-require` (`--require-gate` before Spinel 6aaec4f41) is stripped for the reason the
     # Makefile strips it: a test tree requires gems with no spinel surface
     # at all (vips, mocha, webmock), and gating them fails the compile
     # ahead of the type errors this lane exists to count.
     step "resolving package flags"
-    SPIN_FLAGS="$( (cd "$OUT" && spin flags 2>/dev/null) | tail -1 | sed 's/--require-gate //' )"
+    SPIN_FLAGS="$( (cd "$OUT" && spin flags 2>/dev/null) | tail -1 | sed -e 's/--strict-require //' -e 's/--require-gate //' )"
     if [[ -z "$SPIN_FLAGS" ]]; then
         echo "campfire-suite: \`spin flags\` produced nothing in $OUT." >&2
         echo "  Every test would compile without its dependencies and the run would" >&2

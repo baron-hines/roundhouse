@@ -31,7 +31,7 @@
 //! `extend Foo` with no receiver, or `Foo.extend Bar` on a constant,
 //! is the class-body form. Ingest and `fold_extended_modules` own it.
 
-use std::collections::HashSet;
+use crate::det::HashSet;
 
 use crate::app::App;
 use crate::diagnostic::{Diagnostic, DiagnosticKind, NESTED_DEF, Severity};
@@ -49,6 +49,8 @@ const DETAIL: &str = "mixing a module into one live object needs a per-object me
 
 pub fn apply_object_extend_stub(app: &mut App) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
+    mark_hook_bases(app);
+    lift_fresh_builtin_extends(app);
     super::for_each_hook_body(app, &mut |e| stub_sites(e, &mut diags));
     for view in &mut app.views {
         stub_sites(&mut view.body, &mut diags);
@@ -98,6 +100,166 @@ pub fn apply_object_extend_stub(app: &mut App) -> Vec<Diagnostic> {
     diags
 }
 
+/// `def self.extended(base); base.extend(Api); end` (version_gem's Basic): Ruby hands the hook the class or module
+/// that extends it, so its parameter's `extend` is that class's, as `Foo.extend Api` is.
+fn mark_hook_bases(app: &mut App) {
+    fn mark(e: &mut Expr, base: &Symbol) {
+        if let ExprNode::Send { recv: Some(recv), method, .. } = &mut *e.node
+            && method.as_str() == "extend"
+            && var_is(recv, base)
+        {
+            recv.decisions |= crate::expr::MIXIN_HOOK_BASE;
+        }
+        e.node.for_each_child_mut(&mut |c| mark(c, base));
+    }
+    for lc in &mut app.library_classes {
+        if !lc.is_module {
+            continue;
+        }
+        for m in &mut lc.methods {
+            // (not `included`: ingest carries an included hook's `base.extend(ClassMethods)` as the includer's class methods)
+            if m.receiver != MethodReceiver::Class
+                || m.name.as_str() != "extended"
+                || m.params.len() != 1
+            {
+                continue;
+            }
+            let base = m.params[0].name.clone();
+            mark(&mut m.body, &base);
+        }
+    }
+}
+
+/// `@line_ends = []` then `@line_ends.extend RangeSearch` (parslet's
+/// LineCache, on every parse): the receiver is a fresh Array, not the
+/// `.new` of a class Spinel can subclass. A fresh empty Array or Hash
+/// extended with one of the program's modules right after is made an
+/// instance of a synthesized subclass that includes the module
+/// (`ArrayWithParslet__Source__RangeSearch < Array`), and the `extend` goes:
+/// the object answers the module's methods, is an Array, and holds what
+/// it held. What differs from Ruby is its `class`, which is the subclass.
+fn lift_fresh_builtin_extends(app: &mut App) {
+    // Not a module with a hook: `extended` / `extend_object` would not run, and `included` would run for the subclass instead.
+    let modules: HashSet<String> = app
+        .library_classes
+        .iter()
+        .filter(|c| c.is_module)
+        .filter(|c| !c.methods.iter().any(|m| {
+            m.receiver == crate::dialect::MethodReceiver::Class
+                && matches!(m.name.as_str(), "extended" | "extend_object" | "included" | "append_features")
+        }))
+        .map(|c| c.name.0.to_string())
+        .collect();
+    let taken: HashSet<String> = app.library_classes.iter().map(|c| c.name.0.to_string()).collect();
+    let mut synthesized: Vec<(String, String, String, Span)> = Vec::new();
+    for lc in &mut app.library_classes {
+        let owner = lc.name.0.to_string();
+        for m in &mut lc.methods {
+            lift_in(&mut m.body, &owner, &modules, &taken, &mut synthesized);
+        }
+    }
+    for (name, base, module, site) in synthesized {
+        if app.library_classes.iter().any(|c| c.name.0.as_str() == name) {
+            continue;
+        }
+        app.library_classes.push(LibraryClass {
+            name: ClassId(Symbol::from(name.as_str())),
+            is_module: false,
+            parent: Some(ClassId(Symbol::from(base.as_str()))),
+            parent_span: site,
+            includes: vec![ClassId(Symbol::from(module.as_str()))],
+            include_spans: vec![site],
+            methods: Vec::new(),
+            nullable_columns: Vec::new(),
+            origin: None,
+            constants: Vec::new(),
+            conditional_definitions: Vec::new(),
+            unknown_calls: Vec::new(),
+            class_ivar_initializers: Vec::new(),
+        });
+    }
+}
+
+fn lift_in(
+    e: &mut Expr,
+    owner: &str,
+    modules: &HashSet<String>,
+    taken: &HashSet<String>,
+    out: &mut Vec<(String, String, String, Span)>,
+) {
+    e.node.for_each_child_mut(&mut |c| lift_in(c, owner, modules, taken, out));
+    let ExprNode::Seq { exprs } = &mut *e.node else { return };
+    for i in 0..exprs.len().saturating_sub(1) {
+        let (target, base) = match &*exprs[i].node {
+            ExprNode::Assign { target, value } => match fresh_builtin(value) {
+                Some(base) => (target.clone(), base),
+                None => continue,
+            },
+            _ => continue,
+        };
+        let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*exprs[i + 1].node else { continue };
+        let same = match (&target, &*recv.node) {
+            (LValue::Var { name: a, .. }, ExprNode::Var { name: b, .. }) => a == b,
+            (LValue::Ivar { name: a }, ExprNode::Ivar { name: b }) => a == b,
+            _ => false,
+        };
+        if method.as_str() != "extend" || !same || args.len() != 1 {
+            continue;
+        }
+        let Some(written) = const_name(&args[0]) else { continue };
+        // The module as Ruby finds it from where the call is written (`RangeSearch` in `Parslet::Source::LineCache`).
+        let mut scope = owner;
+        let module = loop {
+            let candidate = if scope.is_empty() { written.clone() } else { format!("{scope}::{written}") };
+            if modules.contains(&candidate) {
+                break Some(candidate);
+            }
+            if scope.is_empty() {
+                break None;
+            }
+            scope = scope.rsplit_once("::").map_or("", |(outer, _)| outer);
+        };
+        let Some(module) = module else { continue };
+        // Not `::` dropped: `A::BC` and `AB::C` would share one class.
+        let name = format!("{base}With{}", module.replace("::", "__"));
+        // Not a name the program already has, or one minted for another module: the site keeps the unsupported path.
+        if taken.contains(&name) || out.iter().any(|(n, b, m, _)| *n == name && (b != base || *m != module)) {
+            continue;
+        }
+        let span = exprs[i].span;
+        if let ExprNode::Assign { value, .. } = &mut *exprs[i].node {
+            *value = Expr::new(
+                span,
+                ExprNode::Send {
+                    recv: Some(Expr::new(span, ExprNode::Const { path: vec![Symbol::from(name.as_str())] })),
+                    method: Symbol::from("new"),
+                    args: Vec::new(),
+                    block: None,
+                    parenthesized: false,
+                },
+            );
+        }
+        exprs[i + 1] = Expr::new(exprs[i + 1].span, ExprNode::Seq { exprs: Vec::new() });
+        out.push((name, base.to_string(), module, span));
+    }
+}
+
+/// `[]`, `Array.new`, `{}`, `Hash.new`: a fresh empty builtin whose class an `extend` would hide.
+fn fresh_builtin(value: &Expr) -> Option<&'static str> {
+    match &*value.node {
+        ExprNode::Array { elements, .. } if elements.is_empty() => Some("Array"),
+        ExprNode::Hash { entries, .. } if entries.is_empty() => Some("Hash"),
+        ExprNode::Send { recv: Some(r), method, args, block: None, .. } if method.as_str() == "new" && args.is_empty() => {
+            match const_name(r).as_deref() {
+                Some("Array") => Some("Array"),
+                Some("Hash") => Some("Hash"),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 struct LibraryIndex {
     models: HashSet<String>,
     /// Classes this program declares that are not ActiveRecord models.
@@ -116,8 +278,8 @@ fn library_index(app: &App) -> LibraryIndex {
         .iter()
         .map(|m| m.name.0.as_str().to_string())
         .collect();
-    let mut classes = HashSet::new();
-    let mut modules = HashSet::new();
+    let mut classes = HashSet::default();
+    let mut modules = HashSet::default();
     for lc in &app.library_classes {
         note_class(lc, &models, &mut classes, &mut modules);
     }
@@ -158,7 +320,7 @@ fn extend_defined_names<'a>(
     classes: impl IntoIterator<Item = &'a LibraryClass>,
 ) -> HashSet<String> {
     let classes: Vec<&LibraryClass> = classes.into_iter().collect();
-    let mut out = HashSet::new();
+    let mut out = HashSet::default();
     let mut grew = true;
     while grew {
         grew = false;
@@ -353,6 +515,7 @@ fn hoist_anonymous_modules(
             nullable_columns: Vec::new(),
             origin: None,
             constants: Vec::new(),
+            conditional_definitions: Vec::new(),
             unknown_calls: Vec::new(),
             class_ivar_initializers: Vec::new(),
         });
@@ -629,7 +792,7 @@ fn instance_extend(expr: &Expr) -> Option<(&Expr, ())> {
     if method.as_str() != "extend" {
         return None;
     }
-    if matches!(&*recv.node, ExprNode::Const { .. } | ExprNode::SelfRef) {
+    if matches!(&*recv.node, ExprNode::Const { .. } | ExprNode::SelfRef) || recv.decisions & crate::expr::MIXIN_HOOK_BASE != 0 {
         return None;
     }
     Some((recv, ()))
@@ -701,7 +864,9 @@ fn stub_sites(expr: &mut Expr, diags: &mut Vec<Diagnostic>) {
     let mut d = Diagnostic::unsupported(expr.span, None, CONSTRUCT, DETAIL);
     d.severity = Severity::Warning;
     diags.push(d);
+    let unreached = expr.decisions & crate::expr::UNCALLED_DEFINER;
     *expr = stub_expr(expr.span);
+    expr.decisions |= unreached;
 }
 
 /// A nil carrying the report — the ruby emitter renders it as the raise.

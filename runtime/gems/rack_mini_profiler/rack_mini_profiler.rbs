@@ -1,0 +1,31 @@
+# Not the whole package: only what app code calls, the gate and the config an initializer writes; spinel infers the rest.
+module Rack
+  class MiniProfiler
+    def self.config: () -> Rack::MiniProfiler::Config
+    def self.authorize_request: () -> bool
+    def self.deauthorize_request: () -> nil
+    def self.request_authorized?: () -> bool?
+
+    class Config
+      def authorization_mode=: (Symbol mode) -> Symbol
+      def auto_inject=: (bool value) -> bool
+      def base_url_path=: (String value) -> String
+      def cookie_path=: (String value) -> String
+      def disable_caching=: (bool value) -> bool
+      def enabled=: (bool value) -> bool
+      def skip_paths=: (Array[String] value) -> Array[String]
+      def collapse_results=: (bool value) -> bool
+      def max_traces_to_show=: (Integer value) -> Integer
+      def position=: (String value) -> String
+      def show_children=: (bool value) -> bool
+      def show_controls=: (bool value) -> bool
+      def show_trivial=: (bool value) -> bool
+      def show_total_sql_count=: (bool value) -> bool
+      def start_hidden=: (bool value) -> bool
+      def toggle_shortcut=: (String value) -> String
+      def html_container=: (String value) -> String
+      def enable_hotwire_turbo_drive_support=: (bool value) -> bool
+      def profile_parameter=: (String value) -> String
+    end
+  end
+end

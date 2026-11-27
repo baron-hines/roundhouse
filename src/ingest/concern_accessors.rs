@@ -2,7 +2,7 @@
 //! retains candidate declarations; only a concrete model inclusion
 //! commits to their ivar contract or reports a contextual refusal.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::diagnostic::DiagnosticKind;
 use crate::dialect::{MethodReceiver, ModelBodyItem};
@@ -31,8 +31,10 @@ pub(super) fn is_candidate(item: &ModelBodyItem) -> bool {
     matches!(item, ModelBodyItem::Unknown { expr, .. } if accessor(expr))
 }
 
-/// Computed/splat names retain concern lexical scope, and one-sided
-/// accessors need a separate analyzer fix. Neither is admitted here.
+/// Computed/splat names retain concern lexical scope and are not
+/// admitted here. A one-sided `attr_reader` / `attr_writer` is: the model
+/// lowering, the analyzer and the audit each take its half alone, as for
+/// a model's own declaration.
 pub(super) fn is_supported(item: &ModelBodyItem) -> bool {
     let ModelBodyItem::Unknown { expr, .. } = item else {
         return false;
@@ -47,7 +49,7 @@ pub(super) fn is_supported(item: &ModelBodyItem) -> bool {
     else {
         return false;
     };
-    method.as_str() == "attr_accessor"
+    matches!(method.as_str(), "attr_accessor" | "attr_reader" | "attr_writer")
         && !args.is_empty()
         && args.iter().all(|arg| {
             matches!(
@@ -115,7 +117,24 @@ fn uncertain_visibility(expr: &Expr, name: &Symbol, writer: &Symbol, nested: boo
 /// class-method carriers have no hook left here. Only literal included
 /// callbacks/defaults after block registration are inert; overriding the
 /// rest of the framework protocol can prevent that registration/execution.
-fn unconsumed_included_hook(model: &crate::dialect::Model, app: &App) -> Option<crate::ClassId> {
+fn unconsumed_included_hook(model: &crate::dialect::Model, app: &App, by_name: &LibraryClassesByName) -> Option<crate::ClassId> {
+    unconsumed_class_side_hook(&crate::analyze::model_includes(model), app, by_name)
+}
+
+/// The library classes of an app by name, each name's declarations in
+/// `library_classes` order: the lookup the hook walks make per include,
+/// which a scan of every library class made quadratic.
+pub(crate) type LibraryClassesByName<'a> = HashMap<&'a ClassId, Vec<&'a crate::dialect::LibraryClass>>;
+
+pub(crate) fn library_classes_by_name(app: &App) -> LibraryClassesByName<'_> {
+    let mut by_name = LibraryClassesByName::default();
+    for class in &app.library_classes {
+        by_name.entry(&class.name).or_default().push(class);
+    }
+    by_name
+}
+
+pub(crate) fn unconsumed_class_side_hook(includes: &[ClassId], app: &App, by_name: &LibraryClassesByName) -> Option<ClassId> {
     fn inert(expr: &Expr) -> bool {
         match &*expr.node {
             ExprNode::Lit { .. } => true,
@@ -125,13 +144,13 @@ fn unconsumed_included_hook(model: &crate::dialect::Model, app: &App) -> Option<
         }
     }
 
-    let mut pending = crate::analyze::model_includes(model);
-    let mut seen = HashSet::new();
+    let mut pending = includes.to_vec();
+    let mut seen = HashSet::default();
     while let Some(id) = pending.pop() {
         if !seen.insert(id.clone()) {
             continue;
         }
-        for class in app.library_classes.iter().filter(|class| class.name == id) {
+        for class in by_name.get(&id).into_iter().flatten().copied() {
             for method in &class.methods {
                 let intercepts_registration = app.concern_model_items.get(&id)
                     .into_iter().flatten().any(|item| {
@@ -177,9 +196,12 @@ fn validate_activation(
     if spans.is_empty() {
         return Ok(());
     }
+    // Taken before the model borrow below: a refusal names the file it
+    // was written in.
+    let sources: &[crate::span::SourceFile] = &app.sources;
     let resolver = app.const_resolver.for_sources(&app.sources);
     let mut includes = BTreeMap::<crate::ClassId, Vec<crate::ClassId>>::new();
-    let mut modules = HashSet::new();
+    let mut modules = HashSet::default();
     let retained: HashSet<_> = app.library_classes.iter().map(|c| &c.name)
         .chain(app.models.iter().map(|m| &m.name))
         .chain(app.controllers.iter().map(|c| &c.name))
@@ -238,6 +260,10 @@ fn validate_activation(
             }
         }
     }
+    // Not only the source's own: a model macro's body that includes (devise's `devise`) wrote these in the call's place.
+    for (owner, module) in &app.macro_includes {
+        includes.entry(owner.clone()).or_default().push(module.clone());
+    }
     // Spelling alone does not prove deferral: use the same source identity,
     // binding barriers and extension ordering as finite configuration.
     let deferred = super::class_configuration::verified_framework_concerns(
@@ -245,6 +271,8 @@ fn validate_activation(
         &includes.iter().map(|(id, edges)| (id.clone(), edges.clone())).collect(),
         framework_shadows,
     );
+    let library_classes: HashSet<crate::ClassId> =
+        app.library_classes.iter().filter(|lc| !lc.is_module).map(|lc| lc.name.clone()).collect();
     for (owner, direct) in &includes {
         // A survey source refusal already diagnosed an omitted class.
         if deferred.contains(owner) || (!retained.contains(owner) && !modules.contains(owner)) {
@@ -266,8 +294,8 @@ fn validate_activation(
             }
         }
         let mut pending = direct.clone();
-        let mut seen = HashSet::new();
-        let mut reported = HashSet::new();
+        let mut seen = HashSet::default();
+        let mut reported = HashSet::default();
         while let Some(id) = pending.pop() {
             if !seen.insert(id.clone()) {
                 continue;
@@ -278,10 +306,12 @@ fn validate_activation(
                     let supplied = direct.contains(&id) && model.as_ref().is_some_and(|m| m.body.iter().any(|item| {
                         matches!(item, ModelBodyItem::Unknown { expr: carried, .. } if carried.span == expr.span)
                     }));
+                    // A library class takes a direct include's plain accessors from `library_concern_items`.
+                    let supplied = supplied || (model.is_none() && direct.contains(&id) && library_classes.contains(owner) && is_supported(item));
                     if !supplied && reported.insert(expr.span) {
                         unwrap_or_record::<()>(Err(IngestError::Unsupported {
-                            file: app.sources[(expr.span.file.0 - 1) as usize].path.clone(),
-                            message: format!("concern attr_accessor on {}: only direct model inclusion is supported", owner.0),
+                            file: span_file(sources, expr.span),
+                            message: format!("concern attr_accessor on {}: only a direct include by a model or class is supported", owner.0),
                         }))?;
                     }
                 }
@@ -339,30 +369,49 @@ pub(super) fn validate(
     // a large app a second complete analysis. Only a name that passes every
     // syntactic check reads it, so a dry pass finds those models and the
     // probe covers just them (or does not run at all).
-    let mut probed = HashSet::new();
+    let mut probed = HashSet::default();
     let _ = refusals(app, &spans, &mut |model, _, _| {
         probed.insert(model.clone());
         false
     });
-    let surfaces = if probed.is_empty() {
-        HashMap::new()
+    let refused = if !probed.is_empty() && super::survey::is_active() && DEFERRAL.with(|state| matches!(*state.borrow(), Deferral::Armed)) {
+        // Deferred: refuse every probed name now, exactly as the probe
+        // would if each were occupied, and leave the caller to confirm
+        // that against the app it analyzes ([`DeferredAccessorSurface`]).
+        let mut names = Vec::new();
+        let refused = refusals(app, &spans, &mut |model, name, writer| {
+            names.push((model.clone(), name.clone(), writer.clone()));
+            true
+        });
+        let oracle = std::env::var_os("ROUNDHOUSE_ACCESSOR_SURFACE_ORACLE").map(|_| {
+            let surfaces = crate::lower::model_to_library::accessor_surface::occupied_surfaces(app, &probed);
+            names.iter().all(|(model, name, writer)| occupied(&surfaces, model, name, writer))
+        });
+        let deferred = DeferredAccessorSurface {
+            selected: crate::lower::model_to_library::accessor_surface::selection(app, &probed),
+            source_ivars: crate::lower::model_to_library::accessor_surface::source_ivars(app),
+            inheritance: crate::lower::model_to_library::accessor_surface::Inheritance::of(app, &probed),
+            names,
+            oracle,
+        };
+        DEFERRAL.with(|state| *state.borrow_mut() = Deferral::Taken(deferred));
+        refused
     } else {
-        crate::timings::phase("concern-accessor-surface", || {
-            crate::lower::model_to_library::accessor_surface::occupied_surfaces(app, &probed)
-        })
+        let surfaces = if probed.is_empty() {
+            HashMap::default()
+        } else {
+            crate::timings::phase("concern-accessor-surface", || {
+                crate::lower::model_to_library::accessor_surface::occupied_surfaces(app, &probed)
+            })
+        };
+        refusals(app, &spans, &mut |model, name, writer| occupied(&surfaces, model, name, writer))
     };
-    let refused = refusals(app, &spans, &mut |model, name, writer| {
-        surfaces[model]
-            .as_ref()
-            .is_none_or(|names| names.contains(name) || names.contains(writer))
-    });
     let mut rejections = Vec::new();
     for (model_index, refused) in refused {
-        let mut rejected = HashSet::new();
+        let mut rejected = HashSet::default();
         for (span, message) in refused {
-            let file = &app.sources[span.file.0 as usize - 1].path;
             unwrap_or_record::<()>(Err(IngestError::Unsupported {
-                file: file.clone(),
+                file: span_file(&app.sources, span),
                 message,
             }))?;
             rejected.insert(span);
@@ -376,6 +425,109 @@ pub(super) fn validate(
     Ok(())
 }
 
+/// The file a span was written in, or a marker for a declaration a
+/// desugar synthesized — `concerning :X do … end`'s block has no file of
+/// its own.
+fn span_file(sources: &[crate::span::SourceFile], span: Span) -> String {
+    span.file
+        .0
+        .checked_sub(1)
+        .and_then(|index| sources.get(index as usize))
+        .map_or_else(|| "<generated>".to_string(), |source| source.path.clone())
+}
+
+fn occupied(
+    surfaces: &HashMap<ClassId, Option<HashSet<Symbol>>>,
+    model: &ClassId,
+    name: &Symbol,
+    writer: &Symbol,
+) -> bool {
+    surfaces[model]
+        .as_ref()
+        .is_none_or(|names| names.contains(name) || names.contains(writer))
+}
+
+enum Deferral {
+    Off,
+    Armed,
+    Taken(DeferredAccessorSurface),
+}
+
+thread_local! {
+    static DEFERRAL: std::cell::RefCell<Deferral> = const { std::cell::RefCell::new(Deferral::Off) };
+}
+
+/// Run `f` with no deferral armed, putting back the caller's after: a pass whose app is thrown away defers nothing.
+pub(super) fn not_deferring<T>(f: impl FnOnce() -> T) -> T {
+    let previous = DEFERRAL.with(|state| std::mem::replace(&mut *state.borrow_mut(), Deferral::Off));
+    let result = f();
+    DEFERRAL.with(|state| *state.borrow_mut() = previous);
+    result
+}
+
+/// Run a survey-mode `ingest` without the surface probe's whole-app clone
+/// and second analysis, for a caller that analyzes the result itself.
+///
+/// Ingest refuses each name the probe would read, as the probe does for
+/// an occupied name. The caller runs `session::analyze_and_lower` on the
+/// app and then [`DeferredAccessorSurface::confirm`]: when every one of
+/// those names is occupied on the analyzed app too, the ingested app is
+/// the one the probe would have produced. Otherwise the caller ingests
+/// again without deferring. Outside survey mode, or when no name reaches
+/// the probe, ingest runs as usual and this returns `None`.
+pub fn defer<T>(ingest: impl FnOnce() -> T) -> (T, Option<DeferredAccessorSurface>) {
+    let previous = DEFERRAL.with(|state| std::mem::replace(&mut *state.borrow_mut(), Deferral::Armed));
+    let result = ingest();
+    let deferred = match DEFERRAL.with(|state| std::mem::replace(&mut *state.borrow_mut(), previous)) {
+        Deferral::Taken(deferred) => Some(deferred),
+        _ => None,
+    };
+    (result, deferred)
+}
+
+/// The surface observation [`defer`] postponed: the probed models, the
+/// names it refused on them, and what the observation reads from the
+/// app as ingest left it.
+pub struct DeferredAccessorSurface {
+    selected: HashSet<ClassId>,
+    source_ivars: HashSet<(Span, Symbol)>,
+    inheritance: crate::lower::model_to_library::accessor_surface::Inheritance,
+    names: Vec<(ClassId, Symbol, Symbol)>,
+    /// With `ROUNDHOUSE_ACCESSOR_SURFACE_ORACLE` set: whether the probe
+    /// found every name occupied.
+    oracle: Option<bool>,
+}
+
+impl DeferredAccessorSurface {
+    /// Whether `analyzed`, the ingested app after `analyze_and_lower`,
+    /// occupies every refused name, so that each refusal stands.
+    pub fn confirm(self, analyzed: &App) -> bool {
+        let (surfaces, _) = crate::emit::diagnostics::scope(|| {
+            crate::lower::model_to_library::accessor_surface::observe_analyzed(
+                analyzed,
+                &self.selected,
+                &self.source_ivars,
+            )
+        });
+        let confirmed = self.inheritance.apply(surfaces).is_some_and(|surfaces| {
+            self.names.iter().all(|(model, name, writer)| {
+                surfaces.contains_key(model) && occupied(&surfaces, model, name, writer)
+            })
+        });
+        match self.oracle {
+            Some(probe) if probe != confirmed => {
+                eprintln!(
+                    "roundhouse: concern-accessor-surface: the analyzed app {} every refused name, the probe {}",
+                    if confirmed { "occupies" } else { "does not occupy" },
+                    if probe { "does" } else { "does not" },
+                );
+                false
+            }
+            _ => confirmed,
+        }
+    }
+}
+
 /// Each carried model's refused declarations with their messages, in
 /// source order. `occupied(model, reader, writer)` is asked last, only
 /// for a name every syntactic check admits.
@@ -385,13 +537,14 @@ fn refusals(
     occupied: &mut dyn FnMut(&ClassId, &Symbol, &Symbol) -> bool,
 ) -> Vec<(usize, Vec<(Span, String)>)> {
     let mut out = Vec::new();
+    let by_name = library_classes_by_name(app);
     for (model_index, model) in app.models.iter().enumerate() {
         let carried = |item: &ModelBodyItem| matches!(item, ModelBodyItem::Unknown { expr, .. } if spans.contains(&expr.span));
         if !model.body.iter().any(carried) {
             continue;
         };
-        let hook = unconsumed_included_hook(model, app);
-        let mut nonpublic_methods = HashSet::new();
+        let hook = unconsumed_included_hook(model, app, &by_name);
+        let mut nonpublic_methods = HashSet::default();
         for item in &model.body {
             match item {
                 ModelBodyItem::Unknown { expr, .. } => {

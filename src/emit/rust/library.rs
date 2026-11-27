@@ -11,7 +11,7 @@ use super::method::{emit_instance_method, emit_module_method};
 use super::ty::rust_ty;
 use crate::dialect::{LibraryClass, MethodDef, MethodReceiver};
 use crate::expr::{Expr, ExprNode, Literal, LValue};
-use crate::ty::Ty;
+use crate::ty::{FnTy, Ty};
 
 /// Module mode — flat list of `def self.*` helpers (e.g.
 /// `inflector.rb`'s `Inflector.pluralize`). Each method emits as a
@@ -29,11 +29,62 @@ use crate::ty::Ty;
 /// Apply the same `str_color` pass here so Module-mode methods
 /// (router.rb, view_helpers.rb's free functions, etc.) get the
 /// same ownership annotations before emit.
+/// Rust has no default arguments, so a sibling call that leaves a
+/// trailing parameter to its default (`make_record` for `def
+/// make_record(size: 1)`, a test helper the tests call bare) gets the
+/// source's default written in. Only literal defaults are copied — a
+/// computed default could read other parameters — and only onto calls
+/// whose arguments are all positional (a braced `{}` is one); a trailing keyword hash is
+/// matched to its parameters by name later, in send dispatch.
+fn pad_sibling_defaults(methods: &mut [MethodDef]) {
+    use crate::expr::{Expr, ExprNode};
+    let defaults: crate::det::HashMap<crate::ident::Symbol, Vec<Option<Expr>>> = methods
+        .iter()
+        .map(|m| {
+            let ds = m
+                .params
+                .iter()
+                .filter(|p| !p.rest && !p.forwarding && !p.name.as_str().is_empty())
+                .map(|p| {
+                    p.default.clone().filter(|d| {
+                        super::expr::util::render_param_default_literal(d).is_some()
+                    })
+                })
+                .collect();
+            (m.name.clone(), ds)
+        })
+        .collect();
+    fn walk(e: &mut Expr, defaults: &crate::det::HashMap<crate::ident::Symbol, Vec<Option<Expr>>>) {
+        e.node.for_each_child_mut(&mut |c| walk(c, defaults));
+        if let ExprNode::Send { recv, method, args, block: None, .. } = &mut *e.node {
+            let self_call = match recv {
+                None => true,
+                Some(r) => matches!(&*r.node, ExprNode::SelfRef),
+            };
+            if !self_call || args.iter().any(|a| matches!(&*a.node, ExprNode::Hash { kwargs: true, .. })) {
+                return;
+            }
+            let Some(ds) = defaults.get(method) else { return };
+            if args.len() >= ds.len() {
+                return;
+            }
+            let missing = &ds[args.len()..];
+            if missing.iter().all(Option::is_some) {
+                args.extend(missing.iter().flatten().cloned());
+            }
+        }
+    }
+    for m in methods.iter_mut() {
+        walk(&mut m.body, &defaults);
+    }
+}
+
 pub fn emit_module(methods: &[MethodDef]) -> Result<String, String> {
     if methods.is_empty() {
         return Ok(String::new());
     }
     let mut colored: Vec<MethodDef> = methods.to_vec();
+    pad_sibling_defaults(&mut colored);
     let registry = crate::emit::rust::decide::str_color::build_registry_from_methods(&colored);
     for m in colored.iter_mut() {
         crate::emit::rust::decide::str_color::color_method(m, &registry);
@@ -52,6 +103,7 @@ pub fn emit_module(methods: &[MethodDef]) -> Result<String, String> {
         nullable_columns: Vec::new(),
         origin: None,
         constants: Vec::new(),
+        conditional_definitions: Vec::new(),
         unknown_calls: Vec::new(),
         class_ivar_initializers: Vec::new(),
     }];
@@ -66,7 +118,10 @@ pub fn emit_module(methods: &[MethodDef]) -> Result<String, String> {
             writeln!(out).unwrap();
         }
         first = false;
-        out.push_str(&emit_module_method(m)?);
+        // A free function: a sibling call is written through the module
+        // (`self::name`), not `Self::` (library mode, below, wraps the
+        // same method in an `impl`).
+        out.push_str(&super::expr::with_free_function_scope(|| emit_module_method(m))?);
     }
     Ok(out)
 }
@@ -90,6 +145,8 @@ pub fn emit_module(methods: &[MethodDef]) -> Result<String, String> {
 /// Subsequent commits drive the per-ExprNode body emit until the
 /// produced Rust is `cargo check`-clean.
 pub fn emit_library_class(class: &LibraryClass) -> Result<String, String> {
+    // Not for a class: a bare constant in a module body is the module's own nested class, the shape runtime modules raise
+    super::expr::set_current_ruby_class_name(if class.is_module { class.name.0.as_str() } else { "" });
     // Strip the namespace prefix (`ActiveSupport::HashWithIndifferentAccess`
     // → `HashWithIndifferentAccess`). Rust uses file-as-module, so the
     // namespace is carried by the file path, not the struct name.
@@ -127,7 +184,7 @@ pub fn emit_library_class(class: &LibraryClass) -> Result<String, String> {
     // case: pure value-transformation, no instance state. The
     // companion call-site rewrite in `expr.rs::emit_send` routes
     // `self.method(args)` for these methods to `Self::method(args)`.
-    let static_method_names: std::collections::HashSet<String> = class
+    let static_method_names: crate::det::HashSet<String> = class
         .methods
         .iter()
         .filter(|m| {
@@ -165,7 +222,7 @@ pub fn emit_library_class(class: &LibraryClass) -> Result<String, String> {
     // closure. Build the per-class mutating-name set from the flags
     // for the `static_method_names` exclusion check + the existing
     // call-site method-mutates logic that the body emit consults.
-    let mutating_methods: std::collections::HashSet<String> = class
+    let mutating_methods: crate::det::HashSet<String> = class
         .methods
         .iter()
         .filter(|m| m.mutates_self)
@@ -204,7 +261,7 @@ pub fn emit_library_class(class: &LibraryClass) -> Result<String, String> {
     // still work alongside; Rust disambiguates field vs method
     // by trailing parens at the call site.
     for (fname, ty) in &ivars {
-        writeln!(out, "    pub {fname}: {},", rust_ty(ty)).unwrap();
+        writeln!(out, "    pub {}: {},", crate::emit::rust::expr::util::escape_rust_keyword(fname), rust_ty(ty)).unwrap();
     }
     out.push_str("}\n\n");
 
@@ -222,7 +279,7 @@ pub fn emit_library_class(class: &LibraryClass) -> Result<String, String> {
     // commonly `self.body = ""` where field is `String` and `""` is
     // `&str`. Empty outside class-body scope; scoped per-class to
     // prevent bleeding between siblings.
-    let ivar_type_map: std::collections::HashMap<String, Ty> =
+    let ivar_type_map: crate::det::HashMap<String, Ty> =
         ivars.iter().cloned().collect();
     let class_method_param_tys = collect_class_method_param_tys(&class.methods);
     let body_result = super::expr::with_class_method_param_tys(class_method_param_tys, || super::expr::with_ivar_types(ivar_type_map, || super::expr::with_static_methods(static_method_names.clone(), || {
@@ -373,7 +430,7 @@ fn emit_module_singleton(
         out.push('\n');
     }
     writeln!(out, "impl {name} {{").unwrap();
-    let ivar_type_map: std::collections::HashMap<String, Ty> =
+    let ivar_type_map: crate::det::HashMap<String, Ty> =
         ivars.iter().cloned().collect();
     let class_method_param_tys = collect_class_method_param_tys(&class.methods);
     let body_result = super::expr::with_class_method_param_tys(class_method_param_tys, || super::expr::with_module_singleton(true, thread_local, || {
@@ -487,7 +544,12 @@ fn method_reads_self(body: &Expr) -> bool {
                 walk(scrutinee) || arms.iter().any(|a| walk(&a.body))
             }
             ExprNode::Cast { value, .. } => walk(value),
-            _ => false,
+            // Not false for the rest: a begin/rescue or any other node holding a self read still makes the method an instance one
+            _ => {
+                let mut found = false;
+                e.node.for_each_child(&mut |c| found |= walk(c));
+                found
+            }
         }
     }
     walk(body)
@@ -504,16 +566,19 @@ fn method_reads_self(body: &Expr) -> bool {
 /// lookup in emit_send for `Self::method(args)` calls.
 fn collect_class_method_param_tys(
     methods: &[MethodDef],
-) -> std::collections::HashMap<String, Vec<Ty>> {
+) -> crate::det::HashMap<String, Vec<Ty>> {
     use crate::ty::ParamKind;
-    let mut out = std::collections::HashMap::new();
+    let mut out = crate::det::HashMap::default();
     for m in methods {
         let tys: Vec<Ty> = match m.signature.as_ref() {
-            Some(Ty::Fn { params, .. }) => params
-                .iter()
-                .filter(|p| !matches!(p.kind, ParamKind::Block | ParamKind::KeywordRest))
-                .map(|p| (*p.ty).clone())
-                .collect(),
+            Some(Ty::Fn(fn_ty)) => {
+                let FnTy { params, .. } = &**fn_ty;
+                params
+                    .iter()
+                    .filter(|p| !matches!(p.kind, ParamKind::Block | ParamKind::KeywordRest))
+                    .map(|p| (*p.ty).clone())
+                    .collect()
+            },
             _ => continue,
         };
         // Ruby `Class.new(args)` invokes `initialize(args)`; the IR
@@ -550,12 +615,12 @@ fn collect_ivar_types(methods: &[MethodDef]) -> Vec<(String, Ty)> {
     // by writes get widened by re-observation and break framework
     // runtime emit (e.g. `Base.flash` typed Option<Flash> mistakenly).
     let mut order: Vec<String> = Vec::new();
-    let mut observed: std::collections::HashMap<String, Vec<Ty>> =
-        std::collections::HashMap::new();
+    let mut observed: crate::det::HashMap<String, Vec<Ty>> =
+        crate::det::HashMap::default();
     for m in methods {
         walk_collect_ivars(&m.body, &mut order, &mut observed);
     }
-    let written: std::collections::HashSet<String> =
+    let written: crate::det::HashSet<String> =
         observed.keys().cloned().collect();
     for m in methods {
         walk_collect_ivar_reads(&m.body, &written, &mut order, &mut observed);
@@ -639,13 +704,13 @@ fn unify_ivar_tys(tys: &[Ty]) -> Ty {
 fn walk_collect_ivars(
     e: &Expr,
     order: &mut Vec<String>,
-    observed: &mut std::collections::HashMap<String, Vec<Ty>>,
+    observed: &mut crate::det::HashMap<String, Vec<Ty>>,
 ) {
     fn record(
         name: &str,
         ty: Ty,
         order: &mut Vec<String>,
-        observed: &mut std::collections::HashMap<String, Vec<Ty>>,
+        observed: &mut crate::det::HashMap<String, Vec<Ty>>,
     ) {
         let k = name.to_string();
         if !order.iter().any(|n| n == &k) {
@@ -753,15 +818,15 @@ fn walk_collect_ivars(
 /// this pass entirely — the write-based ty rules already cover them.
 fn walk_collect_ivar_reads(
     e: &Expr,
-    written: &std::collections::HashSet<String>,
+    written: &crate::det::HashSet<String>,
     order: &mut Vec<String>,
-    observed: &mut std::collections::HashMap<String, Vec<Ty>>,
+    observed: &mut crate::det::HashMap<String, Vec<Ty>>,
 ) {
     fn record(
         name: &str,
         ty: Ty,
         order: &mut Vec<String>,
-        observed: &mut std::collections::HashMap<String, Vec<Ty>>,
+        observed: &mut crate::det::HashMap<String, Vec<Ty>>,
     ) {
         let k = name.to_string();
         if !order.iter().any(|n| n == &k) {
@@ -853,7 +918,11 @@ pub fn format_constant(name: &str, value: &Expr) -> String {
         }
         ExprNode::Hash { entries, .. } => format_hash_constant(name, entries),
         ExprNode::Array { elements, .. } => format_array_constant(name, elements),
-        _ => format!("// TODO rust2 const: {name} = {:?}", value.node),
+        _ => {
+            // Not the panic stub in place: a constant is an item, where an expression does not parse
+            let stub = crate::emit::diagnostics::report_unsupported(value.span, "rust", value.node.kind_str(), "constant value");
+            format!("// {name} = {stub}")
+        }
     }
 }
 
@@ -935,7 +1004,7 @@ fn render_constant_value(e: &Expr) -> String {
         ExprNode::Lit { value: Literal::Bool { value } } => value.to_string(),
         ExprNode::Lit { value: Literal::Str { value } } => format!("{value:?}"),
         ExprNode::Lit { value: Literal::Sym { value } } => format!("{:?}", value.as_str()),
-        _ => format!("/* TODO rust2 const value: {:?} */", e.node),
+        _ => crate::emit::diagnostics::report_unsupported(e.span, "rust", e.node.kind_str(), "constant value"),
     }
 }
 
@@ -960,7 +1029,7 @@ mod op_assign_tests {
             "module OpAssign\n  def self.count(n)\n    i = 0\n    s = \"\"\n    while i < n\n      s += \"x\"\n      i += 1\n    end\n    s\n  end\nend\n",
             "module OpAssign\n  def self.count: (Integer n) -> String\nend\n",
         );
-        assert!(!out.contains("TODO rust2"), "OpAssign fell through:\n{out}");
+        assert!(!out.contains("unsupported"), "OpAssign fell through:\n{out}");
         assert!(out.contains("i = i + 1_i64"), "int counter not advanced:\n{out}");
         // A `+=` is a reassignment, so its local needs `let mut` as the
         // spelled-out `s = s + "x"` gets.

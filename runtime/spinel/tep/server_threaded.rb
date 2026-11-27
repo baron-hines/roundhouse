@@ -140,7 +140,18 @@ module Tep
       # the next connection came in. Then a non-blocking accept, which
       # answers -1 for a spurious wake and is retried.
       def self.run_worker(sfd, ufd = -1)
-        if ufd >= 0
+        if Tep.boot_hooks?
+          tcp_accept = Thread.new(sfd) { |fd| Tep::Server::Threaded.accept_loop(fd, "tcp") }
+          if ufd >= 0
+            unix_accept = Thread.new(ufd) { |fd| Tep::Server::Threaded.accept_loop(fd, "unix") }
+            Tep.on_booted
+            tcp_accept.join
+            unix_accept.join
+          else
+            Tep.on_booted
+            tcp_accept.join
+          end
+        elsif ufd >= 0
           unix_accept = Thread.new(ufd) { |fd| Tep::Server::Threaded.accept_loop(fd, "unix") }
           Tep::Server::Threaded.accept_loop(sfd, "tcp")
           unix_accept.join
@@ -224,6 +235,8 @@ module Tep
           return false
         end
         req.listener_transport = transport
+        # Rack's REMOTE_ADDR: the peer a connection came from ("" over a UNIX socket).
+        req.remote_host = Sock.sp_net_peer_ip(client)
 
         # Before the drain, which is what held the bytes (Request#body_refusal).
         refusal = req.body_refusal(Tep.max_body_bytes)
@@ -233,7 +246,11 @@ module Tep
           return false
         end
 
-        return false unless req.consume_body_via_io(io, client)
+        unless req.consume_body_via_io(io, client, input)
+          failure = req.body_failure_status
+          Tep::Server::Threaded.send_simple(client, failure, failure == 413 ? "request body too large" : "bad request") if failure != 0
+          return false
+        end
 
         res = Response.new
         begin
@@ -307,6 +324,8 @@ module Tep
           # frame when it shared the request's recv.
           begin
             conn.run(input.take_pending_input)
+          rescue StandardError, ScriptError => e
+            Tep.log_dispatch_error(req.verb, req.path, e)
           ensure
             res.ws_driver.retire
           end
@@ -325,7 +344,12 @@ module Tep
           head << "Connection: close\r\n\r\n"
           Sock.sphttp_write_str(client, head)
           out = Tep::Stream.new(client)
-          res.streamer.pump(out)
+          begin
+            res.streamer.pump(out)
+          rescue StandardError, ScriptError => e
+            Tep.log_dispatch_error(req.verb, req.path, e)
+            return false
+          end
           Sock.sphttp_write_chunk_end(client)
           return false
         end
@@ -355,7 +379,12 @@ module Tep
         else
           # BYTES, both times: `length` counts characters, and
           # `write_str` crosses the FFI as a NUL-terminated C string.
-          head << "Content-Length: " + res.body.bytesize.to_s + "\r\n\r\n"
+          # Not for a 204 or a 304: RFC 9110 gives neither a Content-Length of its own body, and Puma writes none.
+          if res.status == 204 || res.status == 304
+            head << "\r\n"
+          else
+            head << "Content-Length: " + res.body.bytesize.to_s + "\r\n\r\n"
+          end
           Sock.sphttp_write_str(client, head)
           # HEAD: the headers GET would send, Content-Length included, and
           # no body (RFC 9110 9.3.2). A body here would be read by the

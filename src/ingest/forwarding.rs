@@ -7,9 +7,15 @@
 //! rest is unreachable from the body, so binding it to a generated name
 //! that the source does not use (checked like the multi-write temps)
 //! changes nothing a program can observe but its arity, which it keeps.
-//! campfire's `ApplicationHelper#token_tag(*)` is that shape. A body that
-//! forwards (`foo(*)`) still reports `AnonymousRest`: the ingest would turn
-//! that bare splat into `*nil`, and forwarding is not modeled yet.
+//! campfire's `ApplicationHelper#token_tag(*)` is that shape. In a model or
+//! controller method a body that forwards (`foo(*)`) still reports
+//! `AnonymousRest`: the ingest would turn that bare splat into `*nil`.
+//!
+//! A LIBRARY method that forwards it (`def deserialize(*, **, &)` calling
+//! `other.deserialize(*, **, &)`) takes the same generated name
+//! (`Formals::forwarded_rest_name`), and the bare `*` splats in its body
+//! read that name (`ingest::expr::with_anonymous_rest`): `def f(*r)` /
+//! `g(*r)` binds and passes on exactly what `def f(*)` / `g(*)` do.
 
 use super::{IngestError, IngestResult};
 use crate::dialect::UnsupportedFormal;
@@ -26,6 +32,9 @@ pub(crate) struct Formals {
     /// The generated name an unforwarded anonymous `*` binds to (see the
     /// module doc); `None` when there is no such rest.
     pub anonymous_rest_name: Option<crate::ident::Symbol>,
+    /// The generated name a FORWARDED anonymous `*` binds to (see the
+    /// module doc); only the library method ingest consumes it.
+    pub forwarded_rest_name: Option<crate::ident::Symbol>,
 }
 
 /// Is there a bare `*` (a splat with no operand) anywhere under `node`?
@@ -112,6 +121,7 @@ pub(crate) fn parse(def: &ruby_prism::DefNode<'_>) -> Formals {
         has_anonymous_block: super::prism_api::block_parameter(&pn)
             .is_some_and(|b| b.name().is_none()),
         anonymous_rest_name: (anonymous_rest && !forwarded).then(|| anonymous_rest_name(def)),
+        forwarded_rest_name: (anonymous_rest && forwarded).then(|| anonymous_rest_name(def)),
     }
 }
 

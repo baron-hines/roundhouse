@@ -7,7 +7,7 @@ use crate::ident::Symbol;
 use crate::span::Span;
 
 fn case_runs(target: BuildTarget) -> bool {
-    matches!(target, BuildTarget::Ruby | BuildTarget::Jruby)
+    matches!(target, BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Spinel)
 }
 
 fn keeps_source_call(target: BuildTarget) -> bool {
@@ -15,21 +15,38 @@ fn keeps_source_call(target: BuildTarget) -> bool {
 }
 
 pub fn lower_for_target(app: &App, target: BuildTarget) -> Option<App> {
-    if keeps_source_call(target) {
+    if !applies(app, target) {
         return None;
+    }
+    let mut app = app.clone();
+    lower(&mut app, target);
+    Some(app)
+}
+
+/// [`lower_for_target`] on the caller's own app: no second copy of the
+/// whole program beside the first (a quarter of the emit's peak on a large app).
+pub fn lower_in_place(app: &mut App, target: BuildTarget) {
+    if applies(app, target) {
+        lower(app, target);
+    }
+}
+
+/// Whether [`lower_in_place`] rewrites any of `app`'s bodies for `target`.
+pub fn applies(app: &App, target: BuildTarget) -> bool {
+    if keeps_source_call(target) {
+        return false;
     }
     let mut found = false;
     crate::lower::for_each_emit_body_ref(app, &mut |body| found |= has_call(body));
-    if !found {
-        return None;
-    }
+    found
+}
+
+fn lower(app: &mut App, target: BuildTarget) {
     let runs = case_runs(target);
-    let lookup = runs.then(|| lookup_class(&app_constants(app)));
-    let mut app = app.clone();
+    let lookup = runs.then(|| if resolves_by_name(target) { native_lookup_class() } else { lookup_class(&app_constants(app)) });
     let target_name = target.as_str();
-    crate::lower::for_each_emit_body(&mut app, &mut |body| rewrite(body, runs, target_name));
+    crate::lower::for_each_emit_body(app, &mut |body| rewrite(body, runs, target_name));
     app.library_classes.extend(lookup.into_iter().flatten());
-    Some(app)
 }
 
 // Only the app's own constants: a name from run-time data must not reach every class in the process
@@ -47,13 +64,21 @@ fn app_constants(app: &App) -> BTreeSet<String> {
 }
 
 fn constantize_method(expr: &Expr) -> Option<&'static str> {
-    let ExprNode::Send { recv: Some(_), method, args, block: None, .. } = &*expr.node else { return None };
-    if !args.is_empty() {
-        return None;
-    }
-    match method.as_str() {
-        "constantize" => Some("constantize"),
-        "safe_constantize" => Some("safe_constantize"),
+    constantized(expr).map(|(method, _)| method)
+}
+
+/// The method and the name it resolves: `name.constantize`, or Active Support's own spelling of it,
+/// `ActiveSupport::Inflector.constantize(name)` (Devise's FailureApp builds its recall's controller so).
+fn constantized(expr: &Expr) -> Option<(&'static str, &Expr)> {
+    let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*expr.node else { return None };
+    let method = match method.as_str() {
+        "constantize" => "constantize",
+        "safe_constantize" => "safe_constantize",
+        _ => return None,
+    };
+    match args.as_slice() {
+        [] => Some((method, recv)),
+        [name] if matches!(&*recv.node, ExprNode::Const { path } if path.iter().map(|s| s.as_str()).collect::<Vec<_>>() == ["ActiveSupport", "Inflector"]) => Some((method, name)),
         _ => None,
     }
 }
@@ -86,10 +111,9 @@ fn rewrite(expr: &mut Expr, runs: bool, target: &str) {
         return;
     }
     expr.node.for_each_child_mut(&mut |child| rewrite(child, runs, target));
-    let Some(method) = constantize_method(expr) else { return };
+    let Some((method, name)) = constantized(expr) else { return };
     let span = expr.span;
-    let ExprNode::Send { recv: Some(recv), .. } = &*expr.node else { return };
-    let recv = recv.clone();
+    let recv = name.clone();
     *expr = if runs {
         Expr::new(
             span,
@@ -113,6 +137,29 @@ fn rewrite(expr: &mut Expr, runs: bool, target: &str) {
         );
         refusal(span, &text)
     };
+}
+
+// The interpreters resolve a name themselves, through the tree's autoloads.
+fn resolves_by_name(target: BuildTarget) -> bool {
+    matches!(target, BuildTarget::Ruby | BuildTarget::Jruby)
+}
+
+// CRuby and JRuby: Active Support's own `constantize` / `safe_constantize`
+// (activesupport 8.1 `inflector/methods.rb`): `Object.const_get`, any constant
+// the process has, and `safe_constantize` answers nil only for a NameError
+// about the name asked for. The closed case below is for Spinel, which has no
+// `const_get` by name. On the interpreters its arms were constant references
+// the emitted file had to load first: in a large app the lookup required every
+// app file before the first `constantize`, so one in a class body re-entered
+// files mid-load, and a framework name
+// (`"ActiveSupport::HashWithIndifferentAccess".constantize`) was a NameError.
+fn native_lookup_class() -> Vec<crate::dialect::LibraryClass> {
+    let source = format!(
+        "class {LOOKUP}\n  def self.constantize(name)\n    ::Object.const_get(name.delete_prefix(\"::\"))\n  end\n\n  \
+         def self.safe_constantize(name)\n    constantize(name)\n  rescue NameError => e\n    \
+         raise if e.name && !(name.to_s.split(\"::\").include?(e.name.to_s) || e.name.to_s == name.to_s)\n    nil\n  end\nend\n"
+    );
+    crate::ingest::ingest_library_classes(source.as_bytes(), "<roundhouse constants>").expect("the constant lookup parses")
 }
 
 // One shared `case`: inlined at every call site, a large app's emit grew thirteenfold

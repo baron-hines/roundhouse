@@ -63,10 +63,10 @@ puts "ok"
     .assert_passes();
 }
 
-// Re-read from the model, `include Greeting` would name a top-level constant, not the gem's `Greeter::Greeting`
+// Not replayed as written: re-read from the model, `include Greeting` would name a top-level constant.
 #[test]
-fn a_macro_mixin_written_relative_to_its_module_is_not_expanded() {
-    let (_, errors) = app(
+fn a_macro_mixin_written_relative_to_its_module_names_the_gems_module() {
+    app(
         "module Greeter
   module Greeting
     def greeting = \"Hello, #{title}\"
@@ -80,11 +80,13 @@ fn a_macro_mixin_written_relative_to_its_module_is_not_expanded() {
 end
 ",
     )
-    .emit(roundhouse::project::BuildTarget::Ruby);
-    assert!(
-        errors.iter().any(|e| e.contains("`acts_as_greeter` defines methods this call does not expand") && e.contains("`Greeting` names a different module")),
-        "{errors:#?}"
-    );
+    .run_ruby(
+        r#"Article.create!(title: "World", body: "body number one is long enough")
+raise "got #{Article.first.greeting.inspect}" unless Article.first.greeting == "Hello, World"
+puts "ok"
+"#,
+    )
+    .assert_passes();
 }
 
 #[test]

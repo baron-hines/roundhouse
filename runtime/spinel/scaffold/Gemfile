@@ -18,7 +18,9 @@ gem "resolv"
 # build, so `bin/rh transpile jruby` rewrites this line to `jdbc-sqlite3`
 # in its emitted tree (see src/project.rs::jruby_runtime_files) and
 # reaches SQLite through the Xerial sqlite-jdbc driver — keeping this
-# committed scaffold Gemfile (and its frozen lock) MRI-only.
+# committed scaffold Gemfile (and its frozen lock) MRI-only. An app whose
+# primary database is PostgreSQL gets `gem "pg"` here instead, and no
+# lock (src/project.rs::apply_postgresql_tree).
 gem "sqlite3"
 gem "minitest"
 gem "rake"

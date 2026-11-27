@@ -202,9 +202,13 @@ fn article_renders_residualized_fill_timestamps() {
         src.contains("if creating && (@created_at_raw.nil? || @created_at_raw.empty?)\n      @__t_created_at = nil\n      @created_at_raw = now"),
         "{src}",
     );
-    // The runtime schema probe must be fully residualized away.
+    // The runtime schema probe must be fully residualized away. Read in
+    // `fill_timestamps` itself: a partial row's serializers ask
+    // `@__unloaded_columns.include?(:updated_at)`, which is no schema probe.
+    let start = src.find("def fill_timestamps(creating)").unwrap();
+    let body = &src[start..start + src[start..].find("\n  end\n").unwrap()];
     assert!(
-        !src.contains(".include?(:updated_at)") && !src.contains(".include?(:created_at)"),
+        !body.contains(".include?(:updated_at)") && !body.contains(".include?(:created_at)"),
         "fill_timestamps still probes the schema at runtime:\n{src}",
     );
 }
@@ -1210,13 +1214,13 @@ fn comments_create_expands_assoc_build_to_typed_factory_with_fk() {
     let files = lowered_real_blog_controllers();
     let src = find(&files, "comments_controller.rb");
     assert!(
-        src.contains("__rh_build_record_0 = Comment.from_params(self.comment_params)"),
+        src.contains("rh_build_record_0 = Comment.from_params(self.comment_params)"),
         "expected typed-factory in build; got:\n{src}",
     );
     assert!(
-        src.contains("__rh_build_owner_0 = @article")
-            && src.contains("__rh_build_record_0.article_id = __rh_build_owner_0.id")
-            && src.contains("@comment = __rh_build_record_0"),
+        src.contains("rh_build_owner_0 = @article")
+            && src.contains("rh_build_record_0.article_id = rh_build_owner_0.id")
+            && src.contains("@comment = rh_build_record_0"),
         "expected FK setter after typed factory; got:\n{src}",
     );
     assert!(
@@ -1903,15 +1907,15 @@ fn lowered_show_view_emits_module_method() {
 fn lowered_show_view_renders_association_partial_via_each() {
     // `<%= render @article.comments %>` — has_many association
     // partial. Lowered to `article.comments.each { |c| io <<
-    // Views::Comments.comment_into(io, c, nil, nil) }`. The variant takes
-    // every parameter as required, so the call spells the partial's
-    // notice/alert defaults. The receiver is the
+    // Views::Comments.comment_into(io, c, notice, alert) }`. The variant
+    // takes every parameter as required, and the partial reads the
+    // caller's flash, so the call passes the view's own. The receiver is the
     // post-ivar-rewrite `article`; the var name is the singular's
     // first letter (`c`).
     let files = lowered_real_blog_views();
     let src = find(&files, "app/views/articles/show.rb");
     assert!(
-        src.contains("article.comments.each { |c| Views::Comments.comment_into(io, c, nil, nil) }"),
+        src.contains("article.comments.each { |c| Views::Comments.comment_into(io, c, notice, alert) }"),
         "expected article.comments.each association iteration; got:\n{src}",
     );
 }
@@ -2147,8 +2151,8 @@ fn lowered_new_view_dispatches_named_partial() {
         "expected `def self._new(article, notice, alert)`; got:\n{src}",
     );
     assert!(
-        src.contains("Views::Articles.form_into(io, article, nil, nil)"),
-        "expected named-partial dispatch to Views::Articles.form_into(io, article, nil, nil); got:\n{src}",
+        src.contains("Views::Articles.form_into(io, article, notice, alert)"),
+        "expected named-partial dispatch to Views::Articles.form_into(io, article, notice, alert); got:\n{src}",
     );
 }
 
@@ -2162,7 +2166,7 @@ fn lowered_edit_view_dispatches_named_partial_and_record_link() {
     );
     // Same shared partial as `new.html.erb`.
     assert!(
-        src.contains("Views::Articles.form_into(io, article, nil, nil)"),
+        src.contains("Views::Articles.form_into(io, article, notice, alert)"),
         "expected named-partial dispatch; got:\n{src}",
     );
     // `<%= link_to "Show this article", @article, ... %>` — the URL
@@ -2542,6 +2546,32 @@ fn block_tag_helper_appends_through_an_open_half_and_an_inline_close() {
     let after = view_src.find("<p>after</p>").unwrap();
     assert!(open < body && body < close && close < after, "{view_src}");
 }
+/// A rooted receiver gets the same rewrite. Inside `Views::Users`, the
+/// call to `Users::PanelsHelper` is spelled `::Users::PanelsHelper`
+/// (`apply_constant_rooting`); the pass's lookup has to read past the
+/// root marker, or every rooted helper call keeps its capture buffer.
+#[test]
+fn a_rooted_block_tag_helper_receiver_appends_through_an_open_half() {
+    let mut app = ingest_tree(&[
+        ("db/schema.rb", "ActiveRecord::Schema.define(version: 1) do\nend\n"),
+        (
+            "app/helpers/users/panels_helper.rb",
+            "module Users::PanelsHelper\n  def panel_tag(kind, &)\n    tag.div class: \"panel panel--#{kind}\", &\n  end\nend\n",
+        ),
+        (
+            "app/views/users/index.html.erb",
+            "<%= panel_tag(\"wide\") do %>\n  <p>inside</p>\n<% end %>\n",
+        ),
+    ]);
+    let mut analyzer = roundhouse::analyze::Analyzer::new(&app);
+    analyzer.analyze(&mut app);
+    roundhouse::lower::apply_post_analyze_lowerings(&mut app, analyzer.class_registry());
+    let view_files = ruby::emit_lowered_views(&app);
+    let view_src = find(&view_files, "app/views/users/index.rb");
+    assert!(view_src.contains("::Users::PanelsHelper.panel_tag_open_into(io, \"wide\")"), "{view_src}");
+    assert!(!view_src.contains("_cap = String.new"), "no capture buffer remains:\n{view_src}");
+}
+
 
 /// A tag helper that takes only the block (`def search_results_tag(&)`)
 /// has no signature when the variant is built; its `_open_into` still

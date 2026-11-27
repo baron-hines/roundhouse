@@ -84,13 +84,10 @@ fn lambda_conditions_report_no_gap_warnings() {
     assert!(warnings.is_empty(), "{warnings:?}");
 }
 
-/// An arity>0 lambda (`->(w) { … }`) is not the zero-arity shape
-/// `callback_condition` accepts (its body would splice an unbound
-/// parameter into `def validate`), so the whole `validates` call stays
-/// the reported gap it already was — not silently promoted to an
-/// always-on check, and not silently dropped either: the attribute
-/// saves blank on every status, same as before this build understood
-/// any lambda condition.
+/// A one-parameter lambda (`->(w) { … }`) is called with the record, as
+/// Rails calls it, so the guard reads the parameter as `self`: the check
+/// runs on a live widget and not on a draft. Two parameters still splice
+/// one unbound, so that `validates` call stays the reported gap.
 const ARITY_ONE_MODEL: &str = r#"class Widget < ApplicationRecord
   validates :name, presence: true, if: ->(w) { w.live? }
 
@@ -101,27 +98,31 @@ end
 "#;
 
 #[test]
-fn arity_one_lambda_condition_stays_a_reported_gap() {
+fn arity_one_lambda_condition_reads_the_record() {
     let warnings = emit_and_run::empty_app()
         .write("app/models/application_record.rb", APPLICATION_RECORD)
         .write("db/schema.rb", SCHEMA)
         .write("app/models/widget.rb", ARITY_ONE_MODEL)
         .ingest_warnings();
-    assert!(
-        warnings.iter().any(|m| m.contains("if:")),
-        "missing if: gap warning in {warnings:?}"
-    );
+    assert!(warnings.is_empty(), "{warnings:?}");
 
     emit_and_run::empty_app()
         .write("app/models/application_record.rb", APPLICATION_RECORD)
         .write("db/schema.rb", SCHEMA)
         .write("app/models/widget.rb", ARITY_ONE_MODEL)
         .run_ruby(r##"
-live = Widget.new(status: "live", name: "")
-raise "arity>0 lambda condition should stay a gap (unconditional pass)" unless live.valid?
-puts "arity-1 lambda stays a gap"
+raise "live widget with a blank name passed" if Widget.new(status: "live", name: "").valid?
+raise "draft widget was checked" unless Widget.new(status: "draft", name: "").valid?
+puts "arity-1 lambda reads the record"
 "##)
         .assert_passes();
+
+    let warnings = emit_and_run::empty_app()
+        .write("app/models/application_record.rb", APPLICATION_RECORD)
+        .write("db/schema.rb", SCHEMA)
+        .write("app/models/widget.rb", &ARITY_ONE_MODEL.replace("->(w)", "->(w, x)"))
+        .ingest_warnings();
+    assert!(warnings.iter().any(|m| m.contains("if:")), "missing if: gap warning in {warnings:?}");
 }
 
 /// A parameter of a block nested in the lambda is bound by that block

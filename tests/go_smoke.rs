@@ -16,6 +16,8 @@
 //!
 //!     cargo test --test go_smoke -- --ignored --nocapture
 
+#[path = "support/scratch.rs"]
+mod scratch;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -29,7 +31,7 @@ use roundhouse::expr::{Expr, ExprNode, LValue, Literal};
 use roundhouse::ident::{ClassId, Symbol, VarId};
 use roundhouse::ingest::ingest_app;
 use roundhouse::span::Span;
-use roundhouse::ty::{Param as TyParam, ParamKind, Ty};
+use roundhouse::ty::{FnTy, Param as TyParam, ParamKind, Ty};
 
 const FIXTURE: &str = "fixtures/real-blog";
 
@@ -83,12 +85,12 @@ fn module_singleton_shape() {
             Span::synthetic(),
             ExprNode::Ivar { name: Symbol::from("adapter") },
         ),
-        signature: Some(Ty::Fn {
+        signature: Some(Ty::Fn(Box::new(FnTy {
             params: vec![].into(),
             block: None,
             ret: std::sync::Arc::new(adapter_ty.clone()),
             effects: EffectSet::default(),
-        }),
+        }))),
         effects: EffectSet::default(),
         enclosing_class: Some(Symbol::from("ActiveRecord")),
         kind: AccessorKind::AttributeReader,
@@ -118,7 +120,7 @@ fn module_singleton_shape() {
                 ),
             },
         ),
-        signature: Some(Ty::Fn {
+        signature: Some(Ty::Fn(Box::new(FnTy {
             params: vec![TyParam {
                 name: Symbol::from("value"),
                 ty: adapter_ty.clone().into(),
@@ -127,7 +129,7 @@ fn module_singleton_shape() {
             block: None,
             ret: std::sync::Arc::new(adapter_ty.clone()),
             effects: EffectSet::default(),
-        }),
+        }))),
         effects: EffectSet::default(),
         enclosing_class: Some(Symbol::from("ActiveRecord")),
         kind: AccessorKind::AttributeWriter,
@@ -146,6 +148,7 @@ fn module_singleton_shape() {
         nullable_columns: Vec::new(),
         origin: None,
         constants: Vec::new(),
+        conditional_definitions: Vec::new(),
         unknown_calls: Vec::new(),
         class_ivar_initializers: Vec::new(),
     };
@@ -252,12 +255,12 @@ fn module_singleton_does_not_fire_on_plain_class() {
             Span::synthetic(),
             ExprNode::Ivar { name: Symbol::from("adapter") },
         ),
-        signature: Some(Ty::Fn {
+        signature: Some(Ty::Fn(Box::new(FnTy {
             params: vec![].into(),
             block: None,
             ret: std::sync::Arc::new(attr_ty.clone()),
             effects: EffectSet::default(),
-        }),
+        }))),
         effects: EffectSet::default(),
         enclosing_class: Some(Symbol::from("Configurable")),
         kind: AccessorKind::AttributeReader,
@@ -276,6 +279,7 @@ fn module_singleton_does_not_fire_on_plain_class() {
         nullable_columns: Vec::new(),
         origin: None,
         constants: Vec::new(),
+        conditional_definitions: Vec::new(),
         unknown_calls: Vec::new(),
         class_ivar_initializers: Vec::new(),
     };
@@ -337,7 +341,7 @@ fn raise_panic_peephole() {
         receiver: MethodReceiver::Instance,
         params: vec![DialectParam::positional(Symbol::from("msg"))],
         body: raise_2arg,
-        signature: Some(Ty::Fn {
+        signature: Some(Ty::Fn(Box::new(FnTy {
             params: vec![TyParam {
                 name: Symbol::from("msg"),
                 ty: Ty::Str.into(),
@@ -346,7 +350,7 @@ fn raise_panic_peephole() {
             block: None,
             ret: std::sync::Arc::new(Ty::Nil),
             effects: EffectSet::default(),
-        }),
+        }))),
         effects: EffectSet::default(),
         enclosing_class: Some(Symbol::from("Crasher")),
         kind: AccessorKind::Method,
@@ -378,7 +382,7 @@ fn raise_panic_peephole() {
         receiver: MethodReceiver::Instance,
         params: vec![DialectParam::positional(Symbol::from("msg"))],
         body: raise_1arg,
-        signature: Some(Ty::Fn {
+        signature: Some(Ty::Fn(Box::new(FnTy {
             params: vec![TyParam {
                 name: Symbol::from("msg"),
                 ty: Ty::Str.into(),
@@ -387,7 +391,7 @@ fn raise_panic_peephole() {
             block: None,
             ret: std::sync::Arc::new(Ty::Nil),
             effects: EffectSet::default(),
-        }),
+        }))),
         effects: EffectSet::default(),
         enclosing_class: Some(Symbol::from("Crasher")),
         kind: AccessorKind::Method,
@@ -406,6 +410,7 @@ fn raise_panic_peephole() {
         nullable_columns: Vec::new(),
         origin: None,
         constants: Vec::new(),
+        conditional_definitions: Vec::new(),
         unknown_calls: Vec::new(),
         class_ivar_initializers: Vec::new(),
     };
@@ -476,12 +481,12 @@ fn time_now_utc_iso8601_peephole() {
         receiver: MethodReceiver::Instance,
         params: vec![],
         body: chain,
-        signature: Some(Ty::Fn {
+        signature: Some(Ty::Fn(Box::new(FnTy {
             params: vec![].into(),
             block: None,
             ret: std::sync::Arc::new(Ty::Str),
             effects: EffectSet::default(),
-        }),
+        }))),
         effects: EffectSet::default(),
         enclosing_class: Some(Symbol::from("Clock")),
         kind: AccessorKind::Method,
@@ -500,6 +505,7 @@ fn time_now_utc_iso8601_peephole() {
         nullable_columns: Vec::new(),
         origin: None,
         constants: Vec::new(),
+        conditional_definitions: Vec::new(),
         unknown_calls: Vec::new(),
         class_ivar_initializers: Vec::new(),
     };
@@ -560,7 +566,7 @@ fn include_array_recv_routes_to_slices_contains() {
         receiver: MethodReceiver::Instance,
         params: vec![DialectParam::positional(Symbol::from("cols"))],
         body,
-        signature: Some(Ty::Fn {
+        signature: Some(Ty::Fn(Box::new(FnTy {
             params: vec![TyParam {
                 name: Symbol::from("cols"),
                 ty: Ty::Array { elem: std::sync::Arc::new(Ty::Sym) }.into(),
@@ -569,7 +575,7 @@ fn include_array_recv_routes_to_slices_contains() {
             block: None,
             ret: std::sync::Arc::new(Ty::Bool),
             effects: EffectSet::default(),
-        }),
+        }))),
         effects: EffectSet::default(),
         enclosing_class: Some(Symbol::from("ColCheck")),
         kind: AccessorKind::Method,
@@ -588,6 +594,7 @@ fn include_array_recv_routes_to_slices_contains() {
         nullable_columns: Vec::new(),
         origin: None,
         constants: Vec::new(),
+        conditional_definitions: Vec::new(),
         unknown_calls: Vec::new(),
         class_ivar_initializers: Vec::new(),
     };
@@ -642,7 +649,7 @@ fn negative_index_rewrites_to_len_minus_n() {
         receiver: MethodReceiver::Instance,
         params: vec![DialectParam::positional(Symbol::from("records"))],
         body: neg_one,
-        signature: Some(Ty::Fn {
+        signature: Some(Ty::Fn(Box::new(FnTy {
             params: vec![TyParam {
                 name: Symbol::from("records"),
                 ty: Ty::Array { elem: std::sync::Arc::new(Ty::Str) }.into(),
@@ -651,7 +658,7 @@ fn negative_index_rewrites_to_len_minus_n() {
             block: None,
             ret: std::sync::Arc::new(Ty::Str),
             effects: EffectSet::default(),
-        }),
+        }))),
         effects: EffectSet::default(),
         enclosing_class: Some(Symbol::from("Tailer")),
         kind: AccessorKind::Method,
@@ -670,6 +677,7 @@ fn negative_index_rewrites_to_len_minus_n() {
         nullable_columns: Vec::new(),
         origin: None,
         constants: Vec::new(),
+        conditional_definitions: Vec::new(),
         unknown_calls: Vec::new(),
         class_ivar_initializers: Vec::new(),
     };
@@ -780,12 +788,12 @@ fn class_reflection_rewrites() {
         receiver: MethodReceiver::Instance,
         params: vec![],
         body: class_name_chain,
-        signature: Some(Ty::Fn {
+        signature: Some(Ty::Fn(Box::new(FnTy {
             params: vec![].into(),
             block: None,
             ret: std::sync::Arc::new(Ty::Str),
             effects: EffectSet::default(),
-        }),
+        }))),
         effects: EffectSet::default(),
         enclosing_class: Some(Symbol::from("Reflect")),
         kind: AccessorKind::Method,
@@ -817,12 +825,12 @@ fn class_reflection_rewrites() {
         receiver: MethodReceiver::Class,
         params: vec![],
         body: bare_name,
-        signature: Some(Ty::Fn {
+        signature: Some(Ty::Fn(Box::new(FnTy {
             params: vec![].into(),
             block: None,
             ret: std::sync::Arc::new(Ty::Str),
             effects: EffectSet::default(),
-        }),
+        }))),
         effects: EffectSet::default(),
         enclosing_class: Some(Symbol::from("Reflect")),
         kind: AccessorKind::Method,
@@ -841,6 +849,7 @@ fn class_reflection_rewrites() {
         nullable_columns: Vec::new(),
         origin: None,
         constants: Vec::new(),
+        conditional_definitions: Vec::new(),
         unknown_calls: Vec::new(),
         class_ivar_initializers: Vec::new(),
     };
@@ -907,7 +916,7 @@ fn bare_new_in_class_method_resolves_to_constructor() {
                 parenthesized: true,
             },
         ),
-        signature: Some(Ty::Fn {
+        signature: Some(Ty::Fn(Box::new(FnTy {
             params: vec![TyParam {
                 name: Symbol::from("attrs"),
                 ty: Ty::Untyped.into(),
@@ -916,7 +925,7 @@ fn bare_new_in_class_method_resolves_to_constructor() {
             block: None,
             ret: std::sync::Arc::new(Ty::Class { id: ClassId(Symbol::from("Widget")), args: vec![].into() }),
             effects: EffectSet::default(),
-        }),
+        }))),
         effects: EffectSet::default(),
         enclosing_class: Some(Symbol::from("Widget")),
         kind: AccessorKind::Method,
@@ -935,6 +944,7 @@ fn bare_new_in_class_method_resolves_to_constructor() {
         nullable_columns: Vec::new(),
         origin: None,
         constants: Vec::new(),
+        conditional_definitions: Vec::new(),
         unknown_calls: Vec::new(),
         class_ivar_initializers: Vec::new(),
     };
@@ -980,12 +990,12 @@ fn implicit_self_method_call_resolution() {
             Span::synthetic(),
             ExprNode::Ivar { name: Symbol::from("status") },
         ),
-        signature: Some(Ty::Fn {
+        signature: Some(Ty::Fn(Box::new(FnTy {
             params: vec![].into(),
             block: None,
             ret: std::sync::Arc::new(Ty::Str),
             effects: EffectSet::default(),
-        }),
+        }))),
         effects: EffectSet::default(),
         enclosing_class: Some(Symbol::from("Worker")),
         kind: AccessorKind::AttributeReader,
@@ -1004,12 +1014,12 @@ fn implicit_self_method_call_resolution() {
         receiver: MethodReceiver::Instance,
         params: vec![],
         body: Expr::new(Span::synthetic(), ExprNode::Lit { value: roundhouse::Literal::Nil }),
-        signature: Some(Ty::Fn {
+        signature: Some(Ty::Fn(Box::new(FnTy {
             params: vec![].into(),
             block: None,
             ret: std::sync::Arc::new(Ty::Nil),
             effects: EffectSet::default(),
-        }),
+        }))),
         effects: EffectSet::default(),
         enclosing_class: Some(Symbol::from("Worker")),
         kind: AccessorKind::Method,
@@ -1063,12 +1073,12 @@ fn implicit_self_method_call_resolution() {
             Span::synthetic(),
             ExprNode::Seq { exprs: vec![s_assign, notify_call, s_return] },
         ),
-        signature: Some(Ty::Fn {
+        signature: Some(Ty::Fn(Box::new(FnTy {
             params: vec![].into(),
             block: None,
             ret: std::sync::Arc::new(Ty::Str),
             effects: EffectSet::default(),
-        }),
+        }))),
         effects: EffectSet::default(),
         enclosing_class: Some(Symbol::from("Worker")),
         kind: AccessorKind::Method,
@@ -1087,6 +1097,7 @@ fn implicit_self_method_call_resolution() {
         nullable_columns: Vec::new(),
         origin: None,
         constants: Vec::new(),
+        conditional_definitions: Vec::new(),
         unknown_calls: Vec::new(),
         class_ivar_initializers: Vec::new(),
     };
@@ -1185,6 +1196,7 @@ fn each_array_block_shape() {
         nullable_columns: Vec::new(),
         origin: None,
         constants: Vec::new(),
+        conditional_definitions: Vec::new(),
         unknown_calls: Vec::new(),
         class_ivar_initializers: Vec::new(),
     };
@@ -1273,6 +1285,7 @@ fn each_hash_block_shape() {
         nullable_columns: Vec::new(),
         origin: None,
         constants: Vec::new(),
+        conditional_definitions: Vec::new(),
         unknown_calls: Vec::new(),
         class_ivar_initializers: Vec::new(),
     };
@@ -1358,6 +1371,7 @@ fn map_array_block_shape() {
         nullable_columns: Vec::new(),
         origin: None,
         constants: Vec::new(),
+        conditional_definitions: Vec::new(),
         unknown_calls: Vec::new(),
         class_ivar_initializers: Vec::new(),
     };
@@ -1419,12 +1433,12 @@ fn empty_body_with_nonvoid_return_synthesizes_zero_value() {
         receiver: MethodReceiver::Instance,
         params: vec![],
         body,
-        signature: Some(Ty::Fn {
+        signature: Some(Ty::Fn(Box::new(FnTy {
             params: vec![].into(),
             block: None,
             ret: std::sync::Arc::new(ret),
             effects: EffectSet::default(),
-        }),
+        }))),
         effects: EffectSet::default(),
         enclosing_class: Some(Symbol::from("Stub")),
         kind: AccessorKind::Method,
@@ -1465,6 +1479,7 @@ fn empty_body_with_nonvoid_return_synthesizes_zero_value() {
         nullable_columns: Vec::new(),
         origin: None,
         constants: Vec::new(),
+        conditional_definitions: Vec::new(),
         unknown_calls: Vec::new(),
         class_ivar_initializers: Vec::new(),
     };
@@ -1532,12 +1547,12 @@ fn typed_empty_literals_back_propagate() {
         receiver: MethodReceiver::Instance,
         params: vec![],
         body: typed_array_lit(Ty::Str),
-        signature: Some(Ty::Fn {
+        signature: Some(Ty::Fn(Box::new(FnTy {
             params: vec![].into(),
             block: None,
             ret: std::sync::Arc::new(Ty::Array { elem: std::sync::Arc::new(Ty::Str) }),
             effects: EffectSet::default(),
-        }),
+        }))),
         effects: EffectSet::default(),
         enclosing_class: Some(Symbol::from("Schema")),
         kind: AccessorKind::Method,
@@ -1556,12 +1571,12 @@ fn typed_empty_literals_back_propagate() {
         receiver: MethodReceiver::Instance,
         params: vec![],
         body: typed_hash_lit(Ty::Str, Ty::Str),
-        signature: Some(Ty::Fn {
+        signature: Some(Ty::Fn(Box::new(FnTy {
             params: vec![].into(),
             block: None,
             ret: std::sync::Arc::new(Ty::Hash { key: std::sync::Arc::new(Ty::Str), value: std::sync::Arc::new(Ty::Str) }),
             effects: EffectSet::default(),
-        }),
+        }))),
         effects: EffectSet::default(),
         enclosing_class: Some(Symbol::from("Schema")),
         kind: AccessorKind::Method,
@@ -1581,6 +1596,7 @@ fn typed_empty_literals_back_propagate() {
         nullable_columns: Vec::new(),
         origin: None,
         constants: Vec::new(),
+        conditional_definitions: Vec::new(),
         unknown_calls: Vec::new(),
         class_ivar_initializers: Vec::new(),
     };
@@ -1872,6 +1888,7 @@ fn nil_check_to_comma_ok_rewrites_pair() {
         nullable_columns: Vec::new(),
         origin: None,
         constants: Vec::new(),
+        conditional_definitions: Vec::new(),
         unknown_calls: Vec::new(),
         class_ivar_initializers: Vec::new(),
     };
@@ -1967,6 +1984,7 @@ fn nil_check_to_comma_ok_skips_non_hash_receiver() {
         nullable_columns: Vec::new(),
         origin: None,
         constants: Vec::new(),
+        conditional_definitions: Vec::new(),
         unknown_calls: Vec::new(),
         class_ivar_initializers: Vec::new(),
     };
@@ -1981,10 +1999,7 @@ fn nil_check_to_comma_ok_skips_non_hash_receiver() {
 }
 
 fn emit_to_scratch() -> PathBuf {
-    let scratch = std::env::temp_dir().join("roundhouse-go-smoke");
-    if scratch.exists() {
-        std::fs::remove_dir_all(&scratch).expect("clean scratch");
-    }
+    let scratch = scratch::dir("roundhouse-go-smoke");
     std::fs::create_dir_all(&scratch).expect("mkdir scratch");
 
     let app = ingest_with_analyzer();

@@ -13,7 +13,7 @@ use super::expr::emit_expr;
 use super::shared::escape_ident;
 use super::ty::{crystal_ty, has_untyped};
 use crate::dialect::{MethodDef, MethodReceiver};
-use crate::ty::Ty;
+use crate::ty::{FnTy, Ty};
 
 /// Emit a single `MethodDef` as Crystal source (trailing newline
 /// included). Mirrors `super::super::ruby::emit_method` in surface
@@ -35,7 +35,8 @@ pub fn emit_method(m: &MethodDef) -> String {
 
     let params = render_params(m, annotate);
     let ret_clause = if annotate {
-        if let Some(Ty::Fn { ret, .. }) = m.signature.as_ref() {
+        if let Some(Ty::Fn(fn_ty)) = m.signature.as_ref() {
+            let FnTy { ret, .. } = &**fn_ty;
             // Drop the return-type annotation when the declared
             // return references the enclosing class — these are
             // self-typed methods (RBS `instance` / `self` types,
@@ -82,7 +83,8 @@ pub fn emit_method(m: &MethodDef) -> String {
     // `backprop_return_ty_to_tail` and the runtime_src pre-type stamp
     // — without it, `default_url_options : Hash(Symbol, String)` with
     // body `{}` fails Crystal typecheck (FV compare-extra crystal).
-    let body = if let Some(Ty::Fn { ret, .. }) = m.signature.as_ref() {
+    let body = if let Some(Ty::Fn(fn_ty)) = m.signature.as_ref() {
+        let FnTy { ret, .. } = &**fn_ty;
         let mut body = m.body.clone();
         crate::analyze::stamp_expected_on_empty_return_tail(&mut body, ret);
         body
@@ -125,7 +127,8 @@ pub fn emit_method(m: &MethodDef) -> String {
 }
 
 fn rewrite_ivars_to_class_vars(body: &str) -> String {
-    let mut out = String::with_capacity(body.len());
+    // Not pushed byte by byte into a String: a byte above 0x7f is half a UTF-8 character, not a char
+    let mut out: Vec<u8> = Vec::with_capacity(body.len());
     let bytes = body.as_bytes();
     let mut i = 0;
     // Track whether we're inside a string literal (`"..."`). The
@@ -139,7 +142,7 @@ fn rewrite_ivars_to_class_vars(body: &str) -> String {
     while i < bytes.len() {
         let c = bytes[i];
         if in_string {
-            out.push(c as char);
+            out.push(c);
             i += 1;
             if string_escape {
                 string_escape = false;
@@ -152,7 +155,7 @@ fn rewrite_ivars_to_class_vars(body: &str) -> String {
         }
         if c == b'"' {
             in_string = true;
-            out.push('"');
+            out.push(b'"');
             i += 1;
             continue;
         }
@@ -160,22 +163,22 @@ fn rewrite_ivars_to_class_vars(body: &str) -> String {
             let next = bytes[i + 1];
             // Already `@@` — emit as-is, advance past both.
             if next == b'@' {
-                out.push('@');
-                out.push('@');
+                out.push(b'@');
+                out.push(b'@');
                 i += 2;
                 continue;
             }
             // `@<ident>` — promote to `@@<ident>`.
             if next.is_ascii_alphabetic() || next == b'_' {
-                out.push_str("@@");
+                out.extend_from_slice(b"@@");
                 i += 1;
                 continue;
             }
         }
-        out.push(c as char);
+        out.push(c);
         i += 1;
     }
-    out
+    String::from_utf8(out).expect("the rewrite only adds ASCII to UTF-8 text")
 }
 
 fn render_params(m: &MethodDef, annotate: bool) -> String {
@@ -183,7 +186,8 @@ fn render_params(m: &MethodDef, annotate: bool) -> String {
         return String::new();
     }
     let sig_params = if annotate {
-        if let Some(Ty::Fn { params, .. }) = m.signature.as_ref() {
+        if let Some(Ty::Fn(fn_ty)) = m.signature.as_ref() {
+            let FnTy { params, .. } = &**fn_ty;
             Some(params)
         } else {
             None
@@ -212,9 +216,10 @@ fn render_params(m: &MethodDef, annotate: bool) -> String {
 }
 
 fn sig_has_untyped(sig: &Ty) -> bool {
-    let Ty::Fn { params, ret, .. } = sig else {
+    let Ty::Fn(fn_ty) = sig else {
         return true;
     };
+    let FnTy { params, ret, .. } = &**fn_ty;
     params.iter().any(|p| has_untyped(&p.ty)) || has_untyped(ret)
 }
 
@@ -265,12 +270,12 @@ mod empty_hash_return_tests {
             block_param: None,
             name_span: Span::synthetic(),
             body,
-            signature: Some(Ty::Fn {
+            signature: Some(Ty::Fn(Box::new(FnTy {
                 params: vec![].into(),
                 block: None,
                 ret: Arc::new(ret),
                 effects: Default::default(),
-            }),
+            }))),
             effects: Default::default(),
             enclosing_class: Some(Symbol::from("ActionController::Base")),
             kind: Default::default(),

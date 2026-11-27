@@ -31,11 +31,20 @@ thread_local! {
     /// fail-loud — an app meant to run on its own should not silently
     /// swallow a mixin it could not resolve.
     static FUTAMURA_BOX: Cell<bool> = const { Cell::new(false) };
+    /// True while emitting a CRuby or JRuby tree, whose interpreters run
+    /// a body statement where the source has it (`expr::BODY_STATEMENT`)
+    /// and have singleton classes (`expr::SINGLETON_BODY`). Off for the
+    /// Spinel tree, which keeps those constants on the class and drops
+    /// the statements.
+    static BODY_STATEMENTS: Cell<bool> = const { Cell::new(false) };
     /// Direct, locked unknown-gem namespaces admitted by the Ruby project
     /// emitter. Other targets retain their constant refusal.
     static EXTERNAL_GEM_NAMESPACES: RefCell<std::collections::BTreeSet<String>> = const {
         RefCell::new(std::collections::BTreeSet::new())
     };
+    /// The same namespaces as a hash index with a per-detail memo, so the
+    /// per-constant check is not a scan of every namespace.
+    static EXTERNAL_ROOT_INDEX: RefCell<crate::gems::ExternalRootIndex> = RefCell::new(crate::gems::ExternalRootIndex::default());
     /// `gems::statically_resolved_external_includes` of the app being
     /// emitted, computed once with the namespaces above: it scans every
     /// class, and asked per class it was most of Mastodon's emit.
@@ -47,6 +56,43 @@ thread_local! {
     /// outside a per-file emit, where the literal is written as is.
     static EMITTED_FILE: RefCell<Option<std::path::PathBuf>> =
         const { RefCell::new(None) };
+}
+
+/// The emit settings above as this thread holds them, for a worker that
+/// renders on another thread (`par_render`).
+#[derive(Clone)]
+pub(super) struct Settings {
+    core_class_reopen: bool,
+    futamura_box: bool,
+    body_statements: bool,
+    external_gem_namespaces: std::collections::BTreeSet<String>,
+    external_includes: std::collections::BTreeMap<String, Vec<String>>,
+    emitted_file: Option<std::path::PathBuf>,
+}
+
+impl Settings {
+    pub(super) fn capture() -> Self {
+        Settings {
+            core_class_reopen: IN_CORE_CLASS_REOPEN.with(Cell::get),
+            futamura_box: FUTAMURA_BOX.with(Cell::get),
+            body_statements: BODY_STATEMENTS.with(Cell::get),
+            external_gem_namespaces: EXTERNAL_GEM_NAMESPACES.with(|c| c.borrow().clone()),
+            external_includes: EXTERNAL_INCLUDES.with(|c| c.borrow().clone()),
+            emitted_file: EMITTED_FILE.with(|c| c.borrow().clone()),
+        }
+    }
+
+    /// Hold these settings on this thread, for good: a worker thread ends
+    /// with its work.
+    pub(super) fn install(&self) {
+        IN_CORE_CLASS_REOPEN.with(|c| c.set(self.core_class_reopen));
+        FUTAMURA_BOX.with(|c| c.set(self.futamura_box));
+        BODY_STATEMENTS.with(|c| c.set(self.body_statements));
+        EXTERNAL_GEM_NAMESPACES.with(|c| *c.borrow_mut() = self.external_gem_namespaces.clone());
+        EXTERNAL_ROOT_INDEX.with(|c| *c.borrow_mut() = crate::gems::ExternalRootIndex::new(&self.external_gem_namespaces));
+        EXTERNAL_INCLUDES.with(|c| *c.borrow_mut() = self.external_includes.clone());
+        EMITTED_FILE.with(|c| *c.borrow_mut() = self.emitted_file.clone());
+    }
 }
 
 /// Run `f` while emitting the file that lands at `out_path` (relative
@@ -107,6 +153,18 @@ pub(super) fn in_futamura_box() -> bool {
     FUTAMURA_BOX.with(Cell::get)
 }
 
+/// Run `f` while emitting a CRuby or JRuby tree. See `BODY_STATEMENTS`.
+pub(crate) fn with_body_statements<R>(f: impl FnOnce() -> R) -> R {
+    let prev = BODY_STATEMENTS.with(|c| c.replace(true));
+    let r = f();
+    BODY_STATEMENTS.with(|c| c.set(prev));
+    r
+}
+
+pub(crate) fn carries_body_statements() -> bool {
+    BODY_STATEMENTS.with(Cell::get)
+}
+
 pub(super) fn with_external_gem_namespaces<R>(
     namespaces: &std::collections::BTreeSet<String>,
     includes: std::collections::BTreeMap<String, Vec<String>>,
@@ -114,8 +172,11 @@ pub(super) fn with_external_gem_namespaces<R>(
 ) -> R {
     let previous = EXTERNAL_GEM_NAMESPACES
         .with(|current| std::mem::replace(&mut *current.borrow_mut(), namespaces.clone()));
+    let previous_index = EXTERNAL_ROOT_INDEX
+        .with(|current| current.replace(crate::gems::ExternalRootIndex::new(namespaces)));
     let previous_includes = EXTERNAL_INCLUDES.with(|current| current.replace(includes));
     let result = f();
+    EXTERNAL_ROOT_INDEX.with(|current| current.replace(previous_index));
     EXTERNAL_GEM_NAMESPACES.with(|current| {
         *current.borrow_mut() = previous;
     });
@@ -138,6 +199,28 @@ pub(crate) fn external_gem_namespace_is_enabled(namespace: &str) -> bool {
 pub fn emit_expr(e: &Expr) -> String {
     if is_locked_external_gem_constant(e) {
         return emit_node(&e.node);
+    }
+    // A constant of `X`'s `class << self` lives on its singleton class.
+    if e.decisions & crate::expr::SINGLETON_CONSTANT_REF != 0
+        && carries_body_statements()
+        && let ExprNode::Const { path } = &*e.node
+        && let [owner @ .., name] = &path[..]
+        && !owner.is_empty()
+    {
+        return format!("{}.singleton_class::{}", emit_const_path(owner), name.as_str());
+    }
+    // `self.class::KINDS`, which ingest gave the analysis as `const_get`.
+    if e.decisions & crate::expr::CONST_PATH != 0
+        && let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*e.node
+        && method.as_str() == "const_get"
+        && let [arg] = args.as_slice()
+        && let Some(name) = match &*arg.node {
+            ExprNode::Lit { value: crate::expr::Literal::Sym { value } } => Some(value.as_str().to_string()),
+            ExprNode::Lit { value: crate::expr::Literal::Str { value } } => Some(value.clone()),
+            _ => None,
+        }
+    {
+        return format!("{}::{name}", emit_postfix_recv(r));
     }
     // A site a lowering replaced with a stub — `lower::object_extend`,
     // the arel `ColumnSpec::Named` placeholder — renders as the raise
@@ -175,6 +258,13 @@ pub fn emit_expr(e: &Expr) -> String {
             }
         }
     }
+    if let ExprNode::Send { recv: None, method, args, block: None, .. } = &*e.node
+        && args.is_empty()
+        && e.decisions & crate::expr::WRITTEN_EMPTY_PARENS != 0
+        && method.as_str().chars().next().is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+    {
+        return format!("{method}()");
+    }
     emit_node(&e.node)
 }
 
@@ -188,12 +278,7 @@ fn is_locked_external_gem_constant(expr: &Expr) -> bool {
     if construct.as_str() != "constant" {
         return false;
     }
-    EXTERNAL_GEM_NAMESPACES.with(|namespaces| {
-        namespaces
-            .borrow()
-            .iter()
-            .any(|root| crate::gems::detail_names_external_namespace(detail, root))
-    })
+    EXTERNAL_ROOT_INDEX.with(|index| index.borrow_mut().names_any(detail))
 }
 
 /// A string literal ingested from `+"literal"`. Written back with its
@@ -266,8 +351,10 @@ fn emit_node(n: &ExprNode) -> String {
         ExprNode::BoolOp { op, surface, left, right } => {
             emit_bool_op(*op, *surface, left, right)
         }
+        // The value as an argument would be: `x = (a if c)`, not the
+        // trailing modifier `x = a if c`, which skips the assignment.
         ExprNode::Let { name, value, body, .. } => {
-            format!("{name} = {}\n{}", emit_expr(value), emit_expr(body))
+            format!("{name} = {}\n{}", emit_arg(value), emit_expr(body))
         }
         ExprNode::Lambda { params, rest_param, extra_params, block_param, body, .. } => {
             let mut ps = lambda_params(params, extra_params, rest_param.as_ref());
@@ -305,6 +392,15 @@ fn emit_node(n: &ExprNode) -> String {
             let brace = block.as_ref().is_some_and(|b| {
                 matches!(&*b.node, ExprNode::Lambda { block_style: crate::expr::BlockStyle::Brace, .. })
             });
+            // `self.[](key, &blk)` (Hashie's `method_missing`): the bracket form takes no block, so a call with one is
+            // written as the method call it is.
+            if let (Some(r), Some(b)) = (recv.as_ref(), block.as_ref())
+                && method.as_str() == "[]"
+            {
+                let args_s: Vec<String> = args.iter().map(emit_arg).collect();
+                let base = format!("{}.[]({})", emit_postfix_recv(r), args_s.join(", "));
+                return emit_do_block(&base, b);
+            }
             let base = emit_send_base(recv.as_ref(), method, args, *parenthesized || (brace && !args.is_empty()));
             match block {
                 None => base,
@@ -349,7 +445,7 @@ fn emit_node(n: &ExprNode) -> String {
             }
         }
         ExprNode::Case { scrutinee, arms } => {
-            let mut s = format!("case {}\n", emit_expr(scrutinee));
+            let mut s = format!("case {}\n", emit_arg(scrutinee));
             for arm in arms {
                 s.push_str(&emit_arm(arm));
             }
@@ -361,7 +457,7 @@ fn emit_node(n: &ExprNode) -> String {
         // scrutinee when there's no `else` clause, which is exactly
         // the semantics `else_body: None` means in this IR.
         ExprNode::CaseMatch { scrutinee, arms, else_body } => {
-            let mut s = format!("case {}\n", emit_expr(scrutinee));
+            let mut s = format!("case {}\n", emit_arg(scrutinee));
             for arm in arms {
                 s.push_str(&emit_match_arm(arm));
             }
@@ -565,7 +661,15 @@ fn emit_node(n: &ExprNode) -> String {
             for rc in rescues {
                 s.push_str("rescue");
                 if !rc.classes.is_empty() {
-                    let cs: Vec<String> = rc.classes.iter().map(emit_expr).collect();
+                    // A `raise` standing for a class that is not there (Ruby's NameError when the clause is tested) parses only in parentheses.
+                    let cs: Vec<String> = rc
+                        .classes
+                        .iter()
+                        .map(|c| match &*c.node {
+                            ExprNode::Raise { .. } => format!("({})", emit_expr(c)),
+                            _ => emit_expr(c),
+                        })
+                        .collect();
                     s.push(' ');
                     s.push_str(&cs.join(", "));
                 }
@@ -1047,12 +1151,18 @@ fn is_simple_ident(s: &str) -> bool {
 /// carrying a `do` block also wraps: CRuby parses
 /// `f(g a: 1 do ... end)` but JRuby (through at least 10.1) rejects it,
 /// and `f((g a: 1 do ... end))` parses identically everywhere.
+/// Case subjects and parameter defaults need the same grouping.
 /// Everything else passes through unchanged.
-fn emit_arg(e: &Expr) -> String {
+pub(super) fn emit_arg(e: &Expr) -> String {
     // A multiple assignment is a statement unless parenthesized: `if a, b
     // = pair` does not parse, and as an argument its comma splits it.
     let multi_assign = matches!(&*e.node, ExprNode::MultiAssign { .. });
-    if renders_as_trailing_modifier(e) || renders_as_command_with_block(e) || is_multi_seq(e) || multi_assign {
+    // A `Let` emits as two lines, its binding and its body; as an argument
+    // the parens keep them one value.
+    let binding = matches!(&*e.node, ExprNode::Let { .. });
+    // A `raise` takes every argument after it as its own: `raise raise E.new(m), "x"` raises E with "x".
+    let raise = matches!(&*e.node, ExprNode::Raise { .. });
+    if renders_as_trailing_modifier(e) || renders_as_command_with_block(e) || is_multi_seq(e) || multi_assign || binding || raise {
         format!("({})", emit_expr(e))
     } else {
         emit_expr(e)
@@ -1156,6 +1266,8 @@ fn recv_needs_parens(r: &Expr) -> bool {
     match &*r.node {
         ExprNode::Seq { exprs } if exprs.len() > 1 => true,
         ExprNode::BoolOp { .. } | ExprNode::Range { .. } | ExprNode::RescueModifier { .. } => true,
+        // `raise E.new(m).f` raises `E.new(m).f`: the call would bind inside the raise's argument.
+        ExprNode::Raise { .. } | ExprNode::Return { .. } => true,
         // An assignment as receiver (`(rd = session[:k]).present?`,
         // lobsters login) MUST keep its parens: rendered bare, Ruby
         // re-parses `rd = session[:k].present?` — the local becomes the
@@ -1194,8 +1306,8 @@ fn recv_needs_parens(r: &Expr) -> bool {
 /// hash (`Hash[Symbol, _]`, e.g. a keyword-arg hash like
 /// `StoryRepository#@params`) has a different type and is left alone, as
 /// is any `untyped`/unknown receiver. A request's params value is
-/// String-keyed at run time whatever the key's static type, so it also
-/// matches (`is_indifferent_params`) and its keys are coerced in full.
+/// String-keyed when it holds a Hash, so it also matches. It can also
+/// hold an Array; its index reads coerce only String or Symbol keys.
 ///
 /// This is the type-directed emit hook (the `[]` analog of the shared
 /// `classify_add`/`_sub`/`_cmp` operator dispatch) where a future
@@ -1261,7 +1373,20 @@ fn emit_str_hash_access(recv: &Expr, method: &str, args: &[Expr]) -> Option<Stri
     let recv_s = emit_expr(recv);
     let indifferent = is_indifferent_params(recv);
     match method {
-        "[]" if args.len() == 1 => Some(format!("{recv_s}[{}]", coerce_str_key(&args[0], indifferent))),
+        "[]" if args.len() == 1 => {
+            let key = &args[0];
+            let param_value = matches!(recv.ty.as_ref(), Some(Ty::Class { id, .. })
+                if id.0.as_str() == crate::analyze::PARAM_VALUE);
+            let string_key = matches!(&*key.node,
+                ExprNode::Lit { value: Literal::Str { .. } | Literal::Sym { .. } })
+                || key.ty.as_ref().is_some_and(Ty::is_stringish);
+            let key_s = if param_value && !string_key {
+                format!("Params.nested_key({})", emit_arg(key))
+            } else {
+                coerce_str_key(key, indifferent)
+            };
+            Some(format!("{recv_s}[{key_s}]"))
+        }
         "[]=" if args.len() == 2 => Some(format!(
             "{recv_s}[{}] = {}",
             coerce_str_key(&args[0], indifferent),
@@ -1290,6 +1415,19 @@ pub(super) fn emit_send_base(
 ) -> String {
     let args_s: Vec<String> = args.iter().map(emit_keyword_forward_arg).collect();
     let m = method.as_str();
+    // `...` is a send argument packet, never an index or infix operand.
+    // Preserve explicit call syntax even for operator/setter method names
+    // and `self`, before any surface-syntax prettification below.
+    if args.iter().any(|a| a.decisions & crate::expr::ERASED_KEYWORD_SPLAT != 0 || matches!(&*a.node, ExprNode::ForwardArgs | ExprNode::ForwardKeywords | ExprNode::ForwardKeywordsWithPairs { .. } | ExprNode::KeywordSplat { .. })) {
+        return match recv {
+            Some(r) => {
+                let receiver = emit_expr(r);
+                let receiver = if recv_needs_parens(r) { format!("({receiver})") } else { receiver };
+                format!("{receiver}.{method}({})", args_s.join(", "))
+            }
+            None => format!("{method}({})", args_s.join(", ")),
+        };
+    }
     // A receiverless call, or one the typer folded onto `self`, is the
     // backtick literal. An override of `` ` `` still runs through that
     // syntax. An explicit other receiver stays a normal send.
@@ -1322,19 +1460,6 @@ pub(super) fn emit_send_base(
                 return format!("{}.now.utc", emit_expr(r));
             }
         }
-    }
-    // `...` is a send argument packet, never an index or infix operand.
-    // Preserve explicit call syntax even for operator/setter method names
-    // and `self`, before any surface-syntax prettification below.
-    if args.iter().any(|a| matches!(&*a.node, ExprNode::ForwardArgs | ExprNode::ForwardKeywords | ExprNode::ForwardKeywordsWithPairs { .. } | ExprNode::KeywordSplat { .. })) {
-        return match recv {
-            Some(r) => {
-                let receiver = emit_expr(r);
-                let receiver = if recv_needs_parens(r) { format!("({receiver})") } else { receiver };
-                format!("{receiver}.{method}({})", args_s.join(", "))
-            }
-            None => format!("{method}({})", args_s.join(", ")),
-        };
     }
     // Indexing a statically string-keyed hash (`Hash[String, _]`, e.g.
     // request `params`) with a Ruby symbol/dynamic key: coerce the key to
@@ -1397,7 +1522,9 @@ pub(super) fn emit_send_base(
         // A method whose name is a Ruby keyword (`self.class`, `self.then`)
         // can't drop to the implicit form — bare `class` parses as the
         // keyword. Keep the explicit `self.class` (falls to the Some(r) arm).
+        // Not only the keyword itself: prism reads a bare `and?(x)` as `and`.
         && !is_ruby_keyword(m)
+        && !is_ruby_keyword(m.trim_end_matches(['?', '!']))
         // A ZERO-ARG bare name is the one form Ruby resolves lexically:
         // after `comments = self.comments.x`, a bare `comments` on the
         // RHS is the just-declared (nil) local, not the method. Args or
@@ -1449,7 +1576,9 @@ pub(super) fn emit_send_base(
             // operand needs parens too.
             // A trailing-modifier operand (`(x rescue nil) == true`) would
             // swallow the operator.
+            // Nor an open-ended one (`raise E.new(m) =~ /x/` raises the comparison): it takes the operator in.
             let lhs = if renders_as_trailing_modifier(r)
+                || renders_open_ended(r)
                 || binop_of(r).is_some_and(|o| {
                     binop_prec(o) < prec || (prec == 30 && binop_prec(o) == 30)
                 })
@@ -1458,7 +1587,7 @@ pub(super) fn emit_send_base(
             } else {
                 emit_expr(r)
             };
-            let rhs = if binop_of(&args[0]).is_some_and(|o| binop_prec(o) <= prec) {
+            let rhs = if binop_of(&args[0]).is_some_and(|o| binop_prec(o) <= prec) || renders_open_ended(&args[0]) {
                 format!("({})", args_s[0])
             } else {
                 args_s[0].clone()
@@ -1558,6 +1687,11 @@ fn binop_of(e: &Expr) -> Option<&str> {
         // re-parses as `hrc = (HatRequest.count > 0)`, the local becoming
         // the comparison.
         ExprNode::Assign { .. } | ExprNode::OpAssign { .. } | ExprNode::MultiAssign { .. } => Some("="),
+        // A statement sequence at a value site (`lower::update_kwargs`'
+        // `rec.x = v; rec.save` for `rec.update(x: v) == true`): bare, its
+        // newline ends the operator's line, and the operator applies to
+        // the last statement only.
+        ExprNode::Seq { exprs } if exprs.len() > 1 => Some("="),
         // A range binds looser than every infix operator and `||`/`&&`:
         // `out << (start...limit)` written bare is `(out << start)...limit`,
         // which pushes the Integer (and `ruby -w` flags the range as
@@ -1647,7 +1781,7 @@ fn lambda_params(params: &[Symbol], extra_params: &[crate::dialect::Param], rest
     let mut ps: Vec<String> = params.iter().map(|p| p.to_string()).collect();
     for p in extra_params.iter().filter(|p| !p.keyword) {
         match &p.default {
-            Some(d) => ps.push(format!("{} = {}", p.name, emit_expr(d))),
+            Some(d) => ps.push(format!("{} = {}", p.name, emit_arg(d))),
             None => ps.push(p.name.to_string()),
         }
     }
@@ -1656,7 +1790,7 @@ fn lambda_params(params: &[Symbol], extra_params: &[crate::dialect::Param], rest
     }
     for p in extra_params.iter().filter(|p| p.keyword && !p.rest) {
         match &p.default {
-            Some(d) => ps.push(format!("{}: {}", p.name, emit_expr(d))),
+            Some(d) => ps.push(format!("{}: {}", p.name, emit_arg(d))),
             None => ps.push(format!("{}:", p.name)),
         }
     }
@@ -1679,7 +1813,7 @@ pub(super) fn emit_do_block(base: &str, block: &Expr) -> String {
         // lobsters' `Rails.cache.fetch(key, &block)` forward returned
         // the Proc, poisoning `@comments` to Proc under spinel and
         // silently mis-caching on CRuby. Re-attach as a `&` argument.
-        let fwd = emit_expr(block);
+        let fwd = emit_arg(block);
         return if let Some(stripped) = base.strip_suffix(')') {
             if stripped.ends_with('(') {
                 format!("{stripped}&{fwd})")
@@ -2424,6 +2558,13 @@ mod tests {
         // as the same command.
         let raise = Expr::new(Span::default(), ExprNode::Raise { value: lit_str("missing") });
         assert_eq!(emit_expr(&or_sym(send(None, "found", vec![]), raise)), "found || (raise \"missing\")");
+    }
+
+    #[test]
+    fn synthesized_raise_operand_of_a_binary_operator_is_parenthesized() {
+        // An absent constant read as `Raise` in `RUBY_ENGINE =~ /rbx/` (method_source): bare, `raise` takes `=~` in.
+        let raise = Expr::new(Span::default(), ExprNode::Raise { value: lit_str("missing") });
+        assert_eq!(emit_expr(&send(Some(raise), "=~", vec![lit_str("rbx")])), "(raise \"missing\") =~ \"rbx\"");
     }
 
     #[test]

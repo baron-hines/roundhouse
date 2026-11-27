@@ -12,7 +12,7 @@
 //! `T | Nil` union prefers the nullable shorthand `T?`.
 #![allow(dead_code)]
 
-use crate::ty::Ty;
+use crate::ty::{FnTy, Ty};
 
 pub fn swift_ty(t: &Ty) -> String {
     match t {
@@ -82,7 +82,8 @@ pub fn swift_ty(t: &Ty) -> String {
         Ty::Record { .. } => "[String: Any?]".to_string(),
 
         // Function type → Swift function type `(P1, P2) -> R`.
-        Ty::Fn { params, ret, .. } => {
+        Ty::Fn(fn_ty) => {
+            let FnTy { params, ret, .. } = &**fn_ty;
             let ps: Vec<String> = params.iter().map(|p| swift_ty(&p.ty)).collect();
             format!("({}) -> {}", ps.join(", "), swift_ty(ret))
         }
@@ -103,6 +104,9 @@ fn render_class(full: &str, args: &[Ty]) -> String {
             return "String".to_string();
         }
         "Regexp" => return "NSRegularExpression".to_string(),
+        // Not a type of its own: a raise of a core error is a fatalError, so nothing of that type is ever thrown or held
+        "StandardError" | "RuntimeError" | "Exception" | "ArgumentError" | "TypeError" | "NameError" | "NoMethodError"
+        | "NotImplementedError" | "KeyError" | "IndexError" => return "Error".to_string(),
         // The params union renders as the top type — the Kotlin arc
         // proved the sealed-union shape doesn't survive the runtime's
         // untyped narrowing (`is_a?(Hash)` doesn't match a union wrapper
@@ -151,7 +155,7 @@ fn render_union(variants: &[Ty]) -> String {
         [] => "Void".to_string(),
         [single] if has_nil => {
             let inner = swift_ty(single);
-            if matches!(single, Ty::Fn { .. }) {
+            if matches!(single, Ty::Fn(_)) {
                 format!("({inner})?")
             } else {
                 format!("{inner}?")
@@ -172,7 +176,8 @@ pub fn has_untyped(t: &Ty) -> bool {
         Ty::Tuple { elems } => elems.iter().any(has_untyped),
         Ty::Union { variants } => variants.iter().any(has_untyped),
         Ty::Class { args, .. } => args.iter().any(has_untyped),
-        Ty::Fn { params, ret, .. } => {
+        Ty::Fn(fn_ty) => {
+            let FnTy { params, ret, .. } = &**fn_ty;
             params.iter().any(|p| has_untyped(&p.ty)) || has_untyped(ret)
         }
         _ => false,

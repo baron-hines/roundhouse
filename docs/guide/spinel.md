@@ -110,6 +110,19 @@ Puma retains its own socket lifecycle and `puma.socket` env value. These
 mode bits control pathname-socket connections on Linux; abstract sockets
 are not supported.
 
+Literal `after_booted` and `on_booted` blocks in `config/puma.rb` run after
+the native server starts its accept threads. Registration follows the source
+order, including `if`/`unless` conditions, before any callback runs. Loading
+the emitted libraries or invoking `--help` leaves the callbacks unrun. Ruby
+and JRuby use Puma's boot event.
+
+The native hook adapter requires one process and the threaded server.
+Callbacks must have no parameters or captured config locals, and cannot use
+the Puma DSL's `self` or implicit methods. Unsupported forms and unresolved
+callback calls produce errors. Other targets report that they have no server
+boot event. Source archives and Futamura retain the original Puma config.
+Other Puma lifecycle hooks are still not run, as before.
+
 ```sh
 spin test
 ```
@@ -162,6 +175,60 @@ without it produces a binary whose stylesheets and scripts all 404.
 `tests/ocran_contract.rs` pins the command lines and output OCRAN
 depends on, so a change on this side that would break it fails here
 first.
+
+## PostgreSQL
+
+An app whose `config/database.yml` names `postgresql` (the `test`
+environment's primary, else the first) compiles to a binary that runs on
+PostgreSQL instead of SQLite. Its SQL is written for PostgreSQL, and its
+`runtime/db.rb` runs on [spinel-pg](https://github.com/roundhouse-rb/spinel-pg),
+a PostgreSQL client in plain Ruby, which `spin.toml` lists. The binary
+links no libpq.
+
+```sh
+roundhouse --target spinel -o out/spinel /path/to/your/rails/app
+cd out/spinel
+spin build
+DATABASE_URL=postgres://user:password@localhost:5432/app ./build/bin/<app>
+```
+
+The server opens the database `DATABASE_URL` names, falling back to
+libpq's `PG*` variables (`PGHOST`, `PGUSER`, ...), and at boot creates
+the tables of the app's schema that are missing. `DATABASE_URL`
+takes no query parameters, so no TLS. Each compiled test file runs in a
+PostgreSQL schema of its own, created when it starts and dropped when it
+exits; every connection of the pool takes it as its `search_path`, as
+Rails' `schema_search_path` setting does.
+
+A string or integer array column (`array: true`) is a real PostgreSQL
+array (`text[]`, `integer[]`), so `unnest`, `@>` and a GIN index work on
+it. Its default is the array literal (`'{}'`, `'{0}'`), and model writes,
+`update_all` and `insert_all` write the array input format. A NULL
+element (one raw SQL wrote) reads as `""` or `0`, where Rails gives nil.
+
+A generated column whose expression is PostgreSQL's own SQL (`::numeric`
+casts, `CASE … = ANY (ARRAY[…])`) is carried as written, and a decimal
+column keeps its `numeric(precision,scale)`. A target that runs SQLite
+refuses such a schema instead of dropping the column.
+
+Not carried yet:
+
+- `where(column: [...])` on an array column, which compares element by
+  element (`IN`) where Rails compares the whole array;
+- `db/structure.sql` loaded as written, and the expression indexes the
+  generated DDL can't carry (left out with a warning);
+- serialized first boots: two servers that boot on an empty database at
+  the same time race to create its tables;
+- `lock: true` / `with_lock` row locks (`FOR UPDATE`);
+- quoting for a column named after a PostgreSQL reserved word in
+  inserts and updates (`user` goes out bare and is a syntax error);
+- fixtures advancing the key's sequence, as Rails' `reset_pk_sequence!`
+  does: fixtures insert explicit ids, so a test that then creates a row
+  in the same keyed table gets a duplicate key from the sequence's
+  first values;
+- the archive's README and Playwright suite seeding the PostgreSQL
+  database: they seed `storage/development.sqlite3`, so seed the
+  database `DATABASE_URL` names yourself before an end-to-end run.
 
 ## Deploying
 
@@ -226,7 +293,7 @@ A new deployment with no such volume can drop `boot` for `USER
 600 MB, nearly all of it libvips and ffmpeg (the binary is 11 MB), and
 runs the whole product — sign-in, rooms, uploads, search,
 live updates over the socket — from `docker run -p 3000:3000`.
-[rubys.github.io/roundhouse/campfire/docker.tgz](https://rubys.github.io/roundhouse/campfire/docker.tgz)
+[roundhouse-rb.dev/campfire/docker.tgz](https://roundhouse-rb.dev/campfire/docker.tgz)
 is that archive, refreshed by scheduled full validation or an explicitly
 publishing manual run on canonical main. PR archive checks never publish it;
 see [CI publication](../ci/README.md#publication-is-separate). It is the fastest way to see the door's
@@ -256,7 +323,20 @@ cleanly, and when it does not, the failure is in one of two places:
 The binary's performance is measured continuously on the blog and on
 Campfire against Rails as Rails ships it — with its fragment caching
 on, jemalloc, and Puma's default configuration — on the same machine:
-[rubys.github.io/roundhouse/bench](https://rubys.github.io/roundhouse/bench/).
+[roundhouse-rb.dev/bench](https://roundhouse-rb.dev/bench/).
 Read that page rather than a number quoted here; it changes with
 every Spinel release and the methodology is written beside the
 charts.
+
+### Raw Faye WebSockets
+
+The threaded server carries a bounded `faye-websocket` adapter over Tep: upgrade detection, text `send`,
+`rack_response`, and one callback each for `open`, `message` and `close`. Callbacks obtain a `Db` lease.
+The `ping:` interval is in seconds; zero disables it. Keyword, positional Hash and splat options are accepted. `EventMachine.schedule` runs on the calling thread.
+Subprotocols, additional constructor options, duplicate callbacks, other events and binary/non-UTF-8 sends raise.
+`on` returns nil. Event names accept Symbols or Strings. Nil close arguments use the normal defaults.
+Pre-open text sends are buffered in order, with a 16 MiB total cap; overflow raises. Buffered Strings are copied.
+Fragmented or binary input closes with 1003 before callbacks; invalid UTF-8 text closes with 1007.
+These input restrictions apply only to this facade; existing Tep and Cable behavior remains unchanged.
+Other EventMachine APIs are unavailable. This adapter does not provide reactor scheduling or Faye error events.
+Ruby and JRuby use the real gems. Tep's close-handshake deadline remains five seconds.

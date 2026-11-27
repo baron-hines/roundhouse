@@ -48,7 +48,7 @@ pub fn scope<T>(f: impl FnOnce() -> T) -> (T, Vec<Diagnostic>) {
     // model-body ledger entry was pushed — and printed — once per
     // slice: five identical lines for one `validate` on campfire. One
     // gap, one line; first occurrence keeps its place in the order.
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = crate::det::HashSet::default();
     collected.retain(|d| seen.insert((d.span, d.message.clone(), d.severity as u8)));
     (result, collected)
 }
@@ -193,6 +193,12 @@ pub enum StubStyle {
     TsThrow,
     /// Python expression-position throw via a throwing generator.
     PythonThrow,
+    /// Swift: `fatalError("…")`.
+    SwiftFatal,
+    /// C#: a throw expression, valid as a switch arm and as a statement.
+    CSharpThrow,
+    /// Kotlin: `error("…")`.
+    KotlinError,
 }
 
 impl StubStyle {
@@ -201,9 +207,12 @@ impl StubStyle {
     pub fn for_target(target: &str) -> StubStyle {
         match target {
             "rust" => StubStyle::RustPanic,
-            "go" => StubStyle::GoPanic,
+            "go" | "go2" => StubStyle::GoPanic,
             "typescript" => StubStyle::TsThrow,
             "python" => StubStyle::PythonThrow,
+            "swift" => StubStyle::SwiftFatal,
+            "kotlin" => StubStyle::KotlinError,
+            "csharp" => StubStyle::CSharpThrow,
             // ruby, elixir, crystal, and anything else.
             _ => StubStyle::Raise,
         }
@@ -225,6 +234,9 @@ impl StubStyle {
             StubStyle::PythonThrow => {
                 format!("(_ for _ in ()).throw(TypeError({msg:?}))")
             }
+            StubStyle::SwiftFatal => format!("fatalError({msg:?})"),
+            StubStyle::KotlinError => format!("error({msg:?})"),
+            StubStyle::CSharpThrow => format!("throw new System.NotSupportedException({msg:?})"),
         }
     }
 }

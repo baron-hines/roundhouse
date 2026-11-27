@@ -1,98 +1,11 @@
+#[path = "../support/scratch.rs"]
+mod scratch;
 use std::path::Path;
 
 use roundhouse::project::BuildTarget;
 
 use super::emit_and_run;
-
-const GEM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pundit_gem");
-
-const APPLICATION_POLICY: &str = "class ApplicationPolicy
-  attr_reader :user, :record
-
-  def initialize(user, record)
-    @user = user
-    @record = record
-  end
-
-  def edit?
-    false
-  end
-
-  class Scope
-    def initialize(user, scope)
-      @user = user
-      @scope = scope
-    end
-
-    def resolve
-      raise NoMethodError, \"You must define #resolve in #{self.class}\"
-    end
-
-    private
-
-    attr_reader :user, :scope
-  end
-end
-";
-
-const ARTICLE_POLICY: &str = "class ArticlePolicy < ApplicationPolicy
-  def edit?
-    user == \"admin\" && record.class.exists?(id: record.id)
-  end
-
-  class Scope < ApplicationPolicy::Scope
-    def resolve
-      return scope.none if user == \"nobody\"
-      return scope.all if user == \"admin\"
-      scope.where(title: \"Published\").or(scope.where.not(title: \"Hidden draft\"))
-    end
-  end
-end
-";
-
-fn with_gem(mut overlay: emit_and_run::Overlay, dir: &Path, rel: &str) -> emit_and_run::Overlay {
-    let mut entries: Vec<_> = std::fs::read_dir(dir).expect("read pundit_gem").map(|e| e.unwrap().path()).collect();
-    entries.sort();
-    for path in entries {
-        let name = path.file_name().unwrap().to_str().unwrap();
-        let rel = format!("{rel}/{name}");
-        overlay = if path.is_dir() {
-            with_gem(overlay, &path, &rel)
-        } else {
-            overlay.write(&rel, &std::fs::read_to_string(&path).unwrap())
-        };
-    }
-    overlay
-}
-
-fn app() -> emit_and_run::Overlay {
-    let overlay = emit_and_run::real_blog()
-        .edit(
-            "Gemfile.lock",
-            "    debug (1.11.1)\n",
-            "    pundit (2.5.2)\n      activesupport (>= 3.0.0)\n    debug (1.11.1)\n",
-        )
-        .edit("Gemfile.lock", "DEPENDENCIES\n", "DEPENDENCIES\n  pundit\n")
-        .write(".bundle/config", "---\nBUNDLE_PATH: \"vendor/bundle\"\n")
-        .write("roundhouse.yml", "extensions:\n  - config/roundhouse\n")
-        .write("config/roundhouse/gems.yml", "source_gems:\n  - {gem: \"pundit\"}\n")
-        .edit(
-            "app/controllers/application_controller.rb",
-            "class ApplicationController < ActionController::Base\n",
-            "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n\n\
-             \x20 rescue_from Pundit::NotAuthorizedError do\n    head :forbidden\n  end\n\n\
-             \x20 def current_user\n    params[:user]\n  end\n",
-        )
-        .edit(
-            "app/controllers/articles_controller.rb",
-            "@articles = Article.includes(:comments).order(created_at: :desc)",
-            "@articles = policy_scope(Article).order(created_at: :desc)",
-        )
-        .edit("app/controllers/articles_controller.rb", "  def edit\n  end", "  def edit\n    authorize @article\n  end")
-        .write("app/policies/application_policy.rb", APPLICATION_POLICY)
-        .write("app/policies/article_policy.rb", ARTICLE_POLICY);
-    with_gem(overlay, Path::new(GEM), "vendor/bundle/ruby/3.4.0/gems/pundit-2.5.2")
-}
+use super::pundit_app::app;
 
 #[test]
 fn authorize_and_policy_scope_run_from_the_gem_source() {
@@ -124,9 +37,8 @@ puts "ok"
 }
 
 #[test]
-fn safe_constantize_is_a_closed_case_on_ruby_and_refused_elsewhere() {
-    let dir = std::env::temp_dir().join(format!("rh-constantize-targets-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+fn safe_constantize_is_by_name_on_the_interpreters_a_closed_case_on_spinel_and_refused_elsewhere() {
+    let dir = scratch::dir("rh-constantize-targets");
     for (path, text) in [
         (
             "db/schema.rb",
@@ -160,14 +72,23 @@ fn safe_constantize_is_a_closed_case_on_ruby_and_refused_elsewhere() {
             .collect();
         (errors, files.unwrap_or_default())
     };
-    let (errors, files) = emit(BuildTarget::Ruby);
-    assert!(!errors.iter().any(|e| e.contains("safe_constantize")), "ruby refused the call:\n{}", errors.join("\n"));
-    let text = |file: &str| files.iter().find(|(path, _)| path.ends_with(file)).map(|(_, text)| text.clone()).unwrap_or_default();
-    let finder = text("finder.rb");
-    assert!(finder.contains("RoundhouseConstants.safe_constantize("), "ruby did not route the call to the lookup:\n{finder}");
-    let lookup = text("roundhouse_constants.rb");
-    assert!(lookup.contains("when \"PostPolicy\""), "ruby did not emit the closed case:\n{lookup}");
-    for target in [BuildTarget::Spinel, BuildTarget::Typescript, BuildTarget::Rust, BuildTarget::Python] {
+    for target in [BuildTarget::Ruby, BuildTarget::Jruby, BuildTarget::Spinel] {
+        let (errors, files) = emit(target);
+        assert!(!errors.iter().any(|e| e.contains("safe_constantize")), "{target:?} refused the call:\n{}", errors.join("\n"));
+        let text = |file: &str| files.iter().find(|(path, _)| path.ends_with(file)).map(|(_, text)| text.clone()).unwrap_or_default();
+        let finder = text("finder.rb");
+        assert!(finder.contains("RoundhouseConstants.safe_constantize("), "{target:?} did not route the call to the lookup:\n{finder}");
+        let lookup = text("roundhouse_constants.rb");
+        // The interpreters resolve the name themselves, as Active Support does (autoload): an
+        // arm naming the constant would make the lookup require every app file at load.
+        let expected = if target != BuildTarget::Spinel {
+            lookup.contains("::Object.const_get(name.delete_prefix(\"::\"))") && !lookup.contains("require_relative \"post_policy\"")
+        } else {
+            lookup.contains("when \"PostPolicy\"")
+        };
+        assert!(expected, "{target:?} did not emit the expected lookup:\n{lookup}");
+    }
+    for target in [BuildTarget::Typescript, BuildTarget::Rust, BuildTarget::Python] {
         let (errors, _) = emit(target);
         assert!(
             errors.iter().any(|e| e.contains("safe_constantize")),

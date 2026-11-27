@@ -31,6 +31,10 @@ module ActiveSupport
       @seconds = seconds
     end
 
+    def self.time_operand(value)
+      value.is_a?(Duration) ? value.seconds : value
+    end
+
     def self.seconds(n)
       new(n)
     end
@@ -150,6 +154,10 @@ module ActiveSupport
     end
 
     def seconds
+      @seconds
+    end
+
+    def value
       @seconds
     end
 

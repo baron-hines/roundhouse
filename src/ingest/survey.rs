@@ -53,6 +53,32 @@ pub(super) fn without_recording<T>(f: impl FnOnce() -> T) -> T {
     result
 }
 
+/// Run `f` as survey mode would, then put back the caller's mode and what it had recorded.
+pub(super) fn surveying<T>(f: impl FnOnce() -> T) -> T {
+    let saved = SURVEY_STATE.with(|s| s.borrow_mut().replace(Vec::new()));
+    let result = f();
+    SURVEY_STATE.with(|s| *s.borrow_mut() = saved);
+    result
+}
+
+/// How many errors are recorded so far, for `rewind`.
+pub(super) fn mark() -> Option<usize> {
+    SURVEY_STATE.with(|s| s.borrow().as_ref().map(Vec::len))
+}
+
+/// The first error recorded since `mark`, as its message.
+pub(super) fn first_since(mark: Option<usize>) -> Option<String> {
+    let length = mark?;
+    SURVEY_STATE.with(|s| s.borrow().as_ref().and_then(|buf| buf.get(length).map(|e| e.to_string())))
+}
+
+/// Forget what was recorded since `mark`: an ingest pass that is run again.
+pub(super) fn rewind(mark: Option<usize>) {
+    if let Some(length) = mark {
+        SURVEY_STATE.with(|s| s.borrow_mut().as_mut().map(|buf| buf.truncate(length)));
+    }
+}
+
 /// Record `err` when survey mode is active and continue. Strict mode
 /// returns it, so a ledgered gap never becomes a silent success and
 /// never claims the construct is supported.
@@ -78,6 +104,17 @@ pub fn record(err: &IngestError) {
                 file: err_file(err).to_string(),
                 message: err_message(err).to_string(),
             });
+        }
+    });
+}
+
+/// Withdraw the last recorded error equal to `err`: a gap a later pass found answered.
+pub(super) fn forget(err: &IngestError) {
+    SURVEY_STATE.with(|s| {
+        if let Some(buf) = s.borrow_mut().as_mut()
+            && let Some(at) = buf.iter().rposition(|e| err_file(e) == err_file(err) && err_message(e) == err_message(err))
+        {
+            buf.remove(at);
         }
     });
 }

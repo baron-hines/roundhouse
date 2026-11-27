@@ -1,0 +1,135 @@
+#!/usr/bin/env ruby
+# scripts/lobsters-http-align-ids REF_DIR CAND_DIR — make two replays of the
+# same steps comparable when they created records.
+#
+# A replay that POSTs a comment, a story or a message gets a new random
+# short id from each server, and that id shows up in the redirect, in the
+# dump names of later steps ({last_comment}) and in the pages. Both replays
+# record their steps in the same order, so the steps are paired by position.
+# Where a paired Location or dump name differs only in id-shaped tokens
+# (lobsters' short ids, six lowercase letters and digits), the candidate's
+# id is mapped to the reference's; so is an id-shaped token a paired page
+# has where the other has another, after the same preceding token, when it
+# sits in a record's URL (/s/, /c/, /messages/ …) or a prefixed element id. The
+# candidate's dump names, its _status.json / _location.json and its bodies
+# are then rewritten with the reference's ids, so lobsters-content-diff
+# compares what the pages say rather than which random ids they got.
+#
+# Rewrites CAND_DIR in place (lobsters-http-compare's own output). Prints the
+# mapping it applied.
+
+require "json"
+
+ref_dir, cand_dir = ARGV
+abort "usage: lobsters-http-align-ids REF_DIR CAND_DIR" unless ref_dir && cand_dir
+
+ID = /\A[a-z0-9]{6}\z/
+PREFIXED_ID = /\A(.*[_-])[a-z0-9]{6}\z/
+
+def load(dir, name)
+  path = File.join(dir, name)
+  File.exist?(path) ? JSON.parse(File.read(path)) : {}
+end
+
+ref_status = load(ref_dir, "_status.json")
+cand_status = load(cand_dir, "_status.json")
+ref_loc = load(ref_dir, "_location.json")
+cand_loc = load(cand_dir, "_location.json")
+
+map = {}
+conflicts = []
+record = lambda do |a, b|
+  if map.key?(b) && map[b] != a
+    conflicts << b
+  else
+    map[b] = a
+  end
+end
+
+# The id inside a differing token pair, or nil. Not the whole token for
+# `delete_n8bfwq`: the id is the suffix after a prefix both share.
+id_pair = lambda do |a, b|
+  return [a, b] if a.match?(ID) && b.match?(ID)
+  prefix = a[PREFIXED_ID, 1]
+  return nil unless prefix && b.length == a.length && b.start_with?(prefix) && b.match?(PREFIXED_ID)
+  [a[prefix.length..], b[prefix.length..]]
+end
+
+tokens = ->(s) { s.split(/[^A-Za-z0-9_-]+/) }
+
+learn_exact = lambda do |r, c|
+  return if r.nil? || c.nil? || r == c
+  rt = tokens.(r)
+  ct = tokens.(c)
+  return unless rt.length == ct.length
+  pairs = rt.zip(ct).reject { |a, b| a == b }.map { |a, b| id_pair.(a, b) }
+  # Not a pair whose other tokens differ too: those are two different pages, not one page under two ids.
+  return if pairs.any?(&:nil?)
+  pairs.each { |a, b| record.(a, b) }
+end
+
+# The path segments a record's short id follows in lobsters' URLs.
+ID_CONTEXTS = %w[s c comments messages stories].freeze
+
+learn_body = lambda do |r, c|
+  rt = tokens.(r)
+  ct = tokens.(c)
+  return unless rt.length == ct.length
+  rt.each_index do |i|
+    next if i.zero? || rt[i] == ct[i] || rt[i - 1] != ct[i - 1]
+    # Not only pages that differ in ids alone: a CSRF token or a clock differs too, so an id pair counts when the token before it agrees.
+    # Not any six-letter word after it either (`delete` against `hidden` is a real difference): only a record's URL or a prefixed element id.
+    prefixed = rt[i].match?(PREFIXED_ID) && !rt[i].match?(ID)
+    next unless prefixed || ID_CONTEXTS.include?(rt[i - 1])
+    pair = id_pair.(rt[i], ct[i])
+    record.(*pair) if pair
+  end
+end
+
+pairs = ref_status.keys.zip(cand_status.keys).first([ref_status.size, cand_status.size].min)
+pairs.each { |rk, ck| learn_exact.(ref_loc[rk], cand_loc[ck]) }
+# Dump names carry the ids the redirects taught.
+pairs.each { |rk, ck| learn_exact.(rk, ck) }
+# A page names a record no redirect did (a message lands on the inbox, not on itself).
+pairs.each do |rk, ck|
+  r = File.join(ref_dir, rk)
+  c = File.join(cand_dir, ck)
+  next unless File.file?(r) && File.file?(c)
+  rb = File.binread(r).force_encoding("UTF-8")
+  cb = File.binread(c).force_encoding("UTF-8")
+  next unless rb.valid_encoding? && cb.valid_encoding?
+  learn_body.(rb, cb)
+end
+conflicts.uniq.each { |b| map.delete(b) }
+
+if map.empty?
+  warn "  no ids to align"
+  exit 0
+end
+
+swap = lambda do |s|
+  s.gsub(/(?<![A-Za-z0-9])[a-z0-9]{6}(?![A-Za-z0-9])/) { |t| map.fetch(t, t) }
+end
+
+renamed_status = {}
+renamed_loc = {}
+cand_status.each do |name, st|
+  new_name = swap.(name)
+  if new_name != name && File.exist?(File.join(cand_dir, name))
+    File.rename(File.join(cand_dir, name), File.join(cand_dir, new_name))
+  end
+  renamed_status[new_name] = st
+  renamed_loc[new_name] = swap.(cand_loc[name]) if cand_loc.key?(name)
+end
+File.write(File.join(cand_dir, "_status.json"), JSON.pretty_generate(renamed_status))
+File.write(File.join(cand_dir, "_location.json"), JSON.pretty_generate(renamed_loc))
+
+renamed_status.each_key do |name|
+  path = File.join(cand_dir, name)
+  next unless File.file?(path)
+  body = File.binread(path).force_encoding("UTF-8")
+  next unless body.valid_encoding?
+  File.binwrite(path, swap.(body))
+end
+
+map.each { |b, a| warn "  aligned id #{b} -> #{a}" }

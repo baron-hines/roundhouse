@@ -15,19 +15,39 @@ use crate::ingest::prism_api::PrismLocation;
 enum SourceKind {
     Inputs,
     Mutations,
+    /// A source that runs at boot, before models load and routes are
+    /// drawn (`config/initializers`): it admits no constant input, but a
+    /// constant it writes or mutates no longer has the input's value.
+    Boot,
 }
 
 impl EnumConstants {
     pub(in crate::ingest) fn record(&mut self, source: &[u8], file: &str) {
-        self.collect(source, file, SourceKind::Inputs);
+        self.collect(source, file, SourceKind::Inputs, false);
+    }
+
+    /// `record` for a second table over sources the pipeline already
+    /// parses and diagnoses (the routes' constants): the same inputs,
+    /// without a second set of parse errors.
+    pub(in crate::ingest) fn record_again(&mut self, source: &[u8], file: &str) {
+        self.collect(source, file, SourceKind::Inputs, true);
     }
 
     /// Observe nonlibrary sources without admitting new constant inputs.
     pub(in crate::ingest) fn record_mutations(&mut self, source: &[u8], file: &str) {
-        self.collect(source, file, SourceKind::Mutations);
+        self.collect(source, file, SourceKind::Mutations, true);
     }
 
-    fn collect(&mut self, source: &[u8], file: &str, kind: SourceKind) {
+    /// Observe a source that runs at boot (an initializer) before the
+    /// folds: it admits no input, and a constant it reassigns, mutates,
+    /// or names in `const_set` / `remove_const` is tainted
+    /// ([`super::super::ConstTaint::scan_boot`]). Its own top-level
+    /// `NAME = …` defines a top-level name and taints no other owner's.
+    pub(in crate::ingest) fn record_boot(&mut self, source: &[u8], file: &str) {
+        self.collect(source, file, SourceKind::Boot, true);
+    }
+
+    fn collect(&mut self, source: &[u8], file: &str, kind: SourceKind, silent: bool) {
         struct Collector<'a, 'pr> {
             constants: &'a mut EnumConstants,
             file: &'a str,
@@ -36,7 +56,7 @@ impl EnumConstants {
             parents: Vec<Node<'pr>>,
             /// Offsets of the plain `NAME = …` writes at a file's or a
             /// body's top level, the one write a constant may have.
-            direct_writes: std::collections::HashSet<usize>,
+            direct_writes: crate::det::HashSet<usize>,
         }
         impl Collector<'_, '_> {
             fn scoped(&self, path: String) -> ScopedName {
@@ -227,7 +247,7 @@ impl EnumConstants {
                 // A consumed (non-input) source is read after the models:
                 // its declarations are never recorded, only marked.
                 if let Some(declaration) = super::super::enum_declaration(&call)
-                    && (matches!(self.kind, SourceKind::Mutations)
+                    && (!matches!(self.kind, SourceKind::Inputs)
                         || !matches!(self.parents.as_slice(), [.., Node::ClassNode { .. }, Node::StatementsNode { .. }]))
                 {
                     constants
@@ -242,6 +262,7 @@ impl EnumConstants {
                 // and leaves. Push/pop below is solely the traversal contract.
                 self.record_reference(&node);
                 self.record_singleton(&node);
+                self.constants.record_ancestor_target(&node, &self.parents, &self.nesting);
                 let direct = matches!(self.kind, SourceKind::Inputs)
                     && self.parents.iter().all(|parent| {
                         matches!(
@@ -253,7 +274,14 @@ impl EnumConstants {
                         )
                     });
                 self.constants.record_write(&node, &self.nesting, direct);
-                if direct && node.as_constant_write_node().is_some() {
+                // A boot source's program-level `NAME = …` defines a
+                // top-level constant: not a write to another owner's.
+                let boot_top_level = matches!(self.kind, SourceKind::Boot)
+                    && self.nesting.is_empty()
+                    && self.parents.iter().all(|parent| {
+                        matches!(parent, Node::ProgramNode { .. } | Node::StatementsNode { .. })
+                    });
+                if (direct || boot_top_level || matches!(self.kind, SourceKind::Mutations)) && node.as_constant_write_node().is_some() {
                     self.direct_writes.insert(node.location().start_offset());
                 }
                 // `const_set(:X, …)` / `self.send(:remove_const, :X)` in a
@@ -335,6 +363,20 @@ impl EnumConstants {
                             }
                         })
                         .or_insert(value);
+                    // A top-level `class ActivityPub::CollectionsController`
+                    // runs only where `ActivityPub` already exists, which
+                    // Zeitwerk defines from the directory when no file
+                    // declares it: its enclosing names are namespaces.
+                    // Inside another body the path resolves lexically
+                    // (`module Wrapper; class T::Enum` reopens `::T`), so
+                    // nothing is assumed there.
+                    if qualified && owner.is_empty() {
+                        let mut enclosing = name.as_str();
+                        while let Some((parent, _)) = enclosing.rsplit_once("::") {
+                            self.constants.values.entry(parent.to_string()).or_insert(EnumConstant::Namespace);
+                            enclosing = parent;
+                        }
+                    }
                     // Classes and modules both own lexical constant
                     // lookup — concern `TYPES` inside `included do`
                     // resolves through the module entry the same way a
@@ -399,11 +441,12 @@ impl EnumConstants {
                 self.constants.record_write(&node, &self.nesting, false);
             }
         }
-        let result = match kind {
-            SourceKind::Inputs => prism::parse(source, file),
-            // Already consumed/diagnosed by the real pipeline. Observe the
-            // original facts without adding a second set of parse errors.
-            SourceKind::Mutations => crate::ingest::prism::parse_silent(source),
+        // A source the real pipeline already consumes and diagnoses is
+        // observed without adding a second set of parse errors.
+        let result = if silent {
+            crate::ingest::prism::parse_silent(source)
+        } else {
+            prism::parse(source, file)
         };
         if result.errors().next().is_none() {
             let mut collector = Collector {
@@ -416,11 +459,105 @@ impl EnumConstants {
             };
             ruby_prism::Visit::visit(&mut collector, &result.node());
             let direct_writes = collector.direct_writes;
-            if matches!(kind, SourceKind::Inputs) {
-                let (tainted, reflected) = super::super::ConstTaint::scan_tree(&result.node(), direct_writes);
-                self.foreign_taint.extend(tainted);
-                self.reflected.extend(reflected);
+            match kind {
+                SourceKind::Inputs => {
+                    let (tainted, reflected, snapshot_taint, aliases) = super::super::ConstTaint::scan_tree(&result.node(), direct_writes);
+                    self.foreign_taint.extend(tainted);
+                    self.reflected.extend(reflected);
+                    self.snapshot_taint.extend(snapshot_taint);
+                    self.snapshot_aliases.extend(aliases);
+                }
+                // A boot source calls the app's classes freely (`Gadget.count`):
+                // the scan skips a receiver rooted at a class or module
+                // (`ConstTaint::names_boot_namespace`).
+                SourceKind::Boot => {
+                    let (_, reflected, _, _) = super::super::ConstTaint::scan_tree(&result.node(), direct_writes.clone());
+                    self.snapshot_reflected.extend(reflected);
+                    let namespaces: crate::det::HashSet<String> = self
+                        .values
+                        .iter()
+                        .filter(|(_, value)| matches!(value, EnumConstant::Namespace))
+                        .map(|(name, _)| name.clone())
+                        .collect();
+                    let (tainted, aliases) =
+                        super::super::ConstTaint::scan_boot(&result.node(), direct_writes, namespaces);
+                    self.snapshot_taint.extend(tainted.iter().cloned());
+                    self.snapshot_aliases.extend(aliases.iter().cloned());
+                    self.foreign_taint.extend(tainted);
+                    self.boot_aliases.extend(aliases);
+                }
+                SourceKind::Mutations => {
+                    let (_, reflected, tainted, aliases) = super::super::ConstTaint::scan_tree(&result.node(), direct_writes);
+                    self.snapshot_taint.extend(tainted);
+                    self.snapshot_aliases.extend(aliases);
+                    self.snapshot_reflected.extend(reflected);
+                }
             }
+        }
+    }
+
+    fn record_ancestor_target(&mut self, node: &Node<'_>, parents: &[Node<'_>], nesting: &[String]) {
+        // Each lexical scope's spelling of `path`, innermost first: the one an owner of that name answers is Ruby's.
+        let candidates = |path: &str| -> Vec<String> {
+            if path.starts_with("::") {
+                return vec![path.to_string()];
+            }
+            nesting.iter().rev().map(|n| format!("{n}::{path}")).chain(std::iter::once(path.to_string())).collect()
+        };
+        let owner_here = || vec![format!("::{}", nesting.last().map(String::as_str).unwrap_or("Object"))];
+        if let Some(class) = node.as_class_node() {
+            // `class C < Struct.new(:a)` inherits an anonymous class, whose constants no name can define.
+            if let (Some(own), Some(base)) =
+                (Self::path(&class.constant_path()), class.superclass().and_then(|base| Self::path(&base)))
+            {
+                let own = Self::qualify(nesting.last().map(String::as_str).unwrap_or(""), &own);
+                self.ancestor_edges.push((vec![format!("::{own}")], candidates(&base)));
+            }
+            return;
+        }
+        let Some(call) = node.as_call_node() else { return };
+        let method = constant_id_str(&call.name());
+        // A local receiver is `self.included(base)`'s includer, or a module the owner goes on to include (`m.include X;
+        // include m`): either way the owner's ancestry reaches what it gains.
+        if call.receiver().is_some_and(|r| {
+            r.as_self_node().is_none() && r.as_local_variable_read_node().is_none() && Self::path(&r).is_none()
+        }) {
+            return;
+        }
+        let args: Vec<Node<'_>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        let targets = match method.as_ref() {
+            "include" | "extend" | "prepend" => &args[..],
+            "send" | "public_send" | "__send__"
+                if args.first().and_then(|a| a.as_symbol_node()).is_some_and(|s| {
+                    matches!(&*String::from_utf8_lossy(s.unescaped()), "include" | "extend" | "prepend")
+                }) =>
+            {
+                &args[1..]
+            }
+            _ => return,
+        };
+        let receiver = call.receiver().filter(|r| r.as_local_variable_read_node().is_none()).and_then(|r| Self::path(&r));
+        let named_receiver = receiver.is_some();
+        let owner = match receiver {
+            Some(receiver) => candidates(&receiver),
+            None => owner_here(),
+        };
+        for target in targets.iter().filter(|t| !anonymous_module(t, parents)) {
+            let spellings = match Self::path(target) {
+                Some(path) => candidates(&path),
+                // `Base.include self` gives the module being declared to another owner; `extend self` gives it to itself.
+                None if target.as_self_node().is_some() => {
+                    if !named_receiver {
+                        continue;
+                    }
+                    owner_here()
+                }
+                None => {
+                    self.unknown_ancestors.push(owner.clone());
+                    continue;
+                }
+            };
+            self.ancestor_edges.push((owner.clone(), spellings));
         }
     }
 
@@ -577,4 +714,65 @@ impl EnumConstants {
         path.push_str(constant_id_str(&name));
         Some(path)
     }
+}
+
+/// An `include` argument that is a module no constant names: Rails' route helper modules
+/// (`Rails.application.routes.url_helpers`, built with `Module.new`), or a local the enclosing
+/// statements assign only `Module.new` (ViewComponent's `generated_slot_methods`).
+fn anonymous_module(target: &Node<'_>, parents: &[Node<'_>]) -> bool {
+    fn module_new(node: &Node<'_>) -> bool {
+        node.as_call_node().is_some_and(|call| {
+            constant_id_str(&call.name()) == "new"
+                && call.receiver().and_then(|r| EnumConstants::path(&r)).is_some_and(|r| r == "Module" || r == "::Module")
+        })
+    }
+    if let Some(call) = target.as_call_node() {
+        let method = constant_id_str(&call.name());
+        return matches!(method.as_ref(), "url_helpers" | "mounted_helpers")
+            && call.arguments().is_none()
+            && call.receiver().and_then(|r| r.as_call_node()).is_some_and(|r| constant_id_str(&r.name()) == "routes");
+    }
+    let Some(local) = target.as_local_variable_read_node() else { return false };
+    struct Writes<'n> {
+        name: &'n [u8],
+        found: Vec<bool>,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Writes<'_> {
+        fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
+            if node.name().as_slice() == self.name {
+                self.found.push(module_new(&node.value()));
+            }
+            ruby_prism::visit_local_variable_write_node(self, node);
+        }
+        // Not only `m = …`: a destructuring or compound write may give it any module.
+        fn visit_local_variable_target_node(&mut self, node: &ruby_prism::LocalVariableTargetNode<'pr>) {
+            if node.name().as_slice() == self.name {
+                self.found.push(false);
+            }
+        }
+        fn visit_local_variable_or_write_node(&mut self, node: &ruby_prism::LocalVariableOrWriteNode<'pr>) {
+            if node.name().as_slice() == self.name {
+                self.found.push(false);
+            }
+            ruby_prism::visit_local_variable_or_write_node(self, node);
+        }
+        fn visit_local_variable_and_write_node(&mut self, node: &ruby_prism::LocalVariableAndWriteNode<'pr>) {
+            if node.name().as_slice() == self.name {
+                self.found.push(false);
+            }
+            ruby_prism::visit_local_variable_and_write_node(self, node);
+        }
+        fn visit_local_variable_operator_write_node(&mut self, node: &ruby_prism::LocalVariableOperatorWriteNode<'pr>) {
+            if node.name().as_slice() == self.name {
+                self.found.push(false);
+            }
+            ruby_prism::visit_local_variable_operator_write_node(self, node);
+        }
+    }
+    // The whole enclosing method, not the nearest statements: the write may sit in a branch (`unless …; m = Module.new`).
+    let Some(scope) = parents.iter().rev().find(|p| p.as_def_node().is_some() || p.as_program_node().is_some()) else { return false };
+    let mut writes = Writes { name: local.name().as_slice(), found: Vec::new() };
+    ruby_prism::Visit::visit(&mut writes, scope);
+    let writes = writes.found;
+    !writes.is_empty() && writes.iter().all(|&m| m)
 }

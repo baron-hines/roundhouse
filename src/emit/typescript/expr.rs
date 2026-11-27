@@ -11,7 +11,7 @@
 //! emitters construct `JsModule`s directly — at which point the
 //! `Span`s every node carries become token-level source-map entries.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use super::js_ast::{
     ArrowBody, Js, JsExpr, JsKey, JsObjEntry, JsParam, JsStmt, JsStmtNode, TplPart, TsType,
@@ -41,7 +41,7 @@ use crate::ty::Ty;
 
 std::thread_local! {
     static ASYNC_METHOD_NAMES: std::cell::RefCell<HashSet<Symbol>> =
-        std::cell::RefCell::new(HashSet::new());
+        std::cell::RefCell::new(HashSet::default());
     /// Whether the body currently being emitted belongs to an
     /// `async`-marked method. The Yield emit reads this to decide
     /// between `__block(...)` (sync method body, await would be a
@@ -136,20 +136,32 @@ pub(super) fn body_has_async_send(expr: &Expr) -> bool {
 #[derive(Default, Clone)]
 pub(crate) struct ClassShape {
     parent: Option<String>,
-    methods: HashMap<String, (crate::dialect::AccessorKind, usize)>,
+    methods: HashMap<String, Shape>,
+    /// The class's own (`def self.x`) methods, read for a `self` send
+    /// inside a class method.
+    class_methods: HashMap<String, Shape>,
+}
+
+/// A method's kind, its parameter count, and whether a call with no
+/// arguments reaches it (every parameter optional: a default, a rest, a
+/// forwarding `...`), which is what makes a parenless send a call.
+type Shape = (crate::dialect::AccessorKind, usize, bool);
+
+fn accepts_no_arguments(m: &crate::dialect::MethodDef) -> bool {
+    m.params.iter().all(|p| p.default.is_some() || p.rest || p.forwarding || p.name.as_str().is_empty())
 }
 
 std::thread_local! {
     /// Each class this emit knows: its parent and the constants its body
     /// declares as `static` members (`set_static_constants`).
     static STATIC_CONSTANTS: std::cell::RefCell<HashMap<String, (Option<String>, HashSet<String>)>> =
-        std::cell::RefCell::new(HashMap::new());
+        std::cell::RefCell::new(HashMap::default());
 }
 
 /// Record, for `classes`, each one's parent and the class-body constants
 /// the TypeScript emit declares as `static` members.
 pub(crate) fn set_static_constants<'a>(classes: impl IntoIterator<Item = &'a crate::dialect::LibraryClass>) {
-    let mut map: HashMap<String, (Option<String>, HashSet<String>)> = HashMap::new();
+    let mut map: HashMap<String, (Option<String>, HashSet<String>)> = HashMap::default();
     for c in classes {
         let entry = map.entry(c.name.0.as_str().to_string()).or_default();
         if entry.0.is_none() {
@@ -186,7 +198,7 @@ pub(crate) fn ancestor_declares_static(parent: Option<&str>, name: &str) -> bool
 
 std::thread_local! {
     static NESTED_CLASS_NAMES: std::cell::RefCell<HashSet<String>> =
-        std::cell::RefCell::new(HashSet::new());
+        std::cell::RefCell::new(HashSet::default());
 }
 
 /// The app's nested classes (`Importer::TooBig`), whose `.new` is a
@@ -197,35 +209,39 @@ pub(crate) fn set_nested_class_names(names: impl IntoIterator<Item = String>) {
 
 std::thread_local! {
     static CLASS_SHAPES: std::cell::RefCell<HashMap<String, ClassShape>> =
-        std::cell::RefCell::new(HashMap::new());
+        std::cell::RefCell::new(HashMap::default());
 }
 
-/// Record the instance-method shapes of `classes` for the Send emit.
-/// `fields` is each class's TS field names (`js_library_class`'s
-/// attribute readers and assigned ivars): a method whose emitted name
-/// is one of them is dropped in favour of the field, so it reads as one.
+/// Record the method shapes of `classes` for the Send emit. `fields` is
+/// each class's TS instance field names and `static_fields` its static
+/// ones (`js_library_class`'s attribute readers and assigned ivars, per
+/// side): a method whose emitted name is one of its side's fields is
+/// dropped in favour of the field, so it reads as one.
 pub(crate) fn set_class_shapes<'a>(
-    classes: impl IntoIterator<Item = (&'a crate::dialect::LibraryClass, HashSet<String>)>,
+    classes: impl IntoIterator<Item = (&'a crate::dialect::LibraryClass, HashSet<String>, HashSet<String>)>,
 ) {
     use crate::dialect::AccessorKind;
-    let mut map: HashMap<String, ClassShape> = HashMap::new();
-    for (c, fields) in classes {
+    let as_field = |kind: AccessorKind, fields: &HashSet<String>, name: &str| {
+        if kind == AccessorKind::Method && fields.contains(&super::library::sanitize_identifier(name)) {
+            AccessorKind::AttributeReader
+        } else {
+            kind
+        }
+    };
+    let mut map: HashMap<String, ClassShape> = HashMap::default();
+    for (c, fields, static_fields) in classes {
         let entry = map.entry(c.name.0.as_str().to_string()).or_default();
         if entry.parent.is_none() {
             entry.parent = c.parent.as_ref().map(|p| p.0.as_str().to_string());
         }
         for m in &c.methods {
             if !matches!(m.receiver, crate::dialect::MethodReceiver::Instance) {
+                let kind = as_field(m.kind, &static_fields, m.name.as_str());
+                entry.class_methods.entry(m.name.as_str().to_string()).or_insert((kind, m.params.len(), accepts_no_arguments(m)));
                 continue;
             }
-            let kind = if m.kind == AccessorKind::Method
-                && fields.contains(&super::library::sanitize_identifier(m.name.as_str()))
-            {
-                AccessorKind::AttributeReader
-            } else {
-                m.kind
-            };
-            entry.methods.entry(m.name.as_str().to_string()).or_insert((kind, m.params.len()));
+            let kind = as_field(m.kind, &fields, m.name.as_str());
+            entry.methods.entry(m.name.as_str().to_string()).or_insert((kind, m.params.len(), accepts_no_arguments(m)));
         }
     }
     CLASS_SHAPES.with(|cell| *cell.borrow_mut() = map);
@@ -233,8 +249,49 @@ pub(crate) fn set_class_shapes<'a>(
 
 /// The shape of `method` on an instance of the class `ty` names, found
 /// on the class or its nearest ancestor that declares it.
-fn instance_method_shape(ty: Option<&Ty>, method: &str) -> Option<(crate::dialect::AccessorKind, usize)> {
+fn instance_method_shape(ty: Option<&Ty>, method: &str) -> Option<Shape> {
     let Some(Ty::Class { id, .. }) = strip_nullable(ty) else { return None };
+    method_shape(id.0.as_str(), method, false)
+}
+
+/// The model a singular finder on it answers (`Slot.find(id)`), whose
+/// result this emit casts to it (the self-type narrowing in the Send
+/// emit) where analysis left the call's type open.
+fn narrowed_record_class(recv: &Expr) -> Option<String> {
+    let ExprNode::Send { recv: Some(on), method, .. } = &*recv.node else { return None };
+    let ExprNode::Const { path } = &*on.node else { return None };
+    let stripped = method.as_str().trim_end_matches('!');
+    if !matches!(stripped, "find" | "find_by" | "last" | "create" | "first") {
+        return None;
+    }
+    let class = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+    descends_from_active_record(&class).then_some(class)
+}
+
+/// The shape of the class method `method` of the class `class`, found
+/// on it or its nearest ancestor that declares it.
+fn class_method_shape(class: &str, method: &str) -> Option<Shape> {
+    method_shape(class, method, true)
+}
+
+/// Whether the class `class` reaches `ActiveRecord::Base` through the
+/// parents this emit recorded: a model, whose `find` takes its key.
+fn descends_from_active_record(class: &str) -> bool {
+    CLASS_SHAPES.with(|cell| {
+        let map = cell.borrow();
+        let mut current = Some(class.to_string());
+        for _ in 0..16 {
+            let Some(name) = current else { return false };
+            if name == "ActiveRecord::Base" {
+                return true;
+            }
+            current = map.get(&name).and_then(|shape| shape.parent.clone());
+        }
+        false
+    })
+}
+
+fn method_shape(class: &str, method: &str, class_side: bool) -> Option<Shape> {
     CLASS_SHAPES.with(|cell| {
         let map = cell.borrow();
         let resolve = |name: &str| -> Option<&ClassShape> {
@@ -247,10 +304,11 @@ fn instance_method_shape(ty: Option<&Ty>, method: &str) -> Option<(crate::dialec
                 }
             })
         };
-        let mut current = Some(id.0.as_str().to_string());
+        let mut current = Some(class.to_string());
         for _ in 0..16 {
             let shape = resolve(current.as_deref()?)?;
-            if let Some(found) = shape.methods.get(method) {
+            let methods = if class_side { &shape.class_methods } else { &shape.methods };
+            if let Some(found) = methods.get(method) {
                 return Some(found.clone());
             }
             current = shape.parent.clone();
@@ -261,7 +319,25 @@ fn instance_method_shape(ty: Option<&Ty>, method: &str) -> Option<(crate::dialec
 
 std::thread_local! {
     static CURRENT_METHOD_PARAMS: std::cell::RefCell<HashSet<Symbol>> =
-        std::cell::RefCell::new(HashSet::new());
+        std::cell::RefCell::new(HashSet::default());
+}
+
+std::thread_local! {
+    static SELF_CLASS: std::cell::RefCell<Option<(String, bool)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with `class` as the class whose method body is being
+/// emitted, and `class_side` true for a class method, so a `self` send
+/// in it reads that class's methods of the same side even where `self`
+/// carries no type.
+pub(crate) fn with_self_class<F, R>(class: String, class_side: bool, f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    let prev = SELF_CLASS.with(|cell| std::mem::replace(&mut *cell.borrow_mut(), Some((class, class_side))));
+    let r = f();
+    SELF_CLASS.with(|cell| *cell.borrow_mut() = prev);
+    r
 }
 
 /// Run `f` with `params` as the active enclosing-method parameter
@@ -803,17 +879,51 @@ fn return_stmt(value: Option<Js>) -> JsStmt {
 // Body + statements -----------------------------------------------------
 
 pub(super) fn js_body(body: &Expr, return_ty: &Ty) -> Vec<JsStmt> {
+    in_scope(body, || js_body_in_scope(body, return_ty))
+}
+
+thread_local! {
+    // Not a block's own `let`: a name its method (or an outer block) assigns is that scope's, as Ruby closes over it
+    static SCOPE_LOCALS: std::cell::RefCell<Vec<HashSet<Symbol>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn collect_scope_locals(e: &Expr, out: &mut HashSet<Symbol>) {
+    if let ExprNode::Assign { target: LValue::Var { name, .. }, .. } = &*e.node {
+        out.insert(name.clone());
+    }
+    if !matches!(&*e.node, ExprNode::Lambda { .. }) {
+        e.node.for_each_child(&mut |child| collect_scope_locals(child, out));
+    }
+}
+
+fn in_scope<T>(body: &Expr, f: impl FnOnce() -> T) -> T {
+    let mut own = HashSet::default();
+    collect_scope_locals(body, &mut own);
+    SCOPE_LOCALS.with(|c| c.borrow_mut().push(own));
+    let out = f();
+    SCOPE_LOCALS.with(|c| c.borrow_mut().pop());
+    out
+}
+
+fn is_outer_local(name: &Symbol) -> bool {
+    SCOPE_LOCALS.with(|c| {
+        let stack = c.borrow();
+        stack.len() > 1 && stack[..stack.len() - 1].iter().any(|scope| scope.contains(name))
+    })
+}
+
+fn js_body_in_scope(body: &Expr, return_ty: &Ty) -> Vec<JsStmt> {
     // Pre-walk: find local-var names assigned more than once in this
     // method body. They'll emit as `let` at first occurrence and bare
     // `name = value` thereafter. Names assigned exactly once still
     // emit as `const`. The `declared` set tracks which reassigned names
     // have already had their declaration emitted as we walk in source
     // order.
-    let mut counts: HashMap<Symbol, usize> = HashMap::new();
+    let mut counts: HashMap<Symbol, usize> = HashMap::default();
     count_var_assignments(body, &mut counts);
     let reassigned: HashSet<Symbol> =
         counts.into_iter().filter(|(_, n)| *n > 1).map(|(s, _)| s).collect();
-    let mut declared: HashSet<Symbol> = HashSet::new();
+    let mut declared: HashSet<Symbol> = HashSet::default();
     // Names whose first assignment lives inside a nested block (an
     // `if`/`else` arm, a `case` branch, …) need a hoisted `let`
     // declaration at the function-body level — TS `let` is block-
@@ -830,10 +940,12 @@ pub(super) fn js_body(body: &Expr, return_ty: &Ty) -> Vec<JsStmt> {
     // restrict to vars whose top-level assignment count is strictly
     // less than their total count — i.e., at least one assignment
     // lives in a nested branch.
-    let mut top_level_counts: HashMap<Symbol, usize> = HashMap::new();
+    let mut top_level_counts: HashMap<Symbol, usize> = HashMap::default();
     count_top_level_var_assignments(body, &mut top_level_counts);
     let mut hoisted: Vec<Symbol> = reassigned
         .iter()
+        // Not an enclosing scope's local: a second `let` here would shadow the one a `catch` or `finally` reads
+        .filter(|name| !is_outer_local(name))
         .filter(|name| {
             let total = count_var_for(body, name);
             let top = top_level_counts.get(*name).copied().unwrap_or(0);
@@ -879,7 +991,7 @@ fn count_top_level_var_assignments(body: &Expr, out: &mut HashMap<Symbol, usize>
 
 /// Total count of Var-assignments to `name` in `body` (recursive).
 fn count_var_for(body: &Expr, name: &Symbol) -> usize {
-    let mut all: HashMap<Symbol, usize> = HashMap::new();
+    let mut all: HashMap<Symbol, usize> = HashMap::default();
     count_var_assignments(body, &mut all);
     all.get(name).copied().unwrap_or(0)
 }
@@ -958,14 +1070,14 @@ fn js_body_with_state(
         // the body actually exits the method, `throw e` outside the match
         // arms rethrows cleanly, and no needless `(() => { ... })()` noise.
         ExprNode::BeginRescue { body: inner, rescues, else_branch, ensure, .. } => {
-            vec![js_begin_rescue_stmt(
+            js_begin_rescue_stmt(
                 body.span,
                 inner,
                 rescues,
-                else_branch.as_ref(),
-                ensure.as_ref(),
+                else_branch.as_deref(),
+                ensure.as_deref(),
                 return_ty,
-            )]
+            )
         }
         // Single-Case-as-whole-body (e.g., `process_action`'s synthesized
         // dispatcher): route through the statement walker so it emits as
@@ -1107,6 +1219,39 @@ fn js_begin_rescue_stmt(
     else_branch: Option<&Expr>,
     ensure: Option<&Expr>,
     return_ty: &Ty,
+) -> Vec<JsStmt> {
+    // Not declared inside `try`: `catch` and `finally` read what the body assigned, as Ruby's rescue and ensure do
+    let mut shared = HashSet::default();
+    for part in std::iter::once(body).chain(else_branch).chain(rescues.iter().map(|r| &r.body)) {
+        collect_scope_locals(part, &mut shared);
+    }
+    let mut hoisted: Vec<Symbol> = shared.iter().filter(|n| !is_outer_local(n)).cloned().collect();
+    hoisted.sort();
+    SCOPE_LOCALS.with(|c| c.borrow_mut().push(shared));
+    let try_stmt = js_begin_rescue_try(span, body, rescues, else_branch, ensure, return_ty);
+    SCOPE_LOCALS.with(|c| c.borrow_mut().pop());
+    let mut out: Vec<JsStmt> = hoisted
+        .iter()
+        .map(|name| {
+            JsStmt::synth(JsStmtNode::VarDecl {
+                kind: VarKind::Let,
+                name: escape_reserved_word(name.as_str()),
+                ty: Some(TsType("any".into())),
+                init: None,
+            })
+        })
+        .collect();
+    out.push(try_stmt);
+    out
+}
+
+fn js_begin_rescue_try(
+    span: Span,
+    body: &Expr,
+    rescues: &[RescueClause],
+    else_branch: Option<&Expr>,
+    ensure: Option<&Expr>,
+    return_ty: &Ty,
 ) -> JsStmt {
     let mut try_body = js_body(body, return_ty);
     if let Some(eb) = else_branch {
@@ -1167,7 +1312,7 @@ fn catch_chain(rescues: &[RescueClause], clause_body: &dyn Fn(&RescueClause) -> 
 /// emit `let` (mutable) for names assigned more than once and
 /// `const` for names assigned exactly once.
 pub(super) fn collect_reassigned(body: &Expr) -> HashSet<Symbol> {
-    let mut counts: HashMap<Symbol, usize> = HashMap::new();
+    let mut counts: HashMap<Symbol, usize> = HashMap::default();
     count_var_assignments(body, &mut counts);
     counts.into_iter().filter(|(_, n)| *n > 1).map(|(s, _)| s).collect()
 }
@@ -1255,7 +1400,12 @@ pub(super) fn js_stmts_with_state(
             // → `const`. Subsequent occurrences (only possible for
             // reassigned names) → bare `name = value`.
             let escaped = escape_reserved_word(name.as_str());
-            let node = if reassigned.contains(name) {
+            let node = if is_outer_local(name) {
+                JsStmtNode::Expr(Js::new(
+                    e.span,
+                    JsExpr::Assign { target: Js::ident(e.span, escaped), op: "=", value: js_expr(value) },
+                ))
+            } else if reassigned.contains(name) {
                 if declared.insert(name.clone()) {
                     JsStmtNode::VarDecl {
                         kind: VarKind::Let,
@@ -1785,24 +1935,37 @@ pub(super) fn js_expr(e: &Expr) -> Js {
             // locals (so e.g. an inner capture buffer `body =
             // String.new` followed by `body << X` emits as `let body`
             // not `const body`).
-            let arrow_body = match &*body.node {
+            // Not the arrow's value: an iterator discards it, and the expression form leaves a branch's locals undeclared
+            let void = VOID_BLOCK.with(|c| {
+                let hit = std::ptr::eq(c.get(), e);
+                if hit {
+                    c.set(std::ptr::null());
+                }
+                hit
+            });
+            let arrow_body = in_scope(body, || match &*body.node {
                 ExprNode::Seq { exprs } if exprs.len() > 1 => {
                     let reassigned = collect_reassigned(body);
-                    let mut declared: HashSet<Symbol> = HashSet::new();
+                    let mut declared: HashSet<Symbol> = HashSet::default();
                     let mut stmts = Vec::new();
                     for (i, x) in exprs.iter().enumerate() {
                         stmts.extend(js_stmts_with_state(
                             x,
                             i == exprs.len() - 1,
-                            false,
+                            void,
                             &reassigned,
                             &mut declared,
                         ));
                     }
                     ArrowBody::Block(stmts)
                 }
+                ExprNode::If { .. } | ExprNode::Case { .. } if void => {
+                    let reassigned = collect_reassigned(body);
+                    let mut declared: HashSet<Symbol> = HashSet::default();
+                    ArrowBody::Block(js_stmts_with_state(body, true, true, &reassigned, &mut declared))
+                }
                 _ => ArrowBody::Expr(js_expr(body)),
-            };
+            });
             Js::new(
                 e.span,
                 JsExpr::Arrow { params: js_params, body: arrow_body, is_async: body_async },
@@ -1932,6 +2095,14 @@ pub(super) fn js_expr(e: &Expr) -> Js {
             // statement and expression position.
             iife(e.span, vec![JsStmt::synth(JsStmtNode::Throw(js_expr(value)))])
         }
+        ExprNode::Let { name, value, body, .. } => {
+            let stmts = vec![
+                JsStmt::synth(JsStmtNode::VarDecl { kind: VarKind::Const, name: name.as_str().to_string(), ty: None, init: Some(js_expr(value)) }),
+                return_stmt(Some(js_expr(body))),
+            ];
+            // Not the plain arrow when it awaits: `await` is a syntax error outside an async function
+            if body_has_async_send(e) { async_iife_awaited(e.span, stmts) } else { iife(e.span, stmts) }
+        }
         ExprNode::OpAssign { target, op, value } => {
             // Desugar `target op= value` to the existing-IR shape and
             // recurse. TS has native compound assignment, but the
@@ -1949,6 +2120,11 @@ pub(super) fn js_expr(e: &Expr) -> Js {
             )),
         ),
     }
+}
+
+thread_local! {
+    // Not a flag the next lambda consumes: an argument's own block can be emitted before this one
+    static VOID_BLOCK: std::cell::Cell<*const Expr> = const { std::cell::Cell::new(std::ptr::null()) };
 }
 
 /// Send emission that folds a trailing block (Ruby `do ... end` /
@@ -2032,10 +2208,15 @@ fn js_send_with_block(
     }
     let mut all_args: Vec<Expr> = args.to_vec();
     all_args.push(blk.clone());
+    let void = matches!(method, "each" | "each_with_index" | "reverse_each" | "each_key" | "each_value" | "each_pair" | "each_char" | "times" | "upto" | "downto");
+    let outer = VOID_BLOCK.with(|c| c.replace(if void { all_args.last().map_or(std::ptr::null(), |b| b as *const Expr) } else { std::ptr::null() }));
     // The block is already in `all_args`. Passing it here keeps
     // `function_receiver` from treating `.call` as a direct invocation
     // and dropping the block into a positional argument.
-    js_send(span, recv, method, &all_args, true, Some(blk))
+    let out = js_send(span, recv, method, &all_args, true, Some(blk));
+    // Not left set: a freed block's address can come back as another call's block
+    VOID_BLOCK.with(|c| c.set(outer));
+    out
 }
 
 /// HOF rewrites for blocks containing async sends. Returns
@@ -2272,6 +2453,49 @@ fn js_send_inner(
             return js_expr(r);
         }
     }
+    // `Model.find(@params[k])`, the pre-Rails-8 spelling of `find(params.
+    // expect(:id))`, on a class reaching `ActiveRecord::Base` (another
+    // class's `find`, `Rake::Task.find(name)`, keeps its argument): the
+    // TS finder takes a `number` and the read is a `ParamValue`, so it
+    // is coerced — the TS counterpart of the Rust emitter's
+    // `.as_i64().unwrap()`. Only a nonblank String is converted: `Number`
+    // reads "" (a blank `?id=`, or a missing one) as 0, which would find
+    // row 0, so a blank, absent or non-String id is NaN and finds nothing
+    // (RecordNotFound, as Rails' `find(nil)`/`find("")`). The Ruby family
+    // hands the raw String to its casting finder instead.
+    if method == "find" && args.len() == 1 && block.is_none() {
+        if let (Some(r), ExprNode::Send { recv: Some(pr), method: index, args: index_args, block: None, .. }) =
+            (recv, &*args[0].node)
+        {
+            if matches!(&*r.node, ExprNode::Const { path } if descends_from_active_record(&path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::")))
+                && index.as_str() == "[]"
+                && index_args.len() == 1
+                && matches!(&*pr.node, ExprNode::Ivar { name } if name.as_str() == "params")
+            {
+                // `Number(typeof v === "string" && v.trim() !== "" ? v : NaN)`;
+                // `v` is a property read, so reading it again is the same value.
+                let v = || js_expr(&args[0]);
+                let is_string = Js::binary(span, "===", Js::unary(span, "typeof ", v()), Js::str(span, "string"));
+                let nonblank = Js::binary(span, "!==", Js::method_call(span, v(), "trim", vec![]), Js::str(span, ""));
+                let key = Js::new(
+                    span,
+                    JsExpr::Ternary {
+                        cond: Js::binary(span, "&&", is_string, nonblank),
+                        then: v(),
+                        else_: Js::ident(span, "NaN"),
+                    },
+                );
+                let coerced = Js::call(span, Js::ident(span, "Number"), vec![key]);
+                // The `Base` it returns narrowed to the model, as the
+                // general path below narrows a class-method `find`.
+                let model = super::printer::render_expr(&js_expr(r));
+                return Js::new(
+                    span,
+                    JsExpr::Cast { expr: Js::method_call(span, js_expr(r), "find", vec![coerced]), ty: TsType(model) },
+                );
+            }
+        }
+    }
     // Temporal reader intrinsic: `ActiveSupport.parse_db_time(s)` parses
     // stored ISO-8601 text into a native `Date` (nil-safe: `string | null`
     // → `Date | null`). Maps to the hand-written `RhDateTime.parse`
@@ -2445,14 +2669,11 @@ fn js_send_inner(
             if is_framework_class_recv(r) {
                 return Js::method_call(span, js_expr(r), "get", vec![js_expr(&args[0])]);
             }
-            // Legacy hardcode for `@params[:k]` — @params's ty isn't
-            // always recovered as Class (it can flow as Hash[Sym, Any]
-            // through the analyzer), so the ivar-name shortcut still
-            // pays for itself. Subsumed by the framework-class match
-            // above when the type is recovered.
-            if matches!(&*r.node, ExprNode::Ivar { name } if name.as_str() == "params") {
-                return Js::method_call(span, js_expr(r), "get", vec![js_expr(&args[0])]);
-            }
+            // `@params[k]` is bracket access: the controller's `params`
+            // is a `Record<string, ParamValue>` (action_controller_base),
+            // not a class with a `get`. An ivar-name shortcut that routed
+            // it to `.get` outlived the class it was written for, and made
+            // `Post.find(params[:id])` a tsc error.
         }
     }
     if method == "[]" {
@@ -2508,7 +2729,7 @@ fn js_send_inner(
         let attr = &method[..method.len() - 1];
         // A custom writer (`def foo=(v)`) is a method, `set_foo`, not
         // a field the assignment could land in.
-        if let Some((crate::dialect::AccessorKind::Method, 1)) =
+        if let Some((crate::dialect::AccessorKind::Method, 1, _)) =
             instance_method_shape(recv.unwrap().ty.as_ref(), method)
         {
             return Js::method_call(
@@ -2938,6 +3159,11 @@ fn js_send_inner(
     // nullable wrapper so dispatch fires on the inner type.
     if let Some(r) = recv {
         let recv_ty = strip_nullable(r.ty.as_ref());
+        // Not left out as a Union: an Integer-or-Float count (`count.to_f`) has every number method a Float has
+        let recv_ty = match recv_ty {
+            Some(Ty::Union { variants }) if variants.iter().all(|v| matches!(v, Ty::Int | Ty::Float | Ty::Nil)) && variants.iter().any(|v| matches!(v, Ty::Float)) => Some(&Ty::Float),
+            other => other,
+        };
         match recv_ty {
             // Ruby Array → JS Array (with native method renames where
             // they diverge: `.each` → `.forEach`, `.size` → `.length`).
@@ -4069,12 +4295,21 @@ fn js_send_inner(
                 }
             );
             // A receiver whose class declares the method as a real
-            // `def` (no attribute slot) needs the call.
-            let is_declared_method = !is_const_recv
-                && matches!(
-                    instance_method_shape(r.ty.as_ref(), method),
-                    Some((crate::dialect::AccessorKind::Method, 0))
-                );
+            // `def` (no attribute slot) needs the call. `self` is the
+            // enclosing class's instance, or the class itself in a class
+            // method, whose own methods answer then.
+            let self_class = matches!(&*r.node, ExprNode::SelfRef)
+                .then(|| SELF_CLASS.with(|cell| cell.borrow().clone()))
+                .flatten();
+            let shape = match &self_class {
+                Some((class, true)) => class_method_shape(class, method),
+                Some((class, false)) => instance_method_shape(r.ty.as_ref(), method)
+                    .or_else(|| method_shape(class, method, false)),
+                None => instance_method_shape(r.ty.as_ref(), method)
+                    .or_else(|| narrowed_record_class(r).and_then(|class| method_shape(&class, method, false))),
+            };
+            let is_declared_method =
+                !is_const_recv && matches!(shape, Some((crate::dialect::AccessorKind::Method, _, true)));
             let raw = if args.is_empty()
                 && !parenthesized
                 && !force_parens
@@ -4131,8 +4366,52 @@ fn js_send_inner(
 /// as Const references — without this, `assert_operator(X, :<,
 /// StandardError)` and similar idioms emit a bare `StandardError`
 /// that's neither in scope nor importable.
+std::thread_local! {
+    /// The aliases of `ActiveRecord::Base` and `ActionController::Base`,
+    /// when they are aliased (`set_runtime_base_aliases`).
+    static RUNTIME_BASE_ALIASES: std::cell::RefCell<Option<(String, String)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Alias the runtime's `ActiveRecord::Base` and `ActionController::Base`
+/// in the app files emitted from here on, for an app that defines its
+/// own `Base` (#1228), under names none of `app_classes` takes
+/// (`ActiveRecordBase`, or `ActiveRecordBase2` beside an app class of
+/// that name). `None` turns it off, as while the runtime's own files
+/// emit, where `Base` is the class being defined.
+pub(crate) fn set_runtime_base_aliases(app_classes: Option<&HashSet<String>>) {
+    let free = |want: &str, taken: &HashSet<String>| {
+        let mut name = want.to_string();
+        let mut n = 2;
+        while taken.contains(&name) {
+            name = format!("{want}{n}");
+            n += 1;
+        }
+        name
+    };
+    let aliases = app_classes.map(|taken| (free("ActiveRecordBase", taken), free("ActionControllerBase", taken)));
+    RUNTIME_BASE_ALIASES.with(|cell| *cell.borrow_mut() = aliases);
+}
+
+/// The local name an app file gives the runtime class `qualified`
+/// (`ActiveRecord::Base`) when the app's own `Base` takes the bare name.
+pub(crate) fn runtime_base_alias(qualified: &str) -> Option<String> {
+    RUNTIME_BASE_ALIASES.with(|cell| {
+        let aliases = cell.borrow();
+        let (record, controller) = aliases.as_ref()?;
+        match qualified {
+            "ActiveRecord::Base" => Some(record.clone()),
+            "ActionController::Base" => Some(controller.clone()),
+            _ => None,
+        }
+    })
+}
+
 fn const_name(path: &[Symbol]) -> String {
     let segs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+    if let Some(alias) = runtime_base_alias(&segs.join("::")) {
+        return alias.to_string();
+    }
     const FRAMEWORK_NAMESPACES: &[&str] = &[
         "ActionController",
         "ActiveRecord",
@@ -4482,7 +4761,7 @@ mod async_hof_tests {
     }
 
     fn with_async<F: FnOnce() -> R, R>(names: &[&str], f: F) -> R {
-        let set: std::collections::HashSet<Symbol> =
+        let set: crate::det::HashSet<Symbol> =
             names.iter().map(|s| Symbol::from(*s)).collect();
         with_async_methods(set, f)
     }

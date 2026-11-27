@@ -329,6 +329,10 @@ RULES = [
     why: "\"stop accepting comments in N minutes\" ticks between the two replays" },
   { name: "timestamp-value", kind: :mask,
     why: "title=/datetime= instants differ by the gap between replays — digits are masked, the FORMAT is not" },
+  { name: "totp-secret", kind: :mask,
+    why: "a 2FA enrolment draws a fresh random secret: the otpauth URI's secret= and the QR code drawn from it are masked, the page around them is not" },
+  { name: "mini-profiler", kind: :known,
+    why: "the Spinel tree's rack-mini-profiler package injects its panel tag for a moderator; the CRuby tree loads the gem without its middleware" },
   { name: "asset-prefix", kind: :known,
     why: "emit serves /assets/NAME where Rails serves /stylesheets/ and /javascripts/" },
   { name: "request-scheme", kind: :known,
@@ -342,8 +346,63 @@ RULES = [
 RELATIVE_TIME = /\A\s*(about |almost |over |less than |a |an )?(\d+|a|an) (second|minute|hour|day|week|month|year)s? ago\s*\z/i
 COUNTDOWN     = /\bin -?\d+ (second|minute|hour|day|week|month|year)s?\b/i
 ISO_TIMESTAMP = /\A\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/
+# The same instants inside markup a response carries as text (a comment
+# partial in a JS/Turbo body): `title=\"…\"`, `datetime=\"…\"`,
+# `data-at-unix=\"…\"`.
+EMBEDDED_TIME = /\b(title|datetime)=(\\?")(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}[^"\\]*)/
+EMBEDDED_UNIX = /\bdata-at-unix=(\\?")(\d+)/
 
-def normalize!(toks, counts, fold_known)
+TOTP_SECRET = /secret=[A-Z2-7]+/
+
+# The QR an otpauth link wraps encodes the secret: its modules are folded to one token, and the secret shown beside it masked.
+def fold_totp_qr!(toks, counts)
+  secrets = toks.filter_map { |t| t.kind == :open && t.attrs.assoc("href")&.last.to_s[/\Aotpauth:.*[?&]secret=([A-Z2-7]+)/, 1] }
+  # Not any base32-looking text: only the secret this page's own otpauth link carries, shown for manual entry.
+  toks.each do |t|
+    next unless t.kind == :text && secrets.include?(t.text.to_s.strip)
+    t.text = "«totp»"
+    counts["totp-secret"] += 1
+  end
+  i = 0
+  while i < toks.size
+    t = toks[i]
+    if t.kind == :open && t.name == "a" && t.attrs.assoc("href")&.last.to_s.start_with?("otpauth:")
+      start = (i + 1...toks.size).find { |j| toks[j].kind == :open && toks[j].name == "svg" }
+      if start && toks[i + 1...start].none? { |x| x.kind == :close && x.name == "a" }
+        depth = 0
+        stop = (start...toks.size).find do |j|
+          depth += 1 if toks[j].kind == :open && toks[j].name == "svg"
+          depth -= 1 if toks[j].kind == :close && toks[j].name == "svg"
+          depth.zero?
+        end
+        # Not the whole svg: its own attributes (size, viewBox) still compare, only the modules drawn from the secret are folded.
+        if stop && stop > start + 1
+          toks[(start + 1)...stop] = [Tok.new(:text, nil, nil, "«totp-qr»")]
+          counts["totp-secret"] += 1
+        end
+      end
+    end
+    i += 1
+  end
+end
+
+def mini_profiler_at(toks)
+  toks.index { |t| t.kind == :open && t.name == "script" && t.attrs.assoc("id")&.last == "mini-profiler" }
+end
+
+# The panel's `<script id="mini-profiler">…</script>`, dropped where only one side injected it.
+def fold_mini_profiler!(toks, counts)
+  i = mini_profiler_at(toks)
+  return unless i
+  close = (i + 1...toks.size).find { |j| toks[j].kind == :close && toks[j].name == "script" }
+  return unless close
+  toks.slice!(i..close)
+  counts["mini-profiler"] += 1
+end
+
+def normalize!(toks, counts, fold_known, fold_profiler = false)
+  fold_totp_qr!(toks, counts)
+  fold_mini_profiler!(toks, counts) if fold_known && fold_profiler
   toks.each do |t|
     case t.kind
     when :text
@@ -353,6 +412,11 @@ def normalize!(toks, counts, fold_known)
       elsif t.text =~ COUNTDOWN
         t.text = t.text.gsub(/\bin -?\d+ (second|minute|hour|day|week|month|year)/i, 'in N \1')
         counts["clock-countdown"] += 1
+      end
+      if t.text =~ EMBEDDED_TIME || t.text =~ EMBEDDED_UNIX
+        t.text = t.text.gsub(EMBEDDED_TIME) { "#{$1}=#{$2}#{$3.gsub(/\d/, "#")}" }
+                       .gsub(EMBEDDED_UNIX) { "data-at-unix=#{$1}#{$2.gsub(/\d/, "#")}" }
+        counts["timestamp-value"] += 1
       end
     when :open
       name_attr = t.attrs.assoc("name")&.last
@@ -366,6 +430,14 @@ def normalize!(toks, counts, fold_known)
         when "value"
           if name_attr == "authenticity_token"
             pair[1] = "«csrf»"; counts["csrf-token"] += 1
+          end
+        when "href"
+          if v.start_with?("otpauth:") && v =~ TOTP_SECRET
+            pair[1] = v.gsub(TOTP_SECRET, "secret=«totp»"); counts["totp-secret"] += 1
+          end
+        when "data-at-unix"
+          if v =~ /\A\d+\z/
+            pair[1] = v.gsub(/\d/, "#"); counts["timestamp-value"] += 1
           end
         when "title", "datetime"
           # Digits masked, punctuation kept: a wrong FORMAT (".595725" vs
@@ -509,8 +581,10 @@ results = names.map do |name|
   cand_kind, cand_toks = tokenize(cand)
 
   counts = Hash.new(0)
-  normalize!(ref_toks, counts, !opts[:strict])
-  normalize!(cand_toks, counts, !opts[:strict])
+  # Not when both carry the panel: then its tags are compared like any markup.
+  one_sided_profiler = mini_profiler_at(ref_toks).nil? != mini_profiler_at(cand_toks).nil?
+  normalize!(ref_toks, counts, !opts[:strict], one_sided_profiler)
+  normalize!(cand_toks, counts, !opts[:strict], one_sided_profiler)
   # A rule fires on both sides of an identical pair; report pairs, not sides.
   counts.each_key { |k| counts[k] = (counts[k] / 2.0).ceil }
 

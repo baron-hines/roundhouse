@@ -25,7 +25,7 @@ fn data_define_block_methods_belong_to_the_data_class_natively() {
     let run = contract::DATA_BLOCK_METHODS
         .overlay()
         .write(contract::DATA_BLOCK_METHODS.path, &source)
-        .run_spinel(contract::DATA_BLOCK_METHODS.script);
+        .run_spinel_slim(&[], contract::DATA_BLOCK_METHODS.script);
     run.assert_passes();
     assert_eq!(run.stdout, contract::DATA_BLOCK_METHODS.expected, "stderr:\n{}", run.stderr);
 }
@@ -41,7 +41,7 @@ fn response_helpers_run_as_rails_runs_them_natively() {
 fn dispatched_request_headers_are_visible_to_headers_api_natively() {
     use super::native_http;
 
-    let (tree, errors) = super::emit_and_run::real_blog()
+    let tree = super::emit_and_run::real_blog()
         .edit(
             "config/routes.rb",
             "  root \"articles#index\"\n",
@@ -61,9 +61,7 @@ fn dispatched_request_headers_are_visible_to_headers_api_natively() {
 end
 "#,
         )
-        .emit(roundhouse::project::BuildTarget::Spinel);
-    assert!(errors.is_empty(), "{errors:?}");
-    native_http::build(&tree);
+        .native_http_tree();
     let server = native_http::Server::start(&tree);
     let headers = [
         ("Accept-Encoding", "br, gzip"),
@@ -92,8 +90,9 @@ fn record_snapshots_and_the_bounded_store_run_natively() {
 }
 
 /// The native half of `emit_and_run::view_fragments_go_through_the_
-/// controllers_caching`, over HTTP: the production server caches (Rails'
-/// default), a commit that does not touch `updated_at` is served stale,
+/// controllers_caching`, over HTTP: the development server caches once
+/// `tmp/caching-dev.txt` exists (`rails dev:cache`, which the generated
+/// `development.rb` reads), a commit that does not touch `updated_at` is served stale,
 /// `?nocache=1` (the app's `perform_caching` override) renders fresh, and
 /// moving the app's epoch (its `combined_fragment_cache_key` override)
 /// misses into the new title.
@@ -102,9 +101,9 @@ fn record_snapshots_and_the_bounded_store_run_natively() {
 fn view_fragments_go_through_the_controllers_caching_natively() {
     use super::native_http;
     const FORM: &str = "application/x-www-form-urlencoded";
-    let (tree, errors) = contract::fragments_overlay().emit(roundhouse::project::BuildTarget::Spinel);
-    assert!(errors.is_empty(), "{errors:?}");
-    native_http::build(&tree);
+    let tree = contract::fragments_overlay().native_http_tree();
+    std::fs::create_dir_all(tree.join("tmp")).expect("create tmp/");
+    std::fs::write(tree.join("tmp/caching-dev.txt"), "").expect("write tmp/caching-dev.txt");
     let mut server = native_http::Server::start(&tree);
     server.take_session("/articles/new");
     let created = server.post(
@@ -133,9 +132,7 @@ fn view_fragments_go_through_the_controllers_caching_natively() {
 #[ignore = "requires the Spinel toolchain, run in its CI lane"]
 fn qr_code_capacity_error_is_rescued_by_name_natively() {
     use super::native_http;
-    let (tree, errors) = contract::qr_code_overlay().emit(roundhouse::project::BuildTarget::Spinel);
-    assert!(errors.is_empty(), "{errors:?}");
-    native_http::build(&tree);
+    let tree = contract::qr_code_overlay().native_http_tree();
     let server = native_http::Server::start(&tree);
     let short = server.get("/qr/10");
     assert_eq!(short.status, 200, "{}\n{}", short.body, server.log());

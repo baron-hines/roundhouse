@@ -97,3 +97,62 @@ fn routes_table_lists_routes() {
         "got:\n{content}"
     );
 }
+
+#[test]
+fn save_primary_key_guards_are_folded_before_functionalization() {
+    let mut app = roundhouse::App::default();
+    app.schema = roundhouse::ingest::ingest_schema(
+        b"ActiveRecord::Schema.define do\n  create_table :widgets do |t|\n    t.integer :value\n  end\n  create_table :taggings, id: false do |t|\n    t.integer :tag_id\n  end\nend\n",
+        "db/schema.rb",
+    ).unwrap();
+    for name in ["Widget", "Tagging"] {
+        let source = format!("class {name} < ActiveRecord::Base\nend\n");
+        app.models.push(roundhouse::ingest::ingest_model(
+            source.as_bytes(), &format!("app/models/{}.rb", name.to_lowercase()),
+            &app.schema, &Default::default(),
+        ).unwrap().unwrap());
+    }
+    let files = elixir::emit(&app);
+    for (file, keyed) in [("lib/widget.ex", true), ("lib/tagging.ex", false)] {
+        let source = find(&files, file);
+        let save = source.split("  def save_after_validation(record) do\n").nth(1).expect("save body")
+            .split("\n  def ").next().unwrap();
+        assert!(!save.contains("is_nil(primary_key())"), "{file}: {save}");
+        assert_eq!(save.matches("_adapter_insert(record)").count(), 1, "{file}: {save}");
+        assert_eq!(save.contains("id: inserted_key"), keyed, "{file}: {save}");
+        if !keyed {
+            assert!(!save.contains("inserted_key"), "unused binding: {save}");
+        }
+    }
+}
+
+/// Elixir has no `while`: `while_to_recursion` turns a counter loop into a
+/// recursive helper, and a loop outside its shape is emitted as a `raise`.
+/// The shared runtime's view helpers all take that shape.
+#[test]
+fn view_helper_loops_lower_to_recursion() {
+    let mut app = ingest_app(Path::new("fixtures/real-blog")).expect("ingest");
+    Analyzer::new(&app).analyze(&mut app);
+    let files = elixir::emit(&app);
+    let helpers = find(&files, "lib/view_helpers.ex");
+    assert!(!helpers.contains("While not supported"), "{}", helpers.lines().filter(|l| l.contains("not supported")).collect::<Vec<_>>().join("\n"));
+}
+
+/// `simple_format`'s two loops (#1861) take that shape too, in an app whose
+/// view calls it, so the helpers are emitted.
+#[test]
+fn simple_format_loops_lower_to_recursion() {
+    let mut app = ingest_app(Path::new("fixtures/real-blog")).expect("ingest");
+    let view = roundhouse::ingest::view::ingest_view(
+        "<%= simple_format(@article.title, { class: \"k\" }, sanitize: false) %>\n",
+        Path::new("articles/notes.html.erb"),
+        "app/views/articles/notes.html.erb",
+    )
+    .expect("ingest view");
+    app.views.push(view);
+    Analyzer::new(&app).analyze(&mut app);
+    let files = elixir::emit(&app);
+    let helpers = find(&files, "lib/view_helpers.ex");
+    assert!(helpers.contains("simple_format_paragraphs") && helpers.contains("simple_format_blank"), "simple_format isn't emitted:\n{helpers}");
+    assert!(!helpers.contains("While not supported"), "{}", helpers.lines().filter(|l| l.contains("not supported")).collect::<Vec<_>>().join("\n"));
+}

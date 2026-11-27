@@ -49,11 +49,9 @@ fn boot(preload: bool) -> (u32, Vec<String>, Vec<String>) {
     let overlay = root.join("runtime/spinel/scaffold/ruby_overlay");
     let dir = scratch_dir(if preload { "preload" } else { "per-child" });
     std::fs::copy(overlay.join("falcon.rb"), dir.join("falcon.rb")).unwrap();
-    std::fs::copy(
-        overlay.join("runtime/thruster_cache.rb"),
-        dir.join("runtime/thruster_cache.rb"),
-    )
-    .unwrap();
+    for file in ["runtime/thruster_cache.rb", "runtime/cable_hub.rb"] {
+        std::fs::copy(overlay.join(file), dir.join(file)).unwrap();
+    }
     std::fs::write(dir.join("config.ru"), CONFIG_RU).unwrap();
     let log = dir.join("loads.txt");
     let port = free_port();

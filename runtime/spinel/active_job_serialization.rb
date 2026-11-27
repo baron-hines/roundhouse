@@ -1,4 +1,5 @@
 # frozen_string_literal: true
+require "time"
 # ActiveJob payloads on the Ruby-family lanes: job arguments written in
 # ActiveJob's wire format, and read back when the drain runs the job.
 #
@@ -26,6 +27,16 @@
 # run a payload on, so this is where it belongs anyway — the same split
 # as GlobalID's mint (ruby/) and locator (spinel/).
 module ActiveJob
+  # Rails' `ActiveJob.adapter_name` (activejob queue_adapter.rb):
+  # mission_control-jobs names the adapter through it.
+  def self.adapter_name(adapter)
+    return adapter.queue_adapter_name if adapter.respond_to?(:queue_adapter_name)
+
+    return adapter.name.to_s.split("::").last.to_s.delete_suffix("Adapter") if adapter.is_a?(Module)
+    # Not Rails' `adapter.is_a?(Module) ? adapter : adapter.class`: that untyped-or-Class value makes Spinel send every untyped `.new` (Relation's `@model.new`) to every class, Flash's included.
+    adapter.class.name.to_s.split("::").last.to_s.delete_suffix("Adapter")
+  end
+
   module Arguments
     GLOBALID_KEY = "_aj_globalid"
     SERIALIZER_KEY = "_aj_serialized"
@@ -112,7 +123,65 @@ module ActiveJob
     # An Array argument, or the whole argument list: the element JSON
     # each helper above wrote, joined.
     def self.list(parts)
-      "[" + parts.join(",") + "]"
+      "[" + parts.reject { |part| part == "" }.join(",") + "]"
+    end
+
+    # A job's keyword arguments, as the one Hash ActiveJob writes for
+    # them after the positional ones: each name and its value's JSON,
+    # then `"_aj_ruby2_keywords"` listing the names, which is what tells
+    # Rails' reader to pass them back as keywords. A name of "" is a
+    # keyword the caller left at its default: Rails doesn't write a
+    # keyword the caller omits, so it is left out here. With none left,
+    # the answer is "", which `list` drops: Rails writes no Hash at all
+    # for a call that passes no keywords.
+    def self.keywords(names, values)
+      out = +"{"
+      written = [""]
+      written.clear
+      i = 0
+      while i < names.length
+        name = names[i]
+        if name != ""
+          out << str(name) + ":" + values[i] + ","
+          written << str(name)
+        end
+        i += 1
+      end
+      return "" if written.empty?
+      out << "\"" + RUBY2_KEYWORDS_KEY + "\":[" + written.join(",") + "]}"
+      out
+    end
+
+    # Whether the trailing keyword Hash names `name`. A payload with no
+    # keyword Hash (every optional keyword left at its default) answers
+    # false, so the reader binds the default.
+    def self.keyword_given?(args, name)
+      names = key_of(args[args.length - 1], RUBY2_KEYWORDS_KEY)
+      !names.nil? && names.include?(name)
+    end
+
+    # Not nil for a keyword the Hash lacks: a defaulted one is read only behind `keyword_given?`, and a required one is an error in Rails too.
+    def self.keyword_args(args, name)
+      raise ActiveJob::DeserializationError, deserialize_message("missing keyword " + name) unless keyword_given?(args, name)
+      [args[args.length - 1][name]]
+    end
+
+    # The keyword hash `Turbo::Streams::ActionBroadcastJob` takes, as
+    # turbo-rails 2.0 writes it for a model's `broadcasts_to` (create and
+    # update): `perform_later(stream, action:, target:, targets:,
+    # attributes:, locals:, partial:)`. Keys in that order; `targets` nil
+    # and `attributes` empty, as `broadcast_action_later_to` passes them;
+    # the record as the one local, under its `model_name.element`; and
+    # the `_aj_ruby2_keywords` list, because ActiveJob flags the hash as
+    # keywords. `tests/broadcast_job.rs` holds it to Rails' own payload.
+    def self.turbo_broadcast_options(action, target, partial, local, gid_uri)
+      "{\"action\":{\"" + SERIALIZER_KEY + "\":\"" + SYMBOL_SERIALIZER + "\",\"value\":" + str(action) + "}" +
+        ",\"target\":" + str(target) +
+        ",\"targets\":null" +
+        ",\"attributes\":{\"_aj_symbol_keys\":[]}" +
+        ",\"locals\":{" + str(local) + ":" + record(gid_uri) + ",\"_aj_symbol_keys\":[" + str(local) + "]}" +
+        ",\"partial\":" + str(partial) +
+        ",\"_aj_ruby2_keywords\":[\"action\",\"target\",\"targets\",\"attributes\",\"locals\",\"partial\"]}"
     end
 
     # ---- Read side: one argument out of the parsed array --------------
@@ -192,6 +261,20 @@ module ActiveJob
       out
     end
 
+    # Readers for a keyword-hash argument (the ActionBroadcastJob's
+    # options): a String, the name of a Symbol, and one of its `locals`.
+    def self.option_str_at(args, i, key)
+      key_of(args[i], key).to_s
+    end
+
+    def self.option_sym_name_at(args, i, key)
+      serialized_value(key_of(args[i], key), SYMBOL_SERIALIZER)
+    end
+
+    def self.option_local_at(args, i, name)
+      key_of(key_of(args[i], "locals"), name)
+    end
+
     # `[app, model, id]` from one `{"_aj_globalid": ...}` argument.
     # Anything else (a missing key, another app's gid, a malformed URI)
     # is a DeserializationError, which is what Rails raises when
@@ -231,40 +314,134 @@ module ActiveJob
       nil
     end
 
-    # `YYYY-MM-DDTHH:MM:SS[.fffffffff](Z|+HH:MM|-HH:MM)` -> Time, in UTC.
-    # Hand-written because spinel has no `Time.iso8601` (it compiles and
-    # raises NoMethodError). The instant is exact to the nanosecond: whole
-    # seconds come from `Time.utc`, and nanoseconds go in through
-    # `Time.at(..., :nsec)`, since adding a Rational loses one on spinel.
     # Rails answers the time in the offset it was written with; this one
     # answers the same instant in UTC.
     def self.parse_time(text)
-      raise ActiveJob::DeserializationError, deserialize_message("bad time " + text) if text.length < 20
-      year = text[0, 4].to_i
-      mon = text[5, 2].to_i
-      day = text[8, 2].to_i
-      hour = text[11, 2].to_i
-      min = text[14, 2].to_i
-      sec = text[17, 2].to_i
-      pos = 19
-      nsec = 0
-      if text[pos] == "."
-        pos += 1
-        digits = +""
-        while pos < text.length && text[pos] >= "0" && text[pos] <= "9"
-          digits << text[pos]
-          pos += 1
+      Time.iso8601(text).utc
+    rescue ArgumentError
+      raise ActiveJob::DeserializationError, deserialize_message("bad time " + text)
+    end
+
+    # ---- Whole-argument read: Rails' `Arguments.deserialize` ----------
+
+    TIME_WITH_ZONE_SERIALIZER = "ActiveJob::Serializers::TimeWithZoneSerializer"
+    SYMBOL_KEYS_KEY = "_aj_symbol_keys"
+    RUBY2_KEYWORDS_KEY = "_aj_ruby2_keywords"
+    WITH_INDIFFERENT_ACCESS_KEY = "_aj_hash_with_indifferent_access"
+
+    # Rails' `ActiveJob::Arguments.serialize`, the JSON-ready objects
+    # (solid_queue's recurring task arguments go through it). The same
+    # serializers `deserialize` reads; any other value raises Rails'
+    # SerializationError.
+    def self.serialize(arguments)
+      arguments.map { |argument| serialize_argument(argument) }
+    end
+
+    # Not a flag on the Hash, as Ruby keeps one: no target carries it, so the latest copies are held and known by identity (not `object_id`, which Spinel reuses once one is freed).
+    FLAGGED = []
+
+    def self.ruby2_keywords_hash(hash)
+      copy = hash.dup
+      FLAGGED << copy
+      FLAGGED.shift if FLAGGED.length > 64
+      copy
+    end
+
+    def self.ruby2_keywords_hash?(hash)
+      FLAGGED.any? { |held| held.equal?(hash) }
+    end
+
+    def self.serialize_hash_key(key)
+      unless key.is_a?(String) || key.is_a?(Symbol)
+        raise ActiveJob::SerializationError, "Only string and symbol hash keys may be serialized as job arguments, but " + key.inspect + " is a " + key.class.name.to_s
+      end
+      name = key.to_s
+      if [GLOBALID_KEY, SERIALIZER_KEY, SYMBOL_KEYS_KEY, RUBY2_KEYWORDS_KEY, WITH_INDIFFERENT_ACCESS_KEY].include?(name)
+        raise ActiveJob::SerializationError, "Can't serialize a Hash with reserved key " + key.inspect
+      end
+      name
+    end
+
+    def self.serialize_argument(argument)
+      case argument
+      when nil, true, false, Integer, Float, String
+        argument
+      when Symbol
+        { SERIALIZER_KEY => SYMBOL_SERIALIZER, "value" => argument.to_s }
+      when Time
+        { SERIALIZER_KEY => TIME_SERIALIZER, "value" => argument.iso8601(9) }
+      when Array
+        argument.map { |part| serialize_argument(part) }
+      when Hash
+        symbol_keys = []
+        result = {}
+        argument.each do |key, value|
+          name = serialize_hash_key(key)
+          symbol_keys << name if key.is_a?(Symbol)
+          result[name] = serialize_argument(value)
         end
-        nsec = (digits + "000000000")[0, 9].to_i
+        result[ruby2_keywords_hash?(argument) ? RUBY2_KEYWORDS_KEY : SYMBOL_KEYS_KEY] = symbol_keys
+        result
+      else
+        # Not Date, Duration or an app's own serializer, which Rails writes: `deserialize` reads none of them either.
+        if argument.respond_to?(:to_gid_uri)
+          { GLOBALID_KEY => argument.to_gid_uri }
+        else
+          raise ActiveJob::SerializationError, "Unsupported argument type: " + argument.class.name.to_s
+        end
       end
-      offset = 0
-      zone = text[pos, text.length - pos]
-      if zone != "Z"
-        raise ActiveJob::DeserializationError, deserialize_message("bad time " + text) unless zone.length == 6
-        offset = zone[1, 2].to_i * 3600 + zone[4, 2].to_i * 60
-        offset = -offset if zone[0] == "-"
+    end
+
+    # Not every Rails serializer: Date, DateTime, Duration, BigDecimal, Range, Module and an app's own raise DeserializationError.
+    def self.deserialize(arguments)
+      arguments.map { |argument| deserialize_argument(argument) }
+    rescue ActiveJob::DeserializationError
+      raise
+    rescue StandardError => e
+      raise ActiveJob::DeserializationError, deserialize_message(e.message)
+    end
+
+    def self.deserialize_argument(argument)
+      case argument
+      when nil, true, false, Integer, Float, String
+        argument
+      when Array
+        argument.map { |part| deserialize_argument(part) }
+      when Hash
+        if argument.size == 1 && argument.key?(GLOBALID_KEY)
+          parts = gid_parts(argument)
+          JobRegistry.locate(parts[1], parts[2])
+        elsif argument.key?(SERIALIZER_KEY)
+          deserialize_serialized(argument)
+        else
+          deserialize_hash(argument)
+        end
+      else
+        raise ArgumentError, "Can only deserialize primitive arguments: " + argument.inspect
       end
-      Time.at(Time.utc(year, mon, day, hour, min, sec).to_i - offset, nsec, :nsec).utc
+    end
+
+    def self.deserialize_serialized(hash)
+      name = hash[SERIALIZER_KEY].to_s
+      case name
+      when SYMBOL_SERIALIZER
+        hash["value"].to_s.to_sym
+      when TIME_SERIALIZER, TIME_WITH_ZONE_SERIALIZER
+        parse_time(hash["value"].to_s)
+      else
+        raise ArgumentError, "Serializer " + name + " is not known"
+      end
+    end
+
+    # Not a HashWithIndifferentAccess for `_aj_hash_with_indifferent_access`: the runtime has none, so its keys stay Strings.
+    def self.deserialize_hash(hash)
+      symbol_keys = hash[SYMBOL_KEYS_KEY] || hash[RUBY2_KEYWORDS_KEY]
+      result = {}
+      hash.each do |key, value|
+        next if key == SYMBOL_KEYS_KEY || key == RUBY2_KEYWORDS_KEY || key == WITH_INDIFFERENT_ACCESS_KEY
+        result[symbol_keys && symbol_keys.include?(key) ? key.to_sym : key] = deserialize_argument(value)
+      end
+      hash[RUBY2_KEYWORDS_KEY].nil? ? result : ruby2_keywords_hash(result)
     end
   end
 
@@ -299,6 +476,105 @@ module ActiveJob
         ",\"timezone\":\"UTC\"" +
         ",\"enqueued_at\":" + Arguments.str(Time.now.utc.iso8601(9)) +
         ",\"scheduled_at\":" + scheduled + "}"
+    end
+  end
+end
+
+module ActiveJob
+  # Rails' job object, for the code that handles one rather than a payload
+  # (solid_queue's records, a batch's callbacks): the `serialize` hash's
+  # fields, read back by `deserialize`. The arguments stay the payload's
+  # JSON text, as Rails keeps them serialized until `perform` reads them.
+  class Base
+    attr_accessor :job_id, :queue_name, :priority, :scheduled_at, :enqueued_at, :executions, :arguments_json, :provider_job_id, :successfully_enqueued, :enqueue_error
+
+    def successfully_enqueued?
+      @successfully_enqueued == true
+    end
+
+    # Rails' `set`: where and when this job is to run.
+    def set(options = {})
+      wait = options[:wait]
+      wait_until = options[:wait_until]
+      @scheduled_at = Time.now + wait.to_f unless wait.nil?
+      @scheduled_at = wait_until unless wait_until.nil?
+      queue = options[:queue]
+      @queue_name = queue.to_s unless queue.nil?
+      priority = options[:priority]
+      @priority = priority.to_i unless priority.nil?
+      self
+    end
+
+    # Not solid_queue's `limits_concurrency` key: no job here declares a limit, so none has one.
+    def concurrency_key
+      nil
+    end
+
+    def serialize
+      JSON.parse(Payload.of(self))
+    end
+
+    def deserialize(job_data)
+      @job_id = job_data["job_id"].to_s
+      queue = job_data["queue_name"]
+      @queue_name = queue.nil? ? "default" : queue.to_s
+      priority = job_data["priority"]
+      @priority = priority.nil? ? nil : priority.to_i
+      @executions = job_data["executions"].to_i
+      @provider_job_id = job_data["provider_job_id"]
+      scheduled = job_data["scheduled_at"]
+      @scheduled_at = scheduled.nil? ? nil : Arguments.parse_time(scheduled.to_s)
+      enqueued = job_data["enqueued_at"]
+      @enqueued_at = enqueued.nil? ? nil : Arguments.parse_time(enqueued.to_s)
+      @arguments_json = JSON.generate(job_data["arguments"])
+      deserialize_extras(job_data)
+      self
+    end
+
+    # What an adapter's extension adds to the hash (solid_queue's batch id); none here.
+    def serialize_extras
+      ""
+    end
+
+    def deserialize_extras(job_data)
+      nil
+    end
+
+    def self.deserialize(job_data)
+      name = job_data["job_class"].to_s
+      job = JobRegistry.instantiate(name)
+      raise NameError, "uninitialized constant " + name if job.nil?
+      job.deserialize(job_data)
+    end
+
+    # Not the job's enqueue callbacks: no job's are modeled in this runtime, and `perform_later` runs none either.
+    def run_callbacks(kind)
+      yield
+    end
+  end
+
+  module Payload
+    # `job.serialize` as JSON, from the job's fields, keys in Rails' order.
+    def self.of(job)
+      provider = job.provider_job_id
+      priority = job.priority
+      "{\"job_class\":" + Arguments.str(job.class.name.to_s) +
+        ",\"job_id\":" + Arguments.str(job.job_id.to_s) +
+        ",\"provider_job_id\":" + (provider.nil? ? "null" : JSON.generate(provider)) +
+        ",\"queue_name\":" + Arguments.str(job.queue_name.nil? ? "default" : job.queue_name.to_s) +
+        ",\"priority\":" + (priority.nil? ? "null" : priority.to_s) +
+        ",\"arguments\":" + (job.arguments_json.nil? ? "[]" : job.arguments_json.to_s) +
+        ",\"executions\":" + job.executions.to_i.to_s +
+        ",\"exception_executions\":{}" +
+        ",\"locale\":\"en\"" +
+        ",\"timezone\":\"UTC\"" +
+        ",\"enqueued_at\":" + time_or_null(job.enqueued_at) +
+        ",\"scheduled_at\":" + time_or_null(job.scheduled_at) +
+        job.serialize_extras + "}"
+    end
+
+    def self.time_or_null(time)
+      time.nil? ? "null" : Arguments.str(time.utc.iso8601(9))
     end
   end
 end

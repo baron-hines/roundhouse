@@ -65,8 +65,16 @@ fn emit(extra_model_body: &str) -> String {
 #[test]
 fn singular_association_read_gets_to_param() {
     let out = emit("  def author_link\n    RouteHelpers.user_path(self.user)\n  end\n");
-    assert!(
-        out.contains("RouteHelpers.user_path(self.user.to_param)"),
+    let projection = concat!(
+        "RouteHelpers.user_path((route_segment_0 = self.user\n",
+        "    if route_segment_0.nil?\n",
+        "      nil\n",
+        "    else\n",
+        "      route_segment_0.to_param\n",
+        "    end))",
+    );
+    assert_eq!(
+        out.matches(projection).count(), 1,
         "a belongs_to read whose target overrides to_param is a record:\n{out}",
     );
 }
@@ -111,7 +119,7 @@ fn an_already_written_to_param_is_not_doubled() {
 #[test]
 fn helper_bodies_keep_bare_segments() {
     // The conversion lives at the call site now; the helper interpolates
-    // whatever slug it was handed.
+    // whatever slug it was handed, through escape_segment.
     let files = vec![
         (
             "db/schema.rb",
@@ -141,8 +149,8 @@ fn helper_bodies_keep_bare_segments() {
     let funcs = roundhouse::lower::lower_routes_to_library_functions(&app);
     let bodies: Vec<String> = funcs.iter().map(|f| ruby::emit_expr(&f.body)).collect();
     assert!(
-        bodies.iter().any(|b| b.contains("#{id}")),
-        "helper segments interpolate the param bare: {bodies:?}",
+        bodies.iter().any(|b| b.contains("#{ActionView::ViewHelpers.escape_segment(id.to_s)}")),
+        "helper segments interpolate the param itself, escaped as Rails' escape_segment: {bodies:?}",
     );
     assert!(
         !bodies.iter().any(|b| b.contains("to_param")),

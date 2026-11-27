@@ -14,6 +14,8 @@
 # placeholder bind params — the FFI shim can't construct SQLITE_TRANSIENT
 # for bind_text, so the shared contract is "inline escaped values".
 module SqliteAdapter
+  DML_QUERY = /\A(?:[(\s]|--.*\n|\/\*(?:[^*]|\*[^\/])*\*\/)*(?:insert|update|delete|replace)\b/i
+
   # Quote one schema-validated SQL identifier (not a value); SQLite
   # doubles embedded quotes and accepts this SQL-standard spelling.
   def self.quote_column_name(name)
@@ -126,29 +128,49 @@ module SqliteAdapter
   # shims answer this now, the FFI one by storage-class dispatch. Each
   # row is its own Hash so the caller gets a stable copy after
   # `finalize`.
-  def self.select_rows(sql)
-    stmt = Db.prepare(sql)
-    rows = []
-    ncols = Db.column_count(stmt)
-    # Column names can't change between rows — resolve them once, not
-    # rows×cols times (each column_name is a shim call, and hydrating
-    # a 1000-row result was paying 24,000 of them).
-    names = []
-    i = 0
-    while i < ncols
-      names.push(Db.column_name(stmt, i))
-      i += 1
-    end
-    while Db.step?(stmt)
-      row = {}
+  #
+  # `each_row` yields each row Hash as it is read; `select_rows` collects
+  # them. Hydration (`instantiate`) goes through `each_row`: Spinel can
+  # only type an Array of Hashes as a polymorphic array, so an element
+  # taken from `select_rows` reaches `<Model>Row.from_raw` boxed and
+  # widens its parameter, while a yielded row stays a Hash.
+  #
+  # The statement is finalized in an `ensure`, as the generated readers
+  # do: a block that raises (an `instantiate(row)` that fails) must not
+  # leave it checked out on the connection until the lease ends — or,
+  # outside `Db.with_connection`, until `Db.close`.
+  def self.each_row(sql)
+    # A write keeps its returned rows and invalidates held readers.
+    stmt = sql.match?(DML_QUERY) ? Db.exec_returning(ActiveRecord::Relation.inline_sql(sql)) : Db.prepare(sql)
+    begin
+      ncols = Db.column_count(stmt)
+      # Column names can't change between rows — resolve them once, not
+      # rows×cols times (each column_name is a shim call, and hydrating
+      # a 1000-row result was paying 24,000 of them).
+      names = []
       i = 0
       while i < ncols
-        row[names[i]] = Db.column_value(stmt, i)
+        names.push(Db.column_name(stmt, i))
         i += 1
       end
-      rows << row
+      while Db.step?(stmt)
+        row = {}
+        i = 0
+        while i < ncols
+          row[names[i]] = Db.column_value(stmt, i)
+          i += 1
+        end
+        yield row
+      end
+    ensure
+      Db.finalize(stmt)
     end
-    Db.finalize(stmt)
+    nil
+  end
+
+  def self.select_rows(sql)
+    rows = []
+    each_row(sql) { |row| rows << row }
     rows
   end
 
@@ -174,18 +196,21 @@ module SqliteAdapter
     if v.is_a?(Integer)
       Db.escape_int(v)
     elsif v == true
-      "1"
+      # The database's own literal: SQLite's 1, PostgreSQL's TRUE (which
+      # compares with no integer).
+      Db.escape_bool_opt(true)
     elsif v == false
-      "0"
+      Db.escape_bool_opt(false)
     elsif v.nil?
       "NULL"
     elsif v.is_a?(Time)
       Db.escape_string(ActiveSupport.format_db_time(v).to_s)
     elsif defined?(Date) && v.is_a?(Date)
-      # Date-only predicates compare against YYYY-MM-DD text, never a
-      # zoned timestamp. Date + format_db_date load only with the Date
-      # package (matz/spinel#7334).
-      Db.escape_string(ActiveSupport.format_db_date(v).to_s)
+      # `time` can load Date even when the app has no date columns and
+      # the optional ActiveSupport date helpers were omitted. Quote the
+      # civil day directly, including for a DateTime receiver.
+      date = defined?(DateTime) && v.is_a?(DateTime) ? Date.new(v.year, v.month, v.day) : v
+      Db.escape_string(date.strftime("%Y-%m-%d"))
     else
       Db.escape_string(v.to_s)
     end

@@ -87,8 +87,8 @@ fn hydration_factories_fire_the_hook_once_on_a_persisted_record() {
     }
     let init = method_body(&src, "def initialize(");
     assert!(
-        init.contains("after_initialize if !(attrs.equal? ActiveRecord::Base::HYDRATE_ATTRS)"),
-        "initialize skips the hook for the hydration sentinel:\n{init}"
+        init.contains("after_initialize if !((attrs.equal? ActiveRecord::Base::HYDRATE_ATTRS) || defer_initialize_callbacks)"),
+        "initialize skips the hook for the hydration sentinel and for a caller that runs it after a creation block:\n{init}"
     );
 }
 

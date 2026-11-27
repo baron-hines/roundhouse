@@ -91,7 +91,7 @@ fn git_path(root: &Path, name: &str) -> Option<PathBuf> {
     (!path.is_empty()).then(|| root.join(path))
 }
 
-/// The `runtime/ruby/` and `runtime/spinel/` trees the ruby and spinel
+/// The `runtime/ruby/`, `runtime/spinel/` and `runtime/gems/` trees the ruby and spinel
 /// targets compose their output from, as a generated table of
 /// `include_str!`s (`$OUT_DIR/runtime_files.rs`, read by
 /// `src/runtime_files.rs`). The emit used to read these from disk
@@ -106,8 +106,15 @@ fn git_path(root: &Path, name: &str) -> Option<PathBuf> {
 fn embed_runtime_files() {
     let root = manifest_root();
     let mut entries: Vec<(String, PathBuf)> = Vec::new();
-    for top in ["runtime/ruby", "runtime/spinel"] {
+    for top in ["runtime/ruby", "runtime/spinel", "runtime/gems"] {
         let dir = root.join(top);
+        // Not the missing tree itself (cargo reruns a script whose watched path does not exist on every build), but its parent, so the tree appearing later regenerates the table.
+        if !dir.exists() {
+            if let Some(parent) = dir.parent().filter(|p| p.exists()) {
+                println!("cargo:rerun-if-changed={}", parent.display());
+            }
+            continue;
+        }
         println!("cargo:rerun-if-changed={}", dir.display());
         collect(&dir, top, &mut entries);
     }

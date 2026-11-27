@@ -3,7 +3,7 @@
 //! This pass has stricter semantic constraints: moving keywords must preserve
 //! Ruby evaluation order and defaults must retain their lexical meaning.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::app::App;
 use crate::expr::{Expr, ExprNode, Literal};
@@ -39,7 +39,7 @@ impl InstanceCallParams {
         >,
         names: &super::super::forwarding::ConstructorNames,
     ) -> Self {
-        let mut slots: HashMap<(String, Symbol), Vec<Slot>> = HashMap::new();
+        let mut slots: HashMap<(String, Symbol), Vec<Slot>> = HashMap::default();
         for class in &app.library_classes {
             for method in &class.methods {
                 if method.receiver != crate::dialect::MethodReceiver::Instance {
@@ -67,7 +67,7 @@ impl InstanceCallParams {
         // receiver types as `Message`. With several includers the
         // receiver still names one, but which module's definition wins
         // is the includer's ancestry, so those are left alone.
-        let mut defined: HashSet<(String, Symbol)> = HashSet::new();
+        let mut defined: HashSet<(String, Symbol)> = HashSet::default();
         for model in &app.models {
             for method in model.methods() {
                 if method.receiver != crate::dialect::MethodReceiver::Instance {
@@ -99,9 +99,9 @@ impl InstanceCallParams {
             }
         }
 
-        let mut custom_new = HashSet::new();
-        let mut custom_new_slots = HashMap::new();
-        let mut unknown_new = HashSet::new();
+        let mut custom_new = HashSet::default();
+        let mut custom_new_slots = HashMap::default();
+        let mut unknown_new = HashSet::default();
         let unqualified_class_ids = names.unqualified_class_ids.clone();
         for (class_id, contract) in constructors {
             add_constructor_slots(
@@ -112,6 +112,12 @@ impl InstanceCallParams {
                 &mut custom_new,
                 &mut unknown_new,
             );
+        }
+        // Not a core container's subclass where the tree keeps keywords (the Ruby family): its `new` is the container's,
+        // which no lowering rewrites, so the call written as the source's reaches what Ruby looks up as it runs
+        // (OmniAuth's `AuthHash.new(:provider => name)`, a Hash subclass whose modules hook `included`).
+        if app.native_library_keywords {
+            unknown_new.retain(|class| !descends_from_core_container(app, class));
         }
         Self {
             slots,
@@ -239,7 +245,7 @@ pub(super) fn lexical_refinement_calls(app: &App) -> HashSet<crate::span::Span> 
         }
     }
 
-    let mut spans = HashSet::new();
+    let mut spans = HashSet::default();
     for class in &app.library_classes {
         let refinements = refinements_for(class.name.0.as_str(), &activations);
         if !refinements.is_empty() {
@@ -280,6 +286,32 @@ pub(super) fn lexical_refinement_calls(app: &App) -> HashSet<crate::span::Span> 
         }
     }
     spans
+}
+
+fn descends_from_core_container(app: &App, class: &str) -> bool {
+    let mut current = class.to_string();
+    for _ in 0..32 {
+        let Some(parent) = app.library_classes.iter().filter(|c| !c.is_module && c.name.0.as_str() == current).find_map(|c| c.parent.clone()) else {
+            return false;
+        };
+        let rooted = parent.0.as_str().starts_with("::");
+        let written = parent.0.as_str().trim_start_matches("::").to_string();
+        if rooted && matches!(written.as_str(), "Hash" | "Array" | "String") && !app.library_classes.iter().any(|c| c.name.0.as_str() == written) {
+            return true;
+        }
+        // The parent as Ruby's lexical lookup would find it from the class's namespace, else as written: an app's
+        // `A::Hash` before the core one.
+        let scope: Vec<&str> = current.split("::").collect();
+        let resolved = (0..scope.len())
+            .rev()
+            .map(|depth| if depth == 0 { written.clone() } else { format!("{}::{written}", scope[..depth].join("::")) })
+            .find(|candidate| *candidate != current && app.library_classes.iter().any(|c| !c.is_module && c.name.0.as_str() == candidate));
+        match resolved {
+            Some(next) => current = next,
+            None => return matches!(written.as_str(), "Hash" | "Array" | "String"),
+        }
+    }
+    false
 }
 
 fn add_constructor_slots(
@@ -355,7 +387,7 @@ pub(super) fn refuse_keyword_splats(
         .get(id.0.as_str())
         .map_or(id.0.as_str(), String::as_str);
     if let Some(reason) =
-        constructor_refusal_reason(params, expr.span, id.0.as_str(), class_name, args)
+        constructor_refusal_reason(params, expr.span, resolved_class_ref(recv), id.0.as_str(), class_name, args)
     {
         refuse_constructor(expr.span, crate::expr::ExprCold::diagnostic_mut(&mut expr.cold), reason, diagnostics);
     }
@@ -557,7 +589,7 @@ fn rewrite_instance_call(
             .get(id.0.as_str())
             .map_or(id.0.as_str(), String::as_str);
         if let Some(reason) =
-            constructor_refusal_reason(params, expr.span, id.0.as_str(), class_id, args)
+            constructor_refusal_reason(params, expr.span, resolved_class_ref(recv), id.0.as_str(), class_id, args)
         {
             refuse_constructor(expr.span, crate::expr::ExprCold::diagnostic_mut(&mut expr.cold), reason, diagnostics);
             return;
@@ -679,9 +711,20 @@ fn has_keyword_arguments(args: &[Expr]) -> bool {
     })
 }
 
+/// The analyzer's constant resolution answered this receiver: the
+/// reference resolved, by Ruby's lexical lookup, to the class its type
+/// names (`analyze::body`, `RESOLVED_CLASS_REF`). A type that only fell
+/// back to the written name carries no such answer. A root-qualified
+/// `::Name` needs none: Ruby looks it up at the top level only.
+fn resolved_class_ref(recv: &Expr) -> bool {
+    recv.decisions & crate::expr::RESOLVED_CLASS_REF != 0
+        || matches!(&*recv.node, ExprNode::Const { path } if path.len() > 1 && path[0].as_str().is_empty())
+}
+
 fn constructor_refusal_reason(
     params: &InstanceCallParams,
     span: crate::span::Span,
+    resolved: bool,
     unqualified_name: &str,
     class_name: &str,
     args: &[Expr],
@@ -689,7 +732,15 @@ fn constructor_refusal_reason(
     if !has_keyword_arguments(args) {
         return None;
     }
-    if params.ambiguous_names.contains(unqualified_name) && !params.model_names.contains(class_name)
+    // A leaf name two classes share (`Request`, `Fasp::Request`) is
+    // ambiguous as written. A reference the analyzer resolved is not: its
+    // type is the class Ruby's lexical lookup reaches, so a top-level
+    // `Request` outside `module Fasp` (including `class Fasp::Compact`,
+    // whose lexical scope is not `Fasp`) is the top-level class, and one
+    // inside it was already qualified to `Fasp::Request`.
+    if params.ambiguous_names.contains(unqualified_name)
+        && !resolved
+        && !params.model_names.contains(class_name)
     {
         return Some(
             "cannot verify constructor lookup because this unqualified class name is ambiguous",
@@ -772,7 +823,7 @@ fn respell_constructor(args: &mut Vec<Expr>, slots: &[Slot]) -> Result<(), ()> {
     }
 
     let mut supplied = Vec::with_capacity(entries.len());
-    let mut positions = HashSet::new();
+    let mut positions = HashSet::default();
     let mut previous_pos = None;
     for (key, value) in entries {
         let ExprNode::Lit {

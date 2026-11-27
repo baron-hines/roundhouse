@@ -48,6 +48,21 @@ require_relative "sidekiq_redis"
 require_relative "sidekiq_push"
 require_relative "job_registry"
 
+# The app's `Sidekiq.configure_client` `url: ENV["REDIS_URL"], db:
+# ENV["SIDEKIQ_LIVE_DB"]`, as the registry generates it: the push has no
+# environment fallback of its own. The test passes the database as
+# `db:`, off the URL, so the pushes reach the reader's database only if
+# `db:` reaches the client.
+module JobRegistry
+  def self.sidekiq_redis_url
+    SidekiqPush.setting("REDIS_URL")
+  end
+
+  def self.sidekiq_redis_db
+    SidekiqPush.db_setting(SidekiqPush.setting("SIDEKIQ_LIVE_DB"))
+  end
+end
+
 def record(gid)
   ActiveJob::Arguments.list([ActiveJob::Arguments.record(gid)])
 end
@@ -69,5 +84,17 @@ ActiveJob.transaction_began
 SidekiqPush.enqueue_after_commit("AfterCommitJob", "default", 0.0,
   ActiveJob::Payload.build_at("AfterCommitJob", "default", 0.0, record("gid://depot/Car/5")))
 ActiveJob.transaction_rolled_back
+
+# Native Sidekiq jobs: one pushed at once, one scheduled (a class-side
+# perform_in), and a bulk push of three in batches of two through
+# SidekiqRedis.push_many.
+SidekiqPush.enqueue_native("NativeWorker", "5", "native", ",\"dead\":false", 0.0, 0, "[1,{\"a\":\"b\"}]")
+SidekiqPush.enqueue_native("NativeWorker", "5", "native", "", 300.0, 1, "[2]")
+SidekiqPush.bulk_begin(2)
+[3, 4, 5].each do |i|
+  SidekiqPush.enqueue_native("NativeWorker", "true", "native", "", 0.0, 2, "[" + i.to_s + "]")
+end
+SidekiqPush.bulk_end
+SidekiqPush.bulk_abort
 
 puts "pushed to " + SidekiqPush.redacted_url(SidekiqPush.url)

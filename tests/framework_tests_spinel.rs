@@ -138,6 +138,10 @@ fn build_and_run(test_file: &Path, tag: &str) {
             stems.push(name);
         }
     }
+    // Not both pagy runtimes: `project.rs::apply_pagy_demand` ships one per app, and their RBS declare the same members.
+    for f in ["pagy9.rb", "pagy9.rbs"] {
+        let _ = std::fs::remove_file(scratch_runtime.join("action_controller").join(f));
+    }
     stems.sort();
     for entry in stems.iter().map(|s| s.as_str()) {
         let src = runtime_ruby.join(entry);
@@ -183,6 +187,9 @@ fn build_and_run(test_file: &Path, tag: &str) {
         "base64.rb",
         "json_impl.rb",
         "message_digest.rb",
+        "active_support_instrumentation.rb",
+        "db.rb",
+        "sqlite_adapter.rb",
     ] {
         let src = runtime_spinel.join(entry);
         assert!(src.exists(), "{} is named in this copy list but does not exist \
@@ -214,6 +221,12 @@ require_relative "../runtime/rails"
 require_relative "../runtime/action_controller/message_verifier"
 require_relative "../runtime/action_controller/cookies"
 require_relative "../runtime/action_controller/rate_limiter"
+require_relative "../runtime/active_support_instrumentation"
+require_relative "../runtime/db"
+require_relative "../runtime/sqlite_adapter"
+
+# Every tree's main.rb sets the adapter the runtime's relation reads.
+ActiveRecord.adapter = SqliteAdapter
 
 class TestBase
   def initialize
@@ -436,7 +449,7 @@ fn ac_message_verifier_test_passes_under_spinel() {
 }
 
 /// `rate_limit`'s counter (`ActionController::RateLimiter` over
-/// `Rails::Cache#increment_str`). Ruby-family lanes only: the store is
+/// `Rails::Cache#increment`). Ruby-family lanes only: the store is
 /// the shared runtime's, which the strict-target runtimes do not stage.
 #[test]
 #[ignore]

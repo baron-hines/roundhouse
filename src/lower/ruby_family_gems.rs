@@ -11,9 +11,13 @@ use crate::build_target::BuildTarget;
 
 /// (root constant, gem, what a reference would be written against).
 const GEMS: &[(&str, &str, &str)] = &[
+    ("Faye", "faye-websocket", "a missing WebSocket adapter"),
+    ("EventMachine", "eventmachine", "a missing scheduler"),
     ("Faraday", "faraday", "a missing HTTP client"),
     ("Retryable", "retryable", "a missing retry helper"),
     ("JWT", "jwt", "a missing token codec"),
+    ("RestClient", "rest-client", "a missing HTTP client"),
+    ("ElasticAPM", "elastic-apm", "a missing APM agent"),
 ];
 
 /// Targets that run the real gem: Ruby and JRuby load it via
@@ -36,6 +40,7 @@ pub fn without_unshipped_gems(app: &App, target: BuildTarget) -> Option<App> {
     }
     let named: Vec<_> = GEMS
         .iter()
+        .filter(|(root, _, _)| !(target == BuildTarget::Spinel && matches!(*root, "Faye" | "EventMachine")))
         .filter(|(root, _, _)| crate::lower::gem_refusal::mentions(app, root))
         .collect();
     if named.is_empty() {

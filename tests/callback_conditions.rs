@@ -82,7 +82,7 @@ fn a_symbol_unless_condition_negates_the_predicate() {
     assert!(src.contains("if self.frozen?"), "{src}");
 }
 
-/// A lambda/proc condition with parameters, several statements, a
+/// A lambda/proc condition with two parameters, several statements, a
 /// control-flow escape, a local write, or a read of a captured local
 /// is NOT spliced: inline in the hook it would read an unbound
 /// `r`/`p`/`flag`, `return` out of the whole callback chain, or leak
@@ -91,7 +91,7 @@ fn a_symbol_unless_condition_negates_the_predicate() {
 /// with a broken guard.
 const DECLINED: &str = r##"class Widget < ApplicationRecord
   flag = true
-  before_save :a1, if: ->(r) { r.name.present? }
+  before_save :a1, if: ->(r, x) { r.name.present? }
   before_save :a2, if: proc { |p| p.name.present? }
   before_save :a3, if: -> { return false if name.nil?; true }
   before_save :a4, if: -> { n = name; n.present? }

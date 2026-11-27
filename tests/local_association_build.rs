@@ -108,7 +108,7 @@ fn aliases_and_except_use_the_params_factory_and_request_a_copying_filter() {
 "#, ASSOCIATION);
     assert!(controller.contains("Message.from_params(alias_attributes.except(:in_reply_to_id))"), "{controller}");
     assert!(controller.contains("Message.from_params(copied_attributes)"), "{controller}");
-    assert!(controller.contains(".to_pty_session_id = __rh_build_owner_"), "{controller}");
+    assert!(controller.contains(".to_pty_session_id = rh_build_owner_"), "{controller}");
     assert!(!controller.contains("received_messages.build("), "{controller}");
     assert!(params.contains("def except(*keys)"), "{params}");
     assert!(params.contains("result.in_reply_to_id_provided = false"), "{params}");
@@ -180,7 +180,7 @@ fn a_reassignment_or_conditional_binding_is_not_a_params_proof() {
         assert!(!controller.contains("Message.from_params("), "false params proof:\n{controller}");
         if !proven_hash {
             assert!(!controller.contains(".merge(to_pty_session_id:"), "unproven Hash:\n{controller}");
-            assert!(!controller.contains("__rh_build_owner_"), "unproven build capture:\n{controller}");
+            assert!(!controller.contains("rh_build_owner_"), "unproven build capture:\n{controller}");
         }
     }
 }
@@ -191,7 +191,7 @@ fn a_declared_row_changing_scope_still_declines_local_build_expansion() {
     let (controller, _) = emitted("    attributes = message_params\n    message = @pty_session.received_messages.new(attributes)", scoped);
     assert!(controller.contains("received_messages."), "{controller}");
     assert!(!controller.contains("Message.from_params("), "{controller}");
-    assert!(!controller.contains("__rh_build_owner_"), "{controller}");
+    assert!(!controller.contains("rh_build_owner_"), "{controller}");
 }
 
 #[test]
@@ -208,8 +208,8 @@ fn an_alias_of_another_resources_params_does_not_select_a_missing_factory() {
 #[test]
 fn emitted_builds_preserve_inputs_owner_evaluation_and_assignment_results() {
     let body = r#"
-    __rh_build_owner_0 = "written local"
-    __rh_build_record_0 = "written record"
+    rh_build_owner_0 = "written local"
+    rh_build_record_0 = "written record"
     attributes = { body: "hash", to_pty_session_id: 999 }
     message = @pty_session.received_messages.new(attributes)
     message.save!
@@ -231,8 +231,8 @@ fn emitted_builds_preserve_inputs_owner_evaluation_and_assignment_results() {
     result = (assigned = @pty_session.received_messages.new(message_params))
     @result = result
     @assigned = assigned
-    @written_owner = __rh_build_owner_0
-    @written_record = __rh_build_record_0
+    @written_owner = rh_build_owner_0
+    @written_record = rh_build_record_0
     head :ok
 "#;
     let mut overlay = emit_and_run::empty_app();
@@ -264,7 +264,7 @@ raise "captured record" unless controller.instance_variable_get(:@written_record
 missing = MessagesController.new
 missing.instance_variable_set(:@params, { "id" => "99999" })
 missing.create
-raise "missing owner guard" unless missing.instance_variable_get(:@status) == 404 && Message.count == 5
+raise "missing owner guard" unless missing.status == 404 && Message.count == 5
 puts "local association builds: rows, inputs, owner, evaluation, assignment"
 "#).assert_passes();
 }

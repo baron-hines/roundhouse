@@ -83,6 +83,10 @@ if [[ ! -f "$PREFIX/.complete" ]]; then
     echo "ruby-head-build: building $SHA into $PREFIX (log $LOG)" >&2
     rm -rf "$BUILD" "$PREFIX"
     mkdir -p "$BUILD"
+    # The build writes revision.h into the SOURCE tree and only rewrites it
+    # when it is missing, so yesterday's copy would name yesterday's commit
+    # in `ruby -v` (and so in env.json): 10-23 ran 50f1aca061 as "8ff4ae135d".
+    rm -f "$SRC/revision.h"
     if ! {
         ( cd "$SRC" && ./autogen.sh ) &&
         ( cd "$BUILD" && "$SRC/configure" --prefix="$PREFIX" --disable-install-doc \

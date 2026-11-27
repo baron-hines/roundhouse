@@ -612,6 +612,20 @@ fn canonical_reads_and_unrelated_namespace_calls_do_not_change_mappings() {
 }
 
 #[test]
+fn a_member_serialized_inside_a_tuple_assignment_keeps_the_mapping() {
+    let model = "class Ticket < ApplicationRecord\n  enum :state, Rating.values.to_h { |v| [v.serialize, v.serialize] }\nend\n";
+    // The member is only the receiver of `.serialize`; what the tuple stores
+    // is the resulting string, not the enum object.
+    let tuple = "def pick(kind)\n  previous, latest, state = case kind\n  when :a then [nil, true, Rating::High.serialize]\n  else [1, false, Rating::Low.serialize]\n  end\n  [previous, latest, state]\nend\n";
+    let app = ingest_enum(model, &[("app/services/rating.rb", RATING), ("app/services/pick.rb", tuple)])
+        .expect("a serialized member in a tuple does not escape the enum");
+    assert_eq!(app.models[0].enums[&roundhouse::Symbol::from("state")].len(), 2);
+    // The member itself stored in the tuple still hands the enum on.
+    let stored = "previous, state = [nil, Rating::High]\n";
+    assert_enum_gap(model, &[("app/services/rating.rb", RATING), ("app/services/pick.rb", stored)]);
+}
+
+#[test]
 fn type_argument_references_remain_a_conservative_folding_gap() {
     let model = "class Ticket < ApplicationRecord\n  enum :state, Rating.values.to_h { |v| [v.serialize, v.serialize] }\nend\n";
     assert_enum_gap(model, &[("app/services/rating.rb", RATING),
