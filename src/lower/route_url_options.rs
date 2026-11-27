@@ -489,17 +489,21 @@ fn rewrite(expr: &mut Expr, helpers: &crate::det::HashSet<String>) {
 /// The classes that define `default_url_options` themselves: their bare `_url` calls take that host
 /// (`emit::ruby::library::url_for_own_options`).
 pub(crate) fn classes_with_own_url_options(app: &App) -> crate::det::HashSet<crate::ident::ClassId> {
-    // Not the instance side alone: a `class << self` that includes the url helpers (lobsters' Routes) defines its
-    // own there, and the emitter's `url_for_own_options` reads either.
-    let own = |m: &crate::dialect::MethodDef| m.name.as_str() == "default_url_options";
+    // Not either side for every call: a `class << self` that includes the url helpers (lobsters' Routes) defines its
+    // own there, and an instance method's call would then read a `default_url_options` its side lacks.
+    fn owns(methods: &[&crate::dialect::MethodDef]) -> bool {
+        let sides: Vec<&crate::dialect::MethodReceiver> =
+            methods.iter().filter(|m| m.name.as_str() == "default_url_options").map(|m| &m.receiver).collect();
+        !sides.is_empty() && methods.iter().all(|m| sides.contains(&&m.receiver) || !calls_url_with_options(&m.body))
+    }
     let mut out = crate::det::HashSet::default();
     for lc in &app.library_classes {
-        if lc.methods.iter().any(own) {
+        if owns(&lc.methods.iter().collect::<Vec<_>>()) {
             out.insert(lc.name.clone());
         }
     }
     for m in &app.models {
-        if m.methods().any(own) {
+        if owns(&m.methods().collect::<Vec<_>>()) {
             out.insert(m.name.clone());
         }
     }
@@ -509,6 +513,18 @@ pub(crate) fn classes_with_own_url_options(app: &App) -> crate::det::HashSet<cra
         }
     }
     out
+}
+
+fn calls_url_with_options(e: &Expr) -> bool {
+    if let ExprNode::Send { recv: None, method, args, .. } = &*e.node
+        && method.as_str().ends_with("_url")
+        && args.last().is_some_and(|a| matches!(&*a.node, ExprNode::Hash { kwargs: true, .. }))
+    {
+        return true;
+    }
+    let mut found = false;
+    e.node.for_each_child(&mut |c| found = found || calls_url_with_options(c));
+    found
 }
 
 fn rewrite_owned(expr: &mut Expr, helpers: &crate::det::HashSet<String>, own_url_options: bool) {
