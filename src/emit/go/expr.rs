@@ -508,12 +508,32 @@ pub(super) fn emit_expr(ctx: &EmitCtx, e: &Expr) -> String {
                 }
                 // A nullable column's pointer field: nil takes the fallback,
                 // any stored value (0 included) is itself, as in Ruby.
-                if let Some(ptr) = nullable_field_go_ty(left)
+                // Not with a nullable column on the right too: the function answers the left's scalar, and the right is a pointer.
+                if let Some(ptr) = nullable_read_go_ty(left)
                     && let Some(scalar) = ptr.strip_prefix('*')
-                    && primitive_kind(&right.ty)
+                    && (primitive_kind(&right.ty) || matches!(right.ty, Some(Ty::Bool)))
+                    && nullable_read_go_ty(right).is_none()
                 {
+                    let right_go = match right.ty {
+                        Some(Ty::Str | Ty::Sym) => "string",
+                        Some(Ty::Int) => "int64",
+                        Some(Ty::Float) => "float64",
+                        _ => "bool",
+                    };
+                    // Not the left's scalar when the right is another type: Ruby answers either, so Go holds both.
+                    let result = if right_go == scalar { scalar } else { "interface{}" };
+                    let set = if scalar == "bool" { "p != nil && *p" } else { "p != nil" };
                     return format!(
-                        "func() {scalar} {{ if p := {}; p != nil {{ return *p }}; return {} }}()",
+                        "func() {result} {{ if p := {}; {set} {{ return *p }}; return {} }}()",
+                        emit_expr_as_value(ctx, left),
+                        emit_expr_as_value(ctx, right)
+                    );
+                }
+                if let Some(ptr) = nullable_or_go_ty(left, right) {
+                    // Not nil alone for a Boolean: a stored false is falsy in Ruby too, and takes the right.
+                    let set = if ptr == "*bool" { "p != nil && *p" } else { "p != nil" };
+                    return format!(
+                        "func() {ptr} {{ if p := {}; {set} {{ return p }}; return {} }}()",
                         emit_expr_as_value(ctx, left),
                         emit_expr_as_value(ctx, right)
                     );
@@ -2190,20 +2210,34 @@ pub(super) fn emit_send(
             // model's own field (`@title`) and a reader call on
             // another record (`article.title` in a view).
             let nilable_col = match &*r.node {
-                ExprNode::Ivar { name } => nullable_column_go_ty(name.as_str()).is_some(),
-                ExprNode::Send { recv: Some(inner), method: m, args, .. } if args.is_empty() => {
-                    nullable_column_go_ty(m.as_str()).is_some()
-                        || recv_column_is_nullable(inner, m.as_str())
+                ExprNode::Ivar { name } => nullable_column_go_ty(name.as_str()),
+                ExprNode::BoolOp { op: crate::expr::BoolOpKind::Or, left, right, .. } => nullable_or_go_ty(left, right),
+                ExprNode::Send { recv: Some(inner), method: m, args, .. }
+                    if args.is_empty() && !recv_model_defines(inner, m.as_str()) =>
+                {
+                    // Not the bare name for a typed receiver: it finds the enclosing model's column of that name.
+                    if recv_model_id(inner).is_some() {
+                        recv_column_go_ty(inner, m.as_str())
+                    } else {
+                        nullable_column_go_ty(m.as_str())
+                    }
                 }
-                _ => false,
+                _ => None,
             };
-            if nilable_col {
-                return format!("DerefString({recv_s})");
+            // Not DerefString for every pointer: it takes `*string`, and `nil.to_s` is "" whatever the column holds.
+            match nilable_col.as_deref() {
+                Some("*string") => return format!("DerefString({recv_s})"),
+                Some("*float64") => return format!("func() string {{ if p := {recv_s}; p != nil {{ return RhFloatToS(*p) }}; return \"\" }}()"),
+                Some(ptr) if ptr.starts_with('*') => {
+                    let verb = if ptr == "*int64" { "%d" } else { "%v" };
+                    return format!("func() string {{ if p := {recv_s}; p != nil {{ return fmt.Sprintf(\"{verb}\", *p) }}; return \"\" }}()");
+                }
+                _ => {}
             }
             return match r.ty.as_ref() {
                 Some(Ty::Str | Ty::Sym) => recv_s,
                 Some(Ty::Int) => format!("fmt.Sprintf(\"%d\", {recv_s})"),
-                Some(Ty::Float) => format!("fmt.Sprintf(\"%g\", {recv_s})"),
+                Some(Ty::Float) => format!("RhFloatToS({recv_s})"),
                 _ => format!("fmt.Sprintf(\"%v\", {recv_s})"),
             };
         }
@@ -4600,6 +4634,7 @@ fn nullable_read_go_ty(e: &Expr) -> Option<String> {
         ExprNode::Send { recv: Some(inner), method, args, block: None, .. } if args.is_empty() => {
             recv_column_go_ty(inner, method.as_str())
         }
+        ExprNode::BoolOp { op: crate::expr::BoolOpKind::Or, left, right, .. } => nullable_or_go_ty(left, right),
         _ => None,
     })
 }
@@ -4685,13 +4720,7 @@ fn box_nullable_column_arg(method: &str, arg: &Expr, arg_s: &str) -> Option<Stri
     if !UNTYPED_ARG_HELPERS.contains(&method) {
         return None;
     }
-    let go_ty = match &*arg.node {
-        ExprNode::Ivar { name } => nullable_column_go_ty(name.as_str()),
-        ExprNode::Send { recv: Some(inner), method: m, args: a, .. } if a.is_empty() => {
-            recv_column_go_ty(inner, m.as_str())
-        }
-        _ => None,
-    }?;
+    let go_ty = nullable_read_go_ty(arg)?;
     let f = match go_ty.as_str() {
         "*string" => "AnyString",
         "*int64" => "AnyInt64",
@@ -4708,13 +4737,7 @@ fn box_nullable_column_arg(method: &str, arg: &Expr, arg_s: &str) -> Option<Stri
 /// `interface{}` slot (nil stays nil). `None` when `v` is no such read
 /// or the slot already holds the pointer.
 fn unbox_nullable_column(v: &Expr, v_s: &str, slot_go: &str) -> Option<String> {
-    let ptr = match &*v.node {
-        ExprNode::Ivar { name } => nullable_column_go_ty(name.as_str()),
-        ExprNode::Send { recv: Some(inner), method: m, args, .. } if args.is_empty() => {
-            recv_column_go_ty(inner, m.as_str())
-        }
-        _ => None,
-    }?;
+    let ptr = nullable_read_go_ty(v)?;
     let (scalar, deref, any) = match ptr.as_str() {
         "*string" => ("string", "DerefString", "AnyString"),
         "*int64" => ("int64", "DerefInt64", "AnyInt64"),
@@ -4734,9 +4757,28 @@ fn unbox_nullable_column(v: &Expr, v_s: &str, slot_go: &str) -> Option<String> {
 
 /// The Go pointer type of `column` on the model this receiver resolves
 /// to, when the schema declares it nullable.
+/// `a || b` over two nullable reads of one pointer type: nil only when both are, so the pointer itself.
+fn nullable_or_go_ty(left: &Expr, right: &Expr) -> Option<String> {
+    let ptr = nullable_read_go_ty(left)?;
+    (ptr.starts_with('*') && nullable_read_go_ty(right).as_deref() == Some(ptr.as_str())).then_some(ptr)
+}
+
+/// The model a receiver reads: its class, or the one class of a nilable read (`belongs_to`'s `Article | nil`).
+fn recv_model_id(recv: &Expr) -> Option<&crate::ClassId> {
+    match recv.ty.as_ref().and_then(union_non_nil_core)? {
+        Ty::Class { id, .. } => Some(id),
+        _ => None,
+    }
+}
+
 fn recv_column_go_ty(recv: &Expr, column: &str) -> Option<String> {
-    let Some(Ty::Class { id, .. }) = recv.ty.as_ref() else { return None };
-    let model = id.0.as_str().rsplit("::").next().unwrap_or(id.0.as_str());
+    let id = recv_model_id(recv)?;
+    // Not a reader the model defines over the column: that method answers its own type, not the column's pointer.
+    if recv_model_defines(recv, column) {
+        return None;
+    }
+    // Not the last segment: the table is keyed by the model's full path (`Admin::Article`), as `recv_model_defines` reads it.
+    let model = id.0.as_str();
     ALL_NULLABLE_COLUMNS.with(|c| {
         c.borrow().iter().find(|(m, col, _)| m == model && col == column).map(|(_, _, ty)| ty.clone())
     })
