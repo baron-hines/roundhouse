@@ -6975,7 +6975,7 @@ fn answers_callback_macro(app: &App, name: &crate::ident::ClassId) -> bool {
     false
 }
 
-fn calls_super(e: &crate::expr::Expr) -> bool {
+pub(super) fn calls_super(e: &crate::expr::Expr) -> bool {
     let mut found = matches!(&*e.node, crate::expr::ExprNode::Super { .. });
     e.node.for_each_child(&mut |c| found |= calls_super(c));
     found

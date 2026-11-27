@@ -229,14 +229,11 @@ fn emit_check_box(
     // attribute — Rails renders exactly
     // `<input name="user[f]" type="hidden" value="0">`.
     let autocomplete = if ctx.hidden_autocomplete { " autocomplete=\"off\"" } else { "" };
-    let hidden = lit_str(format!("<input name=\"{model_name}[{field_str}]\" type=\"hidden\" value=\"0\"{autocomplete}>"));
-    let mut parts: Vec<InterpPart> = Vec::new();
-    parts.push(InterpPart::Text {
-        value: format!(
-            "<input type=\"checkbox\" value=\"1\"{nid}",
-            nid = name_id_attrs_for(binding, field_str, opts),
-        ),
-    });
+    let hidden = lit_str(format!("<input name=\"{model_name}[{field_str}]\" type=\"hidden\" value=\"0\"{autocomplete} />"));
+    // Not after the caller's: `CheckBox#render` assigns `type` and `value` over theirs, where they stood.
+    let opts = &assign_opt(&assign_opt(opts, "type", lit_str("checkbox".to_string())), "value", lit_str("1".to_string()));
+    let mut parts = vec![InterpPart::Text { value: "<input".to_string() }];
+    append_attr_parts(&mut parts, opts);
     // Checked state, typed instead of the runtime `checked_box_attr`
     // seam (an untyped truthiness walk, CRuby-overlay-only). A PROVABLE
     // bool reader (Boolean column / bool typed_store attr / `attribute
@@ -298,8 +295,7 @@ fn emit_check_box(
         )
     };
     parts.push(InterpPart::Expr { expr: checked_expr });
-    append_attr_parts(&mut parts, opts);
-    parts.push(InterpPart::Text { value: ">".to_string() });
+    parts.push(InterpPart::Text { value: format!("{} />", name_id_attrs_for(binding, field_str, opts)) });
     vec![accumulator_append_call(hidden, ctx), accumulator_append_call(string_interp(parts), ctx)]
 }
 
@@ -318,12 +314,19 @@ fn emit_radio_button(
     };
     let model_name = &binding.model_name;
     let field_str = field_sym.as_str();
-    let mut parts: Vec<InterpPart> = Vec::new();
-    parts.push(InterpPart::Text { value: "<input type=\"radio\" value=\"".to_string() });
-    parts.push(InterpPart::Expr {
-        expr: view_helpers_call("html_escape", vec![to_s(value.clone())]),
-    });
-    parts.push(InterpPart::Text { value: "\"".to_string() });
+    // `checked:` is checked STATE, not an HTML attribute: `input_checked?` deletes it.
+    let attr_opts: Vec<(Expr, Expr)> = opts
+        .iter()
+        .filter(|(k, _)| {
+            !matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } }
+                if value.as_str() == "checked")
+        })
+        .cloned()
+        .collect();
+    // Not after the caller's: `RadioButton#render` assigns `type` and the positional value over theirs.
+    let attr_opts = assign_opt(&assign_opt(&attr_opts, "type", lit_str("radio".to_string())), "value", to_s(value.clone()));
+    let mut parts = vec![InterpPart::Text { value: "<input".to_string() }];
+    append_attr_parts(&mut parts, &attr_opts);
     // Checked state, inline instead of the runtime `radio_checked_attr`
     // seam. An explicit `checked:` opt wins (lobsters' search radios:
     // `checked: @search.what == "stories"` — previously it leaked into
@@ -371,19 +374,7 @@ fn emit_radio_button(
     parts.push(InterpPart::Expr {
         expr: view_helpers_call("html_escape", vec![to_s(value.clone())]),
     });
-    parts.push(InterpPart::Text { value: "\"".to_string() });
-    // `checked:` is consumed above — it's checked STATE, not an HTML
-    // attribute.
-    let attr_opts: Vec<(Expr, Expr)> = opts
-        .iter()
-        .filter(|(k, _)| {
-            !matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } }
-                if value.as_str() == "checked")
-        })
-        .cloned()
-        .collect();
-    append_attr_parts(&mut parts, &attr_opts);
-    parts.push(InterpPart::Text { value: ">".to_string() });
+    parts.push(InterpPart::Text { value: "\" />".to_string() });
     vec![accumulator_append_call(string_interp(parts), ctx)]
 }
 
@@ -1655,17 +1646,8 @@ fn emit_typed_input_field(
     let Some(field_sym) = field_symbol(field) else {
         return vec![accumulator_append_call(lit_str(String::new()), ctx)];
     };
-    let field_str = field_sym.as_str();
-    let value_read = field_value_read(binding, field_sym.clone(), ctx);
-    let mut parts: Vec<InterpPart> = Vec::new();
-    parts.push(InterpPart::Text {
-        value: format!("<input type=\"{ty}\"{}", name_id_attrs_for(binding, field_str, opts)),
-    });
-    parts.push(InterpPart::Expr {
-        expr: view_helpers_call("optional_value_attr", vec![value_read]),
-    });
-    append_attr_parts(&mut parts, opts);
-    parts.push(InterpPart::Text { value: ">".to_string() });
+    let value = view_helpers_call("optional_value_attr", vec![field_value_read(binding, field_sym.clone(), ctx)]);
+    let parts = text_field_parts(ty, opts, Some(value), binding, field_sym.as_str());
     vec![accumulator_append_call(string_interp(parts), ctx)]
 }
 
@@ -1684,30 +1666,55 @@ fn emit_color_field(
         return vec![accumulator_append_call(lit_str(String::new()), ctx)];
     };
     let field_str = field_sym.as_str();
-    let mut opts = opts.to_vec();
-    let mut parts: Vec<InterpPart> = Vec::new();
-    parts.push(InterpPart::Text {
-        value: format!("<input type=\"color\"{}", name_id_attrs_for(binding, field_str, &opts)),
-    });
+    let opts = &default_type_opt(opts, "color");
+    let mut parts = vec![InterpPart::Text { value: "<input".to_string() }];
     // A String literal `value:` stays an ordinary attribute; any other is
     // decided at render.
     let literal = |v: &Expr| matches!(&*v.node, ExprNode::Lit { value: Literal::Str { .. } });
-    let value_pos = opts.iter().position(|(k, _)| {
-        matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "value")
-    });
-    if !value_pos.is_some_and(|i| literal(&opts[i].1)) {
-        let record = field_value_read(binding, field_sym.clone(), ctx);
-        let attr = match super::attr_parts::take_opt(&mut opts, "value") {
-            Some(v) if !matches!(&*v.node, ExprNode::Lit { value: Literal::Nil }) => {
-                view_helpers_call("color_field_value_attr", vec![v, record])
-            }
-            _ => view_helpers_call("color_value_attr", vec![record]),
-        };
-        parts.push(InterpPart::Expr { expr: attr });
+    let value_pos = value_opt_position(opts);
+    match value_pos {
+        Some(i) if literal(&opts[i].1) => append_attr_parts(&mut parts, opts),
+        _ => {
+            let record = field_value_read(binding, field_sym.clone(), ctx);
+            let attr = match value_pos.map(|i| &opts[i].1) {
+                Some(v) if !matches!(&*v.node, ExprNode::Lit { value: Literal::Nil }) => {
+                    view_helpers_call("color_field_value_attr", vec![v.clone(), record])
+                }
+                _ => view_helpers_call("color_value_attr", vec![record]),
+            };
+            append_attrs_with_value(&mut parts, opts, value_pos, attr);
+        }
     }
-    append_attr_parts(&mut parts, &opts);
-    parts.push(InterpPart::Text { value: ">".to_string() });
+    if !opts_have_key(opts, "size")
+        && let Some(max) = opt_value(opts, "maxlength")
+    {
+        super::attr_parts::push_escaped_attr(&mut parts, "size", &max);
+    }
+    push_input_tail(&mut parts, "color", None, binding, field_str, opts);
     vec![accumulator_append_call(string_interp(parts), ctx)]
+}
+
+fn value_opt_position(opts: &[(Expr, Expr)]) -> Option<usize> {
+    opts.iter().position(|(k, _)| {
+        matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "value")
+    })
+}
+
+/// The options with a computed ` value="…"` part where the caller's
+/// `value:` stood, or after them: Rails assigns `options["value"]`, and
+/// a Hash keeps an assigned key where it was.
+fn append_attrs_with_value(parts: &mut Vec<InterpPart>, opts: &[(Expr, Expr)], at: Option<usize>, value: Expr) {
+    match at {
+        Some(i) => {
+            append_attr_parts(parts, &opts[..i]);
+            parts.push(InterpPart::Expr { expr: value });
+            append_attr_parts(parts, &opts[i + 1..]);
+        }
+        None => {
+            append_attr_parts(parts, opts);
+            parts.push(InterpPart::Expr { expr: value });
+        }
+    }
 }
 
 /// `<input type="datetime-local" …>` — Rails' `Tags::DatetimeLocalField`.
@@ -1725,26 +1732,20 @@ fn emit_datetime_local_field(
         return vec![accumulator_append_call(lit_str(String::new()), ctx)];
     };
     let field_str = field_sym.as_str();
-    let mut opts = opts.to_vec();
-    let mut parts: Vec<InterpPart> = Vec::new();
-    parts.push(InterpPart::Text {
-        value: format!("<input type=\"datetime-local\"{}", name_id_attrs_for(binding, field_str, &opts)),
-    });
-    match super::attr_parts::take_opt(&mut opts, "value") {
-        Some(v) if matches!(&*v.node, ExprNode::Lit { value: Literal::Nil }) => {}
-        Some(v) => opts.insert(0, (lit_sym(Symbol::from("value")), v)),
-        None => {
-            let is_time = ctx
-                .time_columns
-                .get(binding.metadata_class(ctx).unwrap_or(""))
-                .is_some_and(|names| names.contains(field_str));
-            let helper = if is_time { "datetime_local_value_attr" } else { "optional_value_attr" };
-            let read = field_value_read(binding, field_sym.clone(), ctx);
-            parts.push(InterpPart::Expr { expr: view_helpers_call(helper, vec![read]) });
-        }
+    let opts = &default_type_opt(opts, "datetime-local");
+    let mut parts = vec![InterpPart::Text { value: "<input".to_string() }];
+    if value_opt_position(opts).is_some() {
+        append_attr_parts(&mut parts, opts);
+    } else {
+        let is_time = ctx
+            .time_columns
+            .get(binding.metadata_class(ctx).unwrap_or(""))
+            .is_some_and(|names| names.contains(field_str));
+        let helper = if is_time { "datetime_local_value_attr" } else { "optional_value_attr" };
+        let read = field_value_read(binding, field_sym.clone(), ctx);
+        append_attrs_with_value(&mut parts, opts, None, view_helpers_call(helper, vec![read]));
     }
-    append_attr_parts(&mut parts, &opts);
-    parts.push(InterpPart::Text { value: ">".to_string() });
+    push_input_tail(&mut parts, "datetime-local", None, binding, field_str, opts);
     vec![accumulator_append_call(string_interp(parts), ctx)]
 }
 
@@ -1780,15 +1781,15 @@ fn emit_valueless_input_field(
     let Some(field_sym) = field_symbol(field) else {
         return vec![accumulator_append_call(lit_str(String::new()), ctx)];
     };
-    let mut parts: Vec<InterpPart> = Vec::new();
-    parts.push(InterpPart::Text {
-        value: format!(
-            "<input type=\"{ty}\"{}",
-            name_id_attrs_for(binding, field_sym.as_str(), opts)
-        ),
-    });
-    append_attr_parts(&mut parts, opts);
-    parts.push(InterpPart::Text { value: ">".to_string() });
+    // Not left where the caller wrote it: `PasswordField` merges the options into `{ value: nil }`.
+    let mut opts = opts.to_vec();
+    if ty == "password"
+        && let Some(i) = value_opt_position(&opts)
+    {
+        let value = opts.remove(i);
+        opts.insert(0, value);
+    }
+    let parts = text_field_parts(ty, &opts, None, binding, field_sym.as_str());
     vec![accumulator_append_call(string_interp(parts), ctx)]
 }
 
@@ -1806,24 +1807,14 @@ fn emit_hidden_field(
     let Some(field_sym) = field_symbol(field) else {
         return vec![accumulator_append_call(lit_str(String::new()), ctx)];
     };
-    let mut parts: Vec<InterpPart> = Vec::new();
-    parts.push(InterpPart::Text {
-        value: format!(
-            "<input type=\"hidden\"{}{}",
-            if ctx.hidden_autocomplete && !opts_have_key(opts, "autocomplete") { " autocomplete=\"off\"" } else { "" },
-            name_id_attrs_for(binding, field_sym.as_str(), opts)
-        ),
-    });
-    if !opts_have_value(opts) {
-        parts.push(InterpPart::Expr {
-            expr: view_helpers_call(
-                "optional_value_attr",
-                vec![field_value_read(binding, field_sym.clone(), ctx)],
-            ),
-        });
+    // `HiddenField` reverse-merges `autocomplete: "off"`, so it leads the options whoever set it.
+    let mut opts = opts.to_vec();
+    if ctx.hidden_autocomplete {
+        let autocomplete = super::attr_parts::take_opt(&mut opts, "autocomplete").unwrap_or_else(|| lit_str("off".to_string()));
+        opts.insert(0, (lit_sym(Symbol::from("autocomplete")), autocomplete));
     }
-    append_attr_parts(&mut parts, opts);
-    parts.push(InterpPart::Text { value: ">".to_string() });
+    let value = view_helpers_call("optional_value_attr", vec![field_value_read(binding, field_sym.clone(), ctx)]);
+    let parts = text_field_parts("hidden", &opts, Some(value), binding, field_sym.as_str());
     vec![accumulator_append_call(string_interp(parts), ctx)]
 }
 
@@ -1897,11 +1888,11 @@ fn name_id_attrs_for(binding: &FormBuilderBinding, field: &str, opts: &[(Expr, E
     out
 }
 
-/// The `<label for="...">` open fragment, prefixed for resource forms and
+/// The ` for="..."` fragment of a `<label>`, prefixed for resource forms and
 /// bare for non-resource forms (see `name_id_attrs`).
 fn label_for_attr(binding: &FormBuilderBinding, field: &str) -> String {
     format!(
-        "<label for=\"{}\"",
+        " for=\"{}\"",
         super::field_id(&binding.id_prefix, &binding.model_name, field)
     )
 }
@@ -1947,11 +1938,11 @@ fn emit_label(
     let Some(field_sym) = field_symbol(field) else {
         return vec![accumulator_append_call(lit_str(String::new()), ctx)];
     };
-    let mut parts: Vec<InterpPart> = Vec::new();
-    parts.push(InterpPart::Text {
-        value: label_for_attr(binding, field_sym.as_str()),
-    });
+    let mut parts = vec![InterpPart::Text { value: "<label".to_string() }];
     append_attr_parts(&mut parts, opts);
+    if !opts_have_key(opts, "for") {
+        parts.push(InterpPart::Text { value: label_for_attr(binding, field_sym.as_str()) });
+    }
     parts.push(InterpPart::Text { value: ">".to_string() });
     // Explicit text positional (`f.label :username, "Username:"`) wins
     // over the humanized field name; a literal folds into the text run,
@@ -1988,20 +1979,91 @@ fn emit_text_field(
     let Some(field_sym) = field_symbol(field) else {
         return vec![accumulator_append_call(lit_str(String::new()), ctx)];
     };
-    let field_str = field_sym.as_str();
-    let value_read = field_value_read(binding, field_sym.clone(), ctx);
-    let mut parts: Vec<InterpPart> = Vec::new();
-    parts.push(InterpPart::Text {
-        value: format!("<input type=\"text\"{}", name_id_attrs_for(binding, field_str, opts)),
-    });
-    parts.push(InterpPart::Expr {
-        expr: view_helpers_call("optional_value_attr", vec![value_read]),
-    });
-    append_attr_parts(&mut parts, opts);
-    parts.push(InterpPart::Text {
-        value: ">".to_string(),
-    });
+    let value = view_helpers_call("optional_value_attr", vec![field_value_read(binding, field_sym.clone(), ctx)]);
+    let parts = text_field_parts("text", opts, Some(value), binding, field_sym.as_str());
     vec![accumulator_append_call(string_interp(parts), ctx)]
+}
+
+/// `<input<opts>[ size] type="<ty>"<value> name="…" id="…" />` — Rails'
+/// `Tags::TextField#render`: the caller's options first, `size` taken
+/// from `maxlength:` when not given, `type` and the value unless the
+/// caller set them, then the name and id it did not, closed by `tag`'s
+/// ` />`. `value` is the computed ` value="…"` part, if the field has one.
+fn text_field_parts(
+    ty: &str,
+    opts: &[(Expr, Expr)],
+    value: Option<Expr>,
+    binding: &FormBuilderBinding,
+    field: &str,
+) -> Vec<InterpPart> {
+    let opts = &default_type_opt(opts, ty);
+    let mut parts = vec![InterpPart::Text { value: "<input".to_string() }];
+    append_attr_parts(&mut parts, opts);
+    if !opts_have_key(opts, "size")
+        && let Some(max) = opt_value(opts, "maxlength")
+    {
+        super::attr_parts::push_escaped_attr(&mut parts, "size", &max);
+    }
+    push_input_tail(&mut parts, ty, value.filter(|_| !opts_have_value(opts)), binding, field, opts);
+    parts
+}
+
+/// ` type="<ty>"`, then `value`, then the name and id, then ` />`: what
+/// every `TextField` subclass appends after its options.
+fn push_input_tail(
+    parts: &mut Vec<InterpPart>,
+    ty: &str,
+    value: Option<Expr>,
+    binding: &FormBuilderBinding,
+    field: &str,
+    opts: &[(Expr, Expr)],
+) {
+    if !opts_have_key(opts, "type") {
+        parts.push(InterpPart::Text { value: format!(" type=\"{ty}\"") });
+    }
+    if let Some(value) = value {
+        parts.push(InterpPart::Expr { expr: value });
+    }
+    parts.push(InterpPart::Text { value: format!("{} />", name_id_attrs_for(binding, field, opts)) });
+}
+
+/// The options with `key` set to `value` where the caller's stood, or after
+/// them: a Hash keeps an assigned key where it was (`options["type"] = "checkbox"`).
+fn assign_opt(opts: &[(Expr, Expr)], key: &str, value: Expr) -> Vec<(Expr, Expr)> {
+    let mut out = opts.to_vec();
+    match out.iter().position(|(k, _)| matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == key)) {
+        Some(i) => out[i].1 = value,
+        None => out.push((lit_sym(Symbol::from(key)), value)),
+    }
+    out
+}
+
+/// `options["type"] ||= field_type`: a caller's `type:` that is nil or false,
+/// at render or as a literal, is the field's own type, in its place.
+fn default_type_opt(opts: &[(Expr, Expr)], ty: &str) -> Vec<(Expr, Expr)> {
+    let Some(given) = opt_value(opts, "type") else {
+        return opts.to_vec();
+    };
+    let typed = match &*given.node {
+        ExprNode::Lit { value: Literal::Str { .. } | Literal::Sym { .. } } => given,
+        ExprNode::Lit { value: Literal::Nil | Literal::Bool { value: false } } => lit_str(ty.to_string()),
+        _ => Expr::new(
+            Span::synthetic(),
+            ExprNode::BoolOp {
+                op: crate::expr::BoolOpKind::Or,
+                surface: crate::expr::BoolOpSurface::Symbol,
+                left: given,
+                right: lit_str(ty.to_string()),
+            },
+        ),
+    };
+    assign_opt(opts, "type", typed)
+}
+
+fn opt_value(opts: &[(Expr, Expr)], key: &str) -> Option<Expr> {
+    opts.iter().find_map(|(k, v)| {
+        matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == key).then(|| v.clone())
+    })
 }
 
 /// A textarea has no `size` attribute. Rails splits `size: "100x5"`
@@ -2056,12 +2118,13 @@ fn emit_text_area(
     let mut opts = opts.to_vec();
     let body_value = super::attr_parts::take_opt(&mut opts, "value")
         .unwrap_or_else(|| field_value_read(binding, field_sym.clone(), ctx));
-    expand_textarea_size(&mut opts);
-    let mut parts: Vec<InterpPart> = Vec::new();
-    parts.push(InterpPart::Text {
-        value: format!("<textarea{}", name_id_attrs_for(binding, field_str, &opts)),
-    });
+    // Not split in place: Rails assigns `cols` / `rows` after `add_default_name_and_field`.
+    let mut sized = super::attr_parts::take_opt(&mut opts, "size").map(|size| vec![(lit_sym(Symbol::from("size")), size)]).unwrap_or_default();
+    expand_textarea_size(&mut sized);
+    let mut parts = vec![InterpPart::Text { value: "<textarea".to_string() }];
     append_attr_parts(&mut parts, &opts);
+    parts.push(InterpPart::Text { value: name_id_attrs_for(binding, field_str, &opts) });
+    append_attr_parts(&mut parts, &sized);
     // Rails opens a textarea's content with a newline (the HTML spec
     // lets a parser swallow one, so it protects a body that itself
     // starts with one).
@@ -2504,17 +2567,12 @@ fn emit_submit_input(label_expr: Expr, opts: &[(Expr, Expr)], ctx: &ViewCtx) -> 
         value: "<input type=\"submit\" name=\"commit\" value=\"".to_string(),
     });
     parts.push(InterpPart::Expr { expr: escaped_label });
-    parts.push(InterpPart::Text {
-        value: "\" data-disable-with=\"".to_string(),
-    });
-    parts.push(InterpPart::Expr { expr: escaped_data_disable });
-    parts.push(InterpPart::Text {
-        value: "\"".to_string(),
-    });
+    parts.push(InterpPart::Text { value: "\"".to_string() });
+    // Not before the options: `set_default_disable_with` adds the key after `{ type, name, value }.update(options)`.
     append_attr_parts(&mut parts, opts);
-    parts.push(InterpPart::Text {
-        value: ">".to_string(),
-    });
+    parts.push(InterpPart::Text { value: " data-disable-with=\"".to_string() });
+    parts.push(InterpPart::Expr { expr: escaped_data_disable });
+    parts.push(InterpPart::Text { value: "\" />".to_string() });
     vec![accumulator_append_call(string_interp(parts), ctx)]
 }
 

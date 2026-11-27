@@ -122,6 +122,19 @@ module ActionController
       c == "\x1e" || c == "\x1f" || c == "\x7f"
   end
 
+  # The first requested format that has an arm (or a `*/*`); "" for none.
+  def self.first_requested_format(accepted, order)
+    hits = []
+    i = 0
+    while i < accepted.length
+      name = accepted[i]
+      hits << name if name == "*/*" || order.include?(name)
+      i += 1
+    end
+    return "" if hits.empty?
+    hits[0].to_s
+  end
+
   def self.sanitize_location(path)
     s = path.to_s
     if s.include?("\r") || s.include?("\n") || s.include?("\0") || s.include?("\t")
@@ -728,6 +741,101 @@ module ActionController
     # The dispatcher sets it; false keeps every other request on the
     # html path.
     attr_accessor :accepts_any_format
+    # The request's raw `Accept` header ("" when it sent none), and the
+    # format its URL PINS ("" when it pins none): a `.json` suffix, a
+    # `(.:format)` segment, a route's `format:` default. The dispatchers
+    # set both; `negotiate_format` is the only reader.
+    attr_accessor :accept_header
+    attr_accessor :explicit_format
+    # Whether `Mime[explicit_format]` names a registered type: the
+    # dispatcher asks, as `Mime` is not on every target this class goes to.
+    attr_accessor :explicit_format_registered
+    # Rails' `ActionController::MimeResponds#respond_to` selection, for
+    # the arms the lowering registered (`order`, in source order, as
+    # format names: "html", "turbo_stream", "json", "any", …). Answers
+    # the name of the arm that handles this request, or "" when none
+    # does, which the lowered `respond_to` turns into
+    # `ActionController::UnknownFormat` (406).
+    #
+    # `Request#negotiate_mime`: the requested formats are tried in
+    # order; the first one with an arm wins; a `*/*` entry takes the
+    # FIRST arm; a request nothing answers falls to an `any` arm when
+    # there is one. The requested formats are the pinned format alone
+    # when the URL pins one (`params[:format]` beats `Accept`), else the
+    # parsed `Accept` list, else html.
+    #
+    # A caller that only set `request_format` (the test harness) pins it.
+    #
+    # `negotiate_template_format` is the implicit render's selection (`default_render`
+    # looks a TEMPLATE up against the request's formats, where a
+    # `respond_to` matches arms): a pinned format Rails' registry does not
+    # know (`?format=bogus`, `JSON`, `all`, an empty value) leaves the
+    # lookup unconstrained, so it takes the first template, as `*/*` does;
+    # a pinned `js` falls back to html (ActionView's `formats=`). Any
+    # other pinned format that has no template answers "" (406).
+    def negotiate_format(order)
+      negotiate_in(order, false)
+    end
+
+    # The implicit render's selection (see `template` above). A separate
+    # method rather than an optional argument: Spinel resolves calls by
+    # arity and does not honour the default.
+    def negotiate_template_format(order)
+      negotiate_in(order, true)
+    end
+
+    def negotiate_in(order, template)
+      pinned = @explicit_format
+      if pinned.empty? && @accept_header.empty? && @request_format != :html
+        pinned = @request_format.to_s
+      end
+      if !pinned.empty?
+        return pinned if order.include?(pinned)
+        if template
+          return "html" if pinned == "js" && order.include?("html")
+          return order[0].to_s unless @explicit_format_registered
+        end
+        return "any" if order.include?("any")
+        return ""
+      end
+      first = ActionController.first_requested_format(accepted_format_names, order)
+      if first.empty?
+        return "any" if order.include?("any")
+        return ""
+      end
+      return order[0].to_s if first == "*/*"
+      first
+    end
+
+    # What `ActionDispatch::PublicExceptions` answers for the
+    # `UnknownFormat` a `respond_to` raised: the status page in the
+    # format the request ASKED for. A json request gets Rails' json
+    # status document; every other format gets the empty html page
+    # (Rails renders other formats' status pages too — xml, text — which
+    # no app here reaches).
+    def unacceptable_requested_json?
+      requested = @explicit_format
+      if requested.empty?
+        names = accepted_format_names
+        requested = names[0].to_s if names.length > 0
+      end
+      requested == "json"
+    end
+
+    def unacceptable_body
+      unacceptable_requested_json? ? "{\"status\":406,\"error\":\"Not Acceptable\"}" : ""
+    end
+
+    def unacceptable_content_type
+      unacceptable_requested_json? ? "application/json; charset=UTF-8" : "text/html; charset=UTF-8"
+    end
+
+    # `Request#formats` from the `Accept` header, as format names in
+    # preference order. The dispatcher parses it once per request
+    # (`ActionDispatch::MimeNegotiation.accepted_formats`): only the ruby
+    # family carries that parser, and this class goes to every target.
+    attr_accessor :accepted_format_names
+
     # Rails' `request.should_apply_vary_header?`: the response format
     # was negotiated from the request's Accept header (no `format`
     # param, a non-browser Accept, or an XHR). The dispatcher sets it;
@@ -787,6 +895,10 @@ module ActionController
       @request_format = :html
       @query_string = +""
       @accepts_any_format = false
+      @accept_header = +""
+      @explicit_format = +""
+      @explicit_format_registered = true
+      @accepted_format_names = ["html"]
       @vary_on_accept = false
       @content_type = "text/html; charset=utf-8"
       @content_type_explicit = false
@@ -1244,7 +1356,7 @@ module ActionController
     # With no host at all, neither the request's nor the app's, the
     # path is the answer: Rails raises "Missing host to link to!", and
     # a path is what a browser resolves against the page it is on.
-    def url_from_path(path)
+    def url_from_path(path, call_protocol = nil, call_port = nil, call_port_given = false)
       options = default_url_options
       req_host = request_host_for_redirect
       protocol = request_protocol_for_url
@@ -1255,6 +1367,8 @@ module ActionController
       protocol = options.fetch(:protocol, nil).to_s if options.key?(:protocol)
       host = options.fetch(:host, nil).to_s if options.key?(:host)
       port = options.fetch(:port, nil).to_s if options.key?(:port)
+      protocol = call_protocol unless call_protocol.nil?
+      port = call_port.nil? ? "" : call_port.to_s if call_port_given
       return path if host == ""
       ActionController.build_host_url(protocol, host, port, path)
     end

@@ -338,6 +338,7 @@ pub fn apply_fused_mid_rewrites(app: &mut App, target: crate::build_target::Buil
     let readers = super::assoc_loaded::association_readers_by_model(app);
     let flat_loaded = super::assoc_loaded::flat_loaded_by_model(app);
     let sole_includer = app.sole_includer_of_modules();
+    let own_url_options = super::route_url_options::classes_with_own_url_options(app);
 
     super::for_each_owned_hook_body(app, &mut |owner, body| {
         walk_postorder(body, &mut |e| {
@@ -353,6 +354,7 @@ pub fn apply_fused_mid_rewrites(app: &mut App, target: crate::build_target::Buil
                 &by_model,
                 &readers,
                 &flat_loaded,
+                &own_url_options,
             );
         });
     });
@@ -370,6 +372,7 @@ pub fn apply_fused_mid_rewrites(app: &mut App, target: crate::build_target::Buil
                 &by_model,
                 &readers,
                 &flat_loaded,
+                &own_url_options,
             );
         });
     }
@@ -387,6 +390,7 @@ pub fn apply_fused_mid_rewrites(app: &mut App, target: crate::build_target::Buil
                 &by_model,
                 &readers,
                 &flat_loaded,
+                &own_url_options,
             );
         });
     });
@@ -404,18 +408,20 @@ fn rewrite_mid_node(
     by_model: &crate::det::HashMap<crate::ident::ClassId, crate::det::HashSet<Symbol>>,
     readers: &crate::det::HashMap<crate::ident::ClassId, crate::det::HashSet<Symbol>>,
     flat_loaded: &crate::det::HashMap<crate::ident::ClassId, crate::det::HashSet<Symbol>>,
+    own_url_options: &crate::det::HashSet<crate::ident::ClassId>,
 ) {
     if !helpers.is_empty() {
+        let own = enclosing.is_some_and(|c| own_url_options.contains(c));
         super::route_format_suffix::rewrite_node(e, helpers);
         // Format suffix can wrap a helper as `<call> + ".ext"`. Sequential
         // walks still visit that inner `recv: None` send; a fused callback
         // would otherwise only see `+` and skip position/host rewrites.
         if is_format_suffix_wrap(e, helpers) {
             if let ExprNode::Send { recv: Some(inner), .. } = &mut *e.node {
-                apply_route_url_followups(inner, position_path, path_params, helpers);
+                apply_route_url_followups(inner, position_path, path_params, helpers, own);
             }
         } else {
-            apply_route_url_followups(e, position_path, path_params, helpers);
+            apply_route_url_followups(e, position_path, path_params, helpers, own);
         }
     }
     if !enum_map.is_empty() {
@@ -433,11 +439,12 @@ fn apply_route_url_followups(
     position_path: bool,
     path_params: &crate::det::HashMap<String, Vec<String>>,
     helpers: &crate::det::HashSet<String>,
+    own_url_options: bool,
 ) {
     if position_path {
         super::route_url_options::rewrite_position_node(target, path_params);
     }
-    super::route_url_options::rewrite_node(target, helpers);
+    super::route_url_options::rewrite_owned_node(target, helpers, own_url_options);
 }
 
 /// True when `route_format_suffix` just replaced a helper with concat.

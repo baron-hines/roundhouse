@@ -16,6 +16,7 @@ fn a_partial_path_built_at_run_time_renders_the_partial_it_names() {
 {rows}def render(action, widget)
   controller = WidgetsController.new
   controller.params = {{"id" => widget.id.to_s}}
+  controller.request_format = :json
   controller.process_action(action)
   controller.body
 end

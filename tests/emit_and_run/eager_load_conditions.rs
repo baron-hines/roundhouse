@@ -1,7 +1,7 @@
 //! A condition on an `includes`d association (mission_control-jobs' `executions.includes(:job)` then
 //! `executions.where(job: { queue_name: … })`, each in its own method): Rails reads the association's name in the
 //! condition and loads it with a LEFT OUTER JOIN aliased to that name, or to the table when the condition names the
-//! table; a JOIN the query already has is reused. A string condition joins only after `references` names the table, and fails without it, as in Rails. The query used to keep the preload alone, and SQLite rejected `"article"."title"`. `EXPECTED` is what Rails
+//! table; a JOIN the query already has is reused. A string condition joins only after `references` names the table, and fails without it, as in Rails; `merge`, `and` and `or` carry the other relation's `references`. The query used to keep the preload alone, and SQLite rejected `"article"."title"`. `EXPECTED` is what Rails
 //! 8.1.4 answers for the same data (`conditions_on_an_included_association_match_rails`).
 
 #[path = "../support/prerequisite.rs"]
@@ -9,7 +9,7 @@ mod prerequisite;
 
 use super::emit_and_run;
 
-const FEED: &str = r#"class Feed
+const FEED: &str = r##"class Feed
   def by_association
     Comment.order(:id).includes(:article).where(article: { title: "First" }).map(&:commenter)
   end
@@ -26,10 +26,31 @@ const FEED: &str = r#"class Feed
     Comment.order(:id).includes(:article).references(:articles).where("articles.title = ?", "First").map(&:commenter)
   end
 
+  def merged
+    Comment.order(:id).includes(:article).where("articles.title = ?", "First").merge(Comment.references(:articles)).map(&:commenter)
+  end
+
+  def anded
+    Comment.order(:id).includes(:article).where("articles.title = ?", "Second").and(Comment.order(:id).includes(:article).references(:articles)).map(&:commenter)
+  end
+
+  def ored
+    Comment.order(:id).includes(:article).where("articles.title = ?", "Second").or(Comment.order(:id).includes(:article).references(:articles).where(commenter: "Cy")).map(&:commenter)
+  end
+
   def unreferenced
     Comment.order(:id).includes(:article).where("articles.title = ?", "First").map(&:commenter)
   rescue ActiveRecord::StatementInvalid
     ["refused"]
+  end
+
+  def rewritten
+    count = Comment.includes(:article).references(:articles).where("articles.title = ?", "First").update_all(body: "seen")
+    "#{count}:#{Comment.where(body: "seen").count}"
+  end
+
+  def removed
+    Comment.includes(:article).where("articles.title = ?", "Second").merge(Comment.references(:articles)).delete_all
   end
 
   def split
@@ -49,7 +70,7 @@ const FEED: &str = r#"class Feed
     comments.where(article: { title: "First" })
   end
 end
-"#;
+"##;
 
 fn app() -> emit_and_run::Overlay {
     emit_and_run::real_blog()
@@ -57,7 +78,7 @@ fn app() -> emit_and_run::Overlay {
         .write("app/models/feed.rb", FEED)
         .write(
             "app/controllers/feeds_controller.rb",
-            "class FeedsController < ApplicationController\n  def index\n    feed = Feed.new\n    render plain: \"#{feed.by_association.join(\",\")} #{feed.by_table.join(\",\")} #{feed.split.join(\",\")} #{feed.joined.join(\",\")} #{feed.referenced.join(\",\")} #{feed.unreferenced.join(\",\")}\"\n  end\nend\n",
+            "class FeedsController < ApplicationController\n  def index\n    feed = Feed.new\n    render plain: \"#{feed.by_association.join(\",\")} #{feed.by_table.join(\",\")} #{feed.split.join(\",\")} #{feed.joined.join(\",\")} #{feed.referenced.join(\",\")} #{feed.merged.join(\",\")} #{feed.anded.join(\",\")} #{feed.ored.join(\",\")} #{feed.unreferenced.join(\",\")} #{feed.rewritten} #{feed.removed}\"\n  end\nend\n",
         )
 }
 
@@ -68,7 +89,7 @@ Comment.create!(article: second, commenter: "Bob", body: "A comment")
 Comment.create!(article: first, commenter: "Cy", body: "A comment")
 "#;
 
-const EXPECTED: &str = "Ann,Cy Bob Ann,Cy Bob Ann,Cy refused";
+const EXPECTED: &str = "Ann,Cy Bob Ann,Cy Bob Ann,Cy Ann,Cy Bob Bob,Cy refused 2:2 1";
 
 #[test]
 fn conditions_on_an_included_association_join_it() {
@@ -126,7 +147,7 @@ class Comment < ActiveRecord::Base
   belongs_to :article
 end
 {FEED}{SEED}feed = Feed.new
-print "#{{feed.by_association.join(",")}} #{{feed.by_table.join(",")}} #{{feed.split.join(",")}} #{{feed.joined.join(",")}} #{{feed.referenced.join(",")}} #{{feed.unreferenced.join(",")}}"
+print "#{{feed.by_association.join(",")}} #{{feed.by_table.join(",")}} #{{feed.split.join(",")}} #{{feed.joined.join(",")}} #{{feed.referenced.join(",")}} #{{feed.merged.join(",")}} #{{feed.anded.join(",")}} #{{feed.ored.join(",")}} #{{feed.unreferenced.join(",")}} #{{feed.rewritten}} #{{feed.removed}}"
 "##
     );
     let output = std::process::Command::new("ruby").args(["-e", &script]).output().expect("Rails oracle");

@@ -75,7 +75,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::app::App;
 use crate::build_target::BuildTarget;
 use crate::expr::{Expr, ExprNode, LValue, Literal};
-use crate::ident::{ClassId, Symbol};
+use crate::ident::{ClassId, Symbol, VarId};
 use crate::ty::Ty;
 
 /// Ground duration-unit sends across every app body the post-analyze
@@ -193,6 +193,7 @@ pub(crate) fn apply_duration_rewrites(body: &mut Expr, temporal_predicates: bool
     if temporal_predicates {
         rewrite_temporal_predicates(body);
     }
+    lift_guarded_durations(body);
     rewrite_duration_comparisons(body);
     rewrite_time_duration_arith(body, time_operands);
     rewrite_expires_in(body);
@@ -499,6 +500,51 @@ const SECONDS_PER_DAY: f64 = 86_400.0;
 /// grounding it to plain seconds answers a different question — and
 /// raised on every /newest render when an earlier attempt did exactly
 /// that. See the module header's TIME INTEROP note.
+/// `t < (r.is_a?(Numeric) ? Duration.seconds(r) : r.seconds)` as `r.is_a?(Numeric) ? t < Duration.seconds(r) : t < r.seconds`,
+/// so the comparison and arithmetic rules see the Duration operand.
+fn lift_guarded_durations(expr: &mut Expr) {
+    expr.node.for_each_child_mut(&mut lift_guarded_durations);
+    let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &mut *expr.node else { return };
+    if args.len() != 1 || !matches!(method.as_str(), "<" | "<=" | ">" | ">=" | "+" | "-") {
+        return;
+    }
+    let cmp = !matches!(method.as_str(), "+" | "-");
+    // Not past a side with an effect: the lifted test now runs before it.
+    let arg_side = is_guarded_duration(&args[0]) && is_plain_read(recv);
+    let recv_side = cmp && !arg_side && is_guarded_duration(recv) && is_plain_read(&args[0]);
+    if !arg_side && !recv_side {
+        return;
+    }
+    let span = expr.span;
+    let ty = expr.ty.clone();
+    let ExprNode::Send { recv: Some(recv), method, args, .. } = &mut *expr.node else { unreachable!() };
+    let guarded = if arg_side { take(&mut args[0]) } else { take(recv) };
+    let ExprNode::If { cond, then_branch, else_branch } = *guarded.node else { unreachable!() };
+    let other = if arg_side { take(recv) } else { take(&mut args[0]) };
+    let branch = |side: Expr| {
+        let (l, r) = if arg_side { (other.clone(), side) } else { (side, other.clone()) };
+        Expr { ty: ty.clone(), ..Expr::new(span, ExprNode::Send { recv: Some(l), method: method.clone(), args: vec![r], block: None, parenthesized: false }) }
+    };
+    let (then_branch, else_branch) = (branch(then_branch), branch(else_branch));
+    *expr = Expr { ty, ..Expr::new(span, ExprNode::If { cond, then_branch, else_branch }) };
+}
+
+/// The guard `rewrite_durations` writes around a unit call on a receiver that may not be Numeric.
+fn is_guarded_duration(e: &Expr) -> bool {
+    matches!(&*e.node, ExprNode::If { cond, then_branch, .. }
+        if is_duration_const_call(then_branch)
+            && matches!(&*cond.node, ExprNode::Send { method, args, .. }
+                if method.as_str() == "is_a?" && matches!(args.as_slice(), [a] if matches!(&*a.node, ExprNode::Const { path } if path.len() == 1 && path[0].as_str() == "Numeric"))))
+}
+
+fn is_plain_read(e: &Expr) -> bool {
+    match &*e.node {
+        ExprNode::Var { .. } | ExprNode::Ivar { .. } | ExprNode::Const { .. } | ExprNode::Lit { .. } => true,
+        ExprNode::Send { recv: Some(r), args, block: None, .. } => args.is_empty() && matches!(&*r.node, ExprNode::Const { .. }),
+        _ => false,
+    }
+}
+
 fn rewrite_duration_comparisons(expr: &mut Expr) {
     expr.node.for_each_child_mut(&mut rewrite_duration_comparisons);
     let is_cmp = matches!(
@@ -649,8 +695,20 @@ pub(crate) fn rewrite_durations(expr: &mut Expr, defined: &BTreeSet<String>) {
     // Not a Duration outright where a class's own reader shares the unit's name: Ruby picks by the receiver's class.
     let guarded = rewrite
         && matches!(&*expr.node, ExprNode::Send { recv: Some(r), method, .. }
-            if !is_numeric_expr(r) && defined.contains(method.as_str())
-                && matches!(&*r.node, ExprNode::Var { .. } | ExprNode::Ivar { .. } | ExprNode::Const { .. }));
+            if !is_numeric_expr(r) && defined.contains(method.as_str()));
+    // Not read twice: a receiver that runs something (`fetch.seconds`) is bound once in the test and both arms read the binding.
+    let bound = guarded.then(|| match &*expr.node {
+        ExprNode::Send { recv: Some(r), .. } if !matches!(&*r.node, ExprNode::Var { .. } | ExprNode::Ivar { .. } | ExprNode::Const { .. }) => {
+            let name = Symbol::from(format!("_duration_receiver_{}", expr.span.start));
+            let value = r.clone();
+            let mut read = Expr::new(r.span, ExprNode::Var { id: VarId(0), name: name.clone() });
+            read.ty = r.ty.clone();
+            let ExprNode::Send { recv, .. } = &mut *expr.node else { unreachable!() };
+            *recv = Some(read);
+            Some((name, value))
+        }
+        _ => None,
+    }).flatten();
     let reader = guarded.then(|| expr.clone());
     if rewrite {
         let span = expr.span;
@@ -678,8 +736,13 @@ pub(crate) fn rewrite_durations(expr: &mut Expr, defined: &BTreeSet<String>) {
         let ExprNode::Send { args, .. } = &*expr.node else { return };
         let span = expr.span;
         let numeric = Expr::new(span, ExprNode::Const { path: vec![Symbol::from("Numeric")] });
+        // Bound in the test itself, not by a `Let`: a Let renders as statements, and `x = <Let>` stored the receiver.
+        let tested = match &bound {
+            Some((name, value)) => Expr::new(span, ExprNode::Assign { target: LValue::Var { id: VarId(0), name: name.clone() }, value: value.clone() }),
+            None => args[0].clone(),
+        };
         let cond = Expr::new(span, ExprNode::Send {
-            recv: Some(args[0].clone()),
+            recv: Some(tested),
             method: Symbol::from("is_a?"),
             args: vec![numeric],
             block: None,

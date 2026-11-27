@@ -1094,7 +1094,7 @@ fn subclass_template_hooks(
                         parenthesized: true,
                     },
                 );
-                rewrites::rewrite_render_to_views(&render, Some(&module), &[], view_ivars, partials, &template, true, false, &[], overlaid(controller, controllers))
+                rewrites::rewrite_render_to_views(&render, Some(&module), &[], view_ivars, partials, &template, true, false, &[], overlaid(controller, controllers), &[])
             };
             methods.push(MethodDef {
                 visibility: crate::dialect::MethodVisibility::Public,
@@ -1468,6 +1468,7 @@ fn build_methods(
                 format_breadth, &shadows, route_id_segments, false, false, None, None, &[],
                 /*preserve_named_layout=*/ true, overlaid(controller, all_controllers),
                 &descendant_method_names(controller, all_controllers),
+                &ancestor_view_modules(controller, all_controllers),
             ).0
         });
         // Template lowering can introduce a read of self.action_name.
@@ -2703,6 +2704,19 @@ fn inheritor_view_modules(controller: &Controller, all: &[Controller]) -> Vec<St
         .collect()
 }
 
+/// The view modules Rails' partial lookup falls back through: each
+/// ancestor controller's view directory, nearest first
+/// (`ApplicationController` is `Application`).
+fn ancestor_view_modules(controller: &Controller, all: &[Controller]) -> Vec<String> {
+    ancestor_chain(controller, all)
+        .iter()
+        .rev()
+        .filter_map(|c| c.name.0.as_str().strip_suffix("Controller"))
+        .filter(|stem| !stem.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// Every method name a controller below this one defines (its own or a concern's): an inherited action
 /// calling one of these by name runs that subclass's definition on the subclass's routes.
 fn descendant_method_names(controller: &Controller, all: &[Controller]) -> crate::det::HashSet<Symbol> {
@@ -2764,7 +2778,7 @@ fn reads_action_name(
             // diagnostics; inspecting its binding must not report them.
             let (bound, _) = crate::emit::diagnostics::scope(|| rewrite_render_to_views(
                 e, views_module_name(c).as_deref(), &[], view_ivars, partials,
-                "", false, false, &[], false,
+                "", false, false, &[], false, &ancestor_view_modules(c, all),
             ));
             reads(&bound)
         }
@@ -2827,7 +2841,7 @@ mod action_name_probe_tests {
         let action = controller.actions().next().expect("index action");
         let (_, actual) = crate::emit::diagnostics::scope(|| {
             rewrite_render_to_views(&action.body, Some("Probes"), &[], &views,
-                &partials, "index", true, false, &[], false)
+                &partials, "index", true, false, &[], false, &[])
         });
         assert_eq!(actual.len(), 1, "actual lowering diagnostics: {actual:?}");
         assert!(matches!(&actual[0].kind,
@@ -3323,6 +3337,7 @@ fn action_to_method(
         can_respond_within(&a.body, &resolve, &mut std::collections::BTreeSet::new())
     };
     let inheritor_modules = inheritor_view_modules(controller, all_controllers_for_params);
+    let ancestor_modules = ancestor_view_modules(controller, all_controllers_for_params);
     let chain: Vec<&Controller> = std::iter::once(controller).chain(ancestor_chain(controller, all_controllers_for_params).into_iter().rev()).collect();
     let responder_expr = chain.iter().find_map(|c| {
         c.body.iter().find_map(|item| {
@@ -3382,6 +3397,7 @@ fn action_to_method(
         /*preserve_named_layout=*/ false,
         overlaid(controller, all_controllers_for_params),
         &descendant_method_names(controller, all_controllers_for_params),
+        &ancestor_modules,
     );
     if let Some(tail) = deferred_tail {
         deferred_out.insert(a.name.clone(), tail);
@@ -3629,6 +3645,9 @@ fn lower_action_body(
     overlaid: bool,
     // Method names a subclass redefines (`descendant_method_names`).
     overridden_below: &crate::det::HashSet<Symbol>,
+    // The Views modules of this controller's ancestors, nearest first,
+    // where a bare partial name is looked up after its own.
+    ancestor_modules: &[String],
 ) -> (Expr, Option<Expr>) {
     // BEFORE everything else: this turns a helper the permit recognizer
     // could not read into one that yields the params class, so every
@@ -3651,7 +3670,16 @@ fn lower_action_body(
         }
         None => body.clone(),
     };
-    let unwrapped = unwrap_respond_to_with_format_dispatch(body, format_breadth);
+    let unwrapped = crate::lower::controller::body::unwrap_respond_to_for_action(
+        body,
+        format_breadth,
+        crate::lower::controller::body::ActionFormats {
+            action: is_public.then_some(action_name),
+            variants,
+            html_template: view_ivars
+                .contains_key(&(views_module_name(controller).unwrap_or_default(), action_name.to_string())),
+        },
+    );
     // `is_public` gates the SYNTHESIS — a private helper's caller does
     // the rendering, so nothing is appended to its body — and nothing
     // else. The render REWRITE runs on both: a private helper that
@@ -3714,10 +3742,12 @@ fn lower_action_body(
         // Two reasons to want that: the tail is about to move to the
         // dispatcher because something else (a subclass past `super`) may
         // respond, or a private helper in this body already has.
-        synthesize_deferred_implicit_render(&unwrapped, action_name, variants, any_template_exists, html_exists)
+        synthesize_deferred_implicit_render(
+            &unwrapped, action_name, variants, any_template_exists, html_exists, format_breadth.negotiates,
+        )
     } else {
         crate::lower::controller::body::synthesize_implicit_render_with_html(
-            &unwrapped, action_name, variants, any_template_exists, html_exists,
+            &unwrapped, action_name, variants, any_template_exists, html_exists, format_breadth.negotiates,
         )
     };
     let module_name = views_module_name(controller);
@@ -3734,6 +3764,7 @@ fn lower_action_body(
             preserve_named_layout,
             inheritor_modules,
             overlaid,
+            ancestor_modules,
         )
     };
 

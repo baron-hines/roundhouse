@@ -3,6 +3,38 @@
 
 package v2
 
+import (
+	"math"
+	"strconv"
+	"strings"
+)
+
+// RhFloatToS is Ruby's Float#to_s: a whole value keeps ".0" ("1.0"), and
+// below 1e-4 or from 1e15 it is "1.0e+20", where Go's %g gives "1" and "1e+20".
+func RhFloatToS(f float64) string {
+	switch {
+	case math.IsNaN(f):
+		return "NaN"
+	case math.IsInf(f, 1):
+		return "Infinity"
+	case math.IsInf(f, -1):
+		return "-Infinity"
+	}
+	mant, exp, _ := strings.Cut(strconv.FormatFloat(f, 'e', -1, 64), "e")
+	// Not by the magnitude: Ruby decides on the shortest digits' exponent, which rounding can lift past the bound.
+	if e, _ := strconv.Atoi(exp); f == 0 || (e >= -4 && e <= 14) {
+		s := strconv.FormatFloat(f, 'f', -1, 64)
+		if !strings.Contains(s, ".") {
+			s += ".0"
+		}
+		return s
+	}
+	if !strings.Contains(mant, ".") {
+		mant += ".0"
+	}
+	return mant + "e" + exp
+}
+
 // RhStrSlice is Ruby's `str[start, length]`: character-indexed, a
 // negative start counting from the end, and CLAMPED to the string —
 // `"abc"[1, 10]` is `"bc"`. Go's `s[a:a+n]` panics past the end and

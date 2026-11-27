@@ -1976,7 +1976,7 @@ fn lowered_show_view_form_with_nested_array_model_dispatches_form_builder() {
     );
     // Inline form.X expansions read attributes through form_record.
     assert!(
-        src.contains("<label for=\\\"comment_commenter\\\"")
+        src.contains("\\\" for=\\\"comment_commenter\\\">Commenter</label>")
             && src.contains(">Commenter</label>"),
         "expected inline commenter label; got:\n{src}",
     );

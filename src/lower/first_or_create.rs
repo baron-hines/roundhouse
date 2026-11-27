@@ -80,11 +80,11 @@ pub fn apply_first_or_create_lowering(app: &mut App) -> Vec<crate::diagnostic::D
         let defines = |model: &crate::dialect::Model, name: &str| model.body.iter().any(|item| matches!(item,
             crate::dialect::ModelBodyItem::Method { method, .. }
                 if method.receiver == crate::dialect::MethodReceiver::Instance && method.name.as_str() == name));
-        // Not a private `def after_initialize`: the factory calls the hook on the record, which a private method refuses.
+        // Not a private or protected `def after_initialize`: the factory calls the hook on the record from the caller's scope, which both refuse.
         let private_hook = model.body.iter().any(|item| matches!(item,
             crate::dialect::ModelBodyItem::Method { method, .. }
                 if method.receiver == crate::dialect::MethodReceiver::Instance && method.name.as_str() == "after_initialize"
-                    && method.visibility == crate::dialect::MethodVisibility::Private));
+                    && method.visibility != crate::dialect::MethodVisibility::Public));
         let other_hook = defines(model, "initialize") || private_hook
             || std::iter::successors(model.parent.as_ref().and_then(|p| app.models.iter().find(|m| &m.name == p)), |model| {
                 model.parent.as_ref().and_then(|parent| app.models.iter().find(|m| &m.name == parent))

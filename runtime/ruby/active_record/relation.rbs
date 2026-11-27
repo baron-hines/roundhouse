@@ -246,6 +246,8 @@ module ActiveRecord
     def preload_associations: (Array[Base] records) -> Array[Base]
     def references: (*Symbol names) -> Relation
     def reference_names!: (Array[Symbol] names) -> Relation
+    def reference_names: () -> Array[String]
+    def merge_reference_names!: (Relation other) -> nil
     def merge: (Relation other) -> Relation
     def merge!: (Relation other) -> Relation
     def merge_orders!: (Relation other) -> nil

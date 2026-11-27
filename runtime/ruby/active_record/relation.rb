@@ -642,8 +642,10 @@ module ActiveRecord
     end
 
     def or!(other)
-      return self if other.null_relation?
+      own_lists
       unload_records
+      merge_reference_names!(other)
+      return self if other.null_relation?
       mine = @wheres.length > 0 ? @wheres.join(" AND ") : "1=1"
       other_wheres = other.where_clauses
       theirs = other_wheres.length > 0 ? other_wheres.join(" AND ") : "1=1"
@@ -677,6 +679,7 @@ module ActiveRecord
         end
       end
       other.having_clauses.each { |h| @havings << h unless @havings.include?(h) }
+      merge_reference_names!(other)
       mark_null! if other.null_relation?
       @none = true if other.explicit_none?
       self
@@ -1631,6 +1634,16 @@ module ActiveRecord
       self
     end
 
+    def reference_names
+      @references
+    end
+
+    # Rails' `references_values |= other.references_values`, for `or`, `and` and `merge`.
+    def merge_reference_names!(other)
+      other.reference_names.each { |n| @references << n unless @references.include?(n) }
+      nil
+    end
+
     # `merge(other)` — fold another relation's WHEREs and ORDER BY in.
     # v1 handles the common case (merging a same-table scope's conditions).
     def merge(other)
@@ -1644,6 +1657,7 @@ module ActiveRecord
         push_where(w)
         @opaque_wheres = true
       end
+      merge_reference_names!(other)
       merge_orders!(other)
       mark_null! if other.null_relation?
       @none = true if other.explicit_none?
@@ -3231,12 +3245,14 @@ module ActiveRecord
     # statement, not a subquery over every row.
     def scoped_write_where
       windowed = @orders.length > 0 || !@limit.nil? || !@offset.nil?
-      return "" if @wheres.length == 0 && @joins.length == 0 && !windowed
-      if @joins.length == 0 && !windowed
+      # Not `@joins` alone: an `includes` a condition or `references` names joins too, as a read renders it.
+      joined = rendered_joins.length > 0
+      return "" if @wheres.length == 0 && !joined && !windowed
+      if !joined && !windowed
         return " WHERE #{@wheres.join(" AND ")}"
       end
       primary_key = @model.primary_key
-      if windowed && @joins.length > 0
+      if windowed && joined
         inner = append_window(append_join_where("SELECT #{@model._columns_sql} FROM #{@table}"))
         return " WHERE #{primary_key} IN (SELECT #{primary_key} FROM (#{inner}) AS __rh_window)"
       end
