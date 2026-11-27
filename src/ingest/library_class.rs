@@ -3737,6 +3737,20 @@ fn walk_decl_body_with_visibility<'pr>(
     mode: DeclBodyMode,
     visibility: &Visibility,
 ) -> IngestResult<DeclBody> {
+    walk_decl_body_hosted(body, owner, file, mode, visibility, None)
+}
+
+/// `walk_decl_body_with_visibility` for a `class_eval` loop's string in a concern body (#2278): `host_defs` are
+/// that body's own `def` names, which the string's `included do` hoist treats as the body's, as it does for the
+/// body's own `included do`.
+fn walk_decl_body_hosted<'pr>(
+    body: Option<ruby_prism::Node<'pr>>,
+    owner: &ClassId,
+    file: &str,
+    mode: DeclBodyMode,
+    visibility: &Visibility,
+    host_defs: Option<&HashSet<String>>,
+) -> IngestResult<DeclBody> {
     let mut out = DeclBody::default();
     let mut class_attributes: HashSet<Symbol> = HashSet::default();
     let mut class_attr_defaults: IndexMap<Symbol, Expr> = IndexMap::new();
@@ -3868,6 +3882,7 @@ fn walk_decl_body_with_visibility<'pr>(
                 let def = definition.as_ref().unwrap_or(stmt).as_def_node()?;
                 def.receiver().is_none().then(|| constant_id_str(&def.name()).to_string())
             })
+            .chain(host_defs.into_iter().flatten().cloned())
             .collect()
     });
     let concern_class_defs: Option<HashSet<String>> = concern_direct_defs.as_ref().map(|_| {
@@ -4977,10 +4992,51 @@ fn walk_decl_body_with_visibility<'pr>(
     // later `def` of the body replaces one of them only by name, which no target here orders by.
     let mut from_eval: Vec<usize> = Vec::new();
     for ((start, end), source) in evaled {
-        let wrapped = format!("class RoundhouseClassEval\n{source}\nend\n");
-        let (parsed, _) = super::prism::scope(|| super::ingest_library_classes(wrapped.as_bytes(), file));
-        let mut classes = parsed?;
-        let Some(class) = classes.pop() else { continue };
+        // In a body that extends ActiveSupport::Concern the string runs there too, so its `included do` is the
+        // concern's hook (#2278): the wrapper extends it as well, and its body is walked with this body's own `def`
+        // names (`walk_decl_body_hosted`), so the hoist keeps a colliding hook def in the block, as it does for
+        // this body's own `included do`. The wrapper's `extend` is not the string's.
+        let (includes, unknown_calls, methods) = match &concern_direct_defs {
+            Some(direct) => {
+                let prefix = "class RoundhouseClassEval\nextend ActiveSupport::Concern\n";
+                let wrapped = format!("{prefix}{source}\nend\n");
+                let (walked, _) = super::prism::scope(|| -> IngestResult<Option<DeclBody>> {
+                    let parsed = super::prism::parse(wrapped.as_bytes(), file);
+                    let root = parsed.node();
+                    let Some(class) = root.as_program_node().and_then(|p| p.statements().body().iter().find_map(|s| s.as_class_node())) else {
+                        return Ok(None);
+                    };
+                    let owner = ClassId(Symbol::from("RoundhouseClassEval"));
+                    let visibility = Visibility::resolve_library_carrying(class.body().as_ref(), file, None, Some(&owner))?;
+                    walk_decl_body_hosted(class.body(), &owner, file, DeclBodyMode::Instance, &visibility, Some(direct)).map(Some)
+                });
+                let Some(mut walked) = walked? else { continue };
+                // As a class body's are: its `@x = …` statements are not class-body calls.
+                take_class_ivar_initializers(&mut walked.unknown_calls);
+                walked.unknown_calls.retain(|call| call.span.is_synthetic() || call.span.start >= prefix.len() as u32);
+                (walked.includes, walked.unknown_calls, walked.methods)
+            }
+            None => {
+                let wrapped = format!("class RoundhouseClassEval\n{source}\nend\n");
+                let (parsed, _) = super::prism::scope(|| super::ingest_library_classes(wrapped.as_bytes(), file));
+                let mut classes = parsed?;
+                let Some(class) = classes.pop() else { continue };
+                (class.includes, class.unknown_calls, class.methods)
+            }
+        };
+        // The string's `included` blocks, at their offsets in it, and a span inside the loop's own for them and the
+        // defs hoisted out of them: a `def` the string writes beside the block stays at the loop's span, which the
+        // block's no longer holds, so it is not read as the hook's (`in_included_hook`).
+        let hooks: Vec<Span> = unknown_calls
+            .iter()
+            .filter(|call| {
+                concern_direct_defs.is_some()
+                    && matches!(&*call.node, ExprNode::Send { recv: None, method, block: Some(_), .. } if method.as_str() == "included")
+            })
+            .map(|call| call.span)
+            .collect();
+        let in_hook = |at: Span| hooks.iter().any(|h| h.start <= at.start && at.end <= h.end);
+        let at_hook = Span { file: super::sources::file_id(file), start: start + 1, end };
         // Not its methods alone: an `include` or another class-body call the string makes is the body's too.
         // Each has the loop's span, as it runs there: a name the string spells (`include Leaf`, the host's nested
         // `Leaf`) is looked up in the loop, and an `extend` it makes runs after the includes written ahead of the
@@ -4993,7 +5049,7 @@ fn walk_decl_body_with_visibility<'pr>(
         } else {
             out.includes.len()
         };
-        for include in &class.includes {
+        for include in &includes {
             if spanned {
                 out.includes.insert(at, include.clone());
                 out.include_spans.insert(at, at_loop);
@@ -5010,13 +5066,13 @@ fn walk_decl_body_with_visibility<'pr>(
             }
             e.node.for_each_child_mut(&mut mark_constants);
         }
-        out.unknown_calls.extend(class.unknown_calls.iter().map(|call| {
+        out.unknown_calls.extend(unknown_calls.iter().map(|call| {
             let mut call = call.clone();
-            call.span = at_loop;
+            call.span = if in_hook(call.span) { at_hook } else { at_loop };
             mark_constants(&mut call);
             call
         }));
-        for mut method in class.methods {
+        for mut method in methods {
             mark_constants(&mut method.body);
             for param in &mut method.params {
                 if let Some(default) = param.default.as_mut() {
@@ -5028,7 +5084,7 @@ fn walk_decl_body_with_visibility<'pr>(
                 method.receiver = MethodReceiver::Class;
             }
             // At the loop: the carrier spans (`ingest_concern_class_method_spans`) name it, as they do the body's `def`s.
-            method.name_span = Span { file: super::sources::file_id(file), start, end };
+            method.name_span = if in_hook(method.name_span) { at_hook } else { at_loop };
             match out.methods.iter().position(|m| m.name == method.name && m.receiver == method.receiver) {
                 // A later string's `def` replaces an earlier string's, as Ruby runs them in order.
                 Some(at) if from_eval.contains(&at) => out.methods[at] = method,
@@ -5063,6 +5119,23 @@ fn unroll_class_eval_loops<'pr>(statements: Vec<ruby_prism::Node<'pr>>) -> (Vec<
         }
     }
     (kept, evaled)
+}
+
+/// Whether a module body extends ActiveSupport::Concern and runs a `class_eval` loop `unroll_class_eval_loops`
+/// evaluates: the loop's string runs in the concern, and an `included do` it writes is the concern's hook (#2278),
+/// so the module is kept although it writes no `def` of its own.
+pub(super) fn concern_body_evaluates_class_eval_loop(statements: &[ruby_prism::Node<'_>]) -> bool {
+    let extends_concern = statements.iter().any(|stmt| {
+        stmt.as_call_node().is_some_and(|call| {
+            call.receiver().is_none_or(|r| r.as_self_node().is_some())
+                && constant_id_str(&call.name()) == "extend"
+                && call.arguments().is_some_and(|args| {
+                    args.arguments().iter().any(|arg| constant_path_of(&arg).is_some_and(|path| path.join("::") == "ActiveSupport::Concern"))
+                })
+        })
+    });
+    let lists = class_attribute_lists(statements);
+    extends_concern && statements.iter().any(|stmt| class_eval_loop_sources(stmt, &lists).is_some())
 }
 
 /// Rails 8's `FormBuilder.field_helpers`, also the list without a lockfile; Rails 7 spells two of them
