@@ -60,6 +60,8 @@ fn forwarded_block_may_be_nil(ty: &Ty) -> bool {
 
 mod class_side_miss;
 mod diagnostic;
+mod session_keys;
+pub(crate) use session_keys::app_session_key_types;
 pub(crate) use diagnostic::some_operands_take_it;
 mod const_resolution;
 mod lambda_local;
@@ -596,6 +598,8 @@ pub struct BodyTyper<'a> {
     constant_predicates: Option<&'a HashMap<(ClassId, Symbol), bool>>,
     predicate_bodies: Option<&'a HashMap<(ClassId, Symbol), (Vec<Symbol>, Expr)>>,
     relation_params: Option<&'a crate::analyze::relation_params::RelationParams>,
+    /// What the app stores under each session key (`session_keys`).
+    session_key_types: Option<&'a HashMap<String, Ty>>,
     /// Methods whose value is an ActiveSupport inquirer (see
     /// [`crate::analyze::inquiry`]); empty for the bare constructor,
     /// which the runtime-source typer and tests use.
@@ -827,6 +831,7 @@ impl<'a> BodyTyper<'a> {
             constant_predicates: None,
             predicate_bodies: None,
             relation_params: None,
+            session_key_types: None,
             inquirers: None,
             i18n: None,
             helper_modules: None,
@@ -1011,6 +1016,11 @@ impl<'a> BodyTyper<'a> {
 
     pub(super) fn with_relation_params(mut self, params: &'a crate::analyze::relation_params::RelationParams) -> Self {
         self.relation_params = Some(params);
+        self
+    }
+
+    pub(super) fn with_session_key_types(mut self, keys: &'a HashMap<String, Ty>) -> Self {
+        self.session_key_types = Some(keys);
         self
     }
 
@@ -3581,6 +3591,9 @@ impl<'a> BodyTyper<'a> {
                         || (receiver_is_instance && matches!(recv_ty.as_ref(), Some(Ty::Union { .. }))));
                 if let Some(rel) = self.coerced_operator(recv_ty.as_ref(), method, args) {
                     dispatched = rel;
+                }
+                if let Some(stored) = self.session_read(recv_ty.as_ref(), method, args) {
+                    dispatched = stored;
                 }
                 if block.is_none()
                     && let Some(r) = recv.as_ref()

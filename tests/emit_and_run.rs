@@ -14,6 +14,8 @@ mod data_record_siblings;
 mod scratch;
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
+#[path = "emit_and_run/session_read_untyped.rs"]
+mod session_read_untyped;
 #[path = "support/native_http.rs"]
 #[allow(dead_code)]
 mod native_http;

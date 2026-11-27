@@ -220,6 +220,8 @@ pub struct Analyzer {
     predicate_bodies: HashMap<(ClassId, Symbol), (Vec<Symbol>, Expr)>,
     /// [`relation_params::relation_params`] of the app.
     relation_params: relation_params::RelationParams,
+    /// What the app stores under each session key, refreshed each production round (`body::app_session_key_types`).
+    session_key_types: HashMap<String, Ty>,
     /// Registered Data factories that use the generated initializer, so
     /// `.new` call-site types do not manufacture a source `initialize`.
     data_factories_without_custom_initialize: HashSet<ClassId>,
@@ -1539,6 +1541,7 @@ impl Analyzer {
             constant_predicates: constant_predicates(app),
             predicate_bodies: predicate_bodies(app),
             relation_params: relation_params::relation_params(app),
+            session_key_types: HashMap::default(),
             data_factories_without_custom_initialize,
             view_seeds: None,
             callers_by_target: HashMap::default(),
@@ -1560,6 +1563,15 @@ impl Analyzer {
 
     /// Build a body-typer borrowing this analyzer's dispatch tables.
     /// Cheap — just a struct with a reference.
+    /// Re-join what the app stores under each session key (`body::app_session_key_types`); true when it
+    /// moved, so a write typed this round retypes every read of its key, wherever it is.
+    fn refresh_session_key_types(&mut self, app: &App) -> bool {
+        let keys = body::app_session_key_types(app);
+        let moved = keys != self.session_key_types;
+        self.session_key_types = keys;
+        moved
+    }
+
     fn body_typer(&self) -> BodyTyper<'_> {
         let typer = BodyTyper::new(&self.classes)
             .with_module_self_types(&self.module_self_types)
@@ -1570,7 +1582,7 @@ impl Analyzer {
             .with_open_classes(&self.open_classes)
             .with_typed_constants(&self.typed_constants)
             .with_data_factories(&self.data_factories);
-        let typer = typer.with_class_factories(&self.class_factories).with_constant_predicates(&self.constant_predicates).with_predicate_bodies(&self.predicate_bodies).with_relation_params(&self.relation_params);
+        let typer = typer.with_class_factories(&self.class_factories).with_constant_predicates(&self.constant_predicates).with_predicate_bodies(&self.predicate_bodies).with_relation_params(&self.relation_params).with_session_key_types(&self.session_key_types);
         if self.source_indexed { typer.with_const_resolver(self.const_resolver.clone()) } else { typer }
     }
 
@@ -1796,11 +1808,13 @@ impl Analyzer {
                 self.unify_params_from_call_sites(app, UnifyScope::Production)
             });
             self.settle_oscillations(&prev_hints.sig);
+            let session_moved = self.refresh_session_key_types(app);
             // Returns+params settle independently of block-value
             // verdicts (`DirtyHints`); both must be quiet before the
             // loop stops, or a newly block-valued method leaves its
             // callers on the registered return instead of the block.
             if unseen.is_empty()
+                && !session_moved
                 && self.inference_matches(&prev_hints.sig)
                 && self.block_value_matches(&prev_hints)
             {
@@ -1817,7 +1831,7 @@ impl Analyzer {
             // so the later rounds retype the whole app for a handful of
             // returns. `dirty_classes_for_retype` is that handful plus
             // everything that reads it.
-            let mut dirty = self.dirty_classes_for_retype(app, &prev_hints);
+            let mut dirty = if session_moved { None } else { self.dirty_classes_for_retype(app, &prev_hints) };
             if let Some(dirty) = dirty.as_mut() {
                 dirty.extend(unseen.drain());
             }
@@ -1966,13 +1980,15 @@ impl Analyzer {
                 }
                 self.overlay_test_params(app);
                 self.settle_oscillations(&absorb_hints.sig);
-                if self.inference_matches(&absorb_hints.sig)
+                let session_moved = self.refresh_session_key_types(app);
+                if !session_moved
+                    && self.inference_matches(&absorb_hints.sig)
                     && self.block_value_matches(&absorb_hints)
                 {
                     rounds.absorb = LoopEnd::Settled(round);
                     break;
                 }
-                absorb_dirty = self.dirty_classes_for_retype(app, &absorb_hints);
+                absorb_dirty = if session_moved { None } else { self.dirty_classes_for_retype(app, &absorb_hints) };
                 absorb_hints = self.capture_dirty_hints();
             }
         } else {
@@ -2053,8 +2069,13 @@ impl Analyzer {
             self.overlay_test_params(app);
             self.apply_pinned_params();
             self.settle.params(&mut self.inferred_params, &before);
+            let session_moved = self.refresh_session_key_types(app);
+            if session_moved {
+                // Its readers anywhere; the frontier below reads only what the param rows moved.
+                fed = None;
+            }
             // Not pinned while the loop still moves: a `Var` mid-loop may be an argument the next round types.
-            if self.inferred_params == before && returns_settled && !(app.pins_unresolved_params && self.pin_open_params()) {
+            if !session_moved && self.inferred_params == before && returns_settled && !(app.pins_unresolved_params && self.pin_open_params()) {
                 rounds.restamp.end = LoopEnd::Settled(round);
                 break;
             }
@@ -13384,7 +13405,7 @@ impl Analyzer {
     /// is measured on a copy. Destructured without `..`, so a new field has
     /// to be listed here; `Copy` fields own no heap.
     pub fn census_drop(self) -> HashMap<ClassId, ClassInfo> {
-        let Analyzer { classes, module_self_types, upload_array_fields, materialized_associations, inferred_params, open_param_slots, pinned_param_slots, defaulted_param_slots, seeding_unseen_params: _, deferring_pending_slots: _, unseen_or_assign_classes, test_call_arities, declared_signatures, adapter, concern_folded, host_folded, inquirers, i18n, helper_modules, helper_index, open_classes, refined_action_bindings, const_resolver, source_indexed, typed_constants, data_factories, class_factories, constant_predicates, data_factories_without_custom_initialize, view_seeds, callers_by_target, controller_action_meta_cache, fixpoint_rounds, fixpoint_checks, settle, written_ivars, class_ivar_writes, site_cache, retyped_since_unify, settled_constants, surveys, retyped_since_survey, unify_memo } = self;
+        let Analyzer { classes, module_self_types, upload_array_fields, materialized_associations, inferred_params, open_param_slots, pinned_param_slots, defaulted_param_slots, seeding_unseen_params: _, deferring_pending_slots: _, unseen_or_assign_classes, test_call_arities, declared_signatures, adapter, concern_folded, host_folded, inquirers, i18n, helper_modules, helper_index, open_classes, refined_action_bindings, const_resolver, source_indexed, typed_constants, data_factories, class_factories, constant_predicates, data_factories_without_custom_initialize, view_seeds, callers_by_target, controller_action_meta_cache, fixpoint_rounds, fixpoint_checks, settle, written_ivars, class_ivar_writes, site_cache, retyped_since_unify, settled_constants, surveys, retyped_since_survey, unify_memo, session_key_types } = self;
         let mut freed: Vec<(&str, i64)> = vec![
             ("classes (kept)", crate::memory_census::live_delta(|| classes.clone())),
             ("module_self_types", crate::memory_census::freed_by(|| drop(module_self_types))),
@@ -13420,6 +13441,7 @@ impl Analyzer {
             ("fixpoint_checks", crate::memory_census::freed_by(|| drop(fixpoint_checks))),
             ("settle", crate::memory_census::freed_by(|| drop(settle))),
             ("written_ivars", crate::memory_census::freed_by(|| drop(written_ivars))),
+            ("session_key_types", crate::memory_census::freed_by(|| drop(session_key_types))),
             ("class_ivar_writes", crate::memory_census::freed_by(|| drop(class_ivar_writes))),
             ("site_cache", crate::memory_census::freed_by(|| drop(site_cache))),
             ("retyped_since_unify", crate::memory_census::freed_by(|| drop(retyped_since_unify))),
