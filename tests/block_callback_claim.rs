@@ -2,6 +2,8 @@
 //! `markers::push_block_callback` lowers; every other one reports as
 //! unlowered DSL instead of being dropped or spliced half-bound.
 
+#[path = "support/scratch.rs"]
+mod scratch;
 use std::path::Path;
 
 use roundhouse::ingest::ingest_app;
@@ -25,8 +27,7 @@ fn copy_tree(src: &Path, dst: &Path) {
 /// The diagnostics (any severity) and the lowered `Article` hook names
 /// for real-blog's Article with `callback` added to its class body.
 fn lower_with(tag: &str, callback: &str) -> (Vec<String>, bool) {
-    let dir = std::env::temp_dir().join(format!("roundhouse-block-callback-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = scratch::dir(&format!("roundhouse-block-callback-{tag}"));
     copy_tree(roundhouse::fixtures::real_blog(), &dir);
     let model = dir.join("app/models/article.rb");
     let source = std::fs::read_to_string(&model).unwrap().replacen(
@@ -88,12 +89,21 @@ fn a_block_default_reading_an_earlier_parameter_lowers() {
     assert!(!reports_unlowered(&messages), "{messages:#?}");
 }
 
-/// Required and rest parameters are not bound by the generated parameterless
-/// hook, whether supplied as a block or a lambda argument.
+/// Rails runs a one-parameter callback block with the record as `self` and as
+/// its argument, so the hook reads the parameter as `self`.
+#[test]
+fn a_one_parameter_block_reads_the_record() {
+    let (messages, hooked) = lower_with("record-block", "  before_save { |record| record.body = record.title }");
+    assert!(hooked, "record-block did not lower to a hook");
+    assert!(!reports_unlowered(&messages), "{messages:#?}");
+}
+
+/// Keyword, rest and two-parameter blocks, and parameter lambdas, are not
+/// bound by the generated parameterless hook.
 #[test]
 fn callbacks_with_required_or_rest_parameters_are_declined() {
     for (tag, callback) in [
-        ("required-block", "before_save { |key| self.body = key }"),
+        ("two-parameter-block", "before_save { |key, other| self.body = key }"),
         ("required-keyword-block", "before_save { |key:| self.body = key }"),
         (
             "rest-block",

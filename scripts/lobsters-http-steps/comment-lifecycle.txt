@@ -1,0 +1,11 @@
+# post a comment, edit it, delete it, undelete it, reading the story after each
+GET {story_path}
+POST /comments story_id={story}&comment=A+comment+to+change
+GET /comments/{last_comment}/edit
+POST /comments/{last_comment} _method=patch&comment=Changed+by+the+replay
+GET {story_path}
+POST /comments/{last_comment}/delete
+GET {story_path}
+POST /comments/{last_comment}/undelete
+GET {story_path}
+GET /threads

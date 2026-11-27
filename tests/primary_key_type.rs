@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 use roundhouse::analyze::{diagnose, Analyzer, Severity};
 use roundhouse::ingest::ingest_app_from_tree;
-use roundhouse::ty::Ty;
+use roundhouse::ty::{FnTy, Ty};
 use roundhouse::Symbol;
 
 fn app(schema: &str, model: &str, controller: &str) -> (roundhouse::App, Analyzer) {
@@ -100,7 +100,8 @@ fn adapter_method(app: &roundhouse::App, name: &str) -> (Ty, String) {
 }
 
 fn param_ty(sig: &Ty, i: usize) -> Ty {
-    let Ty::Fn { params, .. } = sig else { panic!("not a signature: {sig:?}") };
+    let Ty::Fn(fn_ty) = sig else { panic!("not a signature: {sig:?}") };
+    let FnTy { params, .. } = &**fn_ty;
     (*params[i].ty).clone()
 }
 
@@ -170,7 +171,8 @@ end
 fn a_uuid_key_is_minted_when_blank_written_and_answered_by_insert() {
     let (app, _) = app(UUID_SCHEMA, MODEL, SHOW);
     let (sig, body) = adapter_method(&app, "_adapter_insert");
-    let Ty::Fn { ret, .. } = &sig else { panic!("not a signature") };
+    let Ty::Fn(fn_ty) = &sig else { panic!("not a signature") };
+    let FnTy { ret, .. } = &**fn_ty;
     assert_eq!(**ret, Ty::Str, "insert answers the key, not a rowid");
     assert!(body.contains("INSERT INTO widgets (id, name)"), "the key is a column of the INSERT: {body}");
     assert!(body.contains("SecureRandom.uuid"), "a blank uuid is minted: {body}");
@@ -195,16 +197,49 @@ end
     assert!(body.trim_end().ends_with("@identifier"), "{body}");
     // …and `id` reads the key column, so `record.id` is the key.
     let (sig, body) = adapter_method(&app, "id");
-    let Ty::Fn { ret, .. } = &sig else { panic!("not a signature") };
+    let Ty::Fn(fn_ty) = &sig else { panic!("not a signature") };
+    let FnTy { ret, .. } = &**fn_ty;
     assert_eq!(**ret, Ty::Str);
     assert_eq!(body.trim(), "@identifier");
+}
+
+/// An `id` column beside a flagged key stays that column. `id` is not
+/// aliased over it, and loaded `ids` reads the key through
+/// `_primary_key_value`.
+#[test]
+fn an_id_column_beside_a_flagged_key_keeps_its_reader() {
+    let schema = r#"ActiveRecord::Schema[8.1].define(version: 1) do
+  create_table "widgets", primary_key: "identifier", id: :string, force: :cascade do |t|
+    t.integer "id", null: false
+    t.string "name", null: false
+  end
+end
+"#;
+    let (app, analyzer) = app(schema, MODEL, SHOW);
+    assert_eq!(registry_ty(&analyzer, "Widget", "id", false), Ty::Int);
+    assert_eq!(
+        registry_ty(&analyzer, "Widget", "ids", true),
+        Ty::Array { elem: std::sync::Arc::new(Ty::Str) }
+    );
+    let model = app.models.iter().find(|m| m.name.0.as_str() == "Widget").expect("Widget");
+    let lc = roundhouse::lower::model_to_library::lower_model_to_library_class(model, &app.schema);
+    let id_readers: Vec<_> = lc
+        .methods
+        .iter()
+        .filter(|m| m.name.as_str() == "id" && m.receiver == roundhouse::dialect::MethodReceiver::Instance)
+        .collect();
+    assert_eq!(id_readers.len(), 1, "the key alias must not cover the id column");
+    assert_eq!(roundhouse::emit::ruby::emit_expr(&id_readers[0].body).trim(), "@id");
+    let (_, key) = adapter_method(&app, "_primary_key_value");
+    assert_eq!(key.trim(), "@identifier");
 }
 
 #[test]
 fn an_integer_key_still_comes_back_as_the_rowid() {
     let (app, _) = app(INT_SCHEMA, MODEL, SHOW);
     let (sig, body) = adapter_method(&app, "_adapter_insert");
-    let Ty::Fn { ret, .. } = &sig else { panic!("not a signature") };
+    let Ty::Fn(fn_ty) = &sig else { panic!("not a signature") };
+    let FnTy { ret, .. } = &**fn_ty;
     assert_eq!(**ret, Ty::Int);
     assert!(body.contains("INSERT INTO widgets (name)"), "{body}");
     assert!(body.contains("last_insert_rowid"), "{body}");

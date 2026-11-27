@@ -2,7 +2,7 @@
 //! instead of a reopen.
 //!
 //! Rails ships `index_by`, `index_with`, `many?`, `to_sentence` and `sole` on
-//! `Enumerable`/`Array`, and `squish` on `String`, by reopening the
+//! `Enumerable`/`Array`, and `squish` and `truncate` on `String`, by reopening the
 //! builtin — which is a shape
 //! only the CRuby overlay can host: the transpiled runtimes cannot
 //! reopen a builtin, and spinel AOT cannot dispatch a user-defined
@@ -67,12 +67,30 @@ pub(crate) fn rewrite_body(expr: &mut Expr) -> bool {
     rewrite_node(expr) || changed
 }
 
+pub(crate) fn rewrite_squish_body(expr: &mut Expr) -> bool {
+    let mut changed = false;
+    expr.node.for_each_child_mut(&mut |child| {
+        changed |= rewrite_squish_body(child);
+    });
+    if matches!(&*expr.node, ExprNode::Send { method, .. } if method.as_str() == "squish") {
+        changed |= rewrite_node(expr);
+    }
+    changed
+}
+
 fn rewrite(expr: &mut Expr) {
     let _ = rewrite_body(expr);
 }
 
 pub(crate) fn rewrite_node(expr: &mut Expr) -> bool {
     let span = expr.span;
+    // AS `String#first` / `String#last`, before the counted-terminal arm
+    // below, which answers every other `first(n)` / `last(n)` receiver.
+    let string_access = matches!(&*expr.node,
+        ExprNode::Send { method, block: None, .. } if matches!(method.as_str(), "first" | "last"));
+    if string_access && ground_string_access(expr) {
+        return true;
+    }
     let ExprNode::Send { recv, method, args, block, parenthesized } = &mut *expr.node else {
         return false;
     };
@@ -84,7 +102,7 @@ pub(crate) fn rewrite_node(expr: &mut Expr) -> bool {
     // `first` takes no count (ArgumentError, every sidebar render for a
     // member of a group direct room). Both halves answer `to_a`, and
     // on the Array that follows `first(n)` means what Ruby means.
-    if matches!(method.as_str(), "first" | "last") && args.len() == 1 && block.is_none() {
+    if crate::catalog::counted_relation_terminal(method.as_str(), args.len(), block.is_some()).is_some() {
         if let Some(array_ty) = recv.as_ref().and_then(|r| relation_or_array_half(r.ty.as_ref())) {
             let receiver = recv.take().expect("checked above");
             let mut to_a = Expr::new(
@@ -132,11 +150,48 @@ pub(crate) fn rewrite_node(expr: &mut Expr) -> bool {
         *parenthesized = true;
         return true;
     }
+    // ActiveSupport's `Array#extract_options!`: the receiver loses its trailing Hash in place, which the helper does to the same Array.
+    if method.as_str() == "extract_options!" && args.is_empty() && block.is_none() {
+        let Some(receiver) = recv.as_ref() else { return false };
+        if !matches!(receiver.ty.as_ref(), Some(Ty::Array { .. })) {
+            return false;
+        }
+        let receiver = recv.take().expect("checked above");
+        *recv = Some(Expr::new(span, ExprNode::Const { path: vec![Symbol::from("ActiveSupport")] }));
+        args.insert(0, receiver);
+        *parenthesized = true;
+        return true;
+    }
+    // ActiveSupport's `Hash#assert_valid_keys(*keys)`: the keys as one list.
+    if method.as_str() == "assert_valid_keys" && block.is_none() && args.iter().all(|a| !matches!(&*a.node, ExprNode::Splat { .. })) {
+        let Some(receiver) = recv.as_ref() else { return false };
+        if !matches!(receiver.ty.as_ref(), Some(Ty::Hash { .. })) {
+            return false;
+        }
+        let receiver = recv.take().expect("checked above");
+        let keys = Expr::new(span, ExprNode::Array { elements: std::mem::take(args), style: Default::default() });
+        *recv = Some(Expr::new(span, ExprNode::Const { path: vec![Symbol::from("ActiveSupport")] }));
+        *args = vec![receiver, keys];
+        *parenthesized = true;
+        return true;
+    }
     if method.as_str() == "pluck" && block.is_none() {
-        return ground_indexed_pluck(expr);
+        if ground_indexed_pluck(expr) {
+            return true;
+        }
+        return ground_untyped_pluck(expr);
     }
     if method.as_str() == "index_with" {
         return ground_index_with(expr);
+    }
+    if method.as_str() == "truncate" && block.is_none() {
+        return ground_string_truncate(expr);
+    }
+    if method.as_str() == "truncate_words" && block.is_none() {
+        return ground_string_truncate_words(expr, None);
+    }
+    if method.as_str() == "truncate_bytes" && block.is_none() {
+        return ground_string_truncate_words(expr, Some("\u{2026}"));
     }
     let wants_block = match method.as_str() {
         "index_by" => true,
@@ -380,6 +435,22 @@ fn ground_indexed_pluck(expr: &mut Expr) -> bool {
     true
 }
 
+/// `value.pluck(:term)` on a receiver with no type → `ActiveSupport.pluck(value, :term)`.
+fn ground_untyped_pluck(expr: &mut Expr) -> bool {
+    let span = expr.span;
+    let ExprNode::Send { recv, method, args, parenthesized, .. } = &mut *expr.node else { return false };
+    let Some(receiver) = recv.as_ref() else { return false };
+    if args.is_empty() || !matches!(receiver.ty.as_ref(), None | Some(Ty::Untyped | Ty::Var { .. })) {
+        return false;
+    }
+    let receiver = recv.take().expect("checked above");
+    *recv = Some(Expr::new(span, ExprNode::Const { path: vec![Symbol::from("ActiveSupport")] }));
+    args.insert(0, receiver);
+    *method = Symbol::from("pluck");
+    *parenthesized = true;
+    true
+}
+
 /// `Array.wrap(value)` → `ActiveSupport.wrap(value)`. A receiverless
 /// `wrap`, or a wrap on something other than the Array class, stays.
 fn ground_array_wrap(expr: &mut Expr) -> bool {
@@ -560,6 +631,219 @@ fn bind_once_as(span: crate::span::Span, arg: &Expr, name: &str, skip_simple: bo
         value: arg.clone(),
     });
     Bound { assign, read }
+}
+
+/// ActiveSupport's `String#truncate(truncate_to, omission:, separator:)`
+/// → `ActiveSupport.truncate(text, truncate_to, omission, separator)`,
+/// an absent option passed as `nil` (the module function reads `nil`
+/// the way Rails reads a missing key). Only a receiver the analyzer
+/// typed String goes: `truncate` is a name a model or an adapter
+/// could own too.
+///
+/// Left as written, visible rather than guessed at: an options argument
+/// that is not a literal keyword Hash of those two keys, and a
+/// separator that is not a String (a Regexp; the module function's
+/// parameter is a String on every target). Arguments keep their
+/// evaluation order: the options are reordered to the positional
+/// order only when neither value can have an effect.
+/// AS `String#first(limit = 1)` / `String#last(limit = 1)` ->
+/// `ActiveSupport.string_first(text, limit)` / `string_last`. Only a
+/// receiver the analyzer typed as a String, or as `String | nil` (the
+/// temporary a safe navigation binds, `password_salt&.last(10)`, before
+/// the `&&` that guards it narrows): a nil there raises NoMethodError in
+/// the module function as `nil.last` does in Ruby. `first`/`last` on an
+/// Array, a Relation or any other union is that class's own method, and
+/// stays it.
+fn ground_string_access(expr: &mut Expr) -> bool {
+    let span = expr.span;
+    let ExprNode::Send { recv, method, args, parenthesized, .. } = &mut *expr.node else {
+        return false;
+    };
+    let stringish = match recv.as_ref().and_then(|r| r.ty.as_ref()) {
+        Some(Ty::Str) => true,
+        Some(Ty::Union { variants }) => {
+            variants.len() == 2
+                && variants.iter().any(|v| matches!(v, Ty::Str))
+                && variants.iter().any(|v| matches!(v, Ty::Nil))
+        }
+        _ => false,
+    };
+    if !stringish || args.len() > 1 {
+        return false;
+    }
+    let limit = args.pop().unwrap_or_else(|| {
+        let mut one = Expr::new(span, ExprNode::Lit { value: crate::expr::Literal::Int { value: 1 } });
+        one.ty = Some(Ty::Int);
+        one
+    });
+    let receiver = recv.take().expect("checked above");
+    *recv = Some(Expr::new(span, ExprNode::Const { path: vec![Symbol::from("ActiveSupport")] }));
+    *method = Symbol::from(if method.as_str() == "first" { "string_first" } else { "string_last" });
+    args.push(receiver);
+    args.push(limit);
+    *parenthesized = true;
+    true
+}
+
+fn ground_string_truncate(expr: &mut Expr) -> bool {
+    let span = expr.span;
+    let ExprNode::Send { recv, args, parenthesized, .. } = &mut *expr.node else {
+        return false;
+    };
+    if !matches!(recv.as_ref().and_then(|r| r.ty.as_ref()), Some(Ty::Str)) {
+        return false;
+    }
+    let nil = || {
+        let mut lit = Expr::new(span, ExprNode::Lit { value: crate::expr::Literal::Nil });
+        lit.ty = Some(Ty::Nil);
+        lit
+    };
+    let (omission, separator) = match args.as_slice() {
+        [_] => (nil(), nil()),
+        [_, options] => {
+            let ExprNode::Hash { entries, .. } = &*options.node else { return false };
+            let mut omission = None;
+            let mut separator = None;
+            for (k, v) in entries {
+                let ExprNode::Lit { value: crate::expr::Literal::Sym { value: key } } = &*k.node else {
+                    return false;
+                };
+                let slot = match key.as_str() {
+                    "omission" => &mut omission,
+                    "separator" => &mut separator,
+                    _ => return false,
+                };
+                if slot.is_some() {
+                    return false;
+                }
+                *slot = Some(v.clone());
+            }
+            if let Some(sep) = &separator {
+                if !matches!(sep.ty.as_ref(), Some(Ty::Str | Ty::Nil)) {
+                    return false;
+                }
+            }
+            let reordered = entries.len() == 2
+                && matches!(&*entries[0].0.node,
+                    ExprNode::Lit { value: crate::expr::Literal::Sym { value } } if value.as_str() == "separator");
+            if reordered && !entries.iter().all(|(_, v)| is_effect_free(v)) {
+                return false;
+            }
+            (omission.unwrap_or_else(nil), separator.unwrap_or_else(nil))
+        }
+        _ => return false,
+    };
+    let truncate_to = args[0].clone();
+    let receiver = recv.take().expect("checked above");
+    *recv = Some(Expr::new(
+        span,
+        ExprNode::Const { path: vec![Symbol::from("ActiveSupport")] },
+    ));
+    *args = vec![receiver, truncate_to, omission, separator];
+    *parenthesized = true;
+    expr.ty = Some(Ty::Str);
+    true
+}
+
+const TRUNCATE_RECV: &str = "__truncate_recv";
+
+/// `text.truncate_words(n)` and `text.truncate_words(n, omission: o)` on
+/// a String become `ActiveSupport.truncate_words(text, n, o_or_nil)`.
+/// The default separator only: Rails builds a Regexp from `separator:`,
+/// which the runtime does not do at run time, so that call stays as
+/// written.
+/// Not nil for an omitted `truncate_bytes` omission: Rails' default is `"…"`, and an explicit nil means none.
+/// An untyped receiver is bound and tested: a String takes the module
+/// function, anything else (nil, a program object) its own dispatch.
+fn ground_string_truncate_words(expr: &mut Expr, default_omission: Option<&str>) -> bool {
+    let span = expr.span;
+    let ExprNode::Send { recv, args, parenthesized, .. } = &mut *expr.node else {
+        return false;
+    };
+    let untyped = match recv.as_ref().map(|r| r.ty.as_ref()) {
+        Some(Some(Ty::Str)) => false,
+        Some(None | Some(Ty::Untyped | Ty::Var { .. })) => true,
+        _ => return false,
+    };
+    // Not again: the fallback arm a guard left is this send on the guard's own binding.
+    if untyped && matches!(recv.as_ref().map(|r| &*r.node), Some(ExprNode::Var { name, .. }) if name.as_str() == TRUNCATE_RECV) {
+        return false;
+    }
+    let omission = match args.as_slice() {
+        [_] => {
+            let mut lit = match default_omission {
+                Some(value) => Expr::new(span, ExprNode::Lit { value: crate::expr::Literal::Str { value: value.into() } }),
+                None => Expr::new(span, ExprNode::Lit { value: crate::expr::Literal::Nil }),
+            };
+            lit.ty = Some(if default_omission.is_some() { Ty::Str } else { Ty::Nil });
+            lit
+        }
+        [_, options] => {
+            let ExprNode::Hash { entries, .. } = &*options.node else { return false };
+            let [(k, v)] = entries.as_slice() else { return false };
+            let ExprNode::Lit { value: crate::expr::Literal::Sym { value: key } } = &*k.node else {
+                return false;
+            };
+            if key.as_str() != "omission" {
+                return false;
+            }
+            v.clone()
+        }
+        _ => return false,
+    };
+    let words_count = args[0].clone();
+    let mut receiver = recv.take().expect("checked above");
+    // Not a bare cast: a nil or a program object that answers the name must keep its own dispatch, as in Rails.
+    let mut bound = None;
+    if untyped {
+        let b = bind_once_as(receiver.span, &receiver, TRUNCATE_RECV, false);
+        let rspan = receiver.span;
+        receiver = Expr::new(rspan, ExprNode::Cast { value: b.read.clone(), target_ty: Ty::Str });
+        receiver.ty = Some(Ty::Str);
+        bound = Some(b);
+    }
+    let kept_args = args.clone();
+    *recv = Some(Expr::new(
+        span,
+        ExprNode::Const { path: vec![Symbol::from("ActiveSupport")] },
+    ));
+    *args = vec![receiver, words_count, omission];
+    *parenthesized = true;
+    expr.ty = Some(Ty::Str);
+    let Some(bound) = bound else { return true };
+    let mut fallback = expr.clone();
+    if let ExprNode::Send { recv, args, .. } = &mut *fallback.node {
+        *recv = Some(bound.read.clone());
+        *args = kept_args;
+    }
+    fallback.ty = Some(Ty::Untyped);
+    let string = Expr::new(span, ExprNode::Const { path: vec![Symbol::from("String")] });
+    let mut test = Expr::new(
+        span,
+        ExprNode::Send {
+            recv: Some(bound.read),
+            method: Symbol::from("is_a?"),
+            args: vec![string],
+            block: None,
+            parenthesized: true,
+        },
+    );
+    test.ty = Some(Ty::Bool);
+    let grounded = std::mem::replace(expr, Expr::new(span, ExprNode::Seq { exprs: vec![] }));
+    let mut branch = Expr::new(span, ExprNode::If { cond: test, then_branch: grounded, else_branch: fallback });
+    branch.ty = Some(Ty::Untyped);
+    *expr = Expr::new(span, ExprNode::Seq { exprs: vec![bound.assign, branch] });
+    expr.ty = Some(Ty::Untyped);
+    true
+}
+
+/// A value whose evaluation cannot be observed, so moving it past a
+/// sibling argument changes nothing.
+fn is_effect_free(e: &Expr) -> bool {
+    matches!(
+        &*e.node,
+        ExprNode::Lit { .. } | ExprNode::Var { .. } | ExprNode::Ivar { .. } | ExprNode::Const { .. }
+    )
 }
 
 /// words_connector, two_words_connector, last_word_connector — Rails'
@@ -1018,5 +1302,132 @@ mod tests {
         let ExprNode::Send { recv: Some(r), .. } = &*e.node else { panic!() };
         assert!(matches!(&*r.node, ExprNode::Const { path } if path[0].as_str() == "ActiveSupport"));
         assert_eq!(string_args(&e), [", ", "+", ", and "]);
+    }
+
+    fn truncate_on(receiver_ty: Option<Ty>, options: Vec<(&str, Expr)>) -> Expr {
+        let mut text = var("text");
+        text.ty = receiver_ty;
+        let mut args = vec![int(27)];
+        if !options.is_empty() {
+            let entries = options
+                .into_iter()
+                .map(|(k, v)| {
+                    let key = Expr::new(Span::synthetic(), ExprNode::Lit { value: crate::expr::Literal::Sym { value: Symbol::from(k) } });
+                    (key, v)
+                })
+                .collect();
+            args.push(Expr::new(Span::synthetic(), ExprNode::Hash { entries, kwargs: true }));
+        }
+        Expr::new(Span::synthetic(), ExprNode::Send {
+            recv: Some(text), method: Symbol::from("truncate"), args, block: None, parenthesized: true,
+        })
+    }
+
+    fn str_lit(value: &str) -> Expr {
+        let mut e = Expr::new(Span::synthetic(), ExprNode::Lit { value: crate::expr::Literal::Str { value: value.to_string() } });
+        e.ty = Some(Ty::Str);
+        e
+    }
+
+    fn arg_kinds(e: &Expr) -> Vec<String> {
+        let ExprNode::Send { args, .. } = &*e.node else { panic!("not a Send") };
+        args.iter()
+            .map(|a| match &*a.node {
+                ExprNode::Lit { value: crate::expr::Literal::Str { value } } => value.clone(),
+                ExprNode::Lit { value: crate::expr::Literal::Nil } => "nil".to_string(),
+                ExprNode::Lit { value: crate::expr::Literal::Int { value } } => value.to_string(),
+                ExprNode::Var { name, .. } => name.as_str().to_string(),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn string_truncate_grounds_with_positional_options() {
+        let mut bare = truncate_on(Some(Ty::Str), vec![]);
+        assert!(rewrite_node(&mut bare));
+        assert_eq!(arg_kinds(&bare), ["text", "27", "nil", "nil"]);
+        assert_eq!(bare.ty, Some(Ty::Str));
+
+        let mut separator = truncate_on(Some(Ty::Str), vec![("separator", str_lit(" "))]);
+        assert!(rewrite_node(&mut separator));
+        assert_eq!(arg_kinds(&separator), ["text", "27", "nil", " "]);
+
+        // Literal values cannot observe their order, so a separator
+        // written first still reaches its positional slot.
+        let mut both = truncate_on(Some(Ty::Str), vec![("separator", str_lit(" ")), ("omission", str_lit("~"))]);
+        assert!(rewrite_node(&mut both));
+        assert_eq!(arg_kinds(&both), ["text", "27", "~", " "]);
+        let ExprNode::Send { recv: Some(r), method, .. } = &*both.node else { panic!() };
+        assert_eq!(method.as_str(), "truncate");
+        assert!(matches!(&*r.node, ExprNode::Const { path } if path[0].as_str() == "ActiveSupport"));
+    }
+
+    #[test]
+    fn string_truncate_stays_as_written_when_grounding_would_change_it() {
+        // Not proven a String: a model or an adapter may own `truncate`.
+        for ty in [None, Some(Ty::Untyped)] {
+            let mut e = truncate_on(ty, vec![]);
+            assert!(!rewrite_node(&mut e));
+        }
+        // A Regexp separator does not fit the String parameter.
+        let mut regexp = Expr::new(Span::synthetic(), ExprNode::Lit {
+            value: crate::expr::Literal::Regex { pattern: "\\s".to_string(), flags: String::new() },
+        });
+        regexp.ty = Some(Ty::Class { id: crate::ident::ClassId(Symbol::from("Regexp")), args: vec![].into() });
+        let mut e = truncate_on(Some(Ty::Str), vec![("separator", regexp)]);
+        assert!(!rewrite_node(&mut e));
+        // An option Rails does not read, and a reorder past an effect.
+        let mut unknown = truncate_on(Some(Ty::Str), vec![("length", int(3))]);
+        assert!(!rewrite_node(&mut unknown));
+        let call = |name: &str| {
+            let mut c = Expr::new(Span::synthetic(), ExprNode::Send {
+                recv: None, method: Symbol::from(name), args: vec![], block: None, parenthesized: false,
+            });
+            c.ty = Some(Ty::Str);
+            c
+        };
+        let mut effects = truncate_on(Some(Ty::Str), vec![("separator", call("sep")), ("omission", call("mark"))]);
+        assert!(!rewrite_node(&mut effects));
+    }
+
+    #[test]
+    fn string_truncate_words_grounds_only_the_default_separator() {
+        let on = |options: Vec<(&str, Expr)>, ty: Option<Ty>| {
+            let mut e = truncate_on(ty, options);
+            if let ExprNode::Send { method, .. } = &mut *e.node {
+                *method = Symbol::from("truncate_words");
+            }
+            e
+        };
+        let mut bare = on(vec![], Some(Ty::Str));
+        assert!(rewrite_node(&mut bare));
+        assert_eq!(arg_kinds(&bare), ["text", "27", "nil"]);
+        assert_eq!(bare.ty, Some(Ty::Str));
+        let ExprNode::Send { recv: Some(r), method, .. } = &*bare.node else { panic!() };
+        assert_eq!(method.as_str(), "truncate_words");
+        assert!(matches!(&*r.node, ExprNode::Const { path } if path[0].as_str() == "ActiveSupport"));
+
+        let mut omission = on(vec![("omission", str_lit("~"))], Some(Ty::Str));
+        assert!(rewrite_node(&mut omission));
+        assert_eq!(arg_kinds(&omission), ["text", "27", "~"]);
+
+        // An untyped receiver: bound, a String to the module function through a Cast, else its own send.
+        let mut untyped = on(vec![], None);
+        assert!(rewrite_node(&mut untyped));
+        let ExprNode::Seq { exprs } = &*untyped.node else { panic!() };
+        let ExprNode::If { then_branch, else_branch, .. } = &*exprs[1].node else { panic!() };
+        let ExprNode::Send { args, .. } = &*then_branch.node else { panic!() };
+        assert!(matches!(&*args[0].node, ExprNode::Cast { target_ty: Ty::Str, .. }));
+        assert_eq!(args[0].ty, Some(Ty::Str));
+        let mut kept = else_branch.clone();
+        assert!(matches!(&*kept.node, ExprNode::Send { method, .. } if method.as_str() == "truncate_words"));
+        // and the kept send is not guarded again.
+        assert!(!rewrite_node(&mut kept));
+        // A typed non-String, or a separator: left as written.
+        let mut integer = on(vec![], Some(Ty::Int));
+        assert!(!rewrite_node(&mut integer));
+        let mut separator = on(vec![("separator", str_lit(" "))], Some(Ty::Str));
+        assert!(!rewrite_node(&mut separator));
     }
 }

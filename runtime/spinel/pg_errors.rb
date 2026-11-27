@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # PostgreSQL SQLSTATE codes to the ActiveRecord exceptions apps rescue,
 # shared by the PostgreSQL Db shims (roundhouse#91). Both drivers (the pg
 # gem and spinel-pg) expose the code the same way:

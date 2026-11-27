@@ -63,6 +63,34 @@ fn attached_many_class() -> ClassId {
     ClassId(Symbol::from("ActiveStorage::AttachedMany"))
 }
 
+/// `return cached if cached.record_id == @id` — the reader's memo is
+/// for the record's current id only. Rails' proxy holds the record, so
+/// it follows the id that the insert gives a new record. This proxy
+/// holds a copy of the id, and a read before the insert (a validation
+/// that asks `attached?`) copies the id of a record not yet saved. A
+/// write through that proxy would belong to the wrong record.
+fn reuse_when_same_record(cached: Expr) -> Expr {
+    let syn = |node: ExprNode| Expr::new(Span::synthetic(), node);
+    let record_id = syn(ExprNode::Send {
+        recv: Some(cached.clone()),
+        method: Symbol::from("record_id"),
+        args: vec![],
+        block: None,
+        parenthesized: false,
+    });
+    syn(ExprNode::If {
+        cond: syn(ExprNode::Send {
+            recv: Some(record_id),
+            method: Symbol::from("=="),
+            args: vec![syn(ExprNode::Ivar { name: Symbol::from("id") })],
+            block: None,
+            parenthesized: false,
+        }),
+        then_branch: syn(ExprNode::Return { value: cached }),
+        else_branch: syn(ExprNode::Lit { value: Literal::Nil }),
+    })
+}
+
 /// `has_one_attached :logo` declarations this pass expands, with the
 /// span of the declaration. The BLOCK form (`do |attachable|
 /// attachable.variant … end`) declares variants, which are not
@@ -156,7 +184,7 @@ fn rewrite_attach(e: &mut Expr) {
     }
     if let Some((io, filename, content_type)) = attach_io_hash(&args[0]) {
         let Some(recv_expr) = recv.clone() else { return };
-        e.diagnostic = None;
+        crate::expr::ExprCold::set_diagnostic(&mut e.cold, None);
         e.ty = Some(if on_blob { blob_class_ty() } else { Ty::Nil });
         *e.node = grounded_io_call(recv_expr, name, io, filename, content_type);
         return;
@@ -167,7 +195,7 @@ fn rewrite_attach(e: &mut Expr) {
     // is that same coercion (it already creates the blob).
     if on_blob {
         if expr_is_hash(&args[0]) {
-            e.diagnostic = None;
+            crate::expr::ExprCold::set_diagnostic(&mut e.cold, None);
             *method = Symbol::from("from_attachable");
         }
         return;
@@ -189,7 +217,7 @@ fn rewrite_attach(e: &mut Expr) {
                 step
             })
             .collect();
-        e.diagnostic = None;
+        e.set_diagnostic(None);
         e.ty = Some(Ty::Nil);
         *e.node = ExprNode::Seq { exprs: steps };
         return;
@@ -198,7 +226,7 @@ fn rewrite_attach(e: &mut Expr) {
     // Analyze stamped `SendDispatchFailed` on the one-arg Hash form
     // against the three-String `attach` signature; the rewrite is the
     // supported shape, so drop that annotation with the call.
-    e.diagnostic = None;
+    e.set_diagnostic(None);
     e.ty = Some(Ty::Nil);
     *e.node = attach_blob_from_attachable(recv_expr, attachable);
 }
@@ -574,6 +602,31 @@ pub fn many_attached_attrs(model: &Model) -> Vec<(Span, Symbol)> {
     macro_attrs(model, "has_many_attached")
 }
 
+/// What `reload` forgets about attachments, as in Rails: each reader's
+/// proxy (`@<attr>_cache = nil`), so the next read queries again, and
+/// each `has_one_attached` assignment not yet saved
+/// (`@<attr>_pending = nil`, Rails' `@attachment_changes = nil`).
+pub fn reload_resets(model: &Model) -> Vec<Expr> {
+    let nil_assign = |ivar: String| {
+        Expr::new(
+            Span::synthetic(),
+            ExprNode::Assign {
+                target: crate::expr::LValue::Ivar { name: Symbol::from(ivar) },
+                value: Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
+            },
+        )
+    };
+    let mut out = Vec::new();
+    for (_span, attr) in attached_attrs(model) {
+        out.push(nil_assign(format!("{}_cache", attr.as_str())));
+        out.push(nil_assign(format!("{}_pending", attr.as_str())));
+    }
+    for (_span, attr) in many_attached_attrs(model) {
+        out.push(nil_assign(format!("{}_cache", attr.as_str())));
+    }
+    out
+}
+
 fn macro_attrs(model: &Model, macro_name: &str) -> Vec<(Span, Symbol)> {
     let mut out = Vec::new();
     for item in &model.body {
@@ -908,7 +961,7 @@ fn push_attachment_changes(methods: &mut Vec<MethodDef>, model: &Model) {
 /// ```ruby
 /// def logo
 ///   cached = @logo_cache
-///   return cached unless cached.nil?
+///   return cached if !cached.nil? && cached.record_id == @id
 ///   fresh = ActiveStorage::Attached.new("Account", @id, "logo")
 ///   @logo_cache = fresh
 ///   fresh
@@ -990,7 +1043,7 @@ fn push_reader(methods: &mut Vec<MethodDef>, model: &Model, attr: &Symbol) {
                     block: None,
                     parenthesized: false,
                 }),
-                then_branch: syn(ExprNode::Return { value: var(&cached) }),
+                then_branch: reuse_when_same_record(var(&cached)),
                 else_branch: syn(ExprNode::Lit { value: Literal::Nil }),
             }),
             syn(ExprNode::Assign {
@@ -1039,7 +1092,7 @@ fn push_reader(methods: &mut Vec<MethodDef>, model: &Model, attr: &Symbol) {
         body: syn(ExprNode::Seq {
             exprs: vec![
                 syn(ExprNode::Assign {
-                    target: crate::expr::LValue::Ivar { name: cache },
+                    target: crate::expr::LValue::Ivar { name: cache.clone() },
                     value: var(&att),
                 }),
                 syn(ExprNode::Lit { value: Literal::Nil }),
@@ -1053,15 +1106,62 @@ fn push_reader(methods: &mut Vec<MethodDef>, model: &Model, attr: &Symbol) {
         mutates_self: true,
         block_param: None,
     });
+
+    // `def <attr>_attachment_loaded?; !@<attr>_cache.nil?; end` — Rails'
+    // `association(:<attr>_attachment).loaded?`, the flat predicate
+    // `lower::assoc_loaded` rewrites that spelling onto. The proxy is
+    // cached by the preload and by the first read, both of which Rails
+    // counts as loading the attachment.
+    methods.push(MethodDef {
+        visibility: crate::dialect::MethodVisibility::Public,
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        name_span: crate::span::Span::synthetic(),
+        name: attachment_loaded_name(attr),
+        receiver: MethodReceiver::Instance,
+        params: Vec::new(),
+        body: syn(ExprNode::Send {
+            recv: Some(syn(ExprNode::Send {
+                recv: Some(syn(ExprNode::Ivar { name: cache })),
+                method: Symbol::from("nil?"),
+                args: vec![],
+                block: None,
+                parenthesized: false,
+            })),
+            method: Symbol::from("!"),
+            args: vec![],
+            block: None,
+            parenthesized: false,
+        }),
+        signature: Some(super::model_to_library::fn_sig(vec![], Ty::Bool)),
+        effects: EffectSet::default(),
+        enclosing_class: Some(model.name.0.clone()),
+        kind: AccessorKind::Method,
+        is_async: false,
+        mutates_self: false,
+        block_param: None,
+    });
+}
+
+/// `<attr>_attachment_loaded?` — the flat loaded flag of a
+/// `has_one_attached :<attr>`.
+pub fn attachment_loaded_name(attr: &Symbol) -> Symbol {
+    Symbol::from(format!("{}_loaded?", attachment_assoc_name(attr).as_str()))
 }
 
 /// ```ruby
 /// def avatar=(value)
 ///   @avatar_pending = ActiveStorage::Blob.from_attachable(value)
+///   @avatar_cache = nil
 ///   nil
 /// end
 ///
 /// def _save_avatar_attachment       # folded into after_save
+///   cached = @avatar_cache
+///   if !cached.nil?
+///     staged = cached.take_staged
+///     @avatar_pending = staged if !staged.nil?
+///   end
 ///   pending = @avatar_pending
 ///   if pending.nil?
 ///     nil
@@ -1079,6 +1179,12 @@ fn push_reader(methods: &mut Vec<MethodDef>, model: &Model, attr: &Symbol) {
 /// point it at — a create assigns before the insert. Same shape as
 /// `has_rich_text`'s `_save_rich_text_<attr>`, for the same reason.
 ///
+/// `avatar.attach(…)` on a record that is not saved yet is the same
+/// change: the proxy stages the blob (`Attached#take_staged`), and the
+/// save takes it. The last change before the save wins, as in Rails:
+/// the writer drops the cached proxy and the blob it staged, and a
+/// blob staged after the writer replaces the pending one.
+///
 /// `value` is `untyped` on purpose: what arrives is whatever the
 /// params tree or the caller held — an `UploadedFile`, a `Blob`, a
 /// signed id String, the bare filename a non-multipart form posts —
@@ -1090,6 +1196,9 @@ fn push_writer_and_save(methods: &mut Vec<MethodDef>, model: &Model, attr: &Symb
     let pending = Symbol::from(format!("{}_pending", attr.as_str()));
     let value = Symbol::from("value");
     let local = Symbol::from("pending");
+    let cache = Symbol::from(format!("{}_cache", attr.as_str()));
+    let cached = Symbol::from("cached");
+    let staged = Symbol::from("staged");
     let var = |name: &Symbol| syn(ExprNode::Var { id: crate::ident::VarId(0), name: name.clone() });
     let ivar = |name: &Symbol| syn(ExprNode::Ivar { name: name.clone() });
     let nil_lit = || syn(ExprNode::Lit { value: Literal::Nil });
@@ -1113,6 +1222,10 @@ fn push_writer_and_save(methods: &mut Vec<MethodDef>, model: &Model, attr: &Symb
                 syn(ExprNode::Assign {
                     target: crate::expr::LValue::Ivar { name: pending.clone() },
                     value: coerce,
+                }),
+                syn(ExprNode::Assign {
+                    target: crate::expr::LValue::Ivar { name: cache.clone() },
+                    value: nil_lit(),
                 }),
                 nil_lit(),
             ],
@@ -1143,6 +1256,60 @@ fn push_writer_and_save(methods: &mut Vec<MethodDef>, model: &Model, attr: &Symb
         Vec::new(),
         syn(ExprNode::Seq {
             exprs: vec![
+                syn(ExprNode::Assign {
+                    target: crate::expr::LValue::Var { id: crate::ident::VarId(0), name: cached.clone() },
+                    value: ivar(&cache),
+                }),
+                syn(ExprNode::If {
+                    cond: syn(ExprNode::Send {
+                        recv: Some(syn(ExprNode::Send {
+                            recv: Some(var(&cached)),
+                            method: Symbol::from("nil?"),
+                            args: vec![],
+                            block: None,
+                            parenthesized: false,
+                        })),
+                        method: Symbol::from("!"),
+                        args: vec![],
+                        block: None,
+                        parenthesized: false,
+                    }),
+                    then_branch: syn(ExprNode::Seq {
+                        exprs: vec![
+                            syn(ExprNode::Assign {
+                                target: crate::expr::LValue::Var { id: crate::ident::VarId(0), name: staged.clone() },
+                                value: syn(ExprNode::Send {
+                                    recv: Some(var(&cached)),
+                                    method: Symbol::from("take_staged"),
+                                    args: vec![],
+                                    block: None,
+                                    parenthesized: false,
+                                }),
+                            }),
+                            syn(ExprNode::If {
+                                cond: syn(ExprNode::Send {
+                        recv: Some(syn(ExprNode::Send {
+                            recv: Some(var(&staged)),
+                            method: Symbol::from("nil?"),
+                            args: vec![],
+                            block: None,
+                            parenthesized: false,
+                        })),
+                        method: Symbol::from("!"),
+                        args: vec![],
+                        block: None,
+                        parenthesized: false,
+                    }),
+                                then_branch: syn(ExprNode::Assign {
+                                    target: crate::expr::LValue::Ivar { name: pending.clone() },
+                                    value: var(&staged),
+                                }),
+                                else_branch: nil_lit(),
+                            }),
+                        ],
+                    }),
+                    else_branch: nil_lit(),
+                }),
                 syn(ExprNode::Assign {
                     target: crate::expr::LValue::Var { id: crate::ident::VarId(0), name: local.clone() },
                     value: ivar(&pending),
@@ -1213,7 +1380,7 @@ pub fn many_preload_setter_name(attr: &Symbol) -> Symbol {
 /// ```ruby
 /// def uploads
 ///   cached = @uploads_cache
-///   return cached unless cached.nil?
+///   return cached if !cached.nil? && cached.record_id == @id
 ///   fresh = ActiveStorage::AttachedMany.new("Doc", @id, "uploads")
 ///   @uploads_cache = fresh
 ///   fresh
@@ -1275,7 +1442,7 @@ fn push_many_reader(methods: &mut Vec<MethodDef>, model: &Model, attr: &Symbol) 
                     block: None,
                     parenthesized: false,
                 }),
-                then_branch: syn(ExprNode::Return { value: var(&cached) }),
+                then_branch: reuse_when_same_record(var(&cached)),
                 else_branch: syn(ExprNode::Lit { value: Literal::Nil }),
             }),
             syn(ExprNode::Assign {

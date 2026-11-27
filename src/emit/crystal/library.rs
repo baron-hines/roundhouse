@@ -81,10 +81,12 @@ fn synthesize_module_lc(funcs: &[LibraryFunction]) -> LibraryClass {
         parent: None,
         parent_span: Default::default(),
         includes: Vec::new(),
+        include_spans: Vec::new(),
         methods,
         nullable_columns: Vec::new(),
         origin: None,
         constants: Vec::new(),
+        conditional_definitions: Vec::new(),
         unknown_calls: Vec::new(),
         class_ivar_initializers: Vec::new(),
     }
@@ -244,21 +246,21 @@ fn render_class(lc: &LibraryClass) -> String {
 
     // Collect attribute properties from attr_reader pairs.
     let mut properties: Vec<(String, String)> = Vec::new();
-    let mut accessor_method_names: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut accessor_method_names: crate::det::HashSet<String> =
+        crate::det::HashSet::default();
     // Temporal-column readers (return `Time`) must NOT collapse into a
     // `property` — the parsing body would be lost. The reader emits as an
     // explicit method (`def col : Time?`) over the `<col>_raw` String
     // storage, which is an ordinary accessor pair from the shared
     // lowering and collapses to `property created_at_raw : String` like
     // any other column.
-    let mut temporal_accessor_names: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut temporal_accessor_names: crate::det::HashSet<String> =
+        crate::det::HashSet::default();
     // First pass: detect which ivars `initialize` directly assigns
     // (used both for ivar nilability AND property nilability —
     // Crystal's strict null check applies the same rule to both).
-    let mut init_assigned: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut init_assigned: crate::det::HashSet<String> =
+        crate::det::HashSet::default();
     for m in &lc.methods {
         if m.name.as_str() == "initialize"
             && matches!(m.receiver, crate::dialect::MethodReceiver::Instance)
@@ -315,7 +317,7 @@ fn render_class(lc: &LibraryClass) -> String {
                     continue;
                 }
                 let ty = match m.signature.as_ref() {
-                    Some(crate::ty::Ty::Fn { ret, .. }) => super::ty::crystal_ty(ret),
+                    Some(crate::ty::Ty::Fn(fn_ty)) => super::ty::crystal_ty(&fn_ty.ret),
                     _ => {
                         // No signature — `attr_accessor` synth without
                         // RBS annotation. Walk every method body in
@@ -456,7 +458,23 @@ fn render_class(lc: &LibraryClass) -> String {
                 wrote_header_lines = true;
                 continue;
             }
-            let (k_ty, v_ty) = classvar_index_types.get(name).cloned().unwrap_or_else(|| {
+            // Not only `@@var[k] = v`: a module that assigns a whole Array or Hash it built (`@@table = table`) types it there
+            if let crate::ty::Ty::Array { elem } = ty
+                && !elem.is_open()
+            {
+                let e_s = super::ty::crystal_ty(elem);
+                writeln!(s, "{body_pad}@@{name} : Array({e_s}) = [] of {e_s}").unwrap();
+                wrote_header_lines = true;
+                continue;
+            }
+            // An open key keeps the String the empty-literal default already gives it
+            let assigned = match ty {
+                crate::ty::Ty::Hash { key, value } if !value.is_open() => {
+                    Some((if key.is_open() { crate::ty::Ty::Str } else { (**key).clone() }, (**value).clone()))
+                }
+                _ => None,
+            };
+            let (k_ty, v_ty) = classvar_index_types.get(name).cloned().or(assigned).unwrap_or_else(|| {
                 (crate::ty::Ty::Str, crate::ty::Ty::Str)
             });
             let k_s = super::ty::crystal_ty(&k_ty);
@@ -524,8 +542,8 @@ fn render_class(lc: &LibraryClass) -> String {
     // `@@<name>`. Without this, the class header declares the
     // widened Hash type but `def initialize; @data = {}; end`
     // emits the default-typed empty literal and Crystal rejects.
-    let mut ivar_hash_types: std::collections::HashMap<String, (String, String)> =
-        std::collections::HashMap::new();
+    let mut ivar_hash_types: crate::det::HashMap<String, (String, String)> =
+        crate::det::HashMap::default();
     for (name, ty) in &ivars {
         if let crate::ty::Ty::Hash { key, value } = ty {
             // Skip when the value type collapses to the default
@@ -610,7 +628,7 @@ fn render_class(lc: &LibraryClass) -> String {
 /// hash-arg version reintroduces the impedance mismatch we just removed).
 fn is_skipped_method(
     m: &MethodDef,
-    accessor_names: &std::collections::HashSet<String>,
+    accessor_names: &crate::det::HashSet<String>,
 ) -> bool {
     if accessor_names.contains(m.name.as_str()) {
         return true;
@@ -676,12 +694,12 @@ fn signature_ret_is_time(sig: Option<&crate::ty::Ty>) -> bool {
             _ => false,
         }
     }
-    matches!(sig, Some(crate::ty::Ty::Fn { ret, .. }) if is_time(ret))
+    matches!(sig, Some(crate::ty::Ty::Fn(fn_ty)) if is_time(&fn_ty.ret))
 }
 
 fn collect_initialize_assignments(
     e: &Expr,
-    out: &mut std::collections::HashSet<String>,
+    out: &mut crate::det::HashSet<String>,
 ) {
     use crate::expr::LValue;
     match &*e.node {

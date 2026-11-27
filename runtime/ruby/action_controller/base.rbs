@@ -9,6 +9,7 @@ module ActionController
   def self.header_value_ok?: (String? v) -> bool
   def self.header_control?: (String c) -> bool
   def self.sanitize_location: (String path) -> String
+  def self.first_requested_format: (Array[String] accepted, Array[String] order) -> String
   def self.strip_leading_controls: (String s) -> String
   def self.strip_trailing_controls: (String s) -> String
   def self.location_host: (String url) -> String
@@ -18,6 +19,7 @@ module ActionController
   def self.url_host_without_port: (String hostport) -> String
   def self.url_port_of: (String hostport) -> String
   def self.find_last: (String hay, String needle) -> Integer
+  def self.symbol_status_code: (Symbol status) -> Integer?
   def self.forgery_flag: () -> bool
   def self.set_forgery_flag: (bool value) -> void
   def self.forgery_switched_off: () -> bool
@@ -109,6 +111,7 @@ module ActionController
   # CRuby-only overlay feature — see runtime/action_controller_cookies.rb
   # — so it isn't declared on the shared/transpiled Base.)
   class Base
+    def json_render_escape: () -> bool
     def self.allow_forgery_protection: () -> bool
     def self.allow_forgery_protection=: (bool) -> void
     # `attr_accessor` produces getter+setter pairs for each name.
@@ -138,10 +141,26 @@ module ActionController
     def query_string=: (String) -> String
     def accepts_any_format: () -> bool
     def accepts_any_format=: (bool) -> bool
+    def accept_header: () -> String
+    def accept_header=: (String) -> String
+    def explicit_format: () -> String
+    def explicit_format=: (String) -> String
+    def negotiate_format: (Array[String] order) -> String
+    def accepted_format_names: () -> Array[String]
+    def accepted_format_names=: (Array[String]) -> Array[String]
+    def unacceptable_requested_json?: () -> bool
+    def unacceptable_body: () -> String
+    def unacceptable_content_type: () -> String
+    def vary_on_accept: () -> bool
+    def vary_on_accept=: (bool) -> bool
+    # Rails' `_set_vary_header` (render, send_data); see the .rb.
+    def apply_vary_header: () -> nil
     def path_parameters: () -> Hash[String, String]
     def path_parameters=: (Hash[String, String]) -> Hash[String, String]
     @headers: ActionController::HeaderStore
     @content_type_explicit: bool
+    @accept_header: String
+    @explicit_format: String
     @head_response: bool
     @cache_control: ActionController::CacheControlStore
     def action_name: () -> String
@@ -179,13 +198,12 @@ module ActionController
     # is divergent and doesn't contradict the declared return.
     %a{abstract}
     def process_action: (Symbol _action_name) -> void
+    def recycle!: () -> void
 
     # `render(body, status:, content_type:, location:)` — sets @body,
     # @status, and optionally @content_type / @location. `status:` is
-    # monomorphic Symbol (was untyped Symbol|Integer; real-blog only
-    # passes Symbol forms — `:ok`, `:created`, `:unprocessable_entity`
-    # etc. — and STATUS_CODES maps them). Callers needing a literal
-    # integer code coerce upstream.
+    # a registered Symbol on strict targets. The Ruby/Spinel reopen
+    # accepts Integer codes too (action_controller_head.rbs).
     def render: (
       String body,
       ?status: Symbol,
@@ -194,7 +212,7 @@ module ActionController
     ) -> void
 
     # `redirect_to(path, notice:, alert:, status:)` — sets @location,
-    # @status, @flash entries. `status:` typed Symbol (see render).
+    # @status, @flash entries. Ruby/Spinel also accepts Integer status codes.
     def redirect_to: (
       String path,
       ?notice: String?,
@@ -207,7 +225,8 @@ module ActionController
     # signature in runtime/spinel/action_controller_head.rbs.
     def head: (Symbol status, ?content_type: String?, ?location: String?) -> void
     def response: () -> Base
-    # Strict stubs; Ruby/Spinel reopen in current.rb fills these in.
+    def redirect?: () -> bool
+    # Strict stubs; Ruby/Spinel reopen in conditional_get.rb fills these in.
     def fresh_when: (untyped subject) -> void
     def stale?: (?etag: untyped) -> bool
     # Integer SECONDS on every duration-shaped keyword —
@@ -221,22 +240,24 @@ module ActionController
                       ?immutable: bool) -> void
     def cache_control_max_age: () -> Integer
     def cache_control_public: () -> bool
+    def set_header: (String name, String value) -> String
     def headers: () -> ActionController::HeaderStore
+    def helpers: () -> Base
     def send_data: (String data, ?type: String, ?disposition: String) -> void
     def verify_authenticity_token: () -> void
     def verified_request?: () -> bool
     def csrf_session_secret: () -> String
     def csrf_header_token: () -> String
     def request_for_csrf: () -> untyped
+    def absolute_redirect_location: (String loc) -> String
     def same_host_location: (String loc) -> String
     def request_host_for_redirect: () -> String
     def default_url_options: () -> Hash[Symbol, String]
     def request_protocol_for_url: () -> String
-    def url_from_path: (String path) -> String
+    def url_from_path: (String path, ?String? call_protocol, ?(Integer | String)? call_port, ?bool call_port_given) -> String
 
-    # Monomorphic on Symbol — body looks up STATUS_CODES. Integer
-    # pass-through was previously supported via `is_a?(Integer)`
-    # narrowing; that branch is removed since real-blog never uses it.
+    # Strict targets use Symbols; Ruby/Spinel widens resolve_status.
     def resolve_status: (Symbol s) -> Integer
+    def resolve_symbol_status: (Symbol s) -> Integer
   end
 end

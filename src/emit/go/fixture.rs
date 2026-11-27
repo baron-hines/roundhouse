@@ -59,12 +59,24 @@ pub(crate) fn emit_go_fixtures(app: &App) -> EmittedFile {
         // AUTOINCREMENT id in FixtureIDs.
         writeln!(s).unwrap();
         writeln!(s, "func {ns}LoadAll() {{").unwrap();
+        let temporal = crate::lower::fixture_to_library::temporal_columns(app, &fixture.class);
         for record in &fixture.records {
             let label = record.label.as_str();
             writeln!(s, "\t{{").unwrap();
             writeln!(s, "\t\tr := &{class_name}{{}}").unwrap();
             for field in &record.fields {
-                let col = go_field_name(field.column.as_str());
+                // Not the column's own field: the struct keeps a date or datetime as its stored text, in `<Col>Raw`.
+                if let crate::lower::LoweredFixtureValue::Literal { raw, .. } = &field.value
+                    && crate::lower::fixture_to_library::is_stored_temporal(&temporal, &field.column, raw)
+                {
+                    writeln!(s, "\t\tr.{} = {raw:?}", go_field_name(&format!("{}_raw", field.column.as_str()))).unwrap();
+                    continue;
+                }
+                let held = super::held_column_field(app, class_name, field.column.as_str());
+                let col = match &held {
+                    Some((field, _)) => field.clone(),
+                    None => go_field_name(field.column.as_str()),
+                };
                 let val = match &field.value {
                     crate::lower::LoweredFixtureValue::Literal { ty, raw } => {
                         go_literal_for(raw, ty)
@@ -92,11 +104,11 @@ pub(crate) fn emit_go_fixtures(app: &App) -> EmittedFile {
                 // A nullable column's field is a Go pointer; fixture
                 // values are plain literals, so route them through the
                 // null-preserving converter.
-                let val = match super::opt_converter_for(
+                let val = match held.map(|(_, conv)| conv).or_else(|| super::opt_converter_for(
                     &nullable_columns,
                     &class_name,
                     field.column.as_str(),
-                ) {
+                )) {
                     Some(conv) => format!("{conv}({val})"),
                     None => val,
                 };
@@ -157,22 +169,28 @@ pub(super) fn go_literal_for(value: &str, ty: &Ty) -> String {
             if value.parse::<i64>().is_ok() {
                 value.to_string()
             } else {
-                format!("0 /* TODO: coerce {value:?} */")
+                unreadable_fixture_value(value, ty)
             }
         }
         Ty::Float => {
             if value.parse::<f64>().is_ok() {
                 value.to_string()
             } else {
-                format!("0.0 /* TODO: coerce {value:?} */")
+                unreadable_fixture_value(value, ty)
             }
         }
         Ty::Bool => match value {
             "true" | "1" => "true".into(),
             "false" | "0" => "false".into(),
-            _ => format!("false /* TODO: coerce {value:?} */"),
+            _ => unreadable_fixture_value(value, ty),
         },
         Ty::Class { id, .. } if id.0.as_str() == "Time" => format!("{value:?}"),
         _ => format!("{value:?}"),
     }
+}
+
+fn unreadable_fixture_value(value: &str, ty: &Ty) -> String {
+    let stub = crate::emit::diagnostics::report_unsupported(crate::span::Span::synthetic(), "go2", "fixture value", format!("{value:?} for a {ty:?} column"));
+    // Not the bare panic: it answers no value, and the fixture assigns this to a field
+    format!("func() {} {{ {stub} }}()", super::ty::go_ty_stub(Some(ty)))
 }

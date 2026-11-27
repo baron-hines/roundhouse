@@ -17,8 +17,6 @@
 /// `restore_extras_facades`. Same raise-loudly contract as
 /// runtime/ruby/gem_facades.rb.
 ///
-/// - Sponge = Net::HTTP + Resolv + IPAddr + OpenSSL (pending the stdlib
-///   spin packages).
 /// - Markdowner walks a Markly DOM with a recursive block-driving helper
 ///   (`walk_text_nodes` forwards `&block` through `Markly::Node#each`);
 ///   that identity-forwarding block-through-a-yielding-method recursion
@@ -26,11 +24,6 @@
 ///   All consumers are write-path (`markeddown_*` precomputed on save),
 ///   so the read benchmark never renders markdown. Real fix = a
 ///   Commonmarker façade over the gem's iterative `Node#walk`.
-/// - CachePageJob warms the page cache through an
-///   `ActionDispatch::Integration::Session`; `caches_page` itself is
-///   dropped, and no AOT runtime carries an integration session.
-/// - StoryImage composites a logo with vips operations (`flatten`,
-///   `resize`, `insert`) spinel-ruby-vips does not carry yet.
 /// - FlaggedCommenters computes flag statistics with MySQL-only SQL
 ///   (stddev(), if()) under `Rails.cache.fetch` blocks whose bodies
 ///   also carry un-modeled calls (`exec_query().first.symbolize_keys!`,
@@ -103,14 +96,6 @@ fn class_names_constant(app: &crate::App, class_name: &str, name: &str) -> bool 
 
 pub const EXTRAS_FACADES: &[Facade] = &[
     Facade {
-        stem: "app/models/sponge",
-        class_name: "Sponge",
-        rb: include_str!("../runtime/spinel/facades/sponge.rb"),
-        rbs: include_str!("../runtime/spinel/facades/sponge.rbs"),
-        lifted_by_sql_functions: &[],
-        lifted_by_constants: &[],
-    },
-    Facade {
         stem: "app/models/markdowner",
         class_name: "Markdowner",
         rb: include_str!("../runtime/spinel/facades/markdowner.rb"),
@@ -131,38 +116,10 @@ pub const EXTRAS_FACADES: &[Facade] = &[
         lifted_by_constants: &[],
     },
     Facade {
-        stem: "app/models/cache_page_job",
-        class_name: "CachePageJob",
-        rb: include_str!("../runtime/spinel/facades/cache_page_job.rb"),
-        rbs: include_str!("../runtime/spinel/facades/cache_page_job.rbs"),
-        lifted_by_sql_functions: &[],
-        lifted_by_constants: &[],
-    },
-    Facade {
-        stem: "app/models/story_image",
-        class_name: "StoryImage",
-        rb: include_str!("../runtime/spinel/facades/story_image.rb"),
-        rbs: include_str!("../runtime/spinel/facades/story_image.rbs"),
-        lifted_by_sql_functions: &[],
-        lifted_by_constants: &[],
-    },
-    Facade {
         stem: "app/models/html_encoder",
         class_name: "HtmlEncoder",
         rb: include_str!("../runtime/spinel/facades/html_encoder.rb"),
         rbs: include_str!("../runtime/spinel/facades/html_encoder.rbs"),
-        lifted_by_sql_functions: &[],
-        lifted_by_constants: &[],
-    },
-    // Preview Campfire's WAL checkpoint thread — File flock /
-    // connection_db_config / FileUtils, none of which Spinel models.
-    // Puma starts it on CRuby; Spinel HTTP does not use Puma. Stub
-    // keeps app/models.rb loading without refusing AOT.
-    Facade {
-        stem: "app/models/sqlite_wal_checkpoint",
-        class_name: "SqliteWalCheckpoint",
-        rb: include_str!("../runtime/spinel/facades/sqlite_wal_checkpoint.rb"),
-        rbs: include_str!("../runtime/spinel/facades/sqlite_wal_checkpoint.rbs"),
         lifted_by_sql_functions: &[],
         lifted_by_constants: &[],
     },
@@ -171,18 +128,18 @@ pub const EXTRAS_FACADES: &[Facade] = &[
 /// The façade contracts, parsed into analysis signatures, for those
 /// façades whose class this app actually defines. Gated the same way
 /// `apply_extras_facades` is a no-op on an absent path — an app with no
-/// `Sponge` must not acquire one's signatures.
+/// `Markdowner` must not acquire one's signatures.
 ///
 /// Merged into `app.rbs_signatures`, which the analyzer already overlays
 /// onto its hardcoded catalog (see `analyzer_rbs_signatures_overlay_the_hardcoded_catalog`).
 pub fn signatures_for(
     app: &crate::App,
-) -> std::collections::HashMap<crate::ClassId, std::collections::HashMap<crate::Symbol, crate::Ty>>
+) -> crate::det::HashMap<crate::ClassId, crate::det::HashMap<crate::Symbol, crate::Ty>>
 {
-    let mut out: std::collections::HashMap<
+    let mut out: crate::det::HashMap<
         crate::ClassId,
-        std::collections::HashMap<crate::Symbol, crate::Ty>,
-    > = std::collections::HashMap::new();
+        crate::det::HashMap<crate::Symbol, crate::Ty>,
+    > = crate::det::HashMap::default();
     for f in EXTRAS_FACADES {
         let defined = app
             .library_classes

@@ -7,6 +7,364 @@ use roundhouse::analyze::Analyzer;
 use roundhouse::ident::{ClassId, Symbol};
 use roundhouse::ty::Ty;
 
+fn review_record(source: &str, path: &str, reopen: Option<(&str, &str)>) -> roundhouse::App {
+    let mut tree = HashMap::from([(PathBuf::from(path), source.as_bytes().to_vec())]);
+    if let Some((path, source)) = reopen {
+        tree.insert(PathBuf::from(path), source.as_bytes().to_vec());
+    }
+    roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest review record")
+}
+
+#[test]
+fn file_data_composition_strictly_emits() {
+    for source in [
+        "require \"stringio\"\nArtifact = Data.define(:digest)\n",
+        "require('set')\nrequire 'digest/sha2'\nArtifact = Data.define(:digest)\n",
+        "Artifact = Data.define(:digest)\nclass Artifact; def label = digest; end\n",
+    ] {
+        for path in ["lib/artifact.rb", "app/models/artifact.rb"] {
+            let mut app = review_record(source, path, None);
+            let diagnostics = errors(&mut app);
+            assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
+            let files = roundhouse::emit::ruby::emit_library(&app);
+            let ruby = &files.iter().find(|f| f.path.to_string_lossy().ends_with("artifact.rb")).unwrap().content;
+            assert_eq!(ruby.matches("Data.define").count(), 1, "{ruby}");
+        }
+    }
+}
+
+#[test]
+fn complete_generated_data_constructors_can_be_made_private() {
+    for names in [":new", ":[]", ":allocate", ":new, :[]", ":new, :allocate", ":[], :allocate",
+        ":new, :new, :[]", ":new, :[], :allocate, :allocate", "'new', '[]', 'allocate'",
+        ":new, :[], :allocate", ":new, :allocate, :[]", ":[], :new, :allocate",
+        ":[], :allocate, :new", ":allocate, :new, :[]", ":allocate, :[], :new"] {
+        let source = format!("Artifact = Data.define(:digest) do\n  private_class_method {names}\nend\n");
+        for path in ["lib/artifact.rb", "app/models/artifact.rb"] {
+            if names.starts_with("'") {
+                assert_review_refusal(&source, path, "Data visibility macro", Some(source.find("private_class_method").unwrap()));
+            } else if ["new", "[]", "allocate"].iter().all(|name| names.contains(name)) {
+                assert_review_admitted(&source, path);
+            } else {
+                assert_review_refusal(&source, path, "requires an already defined local method",
+                    Some(source.find("private_class_method").unwrap()));
+            }
+        }
+    }
+}
+
+#[test]
+fn data_constructor_visibility_before_a_definition_is_refused_at_the_marker() {
+    for (marker, later) in [
+        ("private_class_method :new", "def self.new(digest:) = digest"),
+        ("private_class_method :new", "def new = digest"),
+    ] {
+        let source = format!("Artifact = Data.define(:digest) do\n  {marker}\n  {later}\nend\n");
+        for path in ["lib/artifact.rb", "app/models/artifact.rb"] {
+            let at = source.find(marker).unwrap();
+            assert_review_refusal(&source, path, "requires an already defined local method", Some(at));
+        }
+    }
+}
+
+#[test]
+fn partial_singleton_constructor_privacy_is_refused_at_the_marker() {
+    for later in ["def self.new(digest:) = digest"] {
+        let source = format!("Artifact = Data.define(:digest) do\n  class << self; private :new; end\n  {later}\nend\n");
+        for path in ["lib/artifact.rb", "app/models/artifact.rb"] {
+            assert_review_refusal(&source, path, "requires an already defined local method",
+                Some(source.find("private :new").unwrap()));
+        }
+    }
+}
+
+#[test]
+fn complete_private_constructors_keep_subclasses_and_toggles_refused() {
+    let parent = "Artifact = Data.define(:digest) do\n  def self.build(digest) = new(digest:)\n  private_class_method :new, :[], :allocate\nend\n";
+    for suffix in [
+        "class Child < Artifact; def self.make(digest) = new(digest:); end\n",
+        "class Child < Artifact; DEFAULT = new(digest: 'default'); end\n",
+    ] {
+        let source = format!("{parent}{suffix}");
+        assert_review_refusal(&source, "lib/artifact.rb", "constructor visibility with Data subclasses",
+            Some(source.find("private_class_method").unwrap()));
+    }
+    assert_review_admitted(&format!("{parent}class Artifact; def label = 'L:' + digest; end\n"), "lib/artifact.rb");
+    for marker in ["public_class_method :new", "public_class_method :[]",
+        "public_class_method :new, :[], :allocate"] {
+        let source = parent.replace("end\n", &format!("  {marker}\nend\n"));
+        assert_review_refusal(&source, "lib/artifact.rb", "Data visibility macro",
+            Some(source.find(marker).unwrap()));
+    }
+    for work in ["def self.make(digest) = new(digest:)", "DEFAULT = new(digest: 'default')"] {
+        let source = format!("module Shop; end\nShop::Artifact = Data.define(:digest) do\n  private_class_method :new, :[], :allocate\nend\nmodule Shop\n  class Child < Artifact\n    {work}\n  end\nend\n");
+        assert_review_refusal(&source, "lib/artifact.rb", "constructor visibility with Data subclasses",
+            Some(source.find("private_class_method").unwrap()));
+    }
+}
+
+fn assert_review_admitted(source: &str, path: &str) {
+    let mut app = review_record(source, path, None);
+    let diagnostics = errors(&mut app);
+    assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
+}
+
+#[test]
+fn data_reopenings_refuse_block_load_time_calls() {
+    for work in ["FIRST = new(digest: 'x').label", "FIRST = [new(digest: 'x').label]",
+        "FIRST = {value: new(digest: 'x').label}", "FIRST = ('x'.freeze)",
+        "@first = new(digest: 'x').label", "puts new(digest: 'x').label"] {
+        let source = format!("Artifact = Data.define(:digest) do\n  def label = 'block'\n  {work}\nend\nclass Artifact\n  def label = 'reopen'\nend\n");
+        for path in ["lib/artifact.rb", "app/models/artifact.rb"] {
+            assert_review_refusal(&source, path, "Data.define reopening with load-time", None);
+        }
+    }
+}
+
+fn assert_review_refusal(source: &str, path: &str, shape: &str, marker: Option<usize>) {
+    let tree = [(PathBuf::from(path), source.as_bytes().to_vec())].into_iter().collect();
+    match roundhouse::ingest::ingest_app_from_tree(tree) {
+        Ok(mut app) => {
+            let diagnostics = errors(&mut app);
+            assert!(diagnostics.iter().any(|d| !d.span.is_synthetic() && d.message.contains(shape)
+                && marker.is_none_or(|at| d.span.start as usize == at)), "{source}: {diagnostics:?}");
+        }
+        Err(err) => {
+            let roundhouse::ingest::IngestError::Unsupported { file, message } = &err else {
+                panic!("{source}: expected an unsupported construct, got {err:?}");
+            };
+            assert_eq!(file, path);
+            assert!(message.contains(shape), "{source}: {message}");
+            if let Some(at) = marker {
+                let line = source[..at].bytes().filter(|&c| c == b'\n').count() + 1;
+                let rendered = roundhouse::ingest::render_error(&err);
+                assert!(rendered.contains(&format!("{path}:{line}:")), "{rendered}");
+            }
+        }
+    }
+}
+
+#[test]
+fn an_unlocated_ingest_error_keeps_its_existing_rendering() {
+    let err = roundhouse::ingest::IngestError::Unsupported {
+        file: "unregistered.rb".into(), message: "no recorded site".into(),
+    };
+    assert_eq!(roundhouse::ingest::render_error(&err), err.to_string());
+}
+
+#[test]
+fn data_reopenings_refuse_non_method_block_statements_at_the_statement() {
+    for work in [
+        "VALUE = 1 if true", "VALUE = 1", "value = 1", "@value = 1",
+        "if true; VALUE = 1; end", "unless false; VALUE = 1; end",
+        "if true; def hidden = digest; end", "puts 'loaded'", "private private(:label)",
+        "def Artifact.extra = 1", "private_class_method def Artifact.extra = 1",
+    ] {
+        let source = format!("Artifact = Data.define(:digest) do\n  def label = digest.to_s\n  {work}\nend\nclass Artifact\n  def value = VALUE\nend\n");
+        for path in ["lib/artifact.rb", "app/models/artifact.rb"] {
+            assert_review_refusal(&source, path, "Data.define reopening with load-time",
+                Some(source.find(work).unwrap()));
+        }
+    }
+}
+
+#[test]
+fn a_data_block_without_a_reopening_keeps_its_existing_constants() {
+    let source = "Artifact = Data.define(:digest) do\n  VALUE = 1\n  def label = digest.to_s\nend\n";
+    for path in ["lib/artifact.rb", "app/models/artifact.rb"] {
+        let mut app = review_record(source, path, None);
+        assert!(errors(&mut app).is_empty());
+        let record = app.library_classes.iter().find(|c| c.name.0.as_str() == "Artifact").unwrap();
+        assert!(record.constants.iter().any(|(name, _)| name.as_str() == "VALUE"));
+    }
+}
+
+#[test]
+fn private_data_constructors_do_not_allow_unproven_inherited_methods() {
+    for marker in ["private_class_method :missing", "private :new", "private_class_method ENV.fetch('NAME')",
+        "class << self; private :new; end"] {
+        let source = format!("Artifact = Data.define(:digest) do\n {marker}\nend");
+        let mut app = review_record(&source, "lib/artifact.rb", None);
+        assert!(!errors(&mut app).is_empty(), "{source}");
+    }
+}
+
+#[test]
+fn file_data_admission_does_not_accept_arbitrary_calls_or_replace_an_earlier_class() {
+    for source in [
+        "require ENV.fetch('FEATURE')\nArtifact = Data.define(:digest)",
+        "require 'not_a_standard_library'\nArtifact = Data.define(:digest)",
+        "Kernel.require 'stringio'\nArtifact = Data.define(:digest)",
+        "puts 'side effect'\nArtifact = Data.define(:digest)",
+        "class Artifact; def label = 'old'; end\nArtifact = Data.define(:digest)",
+        "Artifact = Data.define(:digest)\nArtifact = Data.define(:other)",
+        "Artifact = Data.define(:digest) do; def label = 'before'; end\nmodule Observer; VALUE = Artifact.new('x').label; end\nclass Artifact; def label = 'after'; end",
+    ] {
+        let mut app = review_record(source, "lib/artifact.rb", None);
+        let diagnostics = errors(&mut app);
+        assert!(diagnostics.iter().any(|d| !d.span.is_synthetic()), "{source}: {diagnostics:?}");
+    }
+}
+
+#[test]
+fn review_data_nested_bodyless_factory_keeps_emitting() {
+    let source = "Artifact = Data.define(:digest) do\n  Inner = Data.define(:value)\n  def label = digest\nend\nmodule Builder; def self.make = Artifact.new(\"abc\"); end\n";
+    for path in ["lib/artifact.rb", "app/models/artifact.rb"] {
+        let mut app = review_record(source, path, None);
+        assert!(errors(&mut app).is_empty(), "{path}: bodyless nested factory must remain admitted");
+        let files = roundhouse::emit::ruby::emit_library(&app);
+        let ruby = &files.iter().find(|f| f.path.to_string_lossy().ends_with("artifact.rb")).unwrap().content;
+        assert!(ruby.contains("::Inner = ::Data.define(:value)"), "{ruby}");
+        let rbs = &files.iter().find(|f| f.path.to_string_lossy().ends_with("artifact.rbs")).unwrap().content;
+        assert!(rbs.contains("def label:"), "{rbs}");
+    }
+}
+
+#[test]
+fn review_data_nested_body_is_refused_at_its_declaration() {
+    let source = "Artifact = Data.define(:digest, :size) do\n  Inner = Data.define(:value) do\n    def text = \"inner:\" + value\n  end\n  def label = digest + \":\" + size.to_s\nend\nmodule Builder; def self.make = Artifact.new(digest: \"abc\", size: 3); end\n";
+    for path in ["lib/artifact.rb", "app/models/artifact.rb"] {
+        for source in [source.to_string(), source.replace("Data.define(:value) do", "Data.define(:value) do |klass|"),
+            source.replace("Data.define(:value) do", "Data.define(:value) do |klass|; klass;")]
+        {
+            let mut app = review_record(&source, path, None);
+            let diagnostics = errors(&mut app);
+            assert!(diagnostics.iter().any(|d| !d.span.is_synthetic() && d.message.contains("nested Data.define")),
+                "an unreferenced nested factory must not lose its body: {diagnostics:?}");
+        }
+    }
+}
+
+#[test]
+fn review_data_cross_file_reopenings_are_source_located_refusals() {
+    let source = "Artifact = Data.define(:digest, :size) do; def label = digest + \":\" + size.to_s; end\nmodule Builder; def self.make = Artifact.new(digest: \"abc\", size: 3); end\n";
+    for path in ["lib/artifact.rb", "app/models/artifact.rb"] {
+        for reopen in ["lib/a_reopen.rb", "lib/z_reopen.rb"] {
+            let mut app = review_record(source, path, Some((reopen,
+                "require_relative \"artifact\"\nclass Artifact; def extra = \"extra:\" + digest; end\n")));
+            let diagnostics = errors(&mut app);
+            assert!(diagnostics.iter().any(|d| !d.span.is_synthetic() && d.message.contains("cross-file reopening")),
+                "{path}, {reopen}: {diagnostics:?}");
+        }
+    }
+}
+
+fn review_record_signature(source: &str, path: &str) -> String {
+    let mut app = review_record(source, path, None);
+    assert!(errors(&mut app).is_empty());
+    roundhouse::emit::ruby::emit_library(&app).into_iter()
+        .find(|file| file.path.to_string_lossy().ends_with("artifact.rbs"))
+        .expect("Artifact signature").content
+}
+
+#[test]
+fn data_reopening_return_uses_the_last_definition_on_each_receiver() {
+    for (first, last, expected) in [("'old'", "digest", "untyped"), ("digest", "'last'", "String")] {
+        for receiver in ["", "self."] {
+            let member = if receiver.is_empty() { "digest" } else { "new(digest: 1).digest" };
+            let first = if first == "digest" { member } else { first };
+            let last = if last == "digest" { member } else { last };
+            let source = format!("Artifact = Data.define(:digest) do\n  def {receiver}label = {first}\nend\nclass Artifact\n  def {receiver}label = {last}\nend\n");
+            for path in ["lib/artifact.rb", "app/models/artifact.rb"] {
+                let rbs = review_record_signature(&source, path);
+                assert!(rbs.contains(&format!("def {receiver}label: () -> {expected}")), "{rbs}");
+                assert_eq!(rbs.matches(&format!("def {receiver}label:")).count(), 1, "{rbs}");
+            }
+        }
+    }
+    let source = "Artifact = Data.define(:digest) do\n  def label = digest\nend\nclass Artifact\n  def self.label = 'class'\nend\n";
+    let rbs = review_record_signature(source, "lib/artifact.rb");
+    assert!(rbs.contains("def label: () -> untyped") && rbs.contains("def self.label: () -> String"), "{rbs}");
+}
+
+#[test]
+fn an_untyped_override_of_a_generated_data_method_is_untyped() {
+    for (head, tail) in [(" do\n  def with = digest\nend\n", ""), ("\n", "class Artifact\n  def with = digest\nend\n"),
+                         (" do\n  def self.new(digest:) = digest\nend\n", ""), ("\n", "class Artifact\n  def self.new(digest:) = digest\nend\n")] {
+        let source = format!("Artifact = Data.define(:digest){head}{tail}");
+        let receiver = if source.contains("self.new") { "self.new" } else { "with" };
+        for path in ["lib/artifact.rb", "app/models/artifact.rb"] {
+            let rbs = review_record_signature(&source, path);
+            let line = rbs.lines().find(|line| line.contains(&format!("def {receiver}:"))).unwrap_or_else(|| panic!("{rbs}"));
+            assert!(line.ends_with("-> untyped"), "{source}\n{rbs}");
+        }
+    }
+}
+
+#[test]
+fn data_reopening_parameters_use_the_last_definition() {
+    let source = "Artifact = Data.define(:digest) do\n  def label(name) = name\nend\nclass Artifact\n  def label(name:) = name\nend\nmodule Builder; def self.make = Artifact.new(digest: \"a\").label(name: \"abc\"); end\n";
+    for path in ["lib/artifact.rb", "app/models/artifact.rb"] {
+        let rbs = review_record_signature(source, path);
+        assert!(rbs.contains("def label: (name: String) -> String"), "{rbs}");
+    }
+}
+
+/// A load-time statement between two definitions sees the first, which ingest does not keep.
+#[test]
+fn a_statement_between_two_definitions_of_a_data_method_is_refused() {
+    for (receiver, call) in [("self.", "capture"), ("", "new(digest: 1).capture")] {
+        let source = format!("Artifact = Data.define(:digest) do\n  def {receiver}capture = \"old\"\n  CAPTURED = {call}\n  def {receiver}capture = 1\nend\n");
+        for path in ["lib/artifact.rb", "app/models/artifact.rb"] {
+            assert_review_refusal(&source, path, "between two definitions", source.find("CAPTURED"));
+        }
+    }
+    let source = "Artifact = Data.define(:digest) do\n  CAPTURED = 1\n  def capture = \"old\"\n  def capture = 1\nend\n";
+    let mut app = review_record(source, "lib/artifact.rb", None);
+    assert!(errors(&mut app).is_empty());
+}
+
+/// A replaced definition never runs, so neither its block use nor its calls reach analysis.
+#[test]
+fn a_replaced_data_definition_reaches_no_caller_or_callee() {
+    let source = "module Sink\n  def self.take(value) = value\nend\nArtifact = Data.define(:digest) do\n  def pick = yield\n  def feed = Sink.take(\"old\")\nend\nclass Artifact\n  def pick = 1\n  def feed = Sink.take(1)\nend\nmodule Builder\n  def self.make = Artifact.new(digest: \"a\").pick { \"text\" }\nend\n";
+    for path in ["lib/artifact.rb", "app/models/artifact.rb"] {
+        let mut app = review_record(source, path, None);
+        assert!(errors(&mut app).is_empty());
+        let methods: Vec<_> = app.library_classes.iter().filter(|class| class.name.0.as_str() == "Artifact")
+            .flat_map(|class| &class.methods).map(|method| method.name.as_str()).collect();
+        assert_eq!(methods, ["pick", "feed"], "{path}");
+        let rbs: String = roundhouse::emit::ruby::emit_library(&app).into_iter()
+            .filter(|file| file.path.extension().is_some_and(|ext| ext == "rbs")).map(|file| file.content).collect();
+        assert!(rbs.contains("def self.make: () -> Integer"), "{rbs}");
+        assert!(rbs.contains("def self.take: (Integer value) -> Integer"), "{rbs}");
+    }
+}
+
+#[test]
+fn data_reopening_keeps_a_declared_return_signature() {
+    let source = "Artifact = Data.define(:digest) do\n  def label = 'old'\nend\nclass Artifact\n  def label = digest\nend\n";
+    for path in ["lib/artifact.rb", "app/models/artifact.rb"] {
+        let mut app = review_record(source, path, None);
+        app.rbs_signatures = roundhouse::rbs::parse_app_signatures(
+            "class Artifact\n  def label: () -> Integer\nend\n").unwrap();
+        assert!(errors(&mut app).is_empty());
+        let rbs = roundhouse::emit::ruby::emit_library(&app).into_iter()
+            .find(|file| file.path.to_string_lossy().ends_with("artifact.rbs")).unwrap().content;
+        assert!(rbs.contains("def label: () -> Integer"), "{rbs}");
+    }
+}
+
+#[test]
+fn review_data_constructor_override_has_one_signature() {
+    let source = "Artifact = Data.define(:digest) do\n  def self.new(digest:) = \"custom:\" + digest\nend\nmodule Builder; def self.make = Artifact.new(digest: \"abc\"); end\n";
+    for path in ["lib/artifact.rb", "app/models/artifact.rb"] {
+        let rbs = review_record_signature(source, path);
+        assert_eq!(rbs.matches("def self.new:").count(), 1, "{rbs}");
+        assert!(rbs.contains("-> String"), "{rbs}");
+    }
+}
+
+#[test]
+fn review_data_private_visibility_survives_in_signatures() {
+    let source = "Artifact = Data.define(:digest, :size) do\n  def label = hidden + \":\" + size.to_s\n  private\n  def hidden = digest\nend\nmodule Builder; def self.make = Artifact.new(digest: \"abc\", size: 3); end\n";
+    for path in ["lib/artifact.rb", "app/models/artifact.rb"] {
+        let rbs = review_record_signature(source, path);
+        assert!(rbs.contains("private def hidden:"), "{rbs}");
+        assert!(!rbs.contains("private def label:"), "{rbs}");
+    }
+}
+
 #[path = "support/data_factory.rs"]
 mod data_factory;
 
@@ -507,29 +865,24 @@ fn a_result_name_in_another_owner_does_not_answer_an_unresolved_constant() {
 }
 
 #[test]
-fn rehomed_file_level_factories_remain_unsupported() {
+fn file_level_factories_keep_their_identity_beside_other_classes() {
     let source = format!(
         "GlobalResult = Data.define(:name)\n{}",
         data_factory::DECLARATIONS
     );
     let mut app = ingest(&source, "GlobalResult.new(name: \"global\")");
     assert!(
-        !Analyzer::new(&app)
+        Analyzer::new(&app)
             .class_registry()
             .contains_key(&ClassId(Symbol::from("GlobalResult")))
     );
     roundhouse::session::analyze_and_lower(&mut app);
     let diagnostics = roundhouse::analyze::diagnose(&app);
-    assert!(
-        diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.severity == roundhouse::diagnostic::Severity::Error),
-        "{diagnostics:?}"
-    );
+    assert!(diagnostics.iter().all(|diagnostic| diagnostic.severity != roundhouse::diagnostic::Severity::Error), "{diagnostics:?}");
 }
 
 #[test]
-fn factories_outside_library_classes_remain_unsupported() {
+fn factories_in_unretained_owner_positions_remain_unsupported() {
     let tree: HashMap<PathBuf, Vec<u8>> = [
         (
             "app/models/factory_model.rb",
@@ -572,8 +925,8 @@ end
     assert_eq!(app.test_modules.len(), 1);
     assert_eq!(app.test_modules[0].inner_classes.len(), 1);
     let analyzer = Analyzer::new(&app);
+    assert!(analyzer.class_registry().contains_key(&ClassId(Symbol::from("FactoryModel::Result"))));
     for name in [
-        "FactoryModel::Result",
         "FactoryModel::Qualified",
         "FactoryOwnerController::Result",
         "FactoryOwnerController::Qualified",
@@ -590,7 +943,6 @@ end
     roundhouse::session::analyze_and_lower(&mut app);
     let diagnostics = roundhouse::analyze::diagnose(&app);
     for name in [
-        "FactoryModel::Result",
         "FactoryOwnerController::Result",
         "FactoryTest::Result",
         "FactoryCompanion::Result",
@@ -640,7 +992,6 @@ fn custom_factory_blocks_are_not_silently_discarded() {
     assert!(roundhouse::ingest::ingest_library_class(source, "probe.rb").is_err());
     for block in [
         "def label; name; end; LIMIT = 4",
-        "def label; name; end; include Comparable",
         "def label; name; end; puts 'side effect'",
         "def other.label; 1; end",
         "|value| value; def label; name; end",
@@ -651,6 +1002,17 @@ fn custom_factory_blocks_are_not_silently_discarded() {
             "{source}"
         );
     }
+}
+
+/// An `include` of a constant in the block is the Data class's own, kept
+/// rather than dropped with the rest of the body.
+#[test]
+fn a_custom_factory_block_s_include_is_kept() {
+    let source = b"class Owner; State = Data.define(:name) do; include Comparable; def label; name; end; end; end";
+    let classes = roundhouse::ingest::ingest_library_classes(source, "probe.rb").expect("ingests");
+    let state = classes.iter().find(|c| c.name.0.as_str() == "Owner::State").expect("lifted");
+    assert_eq!(state.includes.iter().map(|i| i.0.as_str()).collect::<Vec<_>>(), ["Comparable"]);
+    assert!(state.methods.iter().any(|m| m.name.as_str() == "label"));
 }
 
 /// Keep error diagnostics for dynamic/invalid members, shadowed Data, and
@@ -806,4 +1168,270 @@ fn ruby_and_spinel_emit_declared_factory_types_without_data_errors() {
             "{sidecar}"
         );
     }
+}
+
+/// A file whose only declaration is one top-level `Data.define`
+/// constant, named after the file as Zeitwerk expects.
+fn ingest_top_level(action: &str) -> roundhouse::App {
+    let tree: HashMap<PathBuf, Vec<u8>> = [
+        (
+            PathBuf::from("app/models/breadcrumb.rb"),
+            b"Breadcrumb = Data.define(:name, :path)\n".to_vec(),
+        ),
+        (
+            PathBuf::from("app/controllers/data_probe_controller.rb"),
+            format!("class DataProbeController < ApplicationController\n  def index\n    @result = {action}\n  end\nend\n").into_bytes(),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest")
+}
+
+#[test]
+fn a_top_level_data_factory_file_registers_its_class() {
+    let mut app = ingest_top_level("Breadcrumb.new(name: \"Posts\", path: \"/posts\").path");
+    let id = ClassId(Symbol::from("Breadcrumb"));
+    {
+        let analyzer = Analyzer::new(&app);
+        let class = &analyzer.class_registry()[&id];
+        assert_eq!(
+            class.class_methods.get(&Symbol::from("new")),
+            Some(&Ty::Class { id: id.clone(), args: vec![].into() })
+        );
+        for member in ["name", "path"] {
+            assert_eq!(class.instance_methods.get(&Symbol::from(member)), Some(&Ty::Untyped));
+            assert!(!class.instance_methods.contains_key(&Symbol::from(format!("{member}="))));
+        }
+    }
+    roundhouse::session::analyze_and_lower(&mut app);
+    let errors: Vec<_> = roundhouse::analyze::diagnose(&app)
+        .into_iter()
+        .filter(|diagnostic| diagnostic.severity == roundhouse::diagnostic::Severity::Error)
+        .collect();
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn top_level_files_outside_the_data_define_shape_are_not_admitted() {
+    for source in [
+        "Weird = Data.define(:a) do |klass|\n  def doubled = a * 2\nend\n",
+        "Weird = Data.members(:a)\n",
+        "record::Weird = Data.define(:a)\n",
+        "Weird = Other.define(:a)\n",
+    ] {
+        let tree: HashMap<PathBuf, Vec<u8>> =
+            [(PathBuf::from("app/models/weird.rb"), source.as_bytes().to_vec())]
+                .into_iter()
+                .collect();
+        let app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest");
+        assert!(
+            app.library_classes.iter().all(|lc| lc.data_define().is_none()),
+            "{source:?} was admitted as a Data class"
+        );
+    }
+}
+
+fn ingest_block(body: &str, reader: &str) -> Result<roundhouse::App, roundhouse::ingest::IngestError> {
+    let tree: HashMap<PathBuf, Vec<u8>> = [
+        (
+            PathBuf::from("app/models/timeframe.rb"),
+            format!("Timeframe = Data.define(:id, :label_text) do\n{body}end\n").into_bytes(),
+        ),
+        (
+            PathBuf::from("app/models/timeframe_report.rb"),
+            format!("class TimeframeReport\n  def self.read = {reader}\nend\n").into_bytes(),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    roundhouse::ingest::ingest_app_from_tree(tree)
+}
+
+fn errors(app: &mut roundhouse::App) -> Vec<roundhouse::diagnostic::Diagnostic> {
+    roundhouse::session::analyze_and_lower(app);
+    roundhouse::analyze::diagnose(app)
+        .into_iter()
+        .filter(|diagnostic| diagnostic.severity == roundhouse::diagnostic::Severity::Error)
+        .collect()
+}
+
+#[test]
+fn file_level_data_body_methods_survive_sibling_declarations() {
+    for path in ["lib/artifact.rb", "app/models/artifact.rb"] {
+        let tree: HashMap<PathBuf, Vec<u8>> = [(PathBuf::from(path), br#"
+Artifact = Data.define(:digest, :size) do
+  def label = digest + ":" + size.to_s
+end
+module Builder
+  def self.make = Artifact.new(digest: "abc", size: 3)
+  def self.label = make.label
+end
+"#.to_vec())].into_iter().collect();
+        let mut app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest");
+        let record = app.library_classes.iter().find(|class| class.name.0.as_str() == "Artifact")
+            .unwrap_or_else(|| panic!("{path}: missing Artifact"));
+        assert!(record.data_define().is_some(), "{path}: {:?}", record.origin);
+        assert_eq!(record.methods.len(), 1, "{path}: {:?}", record.methods);
+        assert!(errors(&mut app).is_empty(), "{path}: {:?}", roundhouse::analyze::diagnose(&app));
+    }
+}
+
+#[test]
+fn multiple_file_level_data_records_keep_their_members_and_methods() {
+    let source = "Reports::First = ::Data.define(:value) do; def label = self.value; end\n\
+                  Reports::Second = Data.define(:value) do; def label = value.to_s; end\n";
+    let tree = [(PathBuf::from("app/models/reports/records.rb"), source.as_bytes().to_vec())]
+        .into_iter().collect();
+    let app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest");
+    for name in ["Reports::First", "Reports::Second"] {
+        let class = app.library_classes.iter().find(|class| class.name.0.as_str() == name).expect(name);
+        assert!(class.data_define().is_some(), "{class:?}");
+        assert_eq!(class.methods.len(), 1, "{class:?}");
+    }
+}
+
+#[test]
+fn unsupported_file_level_data_blocks_keep_source_located_refusals() {
+    use roundhouse::diagnostic::Severity;
+    for record in [
+        "Artifact = Data.define(:digest) do |klass|; klass; def label = digest; end",
+        "Artifact = Data.define(member) do; def label = digest; end",
+        "Artifact = Data.define(:digest, :digest) do; def label = digest; end",
+        "Artifact = Data.define(:digest) do; class Nested; end; def label = digest; end",
+        "Artifact = Data.define(:digest) do; def other.label = digest; end",
+    ] {
+        let source = format!("\n{record}\nmodule Builder; def self.label = Artifact.new(\"abc\").label; end\n");
+        let tree = [(PathBuf::from("lib/artifact.rb"), source.into_bytes())].into_iter().collect();
+        let (app, mut diagnostics) = roundhouse::ingest::prism::scope(|| roundhouse::ingest::ingest_app_from_tree(tree));
+        let mut app = app.expect("support-file errors are diagnostics");
+        roundhouse::session::analyze_and_lower(&mut app);
+        diagnostics.extend(roundhouse::analyze::diagnose(&app));
+        assert!(diagnostics.iter().any(|d| d.severity == Severity::Error && !d.span.is_synthetic()),
+            "{record}: {diagnostics:?}");
+    }
+}
+
+#[test]
+fn file_level_data_replacements_are_refused() {
+    let record = "Artifact = Data.define(:digest) do; def label = digest; end";
+    for (source, expected) in [
+        (format!("class Artifact; def extra = 1; end\n{record}"), "same class"),
+        (format!("{record}\nArtifact = Data.define(:size)"), "reassignment of Data.define constant `Artifact`"),
+    ] {
+        let error = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "lib/artifact.rb")
+            .expect_err("a replacement must not merge unrelated bodies");
+        assert!(format!("{error:?}").contains(expected), "{error:?}");
+    }
+}
+
+#[test]
+fn file_level_data_records_require_the_builtin_factory() {
+    let mut app = ingest(r#"class Data
+  def self.define(name) = String
+end
+Artifact = Data.define(:digest) do
+  def label = "custom"
+end
+"#, "Artifact.new.label");
+    assert!(errors(&mut app).iter().any(|d| !d.span.is_synthetic()
+        && d.message.contains("built-in Data")));
+}
+
+#[test]
+fn file_level_data_records_do_not_drop_sibling_statements() {
+    for statement in ["puts 'loaded'", "Reports::Alias = String", "record::Other = Data.define(:value)"] {
+        let source = format!("Artifact = Data.define(:digest)\n{statement}\n");
+        assert!(roundhouse::ingest::ingest_library_classes(source.as_bytes(), "lib/artifact.rb").is_err(),
+            "silently discarded {statement}");
+    }
+}
+
+#[test]
+fn a_data_define_block_is_the_body_of_its_class() {
+    let body = "  OPTIONS = { \"all\" => \"All time\" }.freeze\n\n  def self.find(id) = new(id, nil)\n  def label_text = OPTIONS.fetch(id)\n";
+    let mut app = ingest_block(body, "[OPTIONS.size, Timeframe.find(\"all\").label_text]").expect("ingest");
+    let class = app.library_classes.iter().find(|lc| lc.name.0.as_str() == "Timeframe").unwrap();
+    assert_eq!(class.constants.len(), 1, "{:?}", class.constants);
+    assert_eq!(class.methods.len(), 2, "{:?}", class.methods);
+    let errors = errors(&mut app);
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn a_qualified_data_factory_file_registers_the_qualified_class() {
+    let tree: HashMap<PathBuf, Vec<u8>> = [
+        (PathBuf::from("app/models/reports/line.rb"), b"Reports::Line = Data.define(:label, :count)\n".to_vec()),
+        (
+            PathBuf::from("app/models/line_report.rb"),
+            b"class LineReport\n  def self.count = Reports::Line.new(\"a\", 2).count\nend\n".to_vec(),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    let mut app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest");
+    let id = ClassId(Symbol::from("Reports::Line"));
+    let class = app.library_classes.iter().find(|lc| lc.name == id).expect("Reports::Line");
+    assert!(class.data_define().is_some(), "{:?}", class.origin);
+    let errors = errors(&mut app);
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn a_data_define_block_constant_is_not_a_constant_of_the_class() {
+    let mut app = ingest_block("  OPTIONS = {}.freeze\n", "Timeframe::OPTIONS.size").expect("ingest");
+    let errors = errors(&mut app);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(format!("{:?}", errors[0].kind).contains("Timeframe::OPTIONS"), "{errors:?}");
+}
+
+#[test]
+fn a_class_inside_a_data_define_block_is_rejected() {
+    let Err(roundhouse::ingest::IngestError::Unsupported { message, .. }) =
+        ingest_block("  class Inner\n  end\n", "Timeframe")
+    else {
+        panic!("a class in a Data.define block was admitted");
+    };
+    assert!(message.contains("Data.define block"), "{message}");
+}
+
+#[test]
+fn a_top_level_data_factory_is_rejected_before_unverified_target_emission() {
+    use roundhouse::diagnostic::{DiagnosticKind, Severity};
+    use roundhouse::project::{BuildTarget, target_files};
+
+    let mut app = ingest_top_level("Breadcrumb.new(\"Posts\", \"/posts\")");
+    roundhouse::session::analyze_and_lower(&mut app);
+    for &target in BuildTarget::TRANSPILE {
+        // Futamura's residue is the app itself, run by Ruby: nothing to refuse.
+        if matches!(target, BuildTarget::Ruby | BuildTarget::Spinel | BuildTarget::Futamura) {
+            continue;
+        }
+        let (result, diagnostics) = roundhouse::emit::diagnostics::scope(|| {
+            target_files(&app, std::path::Path::new("not-a-fixture"), target)
+        });
+        assert!(result.is_err(), "{target:?} silently emitted a Data factory");
+        assert_eq!(diagnostics.len(), 1, "{target:?}: {diagnostics:?}");
+        let diagnostic = &diagnostics[0];
+        assert_eq!(diagnostic.severity, Severity::Error);
+        assert!(!diagnostic.span.is_synthetic(), "{diagnostic:?}");
+        assert!(
+            matches!(&diagnostic.kind, DiagnosticKind::Unsupported { construct, target: Some(name), .. }
+            if construct.as_str() == "Data.define" && name.as_str() == target.as_str()),
+            "{diagnostic:?}"
+        );
+    }
+}
+
+/// A computed include replayed as a call keeps no `ActiveModel::Serialization`
+/// argument: the marker the include list drops would name a namespace no
+/// target ships when the call runs.
+#[test]
+fn a_replayed_include_drops_the_serialization_marker() {
+    let source = b"class Stat < Base\n  include ActiveModel::Serialization, Helpers.mixin\nend\n";
+    let classes = roundhouse::ingest::ingest_library_classes(source, "probe.rb").expect("ingests");
+    let stat = classes.iter().find(|c| c.name.0.as_str() == "Stat").expect("class");
+    let replayed: Vec<String> = stat.unknown_calls.iter().map(|e| format!("{:?}", e.node)).collect();
+    assert!(!replayed.is_empty(), "the computed include is replayed");
+    assert!(replayed.iter().all(|r| !r.contains("Serialization")), "{replayed:#?}");
 }

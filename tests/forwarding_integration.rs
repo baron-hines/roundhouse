@@ -168,7 +168,7 @@ fn native_keyword_value_is_rewritten_inside_emitted_controller() {
 }
 
 #[test]
-fn inherited_constructor_and_reopened_descendant_mixin_refuse_unsafe_contracts() {
+fn inherited_constructor_and_reopened_descendant_mixin_keep_native_contracts() {
     for (source, reopen, script) in [
         (
             "class Parent; def self.build(...); new(...); end; def initialize(factor:); @factor=factor; end; def factor; @factor; end; end; class Child < Parent; def initialize(factor:2); @factor=factor; end; end",
@@ -195,13 +195,18 @@ fn inherited_constructor_and_reopened_descendant_mixin_refuse_unsafe_contracts()
             .write("app/lib/probe.rb", source)
             .write("app/lib/probe_reopen.rb", reopen)
             .run_ruby(script);
-        assert!(
-            run.errors.iter().any(|e| e.contains("forwarding")),
-            "errors={:?}; actual={}; stderr={}",
-            run.errors,
-            run.stdout,
-            run.stderr
-        );
+        run.assert_passes();
+        assert_eq!(run.stdout, "3\n");
+        if !reopen.is_empty() {
+            let (_, errors) = emit_and_run::real_blog()
+                .write("app/lib/probe.rb", source)
+                .write("app/lib/probe_reopen.rb", reopen)
+                .emit_target_neutral(roundhouse::project::BuildTarget::Ruby);
+            assert!(
+                errors.iter().any(|e| e.contains("forwarding")),
+                "{errors:?}"
+            );
+        }
     }
 }
 
@@ -532,7 +537,7 @@ puts "super packet reaches the synthesized positional contract"
             "    t.string \"title\"\n    t.index [\"title\"], name: \"index_articles_live_title\", unique: true, where: \"(id > 0)\"",
         )
         .run_ruby("puts 'super packet into a replaced model ancestor is diagnosed'");
-    assert!(run.success, "actual={}; stderr={}", run.stdout, run.stderr);
+    assert!(run.program_succeeded(), "the expected errors aside, the emitted program failed in {}\n=== stdout ===\n{}\n=== stderr ===\n{}", run.emitted.display(), run.stdout, run.stderr);
     assert_eq!(
         run.stdout,
         "super packet into a replaced model ancestor is diagnosed\n"
@@ -633,7 +638,7 @@ puts "base and sibling keyword calls still dispatch"
             "    t.string \"title\"\n    t.index [\"title\"], name: \"index_articles_live_title\", unique: true, where: \"(id > 0)\"",
         )
         .run_ruby("puts 'unsafe inherited keyword destinations are diagnosed'");
-    assert!(run.success, "actual={}; stderr={}", run.stdout, run.stderr);
+    assert!(run.program_succeeded(), "the expected errors aside, the emitted program failed in {}\n=== stdout ===\n{}\n=== stderr ===\n{}", run.emitted.display(), run.stdout, run.stderr);
     assert_eq!(run.stdout, "unsafe inherited keyword destinations are diagnosed\n");
     assert_eq!(run.errors.len(), 4, "errors={:?}", run.errors);
     assert!(
@@ -692,7 +697,7 @@ puts "model-owned source method is replaced"
             "    t.string \"title\"\n    t.index [\"title\"], name: \"index_articles_live_title\", unique: true, where: \"(id > 0)\"",
         )
         .run_ruby("puts 'model-owned replacement is diagnosed'");
-    assert!(run.success, "actual={}; stderr={}", run.stdout, run.stderr);
+    assert!(run.program_succeeded(), "the expected errors aside, the emitted program failed in {}\n=== stdout ===\n{}\n=== stderr ===\n{}", run.emitted.display(), run.stdout, run.stderr);
     assert_eq!(run.stdout, "model-owned replacement is diagnosed\n");
     assert_eq!(run.errors.len(), 1, "errors={:?}", run.errors);
     assert!(
@@ -863,10 +868,11 @@ fn check_surveys_effective_model_declarations_without_lowering_or_diagnostic_lea
             "",
             &[false, false],
         ),
+        // The instance `title` over the column's reader is the effective one (a column accessor yields).
         (
             "def self.title(...); 11; end; def title(...); 29; end",
             "",
-            &[false, true],
+            &[false, false],
         ),
         ("def self.create_from_params(...); 11; end", "", &[false]),
         (

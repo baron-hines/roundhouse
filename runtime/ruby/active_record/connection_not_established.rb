@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # ActiveRecord::ConnectionNotEstablished — named by `rescue_from
 # ActiveRecord::ConnectionNotEstablished` (lobsters answers it with a
 # plain-text 500). Nothing here raises it: the emitted `Db` opens its
@@ -12,5 +13,27 @@
 # targets and spinel AOT share.
 module ActiveRecord
   class ConnectionNotEstablished < StandardError
+  end
+
+  # A failed open and a timed-out open. Both are
+  # ConnectionNotEstablished, so a rescue of the parent catches them.
+  class ConnectionFailed < ConnectionNotEstablished
+  end
+
+  class ConnectionTimeoutError < ConnectionNotEstablished
+  end
+
+  # No pool for the role and shard a `connected_to` block selected.
+  class ConnectionNotDefined < ConnectionNotEstablished
+  end
+
+  # Rails raises it when the configured database does not exist. An
+  # after_initialize callback rescues it around a boot-time query, beside
+  # ConnectionNotEstablished; the emitted Db has opened its database by
+  # then, so nothing here raises it either. A StatementInvalid, as in Rails.
+  class NoDatabaseError < StatementInvalid
+    def initialize(message = "Database not found")
+      super(message)
+    end
   end
 end

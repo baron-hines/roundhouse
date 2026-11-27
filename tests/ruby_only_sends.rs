@@ -1,6 +1,7 @@
 //! Sends the analyzer types for every target but only the Ruby family can
-//! run: `Array#fetch`, `each_slice`, `each_cons`, an enumerator's
-//! `with_object`, `Array[...]`, `Hash[...]`, `include?` on a `Class` value,
+//! run: `Array#fetch`, `each_slice`, `each_cons`, `lazy`, an enumerator's
+//! `with_object`, `Array[...]`, `Hash[...]`, `Array.try_convert` (a nested
+//! splat), `include?` on a `Class` value,
 //! Kernel's `Rational(...)` (what a rational literal ingests as) and
 //! Kernel's `Integer(...)` and `Float(...)`.
 //!
@@ -11,6 +12,8 @@
 //! `array_batches_typing`, `container_index_constructor`,
 //! `include_query_receivers` and `rational_literal`).
 
+#[path = "support/scratch.rs"]
+mod scratch;
 use std::process::Command;
 
 const MODEL: &str = r#"class Article < ApplicationRecord
@@ -27,6 +30,11 @@ const MODEL: &str = r#"class Article < ApplicationRecord
   #: (Array[Integer]) -> Integer
   def self.pairs(nums)
     nums.each_cons(2).to_a.length
+  end
+
+  #: (Array[Integer]) -> untyped
+  def self.first_even(nums)
+    nums.lazy.filter_map { |n| n * 10 if n.even? }.first
   end
 
   #: (Array[Integer]) -> Array[Integer]
@@ -60,13 +68,23 @@ const MODEL: &str = r#"class Article < ApplicationRecord
 end
 "#;
 
-const REFUSED: [&str; 10] = [
+const SERVICE: &str = r#"class RowUnpack
+  def self.rest
+    _head, (_month, *row) = [1, [2, 3]]
+    row
+  end
+end
+"#;
+
+const REFUSED: [&str; 12] = [
     "Array#fetch",
     "Array#each_slice",
     "Array#each_cons",
+    "Array#lazy",
     "Enumerator#with_object",
     "Array[]",
     "Hash[]",
+    "Array.try_convert",
     "Kernel#Rational",
     "Module#include?",
     "Kernel#Integer",
@@ -87,13 +105,13 @@ fn build(root: &std::path::Path, target: &str) -> (bool, String) {
 
 #[test]
 fn only_the_ruby_family_emits_the_ruby_only_sends() {
-    let root = std::env::temp_dir().join(format!("rh_ruby_only_sends_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = scratch::dir("rh_ruby_only_sends");
     for (path, text) in [
         ("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"articles\" do |t|\n    t.string \"title\"\n  end\nend\n"),
         ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n"),
         ("app/models/tagged.rb", "module Tagged\n  def tagged = true\nend\n"),
         ("app/models/article.rb", MODEL),
+        ("app/services/row_unpack.rb", SERVICE),
     ] {
         let file = root.join(path);
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -121,8 +139,7 @@ fn only_the_ruby_family_emits_the_ruby_only_sends() {
 /// call to it is not refused as Kernel's.
 #[test]
 fn an_app_method_named_integer_is_not_refused_as_kernel_s() {
-    let root = std::env::temp_dir().join(format!("rh_ruby_only_sends_shadow_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = scratch::dir("rh_ruby_only_sends_shadow");
     for (path, text) in [
         ("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"articles\" do |t|\n    t.string \"title\"\n  end\nend\n"),
         ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n"),

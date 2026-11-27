@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 module ActionDispatch
   module Http
     # `request.headers` — Rails' `ActionDispatch::Http::Headers`: reads a
@@ -29,6 +30,20 @@ module ActionDispatch
 
       def [](key)
         @env[Headers.env_name(key)]
+      end
+
+      # Rails' `[]=` and `merge!` write into the request's own env, under
+      # each key's env name (`X-Route` is `HTTP_X_ROUTE`), so a later
+      # read through the request sees them. `merge!` answers its
+      # argument, as Rails' `each` over it does.
+      def []=(key, value)
+        @env[Headers.env_name(key)] = value
+        value
+      end
+
+      def merge!(headers)
+        headers.each { |key, value| @env[Headers.env_name(key)] = value }
+        headers
       end
 
       def key?(key)
@@ -79,6 +94,12 @@ module ActionDispatch
         return name unless HTTP_HEADER.match?(name)
         upper = name.upcase.tr("-", "_")
         CGI_VARIABLES.include?(upper) ? upper : "HTTP_" + upper
+      end
+
+      def self.env_name_from_header(name)
+        key = name.upcase.tr("_-", ",_")
+        return key if key == "CONTENT_TYPE" || key == "CONTENT_LENGTH"
+        "HTTP_" + key
       end
 
       # Rails reads Authorization from its ordinary Rack key, legacy

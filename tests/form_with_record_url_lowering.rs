@@ -66,3 +66,65 @@ fn non_model_bareword_keeps_url_for_fallback() {
         "a bareword that is no model must keep the runtime fallback:\n{body}"
     );
 }
+
+/// `form_with model: comment, url: ...` keeps Rails' verb: an explicit
+/// `url:` replaces the action, not the method, so a persisted record
+/// PATCHes (campfire's message edit form). A model-less `url:` form
+/// stays POST.
+#[test]
+fn model_with_explicit_url_patches_a_persisted_record() {
+    // Analyzed, so the view knows `@comment` is a Comment.
+    let lower_analyzed = |files: Vec<(&str, &str)>| {
+        let tree = files
+            .into_iter()
+            .map(|(p, c)| (std::path::PathBuf::from(p), c.as_bytes().to_vec()))
+            .collect();
+        let mut app = ingest_app_from_tree(tree).expect("ingest tree");
+        roundhouse::analyze::Analyzer::new(&app).analyze(&mut app);
+        let view = app.views.first().expect("view ingested");
+        let lc = lower_view_to_library_class(view, &app);
+        format!("{:?}", lc.methods.first().expect("view method").body)
+    };
+    let schema = (
+        "db/schema.rb",
+        "ActiveRecord::Schema.define(version: 1) do\n  create_table :comments do |t|\n    t.text :comment\n  end\nend\n",
+    );
+    let model = ("app/models/comment.rb", "class Comment < ApplicationRecord\nend\n");
+    let body = lower_analyzed(vec![
+        schema,
+        model,
+        (
+            "app/controllers/comments_controller.rb",
+            "class CommentsController < ApplicationController\n  def edit\n    @comment = Comment.find(params[:id])\n  end\nend\n",
+        ),
+        (
+            "app/views/comments/edit.html.erb",
+            "<%= form_with model: @comment, url: \"/c\" do |f| %>\n<% end %>\n",
+        ),
+    ]);
+    assert!(body.contains("persisted?"), "model + url must branch the verb on persistence:\n{body}");
+    assert!(body.contains("\"patch\""), "the persisted arm must PATCH:\n{body}");
+
+    let plain = lower_analyzed(vec![
+        schema,
+        model,
+        ("app/views/comments/_search.html.erb", "<%= form_with url: \"/c\" do |f| %>\n<% end %>\n"),
+    ]);
+    assert!(!plain.contains("\"patch\""), "a url-only form stays POST:\n{plain}");
+
+    // A form object (no `persisted?`) beside an explicit `url:` keeps POST, as Rails does.
+    let form_object = lower_analyzed(vec![
+        schema,
+        model,
+        ("app/models/search_form.rb", "class SearchForm\n  def query\n    \"\"\n  end\nend\n"),
+        (
+            "app/controllers/searches_controller.rb",
+            "class SearchesController < ApplicationController\n  def new\n    @search = SearchForm.new\n  end\nend\n",
+        ),
+        (
+            "app/views/searches/new.html.erb",
+            "<%= form_with model: @search, scope: :search, url: \"/search\" do |f| %>\n<% end %>\n",
+        ),
+    ]);
+    assert!(!form_object.contains("persisted?"), "a form object has no persisted? to ask:\n{form_object}");
+}

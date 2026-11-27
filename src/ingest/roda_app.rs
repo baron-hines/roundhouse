@@ -45,7 +45,7 @@ use super::app::{read_erb_files, read_rb_files};
 use super::controller::infer_render_template;
 use super::expr::{ingest_expr, ingest_ruby_program};
 use super::model::ingest_method;
-use super::sequel_migration::ingest_sequel_migration;
+use super::sequel_migration::{ingest_sequel_migration, settle_absent_targets};
 use super::sequel_model::{hash_kwargs, ingest_sequel_model, normalize_sequel_expr, sym_lit};
 use super::util::{constant_id_str, constant_path_of, find_first_class, flatten_statements};
 use super::view::ingest_template;
@@ -84,6 +84,7 @@ pub fn ingest_roda_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestR
                 &mut app.schema,
             ))?;
         }
+        unwrap_or_record(settle_absent_targets(&mut app.schema, &migrate_dir.display().to_string()))?;
     }
 
     // db.rb — connection + model-wide behavior. One setting is
@@ -136,6 +137,8 @@ pub fn ingest_roda_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestR
         class_attr_defaults: indexmap::IndexMap::new(),
         lexical_json_shadow: false,
         sti_subclass_names: Vec::new(),
+        mixin_sends: Vec::new(),
+        select_aliases: Vec::new(),
         i18n: Default::default(),
     });
     let models_dir = dir.join("models");
@@ -184,8 +187,8 @@ pub fn ingest_roda_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestR
         // the vocabulary is closed by construction) and stamp them as
         // the partial's strict-locals row, the same fixed-signature
         // channel a Rails `<%# locals: (…) %>` header feeds.
-        let mut part_locals: std::collections::HashMap<String, Vec<Symbol>> =
-            std::collections::HashMap::new();
+        let mut part_locals: crate::det::HashMap<String, Vec<Symbol>> =
+            crate::det::HashMap::default();
         for (erb_path, engine) in read_erb_files(vfs, &views_dir)? {
             let source = vfs.read_to_string(&erb_path)?;
             let rel = erb_path
@@ -204,7 +207,6 @@ pub fn ingest_roda_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestR
                     view.name = Symbol::from("layouts/application");
                 }
                 rewrite_part_to_render(&mut view.body, &mut part_locals);
-                rewrite_errors_full_messages(&mut view.body);
                 rewrite_flash_reads(&mut view.body);
                 app.views.push(view);
             }
@@ -355,10 +357,12 @@ fn ingest_roda_class(source: &[u8], file: &str, app: &mut App) -> IngestResult<S
             parent: None,
             parent_span: Default::default(),
             includes: Vec::new(),
+            include_spans: Vec::new(),
             methods: helper_methods,
             nullable_columns: Vec::new(),
             origin: None,
             constants: Vec::new(),
+            conditional_definitions: Vec::new(),
             unknown_calls: Vec::new(),
             class_ivar_initializers: Vec::new(),
         });
@@ -368,13 +372,42 @@ fn ingest_roda_class(source: &[u8], file: &str, app: &mut App) -> IngestResult<S
     // controller inherits from. Layout stays `Inherit`: the app's one
     // layout re-homes to `layouts/application` (the convention
     // default), so no explicit declaration is needed.
+    //
+    // `skip_forgery_protection`: Roda checks no CSRF token unless the
+    // app loads `route_csrf` / `csrf`, which are not in the recognized
+    // plugin set (`ingest_plugin_call` refuses them). Without the skip,
+    // the Rails default this parent brings (`protect_from_forgery with:
+    // :exception`) would answer 422 to every POST the Roda app accepts.
     app.controllers.push(Controller {
         name: ClassId(Symbol::from("ApplicationController")),
         parent: Some(ClassId(Symbol::from("ActionController::Base"))),
         parent_span: Default::default(),
-        body: Vec::new(),
+        body: vec![ControllerBodyItem::Filter {
+            filter: Filter {
+                target_span: crate::span::Span::synthetic(),
+                kind: FilterKind::Skip,
+                target: Symbol::from(super::controller::VERIFY_AUTHENTICITY_TOKEN),
+                from_concern: None,
+                only: Vec::new(),
+                except: Vec::new(),
+                only_style: Default::default(),
+                except_style: Default::default(),
+                if_cond: None,
+                unless_cond: None,
+                if_cond_expr: None,
+                unless_cond_expr: None,
+                unread_guard: false,
+                unread_options: false,
+                only_present: false,
+                block: None,
+                prepend: false,
+            },
+            leading_comments: Vec::new(),
+            leading_blank_line: false,
+        }],
         layout: LayoutDecl::Inherit,
         sibling_classes: Vec::new(),
+        csp_header: false,
     });
 
     let Some(route_call) = route_call else {
@@ -828,7 +861,7 @@ impl<'f> RouteWalker<'f> {
                     constraints.insert(Symbol::from(name.as_str()), "\\d+".to_string());
                 }
             }
-            entries.push(RouteSpec::Explicit {
+            entries.push(RouteSpec::Explicit { defaults: indexmap::IndexMap::new(),
                 method: leaf.method.clone(),
                 path: path_of(&leaf.segs),
                 controller,
@@ -836,9 +869,10 @@ impl<'f> RouteWalker<'f> {
                 as_name: None,
                 constraints,
                 scope: Default::default(),
+                action_symbol: false,
             });
         }
-        app.routes = RouteTable { entries, direct_helpers: Vec::new(), redirects: Vec::new(), diagnostics: Vec::new() };
+        app.routes = RouteTable { entries, direct_helpers: Vec::new(), redirects: Vec::new(), diagnostics: Vec::new(), url_protocols: Vec::new() };
 
         // Controllers — group leaves by controller stem, first-seen
         // order.
@@ -899,6 +933,9 @@ impl<'f> RouteWalker<'f> {
                         unless_cond: None,
                         if_cond_expr: None,
                         unless_cond_expr: None,
+                        unread_guard: false,
+                        unread_options: false,
+                        only_present: false,
                         block: None,
                         prepend: false,
                     },
@@ -937,6 +974,7 @@ impl<'f> RouteWalker<'f> {
                 body,
                 layout: LayoutDecl::Inherit,
                 sibling_classes: Vec::new(),
+                csp_header: false,
             });
         }
     }
@@ -1359,8 +1397,21 @@ fn same_simple_recv(a: &Expr, b: &Expr) -> bool {
 /// the partial's strict-locals signature.
 fn rewrite_part_to_render(
     expr: &mut Expr,
-    part_locals: &mut std::collections::HashMap<String, Vec<Symbol>>,
+    part_locals: &mut crate::det::HashMap<String, Vec<Symbol>>,
 ) {
+    // `<%== part(...) %>` compiles to `raw((part(...)))` (src/erb.rs
+    // leaves only a bare `render` / `yield` unwrapped). The view walker
+    // emits a `render` unescaped and matches it only as the whole
+    // expression, so the wrapper goes with the rename.
+    if let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node {
+        if method.as_str() == "raw" && args.len() == 1 {
+            if let ExprNode::Send { recv: None, method: inner, .. } = &*args[0].node {
+                if inner.as_str() == "part" {
+                    *expr = args[0].clone();
+                }
+            }
+        }
+    }
     expr.node
         .for_each_child_mut(&mut |c| rewrite_part_to_render(c, part_locals));
     let ExprNode::Send { recv: None, method, args, block, parenthesized } = &*expr.node else {
@@ -1402,30 +1453,6 @@ fn rewrite_part_to_render(
         block: block.clone(),
         parenthesized: *parenthesized,
     });
-}
-
-/// `record.errors.full_messages` → `record.errors`. The framework
-/// runtime's `errors` is already the array of full-message strings
-/// (the inline validation checks push humanized text), so Sequel's
-/// explicit `.full_messages` hop is an identity there.
-fn rewrite_errors_full_messages(expr: &mut Expr) {
-    expr.node.for_each_child_mut(&mut rewrite_errors_full_messages);
-    let replacement = match &*expr.node {
-        ExprNode::Send { recv: Some(r), method, args, block: None, .. }
-            if method.as_str() == "full_messages"
-                && args.is_empty()
-                && matches!(
-                    &*r.node,
-                    ExprNode::Send { method, .. } if method.as_str() == "errors"
-                ) =>
-        {
-            Some((*r.node).clone())
-        }
-        _ => None,
-    };
-    if let Some(node) = replacement {
-        expr.node = Box::new(node);
-    }
 }
 
 /// View-side `flash["notice"]` / `flash["alert"]` → the bare `notice` /

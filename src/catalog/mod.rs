@@ -44,6 +44,7 @@
 use std::collections::BTreeSet;
 
 pub mod gems;
+pub mod string_kernel;
 pub use gems::{GemClass, GemTy, GEM_CATALOG};
 
 /// One cataloged method. Static-lifetime strings keep entries
@@ -159,16 +160,9 @@ pub enum ReturnKind {
     /// Returns `Bool`. Example: `Model.exists?`, `#save`,
     /// `#valid?`, `#persisted?`.
     Bool,
-    /// Returns `Hash<Sym, Str>`. Example: `#attributes` on an
-    /// ActiveRecord instance — the canonical schema-derived
-    /// attribute dictionary. Specific rather than generic because
-    /// this one shape is what the Rails dialect emits; if/when
-    /// another Hash shape enters the catalog, generalize to a
-    /// `HashOf(PrimKind, PrimKind)` variant.
-    HashSymStr,
-    /// Returns `Hash<Str, untyped>`. Example:
-    /// `#attributes_before_type_cast` — each column's raw stored value,
-    /// String-keyed as Rails keys it.
+    /// Returns `Hash<Str, untyped>`. Example: `#attributes` and
+    /// `#attributes_before_type_cast` — each column's value (cast or
+    /// raw stored), String-keyed as Rails keys it.
     HashStrUntyped,
     /// Returns `Array<Sym>`. Example: `.schema_column_names` on
     /// an ActiveRecord class — the schema column list the lowerer
@@ -181,6 +175,9 @@ pub enum ReturnKind {
     /// (`article[:id]` is actually Int), but matches the existing
     /// declared shape and isn't worse than today.
     Str,
+    /// Returns `Str | Nil`. Example: `Base#cache_version` — nil on a
+    /// model with no `updated_at` column.
+    StrOrNil,
     /// Reference to a concrete class by dotted-name path
     /// (e.g. `"ActiveModel::Errors"`). Analyzer instantiates as
     /// `Ty::Class { id: ClassId(<path>), args: vec![].into() }`.
@@ -330,6 +327,20 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
     },
     CatalogedMethod {
         name: "find_or_create_by!",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    CatalogedMethod {
+        name: "create_or_find_by",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    CatalogedMethod {
+        name: "create_or_find_by!",
         receiver: ReceiverContext::Class,
         effect: EffectClass::DbWrite,
         chain: ChainKind::NotApplicable,
@@ -602,6 +613,16 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         chain: ChainKind::Builder,
         return_kind: Some(ReturnKind::RelationOfSelf),
     },
+    // Rails 7 `where.not(id: …)` in one hop. A chain that continues
+    // through it (`user.searches.excluding(…).destroy_all`) has to stay
+    // on Relation; `without` is the same method (see [`BUILDER_ALIASES`]).
+    CatalogedMethod {
+        name: "excluding",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
     CatalogedMethod {
         name: "references",
         receiver: ReceiverContext::Class,
@@ -724,12 +745,21 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         chain: ChainKind::NotApplicable,
         return_kind: Some(ReturnKind::Int),
     },
+    // The Ruby-family runtime's single-row inserts answer Rails'
+    // `ActiveRecord::Result`, as `insert_all!` does.
     CatalogedMethod {
         name: "insert",
         receiver: ReceiverContext::Class,
         effect: EffectClass::DbWrite,
         chain: ChainKind::NotApplicable,
-        return_kind: None,
+        return_kind: Some(ReturnKind::ClassRef("ActiveRecord::Result")),
+    },
+    CatalogedMethod {
+        name: "insert!",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::ClassRef("ActiveRecord::Result")),
     },
     // The one bulk write with a return type, because it is the one
     // with a LOWERING: `scope_chain` inlines `Model.insert_all(rows)`
@@ -757,19 +787,21 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         chain: ChainKind::NotApplicable,
         return_kind: Some(ReturnKind::ClassRef("ActiveRecord::Result")),
     },
+    // The runtime's `upsert_all` answers Rails' `ActiveRecord::Result`,
+    // its `affected_rows` the count.
     CatalogedMethod {
         name: "upsert",
         receiver: ReceiverContext::Class,
         effect: EffectClass::DbWrite,
         chain: ChainKind::NotApplicable,
-        return_kind: None,
+        return_kind: Some(ReturnKind::ClassRef("ActiveRecord::Result")),
     },
     CatalogedMethod {
         name: "upsert_all",
         receiver: ReceiverContext::Class,
         effect: EffectClass::DbWrite,
         chain: ChainKind::NotApplicable,
-        return_kind: None,
+        return_kind: Some(ReturnKind::ClassRef("ActiveRecord::Result")),
     },
     CatalogedMethod {
         name: "touch_all",
@@ -927,6 +959,14 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         chain: ChainKind::NotApplicable,
         return_kind: Some(ReturnKind::Bool),
     },
+    // `#validate!` runs them and raises on failure (`RecordInvalid` on a record, `ValidationError` on a tableless one).
+    CatalogedMethod {
+        name: "validate!",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::Pure,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::Bool),
+    },
     CatalogedMethod {
         name: "persisted?",
         receiver: ReceiverContext::Instance,
@@ -956,7 +996,7 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         return_kind: Some(ReturnKind::Bool),
     },
     // ---- Instance-method accessors (state / metadata) ----
-    // `#attributes` returns Hash<Sym, Str>; `#errors` returns the
+    // `#attributes` returns Hash<Str, untyped>; `#errors` returns the
     // per-instance ActiveModel::Errors collection. Both pure
     // (no DB hit); both structural rather than expression-
     // dispatchable.
@@ -965,10 +1005,25 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         receiver: ReceiverContext::Instance,
         effect: EffectClass::Pure,
         chain: ChainKind::NotApplicable,
-        return_kind: Some(ReturnKind::HashSymStr),
+        return_kind: Some(ReturnKind::HashStrUntyped),
     },
     CatalogedMethod {
         name: "attributes_before_type_cast",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::Pure,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::HashStrUntyped),
+    },
+    // Every attribute by its reader (`synth_serializable_hash`), and the record as JSON reads it (runtime `as_json`).
+    CatalogedMethod {
+        name: "serializable_hash",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::Pure,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::HashStrUntyped),
+    },
+    CatalogedMethod {
+        name: "as_json",
         receiver: ReceiverContext::Instance,
         effect: EffectClass::Pure,
         chain: ChainKind::NotApplicable,
@@ -1038,6 +1093,16 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         chain: ChainKind::NotApplicable,
         return_kind: Some(ReturnKind::Str),
     },
+    // `record.slice(:id, :name)`: the named attributes, String-keyed as
+    // Rails' indifferent Hash keys them. `lower::record_slice` grounds a
+    // typed site into reader calls; the ruby family answers the rest.
+    CatalogedMethod {
+        name: "slice",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::Pure,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::HashStrUntyped),
+    },
     CatalogedMethod {
         name: "[]",
         receiver: ReceiverContext::Instance,
@@ -1047,6 +1112,34 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
     },
     CatalogedMethod {
         name: "[]=",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::Pure,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::Str),
+    },
+    // `cache_key` / `cache_version` / `cache_key_with_version`
+    // (`runtime/ruby/active_record/base.rb`): a single record's half
+    // of the fragment-cache key Relation's own trio answers for a
+    // collection — see the `cache_key`/`cache_version`/
+    // `cache_key_with_version` entries under `ReceiverContext::Relation`
+    // below for the companion case and why both are cataloged here
+    // rather than parsed from base.rbs/relation.rbs.
+    CatalogedMethod {
+        name: "cache_key",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::Pure,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::Str),
+    },
+    CatalogedMethod {
+        name: "cache_version",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::Pure,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::StrOrNil),
+    },
+    CatalogedMethod {
+        name: "cache_key_with_version",
         receiver: ReceiverContext::Instance,
         effect: EffectClass::Pure,
         chain: ChainKind::NotApplicable,
@@ -1151,6 +1244,14 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
     },
     CatalogedMethod {
         name: "left_outer_joins",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    // Same hop as the class entry. `without` is its alias.
+    CatalogedMethod {
+        name: "excluding",
         receiver: ReceiverContext::Relation,
         effect: EffectClass::DbRead,
         chain: ChainKind::Builder,
@@ -1648,6 +1749,38 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         chain: ChainKind::Terminal,
         return_kind: Some(ReturnKind::Str),
     },
+    // `cache_key` / `cache_version` / `cache_key_with_version`
+    // (`runtime/ruby/active_record/relation.rb`): the fragment-cache
+    // key a jbuilder `json.cache!` wraps around a whole collection.
+    // `DbRead`, not `Pure`, like `count`/`maximum` above — the key
+    // queries COUNT/MAX under the hood. Without a catalog entry here,
+    // `send.rs`'s `Ty::Relation` arm never reaches the runtime method
+    // at all (dispatch on a Relation receiver goes through THIS
+    // catalog, not a parse of relation.rbs — that file is the sidecar
+    // emitted next to relation.rb, not an analysis source), so every
+    // `@widgets.cache_key_with_version` call failed `check` as "no
+    // known method" before it ever got far enough to raise at runtime.
+    CatalogedMethod {
+        name: "cache_key",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::Str),
+    },
+    CatalogedMethod {
+        name: "cache_version",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::Str),
+    },
+    CatalogedMethod {
+        name: "cache_key_with_version",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::Str),
+    },
     CatalogedMethod {
         name: "pluck",
         receiver: ReceiverContext::Relation,
@@ -1756,6 +1889,20 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         chain: ChainKind::NotApplicable,
         return_kind: Some(ReturnKind::SelfType),
     },
+    CatalogedMethod {
+        name: "create_or_find_by",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    CatalogedMethod {
+        name: "create_or_find_by!",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::SelfType),
+    },
     // Writes through the relation.
     CatalogedMethod {
         name: "update_all",
@@ -1831,6 +1978,88 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         return_kind: Some(ReturnKind::ClassRef("Arel::SelectManager")),
     },
 ];
+
+/// Alternate spellings of a [`ChainKind::Builder`] entry. The chain and
+/// refiner predicates read these together with the Builder names. Each
+/// pair is `(alias, canonical)`.
+///
+/// `left_joins` is `left_outer_joins`. `where!` and `order!` are the
+/// in-place spellings of `where` and `order`, `joins!` of `joins`.
+/// `without` is `excluding`.
+pub(crate) const BUILDER_ALIASES: &[(&str, &str)] = &[
+    ("left_joins", "left_outer_joins"),
+    ("where!", "where"),
+    ("order!", "order"),
+    ("without", "excluding"),
+    ("joins!", "joins"),
+];
+
+/// True when `name` is a [`ChainKind::Builder`] entry, on any receiver,
+/// or an alias of one ([`BUILDER_ALIASES`]), and every catalog entry for
+/// that name agrees.
+///
+/// This is the membership test for name-only chain hops and for arel
+/// refiners. A terminal (`first`, `all`, `pluck`) stays out. So does a
+/// name that is a Builder on one receiver and something else on another:
+/// `reload` is a Relation builder and an Instance read that returns the
+/// record. Treating every `reload` as a relation hop keeps
+/// `article = Model.where(…).find { … }; article.reload` on the runtime
+/// relation, and `find` then ignores the block.
+pub(crate) fn is_relation_builder_name(name: &str) -> bool {
+    let canonical = BUILDER_ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == name)
+        .map(|(_, canonical)| *canonical)
+        .unwrap_or(name);
+    let mut saw_builder = false;
+    for entry in AR_CATALOG.iter().filter(|entry| entry.name == canonical) {
+        if entry.chain != ChainKind::Builder {
+            return false;
+        }
+        saw_builder = true;
+    }
+    saw_builder
+}
+
+/// Counted `first(n)` / `last(n)` on a relation: one positional argument
+/// and no block. The runtime spells these `first_n` / `last_n` because
+/// one method cannot return both a record and an Array.
+///
+/// The name is a catalog terminal on both the class and the relation,
+/// and [`is_relation_builder_name`] rejects it. `take(n)` is the same
+/// terminal shape and stays `take` — this predicate does not rename it.
+/// Enumerable `Array#first(n)` and `String#split.last(n)` share the
+/// call shape; a caller renames only after it has proved a relation.
+pub(crate) fn counted_relation_terminal(
+    name: &str,
+    argc: usize,
+    has_block: bool,
+) -> Option<&'static str> {
+    if argc != 1 || has_block || is_relation_builder_name(name) {
+        return None;
+    }
+    let runtime = match name {
+        "first" => "first_n",
+        "last" => "last_n",
+        _ => return None,
+    };
+    let class = lookup(name, ReceiverContext::Class)?;
+    let relation = lookup(name, ReceiverContext::Relation)?;
+    if class.chain != ChainKind::Terminal || relation.chain != ChainKind::Terminal {
+        return None;
+    }
+    Some(runtime)
+}
+
+/// True when the Relation-context entry for `name` is a Builder.
+///
+/// Callers that already know the receiver is a relation use this so
+/// `relation.reload` stays a hop. Name-only sites keep
+/// [`is_relation_builder_name`], which rejects `reload`.
+pub(crate) fn is_relation_context_builder(name: &str) -> bool {
+    lookup(name, ReceiverContext::Relation)
+        .is_some_and(|entry| entry.chain == ChainKind::Builder)
+}
 
 /// Look up a method in the catalog by name + receiver context.
 /// Returns the single matching entry or None. Used by adapters
@@ -1962,7 +2191,7 @@ mod tests {
             "save", "save!", "create", "create!", "update", "update!",
             "update_all", "destroy", "destroy!", "destroy_all",
             "delete", "delete_all", "increment!", "decrement!",
-            "touch", "touch_all", "insert", "insert_all",
+            "touch", "touch_all", "insert", "insert!", "insert_all",
             "upsert", "upsert_all",
         ] {
             let found: Vec<_> = lookup_any(m)
@@ -1983,7 +2212,7 @@ mod tests {
         // it so the future work is data-in-place.
         for m in [
             "where", "limit", "offset", "order", "group", "having",
-            "joins", "includes", "preload", "select", "distinct",
+            "joins", "left_outer_joins", "excluding", "includes", "preload", "select", "distinct",
         ] {
             let entry = lookup(m, ReceiverContext::Class)
                 .unwrap_or_else(|| panic!("no Class entry for `{m}`"));
@@ -2059,7 +2288,7 @@ mod tests {
         // produce exactly the arm's result shapes.
         for m in [
             "where", "order", "limit", "offset", "includes", "preload",
-            "joins", "left_outer_joins", "distinct", "group", "having",
+            "joins", "left_outer_joins", "excluding", "distinct", "group", "having",
             "references", "eager_load", "readonly", "reorder", "rewhere",
             "merge", "merge!", "extending", "unscope", "not", "or", "and",
             "none", "load", "load_async", "reload", "reselect",
@@ -2121,6 +2350,84 @@ mod tests {
             assert!(
                 cataloged,
                 "query-builder method `{name}` has no Builder/Terminal AR_CATALOG entry",
+            );
+        }
+    }
+
+    #[test]
+    fn relation_chain_and_refiners_match_builder_entries() {
+        // Both directions. A name whose every catalog entry is a Builder,
+        // or a [`BUILDER_ALIASES`] spelling of such a name, is a chain hop
+        // and a refiner. Any other catalog name is neither. A mixed name
+        // (`reload`: Relation builder, Instance read) is neither.
+        // Reintroducing a hand list on either side fails one of the asserts.
+        let mut uniform_builder: std::collections::BTreeMap<&str, bool> =
+            std::collections::BTreeMap::new();
+        for entry in AR_CATALOG {
+            let is_builder = entry.chain == ChainKind::Builder;
+            uniform_builder
+                .entry(entry.name)
+                .and_modify(|all| *all &= is_builder)
+                .or_insert(is_builder);
+        }
+        let mut builders: BTreeSet<&str> = BTreeSet::new();
+        for (name, all_builder) in &uniform_builder {
+            if *all_builder {
+                builders.insert(*name);
+            }
+        }
+        assert_eq!(
+            uniform_builder.get("reload"),
+            Some(&false),
+            "reload should stay a mixed chain kind so the predicate cannot treat every reload as a relation hop",
+        );
+        assert!(!is_relation_builder_name("reload"));
+        assert!(is_relation_context_builder("reload"));
+        let mut seen_alias: BTreeSet<&str> = BTreeSet::new();
+        for (alias, canonical) in BUILDER_ALIASES {
+            assert!(
+                builders.contains(canonical),
+                "alias `{alias}` points at `{canonical}`, which has no Builder entry",
+            );
+            assert!(
+                seen_alias.insert(alias),
+                "duplicate builder alias `{alias}`",
+            );
+            assert!(
+                !AR_CATALOG.iter().any(|entry| entry.name == *alias),
+                "alias `{alias}` is also a catalog entry",
+            );
+            builders.insert(alias);
+        }
+        for name in ["left_joins", "where!", "order!", "without", "excluding"] {
+            assert!(
+                builders.contains(name),
+                "`{name}` dropped out of the builder/alias set",
+            );
+        }
+        for name in &builders {
+            assert!(
+                crate::lower::scope_chain::is_relation_chain_method(name),
+                "`{name}` is a Builder or alias but is_relation_chain_method rejects it",
+            );
+            assert!(
+                crate::lower::arel::is_relation_refiner(name),
+                "`{name}` is a Builder or alias but the arel refiner rejects it",
+            );
+        }
+        for entry in AR_CATALOG {
+            if builders.contains(entry.name) {
+                continue;
+            }
+            assert!(
+                !crate::lower::scope_chain::is_relation_chain_method(entry.name),
+                "`{}` is not a Builder but is_relation_chain_method accepts it",
+                entry.name,
+            );
+            assert!(
+                !crate::lower::arel::is_relation_refiner(entry.name),
+                "`{}` is not a Builder but the arel refiner accepts it",
+                entry.name,
             );
         }
     }

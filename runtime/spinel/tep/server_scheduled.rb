@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Tep::Server::Scheduled -- Falcon-shape fiber-per-connection HTTP
 # server, built on Tep::Scheduler + sp_net non-blocking accept/recv.
 #
@@ -53,7 +54,7 @@ module Tep
         @app = app
       end
 
-      def run(port, workers, quiet)
+      def run(port, workers, quiet, unix = UnixListener.new(""))
         sfd = Sock.sphttp_listen_on(Tep::APP.bind_host, port, workers > 1 ? 1 : 0)
         if sfd < 0
           # Loud + nonzero exit: the one plausible cause on a sane host
@@ -62,6 +63,7 @@ module Tep
           # binary look like it started and immediately vanished.
           $stderr.puts Tep.display_name + ": cannot bind to port " +
                        port.to_s + " (already in use?)"
+          unix.close
           exit(1)
         end
         Sock.sphttp_set_nonblock(sfd)
@@ -85,29 +87,28 @@ module Tep
         Sock.sphttp_install_term_handlers
 
         if workers > 1
+          pids = [0]
+          pids.pop
           i = 0
           while i < workers
             pid = Sock.sphttp_fork
             if pid == 0
-              Tep::Server::Scheduled.run_worker(sfd)
+              Tep::Server::Scheduled.run_worker(sfd, unix.unix_fd)
+              unix.close
               Sock.sphttp_exit(0)
             end
+            pids.push(pid) if pid > 0
             i += 1
           end
           # Reap children until none remain. After all workers exit,
           # emit the single aggregated run_end (see #128 / Tep::Events
           # #run_end_aggregated).
-          loop do
-            gone = Sock.sphttp_wait_any
-            if gone < 0
-              break
-            end
-          end
+          Tep.reap_workers(pids)
           if Sock.sphttp_shutdown_requested != 0
             Tep.on_shutdown
           end
         else
-          Tep::Server::Scheduled.run_worker(sfd)
+          Tep::Server::Scheduled.run_worker(sfd, unix.unix_fd)
           # Single-process: this IS the parent; emit run_end here.
           if Sock.sphttp_shutdown_requested != 0
             Tep.on_shutdown
@@ -115,9 +116,16 @@ module Tep
           # Exit outright, as the threaded server does: the scaffold's
           # job-loop green thread is parked on its queue, and spinel runs
           # every remaining green thread to completion when main returns.
+          unix.close
+          Sock.sphttp_close(sfd)
           Sock.sphttp_exit(0)
         end
-        0
+        unix.close
+        Sock.sphttp_close(sfd)
+        Sock.sphttp_exit(0)
+      ensure
+        unix.close
+        Sock.sphttp_close(sfd) if sfd >= 0
       end
 
       # Spawn the accept fiber + pump the scheduler. Called inside
@@ -126,9 +134,14 @@ module Tep
       # indefinitely -- run_until_empty bails when no fiber is ready
       # to resume THIS pass; we need to keep polling so parked
       # accept-on-sfd fibers get woken when a connection arrives.
-      def self.run_worker(sfd)
-        f = Fiber.new { Tep::Server::Scheduled.accept_loop(sfd) }
+      def self.run_worker(sfd, ufd = -1)
+        f = Fiber.new { Tep::Server::Scheduled.accept_loop(sfd, "tcp") }
         Tep::Scheduler.spawn_fiber(f)
+        if ufd >= 0
+          Sock.sphttp_set_nonblock(ufd)
+          unix_accept = Fiber.new { Tep::Server::Scheduled.accept_loop(ufd, "unix") }
+          Tep::Scheduler.spawn_fiber(unix_accept)
+        end
         while Tep::Scheduler.alive_count > 0
           # Shutdown is the WORKER's exit condition, not the fibers'.
           # The accept fiber honours the term flag and dies, but any
@@ -147,7 +160,7 @@ module Tep
 
       # Accept loop. Each accepted connection becomes its own fiber
       # that closes over the just-accepted `client` fd.
-      def self.accept_loop(sfd)
+      def self.accept_loop(sfd, transport = "tcp")
         while true
           # SIGTERM/SIGINT: sphttp's term flag is set by the signal
           # handler; check before parking on io_wait so we don't sleep
@@ -169,7 +182,7 @@ module Tep
             next
           end
           Sock.sphttp_set_nonblock(client)
-          conn = Fiber.new { Tep::Server::Scheduled.handle_connection(client) }
+          conn = Fiber.new { Tep::Server::Scheduled.handle_connection(client, transport) }
           Tep::Scheduler.spawn_fiber(conn)
         end
       end
@@ -183,10 +196,11 @@ module Tep
       # upward (idle 2 MB -> multi-GB under sustained keep-alive load).
       # Mirrors the Tep::Server#handle_one fix (210a5f6) for the prefork
       # server; this Scheduled server is the one the blog actually runs.
-      def self.handle_connection(client)
+      def self.handle_connection(client, transport = "tcp")
+        input = InputBuffer.new
         keep_going = true
         while keep_going
-          keep_going = Tep::Server::Scheduled.handle_one(client)
+          keep_going = Tep::Server::Scheduled.handle_one(client, input, transport)
         end
         Sock.sphttp_close(client)
         0
@@ -194,16 +208,19 @@ module Tep
 
       # Process exactly one request on `client`. Returns true to keep the
       # connection open for the next keep-alive request, false to close.
-      def self.handle_one(client)
-        blob = Tep::Server::Scheduled.read_request_blob(client, KEEPALIVE_TIMEOUT)
+      def self.handle_one(client, input = InputBuffer.new, transport = "tcp")
+        blob = Tep::Server::Scheduled.read_request_blob(client, KEEPALIVE_TIMEOUT, input)
         if blob.length == 0
           return false
         end
-        req = Parser.parse(blob)
+        req = Parser.parse(blob, input)
         if req == nil
           Tep::Server::Scheduled.send_simple(client, 400, "bad request")
           return false
         end
+        req.listener_transport = transport
+        # Rack's REMOTE_ADDR: the peer a connection came from ("" over a UNIX socket).
+        req.remote_host = Sock.sp_net_peer_ip(client)
 
         # Before the drain, which is what held the bytes (Request#body_refusal).
         refusal = req.body_refusal(Tep.max_body_bytes)
@@ -213,7 +230,11 @@ module Tep
           return false
         end
 
-        return false unless req.consume_body_via_scheduler(client)
+        unless req.consume_body_via_scheduler(client, input)
+          failure = req.body_failure_status
+          Tep::Server::Scheduled.send_simple(client, failure, failure == 413 ? "request body too large" : "bad request") if failure != 0
+          return false
+        end
 
         res = Response.new
         begin
@@ -231,21 +252,18 @@ module Tep
           return false
         end
 
-        # Streaming responses use chunked Connection: close (same
-        # simplification as the prefork server) -- force the keep-alive
-        # loop to end after this response so the stream's terminator isn't
-        # followed by a stale read on the same fd.
-        keep_alive = req.keep_alive? && !res.halted_close? && !res.streaming
+        # The writer returns the keep-alive decision it actually sends.
+        keep_alive = req.keep_alive? && !res.halted_close?
         Tep::Server::Scheduled.write_response(client, req, res, keep_alive)
-        keep_alive
       end
 
       # Non-blocking request reader. Returns the accumulated blob
       # once "\r\n\r\n" is seen, or "" on timeout / EOF / oversize.
-      def self.read_request_blob(fd, timeout_seconds)
-        buf = +""
+      def self.read_request_blob(fd, timeout_seconds, input = InputBuffer.new)
+        buf = input.take_pending_input
+        return buf if buf.include?("\r\n\r\n")
         deadline = Time.now.to_i + timeout_seconds
-        while buf.length < MAX_REQUEST_BYTES
+        while buf.bytesize < MAX_REQUEST_BYTES
           remaining = deadline - Time.now.to_i
           if remaining <= 0
             return ""
@@ -254,12 +272,12 @@ module Tep
           if ready == 0
             return ""
           end
-          chunk = Sock.sphttp_recv_some(fd, 4096)
+          chunk = Sock.sphttp_recv_some(fd, [4096, MAX_REQUEST_BYTES - buf.bytesize].min).b
           if chunk.length == 0
             return ""
           end
           buf << chunk
-          if buf.length >= 4 && buf.include?("\r\n\r\n")
+          if buf.bytesize >= 4 && buf.include?("\r\n\r\n")
             return buf
           end
         end
@@ -284,7 +302,7 @@ module Tep
           # other connection. Refuse the upgrade rather than serve it wrong.
           Tep::Server::Scheduled.send_simple(client, 501,
             "websocket upgrade needs TEP_SERVER=thread")
-          return 0
+          return false
         end
 
         # Streaming branch -- cooperative mirror of Tep::Server's
@@ -308,9 +326,14 @@ module Tep
           head << "Connection: close\r\n\r\n"
           Sock.sphttp_write_str(client, head)
           out = Tep::Stream.new(client)
-          res.streamer.pump(out)
+          begin
+            res.streamer.pump(out)
+          rescue StandardError, ScriptError => e
+            Tep.log_dispatch_error(req.verb, req.path, e)
+            return false
+          end
           Sock.sphttp_write_chunk_end(client)
-          return 0
+          return false
         end
 
         # Default Content-Type for inline-body responses. Matches
@@ -331,6 +354,10 @@ module Tep
         end
         if res.file_path.length > 0
           fs = Sock.sphttp_filesize(res.file_path)
+          if fs < 0
+            Tep::Server::Scheduled.send_simple(client, 404, "file not found")
+            return false
+          end
           head << "Content-Length: " + fs.to_s + "\r\n\r\n"
           Sock.sphttp_write_str(client, head)
           Sock.sphttp_sendfile(client, res.file_path) unless req.verb == "HEAD"
@@ -344,7 +371,12 @@ module Tep
           # browser waits out the difference: campfire's sign-in page
           # hung ~30s on /account/logo until the keep-alive timeout
           # closed the connection under it (ERR_CONTENT_LENGTH_MISMATCH).
-          head << "Content-Length: " + res.body.bytesize.to_s + "\r\n\r\n"
+          # Not for a 204 or a 304: RFC 9110 gives neither a Content-Length of its own body, and Puma writes none.
+          if res.status == 204 || res.status == 304
+            head << "\r\n"
+          else
+            head << "Content-Length: " + res.body.bytesize.to_s + "\r\n\r\n"
+          end
           Sock.sphttp_write_str(client, head)
           # HEAD: the headers GET would send, Content-Length included, and
           # no body (RFC 9110 9.3.2). A body here would be read by the
@@ -353,7 +385,7 @@ module Tep
             Sock.sphttp_write_bytes(client, res.body, res.body.bytesize)
           end
         end
-        0
+        keep_alive
       end
 
       # bytesize, as write_response: a multibyte `msg` would otherwise

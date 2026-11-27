@@ -45,11 +45,12 @@
 //! ordering.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::span::{FileId, SourceFile};
 
+use super::prism_api::PrismLocation;
 thread_local! {
     static SOURCES: RefCell<Registry> = RefCell::new(Registry::default());
 }
@@ -60,10 +61,16 @@ struct Registry {
     by_path: HashMap<String, FileId>,
     root: Option<PathBuf>,
     parsed: HashMap<usize, ParsedSource>,
+    type_var_scopes: HashMap<FileId, std::rc::Rc<Vec<TypeVarScope>>>,
 }
 
+/// A byte range of a registered file and the RBS type variables it
+/// declares (`type_ascription::generic_scopes`).
+pub(super) type TypeVarScope = (usize, usize, Vec<String>);
+
 struct ParsedSource {
-    lines: Vec<usize>,
+    /// Byte offset of the start of each line (Prism `line_offsets()`).
+    line_starts: Vec<usize>,
     reserved_locals: HashSet<String>,
 }
 
@@ -162,18 +169,33 @@ pub fn line_at(path: &str, offset: usize) -> Option<u32> {
 /// Track the actual parsed bytes separately from first-text-wins span sources.
 /// Prism locations borrow this input: its address identifies a live version,
 /// even when several versions of the same filename are being ingested.
-pub(super) fn register_parse(source: &[u8]) {
-    let lines = source.iter().enumerate().filter_map(|(offset, &byte)|
-        (byte == b'\n').then_some(offset)).collect();
+///
+/// Line starts come from [`ruby_prism::ParseResult::line_offsets`] so we do
+/// not re-scan the source for newlines after Prism already built the table.
+pub(super) fn register_parse_result(result: &ruby_prism::ParseResult<'_>) {
+    let source = result.source();
+    let line_starts = result
+        .line_offsets()
+        .iter()
+        .map(|&offset| offset as usize)
+        .collect();
     // Reserve compiler-style identifiers throughout the input, including
     // parameters and later assignments outside the expression being lowered.
     // Strings/comments may conservatively reserve a name too; no user binding
     // may be captured just because it is outside this node's source slice.
-    let reserved_locals = source.split(|b| !b.is_ascii_alphanumeric() && *b != b'_')
+    let reserved_locals = source
+        .split(|b| !b.is_ascii_alphanumeric() && *b != b'_')
         .filter(|word| word.starts_with(b"__"))
-        .map(|word| String::from_utf8_lossy(word).into_owned()).collect();
+        .map(|word| String::from_utf8_lossy(word).into_owned())
+        .collect();
     SOURCES.with(|s| {
-        s.borrow_mut().parsed.insert(source.as_ptr() as usize, ParsedSource { lines, reserved_locals });
+        s.borrow_mut().parsed.insert(
+            source.as_ptr() as usize,
+            ParsedSource {
+                line_starts,
+                reserved_locals,
+            },
+        );
     });
 }
 
@@ -181,8 +203,15 @@ pub(super) fn line_at_parse(location: &ruby_prism::Location<'_>) -> Option<u32> 
     let offset = location.start_offset();
     // Recover only the input's identity, never dereference an adjusted pointer.
     let source = location.as_slice().as_ptr() as usize - offset;
-    SOURCES.with(|s| s.borrow().parsed.get(&source)
-        .map(|parsed| parsed.lines.partition_point(|&newline| newline < offset) as u32 + 1))
+    SOURCES.with(|s| {
+        s.borrow().parsed.get(&source).map(|parsed| {
+            // `line_starts` are sorted start-of-line offsets; the line number
+            // is how many starts are `<= offset` (1-based).
+            parsed
+                .line_starts
+                .partition_point(|&start| start <= offset) as u32
+        })
+    })
 }
 
 /// Check a generated local against the actual parse, not first-text-wins spans.
@@ -209,6 +238,11 @@ pub fn text_of(path: &str) -> Option<String> {
 /// Run `f` on the text registered for `path`, without copying it.
 /// For lookups made per expression, where `text_of`'s clone of the
 /// whole file would make ingest quadratic in file size.
+///
+/// **Re-entrancy:** `f` must not call [`register`], [`register_parse_result`],
+/// [`drain`], or anything else that mutates this registry — the callback
+/// runs under an immutable `RefCell` borrow. Callers that need to re-parse
+/// should [`text_of`] first.
 pub fn with_text<R>(path: &str, f: impl FnOnce(&str) -> R) -> Option<R> {
     SOURCES.with(|s| {
         let reg = s.borrow();
@@ -216,6 +250,23 @@ pub fn with_text<R>(path: &str, f: impl FnOnce(&str) -> R) -> Option<R> {
         let i = (id.0 as usize).checked_sub(1)?;
         reg.files.get(i).map(|file| f(&file.text))
     })
+}
+
+/// `compute` over `path`'s registered text, once per file and ingest.
+pub(super) fn type_var_scopes(
+    path: &str,
+    compute: impl FnOnce(&str) -> Vec<TypeVarScope>,
+) -> Option<std::rc::Rc<Vec<TypeVarScope>>> {
+    let id = file_id(path);
+    if id == FileId(0) {
+        return None;
+    }
+    if let Some(scopes) = SOURCES.with(|s| s.borrow().type_var_scopes.get(&id).cloned()) {
+        return Some(scopes);
+    }
+    let scopes = std::rc::Rc::new(with_text(path, compute)?);
+    SOURCES.with(|s| s.borrow_mut().type_var_scopes.insert(id, scopes.clone()));
+    Some(scopes)
 }
 
 /// The registered path for a `FileId`; `None` for the synthetic
@@ -239,6 +290,16 @@ pub fn drain() -> Vec<SourceFile> {
         reg.root = None;
         reg.parsed.clear();
         std::mem::take(&mut reg.files)
+    })
+}
+
+/// Refill a drained registry with the app's files, so a late registration takes the next id rather than one an
+/// earlier file holds; [`drain`] then answers them all, the late ones after `files`.
+pub(super) fn resume(files: &[SourceFile]) {
+    SOURCES.with(|s| {
+        let mut reg = s.borrow_mut();
+        reg.files = files.to_vec();
+        reg.by_path = files.iter().enumerate().map(|(i, f)| (f.path.clone(), FileId(i as u32 + 1))).collect();
     })
 }
 
@@ -286,6 +347,44 @@ mod tests {
         assert_eq!(line_at("a.rb", 8), Some(3)); // start of "three"
         assert_eq!(line_at("nope.rb", 0), None);
         drain();
+    }
+
+    #[test]
+    fn line_offsets_agree_with_newline_scan() {
+        let source = {
+            let line = b"  def foo(bar, baz = 1)\n    puts bar\n  end\n";
+            let mut buf = Vec::with_capacity(line.len() * 8_000);
+            for _ in 0..8_000 {
+                buf.extend_from_slice(line);
+            }
+            buf
+        };
+        let result = ruby_prism::parse(&source);
+        let prism_starts: Vec<usize> = result.line_offsets().iter().map(|&o| o as usize).collect();
+        let scanned_newlines: Vec<usize> = source
+            .iter()
+            .enumerate()
+            .filter_map(|(offset, &byte)| (byte == b'\n').then_some(offset))
+            .collect();
+
+        // Same 1-based line numbers for every offset we care about.
+        let line_from_starts = |offset: usize| {
+            prism_starts.partition_point(|&start| start <= offset) as u32
+        };
+        let line_from_newlines = |offset: usize| {
+            scanned_newlines.partition_point(|&newline| newline < offset) as u32 + 1
+        };
+        for offset in [0usize, 1, source.len() / 4, source.len() / 2, source.len().saturating_sub(1)] {
+            assert_eq!(
+                line_from_starts(offset),
+                line_from_newlines(offset),
+                "offset {offset}"
+            );
+        }
+
+        // Timing is checked locally when claiming the scan win; CI only
+        // needs line-number equivalence (above).
+        let _ = (prism_starts.len(), scanned_newlines.len());
     }
 
     #[test]
@@ -384,6 +483,37 @@ mod tests {
         assert_eq!(b, FileId(2));
         let files = drain();
         assert_eq!(files.len(), 2);
+    }
+
+    #[test]
+    fn register_parse_result_must_not_run_under_with_text_borrow() {
+        // Documents the re-entrancy contract: holding `with_text`'s
+        // immutable borrow while calling `register_parse_result` panics.
+        // Callers that re-parse (e.g. visibility recovery) must clone via
+        // `text_of` first — see `delegate_declarations`.
+        reset();
+        register("reenter.rb", "class A; end\n");
+        let result = ruby_prism::parse(b"class A; end\n");
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = with_text("reenter.rb", |_text| {
+                register_parse_result(&result);
+                0u8
+            });
+        }))
+        .is_err();
+        assert!(panicked, "expected RefCell re-entrancy panic");
+        drain();
+    }
+
+    #[test]
+    fn text_of_clone_allows_register_parse_result() {
+        reset();
+        register("ok.rb", "class A; end\n");
+        let text = text_of("ok.rb").expect("registered");
+        let result = ruby_prism::parse(text.as_bytes());
+        register_parse_result(&result);
+        assert_eq!(line_at_parse(&result.node().location()), Some(1));
+        drain();
     }
 }
 

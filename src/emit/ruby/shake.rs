@@ -26,14 +26,16 @@
 //! shakeable names — presence/dirty predicates, `update!` — are
 //! candidates, so user methods can't be touched). Everything else
 //! (tep transport, spinel shims, scaffold, tests) is scanned for
-//! usages but never edited.
+//! usages but never edited, `config.ru` among it: it is the CRuby tree's
+//! Rack entry point, and a runtime method only it calls (the static file
+//! server's `public_file_server_headers`) was being dropped.
 //!
 //! Runs to a fixed point: dropping a body removes its calls, which can
 //! orphan further defs on the next pass.
 //!
 //! Kill switch: `ROUNDHOUSE_NO_TREESHAKE=1` skips the pass entirely.
 
-use std::collections::HashSet;
+use crate::det::HashSet;
 
 /// Methods Ruby (or the runtime idiom) dispatches without a textual
 /// call site: constructors via `.new`, `to_s` via interpolation,
@@ -302,9 +304,9 @@ pub fn shake_tree(
     let rescan: Vec<bool> = files.iter().map(|(path, _)| {
         path.ends_with(".rbs")
             || (path.ends_with(".rb")
-                && (is_framework_runtime(path) || path.starts_with("app/models/")))
+                && (is_framework_runtime(path) || super::class_paths::is_class_file(path)))
     }).collect();
-    let mut stable_usage: HashSet<String> = HashSet::new();
+    let mut stable_usage: HashSet<String> = HashSet::default();
     let mut total_runtime = 0usize;
     let mut total_synth = 0usize;
     for pass in 0..10 {
@@ -314,13 +316,13 @@ pub fn shake_tree(
         // names, so these borrows end before any file is rewritten.
         // Only membership matters: occurrence counts and per-line
         // deduplication do not affect whether a method is unreachable.
-        let mut usage = HashSet::new();
-        let mut stable_tokens = HashSet::new();
+        let mut usage = HashSet::default();
+        let mut stable_tokens = HashSet::default();
         for ((path, content), &rescan) in files.iter().zip(&rescan) {
-            if !rescan && (pass != 0 || !path.ends_with(".rb")) {
+            let is_rb = path.ends_with(".rb") || path.ends_with(".ru");
+            if !rescan && (pass != 0 || !is_rb) {
                 continue;
             }
-            let is_rb = path.ends_with(".rb");
             let out = if rescan { &mut usage } else { &mut stable_tokens };
             for line in content.lines() {
                 let defined = if is_rb {
@@ -339,11 +341,11 @@ pub fn shake_tree(
                 continue;
             }
             let runtime = is_framework_runtime(path);
-            let model = path.starts_with("app/models/");
+            let model = super::class_paths::is_class_file(path);
             if !runtime && !model {
                 continue;
             }
-            let mut dead: HashSet<String> = HashSet::new();
+            let mut dead: HashSet<String> = HashSet::default();
             for line in content.lines() {
                 if let Some(name) = def_line_name(line) {
                     if EXEMPT.contains(&name) {
@@ -402,27 +404,136 @@ pub fn shake_tree(
     }
 }
 
+/// `ActiveRecord::Base` methods that `runtime/active_record/base.rb`
+/// defines and `connection.rb` defines again in its `class Base`
+/// reopen, dropped from `base.rb` in the Spinel tree.
+///
+/// `connection.rb` loads later, so Ruby discards the first body, but
+/// Spinel still infers through it and the replaced body's calls type
+/// their callees: `base.rb`'s `find_by` and `where` call `instantiate`
+/// on rows from the untyped `ActiveRecord.adapter`, which widened every
+/// model's `instantiate` and `<Model>Row.from_raw` to the boxed path.
+///
+/// The strict targets never load `connection.rb`, and on the Ruby lanes
+/// the redefinition already wins, so only the Spinel tree is rewritten.
+/// Returns the number of defs dropped.
+pub fn drop_shadowed_base_defs(files: &mut [(String, String)]) -> usize {
+    const BASE: &str = "runtime/active_record/base.rb";
+    const CONNECTION: &str = "runtime/active_record/connection.rb";
+    let Some(base_idx) = files.iter().position(|(p, _)| p == BASE) else { return 0 };
+    let Some(conn_idx) = files.iter().position(|(p, _)| p == CONNECTION) else { return 0 };
+
+    let conn_lines: Vec<&str> = files[conn_idx].1.lines().collect();
+    let Some((cs, ce)) = base_class_block(&conn_lines) else { return 0 };
+    let redefined: HashSet<&str> = conn_lines[cs..ce].iter().filter_map(|l| base_def_key(l)).collect();
+
+    let lines: Vec<&str> = files[base_idx].1.lines().collect();
+    let Some((bs, be)) = base_class_block(&lines) else { return 0 };
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    out.extend(lines[..bs].iter().map(|l| l.to_string()));
+    let mut changed = 0;
+    let mut i = bs;
+    while i < be {
+        let line = lines[i];
+        let key = base_def_key(line);
+        let drop = key.is_some_and(|k| redefined.contains(k));
+        if !drop {
+            out.push(line.to_string());
+            i += 1;
+            continue;
+        }
+        let one_line = line.contains(';') && line.trim_end().ends_with("end");
+        let end = if one_line {
+            Some(i)
+        } else {
+            (i + 1..be).find(|&j| lines[j].trim_end() == "    end")
+        };
+        let Some(end) = end else {
+            out.push(line.to_string());
+            i += 1;
+            continue;
+        };
+        // The comment block directly above documents the dropped body.
+        while out.last().is_some_and(|l| l.starts_with("    #")) {
+            out.pop();
+        }
+        changed += 1;
+        // Nor one closing it.
+        if end + 1 == be && out.last().is_some_and(|l| l.trim().is_empty()) {
+            out.pop();
+        }
+        // No blank line left doubled, or opening the class body.
+        let after_blank = end + 1 < be && lines[end + 1].trim().is_empty();
+        if after_blank && out.last().is_none_or(|l| l.trim().is_empty() || l.trim_end() == "  class Base") {
+            i = end + 2;
+            continue;
+        }
+        i = end + 1;
+    }
+    out.extend(lines[be..].iter().map(|l| l.to_string()));
+    if changed > 0 {
+        let mut text = out.join("\n");
+        text.push('\n');
+        files[base_idx].1 = text;
+    }
+    changed
+}
+
+/// `  class Base` … `  end` (module-level indent): the line range of the
+/// class body.
+fn base_class_block(lines: &[&str]) -> Option<(usize, usize)> {
+    let start = lines.iter().position(|l| l.trim_end() == "  class Base")?;
+    let end = (start + 1..lines.len()).find(|&j| lines[j].trim_end() == "  end")?;
+    Some((start + 1, end))
+}
+
+/// A def at the class-body indent, keyed with its receiver:
+/// `self.find_by`, `save!`, `name=`.
+fn base_def_key(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("    def ")?;
+    let end = rest.find([' ', '(', ';']).unwrap_or(rest.len());
+    (end > 0).then(|| &rest[..end])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn borrowed_tokens_preserve_suffixes_operator_boundaries_and_line_deduplication() {
-        let mut found = HashSet::new();
+        let mut found = HashSet::default();
         tokens("ready! ready!=other next? next? _keep", &mut found, None);
         assert_eq!(
             found,
-            HashSet::from(["ready!", "ready", "other", "next?", "_keep"])
+            HashSet::from_iter(["ready!", "ready", "other", "next?", "_keep"])
         );
     }
 
     #[test]
     fn definition_exclusion_keeps_prior_roots_and_other_calls_on_the_same_line() {
-        let mut found = HashSet::new();
+        let mut found = HashSet::default();
         tokens("kept", &mut found, None);
         tokens("def kept; kept; leaf; end", &mut found, Some("kept"));
         tokens("def orphan; orphan; twig; end", &mut found, Some("orphan"));
-        assert_eq!(found, HashSet::from(["kept", "def", "leaf", "end", "twig"]));
+        assert_eq!(found, HashSet::from_iter(["kept", "def", "leaf", "end", "twig"]));
+    }
+
+    #[test]
+    fn base_defs_redefined_in_the_connection_reopen_are_dropped() {
+        let base = "module ActiveRecord\n  class Base\n    # Generic fallback.\n    def self.find_by(c)\n      instantiate(c)\n    end\n\n    def self.keep(x)\n      x\n    end\n\n    def find_by(c); c; end\n\n    def save!; end\n  end\nend\n";
+        let conn = "module ActiveRecord\n  class Relation\n    def self.keep(x)\n      x\n    end\n  end\n\n  class Base\n    def self.find_by(c)\n      where(c).first\n    end\n\n    def save!\n      save\n    end\n  end\nend\n";
+        let mut files: Vec<(String, String)> = vec![
+            ("runtime/active_record/base.rb".into(), base.into()),
+            ("runtime/active_record/connection.rb".into(), conn.into()),
+        ];
+        assert_eq!(drop_shadowed_base_defs(&mut files), 2);
+        // `self.keep` is redefined only on another class, and the instance
+        // `find_by` is not the class method the reopen defines.
+        assert_eq!(
+            files[0].1,
+            "module ActiveRecord\n  class Base\n    def self.keep(x)\n      x\n    end\n\n    def find_by(c); c; end\n  end\nend\n"
+        );
+        assert_eq!(files[1].1, conn);
     }
 
     #[test]
@@ -457,7 +568,7 @@ mod tests {
             ("app/entry.rb".into(), "Probe.live!\ndeadly\n# mentioned? is a textual root\n".into()),
         ];
         let entry = files[2].clone();
-        shake_tree(&mut files, &HashSet::new(), "test");
+        shake_tree(&mut files, &HashSet::default(), "test");
         assert_eq!(
             files[0].1,
             "module Probe\n  def live!; 3; end\n  def mentioned?; 4; end\n  def initialize; 7; end\nend\n"
@@ -467,6 +578,16 @@ mod tests {
             "module Probe\n  def live!: () -> Integer\n  def mentioned?: () -> Integer\n  def initialize: () -> Integer\nend\n"
         );
         assert_eq!(files[2], entry);
+    }
+
+    #[test]
+    fn a_method_only_config_ru_calls_is_kept() {
+        let mut files = vec![
+            ("runtime/rails.rb".into(), "class App\n  def from_rack; 1; end\n  def unused; 2; end\nend\n".into()),
+            ("config.ru".into(), "HEADERS = App.new.from_rack\nrun ->(env) { [200, {}, []] }\n".into()),
+        ];
+        shake_tree(&mut files, &HashSet::default(), "test");
+        assert_eq!(files[0].1, "class App\n  def from_rack; 1; end\nend\n");
     }
 
     #[test]
@@ -480,7 +601,7 @@ mod tests {
              "# external! is a textual root\ndef generated?; false; end\n".into()),
         ];
         let roots = files[2].clone();
-        let synth = HashSet::from(["generated?".into()]);
+        let synth = HashSet::from_iter(["generated?".into()]);
         shake_tree(&mut files, &synth, "test");
         assert_eq!(files[0].1, "module Probe\n  def external!; 1; end\nend\n");
         assert_eq!(files[1].1, "class Probe\n  def user_method; 4; end\nend\n");
@@ -500,7 +621,7 @@ mod tests {
             ("sig/runtime/active_record/probe.rbs".into(),
              "module Probe\n  def stale: () -> Integer # orphan\n           | () -> String # leaf\n  def orphan: () -> Integer\n  def leaf: () -> Integer\nend\n".into()),
         ];
-        shake_tree(&mut files, &HashSet::new(), "test");
+        shake_tree(&mut files, &HashSet::default(), "test");
         assert_eq!(files[0].1, "module Probe\nend\n");
         assert_eq!(files[1].1, "module Probe\nend\n");
     }
@@ -513,7 +634,7 @@ mod tests {
         }
         body.push_str("  def step10; 7; end\nend\n");
         let mut files = vec![("runtime/active_record/probe.rb".into(), body)];
-        shake_tree(&mut files, &HashSet::new(), "test");
+        shake_tree(&mut files, &HashSet::default(), "test");
         assert_eq!(files[0].1, "module Probe\n  def step10; 7; end\nend\n");
     }
 }

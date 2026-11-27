@@ -10,8 +10,9 @@
 //! Rails DSL.
 //!
 //! This module is pure: input is one `Model` plus the app `Schema`, output
-//! is one `LibraryClass`. No side-effects, no per-target choices. Per-Rails-
-//! idiom lowering is a separate function so each can be tested in
+//! is one `LibraryClass`. No side-effects; target capabilities are supplied
+//! by the caller. Per-Rails-idiom lowering is a separate function so each
+//! can be tested in
 //! isolation (skeleton, schema columns, has_many, belongs_to, validates,
 //! callbacks, …).
 //!
@@ -21,27 +22,30 @@
 //! that haven't migrated.
 
 mod adapter_emit;
+pub(crate) mod primary_key_guard;
 pub(crate) mod accessor_surface;
 pub(crate) mod schema;
 pub use schema::col_storage_name;
-pub use schema::shakeable_synthesized_names;
+pub use schema::{own_column_predicate, shakeable_synthesized_names};
 pub(crate) mod validations;
 mod associations;
 pub(crate) use associations::polymorphic_type_switch;
 pub(crate) mod broadcasts;
 pub(crate) mod markers;
+pub(crate) mod select_aliases;
 pub mod row;
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::dialect::{AccessorKind, LibraryClass, MethodDef, MethodReceiver, Model, Param};
 use crate::expr::{Expr, ExprNode, Literal};
 use crate::ident::{ClassId, Symbol, VarId};
 use crate::schema::{Column, ColumnType, Schema, Table};
 use crate::span::Span;
-use crate::ty::{Row, Ty};
+use crate::ty::{FnTy, Row, Ty};
 
-use self::associations::{push_association_methods, push_dependent_destroy};
+use self::associations::{push_association_methods, push_dependent_destroy, ThroughJoins};
+pub(crate) use self::associations::{ThroughWriterJoin, fk_sentinel, through_writer_join};
 pub(crate) use self::associations::model_defines_instance_method;
 pub(crate) use self::markers::attribute_api_decls;
 pub(crate) use self::markers::block_callback_shape;
@@ -115,6 +119,17 @@ pub(crate) enum ErrorsReaders {
     CreatedOnFirstRead,
 }
 
+/// Whether the target ships the runtime `ActiveRecord::Relation`
+/// (`BuildTarget::has_runtime_relation`): the ruby-family targets do, so a
+/// validation that needs a query at validation time (`uniqueness:`) can
+/// run one. A strict target has only the chains the Arel builder folds,
+/// and keeps such a validation as a reported gap.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuntimeRelation {
+    Absent,
+    Present,
+}
+
 /// Probe bodies expose framework ownership hidden by source overrides,
 /// but register the ordinary production definitions for faithful typing.
 /// Selection bounds retained bodies, never registry or demand inputs.
@@ -178,6 +193,23 @@ pub fn lower_models_with_registry_and_params(
     lower_models_inner(models, schema, extra_class_infos, params_specs, &Default::default(), Materialization::Emit, FinderInputs::Scalar)
 }
 
+/// As above, for an app's emit: a model's broadcasts render its partial
+/// by the method `views` give it, which a template of the partial's name
+/// moves (`PartialStems`). Without the views a partial keeps its stem.
+pub fn lower_models_with_registry_params_and_views(
+    models: &[Model],
+    schema: &Schema,
+    views: &[crate::dialect::View],
+    extra_class_infos: Vec<(ClassId, crate::analyze::ClassInfo)>,
+    params_specs: &crate::lower::controller_to_library::params::ParamsSpecs,
+) -> (Vec<LibraryClass>, HashMap<ClassId, crate::analyze::ClassInfo>) {
+    lower_models_inner_with_ruby_values(
+        models, schema, extra_class_infos, params_specs, &Default::default(), Materialization::Emit,
+        FinderInputs::Scalar, false, false, ErrorsReaders::FieldRead, RuntimeRelation::Absent,
+        &crate::lower::view_to_library::PartialStems::of(views),
+    )
+}
+
 /// Lower models with scalar finder inputs when the caller needs classes only;
 /// Ruby-family request consumers select their separate normalization entry.
 pub fn lower_models_to_library_classes(
@@ -223,21 +255,134 @@ pub fn lower_models_to_library_classes_unfolding(
     schema: &Schema,
     extra_class_infos: Vec<(ClassId, crate::analyze::ClassInfo)>,
     params_specs: &crate::lower::controller_to_library::params::ParamsSpecs,
-    unfolded: &std::collections::HashSet<(ClassId, Symbol)>,
+    unfolded: &crate::det::HashSet<(ClassId, Symbol)>,
 ) -> Vec<LibraryClass> {
     lower_models_inner(models, schema, extra_class_infos, params_specs, unfolded, Materialization::Emit, FinderInputs::Request).0
 }
 
-/// Register raw-input finders only for Ruby-family controller/test consumers.
-pub(crate) fn lower_models_with_request_finders(
+/// What one model lowering with raw-input finders leaves behind besides
+/// its classes: the registry, the diagnostics it reported, and how many
+/// read ids it took.
+struct RequestFinderRegistry {
+    registry: std::rc::Rc<HashMap<ClassId, crate::analyze::ClassInfo>>,
+    diagnostics: Vec<crate::diagnostic::Diagnostic>,
+    read_ids: usize,
+}
+
+type SharedRegistry = (usize, usize, usize, std::rc::Rc<std::cell::OnceCell<std::rc::Rc<RequestFinderRegistry>>>);
+
+thread_local! {
+    static REQUEST_FINDER_REGISTRY: std::cell::RefCell<Option<SharedRegistry>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Restores the previously shared registry when dropped. It borrows the
+/// models and the schema, so neither can change while it is shared.
+pub(crate) struct RequestFinderRegistryGuard<'a>(Option<SharedRegistry>, std::marker::PhantomData<(&'a [Model], &'a Schema)>);
+
+impl Drop for RequestFinderRegistryGuard<'_> {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        REQUEST_FINDER_REGISTRY.with(|slot| *slot.borrow_mut() = previous);
+    }
+}
+
+thread_local! {
+    static MODULE_WRITERS: std::cell::RefCell<HashMap<String, Vec<Symbol>>> = std::cell::RefCell::new(HashMap::default());
+}
+
+/// The public writers (`def x=`) of each library module, for the mass assignment of the models that include them,
+/// held for the guard's life.
+pub(crate) struct ModuleWritersGuard(HashMap<String, Vec<Symbol>>);
+
+impl Drop for ModuleWritersGuard {
+    fn drop(&mut self) {
+        let previous = std::mem::take(&mut self.0);
+        MODULE_WRITERS.with(|slot| *slot.borrow_mut() = previous);
+    }
+}
+
+pub(crate) fn share_module_writers(app: &crate::App) -> ModuleWritersGuard {
+    let mut writers: HashMap<String, Vec<Symbol>> = HashMap::default();
+    for lc in app.library_classes.iter().filter(|c| c.is_module) {
+        for m in lc.methods.iter().filter(|m| m.receiver == crate::dialect::MethodReceiver::Instance && m.visibility == crate::dialect::MethodVisibility::Public) {
+            let Some(base) = m.name.as_str().strip_suffix('=') else { continue };
+            let mut chars = base.chars();
+            if chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                let list = writers.entry(lc.name.0.as_str().to_string()).or_default();
+                if !list.iter().any(|w| w.as_str() == base) {
+                    list.push(Symbol::from(base));
+                }
+            }
+        }
+    }
+    ModuleWritersGuard(MODULE_WRITERS.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), writers)))
+}
+
+pub(crate) fn included_module_writers(module: &str) -> Vec<Symbol> {
+    MODULE_WRITERS.with(|slot| slot.borrow().get(module).cloned().unwrap_or_default())
+}
+
+/// Share [`request_finder_registry`] of `models` and `schema` among its
+/// callers for the guard's life. The Spinel and Ruby-family assembly asks
+/// for it once per controller lowering and once for the tests, each of
+/// which lowered every model again to throw the classes away. A guard
+/// inside another for the same models and schema shares the outer one's.
+pub(crate) fn share_request_finder_registry<'a>(models: &'a [Model], schema: &'a Schema) -> RequestFinderRegistryGuard<'a> {
+    let key = (models.as_ptr() as usize, models.len(), schema as *const Schema as usize);
+    let previous = REQUEST_FINDER_REGISTRY.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let cell = slot.as_ref().filter(|(m, n, s, _)| (*m, *n, *s) == key).map(|(_, _, _, cell)| cell.clone()).unwrap_or_default();
+        slot.replace((key.0, key.1, key.2, cell))
+    });
+    RequestFinderRegistryGuard(previous, std::marker::PhantomData)
+}
+
+/// The class registry of the models lowered with raw-input finders, for
+/// the Ruby-family controller/test consumers that type against it, with
+/// the diagnostics that lowering reports pushed to the active emit sink
+/// when `report` (a caller that only wants the registry drops them).
+///
+/// Computed once per [`share_request_finder_registry`] guard. A cached
+/// call stands in for a run exactly: it pushes the same diagnostics and
+/// takes the same read ids (`lower::arel::visitor::skip_read_ids`).
+pub(crate) fn request_finder_registry(
     models: &[Model],
     schema: &Schema,
-    extra_class_infos: Vec<(ClassId, crate::analyze::ClassInfo)>,
-) -> (Vec<LibraryClass>, HashMap<ClassId, crate::analyze::ClassInfo>) {
-    lower_models_inner(
-        models, schema, extra_class_infos, &Default::default(), &Default::default(),
-        Materialization::Emit, FinderInputs::Request,
-    )
+    report: bool,
+) -> std::rc::Rc<HashMap<ClassId, crate::analyze::ClassInfo>> {
+    let compute = || {
+        let before = crate::lower::arel::visitor::read_ids_taken();
+        let ((_, registry), diagnostics) = crate::emit::diagnostics::scope(|| {
+            lower_models_inner(
+                models, schema, Vec::new(), &Default::default(), &Default::default(),
+                Materialization::Emit, FinderInputs::Request,
+            )
+        });
+        let read_ids = crate::lower::arel::visitor::read_ids_taken() - before;
+        std::rc::Rc::new(RequestFinderRegistry { registry: std::rc::Rc::new(registry), diagnostics, read_ids })
+    };
+    let shared = REQUEST_FINDER_REGISTRY.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|(m, n, s, _)| (*m, *n, *s) == (models.as_ptr() as usize, models.len(), schema as *const Schema as usize))
+            .map(|(_, _, _, cell)| cell.clone())
+    });
+    let (entry, cached) = match shared {
+        Some(cell) => {
+            let hit = cell.get().cloned();
+            (hit.clone().unwrap_or_else(|| cell.get_or_init(compute).clone()), hit.is_some())
+        }
+        None => (compute(), false),
+    };
+    if cached {
+        crate::lower::arel::visitor::skip_read_ids(entry.read_ids);
+    }
+    if report {
+        for d in &entry.diagnostics {
+            crate::emit::diagnostics::push(d.clone());
+        }
+    }
+    entry.registry.clone()
 }
 
 /// Build one registry for the complete model graph, then type the selected
@@ -248,13 +393,18 @@ pub(crate) fn lower_models_inner(
     schema: &Schema,
     extra_class_infos: Vec<(ClassId, crate::analyze::ClassInfo)>,
     params_specs: &crate::lower::controller_to_library::params::ParamsSpecs,
-    unfolded: &std::collections::HashSet<(ClassId, Symbol)>,
+    unfolded: &crate::det::HashSet<(ClassId, Symbol)>,
     materialization: Materialization<'_>,
     finder_inputs: FinderInputs,
 ) -> (Vec<LibraryClass>, HashMap<ClassId, crate::analyze::ClassInfo>) {
+    // No view inventory reaches these entries, so a model's own partial
+    // keeps its stem (`PartialStems`); an app's emit passes its views
+    // through `lower_models_with_registry_params_and_views` or
+    // `lower_models_inner_with_ruby_values`.
     lower_models_inner_with_ruby_values(
         models, schema, extra_class_infos, params_specs, unfolded, materialization,
-        finder_inputs, false, ErrorsReaders::FieldRead,
+        finder_inputs, false, false, ErrorsReaders::FieldRead, RuntimeRelation::Absent,
+        &Default::default(),
     )
 }
 
@@ -263,16 +413,25 @@ pub(crate) fn lower_models_inner_with_ruby_values(
     schema: &Schema,
     extra_class_infos: Vec<(ClassId, crate::analyze::ClassInfo)>,
     params_specs: &crate::lower::controller_to_library::params::ParamsSpecs,
-    unfolded: &std::collections::HashSet<(ClassId, Symbol)>,
+    unfolded: &crate::det::HashSet<(ClassId, Symbol)>,
     materialization: Materialization<'_>,
     finder_inputs: FinderInputs,
     ruby_read_values: bool,
+    param_binds: bool,
     errors_readers: ErrorsReaders,
+    runtime_relation: RuntimeRelation,
+    partial_stems: &crate::lower::view_to_library::PartialStems,
 ) -> (Vec<LibraryClass>, HashMap<ClassId, crate::analyze::ClassInfo>) {
+    // Every target's lowering holds a NOT NULL integer that `presence:`
+    // checks unset until assigned, as Rails reads it nil until then.
+    let unset_schema = crate::lower::validations::hold_unset_presence_columns(models, schema);
+    let schema = &unset_schema;
     let mut all_methods: Vec<(Vec<MethodDef>, ClassId, Option<&Table>, &Model)> = Vec::new();
-    let mut classes: HashMap<ClassId, crate::analyze::ClassInfo> = HashMap::new();
+    let string_enums = if ruby_read_values { crate::lower::arel::StringEnums::of_models(models, schema) } else { Default::default() };
+    let mut classes: HashMap<ClassId, crate::analyze::ClassInfo> = HashMap::default();
+    let _body_names = schema::share_model_body_names(models, &Default::default());
     for model in models {
-        let methods = build_methods_with_finder_inputs(model, models, schema, params_specs, finder_inputs, errors_readers);
+        let methods = build_methods_with_finder_inputs(model, models, schema, params_specs, finder_inputs, param_binds, errors_readers, runtime_relation, partial_stems);
         let table = schema.tables.get(&model.table.0);
         // Register actual production definitions, even for unselected
         // models and when source overrides hide framework ownership.
@@ -291,7 +450,7 @@ pub(crate) fn lower_models_inner_with_ruby_values(
                             if matches!(method.as_str(), "attr_accessor" | "attr_reader" | "attr_writer")),
                     _ => true,
                 });
-                let mut methods = build_methods_with_finder_inputs(&definitions, models, schema, params_specs, finder_inputs, errors_readers);
+                let mut methods = build_methods_with_finder_inputs(&definitions, models, schema, params_specs, finder_inputs, param_binds, errors_readers, runtime_relation, partial_stems);
                 // Preserve original source inputs for late derivations
                 // (e.g. raw helpers) without treating them as framework
                 // claims. Both kinds traverse the canonical Arel/typer.
@@ -332,6 +491,11 @@ pub(crate) fn lower_models_inner_with_ruby_values(
     // `from_params` body's `p.<field>` Send dispatches to the
     // `<Resource>Params` attr_reader signature.
     for spec in params_specs.iter() {
+        if spec.value_map() {
+            classes.insert(spec.class_id.clone(),
+                crate::lower::controller_to_library::params::spec_class_info(spec));
+            continue;
+        }
         let class_id = spec.class_id.clone();
         let mut info = crate::analyze::ClassInfo::default();
         // MUST match what `build_params_class` actually synthesizes. A
@@ -353,12 +517,23 @@ pub(crate) fn lower_models_inner_with_ruby_values(
                 .insert(setter_name, crate::dialect::AccessorKind::AttributeWriter);
         };
         for field in &spec.fields {
-            register(field.clone(), Ty::Str);
+            let ty = if spec.nested_fields.contains_key(field) {
+                crate::lower::controller_to_library::params::field_ty(spec, field)
+            } else {
+                crate::lower::controller_to_library::params::written_scalar_ty(spec, field).unwrap_or(Ty::Str)
+            };
+            register(field.clone(), ty);
             register(
                 crate::lower::controller_to_library::params::provided_field(field),
                 Ty::Bool,
             );
         }
+        // The multiparameter record the model's guard reads.
+        register(
+            crate::lower::controller_to_library::params::multiparameter_fields_field(),
+            Ty::Array { elem: std::sync::Arc::new(Ty::Str) },
+        );
+        register(crate::lower::controller_to_library::params::multiparameter_unsupported_field(), Ty::Bool);
         info.class_methods.insert(
             Symbol::from("from_raw"),
             fn_sig(
@@ -387,9 +562,45 @@ pub(crate) fn lower_models_inner_with_ruby_values(
         classes.insert(id, info);
     }
 
+    // A model class method chained on `all` / `where(...)` runs on that
+    // relation (Rails' scoping; the relation delegates it, see
+    // `emit_relation_scope_delegates`), so the chain under it is not
+    // folded into an Array. Only where a runtime Relation exists to
+    // carry it; elsewhere the fold stands.
+    let relation_class_methods: HashSet<Symbol> = if runtime_relation == RuntimeRelation::Present {
+        models
+            .iter()
+            .flat_map(|m| m.body.iter())
+            .filter_map(|item| match item {
+                crate::ModelBodyItem::Method { method, .. } if method.receiver == crate::dialect::MethodReceiver::Class => {
+                    Some(method.name.clone())
+                }
+                // A scope too: a has_many whose scope names one
+                // (`-> { long }`) chains it on the key query.
+                crate::ModelBodyItem::Scope { scope, .. } => Some(scope.name.clone()),
+                _ => None,
+            })
+            .collect()
+    } else {
+        HashSet::default()
+    };
+    let relation_returns = if runtime_relation == RuntimeRelation::Present {
+        crate::lower::scope_chain::build_user_method_returns(models).class
+    } else {
+        Default::default()
+    };
     let mut out = Vec::new();
     for (mut methods, _, table, model) in all_methods {
         for method in &mut methods {
+            if runtime_relation == RuntimeRelation::Present && method.receiver == MethodReceiver::Class {
+                fn late_bound_self(expr: &mut Expr) {
+                    expr.node.for_each_child_mut(&mut late_bound_self);
+                    if matches!(&*expr.node, ExprNode::Const { .. })
+                        && expr.decisions & crate::expr::IMPLICIT_MODEL_FINDER_RECEIVER != 0
+                    { *expr.node = ExprNode::SelfRef; }
+                }
+                late_bound_self(&mut method.body);
+            }
             // Arel pass — rewrite recognized AR call sites
             // (`Comment.where(article_id: @id)`, `Article.find_by(id:
             // @id)`, `Comment.all`, `Comment.count`, `Comment.exists?`)
@@ -405,14 +616,24 @@ pub(crate) fn lower_models_inner_with_ruby_values(
             // constant, and an inline whole-table count would bake in
             // the reading Rails does not have. Only the Ruby-family
             // entry ever names one.
+            //
+            // Held back, too, for a class method whose body answers a
+            // relation (`scope_chain::UserMethodReturns::class`): its
+            // callers chain on the result as they chain on a scope's,
+            // and the fold would answer an Array.
+            let key = (model.name.clone(), method.name.clone());
             let unfold = method.receiver == crate::dialect::MethodReceiver::Class
-                && unfolded.contains(&(model.name.clone(), method.name.clone()));
+                && (unfolded.contains(&key) || relation_returns.contains_key(&key));
             if !unfold {
                 crate::lower::arel::rewrite_arel_in_expr_with_ruby_values(
-                    &mut method.body, schema, &classes, &[], ruby_read_values,
-                    &HashSet::new(),
+                    &mut method.body, schema, &classes, &[], ruby_read_values.then_some(&string_enums),
+                    &relation_class_methods,
+                    crate::lower::arel::SqliteVisitor { param_binds },
                 );
             }
+            // After the Arel pass, which inlines a finder over `@<col>`
+            // (an association reader) and not over a reader call.
+            read_held_columns_through_readers(std::slice::from_mut(method), table);
             type_method_body(method, &classes, table, Some(model));
         }
         out.push(model_class(model, methods, table));
@@ -460,9 +681,9 @@ pub fn class_info_from_library_class(lc: &LibraryClass) -> crate::analyze::Class
     // shouldn't add `()` to such calls since the field is read as
     // a property. Reclassify those Method entries as AttributeReader
     // so the typer treats them like field accesses.
-    let mut ivar_names: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
-    fn collect_ivars(e: &crate::expr::Expr, out: &mut std::collections::HashSet<String>) {
+    let mut ivar_names: crate::det::HashSet<String> =
+        crate::det::HashSet::default();
+    fn collect_ivars(e: &crate::expr::Expr, out: &mut crate::det::HashSet<String>) {
         match &*e.node {
             ExprNode::Assign { target: LValue::Ivar { name }, value } => {
                 out.insert(name.as_str().to_string());
@@ -552,7 +773,7 @@ pub fn lower_model_to_library_class(model: &Model, schema: &Schema) -> LibraryCl
         build_methods(model, std::slice::from_ref(model), schema, &Default::default());
     let table = schema.tables.get(&model.table.0);
     let class_info = build_class_info(model, &methods, table);
-    let mut classes: HashMap<ClassId, crate::analyze::ClassInfo> = HashMap::new();
+    let mut classes: HashMap<ClassId, crate::analyze::ClassInfo> = HashMap::default();
     classes.insert(model.name.clone(), class_info);
     insert_integer_key_cast_info(&mut classes);
     // Register Row classes so `<Model>.from_row(r)` / `<Model>Row.from_raw(h)`
@@ -571,7 +792,8 @@ pub fn lower_model_to_library_class(model: &Model, schema: &Schema) -> LibraryCl
 
 /// Canonical class envelope for both production lowering and ownership
 /// observation. Typing and method selection remain the caller's job.
-fn model_class(model: &Model, methods: Vec<MethodDef>, table: Option<&Table>) -> LibraryClass {
+fn model_class(model: &Model, mut methods: Vec<MethodDef>, table: Option<&Table>) -> LibraryClass {
+    apply_inherited_visibility(model, &mut methods);
     LibraryClass {
         name: model.name.clone(),
         is_module: false,
@@ -579,11 +801,22 @@ fn model_class(model: &Model, methods: Vec<MethodDef>, table: Option<&Table>) ->
         parent_span: Default::default(),
         // Mixins and constants must survive in every model projection.
         includes: crate::analyze::model_includes(model),
+        // A model's own includes stay `ModelBodyItem::Unknown` with a
+        // real span (`analyze/mod.rs`'s model loop uses it directly,
+        // not this projection), so this envelope needs none.
+        include_spans: Vec::new(),
         methods,
         nullable_columns: nullable_column_names(table),
         origin: None,
-        constants: collect_model_constants(model),
-        unknown_calls: Vec::new(),
+        constants: {
+            let mut constants = collect_model_constants(model);
+            if let Some(table) = table {
+                constants.extend(schema::enum_constants(model, table));
+            }
+            constants
+        },
+        conditional_definitions: Vec::new(),
+        unknown_calls: replayed_class_body(model),
         class_ivar_initializers: collect_class_attr_initializers(model),
     }
 }
@@ -595,7 +828,7 @@ fn model_class(model: &Model, methods: Vec<MethodDef>, table: Option<&Table>) ->
 fn collect_class_attr_initializers(model: &Model) -> Vec<Expr> {
     use crate::ingest::library_class::{mattr_nil_seed, mattr_seed};
 
-    model
+    let mut out: Vec<Expr> = model
         .class_attr_defaults
         .iter()
         .map(|(name, value)| {
@@ -605,7 +838,74 @@ fn collect_class_attr_initializers(model: &Model) -> Vec<Expr> {
                 mattr_seed(name, value.clone())
             }
         })
+        .collect();
+    // The class body's own writes to its class instance variables (`@registry ||= []`, `@registry << …`), in order.
+    for item in &model.body {
+        if let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item
+            && writes_class_ivar(expr)
+        {
+            out.push(expr.clone());
+        }
+    }
+    out
+}
+
+/// `private :comments` on a method the lowering synthesizes; a name it does not synthesize (a gem's) has no method here to mark.
+fn apply_inherited_visibility(model: &Model, methods: &mut [MethodDef]) {
+    for (class_side, name, visibility) in inherited_visibility(model) {
+        let side = if class_side { MethodReceiver::Class } else { MethodReceiver::Instance };
+        for m in methods.iter_mut().filter(|m| m.name.as_str() == name && m.receiver == side) {
+            m.visibility = visibility;
+        }
+    }
+}
+
+/// `(class side, name, visibility)` per name a model's `private :x` gives a method its body does not define.
+pub(crate) fn inherited_visibility(model: &Model) -> Vec<(bool, &str, crate::dialect::MethodVisibility)> {
+    let mut out = Vec::new();
+    for item in &model.body {
+        let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { continue };
+        if expr.decisions & crate::expr::INHERITED_VISIBILITY == 0 {
+            continue;
+        }
+        let ExprNode::Send { method: marker, args, .. } = &*expr.node else { continue };
+        let visibility = match marker.as_str() {
+            "public" | "public_class_method" => crate::dialect::MethodVisibility::Public,
+            "protected" => crate::dialect::MethodVisibility::Protected,
+            _ => crate::dialect::MethodVisibility::Private,
+        };
+        let class_side = marker.as_str().ends_with("_class_method");
+        for arg in args {
+            let name = match &*arg.node {
+                ExprNode::Lit { value: Literal::Sym { value } } => value.as_str(),
+                ExprNode::Lit { value: Literal::Str { value } } => value.as_str(),
+                _ => continue,
+            };
+            out.push((class_side, name, visibility));
+        }
+    }
+    out
+}
+
+/// The class-body statements the Ruby family replays (`ingest::app_extension_calls`), in source order.
+fn replayed_class_body(model: &Model) -> Vec<Expr> {
+    model
+        .body
+        .iter()
+        .filter_map(|item| match item {
+            crate::dialect::ModelBodyItem::Unknown { expr, .. } if expr.decisions & crate::expr::REPLAYED_CLASS_BODY != 0 => Some(expr.clone()),
+            _ => None,
+        })
         .collect()
+}
+
+pub(crate) fn writes_class_ivar(expr: &Expr) -> bool {
+    match &*expr.node {
+        ExprNode::Assign { target: crate::expr::LValue::Ivar { .. }, .. }
+        | ExprNode::OpAssign { target: crate::expr::LValue::Ivar { .. }, .. } => true,
+        ExprNode::Send { recv: Some(r), block: None, .. } => matches!(&*r.node, ExprNode::Ivar { .. }),
+        _ => false,
+    }
 }
 
 /// Class-level `NAME = <expr>` constants declared in a model body (e.g.
@@ -649,12 +949,167 @@ pub(crate) fn collect_model_constants(model: &Model) -> Vec<(Symbol, Expr)> {
 /// dynamic targets often run fine without it. The skip-list below must
 /// stay in sync with the claiming passes — each entry names the pass
 /// that consumes the shape.
+fn defines_methods_in_block(expr: &crate::expr::Expr) -> bool {
+    unrolled_block_call(expr).is_some()
+}
+
+/// The call on the class a model-body block runs that is not carried out
+/// of it: `define_method`, `define_singleton_method` or `scope` anywhere
+/// in the block, or any class macro among a loop's own statements
+/// (`%i[a b].each { |f| validates f, presence: true }`), which no
+/// model-body recognizer reads out of a loop.
+fn unrolled_block_call(expr: &crate::expr::Expr) -> Option<String> {
+    /// The loops a model body runs class calls through.
+    const LOOPS: &[&str] = &[
+        "each", "each_with_index", "each_with_object", "each_pair", "each_key", "each_value", "each_slice", "each_cons",
+        "reverse_each", "map", "collect", "times",
+    ];
+    fn on_class(recv: &Option<crate::expr::Expr>) -> bool {
+        recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+    }
+    // `define_singleton_method` and `singleton_class` are Object's too: in
+    // a block callback (`after_initialize do … end`) they are the record's,
+    // which the callback lowering carries. Only a loop's are the class's.
+    fn walk(expr: &crate::expr::Expr, in_loop: bool) -> Option<String> {
+        if let ExprNode::Send { recv, method, .. } = &*expr.node {
+            // On the class: receiverless or `self.scope`.
+            if on_class(recv) && matches!(method.as_str(), "define_method" | "scope") {
+                return Some(method.to_string());
+            }
+            if in_loop && on_class(recv) && method.as_str() == "define_singleton_method" {
+                return Some(method.to_string());
+            }
+            if in_loop
+                && method.as_str() == "define_method"
+                && let Some(r) = recv
+                && let ExprNode::Send { recv: sc_recv, method: sc, args, block: None, .. } = &*r.node
+                && sc.as_str() == "singleton_class"
+                && args.is_empty()
+                && on_class(sc_recv)
+            {
+                return Some("singleton_class.define_method".into());
+            }
+        }
+        let mut found = None;
+        expr.node.for_each_child(&mut |child| {
+            if found.is_none() {
+                found = walk(child, in_loop);
+            }
+        });
+        found
+    }
+    fn loop_call(body: &crate::expr::Expr) -> Option<String> {
+        let statements = match &*body.node {
+            ExprNode::Seq { exprs } => exprs.as_slice(),
+            _ => std::slice::from_ref(body),
+        };
+        statements.iter().find_map(|s| match &*s.node {
+            ExprNode::Send { recv, method, .. } if on_class(recv) => Some(method.to_string()),
+            _ => None,
+        })
+    }
+    match &*expr.node {
+        ExprNode::Send { method, block: Some(block), .. } => {
+            let in_loop = LOOPS.contains(&method.as_str());
+            walk(block, in_loop).or_else(|| {
+                let ExprNode::Lambda { body, .. } = &*block.node else { return None };
+                in_loop.then(|| loop_call(body)).flatten()
+            })
+        }
+        // `while`/`until` in the body runs its statements as a block does.
+        ExprNode::While { body, .. } => walk(body, true).or_else(|| loop_call(body)),
+        _ => None,
+    }
+}
+
+/// Interim subset of #1302's unclaimed-call errors: dropping encryption
+/// would make the generated writers and persistence store plaintext.
+pub(crate) fn encrypts_diagnostics(app: &crate::App) -> Vec<crate::diagnostic::Diagnostic> {
+    let mut out = Vec::new();
+    if app.extensions.attribute_macro("encrypts").is_some() {
+        return out;
+    }
+    let mut seen = HashSet::default();
+    for model in &app.models {
+        for item in &model.body {
+            let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { continue };
+            let ExprNode::Send { recv: None, method, .. } = &*expr.node else { continue };
+            if method.as_str() != "encrypts"
+                || expr.decisions & (crate::expr::REPLAYED_CLASS_BODY | crate::expr::INHERITED_VISIBILITY) != 0
+                || expr.diagnostic().is_some() || !seen.insert(expr.span)
+            {
+                continue;
+            }
+            out.push(crate::diagnostic::Diagnostic::unsupported(
+                expr.span, None, "encrypts",
+                format!(
+                    "`encrypts` in the body of `{}` is not modelled, so its effect would be dropped from the output",
+                    model.name.0.as_str()
+                ),
+            ));
+        }
+    }
+    out
+}
+
+/// A model-body block that runs `define_method`, `define_singleton_method`
+/// or `scope`, or a loop that runs any class macro (`validates`,
+/// `attribute`, `before_save`), that `ingest::define_method_loop` could
+/// not unroll (`kinds.each do |kind| define_method(…) … end` over a value
+/// known only when the class loads, or a receiverless block): no lowering
+/// carries what it declares, so the emitted model would lack it. An error
+/// for `check`, as the call sites would raise NoMethodError and the
+/// declarations would not run.
+pub(crate) fn unrolled_loop_diagnostics(app: &crate::App) -> Vec<crate::diagnostic::Diagnostic> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::default();
+    for model in &app.models {
+        for item in &model.body {
+            let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { continue };
+            // A receiverless block too (`each do |size| scope size, … end`):
+            // nothing in a model body claims one that defines methods.
+            let Some(call) = unrolled_block_call(expr) else { continue };
+            if expr.decisions & (crate::expr::REPLAYED_CLASS_BODY | crate::expr::INHERITED_VISIBILITY) != 0
+                || expr.diagnostic().is_some() || !seen.insert(expr.span)
+            {
+                continue;
+            }
+            out.push(crate::diagnostic::Diagnostic::unsupported(
+                expr.span, None, "runtime-defined method",
+                format!(
+                    "a block in the body of `{}` runs `{call}` in a shape the compile could not unroll; what it declares would be missing from the output",
+                    model.name.0.as_str()
+                ),
+            ));
+        }
+    }
+    out
+}
+
 fn report_unclaimed_unknowns(model: &Model, schema: &Schema) {
     use crate::diagnostic::{Diagnostic, Severity};
     use crate::expr::LValue;
 
     for item in &model.body {
         let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { continue };
+        // Replayed where the source has it (`ingest::app_extension_calls`).
+        if expr.decisions & crate::expr::REPLAYED_CLASS_BODY != 0 {
+            continue;
+        }
+        // `prepend Concern`: the concern splice carried the module's
+        // `prepended do` items here and the Ruby emit writes the line.
+        if expr.decisions & crate::expr::CONCERN_PREPEND != 0 {
+            continue;
+        }
+        // `connects_to` / `establish_connection`: the model's database,
+        // decided (or refused) by `ingest::database_ownership`.
+        if crate::ingest::database_ownership::claims_model_statement(expr) {
+            continue;
+        }
+        // Claimed by `apply_inherited_visibility` and `analyze::private_calls`.
+        if expr.decisions & crate::expr::INHERITED_VISIBILITY != 0 {
+            continue;
+        }
         // Class-scope constants — claimed by analyze::extract_const_assignments.
         if matches!(&*expr.node, ExprNode::Assign { target: LValue::Const { .. }, .. }) {
             continue;
@@ -663,6 +1118,10 @@ fn report_unclaimed_unknowns(model: &Model, schema: &Schema) {
             continue;
         };
         let name = method.as_str();
+        // `KINDS.each { |k| define_method(…) }` that `define_method_loop` could not unroll: `check`'s error (`unrolled_loop_diagnostics`).
+        if defines_methods_in_block(expr) {
+            continue;
+        }
         if let Some(recv) = recv {
             // Class-body writes are sends too, and dropping an unclaimed
             // setting must report just like dropping a receiver-less DSL.
@@ -670,6 +1129,11 @@ fn report_unclaimed_unknowns(model: &Model, schema: &Schema) {
                 || !name.ends_with('=')
                 || matches!(name, "==" | "!=" | "<=" | ">=" | "===")
             {
+                continue;
+            }
+            // `inheritance_column = nil` / `false` turns STI off, which
+            // `lower::sti_scope` models. A column name stays unsupported.
+            if crate::lower::sti_scope::turns_sti_off(expr).is_some() {
                 continue;
             }
             // Literal table settings are consumed by ingest::model's
@@ -776,12 +1240,19 @@ fn report_unclaimed_unknowns(model: &Model, schema: &Schema) {
             continue;
         }
         // `serialize :col, coder: JSON` (and legacy positional `JSON`) —
-        // claimed by lower::serialize; accessors go through JsonColumn.
+        // claimed by lower::serialize; accessors go through RoundhouseJsonColumn.
         if name == "serialize"
             && crate::lower::serialize::serialize_decls(model)
                 .iter()
                 .any(|d| d.span == expr.span)
         {
+            continue;
+        }
+        // `default_scope { where(…) }`, static or read at build time —
+        // claimed by lower::default_scope (the runtime Relation applies
+        // it; a target without one reports it per target). Other shapes
+        // keep warning.
+        if name == "default_scope" && crate::lower::default_scope::default_scope(model).is_some() {
             continue;
         }
         // Bare `has_rich_text :body` — claimed by lower::rich_text.
@@ -809,19 +1280,69 @@ fn report_unclaimed_unknowns(model: &Model, schema: &Schema) {
         {
             continue;
         }
-        // 2-arg `attribute :name, :type` — claimed by
-        // markers::push_attribute_api_methods (typed virtual
-        // attributes). Other arities (default:-carrying) stay
-        // unclaimed and warn.
+        // `normalizes :attr, with: ->(v) { … }` over columns — claimed by
+        // `lower::normalizes` (the `_normalize_<attr>` class method the
+        // column writer and finders call). Another `with:`, or an
+        // attribute that isn't a column, stays unclaimed and warns.
+        if name == "normalizes"
+            && crate::lower::normalizes::lowers_call(expr, |attr| {
+                schema.tables.get(&model.table.0).is_some_and(|t| t.columns.iter().any(|c| c.name == *attr))
+            })
+        {
+            continue;
+        }
+        // `attribute :name` — claimed by
+        // markers::push_attribute_api_methods (virtual attributes),
+        // with an optional type and a supported `default:`. A
+        // default over an existing column (Rails makes it the column's
+        // default; the column's reader is kept here, so it would be
+        // dropped) or beside the model's own writer
+        // (`markers::default_beside_source_writer`) stays unclaimed and
+        // warns, as other arities do.
         if name == "attribute" {
             if let ExprNode::Send { args, .. } = &*expr.node {
-                if args.len() == 2 {
+                if let Some(decl) = self::markers::attribute_api_decl(args)
+                    && !(decl.options.is_some()
+                        && schema.tables.get(&model.table.0).is_some_and(|t| t.columns.iter().any(|c| c.name == *decl.name)))
+                    && !self::markers::default_beside_source_writer(&model.body, args)
+                {
+                    // Over a column of another type, the column's cast,
+                    // reader and storage are kept
+                    // (`markers::attribute_matches_column`): reported.
+                    let attr = decl.name;
+                    if let Some(ty) = decl.ty
+                        && !model.enums.contains_key(attr)
+                        && let Some(col) = schema
+                            .tables
+                            .get(&model.table.0)
+                            .and_then(|t| t.columns.iter().find(|c| c.name == *attr))
+                        && !self::markers::attribute_matches_column(ty.as_str(), col)
+                    {
+                        let mut d = Diagnostic::unsupported(
+                            expr.span,
+                            None,
+                            name,
+                            format!(
+                                "`attribute :{attr}, :{ty}` over a {}{} column on `{}`: the column's type is kept (its reader and storage don't follow the declared type)",
+                                column_type_word(&col.col_type),
+                                if col.array { " array" } else { "" },
+                                model.name.0.as_str()
+                            ),
+                        );
+                        d.severity = Severity::Warning;
+                        crate::emit::diagnostics::push(d);
+                    }
                     continue;
                 }
             }
         }
         // `primary_abstract_class` — claimed by markers.rs.
         if name == "primary_abstract_class" {
+            continue;
+        }
+        // `self.abstract_class = true|false` — the older spelling of the
+        // same marker, read in order by `markers::is_abstract_class`.
+        if name == "abstract_class=" && self::markers::is_literal_abstract_class_write(expr) {
             continue;
         }
         // `include Notifications` — a model concern, spliced by the
@@ -866,6 +1387,10 @@ fn report_unclaimed_unknowns(model: &Model, schema: &Schema) {
                 }
             }
         }
+        // Reported once by the shared analysis diagnostic, on every target.
+        if name == "encrypts" {
+            continue;
+        }
         let mut d = Diagnostic::unsupported(
             expr.span,
             None,
@@ -874,6 +1399,22 @@ fn report_unclaimed_unknowns(model: &Model, schema: &Schema) {
         );
         d.severity = Severity::Warning;
         crate::emit::diagnostics::push(d);
+    }
+}
+
+/// The schema word for a column type, for a diagnostic.
+fn column_type_word(t: &crate::schema::ColumnType) -> String {
+    use crate::schema::ColumnType;
+    match t {
+        ColumnType::String { .. } => "string".into(),
+        ColumnType::Text => "text".into(),
+        ColumnType::Integer => "integer".into(),
+        ColumnType::BigInt => "bigint".into(),
+        ColumnType::Float => "float".into(),
+        ColumnType::Decimal { .. } => "decimal".into(),
+        ColumnType::Boolean => "boolean".into(),
+        ColumnType::DateTime => "datetime".into(),
+        other => format!("{other:?}").to_lowercase(),
     }
 }
 
@@ -895,37 +1436,51 @@ fn report_unclaimed_unknowns(model: &Model, schema: &Schema) {
 /// each dropped name is ledgered as a `lower_residue` warning.
 fn writable_permit_fields(
     model: &Model,
-    table: &crate::schema::Table,
+    table: Option<&crate::schema::Table>,
     fields: &[crate::ident::Symbol],
 ) -> Vec<crate::ident::Symbol> {
     use crate::diagnostic::{Diagnostic, DiagnosticKind};
     use crate::ident::Symbol;
 
-    let writable = writable_field_set(model, table);
+    let writable = writable_field_set_for_table(model, table);
 
     fields
         .iter()
         .filter(|field| {
-            if writable.contains(*field) || model_defines_writer(model, field) {
+            let public_writer = model_defines_public_writer(model, field);
+            if writable.contains(*field) || public_writer {
                 return true;
             }
+            let private = model_defines_writer(model, field);
             let kind = DiagnosticKind::LowerResidue {
                 pass: Symbol::from("permit_writer_filter"),
                 construct: Symbol::from("permit"),
-                reason: Symbol::from("no writer"),
+                reason: Symbol::from(if private { "private writer" } else { "no writer" }),
             };
-            let d = Diagnostic {
-                span: model.span,
-                severity: Diagnostic::default_severity(&kind),
-                kind,
-                message: format!(
+            let message = if private {
+                format!(
+                    "permitted field `{field}` has only a private or protected writer on \
+                     `{model_name}` — dropped from the synthesized update/from_params; \
+                     Rails assigns through public_send and would raise \
+                     UnknownAttributeError if a request submitted it",
+                    field = field.as_str(),
+                    model_name = model.name.0.as_str(),
+                )
+            } else {
+                format!(
                     "permitted field `{field}` has no writer on `{model_name}` (not a \
                      column, attr_writer, belongs_to, typed_store, has_secure_password, \
                      or `def {field}=`) — dropped from the synthesized update/from_params; \
                      Rails would raise UnknownAttributeError if a request submitted it",
                     field = field.as_str(),
                     model_name = model.name.0.as_str(),
-                ),
+                )
+            };
+            let d = Diagnostic {
+                span: model.span,
+                severity: Diagnostic::default_severity(&kind),
+                kind,
+                message,
             };
             crate::emit::diagnostics::push(d);
             false
@@ -945,12 +1500,19 @@ pub fn writable_field_set(
     model: &Model,
     table: &crate::schema::Table,
 ) -> std::collections::BTreeSet<crate::ident::Symbol> {
+    writable_field_set_for_table(model, Some(table))
+}
+
+fn writable_field_set_for_table(
+    model: &Model,
+    table: Option<&crate::schema::Table>,
+) -> std::collections::BTreeSet<crate::ident::Symbol> {
     use crate::dialect::{Association, ModelBodyItem};
-    use crate::expr::{ExprNode, Literal};
+    use crate::expr::ExprNode;
     use crate::ident::Symbol;
 
     let mut writable: std::collections::BTreeSet<Symbol> = std::collections::BTreeSet::new();
-    for col in &table.columns {
+    for col in table.into_iter().flat_map(|table| &table.columns) {
         writable.insert(col.name.clone());
     }
     for (_span, assoc) in model.spanned_associations() {
@@ -958,8 +1520,6 @@ pub fn writable_field_set(
             writable.insert(name.clone());
         }
     }
-    // `attr_accessor` / `attr_writer` virtuals (mirrors the scan in
-    // markers::push_attr_accessor_methods).
     for item in &model.body {
         let ModelBodyItem::Unknown { expr, .. } = item else { continue };
         let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node else {
@@ -968,11 +1528,7 @@ pub fn writable_field_set(
         if !matches!(method.as_str(), "attr_accessor" | "attr_writer") {
             continue;
         }
-        for arg in args {
-            if let ExprNode::Lit { value: Literal::Sym { value } } = &*arg.node {
-                writable.insert(value.clone());
-            }
-        }
+        writable.extend(self::markers::accessor_names(model, args));
     }
     for (_store, attrs) in crate::lower::typed_store::typed_store_decls(&model.body) {
         for attr in attrs {
@@ -981,6 +1537,7 @@ pub fn writable_field_set(
     }
     if let Some(attr) = crate::lower::secure_password::secure_password_attr(&model.body) {
         writable.insert(Symbol::from(format!("{}_confirmation", attr.as_str())));
+        writable.insert(Symbol::from(format!("{}_challenge", attr.as_str())));
         writable.insert(attr);
     }
     for (name, _ty) in self::markers::attribute_api_decls(&model.body) {
@@ -1014,6 +1571,10 @@ pub fn writable_field_set(
     // writer yet (Many appends via the proxy, not mass-assign), so the
     // attrs stay OUT of the writable set — putting them in would make
     // `update(uploads: …)` / permit emit a missing writer (inv. 6).
+    writable.retain(|field| {
+        let is_column = table.is_some_and(|t| t.columns.iter().any(|c| c.name == *field));
+        is_column || !model_defines_writer(model, field) || model_defines_public_writer(model, field)
+    });
     writable
 }
 
@@ -1022,6 +1583,20 @@ pub fn writable_field_set(
 pub(crate) fn model_defines_writer(model: &Model, field: &crate::ident::Symbol) -> bool {
     let writer = crate::ident::Symbol::from(format!("{}=", field.as_str()));
     model_defines_instance_method(model, &writer)
+}
+
+/// `model_defines_writer` for mass assignment: Rails assigns permitted
+/// params through `public_send`, so a private or protected `def <field>=`
+/// is not a key it accepts (`UnknownAttributeError`). Hydration keeps
+/// `model_defines_writer`, which any visibility satisfies.
+pub(crate) fn model_defines_public_writer(model: &Model, field: &crate::ident::Symbol) -> bool {
+    let writer = crate::ident::Symbol::from(format!("{}=", field.as_str()));
+    model.body.iter().any(|item| {
+        matches!(item, crate::dialect::ModelBodyItem::Method { method, .. }
+            if method.name == writer
+                && method.receiver == MethodReceiver::Instance
+                && method.visibility == crate::dialect::MethodVisibility::Public)
+    })
 }
 
 /// Survey the same untyped synthesis used by emission. Source lookup stays
@@ -1036,7 +1611,8 @@ pub(crate) fn unretained_model_contracts<'a>(
     crate::emit::diagnostics::scope(|| {
         let mut specs = crate::lower::controller_to_library::params::collect_specs(&app.controllers);
         specs.mark_file_fields(&app.models);
-        let mut missing = HashSet::new();
+        let mut missing = HashSet::default();
+        let _body_names = schema::share_model_body_names(&app.models, &Default::default());
         for model in &app.models {
             let selected = selected(model);
             if selected.is_empty()
@@ -1085,7 +1661,7 @@ pub(crate) fn build_methods(
     schema: &Schema,
     params_specs: &crate::lower::controller_to_library::params::ParamsSpecs,
 ) -> Vec<MethodDef> {
-    build_methods_with_finder_inputs(model, models, schema, params_specs, FinderInputs::Scalar, ErrorsReaders::FieldRead)
+    build_methods_with_finder_inputs(model, models, schema, params_specs, FinderInputs::Scalar, false, ErrorsReaders::FieldRead, RuntimeRelation::Absent, &Default::default())
 }
 
 /// Return the instance method surface synthesized for a model, for ingest
@@ -1110,12 +1686,16 @@ fn build_methods_with_finder_inputs(
     schema: &Schema,
     params_specs: &crate::lower::controller_to_library::params::ParamsSpecs,
     finder_inputs: FinderInputs,
+    param_binds: bool,
     errors_readers: ErrorsReaders,
+    runtime_relation: RuntimeRelation,
+    partial_stems: &crate::lower::view_to_library::PartialStems,
 ) -> Vec<MethodDef> {
     // No-op outside an emit diagnostics scope, so the many direct
     // test callers of the lowering entries are unaffected.
     report_unclaimed_unknowns(model, schema);
 
+    let through_joins = ThroughJoins::decide(model, models);
     let mut methods: Vec<MethodDef> = Vec::new();
 
     if let Some(table) = schema.tables.get(&model.table.0) {
@@ -1134,9 +1714,9 @@ fn build_methods_with_finder_inputs(
         // every permitted field (registration above uses the unfiltered
         // spec); only the assignment synthesis narrows.
         let writable_fields =
-            permitted_fields.map(|fields| writable_permit_fields(model, table, fields));
+            permitted_fields.map(|fields| writable_permit_fields(model, Some(table), fields));
         let permitted_fields = writable_fields.as_deref();
-        push_schema_methods(&mut methods, model, models, table);
+        push_schema_methods(&mut methods, model, models, table, &through_joins, runtime_relation, schema.expression_dialect);
         // Per-model Level-3 adapter primitives (`_adapter_find_by_id`, etc.)
         // — typed methods that go directly from SQL composition to typed
         // model instances over the `Sqlite` primitive surface. See
@@ -1145,14 +1725,23 @@ fn build_methods_with_finder_inputs(
             methods.push(adapter_emit::synth_find_primary_key_input(&model.name, table));
             methods.push(adapter_emit::synth_exists_primary_key_input(&model.name, table));
         }
-        push_adapter_methods(&mut methods, model, table, schema);
+        push_adapter_methods(&mut methods, model, table, schema, param_binds, runtime_relation == RuntimeRelation::Present);
+        match crate::lower::default_scope::default_scope(model) {
+            Some(crate::lower::default_scope::DefaultScope::Static(scope)) => {
+                methods.push(crate::lower::default_scope::synth_default_scope_where(model, &scope));
+            }
+            Some(crate::lower::default_scope::DefaultScope::Dynamic(scope)) => {
+                methods.push(crate::lower::default_scope::synth_dynamic_default_scope_where(model, &scope));
+            }
+            None => {}
+        }
         // `from_params(p: <Resource>Params)` — typed factory matching the
         // (resource, fields) tuple a controller's `permit(...)` declared.
         // Skipped silently when the model isn't permitted by any
         // controller.
         if let (Some(fields), Some(spec)) = (permitted_fields, canonical) {
             self::schema::push_from_params_method(
-                &mut methods, model, fields, table, &spec.class_id,
+                &mut methods, model, fields, Some(table), spec,
                 crate::lower::controller_to_library::params::model_from_params_name(spec),
             );
         }
@@ -1166,20 +1755,26 @@ fn build_methods_with_finder_inputs(
         // still keeps the plain name for the canonical list, since
         // nothing else competes for it.
         for spec in params_specs.for_resource(&resource) {
+            let assocs = self::schema::permitted_assocs(model, &through_joins, spec);
+            let scalar: Vec<_> = spec.fields.iter()
+                .filter(|f| !assocs.iter().any(|a| &a.name == *f))
+                .cloned()
+                .collect();
             if spec.is_canonical {
-                let writable = writable_permit_fields(model, table, &spec.fields);
+                let writable = writable_permit_fields(model, Some(table), &scalar);
                 self::schema::push_update_typed_variants(
-                    &mut methods, model, &writable, table, spec,
+                    &mut methods, model, &writable, &assocs, table, spec,
                 );
                 continue;
             }
-            let writable = writable_permit_fields(model, table, &spec.fields);
+            let writable = writable_permit_fields(model, Some(table), &spec.fields);
             self::schema::push_from_params_method(
-                &mut methods, model, &writable, table, &spec.class_id,
+                &mut methods, model, &writable, Some(table), spec,
                 crate::lower::controller_to_library::params::model_from_params_name(spec),
             );
+            let writable = writable_permit_fields(model, Some(table), &scalar);
             self::schema::push_update_typed_variants(
-                &mut methods, model, &writable, table, spec,
+                &mut methods, model, &writable, &assocs, table, spec,
             );
         }
         // `create_from_params(p)` / `create_from_params!(p)` — the typed
@@ -1206,11 +1801,40 @@ fn build_methods_with_finder_inputs(
                 );
             }
         }
+    } else if self::validations::includes_active_model_model(model)
+        && !model_defines_instance_method(model, &Symbol::from("initialize"))
+    {
+        let resource = Symbol::from(crate::naming::snake_case(model.name.0.as_str()));
+        for spec in params_specs.for_resource(&resource) {
+            let factory = crate::lower::controller_to_library::params::model_from_params_name(spec);
+            if model.methods().any(|method| {
+                method.receiver == MethodReceiver::Class && method.name == factory
+            }) {
+                continue;
+            }
+            let writable = writable_permit_fields(model, None, &spec.fields);
+            self::schema::push_from_params_method(
+                &mut methods, model, &writable, None, spec,
+                factory,
+            );
+        }
     }
 
-    push_validate_method(&mut methods, model, models, errors_readers);
-    push_association_methods(&mut methods, model, models);
-    push_dependent_destroy(&mut methods, model);
+    // The key a uniqueness check excludes the record by: `self.primary_key
+    // = "…"`, else a schema key other than `id`, else `id` (as `def
+    // self.primary_key` is chosen in `push_schema_methods`).
+    let primary_key = model
+        .primary_key
+        .clone()
+        .or_else(|| {
+            schema.tables.get(&model.table.0).and_then(|t| {
+                t.columns.iter().find(|c| c.primary_key && c.name.as_str() != "id").map(|c| c.name.clone())
+            })
+        })
+        .unwrap_or_else(|| Symbol::from("id"));
+    push_validate_method(&mut methods, model, errors_readers, runtime_relation, &primary_key, schema.tables.get(&model.table.0), schema);
+    push_association_methods(&mut methods, model, models, &through_joins, runtime_relation, schema.tables.get(&model.table.0));
+    push_dependent_destroy(&mut methods, model, &through_joins);
     push_unknown_marker_methods(&mut methods, model);
     push_attr_accessor_methods(&mut methods, model);
     // AFTER the accessors: the constructor assigns exactly what they
@@ -1218,7 +1842,7 @@ fn build_methods_with_finder_inputs(
     self::validations::push_active_model_constructor(&mut methods, model);
     // `attribute :name, :type` (Rails Attributes API) — typed virtual
     // readers + cast writers; same before-user-methods ordering.
-    self::markers::push_attribute_api_methods(&mut methods, model);
+    self::markers::push_attribute_api_methods(&mut methods, model, runtime_relation);
     // typed_store virtual attributes — reader/predicate/writer per
     // declared attr, routing through the `TypedStore` runtime (the
     // YAML seam). Before `push_user_methods` so a custom method in the
@@ -1256,7 +1880,12 @@ fn build_methods_with_finder_inputs(
     // one of these (last-def-wins) — exactly the collapse snapshot
     // semantics needs to see THROUGH, not after.
     let pre_user_methods = methods.clone();
-    push_user_methods(&mut methods, model);
+    let columns: HashSet<crate::ident::Symbol> = schema
+        .tables
+        .get(&model.table.0)
+        .map(|t| t.columns.iter().map(|c| c.name.clone()).collect())
+        .unwrap_or_default();
+    push_user_methods(&mut methods, model, &columns);
     // friendly_id — `friendly`, its configuration and the slug
     // `to_param`. After the user methods (their own wins), before the
     // `to_param` default below.
@@ -1273,14 +1902,16 @@ fn build_methods_with_finder_inputs(
     // AFTER push_user_methods, unlike the macros above: its skip guard
     // reads the accumulated list, so a model's own `to_param` (already
     // pushed) wins over the synthesized `@id.to_s`.
-    self::markers::push_to_param_method(&mut methods, model);
+    self::markers::push_to_param_method(&mut methods, model, schema.tables.get(&model.table.0));
+    // Not before push_user_methods: its skip guard has to see the model's own methods.
+    self::select_aliases::push_select_alias_methods(&mut methods, model, runtime_relation);
     // Also after push_user_methods: its BODY branches on whether the
     // model carries its own `to_key` (campfire's Message does).
     self::markers::push_dom_record_key_method(&mut methods, model);
     // After push_user_methods too: a model that writes its own
     // `cache_key` keeps it.
     self::markers::push_cache_key_methods(&mut methods, model, schema);
-    push_broadcasts_methods(&mut methods, model);
+    push_broadcasts_methods(&mut methods, model, partial_stems);
     // `has_secure_token` — the token default folds into the
     // `before_create` hook, so it runs BEFORE `push_callback_methods`:
     // the fold appends, and the macro's assignment belongs ahead of a
@@ -1290,7 +1921,7 @@ fn build_methods_with_finder_inputs(
     // runtime. After the user methods, so a model's own
     // `generate_token_for` wins.
     crate::lower::generates_token_for::push_token_for_methods(&mut methods, model);
-    push_callback_methods(&mut methods, model);
+    push_callback_methods(&mut methods, model, partial_stems);
 
     // File-grain catch-all (mirrors view_to_library's
     // build_library_class): whatever the synthesizers left span-less —
@@ -1329,15 +1960,21 @@ fn build_methods_with_finder_inputs(
 ///     `def parsed_url; … URI.parse …; end`; keeping the bare
 ///     `@parsed_url` reader left the ivar untyped/unread and Spinel's
 ///     strict emit failed with `error[ivar_unresolved]`.
-///   * Column / association / scope synthesizers still win over a
+///   * Column writers / association / scope synthesizers still win over a
 ///     duplicate body name. A later source-level `delegate` may replace
 ///     an earlier real method, but only when that method was already
 ///     selected from the model body; generated framework methods are not
 ///     reordered by source spans.
-fn push_user_methods(methods: &mut Vec<MethodDef>, model: &Model) {
+///   * A method a class-body macro synthesized in place in the body
+///     (`delegated_type`'s `build_<role>`, an enum's predicates) yields
+///     to a real `def` written after it, as Ruby's later definition
+///     replaces it. A `def` written before the macro still wins.
+fn push_user_methods(methods: &mut Vec<MethodDef>, model: &Model, columns: &HashSet<crate::ident::Symbol>) {
     use crate::dialect::{AccessorKind, ModelBodyItem};
     use crate::expr::{ExprNode, LValue};
-    let mut selected_source_methods = HashSet::new();
+    let mut selected_source_methods = HashSet::default();
+    // The body's own synthesized methods (a class-body macro's, in place).
+    let mut macro_methods: HashSet<(crate::ident::Symbol, crate::dialect::MethodReceiver)> = HashSet::default();
     for item in &model.body {
         let ModelBodyItem::Method { method, .. } = item else { continue };
         if let Some(idx) = methods
@@ -1348,9 +1985,8 @@ fn push_user_methods(methods: &mut Vec<MethodDef>, model: &Model) {
             let incoming_is_real = matches!(method.kind, AccessorKind::Method);
             // Only bare-ivar attr_* halves (attr_accessor/reader/writer
             // synth, which carry no signature) yield to a later real
-            // `def`. Schema column AttributeReaders are also bare
-            // `@col` reads for scalar columns, but they stamp a
-            // signature — keep those winning (documented above).
+            // `def`. Schema column writers carry a signature and keep
+            // their storage casts.
             let existing_is_attr_half = existing.signature.is_none()
                 && match existing.kind {
                     AccessorKind::AttributeReader => {
@@ -1382,12 +2018,54 @@ fn push_user_methods(methods: &mut Vec<MethodDef>, model: &Model) {
                     && selected_source_methods.contains(&existing.name_span)
                     && existing.name_span.file == method.name_span.file
                     && method.name_span.start > existing.name_span.start;
-            if incoming_is_real && (existing_is_attr_half || incoming_is_later_delegate) {
+            // A table column's accessor yields to the model's own, as Rails' generated attribute methods do; not a signed virtual one (`has_secure_password`'s `confirmation=`).
+            let existing_is_column = existing.signature.is_some()
+                && matches!(existing.kind, AccessorKind::AttributeReader | AccessorKind::AttributeWriter)
+                && columns.contains(&crate::ident::Symbol::from(existing.name.as_str().trim_end_matches('=')));
+            if incoming_is_real && existing_is_column && !method.name_span.is_synthetic() {
+                // The synthesized accessor stays, under the name the override's `super` (`ingest::column_accessors`) and hydration (`schema::hydration_setter`) reach it by.
+                let raw = {
+                    let mut raw = existing.clone();
+                    let column = existing.name.as_str().trim_end_matches('=');
+                    raw.name = crate::ident::Symbol::from(match existing.kind {
+                        AccessorKind::AttributeWriter => format!("_write_{column}_raw"),
+                        _ => format!("_read_{column}_raw"),
+                    });
+                    Some(raw)
+                };
+                selected_source_methods.remove(&existing.name_span);
+                if let Some(raw) = raw
+                    && !methods.iter().any(|m| m.name == raw.name && m.receiver == raw.receiver)
+                {
+                    methods.push(raw);
+                }
+                methods[idx] = method.clone();
+                selected_source_methods.insert(method.name_span);
+                continue;
+            }
+            // A class-body macro's generated method (`delegated_type`'s
+            // `build_<role>`, synthesized in place) yields to a `def` the
+            // body writes after it, as a later definition replaces it in Ruby.
+            let incoming_replaces_macro_method = !method.name_span.is_synthetic()
+                && macro_methods.contains(&(existing.name.clone(), existing.receiver));
+            // A second `def` of a name the body already defined: Ruby's later definition replaces the earlier one.
+            // A `(...)` def on either side stays with the forwarding survey, which refuses the collision.
+            let forwards = |m: &MethodDef| m.params.iter().any(|p| p.forwarding);
+            let incoming_is_later_def = !method.name_span.is_synthetic()
+                && selected_source_methods.contains(&existing.name_span)
+                && existing.name_span.file == method.name_span.file
+                && method.name_span.start > existing.name_span.start
+                && !forwards(existing)
+                && !forwards(method);
+            if incoming_is_real && (existing_is_attr_half || incoming_is_later_delegate || incoming_replaces_macro_method || incoming_is_later_def) {
                 selected_source_methods.remove(&existing.name_span);
                 methods[idx] = method.clone();
                 selected_source_methods.insert(method.name_span);
             }
             continue;
+        }
+        if method.name_span.is_synthetic() && matches!(method.kind, AccessorKind::Method) {
+            macro_methods.insert((method.name.clone(), method.receiver));
         }
         methods.push(method.clone());
         selected_source_methods.insert(method.name_span);
@@ -1429,10 +2107,13 @@ fn push_user_methods(methods: &mut Vec<MethodDef>, model: &Model) {
 ///   - `belongs_to` / `has_one` reader: resolves — Rails defines the
 ///     reader when the macro runs, same as a `def`.
 ///   - `attr_accessor` / `attr_reader` / `attr_writer`: resolves.
-///   - ActiveModel::Attributes `attribute`: resolves in Rails, but
-///     roundhouse doesn't synthesize a method for it yet (separate,
-///     undone work) — so there's nothing in `methods` to find, and it
-///     stays a gap, unchanged from today.
+///   - ActiveModel::Attributes `attribute` on a tableless model:
+///     resolves, against the synthesized reader, from the `attribute`
+///     line on (activemodel 8.1.4 defines it right there: an alias
+///     before it raises `NameError`, and a later `def` doesn't change
+///     what an alias after it copied). On an ActiveRecord model
+///     `attribute` is lazy like a column, so Rails raises `NameError`
+///     and this refuses with the same `alias_attribute` hint.
 ///   - a plain AR column reader: Rails itself raises `NameError`
 ///     here — ActiveRecord generates attribute methods lazily, which
 ///     is why `alias_attribute` exists. Refused with a gap that names
@@ -1461,6 +2142,9 @@ fn resolve_model_aliases(
     }
 
     let table = schema.tables.get(&model.table.0);
+    // `attribute` defines its reader eagerly only through
+    // ActiveModel::Attributes; ActiveRecord's is lazy.
+    let eager_attributes = includes_active_model_attributes(model);
     // Every name declared SOMEWHERE in the body via a category this
     // function can see — a hand-written `def` / enum method, a
     // `belongs_to`/`has_one` reader, or an `attr_accessor`/`attr_reader`/
@@ -1470,7 +2154,7 @@ fn resolve_model_aliases(
     // must refuse rather than fall through to the inherited-method
     // forwarder (which would be synthesizing a forwarder for a name
     // that is, in fact, about to become a plain local method).
-    let mut declared_anywhere: HashSet<Symbol> = HashSet::new();
+    let mut declared_anywhere: HashSet<Symbol> = HashSet::default();
     for item in &model.body {
         match item {
             ModelBodyItem::Method { method, .. } if method.receiver == MethodReceiver::Instance => {
@@ -1481,6 +2165,9 @@ fn resolve_model_aliases(
             }
             ModelBodyItem::Unknown { expr, .. } => {
                 declared_anywhere.extend(attr_accessor_arg_names(expr));
+                if eager_attributes {
+                    declared_anywhere.extend(attribute_api_arg_name(expr));
+                }
             }
             _ => {}
         }
@@ -1495,7 +2182,7 @@ fn resolve_model_aliases(
     // that one synthesized copy is what's live from here on, until a
     // later hand-written redefinition — tracked by the arm below —
     // changes it again).
-    let mut live: HashMap<Symbol, MethodDef> = HashMap::new();
+    let mut live: HashMap<Symbol, MethodDef> = HashMap::default();
 
     for (idx, item) in model.body.iter().enumerate() {
         match item {
@@ -1511,7 +2198,8 @@ fn resolve_model_aliases(
                 }
             }
             ModelBodyItem::Unknown { expr, .. } => {
-                for name in attr_accessor_arg_names(expr) {
+                let attribute = attribute_api_arg_name(expr).filter(|_| eager_attributes);
+                for name in attr_accessor_arg_names(expr).into_iter().chain(attribute) {
                     if let Some(m) = pre_user_methods
                         .iter()
                         .find(|m| m.name == name && m.receiver == MethodReceiver::Instance)
@@ -1529,7 +2217,9 @@ fn resolve_model_aliases(
                     // break snapshot semantics, so this is a refusal
                     // (the `None` arm below), not a fallback.
                     None
-                } else if table.is_some_and(|t| t.columns.iter().any(|c| c.name == *old)) {
+                } else if table.is_some_and(|t| t.columns.iter().any(|c| c.name == *old))
+                    || (!eager_attributes && attribute_api_names(model).contains(old))
+                {
                     // A plain AR column reader — Rails itself raises
                     // NameError here (attribute methods are generated
                     // lazily), so this never resolves; the `None` arm
@@ -1573,7 +2263,8 @@ fn resolve_model_aliases(
                         live.insert(new.clone(), copy);
                     }
                     None => {
-                        push_alias_target_unresolved_gap(*span, model, old, new, table);
+                        let lazy_attribute = !eager_attributes && attribute_api_names(model).contains(old);
+                        push_alias_target_unresolved_gap(*span, model, old, new, table, lazy_attribute);
                     }
                 }
             }
@@ -1588,7 +2279,7 @@ fn resolve_model_aliases(
 /// handles separately aren't needed here: missing one of those just
 /// means `resolve_model_aliases` falls through to a refusal instead
 /// of a resolution, never to a WRONG one).
-fn attr_accessor_arg_names(expr: &Expr) -> Vec<Symbol> {
+pub(super) fn attr_accessor_arg_names(expr: &Expr) -> Vec<Symbol> {
     let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node else {
         return Vec::new();
     };
@@ -1601,6 +2292,40 @@ fn attr_accessor_arg_names(expr: &Expr) -> Vec<Symbol> {
             _ => None,
         })
         .collect()
+}
+
+/// The name an `attribute :name, …` call declares, when `expr` is one.
+pub(super) fn attribute_api_arg_name(expr: &Expr) -> Option<Symbol> {
+    let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node else {
+        return None;
+    };
+    if method.as_str() != "attribute" {
+        return None;
+    }
+    match args.first().map(|a| &*a.node) {
+        Some(ExprNode::Lit { value: Literal::Sym { value } }) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn attribute_api_names(model: &Model) -> HashSet<Symbol> {
+    model.body.iter().filter_map(|item| match item {
+        crate::dialect::ModelBodyItem::Unknown { expr, .. } => attribute_api_arg_name(expr),
+        _ => None,
+    }).collect()
+}
+
+/// `include ActiveModel::Attributes` in the class body.
+fn includes_active_model_attributes(model: &Model) -> bool {
+    model.body.iter().any(|item| {
+        let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { return false };
+        let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { return false };
+        method.as_str() == "include"
+            && args.iter().any(|a| matches!(&*a.node,
+                ExprNode::Const { path } if path.len() == 2
+                    && path[0].as_str() == "ActiveModel"
+                    && path[1].as_str() == "Attributes"))
+    })
 }
 
 /// A forwarder for `old` when it's a known ActiveRecord::Base instance
@@ -1650,9 +2375,15 @@ fn push_alias_target_unresolved_gap(
     old: &Symbol,
     new: &Symbol,
     table: Option<&Table>,
+    lazy_attribute: bool,
 ) {
     let is_column = table.is_some_and(|t| t.columns.iter().any(|c| c.name == *old));
-    let detail = if is_column {
+    let detail = if lazy_attribute {
+        format!(
+            "alias {new} {old} names an ActiveRecord `attribute` — Rails raises NameError here too \
+             (attribute methods are generated lazily); use `alias_attribute :{new}, :{old}` instead"
+        )
+    } else if is_column {
         format!(
             "alias {new} {old} names a column — Rails raises NameError here too \
              (attribute methods are generated lazily); use `alias_attribute :{new}, :{old}` instead"
@@ -1660,7 +2391,8 @@ fn push_alias_target_unresolved_gap(
     } else {
         format!(
             "alias {new} {old} on {}: {old} is not defined (not a hand-written method, \
-             enum method, association, attr_accessor, or inherited ActiveRecord method)",
+             enum method, association, attr_accessor, ActiveModel attribute declared above it, \
+             or inherited ActiveRecord method)",
             model.name.0
         )
     };
@@ -1732,8 +2464,9 @@ pub(crate) fn push_scope_methods(
     methods: &mut Vec<MethodDef>,
     model: &Model,
     scopes: &crate::lower::scope_chain::ScopeRegistry,
-    models_set: &std::collections::HashSet<ClassId>,
+    models_set: &crate::det::HashSet<ClassId>,
     assocs: &crate::lower::scope_chain::AssocRegistry,
+    unique_keys: &crate::lower::scope_chain::UniqueKeys,
 ) {
     use crate::dialect::{AccessorKind, ModelBodyItem, Param};
     use crate::expr::{Expr, ExprNode, LValue};
@@ -1778,25 +2511,26 @@ pub(crate) fn push_scope_methods(
             scopes,
             models_set,
             assocs,
+            unique_keys,
         );
 
         // Rails relations are immutable, so every implicit-self root in
         // a scope body starts from the scope as it was on entry:
-        // `where(a).or(where(b))` is `a OR b`. Ours mutate in place, and
-        // the rewrite roots each of those on the one threaded `__rel`,
-        // so the receiver's `where(a)` landed on the argument too and
-        // the query became `(a AND b) OR (a AND b)`. When the body reads
-        // the relation more than once, each read takes its own copy.
-        // (A single read keeps the bare `__rel`; the entry spawn below
-        // already protects the caller's relation.)
+        // `where(a).or(where(b))` is `a OR b`. The rewrite roots each of
+        // those on the one threaded `__rel`. Chain methods now answer a
+        // new relation (#1041), so these copies no longer change the
+        // query; they cost one clone per extra read and can go once
+        // nothing reaches a scope body through a bang method.
+        // (A single read keeps the bare `__rel`.)
         if count_var_reads(&mut body, &rel_param) > 1 {
             spawn_each_var_read(&mut body, &rel_param, &model.name);
         }
 
         // Rails scopes spawn on entry: `rel.visible.with_direct_rooms`
         // must not leave joins/orders on `rel.visible` for a sibling
-        // `rel.visible.with_ordered_room`. Our chain methods mutate in
-        // place, so the scope method itself takes a copy first.
+        // `rel.visible.with_ordered_room`. Chain methods fork on their
+        // own since #1041; the entry copy is kept for the bang methods
+        // (`where!`, `order!`), which still write in place.
         let span = body.span;
         let rel_ty = Ty::Relation {
             of: model.name.clone(),
@@ -1882,7 +2616,7 @@ pub(crate) fn push_scope_methods(
 pub(crate) fn push_scope_variants(
     methods: &mut Vec<MethodDef>,
     model_name: &ClassId,
-    registered: &std::collections::HashMap<Symbol, Vec<crate::dialect::Param>>,
+    registered: &crate::det::HashMap<Symbol, Vec<crate::dialect::Param>>,
 ) {
     use crate::dialect::{AccessorKind, Param};
     use crate::lower::scope_chain::{delegable_name, scope_variant_name, DelegableShape};
@@ -1988,12 +2722,12 @@ pub(crate) fn push_scope_variants(
                     receiver: MethodReceiver::Class,
                     params,
                     body,
-                    signature: Some(Ty::Fn {
+                    signature: Some(Ty::Fn(Box::new(FnTy {
                         params: sig_params.into(),
                         block: None,
                         ret: std::sync::Arc::new(Ty::Untyped),
                         effects: crate::effect::EffectSet::default(),
-                    }),
+                    }))),
                     effects: crate::effect::EffectSet::default(),
                     enclosing_class: Some(model_name.0.clone()),
                     kind: AccessorKind::Method,
@@ -2048,7 +2782,22 @@ fn build_class_info_with_finder_inputs(
 ) -> crate::analyze::ClassInfo {
     let mut info = crate::analyze::ClassInfo::default();
     info.table = Some(model.table.clone());
+    info.default_scoped = crate::lower::default_scope::default_scope(model).is_some();
     info.parent = model.parent.clone();
+    // The analyzer's registry is not this map. Arel's `ids` / `pluck`
+    // and the source-method decline read these two fields, so they have
+    // to be filled here or a model method inlines `SELECT id` and a
+    // `def self.pluck` becomes SQL.
+    info.primary_key = model.primary_key.clone().or_else(|| {
+        table.and_then(|t| t.columns.iter().find(|column| column.primary_key).map(|column| column.name.clone()))
+    });
+    for item in &model.body {
+        let crate::dialect::ModelBodyItem::Method { method, .. } = item else { continue };
+        if method.receiver == MethodReceiver::Class {
+            info.source_class_methods.insert(method.name.clone());
+        }
+    }
+    info.source_class_methods.extend(model.scopes().map(|s| s.name.clone()));
 
     // Attributes row from schema columns.
     if let Some(t) = table {
@@ -2092,7 +2841,7 @@ fn build_class_info_with_finder_inputs(
     // `/rooms/#<Room:0x000000010…>`. Uses the analyzer's own seed rule
     // rather than a second copy of it.
     {
-        let scope_names: std::collections::HashSet<Symbol> =
+        let scope_names: crate::det::HashSet<Symbol> =
             model.scopes().map(|s| s.name.clone()).collect();
         for scope in model.scopes() {
             info.class_methods.entry(scope.name.clone()).or_insert_with(|| {
@@ -2158,6 +2907,8 @@ fn build_class_info_with_finder_inputs(
                     **elem,
                     Ty::Int | Ty::Float | Ty::Str | Ty::Sym | Ty::Bool
                 ),
+                // A scalar has neither to repeat, and a caller reading it on implicit `self` is typed from here.
+                Ty::Int | Ty::Float | Ty::Str | Ty::Sym | Ty::Bool => true,
                 _ => false,
             })
         else {
@@ -2171,7 +2922,7 @@ fn build_class_info_with_finder_inputs(
         };
         method_map
             .entry(m.name.clone())
-            .or_insert_with(|| Ty::Fn {
+            .or_insert_with(|| Ty::Fn(Box::new(FnTy {
                 // Retain the calling convention too: a positional Hash
                 // default must still normalize keyword syntax into a Hash.
                 // Unsigned methods retain default types, not call-site seeds.
@@ -2184,7 +2935,7 @@ fn build_class_info_with_finder_inputs(
                     .then(|| std::sync::Arc::new(Ty::Untyped)),
                 ret: std::sync::Arc::new(inferred.clone()),
                 effects: m.effects.clone(),
-            });
+            })));
         kind_map.entry(m.name.clone()).or_insert(m.kind);
     }
 
@@ -2253,6 +3004,11 @@ fn build_class_info_with_finder_inputs(
     insert_default(
         &mut info.instance_methods,
         "error_messages_for",
+        fn_sig(vec![(Symbol::from("attribute"), Ty::Str)], Ty::Array { elem: std::sync::Arc::new(Ty::Str) }),
+    );
+    insert_default(
+        &mut info.instance_methods,
+        "error_full_messages_for",
         fn_sig(vec![(Symbol::from("attribute"), Ty::Str)], Ty::Array { elem: std::sync::Arc::new(Ty::Str) }),
     );
     insert_default(&mut info.instance_methods, "valid?", fn_sig(vec![], Ty::Bool));
@@ -2587,7 +3343,7 @@ fn broadcasts_class_info() -> crate::analyze::ClassInfo {
     // Hash, Crystal NamedTuple → named params, TS object literal).
     use crate::dialect::AccessorKind;
     let opts_ty = Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Untyped) };
-    let sig = Ty::Fn {
+    let sig = Ty::Fn(Box::new(FnTy {
         params: vec![crate::ty::Param {
             name: Symbol::from("opts"),
             ty: opts_ty.into(),
@@ -2596,7 +3352,7 @@ fn broadcasts_class_info() -> crate::analyze::ClassInfo {
         block: None,
         ret: std::sync::Arc::new(Ty::Nil),
         effects: crate::effect::EffectSet::pure(),
-    };
+    }));
     for name in ["prepend", "replace", "remove", "append"] {
         info.class_methods.insert(Symbol::from(name), sig.clone());
         info.class_method_kinds.insert(Symbol::from(name), AccessorKind::Method);
@@ -2639,16 +3395,32 @@ fn type_method_body(
 ) {
     let typer = crate::analyze::BodyTyper::new(classes);
     let mut ctx = crate::analyze::Ctx::default();
-    if let Some(Ty::Fn { params, .. }) = &method.signature {
-        for (param, sig) in method.params.iter().zip(params.iter()) {
+    if let Some(Ty::Fn(fn_ty)) = &method.signature {
+        for (param, sig) in method.params.iter().zip(fn_ty.params.iter()) {
             ctx.local_bindings.insert(param.name.clone(), (*sig.ty).clone());
         }
     }
-    if let Some(enclosing) = &method.enclosing_class {
+    // Not the module a method was written in when it runs in the model: an included or extended module's method
+    // (Devise's `serialize_from_session`) has the model as `self`, and the module answers none of the model's methods.
+    let enclosing = method.enclosing_class.as_ref().filter(|e| model.is_none_or(|m| m.name.0 == **e));
+    if let Some(enclosing) = enclosing {
         ctx.self_ty = Some(Ty::Class {
             id: ClassId(enclosing.clone()),
             args: vec![].into(),
         });
+    } else if let Some(model) = model.filter(|_| method.receiver == MethodReceiver::Instance) {
+        // A `def` from the model's source carries no enclosing class; `self` in it is still the model.
+        ctx.self_ty = Some(Ty::Class { id: model.name.clone(), args: vec![].into() });
+        ctx.instance_body = true;
+    } else if let Some(model) = model.filter(|_| method.receiver == MethodReceiver::Class) {
+        // A source `def self.x`: names resolve in the model's namespace, so
+        // its own constant reads find the model's constants (#1223), and
+        // `self` is the class, as the analyzer types a class body: an
+        // implicit-self call (`tag().upcase`) types against the model's
+        // class methods (#1236).
+        ctx.lexical_self = Some(Ty::Class { id: model.name.clone(), args: vec![].into() });
+        ctx.self_ty = Some(Ty::Class { id: model.name.clone(), args: vec![].into() });
+        ctx.class_side = true;
     }
     // Seed ivar_bindings from schema columns so bare `@title` reads
     // resolve to the column type. Same source the synthesizers used
@@ -2687,26 +3459,37 @@ fn type_method_body(
             }
         }
     }
+    // The model's own constants, as the analyzer seeds them
+    // (`extract_const_assignments`): this pass re-types the body from
+    // scratch, and the read the analyzer qualified to `Widget::WEIGHTS`
+    // otherwise fell back to a phantom `Ty::Class` (#1223), so the
+    // emitters saw no Hash or Array behind it.
+    if let Some(m) = model {
+        ctx.constants = crate::analyze::ConstScope::default().with_own(crate::analyze::extract_const_assignments(&m.body));
+    }
     // Opt-in to `recv: Some(SelfRef)` rewriting on bare Sends —
     // matches the pattern view_to_library uses.
     ctx.annotate_self_dispatch = true;
-    let body_ty = typer.analyze_expr(&mut method.body, &ctx);
+    let mut body_ty = typer.analyze_expr(&mut method.body, &ctx);
+    if crate::lower::enumerable_ext::rewrite_squish_body(&mut method.body) {
+        body_ty = typer.analyze_expr(&mut method.body, &ctx);
+    }
     backfill_scalar_signature(method, body_ty);
 }
 
 /// Backfill a signature for a user-defined method whose body types to a
-/// concrete scalar. User methods carry `signature: None`, so the
+/// concrete scalar or Time. User methods carry `signature: None`, so the
 /// emitted `.rbs` says `-> untyped` even when the body is trivially
 /// typed — and under spinel AOT an untyped return turns every chained
 /// call into a whole-program poly dispatch (lobsters:
 /// `User.username_regex_s[1...-1]` became a 26-class `[]` switch that
-/// doesn't C-compile). Scalars only, and only when the body has no
+/// doesn't C-compile). Scalars and Time only, and only when the body has no
 /// explicit `return` (an early return of another type would make the
 /// trailing-expression type a lie — in Ruby a `return` inside a block
 /// exits the method, so the walk counts those too). If/Case bodies
 /// union their branches, so divergent shapes fail the scalar gate on
 /// their own. Param types stay untyped — this pins only the return.
-/// A scalar, or a scalar unioned with nil — `String?` and friends.
+/// A scalar or Time, optionally unioned with nil — `String?`, `Time?` and friends.
 ///
 /// The nullable arm matters because a `rescue` contributes one: a body
 /// of `uri.to_s … rescue nil` types `Str | Nil`, and refusing to
@@ -2716,7 +3499,7 @@ fn type_method_body(
 /// costs nothing here — widening to `untyped` does.
 fn scalar_or_nullable_scalar(ty: &Ty) -> bool {
     fn is_scalar(t: &Ty) -> bool {
-        matches!(t, Ty::Str | Ty::Int | Ty::Float | Ty::Bool)
+        matches!(t, Ty::Str | Ty::Int | Ty::Float | Ty::Bool | Ty::Time)
     }
     match ty {
         t if is_scalar(t) => true,
@@ -2749,15 +3532,16 @@ fn backfill_scalar_signature(method: &mut MethodDef, body_ty: Ty) {
             kind: p.ty_kind(),
         })
         .collect();
-    method.signature = Some(Ty::Fn {
+    method.signature = Some(Ty::Fn(Box::new(FnTy {
         params,
         block: None,
         ret: std::sync::Arc::new(body_ty),
         effects: crate::effect::EffectSet::default(),
-    });
+    })));
 }
 
-fn contains_return(e: &Expr) -> bool {
+/// Does `e` contain a `return` anywhere, nested blocks included?
+pub(crate) fn contains_return(e: &Expr) -> bool {
     if matches!(&*e.node, ExprNode::Return { .. }) {
         return true;
     }
@@ -2844,6 +3628,9 @@ pub fn ty_of_column(t: &ColumnType) -> Ty {
         // (`lower::has_json`), not as a Hash the whole column decodes to.
         ColumnType::Json | ColumnType::Jsonb => Ty::Str,
         ColumnType::Uuid => Ty::Str,
+        // Whole seconds. The public reader is ActiveSupport::Duration;
+        // this is the storage slot, an integer so order matches the count.
+        ColumnType::Interval => Ty::Int,
         ColumnType::Reference { .. } => Ty::Int,
     }
 }
@@ -2866,19 +3653,36 @@ pub fn ty_of_column(t: &ColumnType) -> Ty {
 /// NOT for the SQL seam — `column_read_method` and the Arel visitor pick
 /// their reader from the underlying column type, which nullability
 /// doesn't change.
+/// An `array: true` column is `Array[<element>]` where the target stores
+/// the Array (`Column::array_stored`, `lower::array_columns`); elsewhere it
+/// stays its element type, the lowered targets' storage, and
+/// `project::report_array_columns` reports it.
 pub fn ty_of_column_slot(col: &Column) -> Ty {
-    let base = ty_of_column(&col.col_type);
-    if (col.nullable || col.generated.is_some()) && !col.primary_key {
+    let mut base = ty_of_column(&col.col_type);
+    if col.array_stored {
+        base = Ty::Array { elem: base.into() };
+    }
+    if (col.nullable || col.generated.is_some() || col.persisted_computed_default().is_some()) && !col.primary_key {
         Ty::Union { variants: vec![base, Ty::Nil].into() }
     } else {
         base
     }
 }
 
+/// What the database row holds for the column: the slot type, except
+/// that a stored array column (`Column::array_stored`) is its JSON text
+/// until the model's hydration writer decodes it.
+pub fn ty_of_column_stored(col: &Column) -> Ty {
+    if col.array_stored {
+        return Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() };
+    }
+    ty_of_column_slot(col)
+}
+
 /// Build a `Ty::Fn` signature from positional (name, type) pairs and a return type.
 /// Effects default to pure — callers refine if needed (lifecycle hooks etc.).
 pub(crate) fn fn_sig(params: Vec<(Symbol, Ty)>, ret: Ty) -> Ty {
-    Ty::Fn {
+    Ty::Fn(Box::new(FnTy {
         params: params
             .into_iter()
             .map(|(name, ty)| crate::ty::Param {
@@ -2890,7 +3694,7 @@ pub(crate) fn fn_sig(params: Vec<(Symbol, Ty)>, ret: Ty) -> Ty {
         block: None,
         ret: std::sync::Arc::new(ret),
         effects: crate::effect::EffectSet::pure(),
-    }
+    }))
 }
 
 pub(super) fn var_ref(name: Symbol) -> Expr {
@@ -2915,15 +3719,61 @@ pub(super) fn is_id_column(name: &Symbol) -> bool {
     s == "id" || s.ends_with("_id")
 }
 
+/// A column held unset for its presence check
+/// (`validations::hold_unset_presence_columns`) has no `@<col>` slot:
+/// a body that reads it (a `belongs_to`'s reader and autosave, a model
+/// method) reads its reader, which answers 0 until it is assigned, as
+/// the slot did before; one that assigns it calls its writer, or unsets
+/// `@<col>_raw` for a nil.
+fn read_held_columns_through_readers(methods: &mut [MethodDef], table: Option<&Table>) {
+    use crate::expr::{Expr, ExprNode, LValue};
+    fn rewrite(expr: &mut Expr, col: &Symbol, storage: &Symbol) {
+        expr.node.for_each_child_mut(&mut |c| rewrite(c, col, storage));
+        match &mut *expr.node {
+            ExprNode::Ivar { name } if name == col => {
+                *expr.node = ExprNode::Send { recv: None, method: col.clone(), args: vec![], block: None, parenthesized: false };
+            }
+            // `@<col> = nil` unsets the slot; any other value goes
+            // through the writer, which fills it (so a strict target's
+            // slot stays nilable however the body's value is typed).
+            ExprNode::Assign { target: LValue::Ivar { name }, value } if name == col => {
+                if matches!(&*value.node, ExprNode::Lit { value: crate::expr::Literal::Nil }) {
+                    *name = storage.clone();
+                } else {
+                    let value = value.clone();
+                    *expr.node = ExprNode::Send {
+                        recv: Some(Expr::new(expr.span, ExprNode::SelfRef)),
+                        method: Symbol::from(format!("{}=", col.as_str())),
+                        args: vec![value],
+                        block: None,
+                        parenthesized: false,
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(table) = table else { return };
+    for col in table.columns.iter().filter(|c| c.unset_until_assigned) {
+        let storage = schema::col_storage_name(col);
+        // Instance methods only: a class method's `@<col>` is the class's own state.
+        for method in methods.iter_mut().filter(|m| m.receiver == MethodReceiver::Instance) {
+            rewrite(&mut method.body, &col.name, &storage);
+        }
+    }
+}
+
 /// The schema columns a class stores that the DB declares nullable —
 /// the `LibraryClass::nullable_columns` payload. Same rule as
-/// `ty_of_column_slot`: nullable, primary key excluded.
+/// `ty_of_column_slot`: nullable, primary key excluded. A column held
+/// unset for its presence check is named by its `<col>_raw` slot, the
+/// nilable field; its reader answers the column's own type.
 pub(crate) fn nullable_column_names(table: Option<&Table>) -> Vec<Symbol> {
     let Some(t) = table else { return Vec::new() };
     t.columns
         .iter()
         .filter(|c| c.nullable && !c.primary_key)
-        .map(|c| c.name.clone())
+        .map(|c| if c.unset_until_assigned { schema::col_storage_name(c) } else { c.name.clone() })
         .collect()
 }
 
@@ -2932,6 +3782,58 @@ mod tests {
     use super::*;
     use std::{collections::HashMap, path::PathBuf};
 
+    /// The held column's `@<col>` reads become reader calls in instance
+    /// methods only; a class method's `@<col>` is the class's own state.
+    #[test]
+    fn held_column_reads_rewrite_in_instance_methods_only() {
+        let method = |receiver| MethodDef {
+            visibility: crate::dialect::MethodVisibility::Public,
+            unsupported_formals: None,
+            has_anonymous_block: false,
+            name_span: Span::synthetic(),
+            name: Symbol::from("cached"),
+            receiver,
+            params: Vec::new(),
+            body: Expr::new(Span::synthetic(), ExprNode::Ivar { name: Symbol::from("quota") }),
+            signature: None,
+            effects: crate::effect::EffectSet::default(),
+            enclosing_class: None,
+            kind: AccessorKind::Method,
+            is_async: false,
+            mutates_self: false,
+            block_param: None,
+        };
+        let table = crate::schema::Table {
+            name: Symbol::from("plans"),
+            columns: vec![crate::schema::Column {
+                name: Symbol::from("quota"),
+                col_type: crate::schema::ColumnType::Integer,
+                nullable: true,
+                default: None,
+                default_expression: None,
+                legacy_default_persistence: false,
+                primary_key: false,
+                generated: None,
+                generated_text_compatible: None,
+                generated_int4_compatible: None,
+                array: false,
+                array_stored: false,
+                unset_until_assigned: true,
+                collated: false,
+            }],
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+            known_keyless: false,
+            primary_key_columns: Vec::new(),
+            virtual_module: None,
+        };
+        let mut methods = vec![method(MethodReceiver::Instance), method(MethodReceiver::Class)];
+        read_held_columns_through_readers(&mut methods, Some(&table));
+        assert!(matches!(&*methods[0].body.node, ExprNode::Send { recv: None, method, .. } if method.as_str() == "quota"), "{:?}", methods[0].body);
+        assert!(matches!(&*methods[1].body.node, ExprNode::Ivar { name } if name.as_str() == "quota"), "{:?}", methods[1].body);
+    }
+
     /// Framework normalization must not replace a same-named application class.
     #[test]
     fn integer_key_cast_registry_keeps_application_constants() {
@@ -2939,7 +3841,7 @@ mod tests {
         let marker = Symbol::from("application_marker");
         let mut application = crate::analyze::ClassInfo::default();
         application.class_methods.insert(marker.clone(), fn_sig(vec![], Ty::Str));
-        let mut classes = HashMap::from([(app_id.clone(), application)]);
+        let mut classes = HashMap::from_iter([(app_id.clone(), application)]);
 
         insert_integer_key_cast_info(&mut classes);
 
@@ -2959,7 +3861,7 @@ mod tests {
             files
                 .into_iter()
                 .map(|(path, text)| (PathBuf::from(path), text.into_bytes()))
-                .collect::<HashMap<_, _>>(),
+                .collect::<crate::vfs::FileTree>(),
         )
         .expect("ingest test app")
     }
@@ -3019,7 +3921,7 @@ mod tests {
             parent.params[0].default.as_mut().unwrap().ty = Some(Ty::Hash {
                 key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Str),
             });
-            let classes = HashMap::from([
+            let classes = HashMap::from_iter([
                 (ClassId(Symbol::from("Article")), article_info(&app, &methods)),
             ]);
             let probe = methods.iter_mut().find(|m| m.name.as_str() == "probe").unwrap();
@@ -3078,7 +3980,7 @@ mod tests {
             evens.body.ty = Some(ty);
             let got = article_info(&app, &methods).class_methods.get(&Symbol::from("evens")).cloned();
             match got {
-                Some(Ty::Fn { ret, .. }) if kept => assert_eq!(*ret, ints),
+                Some(Ty::Fn(fn_ty)) if kept => assert_eq!(*fn_ty.ret, ints),
                 None if !kept => {}
                 other => panic!("unexpected registry entry: {other:?}"),
             }

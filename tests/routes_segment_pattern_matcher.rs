@@ -76,6 +76,20 @@ fn lookahead_constraint_refuses_the_whole_route() {
 }
 
 #[test]
+fn hex_and_newline_escapes_refuse_the_whole_route() {
+    for source in [
+        r#"  get "/t/:token", to: "widgets#show", constraints: { token: /\h{32}/ }"#,
+        r#"  get "/t/:token", to: "widgets#show", constraints: { token: /\n/ }"#,
+    ] {
+        let r = routes(source);
+        assert!(
+            find(&r, HttpMethod::Get, "/t/:token").is_none(),
+            "an alphanumeric escape is not the literal character; the route must be ABSENT: {source}\n{r:?}"
+        );
+    }
+}
+
+#[test]
 fn backreference_constraint_refuses_the_whole_route() {
     let r = routes(
         r#"
@@ -89,10 +103,12 @@ fn backreference_constraint_refuses_the_whole_route() {
     );
 }
 
-/// lobsters' domain routes: a lookahead keeps `example.com` whole while
-/// a trailing `.json`/`.rss` stays the format.
+/// A lookahead without `$`: the param must be followed by `.json` or
+/// `.rss`, a split the router cannot make. With `$` the shape is served
+/// (lazy: `route_format_lookahead`; greedy, lobsters' origins:
+/// `route_dot_span`).
 const LOOKAHEAD_DOMAIN: &str = r#"
-  constraints :id => /([^\/]+?)(?=\.json|\.rss|$|\/)/ do
+  constraints :id => /(.+)(?=\.json|\.rss)/ do
     get "/domains/:id" => "widgets#show", :as => "domain"
   end
 "#;
@@ -163,7 +179,52 @@ raise "refused route must not be served: #{got}" unless got.start_with?("404")
         "{:?}",
         run.errors
     );
-    assert!(run.success, "stdout:\n{}\nstderr:\n{}", run.stdout, run.stderr);
+    assert!(run.program_succeeded(), "the expected errors aside, the emitted program failed in {}\n=== stdout ===\n{}\n=== stderr ===\n{}", run.emitted.display(), run.stdout, run.stderr);
+}
+
+/// lobsters' ORIGINS_IDENTIFIER: the greedy `.+` crosses `/`, so the
+/// param is a span the router matches as a `*glob`, and ending the path it
+/// keeps every extension (`format_suffix` no extension meets).
+#[test]
+fn a_dot_requirement_is_a_span_of_segments() {
+    let r = routes(
+        r#"
+  constraints identifier: /(.+)(?=\.json|\.rss|$|\/)/ do
+    get "/origins/:identifier(.:format)" => "widgets#show"
+    get "/mod/origins/:identifier/edit" => "widgets#edit"
+  end
+"#,
+    );
+    let show = find(&r, HttpMethod::Get, "/origins/:identifier").expect("served");
+    assert_eq!(
+        show.seg_patterns,
+        vec![
+            ("*identifier".to_string(), String::new()),
+            ("format_suffix".to_string(), roundhouse::lower::segment_pattern::NEVER.to_string()),
+        ]
+    );
+    assert_eq!(
+        roundhouse::lower::segment_pattern::dispatch_path(&show.path, &show.seg_patterns),
+        "/origins/*identifier"
+    );
+    let edit = find(&r, HttpMethod::Get, "/mod/origins/:identifier/edit").expect("served");
+    assert_eq!(edit.seg_patterns, vec![("*identifier".to_string(), String::new())]);
+}
+
+/// The forms of a span the router has no split for stay refused: inside
+/// a segment, beside another span, and followed by `/` its lookahead
+/// leaves out.
+#[test]
+fn a_span_the_router_cannot_split_refuses_the_route() {
+    for source in [
+        r#"  get "/@:id", to: "widgets#show", constraints: { id: /.+/ }"#,
+        r#"  get "/x/:id/*rest", to: "widgets#show", constraints: { id: /.+/ }"#,
+        r#"  get "/x/:id/edit", to: "widgets#show", constraints: { id: /(.+)(?=\.json|$)/ }"#,
+        r#"  get "/x/:id", to: "widgets#show", constraints: { id: /(.+?)(?=$|\/)/ }"#,
+    ] {
+        let r = routes(source);
+        assert!(r.is_empty(), "{source}\n{r:?}");
+    }
 }
 
 #[test]
@@ -306,6 +367,100 @@ puts "PASS segment-pattern recognition"
 #[test]
 fn ruby_target_enforces_every_required_segment_pattern_shape() {
     constrained_app().run_ruby(&recognition_script()).assert_passes();
+}
+
+/// Alternation, an exact `{n}` repeat, and a routing redirect that
+/// builds its location from the matched params and the query string.
+/// The shapes are the ones route files write (`(?:ABR|SNB)\d{12}`,
+/// `SEE\d{12}`, `redirect(status: 301) { |params, request| … }`); the
+/// names are not.
+#[test]
+fn ruby_target_serves_alternation_constraints_and_block_redirects() {
+    emit_and_run::empty_app()
+        .write(
+            "db/schema.rb",
+            "ActiveRecord::Schema[8.1].define(version: 1) do\n  create_table \"widgets\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n",
+        )
+        .write(
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\nend\n",
+        )
+        .write(
+            "app/controllers/widgets_controller.rb",
+            r#"
+class WidgetsController < ApplicationController
+  def code
+    render plain: "code:#{params[:code]}"
+  end
+
+  def unit
+    render plain: "unit:#{params[:code]}"
+  end
+
+  def show
+    render plain: "show:#{params[:id]}"
+  end
+end
+"#,
+        )
+        .write(
+            "config/routes.rb",
+            r##"
+Rails.application.routes.draw do
+  get "/codes/:code", to: "widgets#code", constraints: { code: /(?:ABR|SNB)\d{12}/ }
+  get "/units/:code", to: "widgets#unit", constraints: { code: /SEE\d{12}/ }
+  get "/old/:id", to: redirect("/units/%{id}"), constraints: { id: /\d+/ }
+  get "/moved/:id", to: redirect(status: :found) { |params, request|
+    query = request.query_string
+    base = "/widgets/#{params[:id]}"
+    query.empty? ? base : "#{base}?#{query}"
+  }
+  get "/widgets/:id", to: "widgets#show"
+end
+"##,
+        )
+        .run_ruby(
+            r#"
+require "stringio"
+
+def req(path, query = "")
+  result = Main.run_rack("REQUEST_METHOD" => "GET", "PATH_INFO" => path, "QUERY_STRING" => query, "rack.input" => StringIO.new(""))
+  status = result[0]
+  location = result[1]["location"].to_s
+  body = result[2].join
+  status.to_s + "|" + location + "|" + body
+end
+
+got = req("/codes/ABR123456789012")
+raise "ABR: #{got}" unless got == "200||code:ABR123456789012"
+got = req("/codes/SNB123456789012")
+raise "SNB: #{got}" unless got == "200||code:SNB123456789012"
+got = req("/codes/SEE123456789012")
+raise "SEE is not an ABR/SNB code: #{got}" unless got.start_with?("404")
+got = req("/codes/ABR123")
+raise "short code: #{got}" unless got.start_with?("404")
+
+got = req("/units/SEE123456789012")
+raise "SEE: #{got}" unless got == "200||unit:SEE123456789012"
+got = req("/units/SEE12345678901")
+raise "eleven digits: #{got}" unless got.start_with?("404")
+got = req("/units/ABR123456789012")
+raise "ABR is not SEE: #{got}" unless got.start_with?("404")
+
+got = req("/old/15")
+raise "digit redirect: #{got}" unless got.start_with?("301|/units/15|")
+got = req("/old/abc")
+raise "non-digit redirect must not be served: #{got}" unless got.start_with?("404")
+
+got = req("/moved/9")
+raise "block redirect: #{got}" unless got.start_with?("302|/widgets/9|")
+got = req("/moved/9", "page=2")
+raise "block redirect keeps the query: #{got}" unless got.start_with?("302|/widgets/9?page=2|")
+
+puts "PASS alternation and redirects"
+"#,
+        )
+        .assert_passes();
 }
 
 // The Spinel side of this recognition suite lives in its own file,

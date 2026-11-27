@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # ActiveSupport::Duration for the spinel (AOT) tree.
 #
 # The value class HALF of the CRuby overlay's
@@ -28,6 +29,10 @@ module ActiveSupport
 
     def initialize(seconds)
       @seconds = seconds
+    end
+
+    def self.time_operand(value)
+      value.is_a?(Duration) ? value.seconds : value
     end
 
     def self.seconds(n)
@@ -152,6 +157,10 @@ module ActiveSupport
       @seconds
     end
 
+    def value
+      @seconds
+    end
+
     # Rails parity, the overlay's rule: a Duration IS its seconds count
     # for equality, so `assert_equal 1.year, response.cache_control
     # [:max_age].to_i` (campfire's QR code test) holds against an
@@ -169,6 +178,10 @@ module ActiveSupport
     # method on this lane.
     def <=>(other)
       @seconds <=> (other.is_a?(Duration) ? other.seconds : other)
+    end
+
+    def coerce(other)
+      [other, @seconds]
     end
 
     def <(other)

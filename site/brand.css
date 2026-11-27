@@ -1,0 +1,82 @@
+/* Roundhouse brand tokens. Pages read their colours from here; change a value here to restyle them.
+   Direction: prismatic colour on black. One light in (Rails), a spectrum out (the targets).
+   Hues share one lightness and chroma in OKLCH, so no colour shouts over another.
+   Grown from the earlier palette in style.css and the colours of logo-on-dark.svg. */
+:root {
+  /* Surfaces: near-black with a trace of cool, darkest to lightest */
+  --rh-bg-deep: oklch(11% 0.006 270);
+  --rh-bg: oklch(13.5% 0.008 270);
+  --rh-surface: oklch(17% 0.010 270);
+  --rh-surface-2: oklch(20.5% 0.012 270);
+  --rh-surface-3: oklch(24% 0.014 270);
+
+  /* Lines */
+  --rh-line: oklch(26% 0.012 270);
+  --rh-line-strong: oklch(34% 0.016 270);
+
+  /* Text, faintest to brightest */
+  --rh-text-faint: oklch(50% 0.020 270);
+  --rh-text-dim: oklch(60% 0.020 270);
+  --rh-text-soft: oklch(66% 0.020 270);
+  --rh-text-muted: oklch(73% 0.018 270);
+  --rh-text-2: oklch(82% 0.015 270);
+  --rh-text: oklch(90% 0.012 270);
+  --rh-heading: oklch(97% 0.006 270);
+
+  /* The prism: one lightness and chroma, eight hues */
+  --rh-prism-red: oklch(72% 0.165 15);
+  --rh-prism-orange: oklch(78% 0.140 55);
+  --rh-prism-yellow: oklch(86% 0.130 95);
+  --rh-prism-green: oklch(80% 0.140 150);
+  --rh-prism-cyan: oklch(80% 0.110 200);
+  --rh-prism-blue: oklch(72% 0.130 255);
+  --rh-prism-violet: oklch(72% 0.150 295);
+  --rh-prism-magenta: oklch(74% 0.150 340);
+
+  /* Crab: the orange of the illustration's crab (sampled #e38342), lifted slightly; near the logo's turntable hub */
+  --rh-crab: oklch(73% 0.150 50);
+
+  /* Accent: buttons, links, the headline's second line */
+  --rh-accent: var(--rh-crab);
+  --rh-accent-ink: var(--rh-bg-deep);
+
+  /* Action: the primary button. White light; the prism is what comes out. */
+  --rh-action: var(--rh-heading);
+  --rh-action-hover: oklch(87% 0.012 270);
+  /* Shimmer on the primary button: how much white veils the prism (100% = none). */
+  --rh-shimmer-veil: 92%;
+  --rh-shimmer-veil-hover: 86%;
+  --rh-prism-loop: linear-gradient(100deg, var(--rh-prism-red), var(--rh-prism-orange), var(--rh-prism-yellow), var(--rh-prism-green), var(--rh-prism-cyan), var(--rh-prism-blue), var(--rh-prism-violet), var(--rh-prism-magenta), var(--rh-prism-red));
+  --rh-action-ink: var(--rh-bg-deep);
+
+  /* The four demo apps */
+  --rh-blog: var(--rh-prism-red);
+  --rh-lobsters: var(--rh-prism-orange);
+  --rh-campfire: var(--rh-prism-cyan);
+  --rh-mastodon: var(--rh-prism-violet);
+
+  /* Target languages: the board walks the spectrum, 36° apart, in board order */
+  --rh-lang-ruby: oklch(78% 0.13 18);
+  --rh-lang-rust: oklch(78% 0.13 54);
+  --rh-lang-go: oklch(78% 0.13 90);
+  --rh-lang-typescript: oklch(78% 0.13 126);
+  --rh-lang-elixir: oklch(78% 0.13 162);
+  --rh-lang-crystal: oklch(78% 0.13 198);
+  --rh-lang-python: oklch(78% 0.13 234);
+  --rh-lang-csharp: oklch(78% 0.13 270);
+  --rh-lang-kotlin: oklch(78% 0.13 306);
+  --rh-lang-swift: oklch(78% 0.13 342);
+
+  /* Secondary hues for small accents (section eyebrows, feature blocks) */
+  --rh-magenta: var(--rh-prism-violet);
+  --rh-teal: var(--rh-prism-cyan);
+
+  /* Station signage (an Underground homage, in brand colours) */
+  --rh-sign-ink: oklch(98% 0.005 262);
+  --rh-sign-ring: var(--rh-prism-red); /* echoes the illustration's red rails */
+  --rh-font-sign: "Gill Sans", "Gill Sans MT", Calibri, "Segoe UI", sans-serif;
+
+  /* Compile route lines */
+  --rh-line-roundhouse: var(--rh-accent);
+  --rh-line-spinel: var(--rh-prism-violet);
+}

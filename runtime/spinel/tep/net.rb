@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # All FFI plumbing lives at the top level so spinel's name resolver
 # finds it from anywhere in the Tep tree (nested modules confuse it).
 #
@@ -19,6 +20,7 @@ module Sock
   ffi_func :sp_net_listen,                [:int, :int],       :int
   ffi_func :sp_net_accept,                [:int],             :int
   ffi_func :sp_net_accept_nb,             [:int],             :int
+  ffi_func :sp_net_peer_ip,               [:int],             :str
   ffi_func :sp_net_set_nonblock,          [:int],             :int
   ffi_func :sp_net_close,                 [:int],             :int
   ffi_func :sp_net_write_str,             [:int, :str],       :int
@@ -38,6 +40,7 @@ module Sock
   ffi_func :sp_net_poll_ready,            [:int],             :int
   ffi_func :sp_net_shell_capture,         [:str, :int],       :binstr
   ffi_func :sp_net_listen_host,           [:str, :int, :int], :int
+  ffi_func :sp_net_unix_listen,           [:str, :int],       :int
 
   # Delegators: keep the existing `Sock.sphttp_*` call sites unchanged
   # while routing them through sp_net (Stage 1 of retiring sphttp.c).
@@ -106,10 +109,10 @@ end
       while out.bytesize < n
         # Match the other two drains' per-read deadline. EOF or timeout
         # discards this incomplete drain; Request checks the byte count.
-        if io.wait_readable(5).nil?
+        if io.wait_readable(Tep::BODY_READ_TIMEOUT).nil?
           return ""
         end
-        chunk = Sock.sp_net_recv_some(fd, n - out.bytesize)
+        chunk = Sock.sp_net_recv_some(fd, n - out.bytesize).b
         if chunk.bytesize == 0
           return ""
         end
@@ -184,4 +187,11 @@ module Crypto
   # derivation; do NOT use it for anything else (collision-broken).
   ffi_func :sp_crypto_sha1_hex,             [:str],             :str
   ffi_func :sp_crypto_websocket_accept,     [:str],             :str
+end
+
+# shutdown wakes a parked receiver without releasing its fd number. The
+# threaded server remains the only owner that closes the descriptor.
+module TepSocketControl
+  ffi_lib "c"
+  ffi_func :shutdown, [:int, :int], :int
 end

@@ -1,9 +1,11 @@
+# frozen_string_literal: true
+require "time"
+require_relative "active_support_interval"
 # Spinel-subset temporal intrinsics: ActiveSupport.parse_db_time /
 # db_now. Sibling of the CRuby/JRuby overlay's
 # ruby_overlay/runtime/active_support_time_parsing.rb, which shadows
 # this file on those trees (dedupe last-wins) with the stdlib-backed
-# implementation. This one avoids everything spinel's Time lacks —
-# no `require "time"`, no `Time.parse`, no `usec` reader.
+# implementation.
 #
 # The synthesized temporal-column readers call `parse_db_time`
 # (apply_datetime_lowering runs on the spinel-shape emit too) and
@@ -22,27 +24,6 @@
 module ActiveSupport
   # Date-only parse/format live in `active_support_date_parsing.rb`,
   # loaded only when `app_uses_date` (matz/spinel#7334).
-
-  # Rails zone name → IANA identifier. TWIN of the constant in the
-  # CRuby/JRuby overlay's sibling file, which shadows this whole file on
-  # those trees — the two must agree, so extend both together. Names not
-  # listed pass through unchanged, since a valid IANA string works as-is
-  # in TZ. Consumed by main.rb's boot-time ENV["TZ"] pin.
-  RAILS_TZ_TO_IANA = {
-    "UTC" => "UTC",
-    "Eastern Time (US & Canada)" => "America/New_York",
-    "Central Time (US & Canada)" => "America/Chicago",
-    "Mountain Time (US & Canada)" => "America/Denver",
-    "Pacific Time (US & Canada)" => "America/Los_Angeles",
-    "Arizona" => "America/Phoenix",
-    "Hawaii" => "Pacific/Honolulu",
-    "Alaska" => "America/Anchorage",
-    "London" => "Europe/London",
-    "Paris" => "Europe/Paris",
-    "Berlin" => "Europe/Berlin",
-    "Tokyo" => "Asia/Tokyo",
-    "Sydney" => "Australia/Sydney",
-  }.freeze
 
   # ---- THE TEST CLOCK ------------------------------------------------
   #
@@ -85,8 +66,8 @@ module ActiveSupport
     FROZEN_AT << 0
   end
 
-  # Stop the clock at `seconds` (the harness's `freeze_time`).
-  def self.freeze(seconds)
+  # Stop the clock at `seconds` (the harness's `freeze_time`). Not `freeze`: that is Module#freeze, which a gem calls on any class value.
+  def self.freeze_clock(seconds)
     FROZEN_AT.clear
     FROZEN_AT << seconds
   end
@@ -103,8 +84,9 @@ module ActiveSupport
 
   # Hydrate the stored UTC instant, then land it in the app's zone —
   # Rails presents every AR temporal value in `config.time_zone`
-  # REGARDLESS of the host's zone, and main.rb has pinned ENV["TZ"] to
-  # that zone before any render, so `getlocal` resolves against it.
+  # REGARDLESS of the host's zone; `ActiveSupport.present` lands it in
+  # that zone, which the boot sets as the runtime's default
+  # (`ActiveSupport.set_default_zone`).
   # Doing the shift HERE rather than at each render site is what makes
   # strftime, iso8601 and pubDate agree without every call site knowing
   # about zones — the same seam the CRuby overlay's twin uses.
@@ -124,15 +106,13 @@ module ActiveSupport
     # Fixed-position slicing with a digit walk, same no-regex rationale
     # as the fields above; digits beyond micros are ignored, a
     # non-digit ends the read (so a legacy "…16Z" contributes nothing).
-    # Plain reassignment, not `+=` — spinel has no operator-assignment
-    # node for locals (LocalVariableOperatorWriteNode is refused).
     micros = 0
     if str.length > 20 && str[19, 1] == "."
       digits = 0
       while digits < 6
         c = str[20 + digits, 1]
         break if c.nil? || c.empty? || c < "0" || c > "9"
-        digits = digits + 1
+        digits += 1
       end
       if digits > 0
         micros = "#{str[20, digits]}000000"[0, 6].to_i
@@ -166,7 +146,8 @@ module ActiveSupport
   #
   # `parse_db_time` above now lands the instant in the app's zone, so
   # the offset is the receiver's own — NOT a hardcoded "+00:00", which
-  # would label local clock fields as UTC and be wrong by the offset.
+  # would label local clock fields as UTC and be wrong by the offset —
+  # and `Z` for the UTC zone, as `xmlschema` writes it (`time_json`).
   # The milliseconds are `usec / 1000`, formatted apart: strftime here
   # has no millisecond directive, and xmlschema(3) TRUNCATES (.027418 →
   # .027), which integer division does too. A monomorphized `as_json`
@@ -175,41 +156,7 @@ module ActiveSupport
   def self.json_time(str)
     t = parse_db_time(str)
     return nil if t.nil?
-    t.strftime("%Y-%m-%dT%H:%M:%S") + format(".%03d", t.usec / 1000) + t.strftime("%:z")
-  end
-
-  # RFC 2822 date, the shape stdlib `time` gives `Time#rfc2822` — which
-  # spinel has no `time` package to provide and which cannot be added by
-  # reopening `Time` (a reopened built-in loses its own method table for
-  # self-calls). Composed from strftime instead, whose `%a`/`%b` are the
-  # English abbreviations RFC 2822 requires on every locale.
-  #
-  # The zone tail is the receiver's own offset, via `%z`.
-  #
-  # NOT stdlib's `utc? ? "-0000" : <offset>` conditional, for two
-  # reasons. Reachability: every value that gets here came from
-  # `parse_db_time`, which ends in `.getlocal`, so the receiver is always
-  # the host-local kind and `utc?` is always false — including when the
-  # app declares no `config.time_zone` and the pin lands on "UTC", where
-  # a local-kind Time at offset 0 renders "+0000" and stdlib agrees.
-  # Typing: `utc?` is not reachable on this receiver anyway — the RBS
-  # types the parameter `Time?`, and calling it raises NoMethodError at
-  # runtime on the boxed value (measured: /rss 500s).
-  #
-  # The divergence this leaves is a caller handing us a true `Time.utc`,
-  # which would render "+0000" where stdlib renders "-0000". No such
-  # caller exists; the RSS feed reads `story.created_at`.
-  #
-  # This used to be a hardcoded "-0000" on the belief that spinel's Time
-  # had no zone model to branch on. It does — `utc?`, `zone`,
-  # `utc_offset` and `getlocal` all exist, and sp_Time carries a 3-state
-  # zone kind, added 2026-07 in matz/spinel 1a7c3597 + fb6e6685. The last
-  # real blocker was that strftime and iso8601 rendered UTC clock fields
-  # for a fixed-offset Time, so `getlocal` output could not be trusted;
-  # fixed by matz/spinel#3492, merged 2026-08-01 as 53feb9df.
-  def self.rfc2822(t)
-    return nil if t.nil?
-    t.strftime("%a, %d %b %Y %H:%M:%S %z")
+    ActiveSupport::JSON.time_json(t)
   end
 
   # Normalize a temporal-writer value into the canonical storage form.
@@ -289,5 +236,39 @@ module ActiveSupport
     offset = -offset if digits[0] == "-"
     shifted = t - offset
     in_zone ? ActiveSupport.present(shifted) : shifted.getlocal(offset)
+  end
+
+  # ActiveModel::Type::DateTime#cast, for an `attribute :x, :datetime` writer.
+  # A subset of the strings Rails reads (ISO 8601 date, optional time, a zone only after seconds); any other string raises rather than read as a different instant.
+  def self.cast_datetime(value)
+    return nil if value.nil?
+    return value if value.is_a?(Time)
+    raise TypeError, "can't cast #{value.class} to a datetime" unless value.is_a?(String)
+    return nil if value.empty?
+    m = /\A(\d{4})-(\d\d)-(\d\d)(?:[T ](\d\d):(\d\d)(?::(\d\d)(?:\.(\d{1,6}))?(Z|[-+]\d\d:?\d\d)?)?)?\z/.match(value)
+    raise ArgumentError, "unsupported datetime format: #{value.inspect}" if m.nil?
+    year = m[1].to_i
+    mon = m[2].to_i
+    mday = m[3].to_i
+    hour = m[4] ? m[4].to_i : 0
+    min = m[5] ? m[5].to_i : 0
+    sec = m[6] ? m[6].to_i : 0
+    usec = m[7] ? "#{m[7]}000000"[0, 6].to_i : 0
+    raise ArgumentError, "unsupported datetime format: #{value.inspect}" if mon < 1 || mon > 12
+    days = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][mon - 1]
+    days = 29 if mon == 2 && year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+    raise ArgumentError, "unsupported datetime format: #{value.inspect}" if mday < 1 || mday > days || hour > 23 || min > 59 || sec > 59
+    zone = m[8]
+    # Rails' `is_utc?` is `Time.zone_default.name == "UTC"`. `GMT`, `Etc/UTC`, `Etc/GMT`, and `Etc/UCT` are not that name, so they take `Time.local` (the host zone). Boot does not pin `ENV["TZ"]`.
+    if zone.nil?
+      return Time.utc(year, mon, mday, hour, min, sec, usec) if Rails.application.config_time_zone == "UTC"
+      return Time.local(year, mon, mday, hour, min, sec, usec)
+    end
+    t = Time.utc(year, mon, mday, hour, min, sec, usec)
+    return t if zone == "Z"
+    digits = zone.delete(":")
+    offset = digits[1, 2].to_i * 3600 + digits[3, 2].to_i * 60
+    offset = -offset if digits[0] == "-"
+    (t - offset).getlocal(offset)
   end
 end

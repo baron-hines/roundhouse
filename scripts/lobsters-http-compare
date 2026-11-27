@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# scripts/lobsters-http-compare — replay the same steps over HTTP against two
+# running lobsters servers and compare what a browser would see.
+#
+#   scripts/lobsters-http-compare REF_URL CAND_URL [--out DIR] [replay options]
+#
+# REF_URL is the reference (the real Rails app, or another emit lane);
+# CAND_URL the server under test (e.g. the Spinel binary). Both must serve
+# the same data and accept the same login. Every option after the two URLs
+# except --out goes to scripts/lobsters-http-replay (--email, --password,
+# --steps, --no-login, …). Bodies land in DIR/ref and DIR/cand (default
+# ./lobsters-http-compare), and scripts/lobsters-content-diff compares them;
+# its report and exit code are this script's. Both replays send the same
+# Host (default localhost; pass --host to change it), so absolute URLs
+# agree.
+#
+# Before the content diff it lists the steps whose status or redirect
+# Location differ (those are not counted in its exit code).
+#
+# The records a replay creates get random ids on each server; before
+# comparing, lobsters-http-align-ids rewrites the candidate's dump with the
+# reference's ids (NO_ALIGN=1 skips it).
+#
+# A local tool: start both servers yourself first.
+set -euo pipefail
+here="$(cd "$(dirname "$0")" && pwd)"
+[[ $# -ge 2 ]] || { sed -n '2,24p' "$0"; exit 2; }
+ref="$1"; cand="$2"; shift 2
+out="lobsters-http-compare"
+pass=()
+host="localhost"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --out) out="$2"; shift 2 ;;
+    --host) host="$2"; shift 2 ;;
+    *) pass+=("$1"); shift ;;
+  esac
+done
+rm -rf "$out/ref" "$out/cand"
+echo "== reference: $ref" >&2
+"$here/lobsters-http-replay" --base "$ref" --dump "$out/ref" --host "$host" --quiet ${pass[@]+"${pass[@]}"} || true
+echo "== candidate: $cand" >&2
+"$here/lobsters-http-replay" --base "$cand" --dump "$out/cand" --host "$host" ${pass[@]+"${pass[@]}"} || true
+for side in ref cand; do
+  [[ -f "$out/$side/_status.json" ]] || { echo "lobsters-http-compare: the $side replay wrote nothing (see above)" >&2; exit 2; }
+done
+if [[ -z "${NO_ALIGN:-}" ]]; then
+  echo "== aligning created ids" >&2
+  "$here/lobsters-http-align-ids" "$out/ref" "$out/cand"
+fi
+echo "== status and redirects" >&2
+ruby -rjson -e '
+  ref, cand = ARGV.map { |d| [JSON.parse(File.read("#{d}/_status.json")), JSON.parse(File.read("#{d}/_location.json"))] }
+  same = ->(k) { ref[0][k] == cand[0][k] && ref[1][k] == cand[1][k] }
+  (ref[0].keys | cand[0].keys).reject(&same).each { |k| warn format("  %-32s ref %s %s  cand %s %s", k, ref[0][k], ref[1][k], cand[0][k], cand[1][k]) }
+  warn "  #{ref[0].keys.count(&same)}/#{ref[0].size} steps answer the same status (and Location)"
+' "$out/ref" "$out/cand"
+echo "== content" >&2
+exec "$here/lobsters-content-diff" "$out/ref" "$out/cand" --md "$out/report.md" --json "$out/report.json"

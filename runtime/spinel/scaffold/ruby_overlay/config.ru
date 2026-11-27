@@ -14,6 +14,7 @@ require "rack"
 require_relative "main"
 require_relative "cable"
 require_relative "runtime/gzip_cache"
+require_relative "runtime/thruster_cache"
 
 Main.configure_default_adapter!
 
@@ -39,33 +40,54 @@ Db.checkpoint_in_background!
 # thread in each serving process instead of running it inside the
 # request (ActiveJob.drain_in_background!).
 ActiveJob.drain_in_background!
+# Under queue_adapter :sidekiq jobs go to Redis instead; say where.
+SidekiqPush.announce if JobRegistry.sidekiq?
 
 # Register the Cable registry as the broadcasts transport: every
 # `Broadcasts.record` call from model callbacks now also fans out
 # the rendered `<turbo-stream>` to every WS connection subscribed
-# to that stream name.
-Broadcasts.set_transport(Cable::Registry)
+# to that stream name. Under config/cable.yml's `adapter: redis` (a tree
+# on :sidekiq), every broadcast goes through Redis instead, and comes back
+# to these sockets through the subscriber runtime/redis_cable.rb starts.
+Broadcasts.set_transport(RedisCable.enabled? ? RedisCable::Transport.new : Cable::Registry)
+
+# Thruster's response cache, in process (runtime/thruster_cache.rb says
+# why). Outermost, so a stored stylesheet or avatar is answered before
+# the static file server or the app is reached, as Thruster answers
+# before Puma.
+use ThrusterCache::Middleware
 
 # Static asset serving — `rake assets` lays files out under
 # `static/assets/*` (CSS + JS) plus root-level icons. Rack::Static
 # intercepts those URLs before the Rack adapter dispatches to
 # Main.run_rack. Anything else falls through to the dynamic Router.
-use Rack::Static, urls: ["/assets", "/icon.png", "/icon.svg"], root: "static"
-# Rails' ActionDispatch::Static: a GET/HEAD for a file that exists under
-# public/ (robots.txt, the error pages) is served ahead of the routes.
+#
+# Both carry `config.public_file_server.headers`, as ActionDispatch::Static
+# does: campfire's production `Cache-Control: public, max-age=2592000`,
+# without which no browser — and no cache in front of the app — keeps a
+# stylesheet. Lowercased because Rack 3 requires lowercase response
+# header names.
+STATIC_HEADERS = Rails.application.public_file_server_headers
+  .to_h { |name, value| [name.downcase, value] }.freeze
+use Rack::Static, urls: ["/assets", "/icon.png", "/icon.svg"], root: "static",
+    header_rules: STATIC_HEADERS.empty? ? [] : [[:all, STATIC_HEADERS]]
+# Rails' ActionDispatch::Static: a GET/HEAD for a file under public/
+# (robots.txt, the error pages, a page `caches_page` wrote) is served ahead
+# of the routes, by FileHandler's lookup (runtime/public_files.rb: listed
+# once, then kept as the page cache writes and expires).
 # Not `Rack::Static, urls: [""], cascade: true`: Rack::Files answers a
 # POST with 405, which does not cascade, and every form post died there.
-PUBLIC_FILES = Rack::Files.new("public")
+PUBLIC_FILES = Rack::Files.new("public", STATIC_HEADERS)
 use(Class.new do
   def initialize(app) = @app = app
 
   def call(env)
-    path = env["PATH_INFO"].to_s
-    if %w[GET HEAD].include?(env["REQUEST_METHOD"]) && !path.include?("..") &&
-       File.file?(File.join("public", path))
-      PUBLIC_FILES.call(env)
-    else
+    method = env["REQUEST_METHOD"]
+    file = method == "GET" || method == "HEAD" ? ActionController::PublicFiles.lookup(env["PATH_INFO"].to_s) : ""
+    if file.empty?
       @app.call(env)
+    else
+      PUBLIC_FILES.call(env.merge("PATH_INFO" => ActionDispatch::Router.escape_path(file)))
     end
   end
 end)
@@ -105,10 +127,9 @@ app = lambda do |env|
   if env["PATH_INFO"] == "/cable"
     unless ActionController::RequestForgeryProtection.cable_origin_allowed?(
         env["HTTP_ORIGIN"].to_s,
-        ActionController::RequestForgeryProtection.base_url_for(
+        ActionController::RequestForgeryProtection.host_origin_for(
           env["HTTP_HOST"].to_s, env["HTTPS"].to_s, env["HTTP_X_FORWARDED_PROTO"].to_s,
-          env["rack.url_scheme"].to_s),
-        Rails.env.development?)
+          env["rack.url_scheme"].to_s))
       return [404, { "content-type" => "text/plain" }, ["Page not found"]]
     end
     if Db.with_connection { Cable.upgrade(env) }

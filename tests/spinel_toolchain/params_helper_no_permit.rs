@@ -13,7 +13,6 @@
 //! hand against the issue's exact repro before writing this test.
 
 use super::{emit_and_run, native_http};
-use roundhouse::project::BuildTarget;
 
 fn widgets() -> emit_and_run::Overlay {
     emit_and_run::real_blog()
@@ -69,10 +68,8 @@ end
 #[test]
 #[ignore = "requires Spinel; run in its CI lane"]
 fn a_no_permit_guard_filter_builds_and_runs_on_spinel() {
-    let (tree, errors) = widgets().emit(BuildTarget::Spinel);
-    assert!(errors.is_empty(), "analysis/emission errors:\n{}", errors.join("\n"));
-
-    native_http::build(&tree);
+    // Not a build of its own: the bare-permit controller (`emit_and_run/bare_permit.rs`) rides this one.
+    let tree = super::bare_permit_contract::apply(widgets()).native_http_tree();
     let server = native_http::Server::start(&tree);
 
     let allowed = server.get("/widgets/1?kind=small");
@@ -80,4 +77,22 @@ fn a_no_permit_guard_filter_builds_and_runs_on_spinel() {
 
     let refused = server.get("/widgets/1?kind=bogus");
     assert_eq!(refused.status, 404, "disallowed kind: {} {}", refused.status, refused.body);
+
+    let full = server.get(super::bare_permit_contract::QUERY);
+    assert_eq!(full.status, 200, "{}", full.body);
+    assert!(full.body.contains("<p id=\"q\">&lt;rails&gt;</p>"), "{}", full.body);
+    assert!(full.body.contains("<p id=\"other\">one</p>"), "{}", full.body);
+    assert!(full.body.contains("<p id=\"log\">Alice|1||2|0</p>"), "{}", full.body);
+    assert!(full.body.contains("href=\"/finds/page/2?q=rails\""), "{}", full.body);
+    assert!(full.body.contains("href=\"/finds/page/3?q=rails\""), "{}", full.body);
+    assert!(full.body.contains("href=\"/finds/page/4?q=rails\""), "{}", full.body);
+    let pager = server.get("/finds/pager?q=rails");
+    assert_eq!(pager.status, 200, "{}", pager.body);
+    assert!(pager.body.contains("href=\"/finds/pager?page=3&amp;q=rails\""), "{}", pager.body);
+    let helper = server.get("/finds/helper_pager?q=rails");
+    assert_eq!(helper.status, 200, "{}", helper.body);
+    assert!(helper.body.contains("href=\"/finds/helper_pager?page=3&amp;q=rails\""), "{}", helper.body);
+    let bare = server.get("/finds");
+    assert_eq!(bare.status, 200, "{}", bare.body);
+    assert!(bare.body.contains("<p id=\"log\">(All)|||1|0</p>"), "{}", bare.body);
 }

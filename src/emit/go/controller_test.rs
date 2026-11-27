@@ -28,6 +28,7 @@ pub(super) struct GoTestCtx<'a> {
 
 pub(super) fn emit_go_controller_test_body(
     test: &Test,
+    setup: Option<&Expr>,
     app: &App,
     ctx: &GoTestCtx,
 ) -> String {
@@ -37,6 +38,10 @@ pub(super) fn emit_go_controller_test_body(
     // `@article` → `article := ArticlesOne()`.
     let walked = crate::lower::walk_controller_ivars(&test.body);
     for ivar in walked.ivars_read_without_assign() {
+        if let Some((fixture, label)) = setup.and_then(|s| crate::lower::setup_fixture(s, &ivar, ctx.fixture_names)) {
+            out.push_str(&format!("{} := {}{}()\n", ivar.as_str(), crate::naming::camelize(fixture.as_str()), go_field_name(&label)));
+            continue;
+        }
         let plural = crate::naming::pluralize_snake(ivar.as_str());
         if ctx.fixture_names.iter().any(|s| s.as_str() == plural) {
             out.push_str(&format!(
@@ -58,6 +63,11 @@ pub(super) fn emit_go_controller_test_body(
         out.push('\n');
     }
     out
+}
+
+/// `response`, the request's `resp`.
+fn is_response(e: &Expr) -> bool {
+    matches!(&*e.node, ExprNode::Send { recv: None, method, args, .. } if method.as_str() == "response" && args.is_empty())
 }
 
 fn emit_go_ctrl_test_stmt(stmt: &Expr, app: &App, ctx: &GoTestCtx) -> String {
@@ -143,8 +153,10 @@ fn emit_go_ctrl_test_send(
         }
         Some(ControllerTestSend::AssertResponse { sym }) => match sym.as_str() {
             "success" => "resp.AssertOk()".to_string(),
-            "unprocessable_entity" | "unprocessable_content" => "resp.AssertUnprocessable()".to_string(),
-            other => format!("resp.AssertStatus(200) // TODO: {other:?}"),
+            other => match crate::lower::controller_test::asserted_status_code(other) {
+                Some(code) => format!("resp.AssertStatus({code})"),
+                None => crate::emit::diagnostics::report_unsupported(crate::span::Span::synthetic(), "go2", "assert_response", format!("`:{other}` names no single status")),
+            },
         },
         Some(ControllerTestSend::AssertRedirectedTo { url }) => {
             let u = emit_go_url_expr(url, app, ctx);
@@ -208,10 +220,7 @@ fn emit_go_assert_select_classified(
     let ExprNode::Lit { value: Literal::Str { value: selector } } =
         &*selector_expr.node
     else {
-        return format!(
-            "resp.AssertSelect({}) // TODO: dynamic selector",
-            emit_go_ctrl_test_expr(selector_expr, app, ctx),
-        );
+        return crate::emit::diagnostics::report_unsupported(selector_expr.span, "go2", "assert_select", "a selector computed when the test runs");
     };
     match kind {
         AssertSelectKind::Text(expr) => {
@@ -302,6 +311,10 @@ fn emit_go_ctrl_test_expr(expr: &Expr, app: &App, ctx: &GoTestCtx) -> String {
                     return format!("{class}Count()");
                 }
             }
+            // Not `DerefString`: a response's body is a plain string, not a nullable column.
+            if args.is_empty() && is_response(r) {
+                return format!("resp.{}", go_field_name(m));
+            }
             if args.is_empty() {
                 let recv_s = match &*r.node {
                     ExprNode::Ivar { name } | ExprNode::Var { name, .. } => {
@@ -336,7 +349,21 @@ fn emit_go_ctrl_test_expr(expr: &Expr, app: &App, ctx: &GoTestCtx) -> String {
                 format!("{method}({})", args_s.join(", "))
             }
         }
-        _ => "nil /* TODO expr */".to_string(),
+        ExprNode::StringInterp { parts } => {
+            let mut format = String::new();
+            let mut values = Vec::new();
+            for part in parts {
+                match part {
+                    crate::expr::InterpPart::Text { value } => format.push_str(&value.replace('%', "%%")),
+                    crate::expr::InterpPart::Expr { expr } => {
+                        format.push_str("%v");
+                        values.push(emit_go_ctrl_test_expr(expr, app, ctx));
+                    }
+                }
+            }
+            format!("fmt.Sprintf({format:?}, {})", values.join(", "))
+        }
+        other => crate::emit::diagnostics::report_unsupported(expr.span, "go2", other.kind_str(), "in a controller test"),
     }
 }
 

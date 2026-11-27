@@ -57,17 +57,17 @@ const RECORD: &str = "record";
 pub struct Registry {
     /// Methods that mutate `record` and return it (no value return) —
     /// a self-call statement `m` becomes `record = m(record)`.
-    pub record_returning: std::collections::HashSet<String>,
+    pub record_returning: crate::det::HashSet<String>,
     /// Mutate-AND-return-value methods (`save`/`valid?`) DEFINED in this
     /// class that emit a `{record, value}` tuple — a self-call
     /// destructures the tuple (`{record, ok} = m(record)`).
-    pub dual_return: std::collections::HashSet<String>,
+    pub dual_return: crate::det::HashSet<String>,
     /// Dual methods defined in OTHER classes that this class CALLS on a
     /// typed field/local (a controller's `@article.save`/`.update`). Used
     /// only to destructure those call sites — NOT to classify a same-named
     /// method defined here (the controller's own `update` action is not
     /// dual just because the model's `update` is).
-    pub external_dual: std::collections::HashSet<String>,
+    pub external_dual: crate::det::HashSet<String>,
 }
 
 impl Registry {
@@ -167,7 +167,7 @@ pub fn compute_registry(methods: &[MethodDef]) -> Registry {
 /// `destroy`) so a controller's field-receiver call sites
 /// (`@article.save`) destructure the tuple — see
 /// [`functionalize_with_external_duals`](super::functionalize_with_external_duals).
-pub fn dual_method_names(methods: &[MethodDef]) -> std::collections::HashSet<String> {
+pub fn dual_method_names(methods: &[MethodDef]) -> crate::det::HashSet<String> {
     let after_while: Vec<_> = methods
         .iter()
         .cloned()
@@ -212,7 +212,18 @@ pub fn transform_method(mut m: MethodDef, reg: &Registry) -> MethodDef {
 /// rather than `self`/`nil`/a mutation (`valid?`'s implicit
 /// `@errors.empty?`).
 fn returns_genuine_value(e: &Expr) -> bool {
-    has_value_return(e) || tail_is_genuine_value(e)
+    has_value_return(e) || tail_is_genuine_value(e) || tail_is_genuine_local(e)
+}
+
+/// True when the body ends in a local that a top-level statement of the
+/// same body assigned a genuine value: `valid?`'s `ok = @errors.empty?;
+/// after_validation; ok`, which takes the answer before a callback runs.
+fn tail_is_genuine_local(e: &Expr) -> bool {
+    let ExprNode::Seq { exprs } = &*e.node else { return false };
+    let Some(ExprNode::Var { name, .. }) = exprs.last().map(|t| &*t.node) else { return false };
+    exprs.iter().any(|s| {
+        matches!(&*s.node, ExprNode::Assign { target: LValue::Var { name: n, .. }, value } if n == name && tail_is_genuine_value(value))
+    })
 }
 
 /// The trailing (value-producing) expression of a body — the last
@@ -875,13 +886,13 @@ fn rewrite_expr(e: &Expr) -> Expr {
                     });
                 }
             }
-            syn(ExprNode::Send {
+            keep_hint(e, syn(ExprNode::Send {
                 recv: Some(rewrite_expr(r)),
                 method: method.clone(),
                 args: args.iter().map(rewrite_expr).collect(),
                 block: None,
                 parenthesized: true,
-            })
+            }))
         }
         // Recurse through the container variants the runtime bodies use.
         // A `super` call (the constructor's chain to ActiveRecord::Base#
@@ -931,23 +942,24 @@ fn rewrite_expr(e: &Expr) -> Expr {
                 case
             }
         }
-        ExprNode::Send { recv, method, args, block, parenthesized } => syn(ExprNode::Send {
+        // Not a fresh untyped node: the rebuild means what the call meant, and the emitter dispatches on its type
+        ExprNode::Send { recv, method, args, block, parenthesized } => keep_ty(e, syn(ExprNode::Send {
             recv: recv.as_ref().map(rewrite_expr),
             method: method.clone(),
             args: args.iter().map(rewrite_expr).collect(),
             block: block.as_ref().map(rewrite_expr),
             parenthesized: *parenthesized,
-        }),
-        ExprNode::BoolOp { op, surface, left, right } => syn(ExprNode::BoolOp {
+        })),
+        ExprNode::BoolOp { op, surface, left, right } => keep_ty(e, syn(ExprNode::BoolOp {
             op: *op,
             surface: *surface,
             left: rewrite_expr(left),
             right: rewrite_expr(right),
-        }),
-        ExprNode::Assign { target, value } => syn(ExprNode::Assign {
+        })),
+        ExprNode::Assign { target, value } => keep_hint(e, syn(ExprNode::Assign {
             target: target.clone(),
             value: rewrite_expr(value),
-        }),
+        })),
         // A bare `return` (return self/nil) in a threaded method returns
         // the updated `record`; `return expr` threads the expr.
         ExprNode::Return { value } => {
@@ -1135,6 +1147,17 @@ fn has_nested_mutation_or_loop(e: &Expr) -> bool {
 
 // ---- IR builders + walker -------------------------------------------
 
+/// The string-builder tags (`io = String.new`, `io << chunk`) a writer reading `self` comes through here with; without them `local_accumulation` turns the appends into a list `++`.
+fn keep_ty(from: &Expr, mut to: Expr) -> Expr {
+    to.ty = from.ty.clone();
+    to
+}
+
+fn keep_hint(from: &Expr, mut to: Expr) -> Expr {
+    to.set_hint(*from.hint());
+    to
+}
+
 fn syn(node: ExprNode) -> Expr {
     Expr::new(Span::synthetic(), node)
 }
@@ -1301,10 +1324,12 @@ mod tests {
             parent: None,
             parent_span: Default::default(),
             includes: vec![],
+            include_spans: Vec::new(),
             methods,
             nullable_columns: Vec::new(),
             origin: None,
             constants: Vec::new(),
+            conditional_definitions: Vec::new(),
             unknown_calls: Vec::new(),
             class_ivar_initializers: Vec::new(),
         };
@@ -1533,10 +1558,12 @@ mod tests {
             parent: None,
             parent_span: Default::default(),
             includes: vec![],
+            include_spans: Vec::new(),
             methods: vec![init],
             nullable_columns: Vec::new(),
             origin: None,
             constants: Vec::new(),
+            conditional_definitions: Vec::new(),
             unknown_calls: Vec::new(),
             class_ivar_initializers: Vec::new(),
         };
@@ -1689,6 +1716,28 @@ mod tests {
         // stamping happens in the full pipeline, not this unit slice).
         assert!(ex.contains("{record, "), "tail wrapped as {{record, value}}:\n{ex}");
         assert!(!ex.contains("mutates instance state and returns a value"), "not stubbed:\n{ex}");
+    }
+
+    #[test]
+    fn dual_return_carries_an_answer_taken_before_a_callback() {
+        // def valid?; @errors = []; ok = @errors.empty?; after_validation; ok; end
+        let valid = instance_method(
+            "valid?",
+            &[],
+            syn(ExprNode::Seq {
+                exprs: vec![
+                    assign_ivar("errors", syn(ExprNode::Array { elements: vec![], style: ArrayStyle::Brackets })),
+                    syn(ExprNode::Assign {
+                        target: lvar("ok"),
+                        value: send(Some(syn(ExprNode::Ivar { name: sym("errors") })), "empty?", vec![]),
+                    }),
+                    send(None, "after_validation", vec![]),
+                    vr("ok"),
+                ],
+            }),
+        );
+        let ex = render_all(vec![valid]);
+        assert!(ex.contains("{record, ok}"), "the local answer is the tuple's value:\n{ex}");
     }
 
     #[test]

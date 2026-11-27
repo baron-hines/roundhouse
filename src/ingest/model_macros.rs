@@ -12,7 +12,7 @@
 //! captures, block parameters, nested blocks, control flow, side
 //! effects outside the definitions and redefinitions stay unexpanded.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::App;
 use crate::dialect::{MethodDef, MethodReceiver, MethodVisibility, ModelBodyItem};
@@ -20,37 +20,63 @@ use crate::expr::{Expr, ExprNode, Literal};
 use crate::ident::{ClassId, Symbol};
 use crate::span::SourceFile;
 
+use crate::ingest::prism_api::PrismLocation;
 mod class_eval;
 
 pub(crate) fn expand_model_macros(
     app: &mut App,
     sources: &[SourceFile],
 ) -> super::IngestResult<()> {
-    if app.concern_spliced_class_methods.is_empty() && app.load_hook_class_macros.is_empty() {
+    if app.concern_spliced_class_methods.is_empty()
+        && app.load_hook_class_macros.is_empty()
+        && app.load_hook_extended_macros.is_empty()
+    {
         return Ok(());
     }
     let mut params_specs =
         crate::lower::controller_to_library::params::collect_specs(&app.controllers);
+    let app_names: HashSet<String> = app
+        .library_classes
+        .iter()
+        .map(|c| c.name.0.as_str().to_string())
+        .chain(app.models.iter().map(|m| m.name.0.as_str().to_string()))
+        .collect();
     params_specs.mark_file_fields(&app.models);
     // Index once. Do not clone these defs onto every model, and do not
     // pretend the hook mixin was `include`d — availability is an
     // explicit load-hook origin check below.
-    let hook_macros: HashMap<Symbol, (ClassId, MethodDef)> = {
-        let mut map = HashMap::new();
-        for id in &app.load_hook_class_macros {
-            let Some(class) = app.library_classes.iter().find(|c| &c.name == id) else {
-                continue;
-            };
-            for m in &class.methods {
-                if m.receiver == MethodReceiver::Class && has_definition(&m.body) {
-                    map.entry(m.name.clone())
-                        .or_insert_with(|| (id.clone(), m.clone()));
-                }
+    let hook_sources = app
+        .load_hook_class_macros
+        .iter()
+        .map(|id| (id, MethodReceiver::Class))
+        .chain(app.load_hook_extended_macros.iter().map(|id| (id, MethodReceiver::Instance)));
+    let mut hook_macros: HashMap<Symbol, (ClassId, MethodDef)> = HashMap::default();
+    let mut hook_providers: HashMap<Symbol, usize> = HashMap::default();
+    for (id, receiver) in hook_sources {
+        let Some(class) = app.library_classes.iter().find(|c| &c.name == id) else {
+            if receiver == MethodReceiver::Instance {
+                super::survey::record(&super::IngestError::Unsupported {
+                    file: id.to_string(),
+                    message: format!(
+                        "`ActiveSupport.on_load(:active_record)` extends `{id}`, which is not ingested: the macros it gives every model are unknown"
+                    ),
+                });
+            }
+            continue;
+        };
+        for m in class.methods.iter().filter(|m| m.receiver == receiver) {
+            *hook_providers.entry(m.name.clone()).or_default() += 1;
+            if has_definition(&m.body) {
+                hook_macros.entry(m.name.clone()).or_insert_with(|| (id.clone(), m.clone()));
             }
         }
-        map
-    };
-    let hook_origins: HashSet<ClassId> = app.load_hook_class_macros.iter().cloned().collect();
+    }
+    let hook_origins: HashSet<ClassId> = app
+        .load_hook_class_macros
+        .iter()
+        .chain(&app.load_hook_extended_macros)
+        .cloned()
+        .collect();
     for model_index in 0..app.models.len() {
         let model = &app.models[model_index];
         let origins = app
@@ -71,8 +97,8 @@ pub(crate) fn expand_model_macros(
             continue;
         }
         let mut candidates = Vec::new();
-        let mut calls = HashMap::<Symbol, usize>::new();
-        let mut included = HashSet::new();
+        let mut calls = HashMap::<Symbol, usize>::default();
+        let mut included = HashSet::default();
         for (index, item) in model.body.iter().enumerate() {
             let ModelBodyItem::Unknown { expr, .. } = item else {
                 continue;
@@ -145,10 +171,11 @@ pub(crate) fn expand_model_macros(
             let providers = app
                 .library_classes
                 .iter()
-                .filter(|c| included.contains(&c.name) || hook_origins.contains(&c.name))
+                .filter(|c| included.contains(&c.name) && !hook_origins.contains(&c.name))
                 .flat_map(|c| &c.methods)
                 .filter(|m| m.receiver == MethodReceiver::Class && &m.name == method)
-                .count();
+                .count()
+                + hook_providers.get(method).copied().unwrap_or(0);
             let methods = (recv.is_none()
                 && block.is_none()
                 && (included.contains(origin) || hook_origins.contains(origin))
@@ -169,10 +196,19 @@ pub(crate) fn expand_model_macros(
                         MethodReceiver::Class,
                     )
                 })
-                && supported_source_signature(def, sources)
+                && supported_source_signature(def, sources, false, rest_each(def).is_some(), false)
                 && supported_source_call(expr, sources))
-            .then(|| expand(def, args, sources, &model.name))
-            .flatten();
+            .then(|| expand(def, args, sources, &model.name, origin, &ancestors_of(app, &model.name), &app_names))
+            .flatten()
+            .filter(|expansion| mixins_resolve_alike(app, origin, &expansion.items))
+            .map(|mut expansion| {
+                mark_mixin_constants(&mut expansion.items);
+                expansion
+            });
+            // A load-hook macro this cannot expand is the partial evaluator's to run or refuse (`class_macros`)
+            if methods.is_none() && hook_origins.contains(origin) && !macros.contains_key(method) {
+                continue;
+            }
             candidates.push((index, method.clone(), methods));
         }
         if candidates.is_empty() {
@@ -205,21 +241,23 @@ pub(crate) fn expand_model_macros(
         // the model lowerer currently keeps the first definition, whereas
         // Ruby keeps the last. An invalid second call must not let the
         // first one become a misleading partial expansion either.
-        let mut names = HashMap::<Symbol, usize>::new();
+        let mut names = HashMap::<Symbol, usize>::default();
         for (_, _, methods) in &candidates {
             let Some(expansion) = methods else { continue };
             for m in &expansion.methods {
                 *names.entry(m.name.clone()).or_default() += 1;
             }
         }
-        let mut expansions = HashMap::new();
+        let mut expansions = HashMap::default();
         // An opaque macro could define any of the same names. Do not
         // invent a partial class when one candidate's effects are unknown.
         let opaque = candidates.iter().any(|(_, _, methods)| methods.is_none());
         for (index, name, methods) in candidates {
             let methods = methods.filter(|expansion| {
+                // A macro called again defines more methods, kept apart by name below; one that also declares
+                // (`has_one`, a scope) stays to a single call.
                 !opaque
-                    && calls[&name] == 1
+                    && (calls[&name] == 1 || expansion.items.is_empty())
                     && expansion.methods.iter().all(|m| {
                         names[&m.name] == 1
                             && !reserved.contains(&m.name)
@@ -245,7 +283,7 @@ pub(crate) fn expand_model_macros(
                 super::survey::unwrap_or_record::<()>(Err(super::IngestError::Unsupported {
                     file,
                     message: format!(
-                        "model macro `{name}` not expanded: requires distinct parameterless definitions, symbol bindings and named visibility on those definitions"
+                        "model macro `{name}` not expanded: requires distinct parameterless definitions, symbol bindings, named visibility on those definitions, and mixins whose constants name the same module from the caller"
                     ),
                 }))?;
             }
@@ -309,7 +347,12 @@ fn include_closure(app: &App, id: ClassId, included: &mut HashSet<ClassId>) {
 /// Library IR intentionally flattens some Ruby parameters. Expansion
 /// needs the original signature: destructuring and anonymous rest may
 /// otherwise disappear altogether and look like a simpler valid macro.
-fn supported_source_signature(def: &MethodDef, sources: &[SourceFile]) -> bool {
+pub(super) fn supported_source_signature(def: &MethodDef, sources: &[SourceFile], optionals: bool, rest: bool, block: bool) -> bool {
+    supported_source_signature_with(def, sources, optionals, rest, block, false)
+}
+
+/// [`supported_source_signature`], with a named keyword rest (`**opts`) admitted when `kwrest`.
+pub(super) fn supported_source_signature_with(def: &MethodDef, sources: &[SourceFile], optionals: bool, rest: bool, block: bool, kwrest: bool) -> bool {
     let Some(source) = def
         .name_span
         .file
@@ -321,6 +364,10 @@ fn supported_source_signature(def: &MethodDef, sources: &[SourceFile]) -> bool {
     };
     struct Signature {
         offset: usize,
+        optionals: bool,
+        rest: bool,
+        block: bool,
+        kwrest: bool,
         valid: bool,
     }
     impl<'pr> ruby_prism::Visit<'pr> for Signature {
@@ -329,10 +376,11 @@ fn supported_source_signature(def: &MethodDef, sources: &[SourceFile]) -> bool {
                 return;
             }
             self.valid = def.parameters().is_none_or(|params| {
-                params.rest().is_none()
-                    && params.keyword_rest().is_none()
-                    && params.block().is_none()
-                    && params.optionals().iter().next().is_none()
+                params.rest().is_none_or(|r| self.rest && r.as_rest_parameter_node().is_some_and(|r| r.name().is_some()))
+                    && params.keyword_rest().is_none_or(|k| self.kwrest && k.as_keyword_rest_parameter_node().is_some_and(|k| k.name().is_some()))
+                    // Not an anonymous `&`: the expansion binds the block by its name.
+                    && params.block().is_none_or(|b| self.block && b.as_block_parameter_node().is_some_and(|b| b.name().is_some()))
+                    && (self.optionals || params.optionals().iter().next().is_none())
                     && params.posts().iter().next().is_none()
                     && params
                         .requireds()
@@ -345,9 +393,13 @@ fn supported_source_signature(def: &MethodDef, sources: &[SourceFile]) -> bool {
             });
         }
     }
-    let parsed = ruby_prism::parse(source.text.as_bytes());
+    let parsed = super::prism::parse_silent(source.text.as_bytes());
     let mut signature = Signature {
         offset: def.name_span.start as usize,
+        optionals,
+        rest,
+        block,
+        kwrest,
         valid: false,
     };
     ruby_prism::Visit::visit(&mut signature, &parsed.node());
@@ -373,7 +425,7 @@ fn supported_source_call(expr: &Expr, sources: &[SourceFile]) -> bool {
     else {
         return false;
     };
-    let parsed = ruby_prism::parse(bytes);
+    let parsed = super::prism::parse_silent(bytes);
     if parsed.errors().next().is_some() {
         return false;
     }
@@ -411,10 +463,74 @@ fn has_definition(body: &Expr) -> bool {
     {
         return true;
     }
+    if mixin_args(body).is_some() {
+        return true;
+    }
     let mut found = false;
     body.node
         .for_each_child(&mut |child| found |= has_definition(child));
     found
+}
+
+/// A receiverless `include`/`extend` whose arguments are all constant
+/// paths: the class-body mixin a macro runs on its caller.
+pub(super) fn mixin_args(expr: &Expr) -> Option<Vec<&[Symbol]>> {
+    let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node else { return None };
+    // Not `prepend`: a model's `prepend` is neither a recorded include nor replayed in the emitted class body
+    if !matches!(method.as_str(), "include" | "extend") || args.is_empty() {
+        return None;
+    }
+    args.iter()
+        .map(|arg| match &*arg.node {
+            ExprNode::Const { path } => Some(path.as_slice()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The expansion re-reads the macro's statements in the caller's body,
+/// so a mixin constant must name the same module from there as from the
+/// macro's own nesting: a known module, with no nearer one of that name.
+fn mixins_resolve_alike(app: &App, origin: &ClassId, items: &[ModelBodyItem]) -> bool {
+    let known = |name: &str| {
+        app.library_classes.iter().any(|c| c.name.0.as_str() == name) || app.models.iter().any(|m| m.name.0.as_str() == name)
+    };
+    let scopes: Vec<&str> = {
+        let full = origin.0.as_str();
+        let mut out = vec![full];
+        let mut rest = full;
+        while let Some((outer, _)) = rest.rsplit_once("::") {
+            out.push(outer);
+            rest = outer;
+        }
+        out
+    };
+    items.iter().all(|item| {
+        let ModelBodyItem::Unknown { expr, .. } = item else { return true };
+        let Some(paths) = mixin_args(expr) else { return true };
+        paths.iter().all(|path| {
+            let rooted = path.first().is_some_and(|s| s.as_str().is_empty());
+            let written = path.iter().filter(|s| !s.as_str().is_empty()).map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+            known(&written) && (rooted || scopes.iter().all(|scope| !known(&format!("{scope}::{written}"))))
+        })
+    })
+}
+
+// A re-read statement's span points into a fragment the constant resolver never indexed, so the checked path is read as written
+fn mark_mixin_constants(items: &mut [ModelBodyItem]) {
+    for item in items {
+        let ModelBodyItem::Unknown { expr, .. } = item else { continue };
+        if mixin_args(expr).is_none() {
+            continue;
+        }
+        let ExprNode::Send { args, .. } = &mut *expr.node else { continue };
+        for arg in args {
+            if let ExprNode::Const { path } = &mut *arg.node {
+                path.retain(|s| !s.as_str().is_empty());
+            }
+            arg.decisions |= crate::expr::GENERATED_CONST_REF;
+        }
+    }
 }
 
 fn macro_calls(
@@ -463,9 +579,9 @@ fn interned_prism_name(arg: &ruby_prism::Node<'_>) -> bool {
     arg.as_symbol_node().is_some() || arg.as_string_node().is_some()
 }
 
-fn valid_def_name(name: &Symbol) -> bool {
+pub(super) fn valid_def_name(name: &Symbol) -> bool {
     let header = format!("def {name}\nend\n");
-    let parsed = ruby_prism::parse(header.as_bytes());
+    let parsed = super::prism::parse_silent(header.as_bytes());
     let node = parsed.node();
     let Some(program) = node.as_program_node() else {
         return false;
@@ -498,7 +614,7 @@ pub(super) fn bindings(def: &MethodDef, args: &[Expr]) -> Option<HashMap<Symbol,
         return None;
     }
     let mut positional = args;
-    let mut keywords = HashMap::new();
+    let mut keywords = HashMap::default();
     if let Some(Expr { node, .. }) = args.last() {
         if let ExprNode::Hash {
             entries,
@@ -517,7 +633,7 @@ pub(super) fn bindings(def: &MethodDef, args: &[Expr]) -> Option<HashMap<Symbol,
         }
     }
     let mut positional = positional.iter();
-    let mut out = HashMap::new();
+    let mut out = HashMap::default();
     for param in &def.params {
         let value = if param.keyword || param.from_keyword {
             match keywords.remove(&param.name) {
@@ -559,7 +675,14 @@ fn expand(
     args: &[Expr],
     sources: &[SourceFile],
     owner: &ClassId,
+    origin: &ClassId,
+    ancestors: &[ClassId],
+    app_names: &HashSet<String>,
 ) -> Option<Expansion> {
+    let scopes: Vec<&ClassId> = [owner, origin].into_iter().chain(ancestors.iter()).collect();
+    if let Some(methods) = expand_rest_each(def, args, sources, &scopes, app_names) {
+        return Some(Expansion { methods, items: Vec::new() });
+    }
     if let Some(methods) = expand_define_methods(def, args, sources) {
         return Some(Expansion {
             methods,
@@ -604,7 +727,7 @@ fn expand_define_methods(
         }
         if method.as_str() == "define_method" {
             let [name] = args.as_slice() else { return None };
-            let name = substitute(name.clone(), &bindings, &HashSet::new())?;
+            let name = substitute(name.clone(), &bindings, &HashSet::default())?;
             let name = interned_name(&name)?;
             // Ruby accepts arbitrary interned names in define_method,
             // but an emitted `def` must be syntactically valid.
@@ -666,7 +789,7 @@ fn expand_define_methods(
             {
                 return None;
             }
-            let helpers = HashSet::new();
+            let helpers = HashSet::default();
             for arg in args {
                 let name = substitute(arg.clone(), &bindings, &helpers)?;
                 let name = interned_name(&name)?;
@@ -675,6 +798,251 @@ fn expand_define_methods(
         }
     }
     (!methods.is_empty()).then_some(methods)
+}
+
+/// `def monetize(*fields); fields.each do |field| … end; end`: the rest parameter's name, the block's, and the
+/// block's statements.
+fn rest_each(def: &MethodDef) -> Option<(&Symbol, &Symbol, &[Expr])> {
+    let [param] = def.params.as_slice() else { return None };
+    if !param.rest || param.keyword || def.block_param.is_some() {
+        return None;
+    }
+    let stmt = match &*def.body.node {
+        ExprNode::Seq { exprs } if exprs.len() == 1 => &exprs[0],
+        _ => &def.body,
+    };
+    let ExprNode::Send { recv: Some(recv), method, args, block: Some(block), .. } = &*stmt.node else { return None };
+    if method.as_str() != "each" || !args.is_empty() || !matches!(&*recv.node, ExprNode::Var { name, .. } if name == &param.name) {
+        return None;
+    }
+    let ExprNode::Lambda { params, rest_param: None, extra_params, block_param: None, body, .. } = &*block.node else { return None };
+    let [item] = params.as_slice() else { return None };
+    if !extra_params.is_empty() {
+        return None;
+    }
+    let statements = match &*body.node {
+        ExprNode::Seq { exprs } => exprs.as_slice(),
+        _ => std::slice::from_ref(body),
+    };
+    Some((&param.name, item, statements))
+}
+
+/// A `*rest` macro whose body walks its arguments (`fields.each do |field| define_method("#{field}_money") do |**args|
+/// … end end`, maybe's `monetize`), unrolled over the call's literal names: each `define_method` is one method, its
+/// block's parameters the method's, and its body read with the name bound (`send(field, **args)` the reader called
+/// by name). Not a call with any other argument (a Hash would be one more element, whose name is no method's).
+fn expand_rest_each(
+    def: &MethodDef,
+    args: &[Expr],
+    sources: &[SourceFile],
+    scopes: &[&ClassId],
+    app_names: &HashSet<String>,
+) -> Option<Vec<MethodDef>> {
+    let (rest, item, statements) = rest_each(def)?;
+    if args.is_empty() {
+        return None;
+    }
+    let mut methods: Vec<MethodDef> = Vec::new();
+    for arg in args {
+        interned_name(arg)?;
+        let mut bindings = HashMap::default();
+        bindings.insert(item.clone(), arg.clone());
+        for statement in statements {
+            let ExprNode::Send { recv, method, args: call_args, block, .. } = &*statement.node else { return None };
+            if recv.as_ref().is_some_and(|r| !matches!(&*r.node, ExprNode::SelfRef)) || method.as_str() != "define_method" {
+                return None;
+            }
+            let [name] = call_args.as_slice() else { return None };
+            let name = bound_name(name, &bindings)?;
+            if !valid_def_name(&name) || methods.iter().any(|m| m.name == name) {
+                return None;
+            }
+            let ExprNode::Lambda { params, rest_param: None, extra_params, block_param: None, body, .. } = &*block.as_ref()?.node else {
+                return None;
+            };
+            if !plain_block_parameters(statement, sources) {
+                return None;
+            }
+            let mut locals: HashSet<Symbol> = params.iter().cloned().chain(extra_params.iter().map(|p| p.name.clone())).collect();
+            // A parameter or local of a bound name would be rewritten through it (`|field|`).
+            if locals.contains(item) || locals.contains(rest) {
+                return None;
+            }
+            // Not a String binding read as a value, which would allocate a fresh String per call (as the
+            // parameterless path declines it).
+            if string_binding_read_as_value(body, &bindings) {
+                return None;
+            }
+            // Not a body that writes the walked rest itself: the block's write reaches the macro's local, a method's
+            // only its own.
+            if writes_name(body, rest) {
+                return None;
+            }
+            let body = substitute_body(body.clone(), &bindings, &mut locals, scopes, app_names)?;
+            let mut generated = def.clone();
+            generated.name = name;
+            generated.name_span = call_args[0].span;
+            generated.receiver = MethodReceiver::Instance;
+            generated.visibility = MethodVisibility::Public;
+            generated.params = params.iter().cloned().map(crate::dialect::Param::positional).chain(extra_params.iter().cloned()).collect();
+            generated.block_param = None;
+            generated.signature = None;
+            generated.body = body;
+            methods.push(generated);
+        }
+    }
+    (!methods.is_empty()).then_some(methods)
+}
+
+/// The model's superclasses, as its constant lookup walks them after its lexical scope.
+fn ancestors_of(app: &App, model: &ClassId) -> Vec<ClassId> {
+    let mut out = Vec::new();
+    let mut current = app.models.iter().find(|m| &m.name == model).and_then(|m| m.parent.clone());
+    while let Some(parent) = current {
+        if out.contains(&parent) {
+            break;
+        }
+        current = app.models.iter().find(|m| m.name == parent).and_then(|m| m.parent.clone());
+        out.push(parent);
+    }
+    out
+}
+
+fn writes_name(e: &Expr, name: &Symbol) -> bool {
+    if matches!(&*e.node, ExprNode::Assign { target: crate::expr::LValue::Var { name: n, .. }, .. } if n == name) {
+        return true;
+    }
+    let mut found = false;
+    e.node.for_each_child(&mut |c| found = found || writes_name(c, name));
+    found
+}
+
+/// A method name as a bound name interpolates it: a Symbol or String, or `"#{field}_money"` with `field` bound.
+fn bound_name(expr: &Expr, bindings: &HashMap<Symbol, Expr>) -> Option<Symbol> {
+    match &*expr.node {
+        ExprNode::StringInterp { parts } => {
+            let mut out = String::new();
+            for part in parts {
+                match part {
+                    crate::expr::InterpPart::Text { value } => out.push_str(value),
+                    crate::expr::InterpPart::Expr { expr } => {
+                        let ExprNode::Var { name, .. } = &*expr.node else { return None };
+                        out.push_str(interned_name(bindings.get(name)?)?.as_str());
+                    }
+                }
+            }
+            Some(Symbol::from(out.as_str()))
+        }
+        _ => interned_name(&substitute(expr.clone(), bindings, &HashSet::default())?),
+    }
+}
+
+/// The `define_method` block's parameters as written: required names and a named `**rest` only, which the lambda IR
+/// keeps as they are.
+fn plain_block_parameters(statement: &Expr, sources: &[SourceFile]) -> bool {
+    let Some(source) = statement.span.file.0.checked_sub(1).and_then(|i| sources.get(i as usize)) else { return false };
+    let Some(text) = source.text.as_bytes().get(statement.span.start as usize..statement.span.end as usize) else { return false };
+    let parsed = super::prism::parse_silent(text);
+    if parsed.errors().next().is_some() {
+        return false;
+    }
+    let root = parsed.node();
+    let Some(program) = root.as_program_node() else { return false };
+    let nodes: Vec<_> = program.statements().body().iter().collect();
+    let [node] = nodes.as_slice() else { return false };
+    let Some(block) = node.as_call_node().and_then(|c| c.block()).and_then(|b| b.as_block_node()) else { return false };
+    let Some(params) = block.parameters() else { return true };
+    let Some(params) = params.as_block_parameters_node().and_then(|p| p.parameters()) else { return false };
+    params.optionals().iter().next().is_none()
+        && params.rest().is_none()
+        && params.posts().iter().next().is_none()
+        && params.keywords().iter().next().is_none()
+        && params.block().is_none()
+        && params.requireds().iter().all(|p| p.as_required_parameter_node().is_some())
+        && params.keyword_rest().is_none_or(|k| k.as_keyword_rest_parameter_node().is_some_and(|k| k.name().is_some()))
+}
+
+/// [`substitute`] for a `define_method` body that reads its own parameters and locals: those stay as written, a
+/// bound name is its value, and the grammar adds a local's write, `if`, `return`, `||`/`&&`, `!`, a `**` of a local
+/// and a top-level constant the includer resolves alike. No block or nested scope, as there.
+fn substitute_body(
+    mut expr: Expr,
+    bindings: &HashMap<Symbol, Expr>,
+    locals: &mut HashSet<Symbol>,
+    scopes: &[&ClassId],
+    app_names: &HashSet<String>,
+) -> Option<Expr> {
+    match &mut *expr.node {
+        ExprNode::Var { name, .. } => {
+            if locals.contains(name) {
+                return Some(expr);
+            }
+            return bindings.get(name).cloned();
+        }
+        ExprNode::Lit { .. } | ExprNode::SelfRef | ExprNode::Ivar { .. } => return Some(expr),
+        // Not a constant the includer's namespace holds its own of: moved there, the name would read that one.
+        ExprNode::Const { path } => {
+            let names: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+            let rooted = names.first() == Some(&"");
+            let written: Vec<&str> = names.into_iter().filter(|s| !s.is_empty()).collect();
+            let [leaf] = written.as_slice() else { return None };
+            // Nor one the macro's own module holds (a load hook's, whose body is not the includer's lexical scope), nor
+            // a superclass's, which the includer's lookup reaches before the top level.
+            if !rooted {
+                for owner in scopes {
+                    let mut scope = owner.0.as_str().to_string();
+                    loop {
+                        if app_names.contains(&format!("{scope}::{leaf}")) {
+                            return None;
+                        }
+                        match scope.rsplit_once("::") {
+                            Some((outer, _)) => scope = outer.to_string(),
+                            None => break,
+                        }
+                    }
+                }
+            }
+            return app_names.contains(*leaf).then_some(expr);
+        }
+        ExprNode::Assign { target: crate::expr::LValue::Var { name, .. }, value } => {
+            if bindings.contains_key(name) {
+                return None;
+            }
+            *value = substitute_body(value.clone(), bindings, locals, scopes, app_names)?;
+            locals.insert(name.clone());
+            return Some(expr);
+        }
+        ExprNode::Send { block: None, .. }
+        | ExprNode::Seq { .. }
+        | ExprNode::If { .. }
+        | ExprNode::BoolOp { .. }
+        | ExprNode::Return { .. }
+        | ExprNode::KeywordSplat { .. } => {}
+        _ => return None,
+    }
+    let mut valid = true;
+    let mut children: Vec<Expr> = Vec::new();
+    expr.node.for_each_child(&mut |child| children.push(child.clone()));
+    let mut replaced = Vec::new();
+    for child in children {
+        match substitute_body(child, bindings, locals, scopes, app_names) {
+            Some(c) => replaced.push(c),
+            None => valid = false,
+        }
+    }
+    if !valid {
+        return None;
+    }
+    let mut next = replaced.into_iter();
+    expr.node.for_each_child_mut(&mut |child| {
+        if let Some(c) = next.next() {
+            *child = c;
+        }
+    });
+    if !collapse_literal_send(&mut expr, &HashSet::default()) {
+        return None;
+    }
+    Some(expr)
 }
 
 /// Lambda IR erases optional/keyword parameters and block-local names.
@@ -702,7 +1070,7 @@ fn supported_source_statement(
     else {
         return false;
     };
-    let parsed = ruby_prism::parse(text);
+    let parsed = super::prism::parse_silent(text);
     if parsed.errors().next().is_some() {
         return false;
     }

@@ -23,7 +23,11 @@ module ActionController
     @flag_samesite: Hash[String, String]
     @flag_secure: Hash[String, String]
     @flag_expires: Hash[String, String]
+    @deleted: Hash[String, String]
 
+    def self.parse_header: (String header) -> Hash[String, String]
+    def self.unescape_component: (String s) -> String
+    def self.hex_value: (Integer b) -> Integer
     def initialize: (?Hash[String, String] inbound) -> void
     def []: (String | Symbol key) -> String
     # The written value is untyped and the STORE is String: `raw_set`
@@ -34,6 +38,7 @@ module ActionController
     def []=: (String | Symbol key, untyped value) -> String
     def permanent: () -> ActionController::PermanentCookieJar
     def signed: () -> ActionController::SignedCookieJar
+    def encrypted: () -> ActionController::EncryptedCookieJar
     def raw: (String | Symbol key) -> String
     def raw_set: (String | Symbol key, untyped value) -> String
     def record_flags: (String | Symbol key, bool httponly, String | Symbol same_site, bool secure) -> String
@@ -43,7 +48,9 @@ module ActionController
     def record_permanent: (String | Symbol key) -> String
     def flag_expires: (String | Symbol key) -> String
     def self.permanent_expires: () -> String
-    def delete: (String | Symbol key) -> String
+    def delete: (String | Symbol key, ?Hash[Symbol, untyped] options) -> String
+    def record_expires: (String | Symbol key, ::Time at) -> String
+    def deleted?: (String | Symbol key) -> bool
     def pending: () -> Hash[String, String]
     def to_h: () -> Hash[String, String]
     def to_hash: () -> Hash[String, String]
@@ -55,12 +62,30 @@ module ActionController
     @permanent: bool
 
     def initialize: (ActionController::CookieJar jar, ?bool permanent) -> void
-    # NULLABLE, unlike the unsigned jar's read — see the .rb.
-    def []: (String | Symbol key) -> String?
+    # What the cookie's JSON holds, nilable — see the .rb.
+    def []: (String | Symbol key) -> untyped
     def []=: (String | Symbol key, untyped value) -> untyped
     def permanent: () -> ActionController::SignedCookieJar
+    def rotated_json: (String raw, String purpose) -> String
+    def delete: (String | Symbol key, ?Hash[Symbol, untyped] options) -> String
+  end
+
+  # `cookies.encrypted`: reads answer what the cookie's JSON holds (a
+  # Hash, a String, an Integer...), so the read is untyped and nilable;
+  # writes take any value JSON can carry.
+  class EncryptedCookieJar
+    @jar: ActionController::CookieJar
+    @permanent: bool
+
+    def initialize: (ActionController::CookieJar jar, ?bool permanent) -> void
+    def []: (String | Symbol key) -> untyped
+    def []=: (String | Symbol key, untyped value) -> untyped
+    def permanent: () -> ActionController::EncryptedCookieJar
+    def rotated_json: (String raw, String purpose) -> String
     def delete: (String | Symbol key) -> String
-    def self.value_of: (Hash[Symbol, untyped] | String | Integer | Symbol | bool value) -> String
+    def self.value_of: (untyped value) -> untyped
+    def self.parse: (String json) -> untyped
+    def self.permanent_time: () -> ::Time
   end
 
   class PermanentCookieJar
@@ -68,12 +93,13 @@ module ActionController
 
     def initialize: (ActionController::CookieJar jar) -> void
     def []: (String | Symbol key) -> String
-    # The value union `SignedCookieJar.value_of` already names, not
+    # The value union a cookie write takes, not
     # `untyped`: a new writer must not add to the Bar B residual
     # (tests/runtime_src_integration.rs), and these are the shapes a
     # cookie write takes.
     def []=: (String | Symbol key, Hash[Symbol, untyped] | String | Integer | Symbol | bool value) -> String
     def signed: () -> ActionController::SignedCookieJar
+    def encrypted: () -> ActionController::EncryptedCookieJar
     def delete: (String | Symbol key) -> String
   end
 
@@ -83,12 +109,20 @@ module ActionController
   end
 end
 
+module ActionDispatch
+  class Request
+    def cookie_jar: () -> ActionController::CookieJar
+    def adopt_cookie_jar: (ActionController::CookieJar jar) -> ActionController::CookieJar
+  end
+end
+
 # Rails' own name for the jar, as a constructor onto the implementation
 # above — see the comment at the foot of cookies.rb.
 module ActionDispatch
   module Cookies
     class CookieJar
       def self.build: (ActionDispatch::Request request, Hash[String, String] cookies) -> ActionController::CookieJar
+      def self.new: (?ActionDispatch::Request? request, ?Hash[String, String] inbound) -> ActionController::CookieJar
     end
   end
 end

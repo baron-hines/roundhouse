@@ -3,7 +3,7 @@
 //! Only a keyword-rest hash writer paired with `@slot || {}` is expanded.
 //! Methods inherit; stored values and fresh default allocations do not.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::App;
 use crate::dialect::{
@@ -141,7 +141,7 @@ pub(super) fn verified_framework_concerns(
     module_includes: &HashMap<ClassId, Vec<ClassId>>,
     framework_shadows: &HashSet<ClassId>,
 ) -> HashSet<ClassId> {
-    let mut extensions: HashMap<ClassId, Vec<crate::span::Span>> = HashMap::new();
+    let mut extensions: HashMap<ClassId, Vec<crate::span::Span>> = HashMap::default();
     for carrier in carriers {
         extensions
             .entry(carrier.owner.clone())
@@ -213,8 +213,8 @@ fn expand_controller(
         }
     }
     let mut methods = Vec::new();
-    let mut names = HashSet::new();
-    let mut slots = HashSet::new();
+    let mut names = HashSet::default();
+    let mut slots = HashSet::default();
     for config in configurations {
         for method in &catalog[&config.carrier].0 {
             if method.name_span != config.writer.name_span
@@ -237,11 +237,17 @@ fn expand_controller(
             (&config.writer, ClassConfigurationRole::Writer),
             (&config.reader, ClassConfigurationRole::Reader),
         ] {
-            // The analyzer's parameter table has no receiver-kind key.
-            // Refuse rather than mixing instance and class call-site types.
-            if surface.instance_methods.contains(&method.name) || controller.class_methods().any(|existing| existing.name == method.name) {
+            // An instance method of the same name is a different method.
+            // Call sites pick a side (`ParamKey` includes `MethodReceiver`):
+            // a bare send in an instance body hits the instance method, and
+            // `self.class.writer` / a class-body send hits this one. Rails
+            // concerns use that split (`def self.period_config(**opts)` next
+            // to `def period_config; self.class.period_options; end`).
+            // A second class method of the same name on this controller is
+            // the same method twice, which the param table cannot keep apart.
+            if controller.class_methods().any(|existing| existing.name == method.name) {
                 return Err(refuse(
-                    "instance/class configuration method name collision is not supported",
+                    "a second class method of the same name is not supported",
                 ));
             }
             if !names.insert(&method.name) {

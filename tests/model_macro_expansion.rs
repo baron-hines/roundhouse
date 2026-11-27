@@ -659,15 +659,17 @@ items[3].move_to_position(0)
 raise "move to first" unless siblings.call(article).active.positioned.ids == [items[3].id, items[0].id, items[1].id, items[2].id]
 items[3].move_to_position(99)
 raise "move beyond end" unless siblings.call(article).active.positioned.ids == [items[0].id, items[1].id, items[2].id, items[3].id]
-items[0].move_to_position(1, [items[1], items[2]])
+items[0].move_to_position(1, followed_by: [items[1], items[2]])
 raise "contiguous block move" unless siblings.call(article).active.positioned.ids == [items[3].id, items[0].id, items[1].id, items[2].id]
 raise "neighbors" unless items[1].previous.id == items[0].id && items[1].next.id == items[2].id
 items[0].update!(position_score: 1e-11)
 items[1].update!(position_score: 2e-11)
 items[2].move_to_position(1)
 raise "rebalance order" unless siblings.call(article).active.positioned.ids == [items[0].id, items[2].id, items[1].id, items[3].id]
-raise "rebalance threshold" unless items[2].send(:rebalance_required?)
-items[2].send(:rebalance_positions)
+# The move ran in `with_lock`'s transaction, so the `after_save_commit`
+# waited for its COMMIT, by which time the move had flagged the rebalance:
+# it ran then, as in Rails, and cleared the flag.
+raise "rebalance threshold" if items[2].send(:rebalance_required?)
 raise "rebalance scores: #{siblings.call(article).active.positioned.pluck(:position_score).inspect}" unless siblings.call(article).active.positioned.pluck(:position_score) == [1.0, 2.0, 3.0, 4.0]
 raise "active sibling exclusion" unless siblings.call(article).active.positioned.count == 4 && !siblings.call(article).active.positioned.ids.include?(inactive.id)
 raise "owner isolation" unless !siblings.call(article).active.positioned.ids.include?(foreign.id)

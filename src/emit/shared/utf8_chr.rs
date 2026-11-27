@@ -46,7 +46,7 @@ pub fn emit(
     target: Target,
     emit_receiver: impl FnOnce(&Expr) -> String,
 ) -> Option<String> {
-    if e.diagnostic.is_some() {
+    if e.diagnostic().is_some() {
         return None;
     }
     let ExprNode::Send {
@@ -71,7 +71,7 @@ pub fn emit(
         Some(
             "the shared UTF-8 constructor does not implement supplied blocks or forwarded operands",
         )
-    } else if recv.diagnostic.is_some() || args[0].diagnostic.is_some() {
+    } else if recv.diagnostic().is_some() || args[0].diagnostic().is_some() {
         Some("the shared UTF-8 constructor cannot erase an operand diagnostic")
     } else {
         None
@@ -138,11 +138,11 @@ mod tests {
         let ExprNode::Send { args, .. } = &mut *diagnostic.node else {
             panic!("constructor call");
         };
-        args[0].diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
+        args[0].set_diagnostic(Some(crate::diagnostic::DiagnosticKind::Unsupported {
             target: None,
             construct: crate::ident::Symbol::new("encoding_operand"),
             detail: "encoding operand remains unsupported".into(),
-        });
+        }));
         for target in [
             Target::Rust,
             Target::TypeScript,
@@ -268,15 +268,16 @@ fn main() {{
         // Module-flat parsing needs the same cross-method return registry
         // as the runtime typing sweep. An empty registry leaves helper calls
         // unresolved and cannot establish emitted-runtime correctness.
-        let mut registry = std::collections::HashMap::new();
+        let mut registry = crate::det::HashMap::default();
         for (owner, signatures) in crate::rbs::parse_app_signatures(&rbs).unwrap() {
             let short = crate::ident::ClassId(crate::ident::Symbol::from(
                 owner.0.as_str().rsplit("::").next().unwrap(),
             ));
             for (name, signature) in signatures {
-                let crate::ty::Ty::Fn { ret, .. } = signature else {
+                let crate::ty::Ty::Fn(fn_ty) = signature else {
                     panic!("method signature")
                 };
+                let crate::ty::FnTy { ret, .. } = *fn_ty;
                 for id in [owner.clone(), short.clone()] {
                     registry
                         .entry(id)

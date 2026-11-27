@@ -57,7 +57,8 @@
 //!   pass for consumers after analysis; no round reads them.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
+use crate::det::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -67,7 +68,7 @@ use crate::diagnostic::DiagnosticKind;
 use crate::dialect::{Filter, MethodDef};
 use crate::expr::Expr;
 use crate::ident::{ClassId, Symbol};
-use crate::ty::Ty;
+use crate::ty::{FnTy, Ty};
 
 use super::typing_mode::{TypingMode, UnifyScope};
 use super::{Analyzer, FixpointRounds, LoopEnd};
@@ -127,8 +128,8 @@ impl Loop {
 
 /// The inputs `analyze` computes once and hands every typing pass.
 pub(super) struct RoundInputs<'a> {
-    pub dynamic_render_ivars: &'a std::collections::HashSet<Symbol>,
-    pub existing_view_names: &'a std::collections::HashSet<Symbol>,
+    pub dynamic_render_ivars: &'a crate::det::HashSet<Symbol>,
+    pub existing_view_names: &'a crate::det::HashSet<Symbol>,
     pub module_methods: &'a HashMap<ClassId, Vec<MethodDef>>,
     pub module_includes: &'a HashMap<ClassId, Vec<ClassId>>,
     pub parent_link_by_name: &'a HashMap<ClassId, Option<ClassId>>,
@@ -194,7 +195,8 @@ pub(super) fn type_hash(t: &Ty) -> u64 {
             }
         }
         Ty::Relation { of } => of.0.as_str().hash(&mut h),
-        Ty::Fn { params, block, ret, effects } => {
+        Ty::Fn(fn_ty) => {
+            let FnTy { params, block, ret, effects } = &**fn_ty;
             for p in params.iter() {
                 p.name.as_str().hash(&mut h);
                 format!("{:?}", p.kind).hash(&mut h);
@@ -251,7 +253,7 @@ type IrRow = (u32, u32, u32, u64, u64);
 
 fn ir_rows(e: &Expr, out: &mut Vec<IrRow>) {
     let ty = e.ty.as_ref().map_or(0, type_hash);
-    let note = hash_of((e.decisions, e.diagnostic.as_ref().map(annotation_hash)));
+    let note = hash_of((e.decisions, e.diagnostic().as_ref().map(annotation_hash)));
     out.push((e.span.file.0, e.span.start, e.span.end, ty, note));
     e.node.for_each_child(&mut |c| ir_rows(c, out));
 }
@@ -360,7 +362,8 @@ fn holds_untyped(t: &Ty) -> bool {
         Ty::Union { variants } => variants.iter().any(holds_untyped),
         Ty::Record { row } => row.fields.values().any(holds_untyped),
         Ty::Class { args, .. } => args.iter().any(holds_untyped),
-        Ty::Fn { params, block, ret, .. } => {
+        Ty::Fn(fn_ty) => {
+            let FnTy { params, block, ret, .. } = &**fn_ty;
             params.iter().any(|p| holds_untyped(&p.ty))
                 || block.as_deref().is_some_and(holds_untyped)
                 || holds_untyped(ret)
@@ -481,7 +484,7 @@ impl Analyzer {
                         )
                     })
                     .collect();
-                let layout = resolution.layout.as_ref().map(|l| l.as_str());
+                let layout: Vec<&str> = resolution.layouts.iter().map(|l| l.as_str()).collect();
                 put("view_seeds", format!("resolution {}", id.0.as_str()), hash_of((filters, layout)));
             }
         }
@@ -509,6 +512,7 @@ impl Analyzer {
         snapshot: Option<&mut HashMap<super::ParamKey, Vec<Ty>>>,
     ) {
         let before = self.state_fp(app);
+        let prev = self.capture_inference_sig();
         match which {
             Loop::Production | Loop::Absorb => {
                 self.run_typing_passes(
@@ -543,6 +547,7 @@ impl Analyzer {
                 self.overlay_test_params(app);
             }
         }
+        self.settle_oscillations(&prev);
         let moved = self.state_fp(app).moved(&before);
         self.fixpoint_checks.verified.push((which.name(), moved));
     }
@@ -553,12 +558,16 @@ impl Analyzer {
             return;
         }
         let rounds: FixpointRounds = self.fixpoint_rounds;
+        let mut restamp = loop_end(rounds.restamp.end);
+        restamp["rounds"] = serde_json::json!(rounds.restamp.rounds);
+        restamp["passes"] = serde_json::json!(rounds.restamp.passes);
         let mut line = serde_json::json!({
             "schema": 1,
             "loops": {
                 "production": loop_end(rounds.production),
                 "views_and_tests": loop_end(rounds.views_and_tests),
                 "absorb": loop_end(rounds.absorb),
+                "restamp": restamp,
             },
         });
         if *VERIFY {
@@ -590,6 +599,8 @@ impl Analyzer {
             });
             line["harvest_untie_cut"] =
                 serde_json::json!(UNTIE_CUTS.load(Ordering::Relaxed) - self.fixpoint_checks.untie_cuts);
+            let (cycles, widened) = self.settle.counts();
+            line["settled"] = serde_json::json!({"cycles": cycles, "widened": widened});
         }
         eprintln!("rh-fixpoint: {line}");
     }
@@ -632,7 +643,7 @@ class SamplesController < ActionController::Base
   end
 end
 "#);
-            let tree = HashMap::from([(
+            let tree = crate::vfs::FileTree::from_iter([(
                 std::path::PathBuf::from("app/controllers/samples_controller.rb"),
                 source.into_bytes(),
             )]);
@@ -692,6 +703,9 @@ end
                 unless_cond: None,
                 if_cond_expr: Some(expr.clone()),
                 unless_cond_expr: Some(expr.clone()),
+                unread_guard: false,
+                unread_options: false,
+                only_present: false,
                 block: Some(expr),
                 prepend: false,
             };
@@ -699,14 +713,14 @@ end
             let resolution = ControllerResolution {
                 filter_chain: vec![ResolvedFilter {
                     filter, defined_in: id.clone(), included_via: id.clone(),
-                    assigns: HashMap::new(), effects: Default::default(),
+                    assigns: HashMap::default(), effects: Default::default(),
                 }],
-                layout: Some(Symbol::from("layouts/application")),
+                layouts: vec![Symbol::from("layouts/application")],
             };
             let app = App::default();
             let mut analyzer = Analyzer::new(&app);
             analyzer.view_seeds = Some(ViewSeeds {
-                controller_resolutions: HashMap::from([(id, resolution)]),
+                controller_resolutions: HashMap::from_iter([(id, resolution)]),
                 ..ViewSeeds::default()
             });
             analyzer.state_fp(&app).digests()["view_seeds"].clone()

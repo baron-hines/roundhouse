@@ -1,0 +1,77 @@
+# Typing contract for pagy9.rb beside this file.
+class Pagy
+  module Backend
+  end
+
+  module Frontend
+  end
+
+  class VariableError < ArgumentError
+  end
+
+  class OverflowError < VariableError
+  end
+
+  HEX: String
+
+  self.@overflow: Symbol?
+  self.@default_limit: Integer
+
+  @items: Integer?
+  @var_limit: Integer | String | Roundhouse::ParamValue
+  @var_page: Integer | String | Roundhouse::ParamValue
+  @path: String
+  @query: String
+  @count: Integer
+  @limit: Integer
+  @page: Integer
+  @offset: Integer
+  @last: Integer
+  @from: Integer
+  @to: Integer
+  @in: Integer
+  @prev: Integer?
+  @next: Integer?
+  @empty: bool
+
+  def self.overflow: () -> Symbol?
+  def self.overflow=: (Symbol? mode) -> Symbol?
+  def self.default_limit: () -> Integer
+  def self.default_limit=: (Integer limit) -> Integer
+
+  def initialize: (Integer count, (Integer | String | Roundhouse::ParamValue)? raw_limit, (Integer | String | Roundhouse::ParamValue)? raw_page, Integer? items, String path, String query) -> void
+  def count: () -> Integer
+  def limit: () -> Integer
+  def page: () -> Integer
+  def offset: () -> Integer
+  def last: () -> Integer
+  def pages: () -> Integer
+  def from: () -> Integer
+  def to: () -> Integer
+  def in: () -> Integer
+  def prev: () -> Integer?
+  def next: () -> Integer?
+  def vars: () -> Hash[Symbol, (Integer | String | Roundhouse::ParamValue)?]
+  def series: () -> Array[Integer | String | Symbol]
+  def url_for: (Integer | String page) -> String
+
+  def self.to_var: ((Integer | String | Roundhouse::ParamValue)? raw, Integer default, String name, Integer min) -> Integer
+  def self.page_var: ((Integer | String | Roundhouse::ParamValue)? option, Roundhouse::ParamValue? param) -> (Integer | String | Roundhouse::ParamValue)
+  def self.query_pairs: (String query) -> Array[Array[String?]]
+  def self.decode: (String raw) -> String
+  def self.hex_value: (Integer? b) -> Integer
+  def self.escape: (String text) -> String
+end
+
+module ActionController
+  class Base
+    def pagy: (ActiveRecord::Relation collection, ?Hash[Symbol, (Integer | String | Roundhouse::ParamValue)?] options) -> [::Pagy, ActiveRecord::Relation]
+    def pagy_array: (Array[untyped] array, ?Hash[Symbol, (Integer | String | Roundhouse::ParamValue)?] options) -> [::Pagy, Array[untyped]]
+  end
+end
+
+module ActionView
+  module ViewHelpers
+    def self.pagy_url_for: (::Pagy pagy, Integer | String page) -> String
+  end
+end

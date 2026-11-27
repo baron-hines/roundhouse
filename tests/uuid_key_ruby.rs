@@ -13,6 +13,8 @@
 //!
 //!     cargo test --test uuid_key_ruby -- --ignored --nocapture
 
+#[path = "support/scratch.rs"]
+mod scratch;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -51,8 +53,8 @@ raise "comment keeps an integer rowid" unless c.id.is_a?(Integer) && c.id > 0
 raise "has_many across a uuid fk failed" unless Post.find(p1.id).comments.map(&:body) == ["hi"]
 raise "belongs_to across a uuid fk failed" unless c.post.id == p1.id
 c.post = nil
-raise "nil writer must blank a uuid fk, got #{c.post_id.inspect}" unless c.post_id == ""
-raise "blank uuid fk must read as no row" unless c.post.nil?
+raise "nil writer must clear a uuid fk to nil, as Rails does, got #{c.post_id.inspect}" unless c.post_id.nil?
+raise "a nil uuid fk must read as no row" unless c.post.nil?
 
 raise "count" unless Post.count == 2
 raise "all" unless Post.all.map(&:id).sort == [p1.id, p2.id].sort
@@ -134,11 +136,7 @@ fn emit_and_run_oracle(fixture: &Path, scratch: &Path, oracle: &str, ok: &str) {
 }
 
 fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(name);
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).expect("clean scratch");
-    }
-    std::fs::create_dir_all(&dir).expect("create scratch");
+    let dir = scratch::dir(name);
     dir
 }
 

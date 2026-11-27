@@ -33,6 +33,7 @@ use super::util::{
 };
 use super::{IngestError, IngestResult};
 
+use crate::ingest::prism_api::PrismLocation;
 /// Parse a single Sequel model file. Returns `Ok(None)` when the file's
 /// first class doesn't subclass `Sequel::Model` (a support class — the
 /// caller ingests it through the library-class path instead).
@@ -98,6 +99,8 @@ pub fn ingest_sequel_model(
         class_attr_defaults: indexmap::IndexMap::new(),
         lexical_json_shadow: false,
         sti_subclass_names: Vec::new(),
+        mixin_sends: Vec::new(),
+        select_aliases: Vec::new(),
         i18n: Default::default(),
         span: Span {
             file: super::sources::file_id(file),
@@ -239,6 +242,8 @@ fn parse_sequel_association(
                 foreign_key,
                 foreign_key_explicit,
                 through: None,
+                source: None,
+                class_explicit: false,
                 dependent,
                 as_interface: None,
                 scope: order_expr,
@@ -246,6 +251,7 @@ fn parse_sequel_association(
                 // `one_to_many` takes a dataset block, a different thing.
                 extension: Vec::new(),
                 primary_key: None,
+                inverse_of: None,
             }
         }
         "one_to_one" => Association::HasOne {
@@ -259,16 +265,21 @@ fn parse_sequel_association(
                 .unwrap_or_else(|| Symbol::from(format!("{owner_snake}_id"))),
             dependent: Dependent::None,
             through: None,
+            source: None,
+            class_explicit: false,
             as_interface: None,
             scope: None,
             autosave: false,
+            validate: false,
             primary_key: None,
+            inverse_of: None,
         },
         "many_to_one" => Association::BelongsTo {
             name: name.clone(),
             target: class_name
                 .map(|s| ClassId(Symbol::from(s.as_str())))
                 .unwrap_or_else(|| ClassId(Symbol::from(camelize(name_str.as_str())))),
+            foreign_key_explicit: key.is_some(),
             foreign_key: key
                 .map(|s| Symbol::from(s.as_str()))
                 .unwrap_or_else(|| Symbol::from(format!("{name_str}_id"))),
@@ -283,6 +294,7 @@ fn parse_sequel_association(
             touch: None,
             foreign_type: None,
             primary_key: None,
+            scope: None,
         },
         "many_to_many" => Association::HasAndBelongsToMany {
             name: name.clone(),
@@ -311,7 +323,7 @@ fn fk_cascades(schema: &Schema, assoc_plural: &str, owner_table: &str, fk: &Symb
         .get(&Symbol::from(assoc_plural))
         .map(|t| {
             t.foreign_keys.iter().any(|f| {
-                f.from_column == *fk
+                f.from_columns.as_slice() == std::slice::from_ref(fk)
                     && f.to_table.0.as_str() == owner_table
                     && matches!(f.on_delete, ReferentialAction::Cascade)
             })
@@ -459,8 +471,12 @@ fn parse_validation_helper(call: &ruby_prism::CallNode<'_>) -> Option<Vec<Valida
                 attrs
                     .into_iter()
                     .map(|attribute| Validation {
+                            prepend: false,
                         attribute,
                         rules: vec![ValidationRule::Presence],
+                        if_cond: None,
+                        unless_cond: None,
+                        message: None,
                     })
                     .collect()
             })
@@ -481,13 +497,18 @@ fn parse_validation_helper(call: &ruby_prism::CallNode<'_>) -> Option<Vec<Valida
                 attrs
                     .into_iter()
                     .map(|attribute| Validation {
+                            prepend: false,
                         attribute,
                         rules: vec![ValidationRule::Length {
                             min,
                             max,
+                            is: None,
                             message: message.clone(),
                             allow_nil: None,
                         }],
+                        if_cond: None,
+                        unless_cond: None,
+                        message: None,
                     })
                     .collect()
             })

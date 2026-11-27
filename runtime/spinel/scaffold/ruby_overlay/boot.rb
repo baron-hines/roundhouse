@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Boot chain — every `require_relative` the app needs, in the order it
 # needs them, and NOTHING that starts anything.
 #
@@ -48,6 +49,7 @@ require_relative "runtime/db"
 # the stdlib equivalents with semantically-identical implementations
 # for the surface framework Ruby actually uses.
 require_relative "runtime/base64"
+require_relative "runtime/securerandom_active_support"
 # stdlib Shellwords, including String#shellescape. The Spinel port is
 # runtime/shellwords_spinel.rb and must not be named shellwords.rb:
 # runtime/ is on $LOAD_PATH, so the library's own name would answer a
@@ -67,6 +69,8 @@ require_relative "runtime/json_builder"
 # (Rails' own synonyms and parameters included).
 require_relative "runtime/mime"
 require_relative "runtime/params"
+# Before any gem: rack-attack asks for it while it loads (runtime/action_dispatch_journey.rb).
+require_relative "runtime/action_dispatch_journey"
 # ActionText::Content — see the spinel scaffold's main.rb. Both entry
 # points need it: a `has_rich_text` model's `body` reader constructs
 # one on every read, so an unloaded constant is a NameError on the
@@ -74,6 +78,8 @@ require_relative "runtime/params"
 require_relative "runtime/action_text"
 require_relative "runtime/importmap"
 require_relative "runtime/rails"
+# Not part of runtime/rails: the instrumented Notifications paths keep per-thread state the strict targets' typing gate does not follow.
+require_relative "runtime/active_support_instrumentation"
 # `ActiveSupport::Cache::MemoryStore` (a `Rails::Cache`) and
 # `ActiveSupport::Cache.expand_cache_key`.
 require_relative "runtime/active_support_cache"
@@ -97,23 +103,41 @@ Rails.secret_key_base = LocalSecret.resolve(ENV["SECRET_KEY_BASE"])
 # runtime's Cache is a recompute-every-fetch no-op).
 require_relative "runtime/rails_cache"
 require_relative "runtime/rails_application_routes"
+require_relative "runtime/gem_middleware"
 require_relative "runtime/active_support_duration"
 require_relative "runtime/active_support_time_parsing"
 require_relative "runtime/active_support_core_ext"
+# type_toolkit's `not_nil!` (Kernel / NilClass reopen, CRuby overlay only).
+require_relative "runtime/type_toolkit"
+# `config_for`'s answer: a Hash subclass with `method_missing`, so it cannot
+# live in the shared runtime that reads it (CRuby overlay only).
+require_relative "runtime/active_support_ordered_options"
+require_relative "runtime/active_support_gzip"
 # Blank-predicate helper for receivers `src/lower/blank.rs` had no static
 # type to ground on. CRuby could serve those sites through the core_ext
 # reopen above; it now takes the same lowered call every other
 # ruby-family target does, so the two stay one behaviour.
 require_relative "runtime/active_support_ext"
+require_relative "runtime/active_support_calendar"
+require_relative "runtime/active_model_validator"
+require_relative "runtime/active_model_name"
+# ActiveSupport::JSON.encode straight through the C generator when the
+# value is already JSON-native; the shared walk otherwise.
+require_relative "runtime/active_support_json_cruby"
 require_relative "runtime/action_view_number_helper"
 require_relative "runtime/action_view_form_builder_extras"
+# A builder the form lowering does not expand (an app's subclass, a gem's) runs at request time.
+require_relative "runtime/action_view_form_builder"
+require_relative "runtime/action_view_tags"
 require_relative "runtime/active_record"
 require_relative "runtime/active_record_bang"
+require_relative "runtime/active_record_runtime_macros"
 # `ActiveRecord::Base.connection_db_config`, `connection_pool` and
 # `transaction_open?` over the Db shim loaded above.
 require_relative "runtime/active_record_db_config"
 require_relative "runtime/active_record_serialization"
 require_relative "runtime/active_record_relation_ext"
+require_relative "runtime/arel_predicates"
 require_relative "config/schema"
 require_relative "runtime/action_dispatch"
 require_relative "runtime/action_controller"
@@ -121,6 +145,8 @@ require_relative "runtime/action_controller"
 require_relative "runtime/header_validation_cruby"
 # Signed cookies verified once per value per thread, not per request.
 require_relative "runtime/message_verifier_cruby"
+# `allow_browser`'s verdict once per User-Agent per thread, not per request.
+require_relative "runtime/browser_blocker_cruby"
 # Masked CSRF tokens XORed with pack/unpack, not 32 `chr`s.
 require_relative "runtime/authenticity_token_cruby"
 # `Hash#to_query`'s nested bracket grammar — a reopen of the shared
@@ -224,8 +250,21 @@ require_relative "runtime/active_job"
 # ActiveJob payload codecs: after the module and its DeserializationError,
 # and after global_id_locator, whose URI parser the record reader uses.
 require_relative "runtime/active_job_serialization"
+# Sidekiq pushes for an app on queue_adapter :sidekiq: the Redis
+# connection (a raising façade unless the tree is on :sidekiq), then the
+# envelope and the after-commit hold. Before job_registry, whose COMMIT
+# and ROLLBACK edges flush and drop the held pushes.
+require_relative "runtime/sidekiq_redis"
+require_relative "runtime/sidekiq_push"
 # The app's payload jobs (generated), and the drain's payload arm.
 require_relative "runtime/job_registry"
+# The `sidekiq` role: envelope reads and dead records, then the worker
+# (a façade unless the tree is on :sidekiq).
+require_relative "runtime/sidekiq_envelope"
+require_relative "runtime/sidekiq_worker"
+# Broadcasts between processes through Redis, for config/cable.yml's
+# `adapter: redis` (a façade unless the tree is on :sidekiq).
+require_relative "runtime/redis_cable"
 # Per-request state per THREAD -- reopens Current, the view slots, the
 # broadcast log, the job queue and the store memo (see the file).
 require_relative "runtime/thread_state"
@@ -244,9 +283,6 @@ require_relative "runtime/view_buffer_cap"
 require_relative "runtime/action_cable"
 require_relative "runtime/turbo_streams"
 require_relative "runtime/cgi_io"
-# The C URL codec CRuby ships, over cgi_io's byte walks.
-require_relative "runtime/cgi_io_cruby"
-require_relative "config/routes"
 # Per-app Importmap override (generated by Roundhouse from the source
 # app's config/importmap.rb). Conditional because source apps without
 # an importmap don't have this file emitted; the runtime/importmap.rb
@@ -254,10 +290,15 @@ require_relative "config/routes"
 # error handling — spinel's static analyzer ignores the rescue path,
 # which is fine here because Importmap is already defined by the
 # fallback require above.
+#
+# Before config/routes, as in the spinel boot: anything routes reaches
+# that computes a constant from `Importmap.pins` must see the reopen
+# (rubys/roundhouse#1477).
 begin
   require_relative "config/importmap"
 rescue LoadError
 end
+require_relative "config/routes"
 # Per-app Rails::Application reopen (generated from the source app's
 # config/application.rb) — real config methods (`read_only?`, `name`)
 # reached via `Rails.application`. Conditional like the importmap:
@@ -286,25 +327,43 @@ end
 # as it did — the comment was believed and the order was not measured.
 # The spinel scaffold's boot.rb had it right; only this one was wrong.
 require_relative "runtime/active_storage_processor"
-# Pin the process zone to the app's config.time_zone (ingest
+# The app's config.time_zone becomes the runtime's default zone (ingest
 # synthesizes `config_time_zone` from the one config-DSL line the
 # render layer must honor; absent → "UTC", Rails' default). Rails
 # presents every AR temporal value in this zone REGARDLESS of the
-# host's zone — parse_db_time hydrates UTC then `.getlocal` lands
-# here, so strftime/iso8601/pubDate offsets match Rails on any host.
+# host's zone - parse_db_time hydrates UTC then `ActiveSupport.present`
+# lands it here, so strftime/iso8601/pubDate offsets match Rails on any
+# host - and leaves the process zone alone, so `Time.now` stays the
+# host's local time, as in Rails.
 tz_name = if Rails.application.respond_to?(:config_time_zone)
   Rails.application.config_time_zone
 else
   "UTC"
 end
-ENV["TZ"] = ActiveSupport::RAILS_TZ_TO_IANA.fetch(tz_name, tz_name)
+ActiveSupport.set_default_zone(tz_name)
 # Rails' fragment caching through the controller: reopens
 # `ActionView::ViewHelpers.fragment_read/_write`, so after every file that
 # defines them.
 require_relative "runtime/action_controller_fragment_caching"
+require_relative "runtime/public_files"
+require_relative "runtime/action_controller_page_caching"
+require_relative "runtime/solid_queue"
+require_relative "runtime/solid_queue_standin"
+require_relative "runtime/solid_queue_runner"
+require_relative "runtime/integration_session_cruby"
 # Rails 8.1.4's full ActionController::Head options hash is a Ruby-family
 # feature; strict non-Ruby targets keep the bounded shared implementation.
 require_relative "runtime/action_controller_head"
+# `Controller.action(name)`, which a gem's middleware calls (Warden's failure app).
+require_relative "runtime/action_controller_endpoint"
+require_relative "runtime/action_controller_render"
+# Rails' FlashHash keeps any key; the shared Flash keeps notice/alert, which every target can type.
+require_relative "runtime/flash_any_key"
+require_relative "runtime/active_record_attribute_keys"
+require_relative "runtime/route_helpers_routes"
+# Rails 8.1.4 `send_data(filename:)`: the Content-Disposition escaping
+# works over UTF-8 bytes, so it is a Ruby-family reopen as well.
+require_relative "runtime/action_controller_send_data"
 # The app/models.rb aggregator (generated — see apply_models_aggregator)
 # loads every model/support class. Model files only require their own
 # LOAD-time deps (superclass, class-body consts); method-body references

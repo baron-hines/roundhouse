@@ -1,20 +1,36 @@
 module ActiveRecord
-  # Same model handle and include list types as Relation (the Spinel
-  # tree widens `Base` here as it does there).
-  class PendingPreload
-    @model: Base
-    @records: Array[Base]
-    @specs: Array[Symbol | Hash[Symbol, Symbol]]
-    @done: bool
-    def initialize: (Base model, Array[Base] records, Array[Symbol | Hash[Symbol, Symbol]] specs) -> void
-    def run: () -> nil
+  # `where` casts of an enum column; see `relation.rb`.
+  def self.enum_where_int: (Integer | Float | bool | Symbol | String | nil value, Array[String] labels, Array[Integer] values, String nil_label) -> Integer?
+  def self.enum_where_str: (Integer | Float | bool | Symbol | String | nil value, Array[String] labels, Array[String] values, String nil_label) -> String?
+
+  # Lazy chainable query builder. Chain methods answer a new Relation
+  # and leave the receiver unchanged; terminals execute and return
+  # rows / scalars. Loaded records are `Base` as an interim (same as
+  # first/take) — not per-model. `Relation[T]` is the later refinement.
+  # `preloaded` and set-operator operands stay `untyped` for Spinel
+  # integer-seed arrays.
+  class EagerFilter
+    type nested_spec = Symbol | Hash[Symbol, Symbol] | Array[Symbol | Hash[Symbol, Symbol]] | nil
+    def initialize: (Array[Hash[Symbol, untyped]] conditions, Array[Hash[Symbol, untyped]] negations, Array[Hash[Symbol, untyped]] orders, nested_spec nested) -> void
+    def nested: () -> nested_spec
+    def conditions: () -> Array[Hash[Symbol, untyped]]
+    def negations: () -> Array[Hash[Symbol, untyped]]
+    def orders: () -> Array[Hash[Symbol, untyped]]
   end
 
-  # Lazy chainable query builder. Chain methods return `self` (typed as
-  # Relation); terminals execute and return rows / scalars. Loaded
-  # records are `Base` as an interim (same as first/take) — not
-  # per-model. `Relation[T]` is the later refinement. `preloaded` and
-  # set-operator operands stay `untyped` for Spinel integer-seed arrays.
+  # The value is a count, a grouped count's Hash or a `then` block's
+  # value; the analyzer types each Promise's value at its call site
+  # (`ActiveRecord::Promise[T]`), which RBS here cannot spell.
+  class Promise
+    def initialize: (untyped value) -> void
+    def value: () -> untyped
+    def pending?: () -> bool
+    def then: () { (untyped) -> untyped } -> Promise
+  end
+
+  class Promise::Complete < Promise
+  end
+
   class Relation
     # Model handle is `Base` (class object collapsed onto `Ty::Class{Base}`
     # in send.rs). Do not spell `Class` — that leaves `@model` as Ty::Var
@@ -22,11 +38,37 @@ module ActiveRecord
     # `untyped` (`spinel_relation_model_handle`): Spinel treats `Base` as
     # an instance (`sp_ActiveRecord__Base *`), so `Relation.new(User)`
     # would otherwise fail campfire AOT.
-    def initialize: (Base model) -> void
+    def initialize: (Base model, ?bool scoped) -> void
+    def apply_default_scope!: () -> nil
+    def self.unscoped_tables: () -> Array[String]
+    # Rails' current scope (`Relation#scoping`): the innermost scoping
+    # relation of the model on this thread; see `relation.rb`.
+    @inherited_scope: bool
+    def self.current_scope_for: (Base model) -> Relation?
+    def scoping: () { () -> untyped } -> untyped
+    def copy_query_state_to: (Relation target) -> Relation
+    def take_query_scalars: (
+        String? select_sql,
+        bool distinct,
+        String hints,
+        Integer? limit,
+        Integer? offset,
+        bool skip_preloading,
+        bool null,
+        bool none,
+        bool opaque,
+        String? from,
+        bool readonly,
+        String lock_clause,
+        bool friendly,
+        bool reordering
+      ) -> Relation
+    def drop_inherited_scope!: () -> Relation
 
     # Rails' Relation#spawn — copy query state onto a fresh Relation so
     # a scope fork cannot mutate its caller's accumulators.
     def spawn: () -> Relation
+    def unloaded_spawn: () -> Relation
     def own_lists: () -> Relation
     def take_query_lists: (
         Array[String] wheres,
@@ -37,16 +79,20 @@ module ActiveRecord
         Array[String] groups,
         Array[String] havings,
         Array[String] ctes,
-        Array[Symbol | Hash[Symbol, Symbol]] includes,
+        Array[Symbol | Hash[Symbol, Symbol | EagerFilter]] includes,
+        Array[String] references,
         Hash[Symbol, untyped] attrs
       ) -> Relation
     def copy_string_list: (Array[String] xs) -> Array[String]
     def copy_bool_list: (Array[bool] xs) -> Array[bool]
     def copy_cols_list: (Array[Array[String]] xs) -> Array[Array[String]]
-    def copy_symbol_list: (Array[Symbol | Hash[Symbol, Symbol]] xs) -> Array[Symbol | Hash[Symbol, Symbol]]
+    def copy_symbol_list: (Array[Symbol | Hash[Symbol, Symbol | EagerFilter]] xs) -> Array[Symbol | Hash[Symbol, Symbol | EagerFilter]]
     def copy_scope_attributes: (Hash[Symbol, untyped] attrs) -> Hash[Symbol, untyped]
 
     def where: (?(Hash[String | Symbol, untyped] | String | nil) condition, *untyped args) -> Relation
+    # In-place steps behind the chain methods (each chain method is
+    # `spawn` plus one of these); rest args arrive as one list.
+    def where_args!: (Hash[String | Symbol, untyped] | String | nil condition, Array[untyped] args) -> Relation
 
     # Query ivars the body reads after builders write them. Declared so
     # probes / RBS-seeded typing do not freeze on `initialize`'s `nil`
@@ -55,22 +101,32 @@ module ActiveRecord
     @limit: Integer?
     @offset: Integer?
     @records: Array[Base]?
-    @includes: Array[Symbol | Hash[Symbol, Symbol]]
+    @includes: Array[Symbol | Hash[Symbol, Symbol | EagerFilter]]
 
     @from: String?
     @ctes: Array[String]
     @shared_lists: bool
     @friendly: bool
+    @inverse_owner: Base?
+    @inverse_name: Symbol?
+    @reordering: bool
     # Rails NullRelation — `none` / empty IN. Kept across spawn/chain.
     @null: bool
+    @none: bool
     def unload_records: () -> void
     def null_relation?: () -> bool
+    def explicit_none?: () -> bool
     def mark_null!: () -> void
     def hash_has_empty_in?: (Hash[untyped, untyped]) -> bool
     def with_recursive: (Hash[Symbol, Array[Relation]] ctes) -> Relation
+    def with_recursive!: (Hash[Symbol, Array[Relation]] ctes) -> Relation
     def from: (String source) -> Relation
+    def from!: (String source) -> Relation
     def cte_prefix: () -> String
     def from_source: () -> String
+    def aggregate_column: (String column) -> String
+    def from_names_table?: () -> bool
+    def word_char?: (String char) -> bool
 
     # The association scope (`where_scope`) and what it presets on a
     # create (`scope_attributes`). The ivar is declared as well as the
@@ -84,19 +140,33 @@ module ActiveRecord
     def hash_column_name: (String col) -> String
     @opaque_wheres: bool
     def where_scope: (Hash[Symbol, untyped] condition) -> Relation
+    def where_scope!: (Hash[Symbol, untyped] condition) -> Relation
     def scope_attributes: () -> Hash[Symbol, untyped]
     def merge_seedable_scope: (Hash[String | Symbol, untyped] hash) -> void
     def not: (?(Hash[String | Symbol, untyped] | String | nil) condition, *untyped args) -> Relation
     def excluding: (*untyped records) -> Relation
+    def excluding_value!: (untyped val) -> Relation
     def without: (*untyped records) -> Relation
     def or: (Relation other) -> Relation
+    def or!: (Relation other) -> Relation
+    def and: (Relation other) -> Relation
+    def readonly: (?bool value) -> Relation
+    def readonly_value!: (bool value) -> Relation
+    def lock_clause!: (String clause) -> Relation
+    def and!: (Relation other) -> Relation
+    def structurally_incompatible_with: (Relation other) -> Array[String]
+    def structural_values: () -> Array[Array[String]]
     def push_where: (String sql) -> Relation
     def push_where_cols: (String sql, Array[String] cols, ?bool null_clause) -> Relation
     def pop_where: () -> String?
     def add_condition: (Hash[String | Symbol, untyped] | String | nil condition, Array[untyped] args, bool negate) -> bool
     def order: (*(String | Symbol | Hash[Symbol, Symbol | Hash[Symbol, Symbol]]) parts) -> Relation
+    def order_parts!: (Array[String | Symbol | Hash[Symbol, Symbol | Hash[Symbol, Symbol]]] parts) -> Relation
+    def reorder_parts!: (Array[String | Symbol | Hash[Symbol, Symbol | Hash[Symbol, Symbol]]] parts) -> Relation
     def order_sql: (String fragment) -> Relation
+    def order_sql!: (String fragment) -> Relation
     def reorder_sql: (String fragment) -> Relation
+    def reordered!: () -> Relation
     def clear_ordering: () -> Relation
     # In-memory sort of a LOADED relation. Records are `Base` (same
     # interim as first/take); `preloaded` stays bare for Spinel integer
@@ -119,7 +189,9 @@ module ActiveRecord
     # Request params (`limit(params[:n])`) are Strings; `sql_limit`
     # is Rails' Integer() and rejects SQL. nil clears, as in Rails.
     def limit: (Integer | Float | String | nil n) -> Relation
+    def limit!: (Integer | Float | String | nil n) -> Relation
     def offset: (Integer | String | nil n) -> Relation
+    def offset!: (Integer | String | nil n) -> Relation
     # LIMIT/OFFSET page arithmetic: `page` / `per` / `paginate` take
     # whatever the request handed over (a params String, an Integer or
     # nil) and read it through `to_s`.
@@ -137,11 +209,15 @@ module ActiveRecord
     def next_page: () -> Integer?
     def prev_page: () -> Integer?
     def group: (*(String | Symbol) parts) -> Relation
+    def group_parts!: (Array[String | Symbol] parts) -> Relation
     def having: (String condition, *untyped args) -> Relation
-    def joins: (String | Symbol spec) -> Relation
+    def having_args!: (String condition, Array[untyped] args) -> Relation
+    def joins: (*(String | Symbol) specs) -> Relation
+    def joins_specs!: (String method, Array[String | Symbol] specs) -> Relation
+    def joins!: (String | Symbol spec) -> Relation
     def join_fragment: (String | Symbol spec) -> String
-    def left_outer_joins: (String | Symbol spec) -> Relation
-    def left_joins: (String | Symbol spec) -> Relation
+    def left_outer_joins: (*(String | Symbol) specs) -> Relation
+    def left_joins: (*(String | Symbol) specs) -> Relation
     # Two methods sharing a name: field args PROJECT columns and keep
     # the Relation; a block is Enumerable's filter over the loaded
     # records and answers an Array (zero args means the block form —
@@ -151,18 +227,52 @@ module ActiveRecord
     # same method under Ruby's other name and DOES declare the block
     # shape, so a strict target that needs it has a spelling.
     def select: (*(String | Symbol) specs) -> Relation
-    def distinct: () -> Relation
-    def includes: (*(Symbol | Hash[Symbol, Symbol]) names) -> Relation
-    def preload: (*(Symbol | Hash[Symbol, Symbol]) names) -> Relation
-    def eager_load: (*(Symbol | Hash[Symbol, Symbol]) names) -> Relation
+    def select_specs!: (Array[String | Symbol] specs) -> Relation
+    def reselect: (*(String | Symbol) specs) -> Relation
+    def distinct: (?(bool | Symbol | String) value) -> Relation
+    def distinct!: (?(bool | Symbol | String) value) -> Relation
+    def optimizer_hints: (*String hints) -> Relation
+    def optimizer_hints!: (*String hints) -> Relation
+    @annotations: Array[String]
+    def annotate: (*String comments) -> Relation
+    def annotate!: (*String comments) -> Relation
+    def annotate_values: () -> Array[String]
+    def all: () -> Relation
+    def includes: (*(Symbol | Hash[Symbol, Symbol | EagerFilter]) names) -> Relation
+    def preload: (*(Symbol | Hash[Symbol, Symbol | EagerFilter]) names) -> Relation
+    def eager_load: (*(Symbol | Hash[Symbol, Symbol | EagerFilter]) names) -> Relation
+    def include_names!: (Array[Symbol | Hash[Symbol, Symbol | EagerFilter]] names) -> Relation
     def skip_preloading!: () -> Relation
     def preload_associations: (Array[Base] records) -> Array[Base]
     def references: (*Symbol names) -> Relation
+    def reference_names!: (Array[Symbol] names) -> Relation
+    def reference_names: () -> Array[String]
+    def merge_reference_names!: (Relation other) -> nil
     def merge: (Relation other) -> Relation
+    def merge!: (Relation other) -> Relation
+    def merge_orders!: (Relation other) -> nil
+    def merge_through_scope: (Relation? other) -> Relation
+    def qualify_order_term: (String term, String table) -> String
     def where_clauses: () -> Array[String]
+    def order_clauses: () -> Array[String]
+    def reordering?: () -> bool
+    def table_sql: () -> String
+    def having_clauses: () -> Array[String]
     def unscope: (?where: Symbol | String | Array[Symbol | String]?) -> Relation
+    def unscope!: (?where: Symbol | String | Array[Symbol | String]?) -> Relation
+    def unscope_where: () -> Relation
+    def unscope_parts: (Array[Symbol] parts) -> Relation
+    def unscope_part!: (Symbol part) -> Relation
+    def unscope_where!: () -> Relation
+    def except: (*Symbol skips) -> Relation
+    def only: (*Symbol onlies) -> Relation
+    def query_parts: () -> Array[Symbol]
+    def except_parts!: (Array[Symbol] skips) -> Relation
+    def split_parts!: (Array[Symbol] skips, Array[Symbol] group, bool held) -> nil
+    def except_part!: (Symbol part) -> Relation
     def arel: () -> Arel::SelectManager
     def none: () -> Relation
+    def none!: () -> Relation
     def reload: () -> Relation
     def load: () -> Relation
     def load_async: () -> Relation
@@ -175,7 +285,23 @@ module ActiveRecord
     # seeded `[]` in the constructor and therefore inferred as an int
     # array. Same over-claim as `map`/`collect` below.
     def preloaded: (untyped records, bool loaded) -> Relation
+    def _inversed_from: (Base owner, Symbol name) -> Relation
     def klass: () -> Class
+    def model: () -> Class
+    def primary_key: () -> String
+
+    # Collection cache key (see relation.rb for why it is not Rails'
+    # digest). Declared ivars so Bar A seeds them from the memoizing
+    # `||=` first-write rather than freezing on `initialize`'s absence.
+    @cache_keys: Hash[String, String]?
+    @cache_versions: Hash[String, String]?
+    CACHE_KEY_DIGEST_KEY: String
+    def cache_key: (?(String | Symbol) timestamp_column) -> String
+    def cache_version: (?(String | Symbol) timestamp_column) -> String
+    def compute_cache_version: (String timestamp_column) -> String
+    def windowed_cache_version: (String timestamp_column, bool has_column) -> String
+    def cache_key_with_version: () -> String
+    def query_digest_hex: (String str) -> String
 
     def to_a: () -> Array[Base]
     def load_records: () -> Array[Base]
@@ -185,6 +311,8 @@ module ActiveRecord
     def ==: (untyped other) -> bool
     def filter: () { (Base) -> bool } -> Array[Base]
     def map: () { (Base) -> untyped } -> untyped
+    def filter_map: () { (Base) -> untyped } -> untyped
+    def flat_map: () { (Base) -> untyped } -> untyped
     def to_h: () { (Base) -> Array[untyped] } -> Hash[untyped, untyped]
     def collect: () { (Base) -> untyped } -> untyped
     # `other` is `untyped`, NOT `Array[untyped]`, on all four set
@@ -206,7 +334,8 @@ module ActiveRecord
     def include?: (Base? record) -> bool
     def each: () { (Base) -> void } -> Relation
     def index_by: () { (Base) -> untyped } -> Hash[untyped, Base]
-    def find_each: () { (Base) -> void } -> Relation
+    def find_each: () ?{ (Base) -> void } -> Relation
+    def each_with_index: () ?{ (Base, Integer) -> void } -> (Relation | Enumerator[[Base, Integer], Array[Base]])
     def find_in_batches: () { (Array[Base]) -> void } -> Relation
     def in_batches: (?of: Integer, ?order: Symbol?) ?{ (Relation) -> void } -> Relation
     # `map`/`collect` return `untyped`, NOT `Array[untyped]`: the result's
@@ -216,20 +345,42 @@ module ActiveRecord
     # body built an `sp_IntArray *` for `{ |a| a.id }` — and the C build
     # stopped with no diagnostic naming the seed. The two agreed only for
     # as long as every id was boxed. Widen to `untyped` so the body
-    # decides the shape; `Array[U]` waits on Relation[T].
+    # decides the shape; `Array[U]` waits on Relation[T]. The same
+    # body inference applies to `filter_map` and `flat_map`, whose
+    # result element types also depend on the block.
     def group_by: () { (Base) -> untyped } -> Hash[untyped, Array[Base]]
     def partition: () { (Base) -> bool } -> Array[Array[Base]]
     def detect: () { (Base) -> bool } -> Base?
-    def sort_by: () { (Base) -> untyped } -> Array[Base]
+    def sort_by: () ?{ (Base) -> untyped } -> (Array[Base] | Enumerator[Base, Array[Base]])
     def inject: (untyped initial) { (untyped, Base) -> untyped } -> untyped
+    def reduce: (untyped initial) { (untyped, Base) -> untyped } -> untyped
     def each_with_object: (untyped memo) { (Base, untyped) -> untyped } -> untyped
     def first: () -> Base?
     def take: () -> Base?
+    def take!: () -> Base
     def first!: () -> Base
     def last: () -> Base?
+    def second: () -> Base?
+    def third: () -> Base?
+    def fourth: () -> Base?
+    def fifth: () -> Base?
+    def second_to_last: () -> Base?
+    def third_to_last: () -> Base?
+    def second!: () -> Base
+    def third!: () -> Base
+    def fourth!: () -> Base
+    def fifth!: () -> Base
+    def second_to_last!: () -> Base
+    def third_to_last!: () -> Base
+    def found_or_raise: (Base? record) -> Base
+    def find_nth: (Integer index) -> Base?
+    def find_nth_from_last: (Integer index) -> Base?
+    def ordered_spawn: () -> Relation
+    def row_at: (Array[Base] rows, Integer index) -> Base?
+    def row_from_end: (Array[Base] rows, Integer index) -> Base?
     def first_n: (Integer | Float | String n) -> Array[Base]
     def last_n: (Integer | Float | String n) -> Array[Base]
-    def count: () -> Integer
+    def count: () ?{ (Base) -> bool } -> Integer
     def sum: (String | Symbol expr) -> Float
     def minimum: (String | Symbol expr) -> untyped
     def maximum: (String | Symbol expr) -> untyped
@@ -239,14 +390,15 @@ module ActiveRecord
     private def cast_schema_value: (untyped value, Symbol column) -> untyped
     private def cast_schema_date: (untyped value) -> untyped
     def group_count: () -> Hash[untyped, Integer]
+    def async_count: (?(Symbol | String)? column) -> Promise
     def empty?: () -> bool
-    def any?: () -> bool
+    def any?: () ?{ (Base) -> bool } -> bool
     def blank?: () -> bool
     def present?: () -> bool
     def presence: () -> Relation?
-    def none?: () -> bool
-    def one?: () -> bool
-    def many?: () -> bool
+    def none?: () ?{ (Base) -> bool } -> bool
+    def one?: () ?{ (Base) -> bool } -> bool
+    def many?: () ?{ (Base) -> bool } -> bool
     def all?: () { (Base) -> bool } -> bool
     # Not `?condition`: the def takes `*conditions`, and spinel types a positional field by the def's own slot.
     def exists?: (*(Integer | String | Hash[String | Symbol, untyped] | nil | false) conditions) -> bool
@@ -258,6 +410,7 @@ module ActiveRecord
     def destroy_all: () -> Array[Base]
     def destroy_by: (Hash[Symbol, untyped] | String conditions) -> Array[Base]
     def delete_by: (Hash[Symbol, untyped] | String conditions) -> Integer
+    def delete: ((Integer | String | Array[Integer | String])? id_or_array) -> Integer
     def update_all: (Hash[Symbol, untyped] | String updates) -> Integer
     def touch_all: (?Symbol? name) -> Integer
     # The WHERE a bulk write takes — a plain clause, or an
@@ -279,12 +432,18 @@ module ActiveRecord
     # lowerer monomorphizing per call site from the schema.
     # `ids` is Array[Integer] for integer-key apps; string/uuid apps
     # widen it via `project::widen_key_contract` (#310).
-    def pluck: (String | Symbol col) -> Array[untyped]
-    def pick: (String | Symbol col) -> untyped
+    def pluck: (*(String | Symbol | Arel::Nodes::SqlLiteral) cols) -> Array[untyped]
+    def pluck_column_sql: (String | Symbol col) -> String
+    def pluck_sql: (Array[String | Symbol | Arel::Nodes::SqlLiteral] cols) -> Array[untyped]
+    def sql_projection_width: (String sql) -> Integer
+    def sql_item_width: (String item) -> Integer
+    def sql_unquoted: (String name) -> String
+    def pick: (*(String | Symbol) cols) -> untyped
     def ids: () -> Array[Integer]
     def find: (Integer | Float | String | Array[Integer | Float | String] | nil id) -> untyped
     def find_primary_key: (Integer | Float | String | Array[Integer | Float | String] | nil id) -> (Base | Array[Base])
     def friendly: () -> Relation
+    def friendly!: () -> Relation
     def friendly_find: (?(Integer | Float | String | Array[Integer | Float | String] | nil) id) -> (Base | Array[Base])
     def friendly_first: (?String id) -> Base?
     def friendly_history_first: (?String id) -> Base?
@@ -295,15 +454,21 @@ module ActiveRecord
     def sole: () -> Base
     def find_sole_by: (Hash[Symbol, untyped] | String | nil conditions) -> Base
     def first_or_initialize: () -> Base
-    def find_or_create_by: (Hash[Symbol, untyped] conditions) -> Base
-    def find_or_create_by!: (Hash[Symbol, untyped] conditions) -> Base
-    def find_or_initialize_by: (Hash[Symbol, untyped] conditions) -> Base
+    def find_or_create_by: (Hash[Symbol, untyped] conditions) ?{ (Base) -> void } -> Base
+    def create: (?Hash[Symbol, untyped] conditions) -> Base
+    def create!: (?Hash[Symbol, untyped] conditions) -> Base
+    def find_or_create_by!: (Hash[Symbol, untyped] conditions) ?{ (Base) -> void } -> Base
+    def find_or_initialize_by: (Hash[Symbol, untyped] conditions) ?{ (Base) -> void } -> Base
+    def build: (Hash[Symbol, untyped] conditions) -> Base
 
     def to_sql: () -> String
     def bound_sql: () -> String
     def to_subquery_sql: () -> String
     def select_sql_with: (String default_cols) -> String
+    def sql_comment: (String comment) -> String
+    def append_window: (String sql) -> String
     def append_join_where: (String sql) -> String
+    def rendered_joins: () -> Array[String]
     def append_group_having: (String sql) -> String
     def count_sql: () -> String
     def bound_count_sql: () -> String
@@ -312,8 +477,27 @@ module ActiveRecord
     def bound_exists_sql: (Integer n) -> String
     def hash_conditions: (Hash[String | Symbol, untyped] hash) -> String
     def column_predicate: (String col, Relation | Array[untyped] | Base | String | Integer | Float | bool | nil val) -> String
+    def range_predicate: (String qcol, untyped range) -> String
+    def bounds_predicate: (String qcol, Time | Date | String | Integer | Float | nil lower, Time | Date | String | Integer | Float | nil upper, bool exclusive) -> String
+    def range_bound_sql: (untyped bound) -> String?
+    def array_with_ranges_predicate: (String qcol, Array[untyped] vals) -> String
+    def integer_query_limit: (String col) -> Integer
+    def integer_value_predicate: (String qcol, String | Integer | Float | bool val, Integer limit) -> String
+    def integer_query_null?: (String | Integer | Float | bool val) -> bool
+    def integer_query_cast: (String | Integer | Float | bool val, Integer limit) -> ::ActiveRecord::IntegerKeyCast
+    def integer_list_predicate: (String qcol, Array[untyped] vals, Integer limit) -> String
+    def uuid_query_column?: (String col) -> bool
+    def uuid_value_predicate: (String qcol, String | Integer | Float | bool val) -> String
+    def uuid_record_key: (Base record) -> Integer?
+    def uuid_list_predicate: (String qcol, Array[untyped] vals) -> String
     def substitute_binds: (String sql, Array[untyped] args) -> String
     def substitute_named_binds: (String sql, Hash[Symbol, untyped] binds) -> String
+    def bound_text: (untyped value) -> String
+    def column_bound_value: (String col, untyped val) -> untyped
+    def integer_column?: (String col) -> bool
+    def enum_column?: (String col) -> bool
+    def list_predicate: (String col, String qcol, Array[untyped] val) -> String
+    def enum_list_predicate: (String col, String qcol, Array[Integer | Float | bool | Symbol | String | Base | Range[untyped] | nil] val) -> String
     def named_bind_start?: (String ch) -> bool
     def named_bind_char?: (String ch) -> bool
     def escape_list: (Array[untyped] vals) -> String
@@ -326,6 +510,7 @@ module ActiveRecord
     def self.bind_kind: (String text) -> String
     def order_term: (String | Symbol | Hash[Symbol, Symbol | Hash[Symbol, Symbol]] p) -> String
     def format_order_hash: (Hash[Symbol, untyped] h) -> String
+    def quote_qualified_ident: (String name) -> String
     def sql_limit: (Integer | Float | String n) -> Integer
     def order_direction: (String | Symbol dir) -> String
     def sql_ident: (String | Symbol name) -> String

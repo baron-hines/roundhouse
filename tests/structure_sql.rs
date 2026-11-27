@@ -16,6 +16,45 @@ fn tree(files: &[(&str, &str)]) -> HashMap<PathBuf, Vec<u8>> {
     files.iter().map(|(p, c)| (PathBuf::from(*p), c.as_bytes().to_vec())).collect()
 }
 
+#[test]
+fn column_primary_keys_are_retained_without_reading_default_text_as_constraints() {
+    let schema = ingest_structure_sql(
+        b"CREATE TABLE jobs (id bigserial PRIMARY KEY, label text DEFAULT 'PRIMARY KEY');",
+        "db/structure.sql",
+    ).unwrap();
+    let table = schema.tables.get(&Symbol::from("jobs")).unwrap();
+    assert!(col(table, "id").primary_key);
+    assert!(!col(table, "label").primary_key);
+}
+
+#[test]
+fn escape_string_defaults_keep_their_quoted_words_out_of_constraints() {
+    let schema = ingest_structure_sql(
+        b"CREATE TABLE notes (\n  id bigserial PRIMARY KEY,\n  body text DEFAULT E'prefix \\' PRIMARY KEY' || E'suffix \\'x',\n  title text DEFAULT 'plain'\n);",
+        "db/structure.sql",
+    ).unwrap();
+    let table = schema.tables.get(&Symbol::from("notes")).unwrap();
+    assert!(col(table, "id").primary_key);
+    assert!(!col(table, "body").primary_key);
+    assert!(!col(table, "title").primary_key);
+}
+
+#[test]
+fn an_identifier_ending_in_e_before_a_quote_is_not_an_escape_string() {
+    let schema = ingest_structure_sql(
+        br"CREATE TABLE notes (
+  id bigserial PRIMARY KEY,
+  code text DEFAULT tag$e'x\' || 'y',
+  title text DEFAULT 'plain'
+);",
+        "db/structure.sql",
+    ).unwrap();
+    let table = schema.tables.get(&Symbol::from("notes")).unwrap();
+    assert!(col(table, "id").primary_key);
+    assert!(table.columns.iter().any(|c| c.name.as_str() == "title"));
+    assert!(!col(table, "title").primary_key);
+}
+
 /// A small hand-rolled `pg_dump`-shaped dump covering the constructs
 /// `ingest_structure_sql` is expected to model plus the ones it must
 /// ledger rather than silently drop.
@@ -195,9 +234,9 @@ fn ingests_tables_columns_indexes_fk_and_pk() {
 
     // Foreign key.
     let fk = widgets.foreign_keys.first().expect("one foreign key");
-    assert_eq!(fk.from_column.as_str(), "company_id");
+    assert_eq!(fk.from_columns[0].as_str(), "company_id");
     assert_eq!(fk.to_table.0.as_str(), "companies");
-    assert_eq!(fk.to_column.as_str(), "id");
+    assert_eq!(fk.to_columns[0].as_str(), "id");
     assert!(matches!(fk.on_delete, roundhouse::schema::ReferentialAction::Cascade));
 
     // Ledgered gaps: the dropped tstzrange column and the unmodeled view.
@@ -260,7 +299,7 @@ fn index_access_method_keyword_requires_a_token_boundary() {
 }
 
 #[test]
-fn composite_primary_and_foreign_keys_are_ledgered_not_narrowed() {
+fn composite_primary_keys_are_kept_whole_and_foreign_keys_ledgered_not_narrowed() {
     let sql = r#"
 CREATE TABLE public.assignments (
     project_id bigint NOT NULL,
@@ -288,8 +327,36 @@ ALTER TABLE ONLY public.assignments
     assert!(assignments.foreign_keys.is_empty(), "composite fk never narrowed to one column pair");
 
     let messages: Vec<String> = gaps.iter().map(|g| format!("{g}")).collect();
-    assert!(messages.iter().any(|m| m.contains("primary key dropped") && m.contains("composite")), "{messages:?}");
+    assert_eq!(assignments.primary_key_columns, [Symbol::from("project_id"), Symbol::from("user_id")]);
+    assert!(!messages.iter().any(|m| m.contains("primary key dropped")), "a composite key is kept, not ledgered: {messages:?}");
     assert!(messages.iter().any(|m| m.contains("foreign key dropped") && m.contains("composite")), "{messages:?}");
+}
+
+#[test]
+fn foreign_key_timing_follows_postgres() {
+    use roundhouse::emit::shared::schema_sql::{Dialect, render_schema_statements_for};
+    use roundhouse::schema::Deferrable::{Deferred, Immediate};
+    // The timing PostgreSQL 18 records for each clause. pg_dump spells a
+    // deferrable key only the first two ways.
+    let cases = [
+        ("deferred", "ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED", Some(Deferred)),
+        ("bare", "DEFERRABLE", Some(Immediate)),
+        ("immediate", "DEFERRABLE INITIALLY IMMEDIATE", Some(Immediate)),
+        ("implied", "INITIALLY DEFERRED", Some(Deferred)),
+        ("never", "NOT DEFERRABLE", None),
+        ("plain", "", None),
+    ];
+    let mut sql = String::from("CREATE TABLE public.parents (\n    id bigint NOT NULL\n);\n\nALTER TABLE ONLY public.parents\n    ADD CONSTRAINT parents_pkey PRIMARY KEY (id);\n");
+    for (name, clause, _) in cases {
+        sql.push_str(&format!("\nCREATE TABLE public.{name}_children (\n    parent_id bigint\n);\n\nALTER TABLE ONLY public.{name}_children\n    ADD CONSTRAINT fk_{name} FOREIGN KEY (parent_id) REFERENCES public.parents(id) {clause};\n"));
+    }
+    let schema = ingest_structure_sql(sql.as_bytes(), "db/structure.sql").unwrap();
+    for (name, _, timing) in cases {
+        assert_eq!(schema.tables[&Symbol::from(format!("{name}_children"))].foreign_keys[0].deferrable, timing, "{name}");
+    }
+    let ddl = render_schema_statements_for(&schema, Dialect::Sqlite).unwrap();
+    let deferred = ddl.iter().find(|s| s.starts_with("CREATE TABLE IF NOT EXISTS deferred_children ")).unwrap();
+    assert!(deferred.contains("ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED"), "{deferred}");
 }
 
 #[test]
@@ -385,8 +452,8 @@ CREATE VIEW public.view_two AS SELECT memberships.org_id FROM public.memberships
             .collect()
     };
 
-    let pk_keys = keys_for("primary key dropped");
-    assert_eq!(pk_keys.len(), 1, "both composite PKs should bucket together: {pk_keys:?}");
+    // Composite primary keys are kept (`Table.primary_key_columns`), not ledgered.
+    assert!(keys_for("primary key dropped").is_empty());
 
     let fk_keys = keys_for("foreign key dropped");
     assert_eq!(fk_keys.len(), 1, "both composite FKs should bucket together: {fk_keys:?}");
@@ -432,12 +499,80 @@ ALTER TABLE ONLY shard.readings_p0
         !schema.tables.contains_key(&Symbol::from("readings_p0")),
         "the attached shard is retracted, not modeled as its own table"
     );
-    // Exactly one composite-pk gap (the parent's), not two — the
-    // shard's own later `ADD CONSTRAINT ... PRIMARY KEY` targets a
-    // table this Schema no longer has, and is silently skipped rather
-    // than ledgering a gap for a table nobody will ever see.
-    let pk_gaps = gaps.iter().filter(|g| format!("{g}").contains("primary key dropped")).count();
-    assert_eq!(pk_gaps, 1, "{gaps:?}");
+    // The parent keeps its composite key; the shard's own later `ADD
+    // CONSTRAINT ... PRIMARY KEY` targets a table this Schema no longer
+    // has, and is silently skipped.
+    assert_eq!(
+        schema.tables[&Symbol::from("readings")].primary_key_columns,
+        [Symbol::from("id"), Symbol::from("shard_key")]
+    );
+    assert!(!gaps.iter().any(|g| format!("{g}").contains("primary key dropped")), "{gaps:?}");
+}
+
+/// pg_dump writes an index on a partitioned table as `CREATE INDEX …
+/// ON ONLY parent`, then one index per partition and an `ALTER INDEX …
+/// ATTACH PARTITION` joining each to the parent's. `ONLY` used to be read
+/// as the table name, so every such index was ledgered as a clause before
+/// the column list. The parent keeps the index; the partitions' indexes
+/// stay out with the partitions.
+#[test]
+fn an_index_on_only_a_partitioned_parent_is_the_parents_index() {
+    let sql = r#"
+CREATE TABLE public.events (
+    id bigint NOT NULL,
+    account_id bigint NOT NULL,
+    created_at timestamp(6) without time zone NOT NULL,
+    status integer
+)
+PARTITION BY RANGE (created_at);
+
+CREATE TABLE public.events_2026_06 (
+    id bigint NOT NULL,
+    account_id bigint NOT NULL,
+    created_at timestamp(6) without time zone NOT NULL,
+    status integer
+);
+
+CREATE TABLE public.only_items (
+    id bigint NOT NULL
+);
+
+ALTER TABLE ONLY public.events ATTACH PARTITION public.events_2026_06 FOR VALUES FROM ('2026-06-01 00:00:00') TO ('2026-07-01 00:00:00');
+
+CREATE UNIQUE INDEX idx_events_tenant_identity ON ONLY public.events USING btree (id, created_at, account_id);
+
+CREATE INDEX index_events_on_failures ON ONLY public.events USING btree (status, created_at DESC) WHERE (status >= 400);
+
+CREATE INDEX index_events_on_account_id ON ONLY public.events (account_id);
+
+CREATE UNIQUE INDEX events_2026_06_id_created_at_account_id_idx ON public.events_2026_06 USING btree (id, created_at, account_id);
+
+CREATE INDEX index_only_items_on_id ON only_items USING btree (id);
+
+ALTER INDEX public.idx_events_tenant_identity ATTACH PARTITION public.events_2026_06_id_created_at_account_id_idx;
+"#;
+    survey::activate();
+    let schema = ingest_structure_sql(sql.as_bytes(), "db/structure.sql").expect("survey mode never errors");
+    let gaps = survey::drain();
+    assert!(gaps.is_empty(), "{gaps:?}");
+
+    let indexes: Vec<(&str, bool, Option<&str>, Option<&str>)> = schema.tables[&Symbol::from("events")]
+        .indexes
+        .iter()
+        .map(|i| (i.name.as_str(), i.unique, i.using.as_deref(), i.predicate.as_deref()))
+        .collect();
+    // `index_events_on_failures` has a `DESC` column, which is skipped
+    // like any other non-plain column, `ONLY` or not.
+    assert_eq!(
+        indexes,
+        vec![
+            ("idx_events_tenant_identity", true, Some("btree"), None),
+            ("index_events_on_account_id", false, None, None),
+        ]
+    );
+    assert!(!schema.tables.contains_key(&Symbol::from("events_2026_06")));
+    // A table whose name starts with `only` is not read as `ONLY`.
+    assert_eq!(schema.tables[&Symbol::from("only_items")].indexes.len(), 1);
 }
 
 /// `CREATE … INDEX … WHERE (…)` keeps its predicate, as `where:` in
@@ -529,4 +664,97 @@ fn other_meta_commands_and_literals_are_left_alone() {
     let schema = ingest_structure_sql(sql.as_bytes(), "db/structure.sql").expect("strict ingest");
     let notes = &schema.tables[&Symbol::from("notes")];
     assert_eq!(col(notes, "body").default.as_deref(), Some("first line\n\\restrict kept"));
+}
+
+#[test]
+fn named_not_null_constraints_keep_the_column() {
+    // PostgreSQL 18 pg_dump names a column's NOT NULL whenever the stored
+    // constraint name is not `<table>_<column>_not_null`: renamed tables,
+    // partitions, and names truncated at 63 bytes.
+    let sql = r#"
+CREATE TABLE public.user_identities (
+    id uuid NOT NULL,
+    first_name text,
+    email character varying CONSTRAINT identities_email_not_null NOT NULL,
+    created_at timestamp(6) without time zone CONSTRAINT identities_created_at_not_null NOT NULL,
+    nickname text DEFAULT 'x'::text CONSTRAINT identities_nickname_not_null NOT NULL,
+    handle text CONSTRAINT "Identities handle not null" NOT NULL,
+    display_name text GENERATED ALWAYS AS (first_name) STORED CONSTRAINT identities_display_name_not_null NOT NULL
+);
+"#;
+    let schema = ingest_structure_sql(sql.as_bytes(), "db/structure.sql").expect("strict ingest");
+    let table = &schema.tables[&Symbol::from("user_identities")];
+    for name in ["email", "created_at", "nickname", "handle", "display_name"] {
+        assert!(!col(table, name).nullable, "{name} keeps NOT NULL");
+    }
+    assert!(col(table, "first_name").nullable);
+    assert!(matches!(col(table, "email").col_type, ColumnType::String { .. }));
+    assert!(matches!(col(table, "created_at").col_type, ColumnType::DateTime));
+    assert_eq!(col(table, "nickname").default.as_deref(), Some("x"));
+    assert_eq!(col(table, "display_name").generated.as_ref().expect("generated").expression, "first_name");
+}
+
+#[test]
+fn a_named_column_constraint_other_than_nullability_is_refused() {
+    // Only the nullability clause is modeled after `CONSTRAINT name`. A
+    // named key, check, uniqueness or reference must fail ingest rather
+    // than be read as a plain nullable column.
+    for (clause, quoted) in [
+        ("CONSTRAINT people_id_pkey PRIMARY KEY", "CONSTRAINT people_id_pkey PRIMARY KEY"),
+        ("CONSTRAINT people_id_key UNIQUE", "CONSTRAINT people_id_key UNIQUE"),
+        ("CONSTRAINT people_id_check CHECK (id > 0)", "CONSTRAINT people_id_check CHECK (id > 0)"),
+        ("CONSTRAINT people_id_fkey REFERENCES public.users(id)", "CONSTRAINT people_id_fkey REFERENCES public.users(id)"),
+        ("NOT NULL CONSTRAINT people_id_pkey PRIMARY KEY", "CONSTRAINT people_id_pkey PRIMARY KEY"),
+    ] {
+        let sql = format!("CREATE TABLE public.people (\n    id bigint {clause}\n);\n");
+        let error = ingest_structure_sql(sql.as_bytes(), "db/structure.sql")
+            .expect_err(clause)
+            .to_string();
+        assert!(
+            error.contains(&format!("column dropped: people.id has unsupported column constraint `{quoted}`")),
+            "{clause}: {error}"
+        );
+    }
+}
+
+#[test]
+fn a_constraint_keyword_needs_a_name() {
+    // `NOT` is a reserved word, so it cannot be the constraint's name:
+    // `CONSTRAINT NOT NULL` is malformed, not a named NOT NULL.
+    let quoted = "CREATE TABLE public.people (\n    email text CONSTRAINT \"not\" NOT NULL\n);\n";
+    let schema = ingest_structure_sql(quoted.as_bytes(), "db/structure.sql").expect("a quoted reserved word is a name");
+    assert!(!col(&schema.tables[&Symbol::from("people")], "email").nullable);
+
+    let plain = "CREATE TABLE public.people (\n    email text CONSTRAINT NOT NULL\n);\n";
+    let error = ingest_structure_sql(plain.as_bytes(), "db/structure.sql")
+        .expect_err("unnamed CONSTRAINT")
+        .to_string();
+    assert!(error.contains("column dropped: people.email has unsupported column constraint `CONSTRAINT NOT NULL`"), "{error}");
+
+    let generated = r#"
+CREATE TABLE public.people (
+    id bigint NOT NULL,
+    first_name text,
+    display_name text GENERATED ALWAYS AS (first_name) STORED CONSTRAINT NOT NULL
+);
+"#;
+    let error = ingest_structure_sql(generated.as_bytes(), "db/structure.sql")
+        .expect_err("unnamed CONSTRAINT after GENERATED")
+        .to_string();
+    assert!(error.contains("people.display_name"), "{error}");
+}
+
+#[test]
+fn a_constraint_keyword_without_a_not_null_still_fails_after_generated() {
+    let sql = r#"
+CREATE TABLE public.people (
+    id bigint NOT NULL,
+    first_name text,
+    display_name text GENERATED ALWAYS AS (first_name) STORED CONSTRAINT people_display_name_check
+);
+"#;
+    let error = ingest_structure_sql(sql.as_bytes(), "db/structure.sql")
+        .expect_err("a dangling constraint name is not a nullability clause")
+        .to_string();
+    assert!(error.contains("generated column dropped: people.display_name"), "{error}");
 }

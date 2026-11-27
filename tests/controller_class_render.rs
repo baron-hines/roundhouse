@@ -24,10 +24,12 @@ fn tree(files: &[(&str, &str)]) -> HashMap<PathBuf, Vec<u8>> {
         .collect()
 }
 
-fn app_with(partial_body: &str, call: &str) -> App {
+fn app_with(partial: &str, partial_body: &str, call: &str) -> App {
     let helper = format!(
         "require \"test_helper\"\n\nclass UserTest < ActiveSupport::TestCase\n  test \"renders\" do\n    frag = {call}\n    assert frag\n  end\nend\n"
     );
+    let partial_path = format!("app/views/users/_{partial}.html.erb");
+    let show = format!("<%= render partial: \"users/{partial}\", locals: {{ user: @user }} %>\n");
     let mut app = ingest_app_from_tree(tree(&[
         (
             "db/schema.rb",
@@ -38,8 +40,8 @@ fn app_with(partial_body: &str, call: &str) -> App {
             "app/controllers/users_controller.rb",
             "class UsersController < ApplicationController\n  def show\n    @user = User.first\n  end\nend\n",
         ),
-        ("app/views/users/_mention.html.erb", Box::leak(partial_body.to_string().into_boxed_str())),
-        ("app/views/users/show.html.erb", "<%= render partial: \"users/mention\", locals: { user: @user } %>\n"),
+        (partial_path.as_str(), partial_body),
+        ("app/views/users/show.html.erb", show.as_str()),
         ("test/models/user_test.rb", Box::leak(helper.into_boxed_str())),
     ]))
     .expect("ingest class-render app");
@@ -48,7 +50,10 @@ fn app_with(partial_body: &str, call: &str) -> App {
 }
 
 fn test_ir(partial_body: &str, call: &str) -> String {
-    let app = app_with(partial_body, call);
+    ir_of(&app_with("mention", partial_body, call))
+}
+
+fn ir_of(app: &App) -> String {
     app.test_modules
         .iter()
         .flat_map(|m| m.tests.iter().map(|t| format!("{:?}", t.body)))
@@ -95,4 +100,54 @@ fn an_unread_option_declines() {
         "ApplicationController.render partial: \"users/mention\", locals: { user: User.first }, formats: :html",
     );
     assert!(ir.contains("Symbol(\"render\")"), "left alone: {ir}");
+}
+
+/// Rails' class-side renderer renders through a controller of its own,
+/// with no request behind it: the call is bracketed the way a broadcast
+/// render is, so `controller` inside it is the detached controller.
+#[test]
+fn a_class_side_render_takes_the_renderer_bracket() {
+    let ir = test_ir(
+        "<span><%= user.name %></span>\n",
+        "ApplicationController.render partial: \"users/mention\", locals: { user: User.first }",
+    );
+    assert!(ir.contains("Symbol(\"begin_broadcast_render\")"), "{ir}");
+    assert!(ir.contains("Symbol(\"broadcast_render\")"), "{ir}");
+}
+
+/// `collection:` renders the partial once per element, bound to its
+/// record local, concatenated. A literal `cached:` is the renderer
+/// controller's to answer, and the detached one caches nothing.
+#[test]
+fn a_collection_render_maps_the_partial_over_its_elements() {
+    let ir = test_ir(
+        "<span><%= user.name %></span>\n",
+        "ApplicationController.render partial: \"users/mention\", collection: [ User.first ], cached: true",
+    );
+    assert!(ir.contains("Symbol(\"map\")") && ir.contains("Symbol(\"join\")"), "{ir}");
+    assert!(ir.contains("Symbol(\"mention\")"), "{ir}");
+    assert!(!ir.contains("Symbol(\"render\")"), "no class-side render may survive: {ir}");
+}
+
+/// A computed `cached:` is a key this does not read: left alone.
+#[test]
+fn a_computed_collection_cache_key_declines() {
+    let ir = test_ir(
+        "<span><%= user.name %></span>\n",
+        "ApplicationController.render partial: \"users/mention\", collection: [ User.first ], cached: ->(u) { u }",
+    );
+    assert!(ir.contains("Symbol(\"render\")"), "left alone: {ir}");
+}
+
+/// The call names the partial by the method its definition has, not by
+/// its stem: `_new` defines `_new` (`view_method_name`).
+#[test]
+fn a_partial_named_new_is_called_by_its_defined_method() {
+    let ir = ir_of(&app_with(
+        "new",
+        "<span><%= user.name %></span>\n",
+        "ApplicationController.render partial: \"users/new\", locals: { user: User.first }",
+    ));
+    assert!(ir.contains("Symbol(\"_new\")"), "the partial's defined method: {ir}");
+    assert!(!ir.contains("Symbol(\"render\")"), "no class-side render may survive: {ir}");
 }

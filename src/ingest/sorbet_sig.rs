@@ -18,16 +18,17 @@
 //! `spinel_rbs_extract` drops RBS it cannot represent. Dropping is a
 //! no-op; guessing is not.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use ruby_prism::Node;
 
 use crate::ident::{ClassId, Symbol};
 use crate::effect::EffectSet;
-use crate::ty::{Param, ParamKind, Ty};
+use crate::ty::{FnTy, Param, ParamKind, Ty};
 
 use super::util::constant_id_str;
 
+use crate::ingest::prism_api::PrismLocation;
 /// Method signatures declared with `sig` in one Ruby file, keyed by the
 /// enclosing class's qualified name.
 pub fn ingest_sorbet_signatures(source: &[u8]) -> HashMap<ClassId, HashMap<Symbol, Ty>> {
@@ -41,22 +42,22 @@ pub fn ingest_sorbet_declarations(
     source: &[u8],
 ) -> (
     HashMap<ClassId, HashMap<Symbol, Ty>>,
-    HashMap<ClassId, std::collections::HashSet<Symbol>>,
+    HashMap<ClassId, crate::det::HashSet<Symbol>>,
 ) {
-    let result = ruby_prism::parse(source);
+    let result = super::prism::parse_silent(source);
     let node = result.node();
     let Some(program) = node.as_program_node() else {
-        return (HashMap::new(), HashMap::new());
+        return (HashMap::default(), HashMap::default());
     };
-    let mut out: HashMap<ClassId, HashMap<Symbol, Ty>> = HashMap::new();
-    let mut abstracts = HashMap::new();
-    let mut sides = MethodSides::new();
+    let mut out: HashMap<ClassId, HashMap<Symbol, Ty>> = HashMap::default();
+    let mut abstracts = HashMap::default();
+    let mut sides = MethodSides::default();
     walk(
         &program.statements().body().iter().collect::<Vec<_>>(),
         None,
         false,
-        &HashMap::new(),
-        &HashMap::new(),
+        &HashMap::default(),
+        &HashMap::default(),
         &mut out,
         &mut abstracts,
         &mut sides,
@@ -76,8 +77,46 @@ pub fn ingest_sorbet_declarations(
                 .get(&(class.clone(), name.clone()))
                 .is_some_and(|(instance, singleton)| *instance && *singleton)
         });
+        for ty in methods.values_mut() {
+            *ty = unnamed_relation_is_gradual(ty);
+        }
     }
     (out, abstracts)
+}
+
+/// A relation type that does not name its model, `ActiveRecord::Relation`
+/// (`::AssociationRelation`, `::Associations::CollectionProxy`) with no
+/// arguments, is `untyped`. Sorbet's per-model `Foo::PrivateRelation` has no
+/// RBS spelling, so signatures write the bare Rails class; the registry has
+/// no class of that name, and reading it as one made every query on the
+/// value (`where`, `exists?`, `find_by`, `each`) a `no known method`. The
+/// model it ranges over is not written down, so neither is the element type.
+fn unnamed_relation_is_gradual(ty: &Ty) -> Ty {
+    let go = unnamed_relation_is_gradual;
+    match ty {
+        Ty::Class { id, args } if args.is_empty() && matches!(
+            id.0.as_str().trim_start_matches("::"),
+            "ActiveRecord::Relation" | "ActiveRecord::AssociationRelation" | "ActiveRecord::Associations::CollectionProxy"
+        ) => Ty::Untyped,
+        Ty::Class { id, args } => Ty::Class { id: id.clone(), args: args.iter().map(go).collect() },
+        Ty::Array { elem } => Ty::Array { elem: std::sync::Arc::new(go(elem)) },
+        Ty::Hash { key, value } => Ty::Hash { key: std::sync::Arc::new(go(key)), value: std::sync::Arc::new(go(value)) },
+        Ty::Tuple { elems } => Ty::Tuple { elems: elems.iter().map(go).collect() },
+        Ty::Union { variants } => Ty::Union { variants: variants.iter().map(go).collect() },
+        Ty::Fn(fn_ty) => {
+            let FnTy { params, block, ret, effects } = &**fn_ty;
+            Ty::Fn(Box::new(FnTy {
+                params: params
+                    .iter()
+                    .map(|p| Param { name: p.name.clone(), ty: std::sync::Arc::new(go(&p.ty)), kind: p.kind.clone() })
+                    .collect(),
+                block: block.as_ref().map(|b| std::sync::Arc::new(go(b))),
+                ret: std::sync::Arc::new(go(ret)),
+                effects: effects.clone(),
+            }))
+        }
+        other => other.clone(),
+    }
 }
 
 /// Which sides of a class define each method name: `(instance,
@@ -91,15 +130,16 @@ type MethodSides = HashMap<(ClassId, Symbol), (bool, bool)>;
 /// there, not an instance of it.
 fn walk(
     statements: &[Node<'_>],
-    scope: Option<&str>,
+    scope: Option<(&str, bool)>,
     in_singleton_class: bool,
     aliases: &HashMap<String, Ty>,
     rbs_aliases: &crate::rbs::AliasTable,
     out: &mut HashMap<ClassId, HashMap<Symbol, Ty>>,
-    abstracts: &mut HashMap<ClassId, std::collections::HashSet<Symbol>>,
+    abstracts: &mut HashMap<ClassId, crate::det::HashSet<Symbol>>,
     sides: &mut MethodSides,
     source: &[u8],
 ) {
+    let (scope, nesting_matches) = scope.map_or((None, true), |(name, matches)| (Some(name), matches));
     // The `sig` immediately above a `def` is the one that applies to
     // it; anything else between them (a comment is not a statement,
     // but another call is) means the pairing is not ours to guess.
@@ -129,7 +169,7 @@ fn walk(
                     // matter; an enclosing scope's aliases stay visible.
                     let inner = collect_type_aliases(&statements, aliases);
                     let inner_rbs = scoped_rbs_aliases(source, class.location(), &statements, rbs_aliases);
-                    walk(&statements, Some(&name), false, &inner, &inner_rbs, out, abstracts, sides, source);
+                    walk(&statements, Some((&name, nesting_matches && class.constant_path().as_constant_read_node().is_some())), false, &inner, &inner_rbs, out, abstracts, sides, source);
                 }
             }
             pending = None;
@@ -142,7 +182,7 @@ fn walk(
                     let statements = body.body().iter().collect::<Vec<_>>();
                     let inner = collect_type_aliases(&statements, aliases);
                     let inner_rbs = scoped_rbs_aliases(source, module.location(), &statements, rbs_aliases);
-                    walk(&statements, Some(&name), false, &inner, &inner_rbs, out, abstracts, sides, source);
+                    walk(&statements, Some((&name, nesting_matches && module.constant_path().as_constant_read_node().is_some())), false, &inner, &inner_rbs, out, abstracts, sides, source);
                 }
             }
             pending = None;
@@ -157,7 +197,8 @@ fn walk(
         if let Some(singleton) = statement.as_singleton_class_node() {
             if let Some(body) = singleton.body() {
                 if let Some(body) = body.as_statements_node() {
-                    walk(&body.body().iter().collect::<Vec<_>>(), scope, true, aliases, rbs_aliases, out, abstracts, sides, source);
+                    // The sidecar has no eigenclass lexical scope.
+                    walk(&body.body().iter().collect::<Vec<_>>(), scope.map(|name| (name, false)), true, aliases, rbs_aliases, out, abstracts, sides, source);
                 }
             }
             pending = None;
@@ -165,6 +206,8 @@ fn walk(
         }
         if let Some(def) = statement.as_def_node() {
             if let Some(scope) = scope {
+                // A replacement without an accepted signature owns no spellings.
+                crate::rbs::file_spellings(&ClassId(Symbol::new(scope)), &Symbol::new(constant_id_str(&def.name())), Default::default(), nesting_matches);
                 let entry = sides
                     .entry((ClassId(Symbol::new(scope)), Symbol::new(constant_id_str(&def.name()))))
                     .or_default();
@@ -181,17 +224,19 @@ fn walk(
                         .or_default()
                         .insert(Symbol::new(constant_id_str(&def.name())));
                 }
-                if let Some(ty) = signature_ty(&statements[sig], &def, in_singleton_class, aliases) {
-                    out.entry(ClassId(Symbol::new(scope)))
-                        .or_default()
-                        .insert(Symbol::new(constant_id_str(&def.name())), ty);
+                let (ty, spelled) = crate::rbs::spelled(|| signature_ty(&statements[sig], &def, in_singleton_class, aliases));
+                if let Some(ty) = ty {
+                    let name = Symbol::new(constant_id_str(&def.name()));
+                    crate::rbs::file_spellings(&ClassId(Symbol::new(scope)), &name, spelled, nesting_matches);
+                    out.entry(ClassId(Symbol::new(scope))).or_default().insert(name, ty);
                 }
             }
             else if let Some(scope) = scope {
-                if let Some(ty) = rbs_comment_signature(source, &def, in_singleton_class, rbs_aliases) {
-                    out.entry(ClassId(Symbol::new(scope)))
-                        .or_default()
-                        .insert(Symbol::new(constant_id_str(&def.name())), ty);
+                let (ty, spelled) = crate::rbs::spelled(|| rbs_comment_signature(source, &def, in_singleton_class, rbs_aliases));
+                if let Some(ty) = ty {
+                    let name = Symbol::new(constant_id_str(&def.name()));
+                    crate::rbs::file_spellings(&ClassId(Symbol::new(scope)), &name, spelled, nesting_matches);
+                    out.entry(ClassId(Symbol::new(scope))).or_default().insert(name, ty);
                 }
             }
             continue;
@@ -237,19 +282,19 @@ fn collect_struct_properties(
         let Some(arguments) = call.arguments() else { continue };
         let mut arguments = arguments.arguments().iter();
         let Some(name) = arguments.next().and_then(|n| symbol_name(&n)) else { continue };
-        let Some(ty) = arguments.next().and_then(|n| sorbet_ty(&n, true, &HashMap::new())) else { continue };
-        let reader = Ty::Fn {
+        let Some(ty) = arguments.next().and_then(|n| sorbet_ty(&n, true, &HashMap::default())) else { continue };
+        let reader = Ty::Fn(Box::new(FnTy {
             params: Vec::new().into(),
             block: None,
             ret: std::sync::Arc::new(ty.clone()),
             effects: EffectSet::pure(),
-        };
+        }));
         let class = out.entry(ClassId(Symbol::new(class_name))).or_default();
         class.insert(Symbol::new(&name), reader);
         if writable {
             class.insert(
                 Symbol::new(&format!("{name}=")),
-                Ty::Fn {
+                Ty::Fn(Box::new(FnTy {
                     params: vec![Param {
                         name: Symbol::new("value"),
                         ty: ty.clone().into(),
@@ -258,7 +303,7 @@ fn collect_struct_properties(
                     block: None,
                     ret: std::sync::Arc::new(ty),
                     effects: EffectSet::pure(),
-                },
+                })),
             );
         }
     }
@@ -307,17 +352,17 @@ fn collect_enum_surface(
     }
     let Some(value_ty) = value_ty else { return };
     let enum_ty = Ty::Class { id: ClassId(Symbol::new(class_name)), args: Vec::new().into() };
-    let nullary = |ret: Ty| Ty::Fn {
+    let nullary = |ret: Ty| Ty::Fn(Box::new(FnTy {
         params: Vec::new().into(),
         block: None,
         ret: std::sync::Arc::new(ret),
         effects: EffectSet::pure(),
-    };
+    }));
     let class = out.entry(ClassId(Symbol::new(class_name))).or_default();
     class.insert(Symbol::new("serialize"), nullary(value_ty.clone()));
     class.insert(
         Symbol::new("deserialize"),
-        Ty::Fn {
+        Ty::Fn(Box::new(FnTy {
             params: vec![Param {
                 name: Symbol::new("value"),
                 ty: value_ty.into(),
@@ -326,7 +371,7 @@ fn collect_enum_surface(
             block: None,
             ret: std::sync::Arc::new(enum_ty.clone()),
             effects: EffectSet::pure(),
-        },
+        })),
     );
     class.insert(Symbol::new("values"), nullary(Ty::Array { elem: std::sync::Arc::new(enum_ty) }));
 }
@@ -347,7 +392,7 @@ fn literal_ty(node: &Node<'_>) -> Option<Ty> {
 
 pub(super) fn symbol_name(node: &Node<'_>) -> Option<String> {
     let symbol = node.as_symbol_node()?;
-    Some(String::from_utf8_lossy(symbol.value_loc()?.as_slice()).into_owned())
+    Some(String::from_utf8_lossy(symbol.unescaped()).into_owned())
 }
 
 /// Does the `sig` chain carry the `abstract` modifier?
@@ -419,7 +464,7 @@ fn signature_ty(
     let body = body.as_statements_node()?;
     let declaration = body.body().iter().next()?;
 
-    let mut declared: HashMap<String, Ty> = HashMap::new();
+    let mut declared: HashMap<String, Ty> = HashMap::default();
     let mut returns: Option<Ty> = None;
     let mut saw_return_clause = false;
     // `params(...).returns(X)`, `void`, `override.returns(X)`,
@@ -450,7 +495,7 @@ fn signature_ty(
                         let assoc = element.as_assoc_node()?;
                         let key = assoc.key();
                         let key = key.as_symbol_node()?;
-                        let name = String::from_utf8_lossy(key.value_loc()?.as_slice()).into_owned();
+                        let name = String::from_utf8_lossy(key.unescaped()).into_owned();
                         declared.insert(name, sorbet_ty(&assoc.value(), self_is_instance, aliases)?);
                     }
                 }
@@ -481,11 +526,11 @@ fn signature_ty(
             // reader does, holding the callable itself.
             if kind == ParamKind::Block {
                 if let Ty::Union { variants } = &ty {
-                    if let [only @ Ty::Fn { .. }, Ty::Nil] = variants.as_slice() {
+                    if let [only @ Ty::Fn(_), Ty::Nil] = variants.as_slice() {
                         ty = only.clone();
                     }
                 }
-                if matches!(ty, Ty::Fn { .. }) {
+                if matches!(ty, Ty::Fn(_)) {
                     block = Some(std::sync::Arc::new(ty.clone()));
                 }
             }
@@ -498,12 +543,12 @@ fn signature_ty(
         return None;
     }
 
-    Some(Ty::Fn {
+    Some(Ty::Fn(Box::new(FnTy {
         params: params.into(),
         block,
         ret: std::sync::Arc::new(returns?),
         effects: EffectSet::pure(),
-    })
+    })))
 }
 
 /// The def's own parameters, in order, with the kind Ruby gives them —
@@ -545,7 +590,7 @@ pub(super) fn def_parameters(
         let name = node.name()?;
         out.push((constant_id_str(&name).to_string(), ParamKind::KeywordRest));
     }
-    if let Some(block) = parameters.block() {
+    if let Some(block) = crate::ingest::prism_api::block_parameter(&parameters) {
         let name = block.name()?;
         out.push((constant_id_str(&name).to_string(), ParamKind::Block));
     }
@@ -618,10 +663,15 @@ pub(super) fn sorbet_ty(
         if let Some(ty) = aliases.get(name) {
             return Some(ty.clone());
         }
+        crate::rbs::note_spelling(name, name.to_string());
         return Some(named_ty(name));
     }
     if let Some(path) = node.as_constant_path_node() {
         let name = constant_path_name(node);
+        fn rooted(node: &Node<'_>) -> bool {
+            node.as_constant_path_node().is_some_and(|p| p.parent().is_none_or(|parent| rooted(&parent)))
+        }
+        crate::rbs::note_spelling(&name, format!("{}{name}", if rooted(node) { "::" } else { "" }));
         // `T::Boolean` is a type of its own; every other `T::…`
         // constant in a signature position is a container handled
         // below or something this grammar does not read.
@@ -641,7 +691,7 @@ pub(super) fn sorbet_ty(
             let assoc = element.as_assoc_node()?;
             let key = assoc.key();
             let key = key.as_symbol_node()?;
-            let name = String::from_utf8_lossy(key.value_loc()?.as_slice()).into_owned();
+            let name = String::from_utf8_lossy(key.unescaped()).into_owned();
             fields.insert(
                 Symbol::new(&name),
                 sorbet_ty(&assoc.value(), self_is_instance, aliases)?,
@@ -805,7 +855,7 @@ fn sorbet_proc_ty(
                             let key = assoc.key();
                             let key = key.as_symbol_node()?;
                             let name =
-                                String::from_utf8_lossy(key.value_loc()?.as_slice()).into_owned();
+                                String::from_utf8_lossy(key.unescaped()).into_owned();
                             params.push(Param {
                                 name: Symbol::new(&name),
                                 ty: sorbet_ty(&assoc.value(), self_is_instance, aliases)?.into(),
@@ -823,12 +873,12 @@ fn sorbet_proc_ty(
                 _ => return None,
             }
         }
-        Some(Ty::Fn {
+        Some(Ty::Fn(Box::new(FnTy {
             params: params.into(),
             block: None,
             ret: std::sync::Arc::new(ret.unwrap_or(Ty::Untyped)),
             effects: EffectSet::default(),
-        })
+        })))
     };
     Some(read())
 }
@@ -879,9 +929,10 @@ fn rbs_comment_signature(
     let receiver = if in_singleton_class || def.receiver().is_some() { "self." } else { "" };
     let wrapped = format!("class X\n  def {receiver}m: {text}\nend\n");
     let sigs = crate::rbs::parse_signatures_with_aliases(&wrapped, rbs_aliases).ok()?;
-    let Ty::Fn { params: declared, block, ret, effects } = sigs.methods.into_iter().next()?.1 else {
+    let Ty::Fn(fn_ty) = sigs.methods.into_iter().next()?.1 else {
         return None;
     };
+    let crate::ty::FnTy { params: declared, block, ret, effects } = *fn_ty;
     let (declared_block, declared): (Vec<Param>, Vec<Param>) =
         declared.into_iter().partition(|p| matches!(p.kind, ParamKind::Block));
     let def_params = match def.parameters() {
@@ -927,7 +978,7 @@ fn rbs_comment_signature(
         let ty = declared_block.into_iter().next().map(|p| p.ty).unwrap_or(Ty::Untyped.into());
         params.push(Param { name: Symbol::new(name), ty, kind: ParamKind::Block });
     }
-    Some(Ty::Fn { params: params.into(), block, ret, effects })
+    Some(Ty::Fn(Box::new(FnTy { params: params.into(), block, ret, effects })))
 }
 
 /// The `#: type name = ...` aliases a class or module body declares,
@@ -1003,7 +1054,7 @@ fn scoped_rbs_aliases(
 
 /// The signature text of the `#:` / `#|` comment lines directly above
 /// the line holding byte `def_start`.
-fn rbs_comment_text(source: &[u8], def_start: usize) -> Option<String> {
+pub(super) fn rbs_comment_text(source: &[u8], def_start: usize) -> Option<String> {
     let text = std::str::from_utf8(source).ok()?;
     let before = text.get(..def_start)?;
     let line_start = before.rfind('\n').map_or(0, |i| i + 1);
@@ -1040,5 +1091,5 @@ fn rbs_comment_text(source: &[u8], def_start: usize) -> Option<String> {
 /// A Sorbet type expression (`T.nilable(Foo)`, `T::Array[String]`, ...)
 /// read as a `Ty`, for `T.let(x, Type)`.
 pub(super) fn sorbet_type_node(node: &Node<'_>) -> Option<Ty> {
-    sorbet_ty(node, true, &HashMap::new())
+    sorbet_ty(node, true, &HashMap::default())
 }

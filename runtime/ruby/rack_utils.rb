@@ -1,7 +1,12 @@
-# `Rack::Utils.q_values` and `Rack::Utils.select_best_encoding`, ported
-# from rack 3.2 (lib/rack/utils.rb) for the trees that have no rack gem
-# to load. The ruby family swaps this file for `require "rack/utils"`
-# (see `project::ruby_runtime_files`), so the gem's own code runs there.
+# frozen_string_literal: true
+# `Rack::Utils.q_values`, `Rack::Utils.select_best_encoding`, `Rack::Utils.unescape_path`,
+# `Rack::Utils.escape`, `Rack::Utils.secure_compare` and `Rack::Utils::HTTP_STATUS_CODES`, ported from rack 3.2
+# (lib/rack/utils.rb) for the trees that have no rack gem to load. The
+# ruby family swaps this file for `require "rack/utils"` (see
+# `project::ruby_runtime_files`), so the gem's own code runs there —
+# the registry types the constant the same way regardless
+# (`analyze::registry::stdlib`), so it must match the real gem's table
+# exactly here too.
 #
 # campfire's `CachedResponses#cache_read_response` negotiates the body's
 # encoding with them before it reuses a cached page:
@@ -19,7 +24,141 @@
 # pair per comma-separated part: the media/encoding name (nil for an
 # empty part, as rack's destructuring of `[]` gives) and its quality.
 module Rack
+  # rack 3.2's `lib/rack/constants.rb`, value for value: the env keys and header names a middleware reads
+  # (message_bus's `env[Rack::RACK_SESSION_OPTIONS]`).
+  HTTP_HOST = "HTTP_HOST"
+  HTTP_PORT = "HTTP_PORT"
+  HTTPS = "HTTPS"
+  PATH_INFO = "PATH_INFO"
+  REQUEST_METHOD = "REQUEST_METHOD"
+  REQUEST_PATH = "REQUEST_PATH"
+  SCRIPT_NAME = "SCRIPT_NAME"
+  QUERY_STRING = "QUERY_STRING"
+  SERVER_PROTOCOL = "SERVER_PROTOCOL"
+  SERVER_NAME = "SERVER_NAME"
+  SERVER_PORT = "SERVER_PORT"
+  HTTP_COOKIE = "HTTP_COOKIE"
+  CACHE_CONTROL = "cache-control"
+  CONTENT_LENGTH = "content-length"
+  CONTENT_TYPE = "content-type"
+  ETAG = "etag"
+  EXPIRES = "expires"
+  SET_COOKIE = "set-cookie"
+  TRANSFER_ENCODING = "transfer-encoding"
+  GET = "GET"
+  POST = "POST"
+  PUT = "PUT"
+  PATCH = "PATCH"
+  DELETE = "DELETE"
+  HEAD = "HEAD"
+  OPTIONS = "OPTIONS"
+  CONNECT = "CONNECT"
+  LINK = "LINK"
+  UNLINK = "UNLINK"
+  TRACE = "TRACE"
+  RACK_VERSION = "rack.version"
+  RACK_TEMPFILES = "rack.tempfiles"
+  RACK_EARLY_HINTS = "rack.early_hints"
+  RACK_ERRORS = "rack.errors"
+  RACK_LOGGER = "rack.logger"
+  RACK_INPUT = "rack.input"
+  RACK_SESSION = "rack.session"
+  RACK_SESSION_OPTIONS = "rack.session.options"
+  RACK_SHOWSTATUS_DETAIL = "rack.showstatus.detail"
+  RACK_URL_SCHEME = "rack.url_scheme"
+  RACK_HIJACK = "rack.hijack"
+  RACK_IS_HIJACK = "rack.hijack?"
+  RACK_RECURSIVE_INCLUDE = "rack.recursive.include"
+  RACK_MULTIPART_BUFFER_SIZE = "rack.multipart.buffer_size"
+  RACK_MULTIPART_TEMPFILE_FACTORY = "rack.multipart.tempfile_factory"
+  RACK_RESPONSE_FINISHED = "rack.response_finished"
+  RACK_PROTOCOL = "rack.protocol"
+  RACK_REQUEST_FORM_INPUT = "rack.request.form_input"
+  RACK_REQUEST_FORM_HASH = "rack.request.form_hash"
+  RACK_REQUEST_FORM_PAIRS = "rack.request.form_pairs"
+  RACK_REQUEST_FORM_VARS = "rack.request.form_vars"
+  RACK_REQUEST_FORM_ERROR = "rack.request.form_error"
+  RACK_REQUEST_COOKIE_HASH = "rack.request.cookie_hash"
+  RACK_REQUEST_COOKIE_STRING = "rack.request.cookie_string"
+  RACK_REQUEST_QUERY_HASH = "rack.request.query_hash"
+  RACK_REQUEST_QUERY_STRING = "rack.request.query_string"
+  RACK_METHODOVERRIDE_ORIGINAL_METHOD = "rack.methodoverride.original_method"
+
   module Utils
+    # Status code => reason phrase. An app's error-response helpers
+    # read this directly (`HTTP_STATUS_CODES[code]`), never through a
+    # method, so there is no `self.` wrapper to write — just the table.
+    HTTP_STATUS_CODES = {
+      100 => "Continue",
+      101 => "Switching Protocols",
+      102 => "Processing",
+      103 => "Early Hints",
+      200 => "OK",
+      201 => "Created",
+      202 => "Accepted",
+      203 => "Non-Authoritative Information",
+      204 => "No Content",
+      205 => "Reset Content",
+      206 => "Partial Content",
+      207 => "Multi-Status",
+      208 => "Already Reported",
+      226 => "IM Used",
+      300 => "Multiple Choices",
+      301 => "Moved Permanently",
+      302 => "Found",
+      303 => "See Other",
+      304 => "Not Modified",
+      305 => "Use Proxy",
+      307 => "Temporary Redirect",
+      308 => "Permanent Redirect",
+      400 => "Bad Request",
+      401 => "Unauthorized",
+      402 => "Payment Required",
+      403 => "Forbidden",
+      404 => "Not Found",
+      405 => "Method Not Allowed",
+      406 => "Not Acceptable",
+      407 => "Proxy Authentication Required",
+      408 => "Request Timeout",
+      409 => "Conflict",
+      410 => "Gone",
+      411 => "Length Required",
+      412 => "Precondition Failed",
+      413 => "Content Too Large",
+      414 => "URI Too Long",
+      415 => "Unsupported Media Type",
+      416 => "Range Not Satisfiable",
+      417 => "Expectation Failed",
+      421 => "Misdirected Request",
+      422 => "Unprocessable Content",
+      423 => "Locked",
+      424 => "Failed Dependency",
+      425 => "Too Early",
+      426 => "Upgrade Required",
+      428 => "Precondition Required",
+      429 => "Too Many Requests",
+      431 => "Request Header Fields Too Large",
+      451 => "Unavailable For Legal Reasons",
+      500 => "Internal Server Error",
+      501 => "Not Implemented",
+      502 => "Bad Gateway",
+      503 => "Service Unavailable",
+      504 => "Gateway Timeout",
+      505 => "HTTP Version Not Supported",
+      506 => "Variant Also Negotiates",
+      507 => "Insufficient Storage",
+      508 => "Loop Detected",
+      511 => "Network Authentication Required",
+    }.freeze
+
+    # Not rack's table derived from the reason phrases: the same names, written out once in ActionController's.
+    def self.status_code(status)
+      return status if status.is_a?(Integer)
+      code = ActionController.symbol_status_code(status)
+      raise ArgumentError, "Unrecognized status code #{status.inspect}" if code.nil?
+      code
+    end
+
     def self.q_values(q_value_header)
       out = []
       q_value_header.to_s.split(",").each do |part|
@@ -75,6 +214,142 @@ module Rack
         candidates.delete(entry[0]) if entry[1] == 0.0
       end
       (candidates & available_encodings)[0]
+    end
+
+    # rack's `unescape_path` is `URI::RFC2396_PARSER.unescape`: each `%`
+    # followed by two hex digits becomes that byte, and anything else, `+`
+    # included, stays as written. The bytes are read as UTF-8, as URI reads
+    # a UTF-8 path, so `%ff` answers a String that is not valid UTF-8.
+    def self.unescape_path(s)
+      out = +""
+      i = 0
+      n = s.bytesize
+      while i < n
+        b = s.getbyte(i)
+        hi = i + 2 < n ? path_hex_value(s.getbyte(i + 1)) : -1
+        lo = i + 2 < n ? path_hex_value(s.getbyte(i + 2)) : -1
+        if b == 37 && hi >= 0 && lo >= 0
+          out << (hi * 16 + lo).chr
+          i += 3
+        else
+          out << b.chr
+          i += 1
+        end
+      end
+      out.force_encoding("UTF-8")
+    end
+
+    # Rack's `escape`, `URI.encode_www_form_component`: ASCII letters, digits and `*-._` as written, a space as `+`,
+    # every other byte as `%XX` (OmniAuth's failure redirect's `message=`).
+    def self.escape(s)
+      out = +""
+      text = s.to_s
+      i = 0
+      n = text.bytesize
+      while i < n
+        b = text.getbyte(i)
+        if (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 42 || b == 45 || b == 46 || b == 95
+          out << b.chr
+        elsif b == 32
+          out << "+"
+        else
+          out << format("%%%02X", b)
+        end
+        i += 1
+      end
+      out
+    end
+
+    # Rack's `unescape`, `URI.decode_www_form_component`: `+` as a space, `%XX` as its byte, the bytes read as UTF-8.
+    def self.unescape(s)
+      out = +""
+      i = 0
+      n = s.bytesize
+      while i < n
+        b = s.getbyte(i)
+        if b == 37
+          hi = i + 2 < n ? path_hex_value(s.getbyte(i + 1)) : -1
+          lo = i + 2 < n ? path_hex_value(s.getbyte(i + 2)) : -1
+          # Not Rack::QueryParser::InvalidParameterError: no tree carries the parser; it is this ArgumentError's subclass.
+          raise ArgumentError, "invalid %-encoding (#{s})" if hi < 0 || lo < 0
+          out << (hi * 16 + lo).chr
+          i += 3
+        elsif b == 43
+          out << " "
+          i += 1
+        else
+          out << b.chr
+          i += 1
+        end
+      end
+      out.force_encoding("UTF-8")
+    end
+
+    # Rack's `parse_query`: pairs split at `&` (and the spaces after it), a key given again collects its values in
+    # an Array, and a key without `=` maps to nil.
+    def self.parse_query(qs)
+      params = {}
+      return params if qs.nil? || qs.empty?
+      raise RangeError, "total query size exceeds limit (4194304)" if qs.bytesize > 4194304
+      pairs = qs.split(/& */n, 4097)
+      raise RangeError, "total number of query parameters (#{pairs.size + pairs.last.count("&")}) exceeds limit (4096)" if pairs.size > 4096
+      # Not one Hash of mixed values read back as it fills: each key's values listed first, in the order Rack meets them.
+      keys = []
+      values = query_lists
+      pairs.each do |pair|
+        next if pair.empty?
+        parts = pair.split("=", 2)
+        key = unescape(parts[0])
+        value = parts.length > 1 ? unescape(parts[1]) : nil
+        list = values[key]
+        if list.nil?
+          keys << key
+          values[key] = [value]
+        elsif list.length == 1 && list[0].nil?
+          # Rack's `if cur = params[k]`: a key held as nil is set again, not collected.
+          list[0] = value
+        else
+          list << value
+        end
+      end
+      keys.each { |key| params[key] = values[key].length == 1 ? values[key][0] : values[key] }
+      params
+    end
+
+    # Not a bare `{}`: its values are read before any write could say their type.
+    def self.query_lists
+      {}
+    end
+
+    # Rack's `build_query`: each pair escaped, an Array value as one pair per element, a nil value as the key alone.
+    def self.build_query(params)
+      params.map { |k, v| query_pair(k, v) }.join("&")
+    end
+
+    def self.query_pair(k, v)
+      return v.map { |x| query_pair(k, x) }.join("&") if v.class == Array
+      v.nil? ? escape(k) : "#{escape(k)}=#{escape(v)}"
+    end
+
+    # Rack's `secure_compare`: equal Strings by every byte, in time that does not depend on where they differ.
+    def self.secure_compare(a, b)
+      return false unless a.bytesize == b.bytesize
+      diff = 0
+      i = 0
+      n = a.bytesize
+      while i < n
+        diff |= a.getbyte(i) ^ b.getbyte(i)
+        i += 1
+      end
+      diff == 0
+    end
+
+    # The value of one hex digit's byte, or -1 for any other byte.
+    def self.path_hex_value(b)
+      return b - 48 if b >= 48 && b <= 57
+      return b - 55 if b >= 65 && b <= 70
+      return b - 87 if b >= 97 && b <= 102
+      -1
     end
   end
 end

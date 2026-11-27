@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Fallback Importmap module. The lowerer-emitted config/importmap.rb
 # (generated per-app from the source's config/importmap.rb) reopens
 # this module and overrides `pins` / `entry` with the app's actual
@@ -18,5 +19,11 @@ module Importmap
 
   def self.entry
     "application"
+  end
+
+  # importmap-rails' map, which an engine keeps its own import map in
+  # (`MissionControl::Jobs.importmap`). Its pins are compiled at ingest to
+  # `Importmap.pins_for_<module>`, which the engine's layout reads.
+  class Map
   end
 end

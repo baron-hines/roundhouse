@@ -53,10 +53,13 @@ pub(super) fn emit_literal(lit: &Literal) -> String {
             let s = value.to_string();
             if s.contains('.') { s } else { format!("{s}.0") }
         }
-        Literal::Str { value } => format!("{value:?}"),
-        Literal::Sym { value } => format!("{:?}", value.as_str()),
+        // Not Rust's `{:?}`, which writes a Unicode space (U+3000) or a
+        // control as `\u{3000}`, an escape Go rejects.
+        Literal::Str { value } => super::expr::go_str_literal(value),
+        Literal::Sym { value } => super::expr::go_str_literal(value.as_str()),
         Literal::Regex { pattern, flags } => {
-            format!("regexp.MustCompile({:?})", format!("(?{flags}){pattern}"))
+            let source = crate::emit::shared::regex_literal::re2_style_regex_source(pattern, flags);
+            format!("regexp.MustCompile({source:?})")
         }
     }
 }

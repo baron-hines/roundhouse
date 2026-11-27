@@ -386,24 +386,12 @@ fn a_wrapper_that_rebinds_or_returns_otherwise_in_any_form_is_refused() {
     assert!(leaked.is_empty(), "accepted (should refuse): {leaked:?}");
 }
 
-/// `for records in ...` writes the outer local; ingest has no `for` node at
-/// all, so the wrapper never reaches the pass-through check: it is an ingest
-/// error (a compile-time refusal), not an accepted override.
+/// `for records in ...` writes the outer local (a `for` opens no scope), so
+/// the wrapper is refused as any other rebinding is.
 #[test]
-fn a_for_loop_in_the_wrapper_is_an_ingest_refusal() {
+fn a_for_loop_in_the_wrapper_is_refused() {
     let wrapper = "def pagy(collection, **vars)\n      pagy, records = super\n      for records in [1]\n        nil\n      end\n      [pagy, records]\n    end";
-    let concern = format!(
-        "module Pagination\n  extend ActiveSupport::Concern\n\n  module BoundsCheck\n    {wrapper}\n  end\n\n  included do\n    prepend BoundsCheck\n  end\nend\n"
-    );
-    let files = tree(
-        Some(LOCK),
-        &[
-            ("app/controllers/concerns/pagination.rb", concern.as_str()),
-            ("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\n  include Pagination\nend\n"),
-        ],
-    );
-    let err = ingest_app_from_tree(files).err().expect("refused").to_string();
-    assert!(err.contains("unsupported expression node"), "{err}");
+    assert!(wrapper_is_refused(wrapper), "accepted a wrapper whose `for` rebinds `records`");
 }
 
 #[test]

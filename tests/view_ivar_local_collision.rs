@@ -12,6 +12,8 @@
 //! the same view. The parameter list, the body and the call sites all
 //! read the same rename, so each ivar keeps its own value.
 
+#[path = "support/scratch.rs"]
+mod scratch;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
@@ -93,7 +95,7 @@ fn each_ivar_gets_its_own_parameter() {
     let views = emitted(ruby::emit_lowered_views(&app));
     let show = find(&views, "app/views/posts/show.rb");
     let parsed = ruby_prism::parse(show.as_bytes());
-    let errors: Vec<String> = parsed.errors().map(|e| e.message().to_string()).collect();
+    let errors: Vec<String> = parsed.errors().map(|e| String::from_utf8_lossy(e.message()).into_owned()).collect();
     assert!(errors.is_empty(), "show.rb does not parse: {errors:?}\n{show}");
     assert!(show.contains("def self.show(class__, class_, post,"), "{show}");
 
@@ -106,11 +108,7 @@ fn each_ivar_gets_its_own_parameter() {
 /// check each with `ruby -c`, load them in order and print `call`.
 /// Returns the rendered HTML.
 fn render(files: &[(&str, &str)], call: &str) -> String {
-    let dir = std::env::temp_dir().join(format!(
-        "roundhouse-view-ivar-local-collision-{}-{}",
-        std::process::id(),
-        files.len()
-    ));
+    let dir = scratch::dir(&format!("roundhouse-view-ivar-local-collision-{}", files.len()));
     let mut requires = String::new();
     for (path, source) in files {
         let file = dir.join(path);

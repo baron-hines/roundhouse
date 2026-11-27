@@ -1,9 +1,10 @@
+# frozen_string_literal: true
 # Tep::Response -- what the handler writes back. Headers are a Bag
 # (string-keyed); the framework adds Content-Length / Connection
 # automatically when serializing.
 module Tep
   class Response
-    attr_accessor :status, :headers, :body, :halted, :file_path, :set_cookies
+    attr_accessor :status, :headers, :body, :halted, :file_path, :set_cookies, :header_fields
 
     def initialize
       @status      = 200
@@ -22,6 +23,8 @@ module Tep
       # points (main.rb / bin/blog.rb); clear and delete_at each have
       # an unarmed cell.
       @set_cookies.pop
+      @header_fields = [["", ""]]
+      @header_fields.pop
       @streamer    = Streamer.new   # default no-op; only used when @streaming
       @streaming   = false
       # WebSocket upgrade slots. When @upgrading_ws is set (by
@@ -68,6 +71,18 @@ module Tep
       @set_cookies.push(line)
     end
 
+    # Keep the ordinary string hash for framing and middleware reads. Repeated
+    # values remain separate fields, validated by the shared header writer.
+    def append_header(name, value)
+      if name.downcase == "set-cookie"
+        @set_cookies.push(value)
+      elsif @headers.key?(name)
+        @header_fields.push([name, value])
+      else
+        @headers[name] = value
+      end
+    end
+
     def send_file(path)
       @file_path = path
       @body = +""
@@ -86,6 +101,14 @@ module Tep
     def set_status(n); @status = n; end
 
     def halted_close?
+      # A handler's close option also overrides request keep-alive.
+      @headers.each do |name, value|
+        if name.downcase == "connection"
+          value.downcase.split(",").each do |option|
+            return true if option.strip == "close"
+          end
+        end
+      end
       @halted && @status >= 300
     end
   end

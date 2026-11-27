@@ -1,7 +1,8 @@
+# frozen_string_literal: true
 # ActiveSupport blank-predicate reopen — ruby-family surface only
 # (inflector_ext.rb pattern): shipped to the scaffold trees via the
 # project.rs stems list, NOT in the runtime_loader tables, so the
-# strict-target transpilers never see the `is_a?` dispatch below.
+# strict-target transpilers never see the class dispatch below.
 #
 # String inflection helpers (`underscore` / `demodulize` / …) live in
 # `active_support_inflections.rb` for the Ruby/Spinel scaffold. Strict
@@ -25,25 +26,29 @@ require_relative "active_support_number_helper"
 # So the residue routes HERE instead. Taking the receiver as an ARGUMENT
 # is what makes this legal where the type-directed forms are not: the
 # value is evaluated exactly once, so a receiver with effects grounds
-# too, and no `respond_to?` is needed because the branch is on the value.
+# too; the helper checks the value's class and optional `empty?`.
 #
 # Semantics are Rails', not an approximation — nil, false, and an empty
 # String/Array/Hash are blank; `0` and `:sym` are present. Verified shape
 # by shape against `Object#blank?`.
 #
-# The STRING tail is `strip.empty?`, not `empty?`: ActiveSupport's
+# The STRING branch uses Rails' whitespace match. ActiveSupport's
 # `String#blank?` is `/\A[[:space:]]*\z/`, so `" ".blank?` is true.
-# `lower::blank` grounds the typed String sites the same way and for the
-# same reason — the two must agree, because which of them serves a given
+# `lower::blank` grounds typed String sites separately. The two must
+# agree, because which of them serves a given
 # call is a fact about type INFERENCE, not about the program. campfire's
 # bot API is what priced it: `raw_request_body.blank?` reaches this
 # function (the reader's type is not inferred), and a boost posted with
 # a body of three spaces was accepted where Rails answers 422.
 #
-# `to_s` first, so the tail is one branch for every remaining shape: an
-# Integer's `"0"` is not blank, a Symbol's `"sym"` is not blank, and a
-# String is itself.
+# Other objects use Rails' optional `empty?` protocol. Their `to_s`
+# says nothing about blankness and may even return nil.
+require_relative "json_builder"
+
 module ActiveSupport
+  class DelegationError < ::NoMethodError
+  end
+
   # `ActiveSupport::JSON` — Rails' JSON coder over the json library.
   #
   # `encode` is `value.as_json.to_json` with Rails' default HTML-entity
@@ -67,8 +72,25 @@ module ActiveSupport
       JsonBuilder.escape_html_entities(::JSON.generate(ActiveSupport::JSON.jsonable(value)))
     end
 
+    # `encode(value, escape: false)`, which `lower::symbolize_keys`
+    # routes here: the same document without the HTML-entity escaping,
+    # for text no page embeds (a digest's input).
+    def self.encode_without_escape(value)
+      ::JSON.generate(ActiveSupport::JSON.jsonable(value))
+    end
+
     def self.decode(text)
       ::JSON.parse(text)
+    end
+
+    # Rails' aliases (`alias_method :load, :decode`, `:dump, :encode`);
+    # solid_queue's recurring task arguments go through them.
+    def self.load(text)
+      ActiveSupport::JSON.decode(text)
+    end
+
+    def self.dump(value)
+      ActiveSupport::JSON.encode(value)
     end
 
     # One `case` rather than a chain of tests: each read of the untyped
@@ -95,7 +117,9 @@ module ActiveSupport
     # taken to be UTC (Rails writes `+00:00` for a non-UTC zone at offset
     # zero, such as London in winter).
     def self.time_json(t)
-      zone = t.zone == "UTC" || (t.utc_offset == 0 && ActiveSupport::JSON.utc_zone?) ? "Z" : t.strftime("%:z")
+      # Concatenate onto a fresh local: Spinel refuses a shared String
+      # written from a conditional into the format append below.
+      zone = (t.zone == "UTC" || (t.utc_offset == 0 && ActiveSupport::JSON.utc_zone?) ? "Z" : t.strftime("%:z")) + ""
       t.strftime("%Y-%m-%dT%H:%M:%S") + format(".%03d", t.usec / 1000) + zone
     end
 
@@ -108,6 +132,10 @@ module ActiveSupport
     def self.utc_zone?
       zone = ActiveSupport.current_zone
       name = zone.nil? ? Rails.application.config_time_zone : zone.name
+      utc_zone_name?(name)
+    end
+
+    def self.utc_zone_name?(name)
       UTC_ZONE_NAMES.include?(name)
     end
 
@@ -120,30 +148,68 @@ module ActiveSupport
     end
   end
 
-  # ActiveSupport's `deep_dup` (core_ext/object/deep_dup.rb), for a typed
-  # Hash or Array receiver (`lower::symbolize_keys` routes the call here).
-  # A Hash copies each value and, for keys that are neither String nor
-  # Symbol, the key too — re-inserted after the String/Symbol ones, as
-  # Rails' delete-and-store does. An Array copies each element. Any other
-  # value is its `dup` (an Integer's, nil's or a Symbol's is itself).
+  # ActiveSupport's `deep_dup` (core_ext/object/deep_dup.rb). One walk,
+  # also what `ErrorReporter` hands each subscriber. A Hash is copied
+  # into a fresh Hash: String and Symbol keys first, every other key
+  # after them, which is where Rails' delete-and-store lands. An Array
+  # copies each element. A Method, an UnboundMethod, a Singleton, or
+  # anything that answers `duplicable?` with false is itself; anything
+  # else is its `dup` (an Integer's, nil's or a Symbol's is itself).
+  # `lower::symbolize_keys` routes a typed Hash or Array receiver here.
+  # Not a table of hooks to run: an `on_load` block is carried into its class when the app is read, or reported.
+  def self.run_load_hooks(name, base = nil)
+    nil
+  end
+
   def self.deep_dup(value)
     case value
     when Array then value.map { |item| ActiveSupport.deep_dup(item) }
     when Hash
+      # A fresh Hash, not `dup`: String and Symbol keys first, every
+      # other key after them. The key class is read once; the second
+      # pass used to ask it again.
       out = {}
-      value.each { |key, item| out[key] = ActiveSupport.deep_dup(item) if key.is_a?(String) || key.is_a?(Symbol) }
-      value.each { |key, item| out[ActiveSupport.deep_dup(key)] = ActiveSupport.deep_dup(item) unless key.is_a?(String) || key.is_a?(Symbol) }
+      deferred_keys = []
+      deferred_items = []
+      value.each do |key, item|
+        if key.is_a?(String) || key.is_a?(Symbol)
+          out[key] = ActiveSupport.deep_dup(item)
+        else
+          deferred_keys << key
+          deferred_items << item
+        end
+      end
+      i = 0
+      while i < deferred_keys.length
+        out[ActiveSupport.deep_dup(deferred_keys[i])] = ActiveSupport.deep_dup(deferred_items[i])
+        i += 1
+      end
       out
-    else value.dup
+    else
+      # Not duplicable? (core_ext/object/duplicable.rb): the value itself.
+      if value.is_a?(Method) || value.is_a?(UnboundMethod) || (defined?(::Singleton) && value.is_a?(::Singleton))
+        value
+      elsif value.respond_to?(:duplicable?) && !value.duplicable?
+        value
+      else
+        value.dup
+      end
     end
   end
 
   def self.blank?(value)
-    return true if value.nil?
-    return true if value == false
-    return value.empty? if value.is_a?(Array)
-    return value.empty? if value.is_a?(Hash)
-    value.to_s.strip.empty?
+    case value
+    when NilClass, FalseClass then true
+    when TrueClass, Numeric, Time then false
+    when String
+      value.empty? || begin
+        /\A[[:space:]]*\z/.match?(value)
+      rescue Encoding::CompatibilityError
+        Regexp.new("\\A[[:space:]]*\\z".encode(value.encoding), Regexp::FIXEDENCODING).match?(value)
+      end
+    else
+      value.respond_to?(:empty?) ? !!value.empty? : false
+    end
   end
 
   def self.present?(value)
@@ -204,7 +270,9 @@ module ActiveSupport
     hash.each do |key, item|
       empty_container = (item.is_a?(Hash) && item.empty?) || (item.is_a?(Array) && item.empty?)
       next if empty_container
-      name = namespace.empty? ? key.to_s : "#{namespace}[#{key.to_s}]"
+      # One `to_s` of the untyped key. The ceiling counts each read.
+      key_text = key.to_s
+      name = namespace.empty? ? key_text : "#{namespace}[#{key_text}]"
       pairs << query_value(name, item)
     end
     pairs = pairs.sort unless namespace.include?("[]")
@@ -267,6 +335,10 @@ module ActiveSupport
     value.is_a?(String) && list.include?(value) ? value : nil
   end
 
+  def self.symbol_presence_in(value, list)
+    value.is_a?(Symbol) && list.include?(value) ? value : nil
+  end
+
   # Rails' `ActiveModel::Errors#to_hash`: each attribute with errors, in
   # the order of its first error, to its messages
   # (`{ title: ["can't be blank"] }`). Reached from
@@ -301,18 +373,40 @@ module ActiveSupport
   end
 
   # Not a `reject!` on each: `errors` holds each detail's full message index for index, so both lose the same entries.
-  def self.errors_delete(errors, details, attribute)
+  # A nil `type_kind` is Rails' `delete(attribute)`, every error on it; otherwise only the entries
+  # whose type is that one — a Symbol type (type_symbolic true), or the message a String type was
+  # added with, which is what Rails' `Error#type` answers for it.
+  def self.errors_delete(errors, details, attribute, type_symbolic, type_kind)
     deleted = []
     i = details.length - 1
     while i >= 0
-      if details[i].attribute == attribute
-        deleted.unshift(details[i].message)
+      detail = details[i]
+      matched = detail.attribute == attribute
+      if matched && !type_kind.nil?
+        matched = detail.symbolic == type_symbolic && detail.kind == type_kind
+      end
+      if matched
+        deleted.unshift(detail.message)
         details.delete_at(i)
         errors.delete_at(i)
       end
       i -= 1
     end
     deleted.empty? ? nil : deleted
+  end
+
+  # Rails' `group_by_attribute`: each attribute with errors, in the order
+  # of its first one, to its `ActiveModel::Error`s — `Enumerable#group_by`
+  # over the errors, so a plain Hash with no default, not `details`. Same
+  # grouping as `errors_details`; reached from `lower::errors_index`.
+  def self.errors_group_by_attribute(details)
+    out = {}
+    details.each do |detail|
+      key = detail.attribute.to_sym
+      out[key] = [] unless out.key?(key)
+      out[key] << detail
+    end
+    out
   end
 
   # Rails' `details`: each attribute's errors, in the order of its first
@@ -345,12 +439,113 @@ module ActiveSupport
     details
   end
 
+  # Rails' `errors.add(attribute, kind_or_message, **options)` where the
+  # attribute or the options are known only at run time (a validator's
+  # `validate_each`). The message is looked up as Rails does: the model's
+  # own (`overrides`, "<attr>.<kind>" then "<kind>", with its "__scope"),
+  # then what the call site baked for its literal kind (`site`):
+  # "ar_messages" or "am_messages" (<scope>.errors.messages.<kind>),
+  # "attributes.<attr>" (errors.attributes.<attr>.<kind>) and "messages"
+  # (errors.messages.<kind>), each with ".one" / ".other" / ".zero" plural
+  # forms. A String `message` is used as given. The attribute is named by
+  # the model's translated names (`names`), else humanized. Answers the
+  # error's detail; the call site pushes it and its full message onto the
+  # record's errors.
+  def self.error_detail(name, kind, message, options, site, names, overrides, before, between, after)
+    count = options["count"]
+    if kind.nil?
+      template = message.to_s
+    else
+      scoped = overrides["__scope"] == "activemodel" ? "am_messages" : "ar_messages"
+      template = error_template(overrides, name + "." + kind, count) ||
+        error_template(overrides, kind, count) ||
+        error_template(site, scoped, count) ||
+        error_template(site, "attributes." + name, count) ||
+        error_template(site, "messages", count) ||
+        ("translation missing: errors.messages." + kind)
+    end
+    human = names.key?(name) ? names[name].to_s : humanize(name.tr(".", "_"))
+    text = template
+    # A String message is kept as written, `%{…}` and all. A kind's
+    # template takes Rails' default interpolations, an explicit option
+    # winning.
+    unless kind.nil?
+      values = { "attribute" => human, "model" => names.key?("__model") ? names["__model"].to_s : "" }
+      options.each { |key, value| values[key] = value }
+      text = interpolate(template, values)
+    end
+    full = text
+    unless name == "base"
+      full = before + human + between + text + after
+    end
+    ActiveRecord::ErrorDetail.new(name, kind.nil? ? text : kind, text, full, !kind.nil?, options.empty?)
+  end
+
+  # I18n's interpolation, in one pass as its `gsub` makes: each `%{name}`
+  # the values give is replaced by its value as written (not rescanned,
+  # and not read for `\0` or `\&`), `%%` is a literal `%`, and any other
+  # `%{name}` stays as written.
+  def self.interpolate(template, values)
+    out = ""
+    rest = template
+    scanning = true
+    while scanning
+      at = rest.index("%")
+      if at.nil? || at + 1 >= rest.length
+        scanning = false
+      else
+        out = out + rest[0, at].to_s
+        after = rest[at + 1, 1].to_s
+        close = after == "{" ? rest.index("}", at + 2) : nil
+        if after == "%"
+          out = out + "%"
+          rest = rest[at + 2, rest.length - at - 2].to_s
+        elsif !close.nil? && values.key?(rest[at + 2, close - at - 2].to_s)
+          out = out + values[rest[at + 2, close - at - 2].to_s].to_s
+          rest = rest[close + 1, rest.length - close - 1].to_s
+        else
+          out = out + "%"
+          rest = rest[at + 1, rest.length - at - 1].to_s
+        end
+      end
+    end
+    out + rest
+  end
+
+  # The template under `key` in `table`, its plural form chosen by
+  # `count` as English does (zero, one, other), else the plain one.
+  def self.error_template(table, key, count)
+    unless count.nil?
+      form = count.to_s == "1" ? "one" : (count.to_s == "0" && table.key?(key + ".zero") ? "zero" : "other")
+      return table[key + "." + form] if table.key?(key + "." + form)
+    end
+    table[key]
+  end
+
   # Rails' `errors.merge!(other)`: each of the other record's errors
   # imported under its own attribute, and nothing when it is these errors.
   def self.errors_merge(errors, details, others, names, before, between, after)
     return details if others.equal?(details)
     others.each { |error| errors_import(errors, details, error, nil, names, before, between, after) }
     others
+  end
+
+  # Rails' `errors.copy!(other)`: the record's own errors go, and each of
+  # the other's is taken as a copy — same attribute, kind and message, and
+  # a full message naming the attribute as THIS model names it, which is
+  # what `errors_import` builds. The copies are this record's own details,
+  # so clearing one errors object's leaves the other's whole. Copying a
+  # record's own errors is a no-op, as Rails' deep_dup of them is.
+  def self.errors_copy(errors, details, others, names, before, between, after)
+    return details if others.equal?(details)
+    errors.clear
+    details.clear
+    # Each copy's Strings are its own, as Rails' deep_dup of an error dups its attribute and type.
+    others.each do |error|
+      copy = ActiveRecord::ErrorDetail.new(error.attribute.dup, error.kind.dup, error.message.dup, error.full_message.dup, error.symbolic, error.optionless)
+      errors_import(errors, details, copy, nil, names, before, between, after)
+    end
+    details
   end
 
   # `ActiveSupport::MessageVerifier::InvalidSignature` — what a signed
@@ -361,6 +556,41 @@ module ActiveSupport
   # `rescue_from(ActiveSupport::MessageVerifier::InvalidSignature) {
   # head :not_found }` over an avatar URL that carries a signed id.
   #
+  # Not `Rails.log_line`, which a host logger may filter, nor `$stderr`
+  # or `STDERR` puts, which the runtime's typing cannot type: Kernel#warn,
+  # which `-W0` silences where Rails' :stderr behavior would still write.
+  def self.deprecation_line(line)
+    warn(line)
+  end
+
+  # Rails' deprecator a gem keeps for itself (`Devise.deprecator`): `warn`
+  # writes Rails' line to stderr, the default behavior of a deprecator
+  # the app's `config.active_support.deprecation` has not configured.
+  class Deprecation
+    attr_reader :deprecation_horizon, :gem_name
+    attr_accessor :silenced
+
+    def initialize(deprecation_horizon = "next release", gem_name = "Rails")
+      @deprecation_horizon = deprecation_horizon
+      @gem_name = gem_name
+      @silenced = false
+    end
+
+    # Not Rails' "(called from …)" suffix: no target keeps the caller's location.
+    def warn(message = nil, callstack = nil)
+      return nil if @silenced
+      ActiveSupport.deprecation_line("DEPRECATION WARNING: #{message}")
+      nil
+    end
+
+    # Rails installs a `const_missing` hook that warns and answers the
+    # replacement. Not ported: a hook no target has, and a program that
+    # reads no deprecated name never calls it (`deprecate_constant` is
+    # refused where one is read).
+    module DeprecatedConstantAccessor
+    end
+  end
+
   # A namespace with no verifier in it, because ours is
   # `ActionController::MessageVerifier` (it serves the cookie jar first).
   # The error keeps Rails' path so app code that names it resolves.
@@ -369,6 +599,86 @@ module ActiveSupport
       def initialize(message = "ActiveSupport::MessageVerifier::InvalidSignature")
         super(message)
       end
+    end
+  end
+
+  # Rails' PBKDF2 key derivation (`ActiveSupport::KeyGenerator`): `secret` stretched with each salt it is asked for,
+  # 2**16 iterations by default, by the SHA256 digest a `load_defaults 7.0` app sets as its `hash_digest_class`,
+  # or by SHA1, the digest an app rotating its pre-7.0 cookies derives their old keys with.
+  class KeyGenerator
+    def initialize(secret, options = {})
+      digest = options[:hash_digest_class].to_s
+      @sha1 = digest.end_with?("SHA1")
+      # Not a SHA256 key under another digest's name: it would never match the keys that digest derived.
+      raise ArgumentError, "hash_digest_class #{digest} is not supported; keys derive by SHA256 or SHA1" unless digest == "" || @sha1 || digest.end_with?("SHA256")
+      @secret = secret
+      iterations = options[:iterations]
+      @iterations = iterations.nil? ? 65536 : iterations.to_i
+    end
+
+    def generate_key(salt, key_size = 64)
+      return MessageDigest.pbkdf2_sha1(@secret, salt, @iterations, key_size) if @sha1
+      MessageDigest.pbkdf2_sha256(@secret, salt, @iterations, key_size)
+    end
+  end
+
+  # Only the key length of the cookie jar's ciphers: the encryption itself is `ActionController::MessageEncryptor`.
+  # Rails' class, as a tree loading the real ActiveSupport reopens it; the analysis answers no `new` on it (`registry::stdlib`).
+  class MessageEncryptor
+    def self.key_len(cipher = "aes-256-gcm")
+      raise ArgumentError, "unsupported cipher #{cipher}" unless cipher == "aes-256-gcm" || cipher == "aes-256-cbc"
+      32
+    end
+  end
+
+  module Messages
+    # `config.action_dispatch.cookies_rotations`: the old secrets the signed and encrypted cookie jars also accept.
+    # One shared instance, as the app's config has one: this runtime's `Rails.application.config` is built per call.
+    class RotationConfiguration
+      def self.shared
+        @shared ||= RotationConfiguration.new
+      end
+
+      def initialize
+        @signed = []
+        @encrypted = []
+      end
+
+      def signed
+        @signed
+      end
+
+      def encrypted
+        @encrypted
+      end
+
+      # One secret per rotation: a signed verifier takes no second, and the AES-256-GCM jar ignores a sign secret.
+      def rotate(kind, secret)
+        if kind == :signed
+          @signed << secret
+        elsif kind == :encrypted
+          @encrypted << secret
+        end
+        nil
+      end
+    end
+  end
+
+  # `ActiveSupport::CachingKeyGenerator`: each salt and size derived once, as the stretch is the slow part.
+  class CachingKeyGenerator
+    def initialize(key_generator)
+      @key_generator = key_generator
+      @cache_keys = {}
+    end
+
+    def generate_key(salt, key_size = 64)
+      cache_key = "#{salt}|#{key_size}"
+      key = @cache_keys[cache_key]
+      if key.nil?
+        key = @key_generator.generate_key(salt, key_size)
+        @cache_keys[cache_key] = key
+      end
+      key
     end
   end
 
@@ -400,6 +710,38 @@ module ActiveSupport
     list - elements.flatten(1)
   end
 
+  # AS `Array#extract_options!` (`lower::enumerable_ext`): the trailing
+  # Hash, removed from the Array it was called on, or a new empty one.
+  # Only a plain Hash, as Rails' `Hash#extractable_options?` answers
+  # (`instance_of?(Hash)`): a subclass stays in the Array.
+  # AS `Hash#assert_valid_keys`: the first key outside the list raises, naming the list.
+  def self.assert_valid_keys(hash, valid_keys)
+    # Not the list as given: Rails flattens it, so `assert_valid_keys(KEYS)` and `(:a, [:b])` name the same keys.
+    keys = valid_keys.flatten
+    hash.keys.each do |key|
+      unless keys.include?(key)
+        raise ArgumentError, "Unknown key: #{key.inspect}. Valid keys are: #{keys.map { |valid| valid.inspect }.join(", ")}"
+      end
+    end
+    hash
+  end
+
+  def self.extract_options!(list)
+    last = list.last
+    return list.pop if last.instance_of?(Hash)
+    {}
+  end
+
+  # AS `Enumerable#pluck` on a receiver the analyzer could not type
+  # (lobsters' `value.pluck(:term)` over a parslet parse tree). Not
+  # `map` for a Relation or a model class: Rails' own `pluck` selects only those columns.
+  def self.pluck(list, *keys)
+    return list.pluck(*keys) if list.is_a?(ActiveRecord::Relation) || list.is_a?(Class)
+    return list.map { |element| keys.map { |key| element[key] } } if keys.length > 1
+
+    list.map { |element| element[keys[0]] }
+  end
+
   # AS `Enumerable#many?`: the materialized no-block form is a length
   # check; the block form counts matches and stops at the second hit.
   # Another core_ext reopen the transpiled runtimes cannot host — same
@@ -422,26 +764,49 @@ module ActiveSupport
   # the transpiled runtimes cannot host, and a REGEX the targets do not
   # all lower, so the scan is spelled out the way `to_sentence` below
   # is. Match each character against Rails' POSIX whitespace class,
-  # including Unicode whitespace.
+  # including Unicode whitespace. The walk is over `chars`, not
+  # `text[i]`: on a multibyte String CRuby finds the i-th character from
+  # the start, so indexing the String made the scan quadratic. The
+  # result grows in place for the same reason.
   #
   # campfire's `content_filters_test` writes `<<~HTML.squish` to put a
   # multi-line fixture body on one line before handing it to a filter.
   def self.squish(text)
     out = +""
     pending_space = false
+    chars = text.chars
+    n = chars.length
     i = 0
-    while i < text.length
-      c = text[i]
+    while i < n
+      c = chars[i]
       if c.match?(/[[:space:]]/)
         pending_space = !out.empty?
       else
-        out = out + " " if pending_space
+        out << " " if pending_space
         pending_space = false
-        out = out + c
+        out << c
       end
       i = i + 1
     end
     out
+  end
+
+  # AS `String#first(limit = 1)` / `String#last(limit = 1)`
+  # (core_ext/string/access.rb): the leading or trailing `limit`
+  # characters, the whole String when it is shorter, and ArgumentError
+  # for a negative limit. A String reopen the transpiled runtimes cannot
+  # host, as `squish` below. Campfire binds its transfer link to
+  # `password_salt&.last(10)`.
+  def self.string_first(text, limit)
+    head = text[0, limit]
+    raise ArgumentError, "negative limit" if head.nil?
+    head
+  end
+
+  def self.string_last(text, limit)
+    tail = text[[text.length - limit, 0].max, limit]
+    raise ArgumentError, "negative limit" if tail.nil?
+    tail
   end
 
   # Rails' destructive form always returns the same receiver, including
@@ -450,6 +815,83 @@ module ActiveSupport
     text.gsub!(/[[:space:]]+/, " ")
     text.strip!
     text
+  end
+
+  # AS `String#truncate(truncate_to, omission: "...", separator: nil)`
+  # (core_ext/string/filters.rb), with the options positional: the
+  # result is at most `truncate_to` characters including the omission,
+  # unless the omission alone is longer, in which case it is the
+  # omission. A separator cuts at its last occurrence that still leaves
+  # room for the omission; when it does not occur there, the cut is
+  # where it would have been without one. `nil` for either option means
+  # what Rails' `options[:omission] || "..."` and `if
+  # options[:separator]` make it mean. A String reopen the transpiled
+  # runtimes cannot host - same home and same rule as `squish` above.
+  def self.truncate(text, truncate_to, omission, separator)
+    return text.dup unless text.length > truncate_to
+
+    mark = omission || "..."
+    room = truncate_to - mark.length
+    return mark.dup if room <= 0
+
+    stop = room
+    if separator
+      found = text.rindex(separator, room)
+      stop = found if found
+    end
+    text[0, stop] + mark
+  end
+
+  # The whitespace Rails' default `truncate_words` separator (`/\s+/`)
+  # splits on, as a byte: space, or \t \n \v \f \r.
+  def self.word_space_byte?(b)
+    b == 32 || (b >= 9 && b <= 13)
+  end
+
+  # AS `String#truncate_words(words_count, omission: "...")`
+  # (core_ext/string/filters.rb) for the default separator, with the
+  # omission positional. Rails matches `/\A((?>.+?\s+){n-1}.+?)\s+.*/m`:
+  # a word is at least one character, so leading whitespace belongs to
+  # the first word, and the cut happens only when whitespace follows the
+  # n-th word. Built without a Regexp, like `squish` above. A `separator:`
+  # call is not grounded here. Same home and same rule as `truncate`.
+  # The scan reads bytes: every separator is ASCII and no byte of a
+  # multibyte UTF-8 character is below 0x80, so the cuts are the same,
+  # and `text[i]` would walk the String from the start on each read.
+  def self.truncate_words(text, words_count, omission)
+    mark = omission || "..."
+    n = text.bytesize
+    i = 0
+    words = 0
+    while i < n
+      j = i + 1
+      j += 1 while j < n && !word_space_byte?(text.getbyte(j))
+      k = j
+      k += 1 while k < n && word_space_byte?(text.getbyte(k))
+      words += 1
+      return text.byteslice(0, j) + mark if words == words_count && k > j
+      i = k
+    end
+    text.dup
+  end
+
+  # AS `String#truncate_bytes(truncate_to, omission: "…")`
+  # (core_ext/string/filters.rb), with the omission positional: the
+  # lowerer passes Rails' default when the call names none.
+  def self.truncate_bytes(text, truncate_to, omission)
+    mark = omission || ""
+    return text.dup if text.bytesize <= truncate_to
+    if mark.bytesize > truncate_to
+      raise ArgumentError, "Omission #{mark.inspect} is #{mark.bytesize}, larger than the truncation length of #{truncate_to} bytes"
+    end
+    return mark.dup if mark.bytesize == truncate_to
+    cut_at = truncate_to - mark.bytesize
+    cut = +""
+    text.grapheme_clusters.each do |grapheme|
+      break if cut.bytesize + grapheme.bytesize > cut_at
+      cut << grapheme
+    end
+    cut + mark
   end
 
   # AS `Enumerable#sole`: THE one element, and a raise for any other
@@ -486,12 +928,44 @@ module ActiveSupport
     out
   end
 
+  def self.deep_stringify_keys(hash)
+    out = {}
+    hash.each do |key, value|
+      converted = case key
+                  when Symbol then key.name
+                  else key.to_s
+                  end
+      out[converted] = ActiveSupport.deep_stringify_keys_value(value)
+    end
+    out
+  end
+
+  def self.deep_stringify_keys_value(value)
+    if value.is_a?(Hash)
+      ActiveSupport.deep_stringify_keys(value)
+    elsif value.is_a?(Array)
+      value.map { |item| ActiveSupport.deep_stringify_keys_value(item) }
+    else
+      value
+    end
+  end
+
   # Not `stringify_keys`: Rails' indifferent hash converts only a Symbol key, and its Hash and Array values all the way down.
   def self.indifferent(hash)
     out = {}
     return out if hash.nil?
     hash.each { |key, item| out[ActiveSupport.indifferent_key(key)] = ActiveSupport.indifferent_value(item, false) }
     out
+  end
+
+  # A Hash a parameter takes where an indifferent one reaches it too: one keyed by Symbol converted, one keyed by String
+  # kept, as the caller's indifferent hash is the one Rails writes in place.
+  def self.indifferent_param(hash)
+    return hash if hash.nil?
+    # Not a value of another class a union lets in (a String): only a Hash has keys to convert.
+    return hash unless hash.is_a?(Hash)
+    return hash if hash.keys.all? { |key| key.is_a?(String) }
+    ActiveSupport.indifferent(hash)
   end
 
   # Not a copy for every Array: Rails converts one written by `[]=` in place, unless it is frozen.
@@ -533,11 +1007,251 @@ module ActiveSupport
   end
 
   # Not `value == false || value == 0`: ActiveModel compares its FALSE_VALUES by string too, so :off and "0" answer false.
+  # Only the String "" is nil, as `cast_value`'s `value == ""`: `:""`
+  # is not in FALSE_VALUES, so it is true.
   def self.cast_boolean(value)
     return nil if value.nil?
+    return nil if value == ""
     text = value.to_s
-    return nil if text == ""
     !%w[0 f F false FALSE off OFF].include?(text)
+  end
+
+  # ActiveModel::Type::String#cast_value. `true`/`false` are the frozen
+  # `"t"`/`"f"`; a String is copied so a later mutation is not the
+  # attribute; anything else is `to_s`.
+  def self.cast_string(value)
+    if value.nil?
+      nil
+    elsif value == true
+      "t".freeze
+    elsif value == false
+      "f".freeze
+    elsif value.is_a?(String)
+      value.dup
+    else
+      value.to_s
+    end
+  end
+
+  # ActiveModel::Type::Integer, through `Helpers::Numeric#cast`. A blank
+  # string is nil. A Float that is not finite is nil (`to_i` raises
+  # `FloatDomainError`). Any other string is `to_i` of its first 16
+  # bytes, Rails' `byteslice(0, limit * 4)` at the default 4-byte limit.
+  # A value of another class is what `value.presence` and then
+  # `value.to_i rescue nil` answer: a Time, a Duration (its seconds) or another Numeric (a
+  # Rational) its `to_i`, anything else nil (a Symbol, an Array, a Hash
+  # and an Object have no `to_i`). Each class is named rather than asked
+  # with `respond_to?`, so every branch is typed.
+  def self.cast_integer(value)
+    if value.nil?
+      nil
+    elsif value == true
+      1
+    elsif value == false
+      0
+    elsif value.is_a?(Integer)
+      value
+    elsif value.is_a?(Float)
+      # Not `finite?`, which not every target's Float answers. NaN and
+      # the infinities are the floats for which `v - v` is not 0.0.
+      if value - value != 0.0
+        nil
+      else
+        value.to_i
+      end
+    elsif value.is_a?(String)
+      ActiveSupport.integer_from_string(value)
+    elsif value.is_a?(Time)
+      value.to_i
+    elsif value.is_a?(ActiveSupport::Duration)
+      value.to_i
+    elsif value.is_a?(Numeric)
+      value.to_i
+    else
+      nil
+    end
+  end
+
+  # `Helpers::Numeric#cast`'s `value.presence` for a value that is not
+  # nil, a boolean, a number or a String: `Object#blank?`, which is
+  # `empty?` for the classes that answer it (`[]`, `{}`, `:""`, `Set[]`) and
+  # false for any other object.
+  def self.numeric_blank?(value)
+    if value.is_a?(Array)
+      value.empty?
+    elsif value.is_a?(Hash)
+      value.empty?
+    elsif value.is_a?(Symbol)
+      value.empty?
+    elsif value.is_a?(Set)
+      value.empty?
+    else
+      false
+    end
+  end
+
+  # ActiveModel::Type::Float, through `Helpers::Numeric#cast` (a decimal
+  # column is a Float here, so it casts the same, where Rails answers a
+  # BigDecimal of the same value). A blank string is nil; `true`/`false`
+  # are 1.0/0.0; `"Infinity"`, `"-Infinity"` and `"NaN"` are those floats
+  # (`Type::Float#cast_value`); any other string is `to_f`. A value of
+  # another class is nil when blank (`[]`, `{}`, `:""`), a Time or
+  # another Numeric (a Rational) or a Duration its `to_f`; Rails does not rescue that
+  # `to_f`, so anything else (a Symbol, an Array, a Hash, an Object)
+  # raises the NoMethodError it raises there.
+  def self.cast_float(value)
+    if value.nil?
+      nil
+    elsif value == true
+      1.0
+    elsif value == false
+      0.0
+    elsif value.is_a?(Float)
+      value
+    elsif value.is_a?(Integer)
+      value.to_f
+    elsif value.is_a?(String)
+      ActiveSupport.float_from_string(value)
+    elsif ActiveSupport.numeric_blank?(value)
+      nil
+    elsif value.is_a?(Time)
+      value.to_f
+    elsif value.is_a?(ActiveSupport::Duration)
+      value.to_f
+    elsif value.is_a?(Numeric)
+      value.to_f
+    else
+      raise NoMethodError, "undefined method 'to_f' for an instance of #{value.class}"
+    end
+  end
+
+  # ActiveModel::Type::Decimal, as a Float (a decimal column is a Float
+  # here). nil, booleans, numbers and Strings cast as `cast_float` does.
+  # Another value is nil when blank; another Numeric (a Rational) is its
+  # value; anything else is what its `to_s` reads (`cast_value(value.to_s)`),
+  # so a Symbol, an Array, a Hash or an Object is 0.0 and `:"5"` is 5.0.
+  def self.cast_decimal(value)
+    if value.nil? || value == true || value == false || value.is_a?(Integer) || value.is_a?(Float) || value.is_a?(String)
+      ActiveSupport.cast_float(value)
+    elsif ActiveSupport.numeric_blank?(value)
+      nil
+    elsif value.is_a?(ActiveSupport::Duration)
+      value.to_f
+    elsif value.is_a?(Numeric)
+      value.to_f
+    else
+      ActiveSupport.float_from_string(value.to_s)
+    end
+  end
+
+  # The number ActiveModel 8.1.4's NumericalityValidator checks, or nil
+  # when it is "not a number". `raw` is the value the user assigned
+  # (`<attr>_before_type_cast`), nil when the attribute did not come from
+  # the user, in which case the cast `value` is read (`raw_value ||
+  # value`). Then `parse_as_number`: a Numeric as it is; a String of
+  # digits (`/\A[+-]?\d+\z/`) its Integer; a hex prefix not a number;
+  # anything else what `Kernel.Float` reads, or not a number where it
+  # raises. `Kernel.Float`'s grammar is the regexp, since not every
+  # target has `Float()`.
+  def self.numericality_number(raw, value)
+    v = raw.nil? || raw == false ? value : raw
+    return nil if v.nil?
+    return v if v.is_a?(Integer) || v.is_a?(Float)
+    text = v.to_s
+    return text.to_i if text.match?(/\A[+-]?\d+\z/)
+    return nil if text.match?(/\A[+-]?0[xX]/)
+    return nil unless text.match?(/\A[[:space:]]*[+-]?(?:\d+(?:_\d+)*(?:\.(?:\d+(?:_\d+)*)?)?|\.\d+(?:_\d+)*)(?:[eE][+-]?\d+(?:_\d+)*)?[[:space:]]*\z/)
+    text.to_f
+  end
+
+  # The String half of `cast_float`: the blank scan `integer_from_string`
+  # makes, then Rails' three named values, then `to_f`. The named values
+  # are divisions rather than `Float::INFINITY`/`NAN`, which not every
+  # target defines.
+  def self.float_from_string(value)
+    i = 0
+    n = value.length
+    blank = true
+    while i < n
+      blank = false unless value[i].match?(/[[:space:]]/)
+      i = n unless blank
+      i = i + 1
+    end
+    return nil if blank
+    zero = 0.0
+    return 1.0 / zero if value == "Infinity"
+    return -1.0 / zero if value == "-Infinity"
+    return zero / zero if value == "NaN"
+    value.to_f
+  end
+
+  # `String#blank?` is `/\A[[:space:]]*\z/`, which raises ArgumentError
+  # on invalid UTF-8 — the integer writer does, in `presence`, before
+  # it slices. One character at a time, the same scan `squish` lowers:
+  # a counter loop, no `break` or `next` (those stay a Ruby loop, and
+  # TypeScript turns `next` into `return`). `value[i]` on a multibyte
+  # string walks from the start, so the loop stops at the first
+  # character that is not space by moving `i` to the end, then taking
+  # the required `i = i + 1` step. A string that is not blank is `to_i`
+  # of its first 16 bytes. The first 16 characters are enough: `to_i`
+  # reads only an ASCII prefix, and 16 characters are at least 16 bytes.
+  def self.integer_from_string(value)
+    i = 0
+    n = value.length
+    blank = true
+    while i < n
+      blank = false unless value[i].match?(/[[:space:]]/)
+      i = n unless blank
+      i = i + 1
+    end
+    return nil if blank
+    prefix = n > 16 ? value[0, 16] : value
+    ActiveSupport.integer_from_bytes(prefix.bytes)
+  end
+
+  # `byteslice(0, 16).to_i`. Strict targets lower `String#bytes`, not
+  # `byteslice`. For a string `blank?` accepted, the two slices' `to_i`
+  # are the same integer: `to_i` reads only an ASCII prefix, and a
+  # non-ASCII byte stops it. Underscores between digits count, as
+  # Ruby's `to_i` does (`"1_0"` is 10, `"1__0"` is 1). `phase` 3 ignores
+  # the rest of the window so the loop stays a counter (`i = i + 1`).
+  def self.integer_from_bytes(raw)
+    limit = raw.length
+    limit = 16 if limit > 16
+    i = 0
+    phase = 0
+    sign = 1
+    n = 0
+    digits = 0
+    while i < limit
+      b = raw[i]
+      b = -1 if b.nil?
+      if phase == 0
+        if b == 43 || b == 45
+          sign = -1 if b == 45
+          phase = 2
+        elsif b >= 48 && b <= 57
+          n = n * 10 + (b - 48)
+          digits = digits + 1
+          phase = 2
+        elsif b != 32 && b != 9 && b != 10 && b != 11 && b != 12 && b != 13
+          phase = 3
+        end
+      elsif phase == 2
+        if b == 95
+          nxt = raw[i + 1]
+          nxt = -1 if nxt.nil?
+          phase = 3 if digits == 0 || nxt < 48 || nxt > 57
+        elsif b >= 48 && b <= 57
+          n = n * 10 + (b - 48)
+          digits = digits + 1
+        else
+          phase = 3
+        end
+      end
+      i = i + 1
+    end
+    n * sign
   end
 
   # AS `Array#to_sentence`: "", "a", "a and b", "a, b, and c" with the
@@ -632,6 +1346,19 @@ module ActiveSupport
 
   def self.years_ago(t, n = 1)
     months_since(t, -12 * n)
+  end
+
+  def self.change_time_usec(time, usec)
+    raise ArgumentError, "argument out of range" if usec >= 1_000_000
+    raise ArgumentError, "argument out of range" if time.sec * 1_000_000 + usec < 0
+    changed = Time.at(time.to_i, usec, :usec)
+    return changed.getutc if time.utc?
+    return changed.getlocal(time.utc_offset) if time.zone.to_s.empty?
+    local = Time.at(time.to_i).getlocal
+    if local.zone != time.zone || local.utc_offset != time.utc_offset || local.dst? != time.dst?
+      raise NotImplementedError, "Time#change with a custom or changed system timezone is not supported"
+    end
+    changed.getlocal
   end
 
   def self.beginning_of_minute(t)
@@ -802,7 +1529,7 @@ module ActiveSupport
     "Bucharest" => "Europe/Bucharest",
     "Cairo" => "Africa/Cairo",
     "Helsinki" => "Europe/Helsinki",
-    "Kyiv" => "Europe/Kiev",
+    "Kyiv" => "Europe/Kyiv",
     "Riga" => "Europe/Riga",
     "Sofia" => "Europe/Sofia",
     "Tallinn" => "Europe/Tallinn",
@@ -843,7 +1570,7 @@ module ActiveSupport
     "Almaty" => "Asia/Almaty",
     "Astana" => "Asia/Almaty",
     "Novosibirsk" => "Asia/Novosibirsk",
-    "Rangoon" => "Asia/Rangoon",
+    "Rangoon" => "Asia/Yangon",
     "Bangkok" => "Asia/Bangkok",
     "Hanoi" => "Asia/Bangkok",
     "Jakarta" => "Asia/Jakarta",
@@ -1023,8 +1750,32 @@ module ActiveSupport
     sign * (h * 3600 + mi * 60 + s)
   end
 
+  # The app's `config.time_zone` (Rails' default `Time.zone`), set once at
+  # boot by `set_default_zone`; empty until then, which presents in the
+  # host's zone. Rails keeps the process zone alone: `Time.now` is the
+  # host's local time and only `Time.current` and Active Record values are
+  # in the configured zone. The boot used to pin `ENV["TZ"]` to the
+  # configured zone instead, which made `Time.now` the configured zone
+  # too (an app that names a file after `Time.now.strftime` on a Warsaw
+  # host gets the Warsaw time from Rails).
+  DEFAULT_ZONE = []
+
+  # UTC needs no tzdata: a zone with no transitions and offset 0, so a
+  # container without /usr/share/zoneinfo still boots on Rails' default.
+  def self.set_default_zone(name)
+    iana = ZONE_NAMES[name.to_s] || name.to_s
+    DEFAULT_ZONE.clear
+    if iana == "UTC" || iana == "Etc/UTC" || iana == "Etc/UCT" || iana == "GMT" || iana == "Etc/GMT"
+      DEFAULT_ZONE << TimeZoneData.new(name.to_s, [], [], 0, [], [])
+    else
+      DEFAULT_ZONE << find_zone!(name)
+    end
+    nil
+  end
+
   def self.current_zone
-    Thread.current[:rh_time_zone]
+    zone = Thread.current[:rh_time_zone]
+    zone.nil? ? DEFAULT_ZONE[0] : zone
   end
 
   def self.use_zone(zone)
@@ -1039,7 +1790,12 @@ module ActiveSupport
 
   def self.present(t)
     zone = current_zone
-    zone.nil? ? t.getlocal : t.getlocal(zone.offset_at(t.to_i))
+    zone.nil? ? t.getlocal : present_in_zone(t, zone)
+  end
+
+  def self.present_in_zone(t, zone)
+    return t.getutc if ActiveSupport::JSON.utc_zone_name?(zone.name)
+    t.getlocal(zone.offset_at(t.to_i))
   end
 
   def self.present_db(t)
@@ -1049,7 +1805,7 @@ module ActiveSupport
 
   def self.in_time_zone(t, zone)
     return present(t) if zone.nil?
-    t.getlocal(find_zone!(zone).offset_at(t.to_i))
+    present_in_zone(t, find_zone!(zone))
   end
 
   def self.zone_name(zone)
@@ -1067,7 +1823,7 @@ module ActiveSupport
     return Time.at(Time.local(y, mo, d, h, mi, s).to_i, nsec, :nsec) if zone.nil?
     guess = Time.utc(y, mo, d, h, mi, s).to_i
     epoch = guess - zone.offset_at(guess - zone.offset_at(guess))
-    Time.at(epoch, nsec, :nsec).getlocal(zone.offset_at(epoch))
+    present_in_zone(Time.at(epoch, nsec, :nsec), zone)
   end
 
   # Not `number.to_s` with commas everywhere: only an all-digit integer part takes them, so `1.0e+20` and `Infinity` pass through.
@@ -1088,6 +1844,93 @@ module ActiveSupport
       i = i + 1
     end
     sign + out + rest
+  end
+
+  # bigdecimal/util's `String#to_d` (`BigDecimal.interpret_loosely`): leading whitespace skipped, a sign, then the
+  # longest decimal it can read (`_` only between digits, an exponent only with digits); none reads as a signed zero.
+  def self.loose_decimal_text(raw)
+    # Not by character: the grammar is single-byte ASCII, and a byte string indexes in constant time.
+    text = raw.b
+    i = 0
+    n = text.length
+    i = i + 1 while i < n && " \t\n\v\f\r".include?(text[i].to_s)
+    sign = ""
+    signed = false
+    if i < n && (text[i] == "+" || text[i] == "-")
+      sign = text[i] == "-" ? "-" : ""
+      signed = true
+      i = i + 1
+    end
+    # A special value only as the whole rest (trailing whitespace allowed): `"Infinityjunk"` reads as a zero.
+    rest = text[i, n].to_s.rstrip
+    return sign + "Infinity" if rest == "Infinity"
+    # Not a signed one: bigdecimal reads `NaN` before any sign, so `+NaN` is a zero.
+    return "NaN" if !signed && rest == "NaN"
+    int_part = loose_digits(text, i)
+    i = loose_digits_end(text, i)
+    frac_part = ""
+    if i < n && text[i] == "."
+      frac_part = loose_digits(text, i + 1)
+      i = loose_digits_end(text, i + 1)
+    end
+    return sign + "0" if int_part.empty? && frac_part.empty?
+    exponent = ""
+    if i < n && (text[i] == "e" || text[i] == "E" || text[i] == "d" || text[i] == "D")
+      j = i + 1
+      exp_sign = ""
+      if j < n && (text[j] == "+" || text[j] == "-")
+        exp_sign = text[j].to_s
+        j = j + 1
+      end
+      exp_digits = loose_digits(text, j)
+      exponent = "e" + exp_sign + exp_digits unless exp_digits.empty?
+    end
+    sign + (int_part.empty? ? "0" : int_part) + (frac_part.empty? ? "" : "." + frac_part) + exponent
+  end
+
+  # The digits from `at` on, an `_` kept out between two of them.
+  def self.loose_digits(text, at)
+    out = +""
+    j = at
+    n = text.length
+    while j < n
+      c = text[j].to_s
+      if c >= "0" && c <= "9"
+        out << c
+      elsif !(c == "_" && !out.empty? && j + 1 < n && text[j + 1].to_s >= "0" && text[j + 1].to_s <= "9")
+        break
+      end
+      j = j + 1
+    end
+    out
+  end
+
+  def self.loose_digits_end(text, at)
+    j = at
+    n = text.length
+    seen = false
+    while j < n
+      c = text[j].to_s
+      if c >= "0" && c <= "9"
+        seen = true
+      elsif !(c == "_" && seen && j + 1 < n && text[j + 1].to_s >= "0" && text[j + 1].to_s <= "9")
+        break
+      end
+      j = j + 1
+    end
+    j
+  end
+
+  # `to_d` on what a String's or nil's position holds (a request param, a nullable column): nil is zero, as
+  # bigdecimal/util's `NilClass#to_d`, and a shape with no `to_d` raises.
+  # A value the analysis could not type takes the Numeric reopens' `to_d` too.
+  def self.loose_to_d(value)
+    return BigDecimal("0") if value.nil?
+    return value if value.is_a?(BigDecimal)
+    return BigDecimal(value) if value.is_a?(Integer)
+    return BigDecimal(float_decimal_text(value)) if value.is_a?(Float)
+    raise NoMethodError, "undefined method 'to_d' for a value that is neither a String nor a number" unless value.is_a?(String)
+    BigDecimal(loose_decimal_text(value))
   end
 
   # Not `f.to_s` as it is: `Float#to_d` keeps the shortest digits but cuts them at 16 without rounding (bigdecimal's BIGDECIMAL_DOUBLE_FIGURES).
@@ -1130,6 +1973,8 @@ module ActiveSupport
   end
 
   class TimeZone
+    MAPPING = ZONE_NAMES
+
     attr_reader :name
 
     def initialize(name, data)
@@ -1147,10 +1992,17 @@ module ActiveSupport
       end
     end
 
+    # Rails' `zones_map` (`activesupport/lib/active_support/values/time_zone.rb`)
+    # builds this by calling `self[name]` per mapped name and keeping only
+    # the ones that resolve; `[]` itself rescues `TZInfo::InvalidTimezoneIdentifier`
+    # and returns nil for the rest. `lookup` is our spelling of that `[]`.
+    # A host missing a legacy zone file (no `tzdata-legacy`) then just has
+    # fewer zones, not a raise.
     def self.all
       zones = []
       ActiveSupport.rails_zone_names.each do |zone_name|
-        zones << TimeZone.new(zone_name, ActiveSupport.find_zone!(zone_name))
+        zone = lookup(zone_name)
+        zones << zone unless zone.nil?
       end
       # Not `sort { |a, b| … }`: a block's parameters do not type on every target, and 152 zones sort cheaply in place.
       i = 1
@@ -1186,7 +2038,38 @@ module ActiveSupport
 
     def now
       t = Time.now
-      t.getlocal(@data.offset_at(t.to_i))
+      ActiveSupport.present_in_zone(t, @data)
     end
+
+    # Rails' `TimeZone#tzinfo` is the zone's TZInfo::Timezone; this
+    # models only its IANA identifier (`TimeZoneInfo`).
+    def tzinfo
+      TimeZoneInfo.new(ZONE_NAMES[@name] || @name)
+    end
+  end
+
+  # The part of a TZInfo::Timezone the runtime answers: `name` and
+  # `identifier`, both the IANA identifier ("Asia/Tokyo" for Rails'
+  # "Tokyo"). TZInfo's `to_s` ("Asia - Tokyo") and the period and offset
+  # methods are not modeled.
+  class TimeZoneInfo
+    attr_reader :name
+
+    def initialize(name)
+      @name = name
+    end
+
+    def identifier
+      @name
+    end
+  end
+
+  # `Time.zone.tzinfo`: the configured zone's identifier. The default
+  # zone is named as configured ("UTC") or by its IANA identifier, which
+  # ZONE_NAMES passes through.
+  def self.current_tzinfo
+    zone = current_zone
+    name = zone.nil? ? "UTC" : zone.name
+    TimeZoneInfo.new(ZONE_NAMES[name] || name)
   end
 end

@@ -1,3 +1,16 @@
+# frozen_string_literal: true
+# Emitted trees place this file beside `active_support_interval.rb`.
+# The source tree keeps that one parser under `runtime/spinel/`.
+begin
+  require_relative "active_support_interval"
+rescue LoadError
+  # Source-tree fallback: the parser lives under runtime/spinel/, three
+  # directories up from this overlay. Emitted trees place the sibling
+  # beside this file, so the fallback never runs there. A computed path
+  # stays out of the static require graph, which only resolves literals.
+  rel = File.join("..", "..", "..", "active_support_interval")
+  require_relative rel
+end
 # Native date-only parsing plus UTC-safe timestamp parsing/stamping.
 #
 # Dates store as YYYY-MM-DD, with no time or zone. Separately,
@@ -47,26 +60,6 @@ module ActiveSupport
   # `active_support_date_parsing.rb` (date-gated package). Do not
   # redefine them here — CRuby boot re-injects that file after overlay.
 
-  # Rails zone name → IANA identifier (the ActiveSupport::TimeZone::
-  # MAPPING subset corpora have needed; extend as apps demand). Names
-  # not listed pass through unchanged — a valid IANA string works
-  # as-is in TZ. Consumed by main.rb's boot-time ENV["TZ"] pin.
-  RAILS_TZ_TO_IANA = {
-    "UTC" => "UTC",
-    "Eastern Time (US & Canada)" => "America/New_York",
-    "Central Time (US & Canada)" => "America/Chicago",
-    "Mountain Time (US & Canada)" => "America/Denver",
-    "Pacific Time (US & Canada)" => "America/Los_Angeles",
-    "Arizona" => "America/Phoenix",
-    "Hawaii" => "Pacific/Honolulu",
-    "Alaska" => "America/Anchorage",
-    "London" => "Europe/London",
-    "Paris" => "Europe/Paris",
-    "Berlin" => "Europe/Berlin",
-    "Tokyo" => "Asia/Tokyo",
-    "Sydney" => "Australia/Sydney",
-  }.freeze
-
   def self.parse_db_time(str)
     return nil if str.nil? || str.empty?
     # Fast path for the sqlite3 adapter's own storage form — bare
@@ -83,9 +76,10 @@ module ActiveSupport
     end
     t = str =~ /(Z|[+-]\d\d:?\d\d)\z/ ? Time.parse(str) : Time.parse("#{str} UTC")
     # Present in the app's zone, exactly as ActiveRecord returns
-    # TimeWithZone values in Time.zone: main.rb pins ENV["TZ"] to the
-    # app's config.time_zone (default UTC — Rails' default — so
-    # rendered offsets never follow the HOST's zone). Instants are
+    # TimeWithZone values in Time.zone: the boot sets the app's
+    # config.time_zone (default UTC - Rails' default) as the runtime's
+    # default zone, so rendered offsets never follow the HOST's zone,
+    # while `Time.now` still does, as in Rails. Instants are
     # unchanged; only strftime/iso8601 presentation moves.
     ActiveSupport.present(t)
   end
@@ -147,8 +141,8 @@ module ActiveSupport
     FROZEN_AT << 0
   end
 
-  # Stop the clock at `seconds` (the harness's `freeze_time`).
-  def self.freeze(seconds)
+  # Stop the clock at `seconds` (the harness's `freeze_time`). Not `freeze`: that is Module#freeze, which a gem calls on any class value.
+  def self.freeze_clock(seconds)
     FROZEN_AT.clear
     FROZEN_AT << seconds
   end
@@ -179,17 +173,6 @@ module ActiveSupport
       "%04d-%02d-%02d %02d:%02d:%02d.%06d",
       t.year, t.month, t.day, t.hour, t.min, t.sec, t.usec
     )
-  end
-
-  # Stdlib is the authority here (this tree already requires "time"),
-  # so the overlay delegates rather than re-derives — the CRuby lane's
-  # feed bytes are exactly what they were before the call site was
-  # grounded to a module function. The spinel twin composes the same
-  # shape from strftime and pins the zone tail; see its comment for why
-  # the two differ.
-  def self.rfc2822(t)
-    return nil if t.nil?
-    t.rfc2822
   end
 
   # Normalize a temporal-writer value into the canonical storage form
@@ -229,5 +212,41 @@ module ActiveSupport
       return ActiveSupport.local_time(year, mon, mday, parts.fetch(:hour, 0), parts.fetch(:min, 0), sec.to_i, ((sec - sec.to_i) * 1_000_000_000).to_i)
     end
     ActiveSupport.present(Time.new(year, mon, mday, parts.fetch(:hour, 0), parts.fetch(:min, 0), sec, parts[:offset]))
+  end
+
+  # ActiveModel::Type::DateTime#cast (Rails 8.1), for an `attribute :x, :datetime` writer: the strict
+  # `Time.new` read first, then `Date._parse`. `is_utc?` is `Time.zone_default.name == "UTC"`, so only
+  # config.time_zone `"UTC"` is UTC. `GMT` and `Etc/UTC` are other names and take `Time.local`, the host
+  # process zone. Boot does not pin `ENV["TZ"]`.
+  def self.cast_datetime(value)
+    return nil if value.nil?
+    return value unless value.is_a?(String)
+    return nil if value.empty?
+    utc = Rails.application.config_time_zone == "UTC"
+    if value.include?("-")
+      begin
+        return utc ? Time.new(value, in: "UTC") : Time.new(value)
+      rescue ArgumentError
+      end
+    end
+    parts = begin
+      Date._parse(value)
+    rescue ArgumentError
+      nil
+    end
+    return nil if parts.nil?
+    year, mon, mday, hour, min, sec, offset = parts.values_at(:year, :mon, :mday, :hour, :min, :sec, :offset)
+    usec = parts[:sec_fraction] ? (parts[:sec_fraction] * 1_000_000).to_i : 0
+    return nil if year.nil? || (year == 0 && mon == 0 && mday == 0)
+    if offset
+      t = Time.utc(year, mon, mday, hour, min, sec, usec) rescue nil
+      return nil if t.nil?
+      t -= offset unless offset == 0
+      utc ? t : t.getlocal
+    elsif utc
+      Time.utc(year, mon, mday, hour, min, sec, usec) rescue nil
+    else
+      Time.local(year, mon, mday, hour, min, sec, usec) rescue nil
+    end
   end
 end

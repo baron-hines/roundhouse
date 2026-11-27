@@ -11,7 +11,7 @@
 //! emitters construct `JsModule`s directly — at which point the
 //! `Span`s every node carries become token-level source-map entries.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use super::js_ast::{
     ArrowBody, Js, JsExpr, JsKey, JsObjEntry, JsParam, JsStmt, JsStmtNode, TplPart, TsType,
@@ -41,7 +41,7 @@ use crate::ty::Ty;
 
 std::thread_local! {
     static ASYNC_METHOD_NAMES: std::cell::RefCell<HashSet<Symbol>> =
-        std::cell::RefCell::new(HashSet::new());
+        std::cell::RefCell::new(HashSet::default());
     /// Whether the body currently being emitted belongs to an
     /// `async`-marked method. The Yield emit reads this to decide
     /// between `__block(...)` (sync method body, await would be a
@@ -136,40 +136,112 @@ pub(super) fn body_has_async_send(expr: &Expr) -> bool {
 #[derive(Default, Clone)]
 pub(crate) struct ClassShape {
     parent: Option<String>,
-    methods: HashMap<String, (crate::dialect::AccessorKind, usize)>,
+    methods: HashMap<String, Shape>,
+    /// The class's own (`def self.x`) methods, read for a `self` send
+    /// inside a class method.
+    class_methods: HashMap<String, Shape>,
+}
+
+/// A method's kind, its parameter count, and whether a call with no
+/// arguments reaches it (every parameter optional: a default, a rest, a
+/// forwarding `...`), which is what makes a parenless send a call.
+type Shape = (crate::dialect::AccessorKind, usize, bool);
+
+fn accepts_no_arguments(m: &crate::dialect::MethodDef) -> bool {
+    m.params.iter().all(|p| p.default.is_some() || p.rest || p.forwarding || p.name.as_str().is_empty())
+}
+
+std::thread_local! {
+    /// Each class this emit knows: its parent and the constants its body
+    /// declares as `static` members (`set_static_constants`).
+    static STATIC_CONSTANTS: std::cell::RefCell<HashMap<String, (Option<String>, HashSet<String>)>> =
+        std::cell::RefCell::new(HashMap::default());
+}
+
+/// Record, for `classes`, each one's parent and the class-body constants
+/// the TypeScript emit declares as `static` members.
+pub(crate) fn set_static_constants<'a>(classes: impl IntoIterator<Item = &'a crate::dialect::LibraryClass>) {
+    let mut map: HashMap<String, (Option<String>, HashSet<String>)> = HashMap::default();
+    for c in classes {
+        let entry = map.entry(c.name.0.as_str().to_string()).or_default();
+        if entry.0.is_none() {
+            entry.0 = c.parent.as_ref().map(|p| p.0.as_str().to_string());
+        }
+        for (name, value) in &c.constants {
+            if super::declarable_constant_value(value).is_some() {
+                entry.1.insert(name.as_str().to_string());
+            }
+        }
+    }
+    STATIC_CONSTANTS.with(|cell| *cell.borrow_mut() = map);
+}
+
+/// Whether an ancestor of a class whose parent is `parent` declares a
+/// `static` constant `name`: a child's own constant of that name shadows
+/// it, as Ruby's does, and TypeScript requires the child's static side to
+/// be assignable to the parent's, so the child's is typed `any`.
+pub(crate) fn ancestor_declares_static(parent: Option<&str>, name: &str) -> bool {
+    STATIC_CONSTANTS.with(|cell| {
+        let map = cell.borrow();
+        let mut current = parent.map(str::to_string);
+        for _ in 0..16 {
+            let Some(class) = current else { return false };
+            let Some((next, statics)) = map.get(&class) else { return false };
+            if statics.contains(name) {
+                return true;
+            }
+            current = next.clone();
+        }
+        false
+    })
+}
+
+std::thread_local! {
+    static NESTED_CLASS_NAMES: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::default());
+}
+
+/// The app's nested classes (`Importer::TooBig`), whose `.new` is a
+/// constructor although its receiver renders dotted (`Importer.TooBig`).
+pub(crate) fn set_nested_class_names(names: impl IntoIterator<Item = String>) {
+    NESTED_CLASS_NAMES.with(|cell| *cell.borrow_mut() = names.into_iter().collect());
 }
 
 std::thread_local! {
     static CLASS_SHAPES: std::cell::RefCell<HashMap<String, ClassShape>> =
-        std::cell::RefCell::new(HashMap::new());
+        std::cell::RefCell::new(HashMap::default());
 }
 
-/// Record the instance-method shapes of `classes` for the Send emit.
-/// `fields` is each class's TS field names (`js_library_class`'s
-/// attribute readers and assigned ivars): a method whose emitted name
-/// is one of them is dropped in favour of the field, so it reads as one.
+/// Record the method shapes of `classes` for the Send emit. `fields` is
+/// each class's TS instance field names and `static_fields` its static
+/// ones (`js_library_class`'s attribute readers and assigned ivars, per
+/// side): a method whose emitted name is one of its side's fields is
+/// dropped in favour of the field, so it reads as one.
 pub(crate) fn set_class_shapes<'a>(
-    classes: impl IntoIterator<Item = (&'a crate::dialect::LibraryClass, HashSet<String>)>,
+    classes: impl IntoIterator<Item = (&'a crate::dialect::LibraryClass, HashSet<String>, HashSet<String>)>,
 ) {
     use crate::dialect::AccessorKind;
-    let mut map: HashMap<String, ClassShape> = HashMap::new();
-    for (c, fields) in classes {
+    let as_field = |kind: AccessorKind, fields: &HashSet<String>, name: &str| {
+        if kind == AccessorKind::Method && fields.contains(&super::library::sanitize_identifier(name)) {
+            AccessorKind::AttributeReader
+        } else {
+            kind
+        }
+    };
+    let mut map: HashMap<String, ClassShape> = HashMap::default();
+    for (c, fields, static_fields) in classes {
         let entry = map.entry(c.name.0.as_str().to_string()).or_default();
         if entry.parent.is_none() {
             entry.parent = c.parent.as_ref().map(|p| p.0.as_str().to_string());
         }
         for m in &c.methods {
             if !matches!(m.receiver, crate::dialect::MethodReceiver::Instance) {
+                let kind = as_field(m.kind, &static_fields, m.name.as_str());
+                entry.class_methods.entry(m.name.as_str().to_string()).or_insert((kind, m.params.len(), accepts_no_arguments(m)));
                 continue;
             }
-            let kind = if m.kind == AccessorKind::Method
-                && fields.contains(&super::library::sanitize_identifier(m.name.as_str()))
-            {
-                AccessorKind::AttributeReader
-            } else {
-                m.kind
-            };
-            entry.methods.entry(m.name.as_str().to_string()).or_insert((kind, m.params.len()));
+            let kind = as_field(m.kind, &fields, m.name.as_str());
+            entry.methods.entry(m.name.as_str().to_string()).or_insert((kind, m.params.len(), accepts_no_arguments(m)));
         }
     }
     CLASS_SHAPES.with(|cell| *cell.borrow_mut() = map);
@@ -177,8 +249,49 @@ pub(crate) fn set_class_shapes<'a>(
 
 /// The shape of `method` on an instance of the class `ty` names, found
 /// on the class or its nearest ancestor that declares it.
-fn instance_method_shape(ty: Option<&Ty>, method: &str) -> Option<(crate::dialect::AccessorKind, usize)> {
+fn instance_method_shape(ty: Option<&Ty>, method: &str) -> Option<Shape> {
     let Some(Ty::Class { id, .. }) = strip_nullable(ty) else { return None };
+    method_shape(id.0.as_str(), method, false)
+}
+
+/// The model a singular finder on it answers (`Slot.find(id)`), whose
+/// result this emit casts to it (the self-type narrowing in the Send
+/// emit) where analysis left the call's type open.
+fn narrowed_record_class(recv: &Expr) -> Option<String> {
+    let ExprNode::Send { recv: Some(on), method, .. } = &*recv.node else { return None };
+    let ExprNode::Const { path } = &*on.node else { return None };
+    let stripped = method.as_str().trim_end_matches('!');
+    if !matches!(stripped, "find" | "find_by" | "last" | "create" | "first") {
+        return None;
+    }
+    let class = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+    descends_from_active_record(&class).then_some(class)
+}
+
+/// The shape of the class method `method` of the class `class`, found
+/// on it or its nearest ancestor that declares it.
+fn class_method_shape(class: &str, method: &str) -> Option<Shape> {
+    method_shape(class, method, true)
+}
+
+/// Whether the class `class` reaches `ActiveRecord::Base` through the
+/// parents this emit recorded: a model, whose `find` takes its key.
+fn descends_from_active_record(class: &str) -> bool {
+    CLASS_SHAPES.with(|cell| {
+        let map = cell.borrow();
+        let mut current = Some(class.to_string());
+        for _ in 0..16 {
+            let Some(name) = current else { return false };
+            if name == "ActiveRecord::Base" {
+                return true;
+            }
+            current = map.get(&name).and_then(|shape| shape.parent.clone());
+        }
+        false
+    })
+}
+
+fn method_shape(class: &str, method: &str, class_side: bool) -> Option<Shape> {
     CLASS_SHAPES.with(|cell| {
         let map = cell.borrow();
         let resolve = |name: &str| -> Option<&ClassShape> {
@@ -191,10 +304,11 @@ fn instance_method_shape(ty: Option<&Ty>, method: &str) -> Option<(crate::dialec
                 }
             })
         };
-        let mut current = Some(id.0.as_str().to_string());
+        let mut current = Some(class.to_string());
         for _ in 0..16 {
             let shape = resolve(current.as_deref()?)?;
-            if let Some(found) = shape.methods.get(method) {
+            let methods = if class_side { &shape.class_methods } else { &shape.methods };
+            if let Some(found) = methods.get(method) {
                 return Some(found.clone());
             }
             current = shape.parent.clone();
@@ -205,7 +319,25 @@ fn instance_method_shape(ty: Option<&Ty>, method: &str) -> Option<(crate::dialec
 
 std::thread_local! {
     static CURRENT_METHOD_PARAMS: std::cell::RefCell<HashSet<Symbol>> =
-        std::cell::RefCell::new(HashSet::new());
+        std::cell::RefCell::new(HashSet::default());
+}
+
+std::thread_local! {
+    static SELF_CLASS: std::cell::RefCell<Option<(String, bool)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with `class` as the class whose method body is being
+/// emitted, and `class_side` true for a class method, so a `self` send
+/// in it reads that class's methods of the same side even where `self`
+/// carries no type.
+pub(crate) fn with_self_class<F, R>(class: String, class_side: bool, f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    let prev = SELF_CLASS.with(|cell| std::mem::replace(&mut *cell.borrow_mut(), Some((class, class_side))));
+    let r = f();
+    SELF_CLASS.with(|cell| *cell.borrow_mut() = prev);
+    r
 }
 
 /// Run `f` with `params` as the active enclosing-method parameter
@@ -292,6 +424,341 @@ fn synth_ident(name: &str) -> Js {
     Js::synth(JsExpr::Ident(name.into()))
 }
 
+/// Whether a send on a typed Array receiver, with `argc` arguments
+/// counting its block, emits as a JS expression that answers what Ruby
+/// does: the Array arm of `js_send` above, or a name it shares with JS
+/// Array or with the generic rewrites (`nil?`, `present?`, `is_a?`, …).
+/// `project::report_typescript_array_sends` refuses the rest, which the
+/// fallback would emit as a property or method the JS Array lacks.
+pub(crate) fn array_method_handled(method: &str, argc: usize, block: Option<&Expr>, elem: &Ty) -> bool {
+    // The translations above match a literal block (`Lambda`); a `&blk` or `&method(:m)` block reaches the fallback.
+    let lambda = block.is_some_and(is_block) && argc == 1;
+    let any_block = block.is_some() && argc == 1;
+    // Blockless `any?`/`none?` count elements: right only when no element can be nil or false.
+    let never_falsy = matches!(elem, Ty::Str | Ty::Int | Ty::Float | Ty::Sym);
+    match method {
+        "each" | "map" | "find" | "sort_by" => any_block,
+        "collect" | "flat_map" | "select" | "filter" | "find_all" | "reject" | "detect" | "each_with_index"
+        | "all?" => lambda,
+        "any?" | "none?" => lambda || (argc == 0 && never_falsy),
+        "sum" => argc == 0 || lambda,
+        "inject" | "reduce" => block.is_some_and(is_block) && (argc == 1 || argc == 2),
+        "count" | "index" | "find_index" => {
+            argc == 0 && method == "count" || (argc == 1 && (block.is_none() || lambda))
+        }
+        "first" | "last" | "join" => block.is_none() && argc <= 1,
+        "take" | "drop" | "include?" => block.is_none() && argc == 1,
+        "max" | "min" => argc == 0 && matches!(elem, Ty::Int | Ty::Float),
+        "size" | "length" | "empty?" | "reverse" | "to_a" | "to_h" | "sort" | "compact" | "uniq" | "dup"
+        | "clone" | "nil?" | "present?" | "blank?" | "freeze" | "!" => argc == 0,
+        // JS `pop(n)` / `shift(n)` ignore `n`, where Ruby answers the last or first n.
+        "pop" | "shift" => argc == 0,
+        "push" | "unshift" => block.is_none(),
+        "[]" | "<<" | "==" | "!=" | "+" | "-" | "&" | "|" | "is_a?" | "kind_of?" => block.is_none() && argc == 1,
+        "[]=" => block.is_none() && argc == 2,
+        _ => false,
+    }
+}
+
+/// `array_method_handled` for an Integer or Float receiver: the numeric
+/// arm of `js_send`, the operators, and the generic `to_s` / `to_i` /
+/// `times` rewrites.
+pub(crate) fn numeric_method_handled(method: &str, argc: usize, block: Option<&Expr>) -> bool {
+    match method {
+        "times" => block.is_some_and(is_block) && argc == 1,
+        "odd?" | "even?" | "zero?" | "positive?" | "negative?" | "abs" | "to_f" | "to_i" | "to_s" | "pred"
+        | "succ" | "floor" | "ceil" | "round" | "-@" | "+@" | "nil?" | "present?" | "blank?" | "freeze" | "!" => argc == 0,
+        "fdiv" | "<=>" | "+" | "-" | "*" | "/" | "%" | "**" | "==" | "!=" | "<" | ">" | "<=" | ">=" | "is_a?"
+        | "kind_of?" => argc == 1 && block.is_none(),
+        "clamp" | "between?" => argc == 2,
+        _ => false,
+    }
+}
+
+pub(crate) fn string_method_handled(method: &str, args: &[Expr], block: Option<&Expr>) -> bool {
+    let argc = args.len();
+    // The shared bytes bridge takes a literal `&nil` block and refuses the other shapes itself.
+    if method == "bytes" {
+        return true;
+    }
+    if block.is_some() {
+        return matches!(method, "sub" | "gsub") && argc == 1;
+    }
+    if crate::catalog::string_kernel::lookup(method, argc).is_some() {
+        return true;
+    }
+    let int_or_range = |e: &Expr| matches!(strip_nullable(e.ty.as_ref()), Some(Ty::Int)) || matches!(&*e.node, ExprNode::Range { .. });
+    match method {
+        "capitalize" | "reverse" | "chars" | "bytes" | "to_s" | "to_sym" | "to_str" | "html_safe" | "nil?" | "present?"
+        | "blank?" | "presence" | "freeze" | "dup" | "clone" | "itself" | "lstrip" | "rstrip" | "chomp" | "class" | "!" => {
+            argc == 0
+        }
+        "sub" | "gsub" => argc == 2,
+        "center" | "ljust" | "rjust" => (argc == 1 || argc == 2) && args.get(1).and_then(literal_str) != Some(""),
+        "count" | "delete" => argc >= 1 && char_sets(args).is_some(),
+        "squeeze" => char_sets(args).is_some(),
+        "tr" => argc == 2 && tr_plan(&args[0], &args[1]).is_some(),
+        "delete_prefix" | "delete_suffix" => argc == 1,
+        "split" => argc == 0 || (argc == 1 && literal_str(&args[0]).is_some()),
+        "index" | "rindex" => argc == 1 && matches!(strip_nullable(args[0].ty.as_ref()), Some(Ty::Str)),
+        "[]" | "slice" => argc == 2 || (argc == 1 && int_or_range(&args[0])),
+        "match" | "match?" | "==" | "!=" | "+" | "*" | "<" | ">" | "<=" | ">=" | "<<" | "is_a?" | "kind_of?"
+        | "equal?" => argc == 1,
+        _ => false,
+    }
+}
+
+fn literal_str(e: &Expr) -> Option<&str> {
+    match &*e.node {
+        ExprNode::Lit { value: Literal::Str { value } } => Some(value.as_str()),
+        _ => None,
+    }
+}
+
+fn char_sets(args: &[Expr]) -> Option<Vec<super::char_set::CharSet>> {
+    args.iter().map(|a| literal_str(a).and_then(super::char_set::parse)).collect()
+}
+
+fn char_set_regex(args: &[Expr], squeeze: bool) -> Option<Js> {
+    let sets = char_sets(args)?;
+    let pattern = match (squeeze, sets.is_empty()) {
+        (true, true) => "(.)\\1+".to_string(),
+        (true, false) => format!("({})\\1+", super::char_set::intersection(&sets)),
+        (false, _) => super::char_set::intersection(&sets),
+    };
+    let flags = if squeeze && sets.is_empty() { "gsu" } else { "gu" };
+    Some(Js::synth(JsExpr::Regex { pattern, flags: flags.into() }))
+}
+
+enum TrPlan {
+    Replace { pattern: String, with: String },
+    Map { pattern: String, from: Vec<char>, to: Vec<char> },
+}
+
+fn tr_plan(from: &Expr, to: &Expr) -> Option<TrPlan> {
+    let from = super::char_set::parse(literal_str(from)?)?;
+    let to_set = super::char_set::parse(literal_str(to)?)?;
+    let mut to_chars = Vec::new();
+    // Only `from` negates: a leading `^` in `to` is the character itself.
+    if to_set.negated {
+        to_chars.push('^');
+    }
+    to_chars.extend(to_set.expand()?);
+    let pattern = from.class();
+    let Some(&last) = to_chars.last() else {
+        return Some(TrPlan::Replace { pattern, with: String::new() });
+    };
+    if from.negated {
+        return Some(TrPlan::Replace { pattern, with: last.to_string() });
+    }
+    let mut map: Vec<(char, char)> = Vec::new();
+    for (i, c) in from.expand()?.into_iter().enumerate() {
+        let target = to_chars.get(i).copied().unwrap_or(last);
+        // A character listed twice in `from` takes its last mapping, as Ruby's does.
+        map.retain(|(k, _)| *k != c);
+        map.push((c, target));
+    }
+    if map.iter().all(|(_, t)| *t == last) {
+        return Some(TrPlan::Replace { pattern, with: last.to_string() });
+    }
+    let (from, to) = map.into_iter().unzip();
+    Some(TrPlan::Map { pattern, from, to })
+}
+
+fn js_tr(span: Span, recv: &Expr, plan: TrPlan) -> Js {
+    let regex = |pattern: String| Js::synth(JsExpr::Regex { pattern, flags: "gu".into() });
+    let chars = |cs: Vec<char>| Js::synth(JsExpr::Array(cs.into_iter().map(|c| Js::str(Span::synthetic(), c.to_string())).collect()));
+    match plan {
+        TrPlan::Replace { pattern, with } => {
+            Js::method_call(span, js_expr(recv), "replace", vec![regex(pattern), Js::str(Span::synthetic(), with)])
+        }
+        TrPlan::Map { pattern, from, to } => {
+            let at = Js::method_call(Span::synthetic(), chars(from), "indexOf", vec![synth_ident("__c")]);
+            let lookup = arrow1("__c", Js::index(Span::synthetic(), chars(to), at));
+            Js::method_call(span, js_expr(recv), "replace", vec![regex(pattern), lookup])
+        }
+    }
+}
+
+fn arrow2(a: &str, b: &str, body: Js) -> Js {
+    Js::synth(JsExpr::Arrow { params: vec![js_param(a), js_param(b)], body: ArrowBody::Expr(body), is_async: false })
+}
+
+fn nil_if_negative(found: Js) -> Js {
+    let pick = arrow1(
+        "__i",
+        Js::synth(JsExpr::Ternary {
+            cond: Js::binary(Span::synthetic(), "<", synth_ident("__i"), Js::num(Span::synthetic(), "0")),
+            then: Js::synth(JsExpr::Null),
+            else_: synth_ident("__i"),
+        }),
+    );
+    Js::call(Span::synthetic(), pick, vec![found])
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Truth {
+    Js,
+    NotNil,
+    Full,
+}
+
+fn truth_of(ty: Option<&Ty>) -> Truth {
+    match ty {
+        None | Some(Ty::Untyped | Ty::Var { .. }) => Truth::Full,
+        Some(Ty::Int | Ty::Float | Ty::Str | Ty::Sym) => Truth::NotNil,
+        Some(Ty::Class { id, .. }) => match id.0.as_str() {
+            "String" | "Integer" | "Float" | "Numeric" | "Symbol" => Truth::NotNil,
+            "Object" | "BasicObject" | "Kernel" | "Comparable" => Truth::Full,
+            _ => Truth::Js,
+        },
+        Some(Ty::Union { variants }) => {
+            let parts: Vec<Truth> = variants.iter().map(|v| truth_of(Some(v))).collect();
+            let may_be_false = variants.iter().any(|v| matches!(v, Ty::Bool));
+            if parts.contains(&Truth::Full) || (may_be_false && parts.contains(&Truth::NotNil)) {
+                Truth::Full
+            } else if parts.contains(&Truth::NotNil) {
+                Truth::NotNil
+            } else {
+                Truth::Js
+            }
+        }
+        _ => Truth::Js,
+    }
+}
+
+fn expr_truth(e: &Expr) -> Truth {
+    let truth = truth_of(e.ty.as_ref());
+    // An untyped predicate call still answers true, false or nil (`nonzero?` a non-zero number).
+    let predicate = matches!(&*e.node, ExprNode::Send { method, .. } if method.as_str().ends_with('?'));
+    if truth == Truth::Full && predicate && matches!(e.ty, None | Some(Ty::Untyped)) {
+        return Truth::Js;
+    }
+    truth
+}
+
+fn reads_once(e: &Expr) -> bool {
+    matches!(&*e.node, ExprNode::Var { .. } | ExprNode::Ivar { .. } | ExprNode::Lit { .. } | ExprNode::SelfRef | ExprNode::Const { .. })
+}
+
+// `Truth::Full` reads `v` twice: the caller passes a plain read or binds it first.
+fn ruby_truthy(truth: Truth, v: Js) -> Js {
+    let not_nil = |v: Js| Js::binary(Span::synthetic(), "!=", v, Js::synth(JsExpr::Null));
+    match truth {
+        Truth::Js => v,
+        Truth::NotNil => not_nil(v),
+        Truth::Full => Js::binary(
+            Span::synthetic(),
+            "&&",
+            not_nil(v.clone()),
+            Js::binary(Span::synthetic(), "!==", v, Js::synth(JsExpr::Bool(false))),
+        ),
+    }
+}
+
+// JS also treats `0`, `NaN` and `""` as false, so a condition is not emitted as its plain value.
+fn js_cond(e: &Expr) -> Js {
+    if let ExprNode::BoolOp { op, left, right, .. } = &*e.node {
+        let op_s = match op {
+            crate::expr::BoolOpKind::Or => "||",
+            crate::expr::BoolOpKind::And => "&&",
+        };
+        return Js::binary(e.span, op_s, js_cond(left), js_cond(right));
+    }
+    let truth = expr_truth(e);
+    if truth != Truth::Full || reads_once(e) {
+        return ruby_truthy(truth, js_expr(e));
+    }
+    Js::call(e.span, arrow1("__v", ruby_truthy(truth, synth_ident("__v"))), vec![js_expr(e)])
+}
+
+// Not a plain JS `||` / `&&`: Ruby's `0 || 5` is 0, where JS answers 5.
+fn js_bool_value(span: Span, op: &crate::expr::BoolOpKind, left: &Expr, right: &Expr) -> Js {
+    let or = matches!(op, crate::expr::BoolOpKind::Or);
+    let truth = expr_truth(left);
+    match truth {
+        Truth::Js => return Js::binary(span, if or { "||" } else { "&&" }, js_expr(left), js_expr(right)),
+        Truth::NotNil if or => return Js::binary(span, "??", js_expr(left), js_expr(right)),
+        _ => {}
+    }
+    let pick = |v: Js| {
+        let (then, else_) = if or { (v.clone(), js_expr(right)) } else { (js_expr(right), v.clone()) };
+        Js::synth(JsExpr::Ternary { cond: ruby_truthy(truth, v), then, else_ })
+    };
+    if reads_once(left) {
+        let mut js = pick(js_expr(left));
+        js.span = span;
+        return js;
+    }
+    // `right` runs inside the arrow, so an `await` in it needs the arrow async and awaited.
+    let is_async = body_has_async_send(right);
+    let arrow = Js::synth(JsExpr::Arrow { params: vec![js_param("__v")], body: ArrowBody::Expr(pick(synth_ident("__v"))), is_async });
+    let call = Js::call(span, arrow, vec![js_expr(left)]);
+    if is_async { Js::await_(span, call) } else { call }
+}
+
+// JS tests a callback's value by its own truthiness, so the block answers `If(c, true, false)`, which emits as `js_cond(c)`.
+fn ruby_predicate_block(method: &str, blk: &Expr) -> Option<Expr> {
+    if !matches!(
+        method,
+        "select" | "filter" | "find_all" | "reject" | "detect" | "find" | "find_index" | "index" | "count" | "any?"
+            | "all?" | "none?" | "one?" | "partition" | "take_while" | "drop_while" | "delete_if" | "keep_if"
+            | "select!" | "filter!" | "reject!"
+    ) {
+        return None;
+    }
+    let ExprNode::Lambda { body, .. } = &*blk.node else { return None };
+    let last = match &*body.node {
+        ExprNode::Seq { exprs } => exprs.last()?,
+        _ => body,
+    };
+    if expr_truth(last) == Truth::Js {
+        return None;
+    }
+    let as_bool = |e: &Expr| {
+        let lit = |value| Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Bool { value } });
+        let mut test = Expr::new(e.span, ExprNode::If { cond: e.clone(), then_branch: lit(true), else_branch: lit(false) });
+        test.ty = Some(Ty::Bool);
+        test
+    };
+    let mut out = blk.clone();
+    if let ExprNode::Lambda { body, .. } = &mut *out.node {
+        match &mut *body.node {
+            ExprNode::Seq { exprs } => {
+                let tail = exprs.last_mut().expect("non-empty");
+                *tail = as_bool(tail);
+            }
+            _ => *body = as_bool(body),
+        }
+        body.ty = Some(Ty::Bool);
+    }
+    Some(out)
+}
+
+fn is_block(e: &Expr) -> bool {
+    matches!(&*e.node, ExprNode::Lambda { .. })
+}
+
+/// `(<param>) => <body>`.
+fn arrow1(param: &str, body: Js) -> Js {
+    Js::synth(JsExpr::Arrow { params: vec![js_param(param)], body: ArrowBody::Expr(body), is_async: false })
+}
+
+/// `((__a) => <body(__a)>)(<recv>)` — the receiver evaluated once.
+fn with_array(span: Span, recv: &Expr, body: impl FnOnce(Js) -> Js) -> Js {
+    Js::call(span, arrow1("__a", body(synth_ident("__a"))), vec![js_expr(recv)])
+}
+
+/// `<a>.reduce((s, x) => s + x, 0)` — Ruby's `sum` of an empty Array is 0.
+fn array_sum(a: Js) -> Js {
+    let add = Js::synth(JsExpr::Arrow {
+        params: vec![js_param("__s"), js_param("__x")],
+        body: ArrowBody::Expr(Js::binary(Span::synthetic(), "+", synth_ident("__s"), synth_ident("__x"))),
+        is_async: false,
+    });
+    Js::method_call(Span::synthetic(), a, "reduce", vec![add, Js::num(Span::synthetic(), "0")])
+}
+
 fn js_param(name: impl Into<String>) -> JsParam {
     JsParam { name: name.into(), optional: false, ty: None, default: None }
 }
@@ -323,6 +790,17 @@ fn async_iife_awaited(span: Span, stmts: Vec<JsStmt>) -> Js {
             vec![],
         ),
     )
+}
+
+/// `Object.prototype.hasOwnProperty.call(obj, key)`: an own key, as Ruby's
+/// `Hash#key?` answers (`key in obj` also finds the prototype's).
+fn has_own(span: Span, obj: Js, key: Js) -> Js {
+    let has = Js::member(
+        Span::synthetic(),
+        Js::member(Span::synthetic(), Js::member(Span::synthetic(), synth_ident("Object"), "prototype"), "hasOwnProperty"),
+        "call",
+    );
+    Js::call(span, has, vec![obj, key])
 }
 
 /// `(() => { throw new Error("<msg>"); })()`
@@ -401,17 +879,51 @@ fn return_stmt(value: Option<Js>) -> JsStmt {
 // Body + statements -----------------------------------------------------
 
 pub(super) fn js_body(body: &Expr, return_ty: &Ty) -> Vec<JsStmt> {
+    in_scope(body, || js_body_in_scope(body, return_ty))
+}
+
+thread_local! {
+    // Not a block's own `let`: a name its method (or an outer block) assigns is that scope's, as Ruby closes over it
+    static SCOPE_LOCALS: std::cell::RefCell<Vec<HashSet<Symbol>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn collect_scope_locals(e: &Expr, out: &mut HashSet<Symbol>) {
+    if let ExprNode::Assign { target: LValue::Var { name, .. }, .. } = &*e.node {
+        out.insert(name.clone());
+    }
+    if !matches!(&*e.node, ExprNode::Lambda { .. }) {
+        e.node.for_each_child(&mut |child| collect_scope_locals(child, out));
+    }
+}
+
+fn in_scope<T>(body: &Expr, f: impl FnOnce() -> T) -> T {
+    let mut own = HashSet::default();
+    collect_scope_locals(body, &mut own);
+    SCOPE_LOCALS.with(|c| c.borrow_mut().push(own));
+    let out = f();
+    SCOPE_LOCALS.with(|c| c.borrow_mut().pop());
+    out
+}
+
+fn is_outer_local(name: &Symbol) -> bool {
+    SCOPE_LOCALS.with(|c| {
+        let stack = c.borrow();
+        stack.len() > 1 && stack[..stack.len() - 1].iter().any(|scope| scope.contains(name))
+    })
+}
+
+fn js_body_in_scope(body: &Expr, return_ty: &Ty) -> Vec<JsStmt> {
     // Pre-walk: find local-var names assigned more than once in this
     // method body. They'll emit as `let` at first occurrence and bare
     // `name = value` thereafter. Names assigned exactly once still
     // emit as `const`. The `declared` set tracks which reassigned names
     // have already had their declaration emitted as we walk in source
     // order.
-    let mut counts: HashMap<Symbol, usize> = HashMap::new();
+    let mut counts: HashMap<Symbol, usize> = HashMap::default();
     count_var_assignments(body, &mut counts);
     let reassigned: HashSet<Symbol> =
         counts.into_iter().filter(|(_, n)| *n > 1).map(|(s, _)| s).collect();
-    let mut declared: HashSet<Symbol> = HashSet::new();
+    let mut declared: HashSet<Symbol> = HashSet::default();
     // Names whose first assignment lives inside a nested block (an
     // `if`/`else` arm, a `case` branch, …) need a hoisted `let`
     // declaration at the function-body level — TS `let` is block-
@@ -428,10 +940,12 @@ pub(super) fn js_body(body: &Expr, return_ty: &Ty) -> Vec<JsStmt> {
     // restrict to vars whose top-level assignment count is strictly
     // less than their total count — i.e., at least one assignment
     // lives in a nested branch.
-    let mut top_level_counts: HashMap<Symbol, usize> = HashMap::new();
+    let mut top_level_counts: HashMap<Symbol, usize> = HashMap::default();
     count_top_level_var_assignments(body, &mut top_level_counts);
     let mut hoisted: Vec<Symbol> = reassigned
         .iter()
+        // Not an enclosing scope's local: a second `let` here would shadow the one a `catch` or `finally` reads
+        .filter(|name| !is_outer_local(name))
         .filter(|name| {
             let total = count_var_for(body, name);
             let top = top_level_counts.get(*name).copied().unwrap_or(0);
@@ -477,7 +991,7 @@ fn count_top_level_var_assignments(body: &Expr, out: &mut HashMap<Symbol, usize>
 
 /// Total count of Var-assignments to `name` in `body` (recursive).
 fn count_var_for(body: &Expr, name: &Symbol) -> usize {
-    let mut all: HashMap<Symbol, usize> = HashMap::new();
+    let mut all: HashMap<Symbol, usize> = HashMap::default();
     count_var_assignments(body, &mut all);
     all.get(name).copied().unwrap_or(0)
 }
@@ -509,7 +1023,7 @@ fn js_body_with_state(
             );
             let mut out = vec![JsStmt::new(
                 body.span,
-                JsStmtNode::If { cond: js_expr(cond), then: vec![ret], else_: None },
+                JsStmtNode::If { cond: js_cond(cond), then: vec![ret], else_: None },
             )];
             out.extend(js_body_with_state(else_branch, return_ty, reassigned, declared));
             out
@@ -556,14 +1070,14 @@ fn js_body_with_state(
         // the body actually exits the method, `throw e` outside the match
         // arms rethrows cleanly, and no needless `(() => { ... })()` noise.
         ExprNode::BeginRescue { body: inner, rescues, else_branch, ensure, .. } => {
-            vec![js_begin_rescue_stmt(
+            js_begin_rescue_stmt(
                 body.span,
                 inner,
                 rescues,
-                else_branch.as_ref(),
-                ensure.as_ref(),
+                else_branch.as_deref(),
+                ensure.as_deref(),
                 return_ty,
-            )]
+            )
         }
         // Single-Case-as-whole-body (e.g., `process_action`'s synthesized
         // dispatcher): route through the statement walker so it emits as
@@ -602,7 +1116,7 @@ fn count_var_assignments(e: &Expr, out: &mut HashMap<Symbol, usize>) {
         ExprNode::Send { recv: Some(recv), method, args, block, .. }
             if method.as_str() == "<<" && args.len() == 1 =>
         {
-            let is_string_builder_append = matches!(e.hint, Some(IrHint::StringBuilderAppend));
+            let is_string_builder_append = matches!(e.hint(), Some(IrHint::StringBuilderAppend));
             if !is_string_builder_append {
                 if let ExprNode::Var { name, .. } = &*recv.node {
                     *out.entry(name.clone()).or_insert(0) += 1;
@@ -705,6 +1219,39 @@ fn js_begin_rescue_stmt(
     else_branch: Option<&Expr>,
     ensure: Option<&Expr>,
     return_ty: &Ty,
+) -> Vec<JsStmt> {
+    // Not declared inside `try`: `catch` and `finally` read what the body assigned, as Ruby's rescue and ensure do
+    let mut shared = HashSet::default();
+    for part in std::iter::once(body).chain(else_branch).chain(rescues.iter().map(|r| &r.body)) {
+        collect_scope_locals(part, &mut shared);
+    }
+    let mut hoisted: Vec<Symbol> = shared.iter().filter(|n| !is_outer_local(n)).cloned().collect();
+    hoisted.sort();
+    SCOPE_LOCALS.with(|c| c.borrow_mut().push(shared));
+    let try_stmt = js_begin_rescue_try(span, body, rescues, else_branch, ensure, return_ty);
+    SCOPE_LOCALS.with(|c| c.borrow_mut().pop());
+    let mut out: Vec<JsStmt> = hoisted
+        .iter()
+        .map(|name| {
+            JsStmt::synth(JsStmtNode::VarDecl {
+                kind: VarKind::Let,
+                name: escape_reserved_word(name.as_str()),
+                ty: Some(TsType("any".into())),
+                init: None,
+            })
+        })
+        .collect();
+    out.push(try_stmt);
+    out
+}
+
+fn js_begin_rescue_try(
+    span: Span,
+    body: &Expr,
+    rescues: &[RescueClause],
+    else_branch: Option<&Expr>,
+    ensure: Option<&Expr>,
+    return_ty: &Ty,
 ) -> JsStmt {
     let mut try_body = js_body(body, return_ty);
     if let Some(eb) = else_branch {
@@ -729,8 +1276,9 @@ fn js_begin_rescue_stmt(
 /// resolve.
 fn rescue_binding_alias(rc: &RescueClause) -> Vec<JsStmt> {
     match &rc.binding {
-        Some(name) => vec![const_decl(name.as_str(), synth_ident("e"))],
-        None => vec![],
+        // `const e = e;` reads the binding it declares: a ReferenceError at run time.
+        Some(name) if name.as_str() != "e" => vec![const_decl(name.as_str(), synth_ident("e"))],
+        _ => vec![],
     }
 }
 
@@ -764,7 +1312,7 @@ fn catch_chain(rescues: &[RescueClause], clause_body: &dyn Fn(&RescueClause) -> 
 /// emit `let` (mutable) for names assigned more than once and
 /// `const` for names assigned exactly once.
 pub(super) fn collect_reassigned(body: &Expr) -> HashSet<Symbol> {
-    let mut counts: HashMap<Symbol, usize> = HashMap::new();
+    let mut counts: HashMap<Symbol, usize> = HashMap::default();
     count_var_assignments(body, &mut counts);
     counts.into_iter().filter(|(_, n)| *n > 1).map(|(s, _)| s).collect()
 }
@@ -786,7 +1334,7 @@ pub(super) fn collect_reassigned(body: &Expr) -> HashSet<Symbol> {
 ///   site is the function's tail; an Append at the tail would be
 ///   a lowerer bug).
 fn try_string_builder_stmt(e: &Expr, declared: &mut HashSet<Symbol>) -> Option<Vec<JsStmt>> {
-    match e.hint? {
+    match e.hint().as_ref()? {
         IrHint::MutableStringLiteral => None, // emitted as the plain literal
         IrHint::StringBuilderInit => {
             if let ExprNode::Assign { target: LValue::Var { name, .. }, .. } = &*e.node {
@@ -852,7 +1400,12 @@ pub(super) fn js_stmts_with_state(
             // → `const`. Subsequent occurrences (only possible for
             // reassigned names) → bare `name = value`.
             let escaped = escape_reserved_word(name.as_str());
-            let node = if reassigned.contains(name) {
+            let node = if is_outer_local(name) {
+                JsStmtNode::Expr(Js::new(
+                    e.span,
+                    JsExpr::Assign { target: Js::ident(e.span, escaped), op: "=", value: js_expr(value) },
+                ))
+            } else if reassigned.contains(name) {
                 if declared.insert(name.clone()) {
                     JsStmtNode::VarDecl {
                         kind: VarKind::Let,
@@ -954,7 +1507,7 @@ pub(super) fn js_stmts_with_state(
             vec![JsStmt::new(
                 e.span,
                 JsStmtNode::If {
-                    cond: js_expr(cond),
+                    cond: js_cond(cond),
                     then: vec![JsStmt::new(
                         then_branch.span,
                         JsStmtNode::Return(Some(js_expr(value))),
@@ -973,7 +1526,7 @@ pub(super) fn js_stmts_with_state(
             vec![JsStmt::new(
                 e.span,
                 JsStmtNode::If {
-                    cond: js_expr(cond),
+                    cond: js_cond(cond),
                     then: js_branch(then_branch, reassigned, declared),
                     else_: None,
                 },
@@ -993,9 +1546,9 @@ pub(super) fn js_stmts_with_state(
         // negates the condition (TS has no `until` keyword).
         ExprNode::While { cond, body, until_form } => {
             let cond_js = if *until_form {
-                Js::unary(cond.span, "!", js_expr(cond))
+                Js::unary(cond.span, "!", js_cond(cond))
             } else {
-                js_expr(cond)
+                js_cond(cond)
             };
             vec![JsStmt::new(
                 e.span,
@@ -1068,7 +1621,7 @@ fn js_if_chain(
     } else {
         Some(js_branch(else_branch, reassigned, declared))
     };
-    JsStmt::new(span, JsStmtNode::If { cond: js_expr(cond), then, else_ })
+    JsStmt::new(span, JsStmtNode::If { cond: js_cond(cond), then, else_ })
 }
 
 /// Statement list for a single branch of an `if`/`while` block.
@@ -1187,6 +1740,30 @@ pub(super) fn emit_expr(e: &Expr) -> String {
     super::printer::render_expr(&js_expr(e))
 }
 
+/// Print one string-kernel call. The Ruby name stays in the table.
+fn js_string_kernel(
+    span: Span,
+    recv: &Expr,
+    args: &[Expr],
+    entry: &crate::catalog::string_kernel::StringKernel,
+) -> Js {
+    use crate::catalog::string_kernel::TsSpell;
+    match entry.typescript {
+        TsSpell::LengthEqZero => Js::binary(
+            span,
+            "===",
+            Js::member(span, js_expr(recv), "length"),
+            Js::num(span, "0"),
+        ),
+        TsSpell::Member(prop) => Js::member(span, js_expr(recv), prop),
+        TsSpell::Method0(name) => Js::method_call(span, js_expr(recv), name, vec![]),
+        TsSpell::Method1(name) => {
+            Js::method_call(span, js_expr(recv), name, vec![js_expr(&args[0])])
+        }
+        TsSpell::Number => Js::call(span, Js::ident(span, "Number"), vec![js_expr(recv)]),
+    }
+}
+
 /// Build a JavaScript expression with its source span and shared primitive behavior.
 pub(super) fn js_expr(e: &Expr) -> Js {
     if let Some(s) = crate::emit::shared::utf8_chr::emit(e, crate::emit::shared::utf8_chr::Target::TypeScript, emit_expr) {
@@ -1197,7 +1774,7 @@ pub(super) fn js_expr(e: &Expr) -> Js {
     }
     // Analyzer-set diagnostic annotations short-circuit to a target
     // raise-equivalent (preserves Ruby's runtime-raise semantics).
-    if let Some(kind) = &e.diagnostic {
+    if let Some(kind) = &e.diagnostic() {
         return Js::new(
             e.span,
             JsExpr::Raw(
@@ -1212,7 +1789,7 @@ pub(super) fn js_expr(e: &Expr) -> Js {
     // Append-inside-lambda (`articles.forEach(a => io << render(a))`
     // — the partial lowerer's collection-render shape) and the
     // terminal Result Var read at the function tail.
-    match e.hint {
+    match e.hint() {
         Some(IrHint::StringBuilderAppend) => {
             if let ExprNode::Send { recv: Some(recv), method, args, .. } = &*e.node {
                 if method.as_str() == "<<" && args.len() == 1 {
@@ -1245,14 +1822,25 @@ pub(super) fn js_expr(e: &Expr) -> Js {
             Js::ident(e.span, "this"),
             ts_field_name(name.as_str()),
         ),
-        ExprNode::Send { recv, method, args, block, parenthesized } => js_send_with_block(
-            e.span,
-            recv.as_ref(),
-            method.as_str(),
-            args,
-            block.as_ref(),
-            *parenthesized,
-        ),
+        ExprNode::Send { recv, method, args, block, parenthesized } => {
+            if e.decisions & crate::expr::GROUNDED_TIME_FORMAT != 0
+                && method.as_str() == "to_rfc3339"
+                && args.is_empty()
+                && block.is_none()
+            {
+                if let Some(r) = recv {
+                    return Js::method_call(e.span, js_expr(r), "toISOString", vec![]);
+                }
+            }
+            js_send_with_block(
+                e.span,
+                recv.as_ref(),
+                method.as_str(),
+                args,
+                block.as_ref(),
+                *parenthesized,
+            )
+        }
         ExprNode::Assign { target, value } => {
             // Expression-position assignment — preserve the side effect.
             // JS `a = b` is an expression that both assigns and yields
@@ -1290,22 +1878,24 @@ pub(super) fn js_expr(e: &Expr) -> Js {
                 iife(e.span, stmts)
             }
         },
-        ExprNode::If { cond, then_branch, else_branch } => Js::new(
-            e.span,
-            JsExpr::Ternary {
-                cond: js_expr(cond),
-                then: js_expr(then_branch),
-                else_: js_expr(else_branch),
-            },
-        ),
-        ExprNode::BoolOp { op, left, right, .. } => {
-            use crate::expr::BoolOpKind;
-            let op_s = match op {
-                BoolOpKind::Or => "||",
-                BoolOpKind::And => "&&",
+        ExprNode::If { cond, then_branch, else_branch } => {
+            let lit_bool = |b: &Expr| match &*b.node {
+                ExprNode::Lit { value: Literal::Bool { value } } => Some(*value),
+                _ => None,
             };
-            Js::binary(e.span, op_s, js_expr(left), js_expr(right))
+            // A JS-truthy `cond` read as-is is not a boolean, which `c ? true : false` answers.
+            let boolean = matches!(cond.ty, Some(Ty::Bool))
+                || (!matches!(&*cond.node, ExprNode::BoolOp { .. }) && truth_of(cond.ty.as_ref()) != Truth::Js);
+            match (lit_bool(then_branch), lit_bool(else_branch)) {
+                (Some(true), Some(false)) if boolean => js_cond(cond),
+                (Some(false), Some(true)) if boolean => Js::unary(e.span, "!", js_cond(cond)),
+                _ => Js::new(
+                    e.span,
+                    JsExpr::Ternary { cond: js_cond(cond), then: js_expr(then_branch), else_: js_expr(else_branch) },
+                ),
+            }
         }
+        ExprNode::BoolOp { op, left, right, .. } => js_bool_value(e.span, op, left, right),
         ExprNode::Array { elements, .. } => {
             Js::new(e.span, JsExpr::Array(elements.iter().map(js_expr).collect()))
         }
@@ -1345,24 +1935,37 @@ pub(super) fn js_expr(e: &Expr) -> Js {
             // locals (so e.g. an inner capture buffer `body =
             // String.new` followed by `body << X` emits as `let body`
             // not `const body`).
-            let arrow_body = match &*body.node {
+            // Not the arrow's value: an iterator discards it, and the expression form leaves a branch's locals undeclared
+            let void = VOID_BLOCK.with(|c| {
+                let hit = std::ptr::eq(c.get(), e);
+                if hit {
+                    c.set(std::ptr::null());
+                }
+                hit
+            });
+            let arrow_body = in_scope(body, || match &*body.node {
                 ExprNode::Seq { exprs } if exprs.len() > 1 => {
                     let reassigned = collect_reassigned(body);
-                    let mut declared: HashSet<Symbol> = HashSet::new();
+                    let mut declared: HashSet<Symbol> = HashSet::default();
                     let mut stmts = Vec::new();
                     for (i, x) in exprs.iter().enumerate() {
                         stmts.extend(js_stmts_with_state(
                             x,
                             i == exprs.len() - 1,
-                            false,
+                            void,
                             &reassigned,
                             &mut declared,
                         ));
                     }
                     ArrowBody::Block(stmts)
                 }
+                ExprNode::If { .. } | ExprNode::Case { .. } if void => {
+                    let reassigned = collect_reassigned(body);
+                    let mut declared: HashSet<Symbol> = HashSet::default();
+                    ArrowBody::Block(js_stmts_with_state(body, true, true, &reassigned, &mut declared))
+                }
                 _ => ArrowBody::Expr(js_expr(body)),
-            };
+            });
             Js::new(
                 e.span,
                 JsExpr::Arrow { params: js_params, body: arrow_body, is_async: body_async },
@@ -1459,9 +2062,9 @@ pub(super) fn js_expr(e: &Expr) -> Js {
             // wrap in IIFE so the syntactic position works. Statement-
             // position uses are handled in `js_stmts_with_state`.
             let cond_js = if *until_form {
-                Js::unary(cond.span, "!", js_expr(cond))
+                Js::unary(cond.span, "!", js_cond(cond))
             } else {
-                js_expr(cond)
+                js_cond(cond)
             };
             iife(
                 e.span,
@@ -1492,6 +2095,14 @@ pub(super) fn js_expr(e: &Expr) -> Js {
             // statement and expression position.
             iife(e.span, vec![JsStmt::synth(JsStmtNode::Throw(js_expr(value)))])
         }
+        ExprNode::Let { name, value, body, .. } => {
+            let stmts = vec![
+                JsStmt::synth(JsStmtNode::VarDecl { kind: VarKind::Const, name: name.as_str().to_string(), ty: None, init: Some(js_expr(value)) }),
+                return_stmt(Some(js_expr(body))),
+            ];
+            // Not the plain arrow when it awaits: `await` is a syntax error outside an async function
+            if body_has_async_send(e) { async_iife_awaited(e.span, stmts) } else { iife(e.span, stmts) }
+        }
         ExprNode::OpAssign { target, op, value } => {
             // Desugar `target op= value` to the existing-IR shape and
             // recurse. TS has native compound assignment, but the
@@ -1511,6 +2122,11 @@ pub(super) fn js_expr(e: &Expr) -> Js {
     }
 }
 
+thread_local! {
+    // Not a flag the next lambda consumes: an argument's own block can be emitted before this one
+    static VOID_BLOCK: std::cell::Cell<*const Expr> = const { std::cell::Cell::new(std::ptr::null()) };
+}
+
 /// Send emission that folds a trailing block (Ruby `do ... end` /
 /// `&:sym`) in as an arrow-function argument — TS's closest
 /// equivalent. The block-less path delegates directly to `js_send`.
@@ -1523,8 +2139,10 @@ fn js_send_with_block(
     parenthesized: bool,
 ) -> Js {
     let Some(blk) = block else {
-        return js_send(span, recv, method, args, parenthesized);
+        return js_send(span, recv, method, args, parenthesized, None);
     };
+    let predicate = recv.and(ruby_predicate_block(method, blk));
+    let blk = predicate.as_ref().unwrap_or(blk);
     // `N.times { |i| body }` — JS Numbers have no `.times` method,
     // so a fall-through emit produces `3.times(i => …)` which tsc
     // (and esbuild's parser) reject. Rewrite to a counted loop that
@@ -1590,7 +2208,15 @@ fn js_send_with_block(
     }
     let mut all_args: Vec<Expr> = args.to_vec();
     all_args.push(blk.clone());
-    js_send(span, recv, method, &all_args, true)
+    let void = matches!(method, "each" | "each_with_index" | "reverse_each" | "each_key" | "each_value" | "each_pair" | "each_char" | "times" | "upto" | "downto");
+    let outer = VOID_BLOCK.with(|c| c.replace(if void { all_args.last().map_or(std::ptr::null(), |b| b as *const Expr) } else { std::ptr::null() }));
+    // The block is already in `all_args`. Passing it here keeps
+    // `function_receiver` from treating `.call` as a direct invocation
+    // and dropping the block into a positional argument.
+    let out = js_send(span, recv, method, &all_args, true, Some(blk));
+    // Not left set: a freed block's address can come back as another call's block
+    VOID_BLOCK.with(|c| c.set(outer));
+    out
 }
 
 /// HOF rewrites for blocks containing async sends. Returns
@@ -1660,7 +2286,7 @@ fn try_js_async_hof(
                 vec![synth_ident(&p)],
             );
             let guard = JsStmt::synth(JsStmtNode::If {
-                cond: js_expr(body),
+                cond: js_cond(body),
                 then: vec![JsStmt::expr(push)],
                 else_: None,
             });
@@ -1682,7 +2308,7 @@ fn try_js_async_hof(
                 vec![synth_ident(&p)],
             );
             let guard = JsStmt::synth(JsStmtNode::If {
-                cond: Js::unary(Span::synthetic(), "!", js_expr(body)),
+                cond: Js::unary(Span::synthetic(), "!", js_cond(body)),
                 then: vec![JsStmt::expr(push)],
                 else_: None,
             });
@@ -1698,7 +2324,7 @@ fn try_js_async_hof(
         "find" | "detect" if args.is_empty() => {
             let p = single_param()?;
             let found = JsStmt::synth(JsStmtNode::If {
-                cond: js_expr(body),
+                cond: js_cond(body),
                 then: vec![return_stmt(Some(synth_ident(&p)))],
                 else_: None,
             });
@@ -1710,7 +2336,7 @@ fn try_js_async_hof(
         "any?" if args.is_empty() => {
             let p = single_param()?;
             let hit = JsStmt::synth(JsStmtNode::If {
-                cond: js_expr(body),
+                cond: js_cond(body),
                 then: vec![return_stmt(Some(Js::synth(JsExpr::Bool(true))))],
                 else_: None,
             });
@@ -1722,7 +2348,7 @@ fn try_js_async_hof(
         "all?" if args.is_empty() => {
             let p = single_param()?;
             let miss = JsStmt::synth(JsStmtNode::If {
-                cond: Js::unary(Span::synthetic(), "!", js_expr(body)),
+                cond: Js::unary(Span::synthetic(), "!", js_cond(body)),
                 then: vec![return_stmt(Some(Js::synth(JsExpr::Bool(false))))],
                 else_: None,
             });
@@ -1769,8 +2395,9 @@ fn js_send(
     method: &str,
     args: &[Expr],
     parenthesized: bool,
+    block: Option<&Expr>,
 ) -> Js {
-    let result = js_send_inner(span, recv, method, args, parenthesized);
+    let result = js_send_inner(span, recv, method, args, parenthesized, block);
     if !is_async_method_name(method) {
         return result;
     }
@@ -1812,7 +2439,63 @@ fn js_send_inner(
     method: &str,
     args: &[Expr],
     parenthesized: bool,
+    block: Option<&Expr>,
 ) -> Js {
+    if let Some(recv) = crate::emit::shared::fn_call::function_receiver(recv, method, block) {
+        return Js::call(span, js_expr(recv), args.iter().map(js_expr).collect());
+    }
+    // `x.freeze` answers `x`, whatever its type: no JS value has a
+    // `freeze` method (only the static `Object.freeze`), so the bare
+    // property read was `undefined`, as in a constant's nested
+    // `[1, 2].freeze` (#1223).
+    if method == "freeze" && args.is_empty() && block.is_none() {
+        if let Some(r) = recv {
+            return js_expr(r);
+        }
+    }
+    // `Model.find(@params[k])`, the pre-Rails-8 spelling of `find(params.
+    // expect(:id))`, on a class reaching `ActiveRecord::Base` (another
+    // class's `find`, `Rake::Task.find(name)`, keeps its argument): the
+    // TS finder takes a `number` and the read is a `ParamValue`, so it
+    // is coerced — the TS counterpart of the Rust emitter's
+    // `.as_i64().unwrap()`. Only a nonblank String is converted: `Number`
+    // reads "" (a blank `?id=`, or a missing one) as 0, which would find
+    // row 0, so a blank, absent or non-String id is NaN and finds nothing
+    // (RecordNotFound, as Rails' `find(nil)`/`find("")`). The Ruby family
+    // hands the raw String to its casting finder instead.
+    if method == "find" && args.len() == 1 && block.is_none() {
+        if let (Some(r), ExprNode::Send { recv: Some(pr), method: index, args: index_args, block: None, .. }) =
+            (recv, &*args[0].node)
+        {
+            if matches!(&*r.node, ExprNode::Const { path } if descends_from_active_record(&path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::")))
+                && index.as_str() == "[]"
+                && index_args.len() == 1
+                && matches!(&*pr.node, ExprNode::Ivar { name } if name.as_str() == "params")
+            {
+                // `Number(typeof v === "string" && v.trim() !== "" ? v : NaN)`;
+                // `v` is a property read, so reading it again is the same value.
+                let v = || js_expr(&args[0]);
+                let is_string = Js::binary(span, "===", Js::unary(span, "typeof ", v()), Js::str(span, "string"));
+                let nonblank = Js::binary(span, "!==", Js::method_call(span, v(), "trim", vec![]), Js::str(span, ""));
+                let key = Js::new(
+                    span,
+                    JsExpr::Ternary {
+                        cond: Js::binary(span, "&&", is_string, nonblank),
+                        then: v(),
+                        else_: Js::ident(span, "NaN"),
+                    },
+                );
+                let coerced = Js::call(span, Js::ident(span, "Number"), vec![key]);
+                // The `Base` it returns narrowed to the model, as the
+                // general path below narrows a class-method `find`.
+                let model = super::printer::render_expr(&js_expr(r));
+                return Js::new(
+                    span,
+                    JsExpr::Cast { expr: Js::method_call(span, js_expr(r), "find", vec![coerced]), ty: TsType(model) },
+                );
+            }
+        }
+    }
     // Temporal reader intrinsic: `ActiveSupport.parse_db_time(s)` parses
     // stored ISO-8601 text into a native `Date` (nil-safe: `string | null`
     // → `Date | null`). Maps to the hand-written `RhDateTime.parse`
@@ -1986,14 +2669,11 @@ fn js_send_inner(
             if is_framework_class_recv(r) {
                 return Js::method_call(span, js_expr(r), "get", vec![js_expr(&args[0])]);
             }
-            // Legacy hardcode for `@params[:k]` — @params's ty isn't
-            // always recovered as Class (it can flow as Hash[Sym, Any]
-            // through the analyzer), so the ivar-name shortcut still
-            // pays for itself. Subsumed by the framework-class match
-            // above when the type is recovered.
-            if matches!(&*r.node, ExprNode::Ivar { name } if name.as_str() == "params") {
-                return Js::method_call(span, js_expr(r), "get", vec![js_expr(&args[0])]);
-            }
+            // `@params[k]` is bracket access: the controller's `params`
+            // is a `Record<string, ParamValue>` (action_controller_base),
+            // not a class with a `get`. An ivar-name shortcut that routed
+            // it to `.get` outlived the class it was written for, and made
+            // `Post.find(params[:id])` a tsc error.
         }
     }
     if method == "[]" {
@@ -2049,7 +2729,7 @@ fn js_send_inner(
         let attr = &method[..method.len() - 1];
         // A custom writer (`def foo=(v)`) is a method, `set_foo`, not
         // a field the assignment could land in.
-        if let Some((crate::dialect::AccessorKind::Method, 1)) =
+        if let Some((crate::dialect::AccessorKind::Method, 1, _)) =
             instance_method_shape(recv.unwrap().ty.as_ref(), method)
         {
             return Js::method_call(
@@ -2087,7 +2767,11 @@ fn js_send_inner(
         // `new Views.Articles(...)` would invoke an object as a
         // constructor, which TS rejects at runtime. Fall through to
         // the regular member-call form for those.
-        if !recv_s.contains('.') {
+        let nested_class = matches!(&*recv.unwrap().node, ExprNode::Const { path }
+            if NESTED_CLASS_NAMES.with(|n| {
+                n.borrow().contains(&path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::"))
+            }));
+        if !recv_s.contains('.') || nested_class {
             if args.is_empty() {
                 match recv_s.as_str() {
                     "String" => return Js::str(span, ""),
@@ -2135,10 +2819,14 @@ fn js_send_inner(
     // `Time.now` → `new Date()`. Ruby's Time class has no JS
     // analog; JS Date covers the use cases the framework runtime
     // needs (`utc`, `iso8601`).
-    if method == "now" && args.is_empty() {
+    // `Time.now` and the lowered clock `Time.utc` (no args) are both
+    // `new Date()`. `::Time` counts; a namespaced `Foo::Time` does not.
+    if matches!(method, "now" | "utc") && args.is_empty() {
         if let Some(r) = recv {
             if let ExprNode::Const { path } = &*r.node {
-                if path.len() == 1 && path[0].as_str() == "Time" {
+                if path.last().is_some_and(|s| s.as_str() == "Time")
+                    && path.iter().rev().skip(1).all(|s| s.as_str().is_empty())
+                {
                     return Js::new(
                         span,
                         JsExpr::New { callee: Js::ident(span, "Date"), args: vec![] },
@@ -2220,7 +2908,12 @@ fn js_send_inner(
     }
     // `<date>.iso8601` → `.toISOString()` — produces the Z-suffix
     // ISO-8601 string Ruby's Time#iso8601 does.
-    if method == "iso8601" && args.is_empty() && recv.is_some() {
+    // Zero-arg `iso8601` on a time is `to_rfc3339` after `time_calendar`.
+    // An application method of that name keeps normal dispatch.
+    if method == "to_rfc3339"
+        && args.is_empty()
+        && recv.is_some_and(crate::lower::time_calendar::is_time_rfc3339_receiver)
+    {
         return Js::method_call(span, js_expr(recv.unwrap()), "toISOString", vec![]);
     }
     // Ruby has both `Regexp#match?(str)` and `String#match?(re)`.
@@ -2278,7 +2971,16 @@ fn js_send_inner(
                     };
                     return Js::call(span, Js::ident(span, "String"), vec![value]);
                 }
-                "to_i" => return Js::call(span, Js::ident(span, "Number"), vec![js_expr(r)]),
+                // `Number(2.5)` is 2.5; a Float's `to_i` truncates.
+                "to_i" if matches!(strip_nullable(r.ty.as_ref()), Some(Ty::Float)) => {
+                    return Js::method_call(span, synth_ident("Math"), "trunc", vec![js_expr(r)]);
+                }
+                // String receivers answer `to_i` from `string_kernel`
+                // in the `Ty::Str` arm below. This arm is every other
+                // receiver.
+                "to_i" if !matches!(r.ty.as_ref(), Some(Ty::Str)) => {
+                    return Js::call(span, Js::ident(span, "Number"), vec![js_expr(r)])
+                }
                 "to_sym" => return js_expr(r),
                 _ => {}
             }
@@ -2448,7 +3150,7 @@ fn js_send_inner(
             _ => None,
         };
         if let Some(inner) = inner {
-            return Js::unary(span, "!", js_expr(inner));
+            return Js::unary(span, "!", js_cond(inner));
         }
     }
     // Type-aware per-receiver dispatch. The receiver type may be
@@ -2457,6 +3159,11 @@ fn js_send_inner(
     // nullable wrapper so dispatch fires on the inner type.
     if let Some(r) = recv {
         let recv_ty = strip_nullable(r.ty.as_ref());
+        // Not left out as a Union: an Integer-or-Float count (`count.to_f`) has every number method a Float has
+        let recv_ty = match recv_ty {
+            Some(Ty::Union { variants }) if variants.iter().all(|v| matches!(v, Ty::Int | Ty::Float | Ty::Nil)) && variants.iter().any(|v| matches!(v, Ty::Float)) => Some(&Ty::Float),
+            other => other,
+        };
         match recv_ty {
             // Ruby Array → JS Array (with native method renames where
             // they diverge: `.each` → `.forEach`, `.size` → `.length`).
@@ -2612,6 +3319,116 @@ fn js_send_inner(
                     };
                     return Js::method_call(span, copy, "sort", cmp);
                 }
+                // Each below reads the receiver once through `__a`, and a
+                // block reaches JS as the arrow it already emits as.
+                "sum" if args.is_empty() => {
+                    return with_array(span, r, |a| array_sum(a));
+                }
+                "sum" if args.len() == 1 && is_block(&args[0]) => {
+                    let f = js_expr(&args[0]);
+                    return with_array(span, r, |a| array_sum(Js::method_call(Span::synthetic(), a, "map", vec![f])));
+                }
+                "select" | "filter" | "find_all" if args.len() == 1 && is_block(&args[0]) => {
+                    return Js::method_call(span, js_expr(r), "filter", vec![js_expr(&args[0])]);
+                }
+                "reject" if args.len() == 1 && is_block(&args[0]) => {
+                    let f = js_expr(&args[0]);
+                    let not_f = arrow1("__x", Js::unary(Span::synthetic(), "!", Js::call(Span::synthetic(), f, vec![synth_ident("__x")])));
+                    return Js::method_call(span, js_expr(r), "filter", vec![not_f]);
+                }
+                "collect" if args.len() == 1 && is_block(&args[0]) => {
+                    return Js::method_call(span, js_expr(r), "map", vec![js_expr(&args[0])]);
+                }
+                "detect" if args.len() == 1 && is_block(&args[0]) => {
+                    return Js::method_call(span, js_expr(r), "find", vec![js_expr(&args[0])]);
+                }
+                "flat_map" if args.len() == 1 && is_block(&args[0]) => {
+                    return Js::method_call(span, js_expr(r), "flatMap", vec![js_expr(&args[0])]);
+                }
+                // `forEach` hands the callback (element, index), the block's two parameters.
+                "each_with_index" if args.len() == 1 && is_block(&args[0]) => {
+                    return Js::method_call(span, js_expr(r), "forEach", vec![js_expr(&args[0])]);
+                }
+                "compact" if args.is_empty() => {
+                    let not_nil = arrow1("__x", Js::binary(Span::synthetic(), "!=", synth_ident("__x"), Js::synth(JsExpr::Null)));
+                    return Js::method_call(span, js_expr(r), "filter", vec![not_nil]);
+                }
+                "uniq" if args.is_empty() => {
+                    let set = Js::synth(JsExpr::New { callee: synth_ident("Set"), args: vec![js_expr(r)] });
+                    return Js::new(span, JsExpr::Array(vec![Js::synth(JsExpr::Spread(set))]));
+                }
+                "max" | "min" if args.is_empty() && matches!(**elem, Ty::Int | Ty::Float) => {
+                    let pick = if method == "max" { "max" } else { "min" };
+                    return with_array(span, r, |a| {
+                        Js::synth(JsExpr::Ternary {
+                            cond: Js::member(Span::synthetic(), a.clone(), "length"),
+                            then: Js::method_call(Span::synthetic(), synth_ident("Math"), pick, vec![Js::synth(JsExpr::Spread(a))]),
+                            else_: Js::synth(JsExpr::Null),
+                        })
+                    });
+                }
+                "first" | "take" if args.len() == 1 && !is_block(&args[0]) => {
+                    return Js::method_call(span, js_expr(r), "slice", vec![Js::num(Span::synthetic(), "0"), js_expr(&args[0])]);
+                }
+                "last" if args.len() == 1 && !is_block(&args[0]) => {
+                    // `slice(-n)` is the whole Array for n = 0, where Ruby answers [].
+                    let n = js_expr(&args[0]);
+                    return with_array(span, r, |a| {
+                        let from = Js::method_call(
+                            Span::synthetic(),
+                            synth_ident("Math"),
+                            "max",
+                            vec![Js::binary(Span::synthetic(), "-", Js::member(Span::synthetic(), a.clone(), "length"), n), Js::num(Span::synthetic(), "0")],
+                        );
+                        Js::method_call(Span::synthetic(), a, "slice", vec![from])
+                    });
+                }
+                "dup" | "clone" if args.is_empty() => {
+                    return Js::new(span, JsExpr::Array(vec![Js::synth(JsExpr::Spread(js_expr(r)))]));
+                }
+                "drop" if args.len() == 1 && !is_block(&args[0]) => {
+                    return Js::method_call(span, js_expr(r), "slice", vec![js_expr(&args[0])]);
+                }
+                "count" if args.len() == 1 => {
+                    let pred = if is_block(&args[0]) {
+                        js_expr(&args[0])
+                    } else {
+                        arrow1("__x", Js::binary(Span::synthetic(), "===", synth_ident("__x"), js_expr(&args[0])))
+                    };
+                    let kept = Js::method_call(Span::synthetic(), js_expr(r), "filter", vec![pred]);
+                    return Js::member(span, kept, "length");
+                }
+                "inject" | "reduce" if args.len() == 2 && is_block(&args[1]) => {
+                    return Js::method_call(span, js_expr(r), "reduce", vec![js_expr(&args[1]), js_expr(&args[0])]);
+                }
+                // An empty Array's `inject` is nil; JS `reduce` without a seed throws on one.
+                "inject" | "reduce" if args.len() == 1 && is_block(&args[0]) => {
+                    let f = js_expr(&args[0]);
+                    return with_array(span, r, |a| {
+                        Js::synth(JsExpr::Ternary {
+                            cond: Js::member(Span::synthetic(), a.clone(), "length"),
+                            then: Js::method_call(Span::synthetic(), a, "reduce", vec![f]),
+                            else_: Js::synth(JsExpr::Null),
+                        })
+                    });
+                }
+                "index" | "find_index" if args.len() == 1 => {
+                    let found = if is_block(&args[0]) {
+                        Js::method_call(Span::synthetic(), js_expr(r), "findIndex", vec![js_expr(&args[0])])
+                    } else {
+                        Js::method_call(Span::synthetic(), js_expr(r), "indexOf", vec![js_expr(&args[0])])
+                    };
+                    let nil_if_absent = Js::synth(JsExpr::Arrow {
+                        params: vec![js_param("__i")],
+                        body: ArrowBody::Expr(Js::synth(JsExpr::Ternary {
+                            cond: Js::binary(Span::synthetic(), "<", synth_ident("__i"), Js::num(Span::synthetic(), "0")),
+                            then: Js::synth(JsExpr::Null),
+                            else_: synth_ident("__i"),
+                        })),
+                        is_async: false,
+                    });
+                    return Js::call(span, nil_if_absent, vec![found]);
+                }
                 // Ruby's `Array#join` with no args uses `$,` as the
                 // separator (defaults to nil → ""). JS's
                 // `Array.prototype.join()` defaults to "," — wrong
@@ -2629,26 +3446,183 @@ fn js_send_inner(
                 }
                 _ => {}
             },
+            Some(Ty::Int | Ty::Float) => {
+                let is_float = matches!(recv_ty, Some(Ty::Float));
+                let n = || js_expr(r);
+                let zero = || Js::num(Span::synthetic(), "0");
+                let math = |f: &str, xs: Vec<Js>| Js::method_call(Span::synthetic(), synth_ident("Math"), f, xs);
+                match (method, args.len()) {
+                    ("odd?", 0) => {
+                        return Js::binary(span, "!==", Js::binary(Span::synthetic(), "%", n(), Js::num(Span::synthetic(), "2")), zero());
+                    }
+                    ("even?", 0) => {
+                        return Js::binary(span, "===", Js::binary(Span::synthetic(), "%", n(), Js::num(Span::synthetic(), "2")), zero());
+                    }
+                    ("zero?", 0) => return Js::binary(span, "===", n(), zero()),
+                    ("positive?", 0) => return Js::binary(span, ">", n(), zero()),
+                    ("negative?", 0) => return Js::binary(span, "<", n(), zero()),
+                    ("abs", 0) => return math("abs", vec![n()]),
+                    ("to_f", 0) => return n(),
+                    ("pred", 0) => return Js::binary(span, "-", n(), Js::num(Span::synthetic(), "1")),
+                    ("succ", 0) => return Js::binary(span, "+", n(), Js::num(Span::synthetic(), "1")),
+                    ("fdiv", 1) => return Js::binary(span, "/", n(), js_expr(&args[0])),
+                    ("floor" | "ceil", 0) => return math(method, vec![n()]),
+                    ("round", 0) if !is_float => return n(),
+                    // Ruby rounds half away from zero; `Math.round(-2.5)` is -2.
+                    ("round", 0) => {
+                        return with_array(span, r, |x| {
+                            Js::binary(
+                                Span::synthetic(),
+                                "*",
+                                math("sign", vec![x.clone()]),
+                                math("round", vec![math("abs", vec![x])]),
+                            )
+                        });
+                    }
+                    ("<=>", 1) => {
+                        let other = js_expr(&args[0]);
+                        let cmp = Js::synth(JsExpr::Arrow {
+                            params: vec![js_param("__a"), js_param("__b")],
+                            body: ArrowBody::Expr(Js::synth(JsExpr::Ternary {
+                                cond: Js::binary(Span::synthetic(), "<", synth_ident("__a"), synth_ident("__b")),
+                                then: Js::num(Span::synthetic(), "-1"),
+                                else_: Js::synth(JsExpr::Ternary {
+                                    cond: Js::binary(Span::synthetic(), ">", synth_ident("__a"), synth_ident("__b")),
+                                    then: Js::num(Span::synthetic(), "1"),
+                                    else_: zero(),
+                                }),
+                            })),
+                            is_async: false,
+                        });
+                        return Js::call(span, cmp, vec![n(), other]);
+                    }
+                    ("clamp", 2) => {
+                        return math("min", vec![math("max", vec![n(), js_expr(&args[0])]), js_expr(&args[1])]);
+                    }
+                    ("between?", 2) => {
+                        let (lo, hi) = (js_expr(&args[0]), js_expr(&args[1]));
+                        return with_array(span, r, |x| {
+                            Js::binary(
+                                Span::synthetic(),
+                                "&&",
+                                Js::binary(Span::synthetic(), ">=", x.clone(), lo),
+                                Js::binary(Span::synthetic(), "<=", x, hi),
+                            )
+                        });
+                    }
+                    _ => {}
+                }
+            }
             // String receiver: predicate forms parallel Array's; the
             // case-shift helpers map to JS String methods.
-            Some(Ty::Str) => match method {
-                "empty?" if args.is_empty() => {
-                    return Js::binary(
-                        span,
-                        "===",
-                        Js::member(span, js_expr(r), "length"),
-                        Js::num(span, "0"),
+            Some(Ty::Str) => {
+                if let Some(entry) = crate::catalog::string_kernel::lookup(method, args.len()) {
+                    return js_string_kernel(span, r, args, entry);
+                }
+                match method {
+                "freeze" | "dup" | "clone" | "itself" | "to_str" if args.is_empty() => return js_expr(r),
+                "lstrip" if args.is_empty() => return Js::method_call(span, js_expr(r), "trimStart", vec![]),
+                "rstrip" if args.is_empty() => return Js::method_call(span, js_expr(r), "trimEnd", vec![]),
+                "chomp" if args.is_empty() => {
+                    let eol = Js::synth(JsExpr::Regex { pattern: "(?:\\r\\n|\\n|\\r)$".into(), flags: String::new() });
+                    return Js::method_call(span, js_expr(r), "replace", vec![eol, Js::str(Span::synthetic(), "")]);
+                }
+                // Ruby's blank-separated split drops the empty fields JS `split(/\s+/)` keeps at either end.
+                "split" if args.is_empty() || literal_str(&args[0]) == Some(" ") => {
+                    let ws = Js::synth(JsExpr::Regex { pattern: "\\s+".into(), flags: String::new() });
+                    let fields = Js::method_call(Span::synthetic(), js_expr(r), "split", vec![ws]);
+                    let non_empty = arrow1("__x", Js::binary(Span::synthetic(), "!==", synth_ident("__x"), Js::str(Span::synthetic(), "")));
+                    return Js::method_call(span, fields, "filter", vec![non_empty]);
+                }
+                // Ruby drops the trailing empty fields JS `split` keeps, so `"".split(",")` is [].
+                "split" if args.len() == 1 && literal_str(&args[0]).is_some() => {
+                    let fields = Js::method_call(Span::synthetic(), js_expr(r), "split", vec![js_expr(&args[0])]);
+                    let kept = Js::synth(JsExpr::Arrow {
+                        params: vec![js_param("__n"), js_param("__x"), js_param("__i")],
+                        body: ArrowBody::Expr(Js::synth(JsExpr::Ternary {
+                            cond: Js::binary(Span::synthetic(), "!==", synth_ident("__x"), Js::str(Span::synthetic(), "")),
+                            then: Js::binary(Span::synthetic(), "+", synth_ident("__i"), Js::num(Span::synthetic(), "1")),
+                            else_: synth_ident("__n"),
+                        })),
+                        is_async: false,
+                    });
+                    let end = Js::method_call(Span::synthetic(), synth_ident("__a"), "reduce", vec![kept, Js::num(Span::synthetic(), "0")]);
+                    let trim = arrow1("__a", Js::method_call(Span::synthetic(), synth_ident("__a"), "slice", vec![Js::num(Span::synthetic(), "0"), end]));
+                    return Js::call(span, trim, vec![fields]);
+                }
+                "ljust" | "rjust" if args.len() == 1 || args.len() == 2 => {
+                    let pad = if method == "ljust" { "padEnd" } else { "padStart" };
+                    return Js::method_call(span, js_expr(r), pad, args.iter().map(js_expr).collect());
+                }
+                "center" if args.len() == 1 || args.len() == 2 => {
+                    let pad = args.get(1).map(js_expr).unwrap_or_else(|| Js::str(Span::synthetic(), " "));
+                    let len = || Js::member(Span::synthetic(), synth_ident("__s"), "length");
+                    let left = Js::method_call(
+                        Span::synthetic(),
+                        synth_ident("Math"),
+                        "floor",
+                        vec![Js::binary(Span::synthetic(), "/", Js::binary(Span::synthetic(), "-", synth_ident("__w"), len()), Js::num(Span::synthetic(), "2"))],
                     );
+                    let padded = Js::method_call(
+                        Span::synthetic(),
+                        Js::method_call(Span::synthetic(), synth_ident("__s"), "padStart", vec![Js::binary(Span::synthetic(), "+", len(), left), synth_ident("__p")]),
+                        "padEnd",
+                        vec![synth_ident("__w"), synth_ident("__p")],
+                    );
+                    let shell = Js::synth(JsExpr::Arrow {
+                        params: vec![js_param("__s"), js_param("__w"), js_param("__p")],
+                        body: ArrowBody::Expr(padded),
+                        is_async: false,
+                    });
+                    return Js::call(span, shell, vec![js_expr(r), js_expr(&args[0]), pad]);
                 }
-                "size" | "length" if args.is_empty() => {
-                    return Js::member(span, js_expr(r), "length");
+                "count" if !args.is_empty() => {
+                    if let Some(re) = char_set_regex(args, false) {
+                        let hits = Js::method_call(Span::synthetic(), js_expr(r), "match", vec![re]);
+                        let hits = Js::binary(Span::synthetic(), "??", hits, Js::synth(JsExpr::Array(vec![])));
+                        return Js::member(span, hits, "length");
+                    }
                 }
-                "upcase" if args.is_empty() => {
-                    return Js::method_call(span, js_expr(r), "toUpperCase", vec![]);
+                "delete" if !args.is_empty() => {
+                    if let Some(re) = char_set_regex(args, false) {
+                        return Js::method_call(span, js_expr(r), "replace", vec![re, Js::str(Span::synthetic(), "")]);
+                    }
                 }
-                "downcase" if args.is_empty() => {
-                    return Js::method_call(span, js_expr(r), "toLowerCase", vec![]);
+                "squeeze" => {
+                    if let Some(re) = char_set_regex(args, true) {
+                        return Js::method_call(span, js_expr(r), "replace", vec![re, Js::str(Span::synthetic(), "$1")]);
+                    }
                 }
+                "delete_prefix" if args.len() == 1 => {
+                    let cut = Js::synth(JsExpr::Ternary {
+                        cond: Js::method_call(Span::synthetic(), synth_ident("__s"), "startsWith", vec![synth_ident("__p")]),
+                        then: Js::method_call(Span::synthetic(), synth_ident("__s"), "slice", vec![Js::member(Span::synthetic(), synth_ident("__p"), "length")]),
+                        else_: synth_ident("__s"),
+                    });
+                    return Js::call(span, arrow2("__s", "__p", cut), vec![js_expr(r), js_expr(&args[0])]);
+                }
+                "delete_suffix" if args.len() == 1 => {
+                    let keep = Js::binary(
+                        Span::synthetic(),
+                        "-",
+                        Js::member(Span::synthetic(), synth_ident("__s"), "length"),
+                        Js::member(Span::synthetic(), synth_ident("__p"), "length"),
+                    );
+                    let cut = Js::synth(JsExpr::Ternary {
+                        cond: Js::method_call(Span::synthetic(), synth_ident("__s"), "endsWith", vec![synth_ident("__p")]),
+                        then: Js::method_call(Span::synthetic(), synth_ident("__s"), "slice", vec![Js::num(Span::synthetic(), "0"), keep]),
+                        else_: synth_ident("__s"),
+                    });
+                    return Js::call(span, arrow2("__s", "__p", cut), vec![js_expr(r), js_expr(&args[0])]);
+                }
+                "index" | "rindex" if args.len() == 1 && matches!(strip_nullable(args[0].ty.as_ref()), Some(Ty::Str)) => {
+                    let find = if method == "index" { "indexOf" } else { "lastIndexOf" };
+                    let found = Js::method_call(Span::synthetic(), js_expr(r), find, vec![js_expr(&args[0])]);
+                    let mut js = nil_if_negative(found);
+                    js.span = span;
+                    return js;
+                }
+                "slice" => return js_send_inner(span, recv, "[]", args, true, None),
                 "capitalize" if args.is_empty() => {
                     // JS has no built-in capitalize. Match Ruby's
                     // semantics: uppercase the first char, lowercase
@@ -2684,9 +3658,6 @@ fn js_send_inner(
                     });
                     return Js::call(span, shell, vec![js_expr(r)]);
                 }
-                "strip" if args.is_empty() => {
-                    return Js::method_call(span, js_expr(r), "trim", vec![]);
-                }
                 "reverse" if args.is_empty() => {
                     let chars = Js::method_call(
                         span,
@@ -2708,30 +3679,6 @@ fn js_send_inner(
                         js_expr(r),
                         "split",
                         vec![Js::str(Span::synthetic(), "")],
-                    );
-                }
-                "start_with?" if args.len() == 1 => {
-                    return Js::method_call(
-                        span,
-                        js_expr(r),
-                        "startsWith",
-                        vec![js_expr(&args[0])],
-                    );
-                }
-                "end_with?" if args.len() == 1 => {
-                    return Js::method_call(
-                        span,
-                        js_expr(r),
-                        "endsWith",
-                        vec![js_expr(&args[0])],
-                    );
-                }
-                "include?" if args.len() == 1 => {
-                    return Js::method_call(
-                        span,
-                        js_expr(r),
-                        "includes",
-                        vec![js_expr(&args[0])],
                     );
                 }
                 // `s.sub(pat, repl)` → `s.replace(pat, repl)` (first
@@ -2810,39 +3757,13 @@ fn js_send_inner(
                     };
                     return Js::method_call(span, js_expr(r), method, vec![pat_js, repl_js]);
                 }
-                // `s.tr(from, to)` — character translation. Limited
-                // to single-char from/to (covers framework Ruby's
-                // `inner_k.to_s.tr("_", "-")` shape). Multi-char
-                // and ranges aren't yet supported; the call falls
-                // through to the generic dispatch (and tsc errors)
-                // so the gap surfaces instead of silently miscompiling.
                 "tr" if args.len() == 2 => {
-                    if let (
-                        ExprNode::Lit { value: Literal::Str { value: from } },
-                        ExprNode::Lit { value: Literal::Str { value: to } },
-                    ) = (&*args[0].node, &*args[1].node)
-                    {
-                        if from.chars().count() == 1 && to.chars().count() == 1 {
-                            // Escape the `from` char for use inside a
-                            // regex character class.
-                            let c = from.chars().next().unwrap();
-                            let escaped = match c {
-                                '\\' | '/' | '^' | '$' | '.' | '|' | '?' | '*' | '+' | '('
-                                | ')' | '[' | ']' | '{' | '}' => format!("\\{c}"),
-                                _ => c.to_string(),
-                            };
-                            let pat =
-                                Js::synth(JsExpr::Regex { pattern: escaped, flags: "g".into() });
-                            return Js::method_call(
-                                span,
-                                js_expr(r),
-                                "replace",
-                                vec![pat, Js::str(args[1].span, to.clone())],
-                            );
-                        }
+                    if let Some(plan) = tr_plan(&args[0], &args[1]) {
+                        return js_tr(span, r, plan);
                     }
                 }
                 _ => {}
+                }
             },
             // Hash → JS plain-object. `.merge` becomes object spread;
             // `.key?` becomes the `in` operator; `.empty?` counts keys;
@@ -2852,8 +3773,10 @@ fn js_send_inner(
                     Js::method_call(span, synth_ident("Object"), "keys", vec![js_expr(r)])
                 };
                 match method {
+                    // An own key, as Ruby's `Hash#key?` answers: `in` also
+                    // finds `Object.prototype`'s (`"constructor"`).
                     "key?" | "has_key?" | "include?" if args.len() == 1 => {
-                        return Js::binary(span, "in", js_expr(&args[0]), js_expr(r));
+                        return has_own(span, js_expr(r), js_expr(&args[0]));
                     }
                     "empty?" if args.is_empty() => {
                         return Js::binary(
@@ -2930,18 +3853,60 @@ fn js_send_inner(
                     // permitted field; without this rewrite the Send
                     // emits literally and tsc rejects since
                     // `Record<string, any>` has no `.fetch`. The
-                    // single-arg form becomes a bracket index — Ruby's
-                    // KeyError on missing key isn't modeled in TS.
+                    // single-arg form raises on a missing key, as Ruby's
+                    // KeyError does (it is typed the value, never nil).
+                    // `(() => { const h = r; const k = key; const d = default;
+                    // return own(h, k) ? h[k] : d; })()`: the default only on
+                    // a missing key, so a key holding nil answers nil (`??`
+                    // read it as missing); each operand read once, the
+                    // default eagerly, as Ruby evaluates its arguments.
                     "fetch" if args.len() == 2 => {
-                        return Js::binary(
+                        let pick = Js::new(
                             span,
-                            "??",
-                            Js::index(span, js_expr(r), js_expr(&args[0])),
-                            js_expr(&args[1]),
+                            JsExpr::Ternary {
+                                cond: has_own(span, synth_ident("h"), synth_ident("k")),
+                                then: Js::index(span, synth_ident("h"), synth_ident("k")),
+                                else_: synth_ident("d"),
+                            },
+                        );
+                        return iife(
+                            span,
+                            vec![
+                                const_decl("h", js_expr(r)),
+                                const_decl("k", js_expr(&args[0])),
+                                const_decl("d", js_expr(&args[1])),
+                                return_stmt(Some(pick)),
+                            ],
                         );
                     }
+                    // `(() => { const h = r; const k = key; if (!own(h, k))
+                    // throw new Error(…); return h[k]; })()`: receiver and
+                    // key read once; a present key holding nil answers it,
+                    // and an Object.prototype name is not a key.
                     "fetch" if args.len() == 1 => {
-                        return Js::index(span, js_expr(r), js_expr(&args[0]));
+                        let missing = Js::unary(span, "!", has_own(span, synth_ident("h"), synth_ident("k")));
+                        let err = Js::synth(JsExpr::New {
+                            callee: synth_ident("Error"),
+                            args: vec![Js::binary(
+                                span,
+                                "+",
+                                Js::str(Span::synthetic(), "key not found: "),
+                                synth_ident("k"),
+                            )],
+                        });
+                        return iife(
+                            span,
+                            vec![
+                                const_decl("h", js_expr(r)),
+                                const_decl("k", js_expr(&args[0])),
+                                JsStmt::synth(JsStmtNode::If {
+                                    cond: missing,
+                                    then: vec![JsStmt::synth(JsStmtNode::Throw(err))],
+                                    else_: None,
+                                }),
+                                return_stmt(Some(Js::index(span, synth_ident("h"), synth_ident("k")))),
+                            ],
+                        );
                     }
                     "dup" | "clone" if args.is_empty() => {
                         return Js::new(
@@ -3016,7 +3981,18 @@ fn js_send_inner(
                     return Js::method_call(span, js_expr(r), "add", vec![js_expr(&args[0])]);
                 }
                 Ty::Array { .. } => {
-                    return Js::method_call(span, js_expr(r), "push", vec![js_expr(&args[0])]);
+                    // `out << a << b` appends both to `out`; JS `push` answers a length, not the Array to chain on.
+                    let mut appended = vec![&args[0]];
+                    let mut base = r;
+                    while let ExprNode::Send { recv: Some(inner), method: m, args: a, block: None, .. } = &*base.node {
+                        if m.as_str() != "<<" || a.len() != 1 || !matches!(strip_nullable(inner.ty.as_ref()), Some(Ty::Array { .. })) {
+                            break;
+                        }
+                        appended.push(&a[0]);
+                        base = inner;
+                    }
+                    appended.reverse();
+                    return Js::method_call(span, js_expr(base), "push", appended.into_iter().map(js_expr).collect());
                 }
                 // Ruby's `str << x` appends in place. TS strings
                 // are immutable, but the receiver is always a
@@ -3251,11 +4227,13 @@ fn js_send_inner(
     // where receiver type is `any`. Hash receivers reach the
     // type-aware branch and emit as `in`, so they don't fall through
     // here.
-    let (mapped_name, force_parens) = match method {
-        "strip" => ("trim", true),
-        "include?" => ("includes", true),
-        _ => (method, false),
-    };
+    // Untyped receivers still rewrite `strip` and `include?`. The
+    // spelling comes from the string kernel.
+    let (mapped_name, force_parens) =
+        match crate::catalog::string_kernel::untyped_typescript_method(method, args.len()) {
+            Some(name) => (name, true),
+            None => (method, false),
+        };
     let ts_m = ts_method_name(mapped_name);
     match recv {
         None => {
@@ -3317,12 +4295,21 @@ fn js_send_inner(
                 }
             );
             // A receiver whose class declares the method as a real
-            // `def` (no attribute slot) needs the call.
-            let is_declared_method = !is_const_recv
-                && matches!(
-                    instance_method_shape(r.ty.as_ref(), method),
-                    Some((crate::dialect::AccessorKind::Method, 0))
-                );
+            // `def` (no attribute slot) needs the call. `self` is the
+            // enclosing class's instance, or the class itself in a class
+            // method, whose own methods answer then.
+            let self_class = matches!(&*r.node, ExprNode::SelfRef)
+                .then(|| SELF_CLASS.with(|cell| cell.borrow().clone()))
+                .flatten();
+            let shape = match &self_class {
+                Some((class, true)) => class_method_shape(class, method),
+                Some((class, false)) => instance_method_shape(r.ty.as_ref(), method)
+                    .or_else(|| method_shape(class, method, false)),
+                None => instance_method_shape(r.ty.as_ref(), method)
+                    .or_else(|| narrowed_record_class(r).and_then(|class| method_shape(&class, method, false))),
+            };
+            let is_declared_method =
+                !is_const_recv && matches!(shape, Some((crate::dialect::AccessorKind::Method, _, true)));
             let raw = if args.is_empty()
                 && !parenthesized
                 && !force_parens
@@ -3379,8 +4366,52 @@ fn js_send_inner(
 /// as Const references — without this, `assert_operator(X, :<,
 /// StandardError)` and similar idioms emit a bare `StandardError`
 /// that's neither in scope nor importable.
+std::thread_local! {
+    /// The aliases of `ActiveRecord::Base` and `ActionController::Base`,
+    /// when they are aliased (`set_runtime_base_aliases`).
+    static RUNTIME_BASE_ALIASES: std::cell::RefCell<Option<(String, String)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Alias the runtime's `ActiveRecord::Base` and `ActionController::Base`
+/// in the app files emitted from here on, for an app that defines its
+/// own `Base` (#1228), under names none of `app_classes` takes
+/// (`ActiveRecordBase`, or `ActiveRecordBase2` beside an app class of
+/// that name). `None` turns it off, as while the runtime's own files
+/// emit, where `Base` is the class being defined.
+pub(crate) fn set_runtime_base_aliases(app_classes: Option<&HashSet<String>>) {
+    let free = |want: &str, taken: &HashSet<String>| {
+        let mut name = want.to_string();
+        let mut n = 2;
+        while taken.contains(&name) {
+            name = format!("{want}{n}");
+            n += 1;
+        }
+        name
+    };
+    let aliases = app_classes.map(|taken| (free("ActiveRecordBase", taken), free("ActionControllerBase", taken)));
+    RUNTIME_BASE_ALIASES.with(|cell| *cell.borrow_mut() = aliases);
+}
+
+/// The local name an app file gives the runtime class `qualified`
+/// (`ActiveRecord::Base`) when the app's own `Base` takes the bare name.
+pub(crate) fn runtime_base_alias(qualified: &str) -> Option<String> {
+    RUNTIME_BASE_ALIASES.with(|cell| {
+        let aliases = cell.borrow();
+        let (record, controller) = aliases.as_ref()?;
+        match qualified {
+            "ActiveRecord::Base" => Some(record.clone()),
+            "ActionController::Base" => Some(controller.clone()),
+            _ => None,
+        }
+    })
+}
+
 fn const_name(path: &[Symbol]) -> String {
     let segs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+    if let Some(alias) = runtime_base_alias(&segs.join("::")) {
+        return alias.to_string();
+    }
     const FRAMEWORK_NAMESPACES: &[&str] = &[
         "ActionController",
         "ActiveRecord",
@@ -3443,17 +4474,81 @@ pub(super) fn js_literal(span: Span, lit: &Literal) -> Js {
             // string-boundary in practice (no `m` → no per-line shift),
             // matching Ruby `\A` / `\z` for the framework's use cases
             // (validates_format_of, route param matching, etc.).
+            //
+            // Ruby's `m` flag is "dot matches newline" (JS `s`), and
+            // Ruby's `^`/`$` are line anchors with or without it (JS
+            // `m`), so a flagged `m` emits both. With JS's `m` on, `^`/`$`
+            // no longer stand for Ruby's string anchors, which then
+            // become lookarounds instead.
+            let multiline = flags.contains('m');
             Js::new(
                 span,
                 JsExpr::Regex {
-                    pattern: translate_ruby_regex_anchors(pattern),
-                    flags: flags.clone(),
+                    pattern: translate_ruby_regex_anchors(pattern, multiline),
+                    flags: crate::emit::shared::regex_literal::translate_ruby_flags_for_re2_style_m(flags),
                 },
             )
         }
     }
 }
 
+#[cfg(test)]
+mod regex_flag_tests {
+    fn pattern_and_flags(pattern: &str, flags: &str) -> (String, String) {
+        let lit = Literal::Regex { pattern: pattern.to_string(), flags: flags.to_string() };
+        match *js_literal(Span::synthetic(), &lit).node {
+            super::JsExpr::Regex { pattern, flags } => (pattern, flags),
+            other => panic!("expected JsExpr::Regex, got {other:?}"),
+        }
+    }
+
+    /// Ruby's `^`/`$` are line anchors and `m` adds dot-matches-newline:
+    /// JS needs both `s` and `m`. With `m` on, JS's `^`/`$` are line
+    /// anchors, so Ruby's string anchors `\A`/`\z`/`\Z` can no longer
+    /// be spelled `^`/`$`.
+    #[test]
+    fn rubys_m_keeps_line_anchors_and_string_anchors_stay_absolute() {
+        assert_eq!(pattern_and_flags("^b.c$", "m"), ("^b.c$".to_string(), "sm".to_string()));
+        assert_eq!(
+            pattern_and_flags("\\Aa.b\\z", "m"),
+            ("(?<![\\s\\S])a.b(?![\\s\\S])".to_string(), "sm".to_string())
+        );
+        assert_eq!(pattern_and_flags("a\\Z", "im").0, "a(?=\\n?(?![\\s\\S]))");
+        // Without `m`, unchanged.
+        assert_eq!(pattern_and_flags("\\Aa\\z", ""), ("^a$".to_string(), String::new()));
+    }
+
+    use super::js_literal;
+    use crate::expr::Literal;
+    use crate::span::Span;
+
+    fn flags_of(pattern: &str, flags: &str) -> String {
+        let lit = Literal::Regex { pattern: pattern.to_string(), flags: flags.to_string() };
+        match *js_literal(Span::synthetic(), &lit).node {
+            super::JsExpr::Regex { flags, .. } => flags,
+            other => panic!("expected JsExpr::Regex, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ignore_case_passes_through_as_js_i() {
+        assert_eq!(flags_of("a.b", "i"), "i");
+    }
+
+    #[test]
+    fn rubys_m_maps_to_js_s_and_m() {
+        // Ruby's `m` is JS `s` (dot-all). Ruby's `^`/`$` are always
+        // line anchors, so flagged `m` also needs JS `m`. Absolute
+        // anchors `\A`/`\z`/`\Z` then use lookarounds — covered by
+        // `rubys_m_keeps_line_anchors_and_string_anchors_stay_absolute`.
+        assert_eq!(flags_of("a.b", "m"), "sm");
+    }
+
+    #[test]
+    fn ignore_case_and_dot_matches_newline_combine() {
+        assert_eq!(flags_of("a.b", "im"), "ism");
+    }
+}
 
 /// Classify a `gsub` pattern into the JS pattern expression and the
 /// method name (`replace` vs `replaceAll`).
@@ -3488,16 +4583,18 @@ fn gsub_pattern_and_method(pat: &Expr) -> (Js, &'static str) {
         value: Literal::Regex { pattern, flags },
     } = &*pat.node
     {
-        let new_flags = if flags.contains('g') {
-            flags.clone()
+        // Same translation as a plain regex literal (`js_literal`), plus `g`.
+        let js_flags = crate::emit::shared::regex_literal::translate_ruby_flags_for_re2_style_m(flags);
+        let new_flags = if js_flags.contains('g') {
+            js_flags
         } else {
-            format!("{flags}g")
+            format!("{js_flags}g")
         };
         return (
             Js::new(
                 pat.span,
                 JsExpr::Regex {
-                    pattern: translate_ruby_regex_anchors(pattern),
+                    pattern: translate_ruby_regex_anchors(pattern, flags.contains('m')),
                     flags: new_flags,
                 },
             ),
@@ -3554,14 +4651,22 @@ fn gsub_pattern_and_method(pat: &Expr) -> (Js, &'static str) {
 /// backslash followed by `A`/`z`/`Z` doesn't get clobbered.
 /// Strict-end `\Z` differs from `\z` only in trailing-newline
 /// handling — close enough to `$` for these targets.
-fn translate_ruby_regex_anchors(pattern: &str) -> String {
+fn translate_ruby_regex_anchors(pattern: &str, multiline: bool) -> String {
     let mut out = String::with_capacity(pattern.len());
     let mut chars = pattern.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\\' {
             match chars.peek() {
                 Some('A') => {
-                    out.push('^');
+                    out.push_str(if multiline { "(?<![\\s\\S])" } else { "^" });
+                    chars.next();
+                }
+                Some('z') if multiline => {
+                    out.push_str("(?![\\s\\S])");
+                    chars.next();
+                }
+                Some('Z') if multiline => {
+                    out.push_str("(?=\\n?(?![\\s\\S]))");
                     chars.next();
                 }
                 Some('z') | Some('Z') => {
@@ -3656,7 +4761,7 @@ mod async_hof_tests {
     }
 
     fn with_async<F: FnOnce() -> R, R>(names: &[&str], f: F) -> R {
-        let set: std::collections::HashSet<Symbol> =
+        let set: crate::det::HashSet<Symbol> =
             names.iter().map(|s| Symbol::from(*s)).collect();
         with_async_methods(set, f)
     }
@@ -3690,7 +4795,8 @@ mod async_hof_tests {
 
     #[test]
     fn filter_with_async_predicate_rewrites_correctly() {
-        let body = synth_send(Some(synth_var("x")), "save", vec![], None);
+        let mut body = synth_send(Some(synth_var("x")), "save", vec![], None);
+        body.ty = Some(Ty::Bool);
         let block = synth_lambda(vec!["x"], body);
         let send = synth_send(Some(synth_var("arr")), "filter", vec![], Some(block));
         let out = with_async(&["save"], || emit_expr(&send));
@@ -3702,7 +4808,8 @@ mod async_hof_tests {
 
     #[test]
     fn reject_with_async_predicate_negates() {
-        let body = synth_send(Some(synth_var("x")), "save", vec![], None);
+        let mut body = synth_send(Some(synth_var("x")), "save", vec![], None);
+        body.ty = Some(Ty::Bool);
         let block = synth_lambda(vec!["x"], body);
         let send = synth_send(Some(synth_var("arr")), "reject", vec![], Some(block));
         let out = with_async(&["save"], || emit_expr(&send));

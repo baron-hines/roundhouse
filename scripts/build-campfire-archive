@@ -88,8 +88,13 @@ CEILING="${CAMPFIRE_CEILING_ERRORS:-0}"
 allow=()
 [[ "$CEILING" -gt 0 ]] && allow=(--allow-unsupported)
 step "transpiling $APP → spinel (error ceiling $CEILING)"
-(cd "$REPO_ROOT" && cargo run --release --quiet --bin roundhouse -- \
-    --target spinel "$APP" -o "$TREE" ${allow[@]+"${allow[@]}"}) 2>"$WORK/emit.log" || {
+if [[ -n "${ROUNDHOUSE_BIN:-}" ]]; then
+    . "$REPO_ROOT/scripts/lib/roundhouse-bin.sh"
+    transpile() { roundhouse_run "$@"; }
+else
+    transpile() { (cd "$REPO_ROOT" && cargo run --release --quiet --bin roundhouse -- "$@"); }
+fi
+transpile --target spinel "$APP" -o "$TREE" ${allow[@]+"${allow[@]}"} 2>"$WORK/emit.log" || {
     tail -30 "$WORK/emit.log" >&2
     fail "transpile failed"
 }
@@ -151,7 +156,8 @@ rm -rf "$TREE/test/fixtures/files"
 step "installing the campfire README + e2e suite"
 rm -rf "$TREE/e2e"
 mkdir -p "$TREE/e2e"
-cp "$REPO_ROOT"/e2e/campfire/*.spec.js "$REPO_ROOT/e2e/campfire/helpers.js" "$TREE/e2e/"
+cp "$REPO_ROOT"/e2e/campfire/*.spec.js "$REPO_ROOT/e2e/campfire/helpers.js" \
+    "$REPO_ROOT/e2e/campfire/global-setup.js" "$TREE/e2e/"
 # Keep the standalone README install on the dependency set CI prewarms.
 cp "$REPO_ROOT"/e2e/campfire/package{,-lock}.json "$TREE/e2e/"
 

@@ -24,6 +24,27 @@ pub fn snake_case(class_name: &str) -> String {
     s
 }
 
+/// ActiveSupport-style word break for a constant segment: like
+/// `snake_case`, but also splits an acronym from the next word
+/// (`HTMLApp` → `html_app`). `snake_case` keeps that as `htmlapp`.
+pub fn underscore_words(name: &str) -> String {
+    let chars: Vec<char> = name.replace("::", "_").chars().collect();
+    let mut out = String::with_capacity(chars.len() + 4);
+    for (i, c) in chars.iter().enumerate() {
+        if c.is_ascii_uppercase()
+            && i > 0
+            && (chars[i - 1].is_ascii_lowercase()
+                || chars[i - 1].is_ascii_digit()
+                || (chars[i - 1].is_ascii_uppercase()
+                    && chars.get(i + 1).is_some_and(char::is_ascii_lowercase)))
+        {
+            out.push('_');
+        }
+        out.push(c.to_ascii_lowercase());
+    }
+    out
+}
+
 /// Rails `underscore`: like `snake_case`, but `::` becomes a path
 /// separator (`ShortId::CandidateId` → `short_id/candidate_id`). Use for
 /// file placement of possibly-namespaced classes — a literal `::` in a
@@ -35,6 +56,38 @@ pub fn underscore(class_name: &str) -> String {
         .map(snake_case)
         .collect::<Vec<_>>()
         .join("/")
+}
+
+/// ActiveModel's default parameter key keeps namespaces as underscores.
+pub fn model_param_key(class_name: &str) -> String {
+    let class_name = class_name.trim_start_matches("::");
+    let acronyms = APP_INFLECTIONS.with(|a| a.borrow().acronym.clone());
+    if acronyms.is_empty() { return underscore_words(class_name); }
+    class_name.split("::").map(|segment| {
+        let mut word = String::new();
+        let mut offset = 0;
+        let mut previous: Option<char> = None;
+        while offset < segment.len() {
+            let rest = &segment[offset..];
+            let boundary = previous.is_none_or(|c| c.is_ascii_alphanumeric() || !(c.is_alphanumeric() || c == '_'));
+            let acronym = boundary.then(|| acronyms.iter().find(|name| {
+                !name.is_empty() && rest.starts_with(name.as_str())
+                    && rest[name.len()..].chars().next().is_none_or(|c| !c.is_ascii_lowercase())
+            })).flatten();
+            if let Some(name) = acronym {
+                if previous.is_some_and(|c| c.is_ascii_alphanumeric()) { word.push('_'); }
+                word.push_str(&name.to_ascii_lowercase());
+                previous = name.chars().last();
+                offset += name.len();
+            } else {
+                let c = rest.chars().next().unwrap();
+                word.push(c);
+                previous = Some(c);
+                offset += c.len_utf8();
+            }
+        }
+        underscore_words(&word)
+    }).collect::<Vec<_>>().join("_")
 }
 
 pub fn camelize(snake: &str) -> String {
@@ -431,6 +484,21 @@ fn inflect(word: &str, rules: &[(&str, &str)], from_singular: bool) -> String {
     word.to_string()
 }
 
+/// `String#pluralize`: the rules match case-insensitively, and the word keeps its own case where the plural keeps its letters ("Person" → "People", "API" → "APIs").
+pub fn pluralize(word: &str) -> String {
+    // Not by byte position past ASCII: lowercasing can change a character's width.
+    if !word.is_ascii() {
+        return inflect(word, PLURAL_RULES, true);
+    }
+    let lower = word.to_lowercase();
+    let plural = inflect(&lower, PLURAL_RULES, true);
+    if lower == word {
+        return plural;
+    }
+    let kept = lower.char_indices().zip(plural.chars()).take_while(|((_, a), b)| a == b).last().map_or(0, |((i, c), _)| i + c.len_utf8());
+    format!("{}{}", &word[..kept], &plural[kept..])
+}
+
 pub fn pluralize_snake(class_name: &str) -> String {
     inflect(&snake_case(class_name), PLURAL_RULES, true)
 }
@@ -519,4 +587,49 @@ pub(crate) fn is_sqlite_keyword(name: &str) -> bool {
             | "transaction" | "trigger" | "unbounded" | "union" | "unique" | "update" | "using"
             | "vacuum" | "values" | "view" | "virtual" | "when" | "where" | "window" | "with" | "without"
     )
+}
+
+#[cfg(test)]
+mod string_query_parity {
+    #[test]
+    fn pluralize_matches_any_case_and_keeps_the_words_own() {
+        for (word, plural) in [("User", "Users"), ("Status", "Statuses"), ("Person", "People"), ("Mouse", "Mice"), ("API", "APIs"), ("admin_user", "admin_users")] {
+            assert_eq!(super::pluralize(word), plural, "{word}");
+        }
+    }
+
+    use super::{is_reserved_local, RESERVED_LOCALS};
+    use ruby_prism::StringQuery;
+
+    /// Prism's `StringQuery::is_keyword` is a *superset* of
+    /// [`RESERVED_LOCALS`]: it also treats `__FILE__` / `__LINE__` /
+    /// `__ENCODING__` as keywords. Pseudo-vars stay in the table for
+    /// `safe_local` but are excluded from [`is_reserved_local`]. Until
+    /// those differences are modeled explicitly, do not replace the
+    /// table with StringQuery.
+    #[test]
+    fn reserved_locals_are_prism_keywords_but_prism_has_extras() {
+        for name in RESERVED_LOCALS {
+            assert_eq!(
+                StringQuery::new(name.as_bytes()).is_keyword(),
+                Ok(true),
+                "{name} should be a Prism keyword"
+            );
+        }
+        for magic in ["__FILE__", "__LINE__", "__ENCODING__"] {
+            assert_eq!(
+                StringQuery::new(magic.as_bytes()).is_keyword(),
+                Ok(true),
+                "{magic}"
+            );
+            assert!(
+                !RESERVED_LOCALS.contains(&magic),
+                "{magic} is intentionally absent from RESERVED_LOCALS"
+            );
+        }
+        for pseudo in ["self", "nil", "true", "false"] {
+            assert!(RESERVED_LOCALS.contains(&pseudo));
+            assert!(!is_reserved_local(pseudo));
+        }
+    }
 }

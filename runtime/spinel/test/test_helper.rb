@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Copied verbatim to <out>/test/test_helper.rb (by `make ruby-transpile`
 # or `tests/ruby_toolchain.rs`). `__dir__` is `<out>/test/`, so the
 # `require_relative` paths walk up one level to reach `runtime/`, `config/`,
@@ -28,6 +29,11 @@
 # (LocalSecret treats "" as unset) and a secret inherited from the
 # parent process would sign the vectors with a different key.
 ENV["SECRET_KEY_BASE"] = "roundhouse-test-secret"
+# Rails' own test_helper opens with `ENV["RAILS_ENV"] ||= "test"`, and
+# boot.rb parks it as `Rails.env`. Without it a test process reads as
+# development: `Rails.env.test?` gates (campfire's WAL checkpointer
+# `start(enabled: !Rails.env.test?)`) take the serving branch.
+ENV["RAILS_ENV"] = "test" if ENV["RAILS_ENV"].nil?
 require_relative "../runtime/base64"
 require_relative "../runtime/json_impl"
 require_relative "../runtime/db"
@@ -156,9 +162,11 @@ module SchemaSetup
   # truncate call from `ActiveRecord.adapter.truncate(t)` to
   # `<Model>._adapter_truncate` is the per-model dispatch.
   def self.reset!
-    Article._adapter_truncate if defined?(Article)
-    Comment._adapter_truncate if defined?(Comment)
-    FixtureLoader.load_all!
+    FixtureLoader.with_foreign_keys_deferred do
+      Article._adapter_truncate if defined?(Article)
+      Comment._adapter_truncate if defined?(Comment)
+      FixtureLoader.load_all!
+    end
   end
 end
 
@@ -195,6 +203,17 @@ module FixtureLoader
   # Filter by `*Fixtures` suffix BEFORE `const_get` so deprecated
   # constants like Ruby 3.4's `SortedSet` (which raises on access via
   # autoload) don't get touched while scanning for fixture modules.
+  # Rails' fixture setup: loaded with referential integrity off, then checked (`verify_foreign_keys_for_fixtures`). Not Db's alone: a framework test runs this helper with no Db loaded.
+  def self.with_foreign_keys_deferred
+    if defined?(Db)
+      Db.without_foreign_keys { yield }
+      Db.check_foreign_keys!
+    else
+      yield
+    end
+    nil
+  end
+
   def self.load_all!
     Object.constants.sort.each do |c|
       next unless c.to_s.end_with?("Fixtures")
@@ -299,7 +318,7 @@ module Dom
     chunk = target_chunk(selector)
     negated = negated_attrs(chunk)
     chunk = without_negations(chunk)
-    base = chunk.split("[")[0].to_s
+    base = selector_base(chunk)
     want_tag = selector_tag(base)
     want_id = selector_id(base)
     want_classes = selector_classes(base)
@@ -334,6 +353,12 @@ module Dom
   # verbatim (so a content check degrades to a body-substring check).
   def self.text(node)
     node
+  end
+
+  # The text as the browser reads it (Rails compares Nokogiri's decoded
+  # text): `&lt;rails&gt;` in the source is `<rails>`.
+  def self.unescape(s)
+    s.gsub("&lt;", "<").gsub("&gt;", ">").gsub("&quot;", "\"").gsub("&#39;", "'").gsub("&amp;", "&")
   end
 
   # The index of the `<` that opens the tag position `i` sits inside.
@@ -434,7 +459,7 @@ module Dom
   # attribute or in text — which costs candidates, not correctness:
   # a false candidate fails the class check that follows.
   def self.fragment_for(selector)
-    base = target_chunk(selector).split("[")[0].to_s
+    base = selector_base(without_negations(target_chunk(selector)))
     tag = selector_tag(base)
     id = selector_id(base)
     classes = selector_classes(base)
@@ -512,7 +537,7 @@ module Dom
              else value.end_with?(want) || value.end_with?(escaped)
              end
     end
-    tag.include?(pred) || tag.include?(pred.gsub(">", "&gt;").gsub("<", "&lt;"))
+    tag.include?(pred) || tag.include?(pred.gsub(">", "&gt;").gsub("<", "&lt;").gsub("'", "&#39;"))
   end
 
   # Whether a start tag carries the attribute a predicate names: a
@@ -525,16 +550,13 @@ module Dom
 
   def self.selector_attrs(chunk)
     out = []
-    parts = chunk.split("[")
-    i = 1
-    while i < parts.length
-      pred = parts[i].to_s.split("]")[0].to_s
+    selector_preds(chunk).each do |pred|
       eq = pred.index("=")
       if eq.nil?
         out << pred
       else
         name = pred[0, eq].to_s
-        value = pred[eq + 1, pred.length].to_s.gsub("'", "").gsub("\"", "")
+        value = selector_value(pred[eq + 1, pred.length].to_s)
         # `*=` / `^=` / `$=` — substring, prefix and suffix matches
         # (campfire's `img[src*='install-edge']`). Kept as the operator
         # spelled out, which `attr_matches?` reads; `=` stays the literal
@@ -546,9 +568,76 @@ module Dom
           out << %(#{name}="#{value}")
         end
       end
+    end
+    out
+  end
+
+  # Not `split("[")`: a quoted value can hold brackets (`[name='filter[q]']`) and an id can follow a predicate; a pseudo-class (`:checked`) is not checked, as before.
+  def self.selector_value(raw)
+    q = raw[0, 1].to_s
+    raw = raw[1, raw.length - 2].to_s if raw.length >= 2 && (q == "'" || q == "\"") && raw[-1, 1].to_s == q
+    out = ""
+    i = 0
+    while i < raw.length
+      c = raw[i, 1].to_s
+      if c == "\\" && i + 1 < raw.length
+        i += 1
+        c = raw[i, 1].to_s
+      end
+      out = out + c
       i += 1
     end
     out
+  end
+
+  def self.selector_base(chunk)
+    selector_split(chunk)[0].to_s
+  end
+
+  def self.selector_preds(chunk)
+    parts = selector_split(chunk)
+    parts[1, parts.length].to_a
+  end
+
+  def self.selector_split(chunk)
+    base = ""
+    preds = []
+    pred = ""
+    inside = false
+    pseudo = false
+    quote = ""
+    i = 0
+    while i < chunk.length
+      c = chunk[i, 1].to_s
+      if !inside
+        if c == "["
+          inside = true
+          pseudo = false
+          pred = ""
+        elsif c == ":"
+          pseudo = true
+        elsif !pseudo || c == "#" || c == "."
+          pseudo = false
+          base = base + c
+        end
+      elsif quote != "" && c == "\\"
+        pred = pred + chunk[i, 2].to_s
+        i += 1
+      elsif quote != ""
+        quote = "" if c == quote
+        pred = pred + c
+      elsif c == "'" || c == "\""
+        quote = c
+        pred = pred + c
+      elsif c == "]"
+        preds << pred
+        inside = false
+      else
+        pred = pred + c
+      end
+      i += 1
+    end
+    [base] + preds
   end
 
   # The three parts of one compound selector chunk. Split by hand rather
@@ -728,6 +817,26 @@ module ActionCable
     def assert_no_broadcasts(stream, &block)
       assert_broadcasts(stream, 0, &block)
     end
+
+    # `assert_broadcast_on stream, data`: some broadcast to `stream` —
+    # during the block, or so far in this test without one — carries
+    # `data`. Compared as Rails compares it, after a JSON round trip:
+    # `data` goes through the same encoder a broadcast does, and both
+    # sides are parsed, so key order and symbol keys do not matter. The
+    # log holds each publish as its JSON text on this tree.
+    def assert_broadcast_on(stream, data, &block)
+      entries =
+        if block
+          capture_broadcasts_on(stream, &block)
+        else
+          Broadcasts.log.select { |entry| entry[:stream] == stream }
+        end
+      want = JSON.parse(ActionCable.payload_json(data))
+      payloads = entries.map { |entry| entry[:payload] }.compact
+      return if payloads.any? { |payload| JSON.parse(payload.to_s) == want }
+      raise "assert_broadcast_on failed: no broadcast to #{stream.inspect} carried #{JSON.generate(want)}; " \
+            "got #{payloads.inspect}"
+    end
   end
 end
 
@@ -830,6 +939,12 @@ class ActionResponse
     out
   end
 
+  # Rails' `response.header`, `alias_method :header, :headers` on
+  # ActionDispatch::Response.
+  def header
+    headers
+  end
+
   # Rails' `response.cache_control` — the mixed Hash Rails hands back,
   # because the subscript spelling is what a test writes:
   #
@@ -911,8 +1026,9 @@ end
 # (`SchemaSetup.reset!` if defined).
 # What `skip` raises. Minitest's own is `Minitest::Skip < Exception`,
 # deliberately outside StandardError so a test's `rescue => e` cannot
-# swallow it; same rule here, and the autorun shim rescues this arm
-# BEFORE its `rescue Exception` so a skip is never counted a failure.
+# swallow it; same rule here. The autorun shim's `rescue Exception`
+# treats an exception whose class name is `TestSkipped` as a skip, so
+# a framework file that never loads this helper still runs.
 class TestSkipped < Exception
 end
 
@@ -924,22 +1040,13 @@ end
 # The runtime fragment-caches message partials in its own store; these
 # give the test the settings it reads and restores. A fresh
 # `ActiveSupport::Cache::MemoryStore` (runtime/active_support_cache.rb) is
-# a `Rails::Cache`, so it can stand in for `Rails.cache` here.
+# a `Rails::Cache`, so it can stand in for `Rails.cache` here. The
+# third knob, `ActionView::PartialRenderer.collection_cache`, is the
+# runtime's own (runtime/action_controller_fragment_caching.rb): the
+# store cached collections really read.
 module Rails
   def self.cache=(store)
     @cache_store = store
-  end
-end
-
-module ActionView
-  class PartialRenderer
-    def self.collection_cache
-      @collection_cache
-    end
-
-    def self.collection_cache=(store)
-      @collection_cache = store
-    end
   end
 end
 
@@ -951,25 +1058,10 @@ ActionController::Base.perform_caching = false
 
 # ---- Query assertions ------------------------------------------------
 #
-# Rails' `ActiveSupport::Notifications.subscribed(callback,
-# "sql.active_record") { … }` and the `ActiveRecord::Assertions::
-# QueryAssertions` built on it, over `Db.capture_sql`, which records
-# every statement a prepare/exec issues and skips a query-cache replay,
-# as Rails' counter skips CACHE events. The callback gets Rails' five
-# arguments; the payload carries `:sql` and `:name` ("SQL", since the
-# runtime does not name its queries). Called after the block rather than
-# during it, which no test can tell: they collect, then inspect.
-module ActiveSupport
-  module Notifications
-    def self.subscribed(callback, name, &block)
-      return block.call unless name == "sql.active_record"
-      result = nil
-      statements = Db.capture_sql { result = block.call }
-      statements.each { |sql| callback.call(name, nil, nil, nil, { sql: sql, name: "SQL" }) }
-      result
-    end
-  end
-end
+# `ActiveSupport::Notifications.subscribed` lives in
+# runtime/ruby/active_support_notifications.rb. SQL for that name drains
+# `Db.capture_sql` after the block. QueryAssertions below read the same
+# log directly and skip schema statements.
 
 module ActiveRecord
   module Assertions
@@ -1021,6 +1113,15 @@ module ActiveRecord
 end
 
 class TestBase
+  # Rails wraps each example in a non-joinable transaction
+  # (`use_transactional_tests`, default true) so a nested `save` or
+  # `destroy` is a SAVEPOINT. Campfire's room-destroy test counts those
+  # releases. A class that must see a real COMMIT sets this false
+  # (`MessageCreationCommitTest`).
+  def self.use_transactional_tests
+    true
+  end
+
   # Rails puts both of these on `ActiveSupport::TestCase` itself, so a
   # test that never writes `include ActiveJob::TestHelper` still has
   # `perform_enqueued_jobs` — campfire's `User::BotTest` is exactly
@@ -1167,13 +1268,25 @@ class TestBase
   # read until `travel_back` (the block's end, or the next test's
   # setup) answers the same whole second.
   def freeze_time
-    ActiveSupport.freeze(ActiveSupport.now.to_i)
+    ActiveSupport.freeze_clock(ActiveSupport.now.to_i)
     return unless block_given?
     begin
       yield
     ensure
       travel_back
     end
+  end
+
+  # Rails' `stub_const`, for the sites `lower::stub_const` could not
+  # make static: a stub that changes the constant's type (`TIME_LIMIT =
+  # 10` stubbed with `0.2`), or one whose owner the pass did not find.
+  # This tree resolves constants at build time and has no `const_set`,
+  # so the stub cannot take effect; the test FAILS, saying so, rather
+  # than running its block against the unstubbed value. The CRuby tree
+  # replaces this with the real helper (test_support_cruby.rb).
+  def stub_const(mod, constant, _value)
+    raise "stub_const(#{mod}, #{constant.inspect}) has no compiled form here: " \
+          "the stub changes the constant's type, or names a constant the lowering could not find"
   end
 
   # Minitest's `assert_nothing_raised`: the block runs, and an exception
@@ -1402,8 +1515,258 @@ module RequestDispatch
 end
 
 module ActionDispatch
+  module Assertions
+    # Rails' `ActionDispatch::Assertions::RoutingAssertions`:
+    # `assert_recognizes`, `assert_generates` and `assert_routing`.
+    module RoutingAssertions
+      # `assert_recognizes(expected_options, path, extras = {}, message = nil)`.
+      # `path` is a String (a GET) or `{ method: verb, path: path }`;
+      # `method: :all` checks GET, POST, PUT and DELETE in turn. What
+      # the router recognizes is the route's `controller` and `action`
+      # (`controller` the Rails path of a namespaced one,
+      # "admin/posts"), its dynamic segments and `format` when the path
+      # has one, with `extras` merged over them; every key a String,
+      # as Rails' `path_parameters`. It must equal `expected_options`
+      # with its keys stringified and its values as given.
+      def assert_recognizes(expected_options, path, extras = {}, message = nil)
+        verb = "GET"
+        request_path = ""
+        if path.is_a?(Hash)
+          verb = path[:method].to_s.upcase
+          verb = "GET" if verb.empty?
+          request_path = path[:path].to_s
+        else
+          request_path = path.to_s
+        end
+        if verb == "ALL"
+          ["GET", "POST", "PUT", "DELETE"].each do |each_verb|
+            assert_recognizes(expected_options, { method: each_verb, path: request_path }, extras, message)
+          end
+          return
+        end
+        recognized = recognized_path_parameters(verb, request_path)
+        extras.each { |key, value| recognized[key.to_s] = value }
+        expected = {}
+        expected_options.each { |key, value| expected[key.to_s] = value }
+        return if expected == recognized
+        raise(message || "The recognized options <#{recognized.inspect}> did not match <#{expected.inspect}>")
+      end
+
+      # Rails' `recognize_path` (`ActionDispatch::Routing::RouteSet`)
+      # over the app's route table, keyed by String, in the steps of
+      # the ruby overlay's `Rails.application.routes.recognize_path`:
+      # the whole string normalized unless it is a full URL (one
+      # leading slash, no doubled slash, no trailing slash, uppercase
+      # percent-encoded octets), then the query, the fragment and a
+      # URL's scheme and host cut off. What is left must match a route
+      # as it is, so a slash before the query (`/articles/1/?x=1`)
+      # matches none, as in Rails. Redirect routes are skipped, as
+      # Rails skips them.
+      def recognized_path_parameters(verb, path)
+        require_relative "../config/routes"
+        request_path = path
+        unless request_path.include?("://")
+          request_path = ("/" + request_path).squeeze("/")
+          request_path = request_path.delete_suffix("/") unless request_path == "/"
+          request_path = request_path.gsub(/%[a-f0-9]{2}/) { |octet| octet.upcase }
+        end
+        scheme = request_path.partition("://")[0]
+        # As in `URI.parse`: what comes before "://" is a scheme only
+        # when it holds no "/", "?" or "#"; otherwise the "://" is in
+        # the query or the fragment, and there is no host to cut off.
+        if request_path.include?("://") && !scheme.empty? && !scheme.include?("/") && !scheme.include?("?") && !scheme.include?("#")
+          # The authority ends at the first "/", "?" or "#": a slash in
+          # the query or the fragment is not the path's.
+          rest = request_path.partition("://")[2].partition("?")[0].partition("#")[0]
+          slash = rest.index("/")
+          request_path = slash.nil? ? "/" : rest[slash..]
+        end
+        request_path = request_path.partition("?")[0].partition("#")[0]
+        request_path = "/" + request_path unless request_path.start_with?("/")
+        table = ([RouteTable.root] + RouteTable.table + ActiveStorage::Routes.table).reject { |route| route.controller == :roundhouse_redirects }
+        # Rails asks a route's request constraints with a mock request (`Rack::MockRequest.env_for`).
+        asked = ActionDispatch::Request.for({ "HTTP_HOST" => "example.org", "REQUEST_METHOD" => verb, "PATH_INFO" => request_path }, {})
+        asked.format = ActionDispatch::MimeNegotiation.format_name(request_path.split("/").last.to_s.include?(".") ? request_path.split("/").last.to_s.split(".").last.to_s : "", "", "", "")
+        matched = RouteTable.match_asking(verb, request_path, table, asked)
+        matched = nil if request_path != "/" && request_path.end_with?("/")
+        raise "No route matches #{path.inspect}" if matched.nil?
+        controller = RouteTable::CONTROLLER_PATHS[matched.controller] || ActiveStorage::Routes::CONTROLLER_PATHS[matched.controller] || matched.controller.to_s
+        recognized = { "controller" => controller, "action" => matched.action.to_s }
+        format = ""
+        matched.path_params.each do |name, value|
+          if name == "format"
+            format = value
+          else
+            recognized[name] = value
+          end
+        end
+        # A forced format (`get "/rss" => "home#index", format: "rss"`)
+        # is one of the route's defaults, which Rails recognizes too.
+        format = matched.req_format.to_s if format.empty? && !matched.req_format.nil?
+        recognized["format"] = format unless format.empty?
+        defaults = {}
+        RouteTable.route_defaults(matched.defaults, defaults, matched.path_params)
+        defaults.each { |name, value| recognized[name] = value.is_a?(String) ? ActionDispatch::Router.percent_bytes(value.bytes).pack("C*") : value }
+        recognized
+      end
+
+      # Rails' `assert_generates(expected_path, options, defaults = {},
+      # extras = {}, message = nil)`: the path the routes generate from
+      # `options` (`generate_extras`) must be `expected_path`, and the
+      # options that went to the query instead of the path must be
+      # `extras`. A full URL is compared by its path.
+      def assert_generates(expected_path, options, defaults = {}, extras = {}, message = nil)
+        if expected_path.include?("://")
+          rest = expected_path.partition("://")[2]
+          slash = rest.index("/")
+          expected_path = slash.nil? ? "/" : rest[slash..]
+        else
+          expected_path = "/" + expected_path unless expected_path.start_with?("/")
+        end
+        given = generation_parts(defaults)
+        generation_parts(options).each { |key, value| given[key] = value }
+        route = generated_route(given)
+        query_keys = generated_query_keys(route, generation_parts(options))
+        found_extras = {}
+        options.each { |key, value| found_extras[key] = value if query_keys.include?(key.to_s) }
+        raise(message || "found extras <#{found_extras.inspect}>, not <#{extras.inspect}>") unless extras == found_extras
+        path = generated_route_path(route, given)
+        return if expected_path == path
+        raise(message || "The generated path <#{path}> did not match <#{expected_path}>")
+      end
+
+      # Rails' `assert_routing`: `assert_recognizes` one way, then
+      # `assert_generates` back from the options `defaults` does not
+      # name.
+      def assert_routing(path, options, defaults = {}, extras = {}, message = nil)
+        assert_recognizes(options, path, extras, message)
+        generate_options = {}
+        options.each { |key, value| generate_options[key] = value unless defaults.key?(key) }
+        request_path = path.is_a?(Hash) ? path[:path].to_s : path.to_s
+        assert_generates(request_path, generate_options, defaults, extras, message)
+      end
+
+      # The values a route is generated from, keyed by String, as
+      # `to_param` gives them; nil leaves the key out.
+      def generation_parts(options)
+        parts = {}
+        options.each do |key, value|
+          next if value.nil?
+          parts[key.to_s] = value.is_a?(ActiveRecord::Base) ? value.to_param.to_s : value.to_s
+        end
+        parts
+      end
+
+      # The route Rails' `Journey::Formatter#match_route` picks, over the
+      # app's routes in declaration order (redirects left out, as
+      # generation never yields them). A candidate's controller, action
+      # and forced format must equal the given ones; a route missing a
+      # value for one of its segments, or whose generated path its own
+      # constraints refuse, is skipped. Of the rest, the highest
+      # `Route#score` wins: two for each of those required defaults,
+      # one for each segment given a value (the implicit `(.:format)`
+      # counted too); a tie goes to the earlier route.
+      def generated_route(given)
+        require_relative "../config/routes"
+        routes = RouteTable.table.dup
+        routes.insert(RouteTable.root_position, RouteTable.root)
+        best = nil
+        best_score = -1
+        routes.each do |route|
+          next if route.controller == :roundhouse_redirects
+          controller = RouteTable::CONTROLLER_PATHS[route.controller] || route.controller.to_s
+          next unless given["controller"] == controller && given["action"] == route.action.to_s
+          required = 2
+          unless route.req_format.nil?
+            next unless given["format"] == route.req_format.to_s
+            required = 3
+          end
+          names = generation_segment_names(route.pattern)
+          next unless names.all? { |name| given.key?(name) }
+          defaults = {}
+          RouteTable.route_defaults(route.defaults, defaults, {})
+          trailing = names.last.to_s
+          if (!route.req_format.nil? || !given.key?("format")) && defaults.key?(trailing) && defaults[trailing].to_s == given[trailing]
+            next if routes.any? { |short| short.defaults == route.defaults && short.controller == route.controller && short.action == route.action && route.pattern.start_with?(short.pattern + "/") && generation_segment_names(short.pattern) == names[0, names.length - 1] }
+          end
+          path = generated_route_path(route, given)
+          bare = route.req_format.nil? && given.key?("format") ? path.delete_suffix("." + given["format"].to_s) : path
+          next if ActionDispatch::Router.match_pattern(route.pattern, bare, route.int_params + "", route.seg_constraints + "").nil?
+          score = required * 2 + names.length
+          score += 1 if route.req_format.nil? && route.pattern != "/" && given.key?("format")
+          if score > best_score
+            best = route
+            best_score = score
+          end
+        end
+        raise "No route matches {#{generation_options_text(given)}}" if best.nil?
+        best
+      end
+
+      # `{action: "show", controller: "articles"}`, as Rails' message
+      # spells the options it could not route.
+      def generation_options_text(given)
+        given.keys.sort.map { |key| "#{key}: #{given[key].inspect}" }.join(", ")
+      end
+
+      # The `:name` and `*name` segments of a route pattern, a literal
+      # prefix (`/~:user`) or suffix (`/c/:id.json`) aside.
+      def generation_segment_names(pattern)
+        names = []
+        pattern.split("/").each do |segment|
+          at = segment.index(":") || segment.index("*")
+          next if at.nil?
+          name = segment[at + 1, segment.length].to_s
+          stop = name.index(/[^A-Za-z0-9_]/)
+          names << (stop.nil? ? name : name[0, stop].to_s)
+        end
+        names
+      end
+
+      # The pattern with each segment's value in place, escaped as
+      # Journey escapes a segment (a glob as a path), and `.format`
+      # appended when the format was given and the route does not force
+      # one.
+      def generated_route_path(route, given)
+        out = []
+        route.pattern.split("/").each do |segment|
+          at = segment.index(":") || segment.index("*")
+          if at.nil?
+            out << segment
+            next
+          end
+          glob = segment[at, 1] == "*"
+          name = segment[at + 1, segment.length].to_s
+          stop = name.index(/[^A-Za-z0-9_]/)
+          tail = stop.nil? ? "" : name[stop, name.length].to_s
+          name = name[0, stop].to_s unless stop.nil?
+          value = ActionDispatch::Router.escape_path(given[name].to_s)
+          value = value.gsub("/", "%2F") unless glob
+          out << segment[0, at].to_s + value + tail
+        end
+        path = out.join("/")
+        path = "/" if path.empty?
+        path += "." + given["format"].to_s if route.req_format.nil? && route.pattern != "/" && given.key?("format")
+        path
+      end
+
+      # The options that go to the query: those neither a segment of the
+      # route nor one of its defaults (controller, action, a forced
+      # format) take.
+      def generated_query_keys(route, options)
+        used = generation_segment_names(route.pattern) + ["controller", "action"]
+        used << "format" if !route.req_format.nil? || route.pattern != "/"
+        defaults = {}
+        RouteTable.route_defaults(route.defaults, defaults, {})
+        used.concat(defaults.keys)
+        options.keys.reject { |key| used.include?(key) }
+      end
+    end
+  end
+
   class IntegrationTest < TestBase
     include RequestDispatch
+    include Assertions::RoutingAssertions
   end
 
   # `ActionDispatch::Integration::Session.new(Rails.application)` — a
@@ -1566,14 +1929,99 @@ module ActionCable
   end
 
   module Connection
+    # Rails' `ActionCable::Connection::TestSocket` (8.2): the socket a
+    # `Connection::TestCase` connection is accepted on. It records what
+    # the connection was told — `transmissions`, the frames, and
+    # `closed` — and runs `perform_work` inline, as Rails' test server
+    # does, so a test's `connection.beat` has finished its work when it
+    # returns. `close_with_reason` is the call `Connection::Base#close`
+    # makes on its socket on both lanes, answered with the disconnect
+    # frame Rails' `close` transmits and the close.
+    #
+    # `build_request(path, cookies:)` is Rails' request for a socket, cut
+    # to what a connection here reads off it: the path and the cookie jar.
+    class TestSocket
+      class Request
+        attr_reader :path, :cookie_jar
+
+        def initialize(path, cookie_jar)
+          @path = path
+          @cookie_jar = cookie_jar
+        end
+      end
+
+      def self.build_request(path, cookies:)
+        Request.new(path, cookies)
+      end
+
+      attr_reader :request, :transmissions, :closed
+
+      def initialize(request)
+        @request = request
+        @transmissions = [{ type: "", reason: "", reconnect: false }]
+        @transmissions.pop
+        @closed = false
+      end
+
+      def close_with_reason(reason, reconnect)
+        @transmissions << { type: "disconnect", reason: reason.to_s, reconnect: reconnect ? true : false }
+        @closed = true
+        nil
+      end
+
+      def perform_work(receiver)
+        receiver.call
+        nil
+      end
+    end
+
+    # Rails' `ActionCable::Connection::TestServer`, which a test hands a
+    # connection it builds itself. Its executor and pub/sub are the
+    # socket's here (`TestSocket#perform_work` runs inline), so it holds
+    # nothing; `lower::cable_test_case` drops it from the constructor.
+    class TestServer
+      def initialize(server)
+        @server = server
+      end
+    end
+
+    # What a test's `ApplicationCable::Connection.new(TestServer.new(…),
+    # socket)` lowers to (`lower::cable_test_case`): Rails 8.2 builds a
+    # connection from a server and a socket, this runtime from the
+    # handshake's cookie jar — so the connection is built the way
+    # `Cable.identify` builds one, over the socket's jar, and accepted on
+    # the socket.
+    def self.accept_test_socket(sock)
+      conn = build(sock.request.cookie_jar)
+      conn.transport = sock
+      conn
+    end
+
+    # Rails' `handle_open`, the server's call when a socket opens:
+    # `connect`, and a rejection answered by closing with the
+    # unauthorized reason and no reconnect. The live servers on both
+    # lanes refuse an unauthorized handshake before it is a socket
+    # (`Cable.upgrade` answers 401), so only a test reaches this.
+    class Base
+      def handle_open
+        begin
+          connect
+        rescue ActionCable::Connection::Authorization::UnauthorizedError
+          close(reason: ActionCable::INTERNAL[:disconnect_reasons][:unauthorized], reconnect: false)
+        end
+        nil
+      end
+    end
+
     # `ActionCable::Connection::TestCase` — Rails' way of running an
-    # app's `connect` against a cookie jar the test seeded, with no
-    # socket. `cookies.signed[:session_token] = token` writes the jar,
-    # `connect` builds the app's connection class over it (the same
-    # factory `Cable.identify` uses, so this IS the handshake's code
-    # path minus the socket) and runs `connect`; `connection` is the
-    # identified object, and `assert_reject_connection` is the
-    # `reject_unauthorized_connection` raise, caught.
+    # app's `connect` against a cookie jar the test seeded.
+    # `cookies.signed[:session_token] = token` writes the jar, `connect`
+    # builds the app's connection class over it (the same factory
+    # `Cable.identify` uses, so this IS the handshake's code path) on a
+    # fresh `TestSocket` and runs `connect`; `connection` is the
+    # identified object, `socket` what it was told, and
+    # `assert_reject_connection` is the `reject_unauthorized_connection`
+    # raise, caught.
     class TestCase < TestBase
       def cookies
         @__cookies = ActionController::CookieJar.new if @__cookies.nil?
@@ -1581,10 +2029,19 @@ module ActionCable
       end
 
       def connect
+        sock = ActionCable::Connection::TestSocket.new(
+          ActionCable::Connection::TestSocket.build_request("/cable", cookies: cookies)
+        )
+        @__socket = sock
         conn = ActionCable::Connection.build(cookies)
+        conn.transport = sock
         conn.connect
         @__connection = conn
         nil
+      end
+
+      def socket
+        @__socket
       end
 
       # Rails: `check_connected!` — "Must be connected!".
@@ -1608,6 +2065,149 @@ module ActionCable
           raise "Expected to reject connection but no rejection was made"
         end
         nil
+      end
+    end
+  end
+end
+
+module ActionController
+  # Rails' `ActionController::TestCase` (8.1): a functional test that
+  # runs one controller's actions directly, without routing a path.
+  # `@controller` (the controller under test) and `@__controller_route`
+  # (its router symbol) are assigned at the start of each test by the
+  # `controller_test_case` lowering, as Rails'
+  # `setup_controller_request_and_response` builds the controller before
+  # the test's own setup.
+  #
+  # `get :show, params: { id: 1 }` is Rails' `process`:
+  # - before each request but the first, the instance variables the
+  #   previous ones left on the controller are cleared, and the
+  #   controller's response state is reset (`recycle!`);
+  # - the params become what a request carries, Strings
+  #   (`ActionController::TestRequest#assign_parameters`: a record by
+  #   `to_param`, nil as "", nested Hashes and Arrays alike);
+  # - the route is checked as Rails generates it: a route of this
+  #   controller and action whose dynamic segments all have a value,
+  #   whatever its verb, the first in the table; none is "No route
+  #   matches", Rails' ActionController::UrlGenerationError. The values
+  #   used by the path are the path parameters, the rest the request's
+  #   params, and `format:` is one of them;
+  # - `session:` and `flash:` are merged into the test's session and
+  #   flash, which persist across the test's requests (`session[:u] = x`
+  #   before a request reaches it); `xhr: true` sets the XHR headers;
+  # - the action runs through the same `run_controller` an integration
+  #   test's request ends in, and `response` / `@response` is the result.
+  class TestCase < TestBase
+    include RequestDispatch
+    include ActionDispatch::Assertions::RoutingAssertions
+
+    def get(action, params: {}, session: {}, flash: {}, format: nil, xhr: false, as: nil)
+      process(action, "GET", params, session, flash, format, xhr, as)
+    end
+
+    def post(action, params: {}, session: {}, flash: {}, format: nil, xhr: false, as: nil)
+      process(action, "POST", params, session, flash, format, xhr, as)
+    end
+
+    def patch(action, params: {}, session: {}, flash: {}, format: nil, xhr: false, as: nil)
+      process(action, "PATCH", params, session, flash, format, xhr, as)
+    end
+
+    def put(action, params: {}, session: {}, flash: {}, format: nil, xhr: false, as: nil)
+      process(action, "PUT", params, session, flash, format, xhr, as)
+    end
+
+    def delete(action, params: {}, session: {}, flash: {}, format: nil, xhr: false, as: nil)
+      process(action, "DELETE", params, session, flash, format, xhr, as)
+    end
+
+    def head(action, params: {}, session: {}, flash: {}, format: nil, xhr: false, as: nil)
+      process(action, "HEAD", params, session, flash, format, xhr, as)
+    end
+
+    def session
+      @__session ||= ActionDispatch::Session.new
+    end
+
+    def flash
+      @__flash ||= ActionDispatch::Flash.new
+    end
+
+    def process(action, method, params, session_values, flash_values, format, xhr, as)
+      require_relative "../config/routes"
+      @controller.clear_instance_variables_between_requests if @__processed
+      @__processed = true
+      @controller.recycle!
+      wanted = action.to_s
+      request_params = stringify_keys({})
+      params.each { |key, value| request_params[key.to_s] = test_request_param(value) }
+      request_params["format"] = format.to_s unless format.nil?
+      route = nil
+      path_params = {}
+      path = ""
+      table = [RouteTable.root] + RouteTable.table
+      i = 0
+      while i < table.length && route.nil?
+        candidate = table[i]
+        i += 1
+        next unless candidate.controller == @__controller_route && candidate.action.to_s == wanted
+        captured = {}
+        segments = []
+        fits = true
+        candidate.pattern_parts.each do |part|
+          if part.start_with?(":") || part.start_with?("*")
+            value = request_params[part[1..]]
+            if value.nil? || value.to_s.empty?
+              fits = false
+            else
+              captured[part[1..]] = value.to_s
+              segments << value.to_s
+            end
+          else
+            segments << part
+          end
+        end
+        next unless fits
+        route = candidate
+        path_params = captured
+        path = segments.join("/")
+      end
+      if route.nil?
+        controller_path = RouteTable::CONTROLLER_PATHS[@__controller_route] || @__controller_route.to_s
+        raise "No route matches {action: #{wanted.inspect}, controller: #{controller_path.inspect}}"
+      end
+      path = "/" if path.empty?
+      unless format.nil?
+        path = path + "." + format.to_s
+        path_params["format"] = format.to_s
+      end
+      rest = stringify_keys({})
+      request_params.each { |key, value| rest[key] = value unless path_params.key?(key) }
+      session_values.each { |key, value| session[key] = value }
+      flash_values.each { |key, value| flash[key] = value }
+      headers = {}
+      if xhr
+        headers["HTTP_X_REQUESTED_WITH"] = "XMLHttpRequest"
+        headers["HTTP_ACCEPT"] = "text/javascript, text/html, application/xml, text/xml, */*"
+      end
+      run_controller(@controller, route.action, path_params, nil, method, method, path, "", rest, headers, as)
+    end
+
+    # A param value as a request carries it: what Rails' TestRequest
+    # gets back from encoding the params into the query or the body.
+    def test_request_param(value)
+      if value.is_a?(Hash)
+        out = stringify_keys({})
+        value.each { |key, inner| out[key.to_s] = test_request_param(inner) }
+        out
+      elsif value.is_a?(Array)
+        value.map { |inner| test_request_param(inner) }
+      elsif value.nil?
+        ""
+      elsif value.is_a?(ActiveRecord::Base)
+        value.to_param.to_s
+      else
+        value.to_s
       end
     end
   end
@@ -1653,32 +2253,45 @@ module RequestDispatch
   # `request_parameters` (body alone) the encoder would; a controller
   # that reads the raw body sees an empty one. campfire's direct-upload
   # tests are the corpus's use.
-  def get(path, params: {}, headers: {}, env: {}, as: nil)
-    dispatch_request("GET", path, params, headers.merge(env), as)
+  def get(path, params: {}, headers: {}, env: {}, xhr: false, as: nil)
+    dispatch_request("GET", path, params, xhr_headers(headers.merge(env), xhr), as)
   end
 
-  def post(path, params: {}, headers: {}, env: {}, as: nil)
-    dispatch_request("POST", path, params, headers.merge(env), as)
+  def post(path, params: {}, headers: {}, env: {}, xhr: false, as: nil)
+    dispatch_request("POST", path, params, xhr_headers(headers.merge(env), xhr), as)
   end
 
-  def patch(path, params: {}, headers: {}, env: {}, as: nil)
-    dispatch_request("PATCH", path, params, headers.merge(env), as)
+  def patch(path, params: {}, headers: {}, env: {}, xhr: false, as: nil)
+    dispatch_request("PATCH", path, params, xhr_headers(headers.merge(env), xhr), as)
   end
 
   # Rails' integration tests define all five verbs plus `head`; the four
   # the blog happened to use were the four that existed. campfire's
   # `put account_user_url(...)` is the first `put` in the corpus, and it
   # failed as a missing METHOD rather than as an unrouted request.
-  def put(path, params: {}, headers: {}, env: {}, as: nil)
-    dispatch_request("PUT", path, params, headers.merge(env), as)
+  def put(path, params: {}, headers: {}, env: {}, xhr: false, as: nil)
+    dispatch_request("PUT", path, params, xhr_headers(headers.merge(env), xhr), as)
   end
 
-  def delete(path, params: {}, headers: {}, env: {}, as: nil)
-    dispatch_request("DELETE", path, params, headers.merge(env), as)
+  def delete(path, params: {}, headers: {}, env: {}, xhr: false, as: nil)
+    dispatch_request("DELETE", path, params, xhr_headers(headers.merge(env), xhr), as)
   end
 
-  def head(path, params: {}, headers: {}, env: {}, as: nil)
-    dispatch_request("HEAD", path, params, headers.merge(env), as)
+  def head(path, params: {}, headers: {}, env: {}, xhr: false, as: nil)
+    dispatch_request("HEAD", path, params, xhr_headers(headers.merge(env), xhr), as)
+  end
+
+  # Rails' `xhr: true` on an integration verb (`Integration::Session#
+  # process`): the request says it is an XMLHttpRequest and, unless the
+  # test named an Accept under any spelling (`"Accept"`, `HTTP_ACCEPT`:
+  # Rails' `Http::Headers` folds them), accepts what a browser's XHR does.
+  def xhr_headers(headers, xhr)
+    return headers unless xhr
+    out = headers.merge({ "HTTP_X_REQUESTED_WITH" => "XMLHttpRequest" })
+    named = false
+    headers.each_key { |name| named = true if env_key(name.to_s) == "HTTP_ACCEPT" }
+    out["HTTP_ACCEPT"] = "text/javascript, text/html, application/xml, text/xml, */*" unless named
+    out
   end
 
   # Rails' `open_session` — a second browser beside the test's own, with
@@ -1737,6 +2350,15 @@ module RequestDispatch
   # actually use — were a NoMethodError on the test instance.
   def response
     @__response
+  end
+
+  # The last request's flash, as Rails' integration tests read it
+  # (`assert_equal "✓", flash[:notice]` after an unfollowed redirect).
+  # The dispatch keeps it in `@__flash` and carries what it set into the
+  # next request; this is its reader.
+  def flash
+    @__flash = ActionDispatch::Flash.new if @__flash.nil?
+    @__flash
   end
 
   # `host! "once.campfire.test"` — the Host every subsequent request in
@@ -1834,19 +2456,76 @@ module RequestDispatch
     # after the body parse. campfire's fetch-metadata test posts
     # `_method: "delete"` cross-site and expects the DELETE route's
     # forgery refusal, not "No route matches POST".
+    wire_method = method
     if method == "POST" && params.is_a?(Hash)
       override = (params[:_method] || params["_method"]).to_s.upcase
       method = override if override == "PUT" || override == "PATCH" || override == "DELETE"
     end
-    matched = ActionDispatch::Router.match(
-      method, match_path, [RouteTable.root] + RouteTable.table + ActiveStorage::Routes.table
+    # What a request constraint asks before its route is chosen (`RouteTable.match_asking`).
+    asked_env = { "HTTP_HOST" => host, "REMOTE_ADDR" => "127.0.0.1" }
+    headers.each { |k, v| asked_env[env_key(k.to_s)] = v.to_s }
+    asked_env["HTTPS"] = "on" if https?
+    asked = ActionDispatch::Request.for(asked_env, {})
+    last_segment = match_path.split("/").last.to_s
+    asked.format = ActionDispatch::MimeNegotiation.format_name(
+      last_segment.include?(".") ? last_segment.split(".").last.to_s : "",
+      asked_env.fetch("HTTP_ACCEPT", "").to_s,
+      asked_env.fetch("HTTP_X_REQUESTED_WITH", "").to_s,
+      as == :json ? "application/json" : ""
     )
-    raise "No route matches #{method} #{path}" if matched.nil?
-    controller = case matched.controller
-                 when :articles then ArticlesController.new
-                 when :comments then CommentsController.new
-                 else ActiveStorage::Routes.instantiate_controller(matched.controller)
-                 end
+    # Through the gem middleware's stack, as Rails' integration tests run the request: what a
+    # middleware sets in the env (`env["warden"]`) is the request's, and one may answer it itself.
+    rack_env = {}
+    asked_env.each { |k, v| rack_env[k] = v }
+    rack_env["REQUEST_METHOD"] = method
+    rack_env["PATH_INFO"] = match_path
+    rack_env["QUERY_STRING"] = query.to_s
+    rack_env["rack.session"] = @__session ||= ActionDispatch::Session.new
+    asked.session = @__session
+    @__routed = false
+    @__rack_env = nil
+    answered = GemMiddleware.around(rack_env) do |env|
+      @__routed = true
+      @__rack_env = env
+      env.each { |k, v| asked.env[k] = v }
+      # Not left at the test's own: a middleware above may have put another session in its place.
+      @__session = asked.session = env["rack.session"] if env["rack.session"].is_a?(ActionDispatch::Session)
+      matched = RouteTable.match_asking(
+        method, match_path, [RouteTable.root] + RouteTable.table + ActiveStorage::Routes.table, asked
+      )
+      raise "No route matches #{method} #{path}" if matched.nil?
+      controller = case matched.controller
+                   when :articles then ArticlesController.new
+                   when :comments then CommentsController.new
+                   else ActiveStorage::Routes.instantiate_controller(matched.controller)
+                   end
+      run_controller(controller, matched.action, matched.path_params, matched.req_format, method, wire_method, path, query, params, headers, as, matched.defaults)
+      [@__response.status, @__response.headers, [@__response.body.to_s]]
+    end
+    return @__response if @__routed
+    # A middleware answered before the routes (a throttle's 429): its Rack response is the test's.
+    status, answer_headers, chunks = answered
+    text = +""
+    chunks.each { |chunk| text << chunk.to_s }
+    @__response = ActionResponse.new(
+      status: status.to_i,
+      body: text,
+      location: answer_headers["Location"] || answer_headers["location"],
+      flash: ActionDispatch::Flash.new,
+      cookies: ActionController::CookieJar.new({}),
+      content_type: (answer_headers["Content-Type"] || answer_headers["content-type"] || "text/html").to_s,
+      headers: answer_headers,
+    )
+    @response = @__response
+    @__response
+  end
+
+  # The request through `controller`, once the route is known: the
+  # params, session, flash, cookies and request the controller reads,
+  # the action run inside a connection lease, and the response kept.
+  # `dispatch_request` comes here after the router matched the path;
+  # ActionController::TestCase#process with the controller it holds.
+  def run_controller(controller, action, path_params, req_format, method, wire_method, path, query, params, headers, as, defaults = -1)
     # Test fixtures pass Symbol-keyed nested hashes (`{article: {title:
     # ...}}`); the wire-level request body is String-keyed at runtime.
     # Stringify recursively so the harness shape matches what the
@@ -1854,44 +2533,56 @@ module RequestDispatch
     # check is inline at the call site (not inside stringify_keys) so
     # the helper itself stays strictly typed as `(Hash) -> Hash`.
     #
-    # `stringify_keys(matched.path_params)` (rather than `path_params
-    # .dup`) seeds `merged` as `Hash[String, untyped]` — needed so the
-    # nested-Hash branch of the ternary below has a slot wide enough
-    # to hold a Hash value. `path_params.dup` keeps the StrStrHash
-    # shape, which spinel then refuses to assign a Hash into.
-    merged = stringify_keys(matched.path_params)
+    # `stringify_keys({})` (rather than `path_params.dup` or `{}`)
+    # seeds each Hash below as `Hash[String, untyped]` — needed so the
+    # nested-Hash branch has a slot wide enough to hold a Hash value.
+    # `path_params.dup` keeps the StrStrHash shape, which spinel then
+    # refuses to assign a Hash into.
     # `post url, params: "Hello Bot World!"` — Rails' integration tests
     # take a STRING `params:` as the raw request BODY, not as a
     # parameter hash. campfire's bot endpoint is written that way (a bot
     # POSTs plain text and the controller reads `request.body`), and the
     # harness iterated it: `undefined method 'each' for an instance of
     # String`, every test in the file.
-    # Query-string pairs are parameters too, and they arrive UNDER the
-    # explicit `params:` — Rails merges the request's own parameters
-    # first and lets the caller's hash win on a collision.
     # `CgiIo.parse_form_into` — THE SAME PARSER the production
     # dispatcher uses on `QUERY_STRING` (`parse_request` calls it on
     # exactly this string), so the harness cannot disagree with
     # production about what a query string means. Not `CGI.parse`: Ruby
     # 4.0 no longer ships it, and a hand-rolled split would be a second
     # copy of a table this tree already owns.
-    CgiIo.parse_form_into(query, merged) unless query.empty?
+    from_query = stringify_keys({})
+    CgiIo.parse_form_into(query, from_query) unless query.empty?
+    from_caller = stringify_keys({})
     request_body = +""
     if params.is_a?(String)
       request_body = params.to_s
     else
       params.each do |k, v|
         if v.is_a?(Hash)
-          merged[k.to_s] = stringify_keys(v)
+          from_caller[k.to_s] = stringify_keys(v)
         else
-          merged[k.to_s] = v
+          from_caller[k.to_s] = v
         end
       end
     end
+    # Not one order for every verb: Rack::Test appends a GET's `params:` to its query string, so they win there, while any other verb sends them as the body and Rails' `request_parameters.merge(query_parameters)` lets the query win.
+    merged = stringify_keys({})
+    if wire_method == "GET"
+      from_query.each { |k, v| merged[k] = v }
+      from_caller.each { |k, v| merged[k] = v }
+    else
+      from_caller.each { |k, v| merged[k] = v }
+      from_query.each { |k, v| merged[k] = v }
+    end
+    # Rails' `params.merge!(path_parameters)`: the route's own segments win over both.
+    path_params.each { |k, v| merged[k.to_s] = v }
+    RouteTable.route_defaults(defaults, merged, path_params)
     controller.params  = merged
-    controller.path_parameters = matched.path_params
+    controller.path_parameters = path_params
     controller.session = @__session ||= ActionDispatch::Session.new
-    controller.flash   = @__flash   ||= ActionDispatch::Flash.new
+    # Not the last request's Flash itself: Rails carries only what it set (`to_persisted`), so a shown message is gone on the next page.
+    carried = @__flash
+    controller.flash = ActionDispatch::Flash.new(carried.nil? ? nil : carried.to_persisted)
     # The inbound jar is the browser's whole state — what the test has
     # accumulated from earlier responses PLUS anything it seeded itself,
     # which is exactly `to_h`. A fresh jar per request, so `pending`
@@ -1911,12 +2602,14 @@ module RequestDispatch
     # `to_sym`, the same shape main.rb uses and for the same reason: a
     # Symbol materialized from a runtime String is not a shape the
     # strict targets share.
-    path_format = matched.path_params.fetch("format", "")
+    path_format = path_params.fetch("format", "")
     controller.request_format = :json if path_format == "json"
     controller.request_format = :turbo_stream if path_format == "turbo_stream"
     controller.request_format = :rss if path_format == "rss"
-    controller.request_format = :json if matched.req_format == :json
-    controller.request_format = :rss if matched.req_format == :rss
+    if path_format.empty?
+      controller.request_format = :json if req_format == :json
+      controller.request_format = :rss if req_format == :rss
+    end
     controller.request_format = :json if as == :json
     # The request object, built the way the dispatcher builds it (see
     # `main.rb`'s `controller.request = ActionDispatch::Request.new(...)`).
@@ -1946,6 +2639,9 @@ module RequestDispatch
     env["PATH_INFO"]      = request_path
     env["QUERY_STRING"]   = request_query
     controller.request = ActionDispatch::Request.for(env, merged)
+    controller.request.session = controller.session
+    # What the gem middleware set in the Rack env (`env["warden"]`), the controller's request env too.
+    @__rack_env&.each { |k, v| controller.request.env[k] = v unless controller.request.env.key?(k) }
     controller.request.body = request_body
     # Body params alone — what ParamsWrapper copies from. Production
     # dispatchers fill this from the parsed JSON body; the harness
@@ -2004,7 +2700,7 @@ module RequestDispatch
       Db.query_cache_begin unless cached
       Db.read_snapshot_begin if snapshot
       begin
-        controller.process_action(matched.action)
+        controller.process_action(action)
       ensure
         Db.read_snapshot_end if snapshot
         Db.query_cache_end unless cached
@@ -2015,7 +2711,7 @@ module RequestDispatch
         Db.query_cache_begin unless cached
         Db.read_snapshot_begin if snapshot
         begin
-          controller.process_action(matched.action)
+          controller.process_action(action)
         ensure
           Db.read_snapshot_end if snapshot
           Db.query_cache_end unless cached
@@ -2110,11 +2806,27 @@ module RequestDispatch
     hash.each do |k, v|
       if v.is_a?(Hash)
         out[k.to_s] = stringify_keys(v)
+      elsif v.is_a?(Array)
+        # A form's `items[][name]` arrives as String-keyed hashes too,
+        # at any depth of nesting.
+        out[k.to_s] = stringify_list(v)
       else
         out[k.to_s] = v
       end
     end
     out
+  end
+
+  def stringify_list(list)
+    list.map do |item|
+      if item.is_a?(Hash)
+        stringify_keys(item)
+      elsif item.is_a?(Array)
+        stringify_list(item)
+      else
+        item
+      end
+    end
   end
 
   # Symbol-form HTTP-status assertion. Real-blog tests pass `:success`,
@@ -2291,9 +3003,25 @@ module RequestDispatch
       content_or_opts = opts
       opts = nil
     end
+    # Rails' substitution values: a `?` in an attribute predicate
+    # (`"#row[data-n=?]", value`) takes the argument after the selector,
+    # and the equality test, if any, is the argument after that. Read as
+    # the content string instead, the value was looked for in the
+    # element's text and the predicate matched a literal "?".
+    if selector.to_s.include?("=?]") && content_or_opts.is_a?(String)
+      selector = selector.to_s.sub("=?]", "=\"#{content_or_opts}\"]")
+      content_or_opts = opts
+      opts = nil
+    end
     nodes = Dom.select(Dom.parse(body), selector)
     options = content_or_opts.is_a?(Hash) ? content_or_opts : opts
-    if options.is_a?(Hash) && options[:count] == 0
+    # rails-dom-testing's equality `false` or `0` is `count: 0`
+    # (`HTMLSelector#equality_tests`); `true` is presence, below. A `0`
+    # is not one while the selector still holds a `?`: Rails substitutes
+    # a number there (`SubstitutionContext`), which only a String gets
+    # above. `false` is never substituted.
+    none = content_or_opts == false || (content_or_opts == 0 && !selector.to_s.include?("?"))
+    if none || (options.is_a?(Hash) && options[:count] == 0)
       raise "expected no #{selector.inspect} in response body" unless nodes.empty?
       return
     end
@@ -2301,7 +3029,7 @@ module RequestDispatch
     content = content_or_opts.is_a?(Hash) ? nil : content_or_opts
     if content.is_a?(String)
       needle  = content
-      matched = nodes.any? { |n| Dom.text(n).include?(needle) }
+      matched = nodes.any? { |n| Dom.text(n).include?(needle) || Dom.unescape(Dom.text(n)).include?(needle) }
       raise "expected #{selector.inspect} containing #{content.inspect} in response body" unless matched
     elsif content.is_a?(Regexp)
       # Rails' `assert_select "h1", /Upgrade…/`: the equality test is a

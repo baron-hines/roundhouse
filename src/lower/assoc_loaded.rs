@@ -18,7 +18,7 @@
 //! `account.settings_foo?`): the intermediate object Rails invents is
 //! erased, and every target keeps a typed one-hop call.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::app::App;
 use crate::diagnostic::Diagnostic;
@@ -31,7 +31,7 @@ use crate::ty::Ty;
 /// reader. Keyed by owner ClassId so `room.boosts.loaded?` is not
 /// rewritten when only `Message` declares `has_many :boosts`.
 pub(crate) fn has_many_by_model(app: &App) -> HashMap<ClassId, HashSet<Symbol>> {
-    let mut out: HashMap<ClassId, HashSet<Symbol>> = HashMap::new();
+    let mut out: HashMap<ClassId, HashSet<Symbol>> = HashMap::default();
     for model in &app.models {
         // Every model gets a key so `in_model` owner checks don't treat
         // a has_many-less model (Room) as a view/library class.
@@ -52,7 +52,7 @@ pub(crate) fn has_many_by_model(app: &App) -> HashMap<ClassId, HashSet<Symbol>> 
 /// may collapse onto. Keyed by owner so `room.association(:boosts).target`
 /// is not rewritten when only `Message` declares `:boosts`.
 pub(crate) fn association_readers_by_model(app: &App) -> HashMap<ClassId, HashSet<Symbol>> {
-    let mut out: HashMap<ClassId, HashSet<Symbol>> = HashMap::new();
+    let mut out: HashMap<ClassId, HashSet<Symbol>> = HashMap::default();
     for model in &app.models {
         let entry = out.entry(model.name.clone()).or_default();
         for (_, assoc) in model.spanned_associations() {
@@ -75,7 +75,7 @@ pub(crate) fn association_readers_by_model(app: &App) -> HashMap<ClassId, HashSe
 /// `rich_text_<attr>` has_one. `association(:name).loaded?` rewrites onto
 /// it; any other name (a polymorphic belongs_to, habtm) stays put.
 pub(crate) fn flat_loaded_by_model(app: &App) -> HashMap<ClassId, HashSet<Symbol>> {
-    let mut out: HashMap<ClassId, HashSet<Symbol>> = HashMap::new();
+    let mut out: HashMap<ClassId, HashSet<Symbol>> = HashMap::default();
     for model in &app.models {
         let entry = out.entry(model.name.clone()).or_default();
         for (_, assoc) in model.spanned_associations() {
@@ -90,6 +90,10 @@ pub(crate) fn flat_loaded_by_model(app: &App) -> HashMap<ClassId, HashSet<Symbol
         }
         for (_, attr) in crate::lower::rich_text::rich_text_attrs(model) {
             entry.insert(Symbol::from(format!("rich_text_{}", attr.as_str())));
+        }
+        // `has_one_attached :<attr>` — its `<attr>_attachment_loaded?`.
+        for (_, attr) in crate::lower::attached::attached_attrs(model) {
+            entry.insert(crate::lower::attached::attachment_assoc_name(&attr));
         }
     }
     out
@@ -222,6 +226,11 @@ pub(crate) fn rewrite_node(
     readers: &HashMap<ClassId, HashSet<Symbol>>,
     flat_loaded: &HashMap<ClassId, HashSet<Symbol>>,
 ) {
+    if let Some(mut unrolled) = unroll_all_loaded(expr) {
+        rewrite(&mut unrolled, enclosing, sole_includer, by_model, readers, flat_loaded);
+        *expr = unrolled;
+        return;
+    }
     if rewrite_association_target(expr, enclosing, sole_includer, readers) {
         return;
     }
@@ -566,6 +575,90 @@ fn rewrite_association_target(
     rewritten.ty = prior_ty;
     *expr = rewritten;
     true
+}
+
+/// `%i[a b].all? { |name| recv.association(name).loaded? }` →
+/// `recv.association(:a).loaded? && recv.association(:b).loaded?`, which
+/// the literal-name rewrite then flattens onto `recv.a_loaded? &&
+/// recv.b_loaded?`. campfire's `message_fragment_cache_key` asks this
+/// way; with the name a block local, nothing could resolve it, and the
+/// emitted `association(name)` had no method behind it.
+fn unroll_all_loaded(expr: &Expr) -> Option<Expr> {
+    let ExprNode::Send { recv: Some(list), method, args, block: Some(block), .. } = &*expr.node else {
+        return None;
+    };
+    if method.as_str() != "all?" || !args.is_empty() {
+        return None;
+    }
+    let ExprNode::Array { elements, .. } = &*list.node else {
+        return None;
+    };
+    let names: Vec<Symbol> = elements.iter().map(sym_lit).collect::<Option<_>>()?;
+    if names.is_empty() {
+        return None;
+    }
+    let ExprNode::Lambda { params, body, .. } = &*block.node else {
+        return None;
+    };
+    let [param] = params.as_slice() else {
+        return None;
+    };
+    let ExprNode::Send { recv: Some(assoc_call), method: loaded, args: loaded_args, .. } = &*body.node else {
+        return None;
+    };
+    if loaded.as_str() != "loaded?" || !loaded_args.is_empty() {
+        return None;
+    }
+    let ExprNode::Send { recv: owner, method: assoc, args: assoc_args, block: None, .. } = &*assoc_call.node else {
+        return None;
+    };
+    if assoc.as_str() != "association" {
+        return None;
+    }
+    match assoc_args.as_slice() {
+        [arg] if matches!(&*arg.node, ExprNode::Var { name, .. } if name == param) => {}
+        _ => return None,
+    }
+    // The receiver must not read the block local itself.
+    if owner.as_ref().is_some_and(|o| mentions_var(o, param)) {
+        return None;
+    }
+    let term = |name: &Symbol| {
+        let mut call = assoc_call.clone();
+        if let ExprNode::Send { args, .. } = &mut *call.node {
+            args[0] = Expr::new(args[0].span, ExprNode::Lit { value: Literal::Sym { value: name.clone() } });
+        }
+        let mut e = Expr::new(
+            body.span,
+            ExprNode::Send { recv: Some(call), method: loaded.clone(), args: vec![], block: None, parenthesized: false },
+        );
+        e.ty = Some(Ty::Bool);
+        e
+    };
+    let mut out = term(&names[0]);
+    for name in &names[1..] {
+        let mut e = Expr::new(
+            expr.span,
+            ExprNode::BoolOp {
+                op: crate::expr::BoolOpKind::And,
+                surface: crate::expr::BoolOpSurface::Symbol,
+                left: out,
+                right: term(name),
+            },
+        );
+        e.ty = Some(Ty::Bool);
+        out = e;
+    }
+    Some(out)
+}
+
+fn mentions_var(e: &Expr, name: &Symbol) -> bool {
+    if matches!(&*e.node, ExprNode::Var { name: n, .. } if n == name) {
+        return true;
+    }
+    let mut found = false;
+    e.node.for_each_child(&mut |c| found = found || mentions_var(c, name));
+    found
 }
 
 fn sym_lit(expr: &Expr) -> Option<Symbol> {

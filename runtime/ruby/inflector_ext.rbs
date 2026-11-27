@@ -4,5 +4,14 @@ module Inflector
   PARAMETERIZE_EDGES: Regexp
 
   def self.parameterize: (String) -> String
-  def self.pluralize_word: (String word, untyped count) -> String
+  def self.pluralize_word: (String? word, untyped count) -> String
+  def self.pluralize_tail: (String s, Integer drop) -> String
+  def self.pluralize_uncountable?: (String d) -> bool
+  def self.pluralize_ends_word?: (String d, String word) -> bool
+  def self.pluralize_word_char?: (String c) -> bool
+  def self.pluralize_irregular: (String s, String d) -> String?
+  def self.pluralize_cased: (String s, Integer tail, String rest) -> String
+  def self.pluralize_ix?: (String d) -> bool
+  def self.pluralize_consonant_y?: (String d) -> bool
+  def self.pluralize_fe?: (String d) -> bool
 end

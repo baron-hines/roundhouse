@@ -12,7 +12,7 @@
 #![allow(dead_code)]
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::expr::{
     Arm, BoolOpKind, Expr, ExprNode, InterpPart, IrHint, LValue, Literal, OpAssignOp, Pattern,
@@ -24,17 +24,19 @@ use super::ty::kotlin_ty;
 thread_local! {
     /// Local names already declared in the current method body (so the
     /// first `Assign` emits `val`/`var` and later ones emit bare `=`).
-    static DECLARED: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    static DECLARED: RefCell<HashSet<String>> = RefCell::new(HashSet::default());
+    // Not a `next` read as the lambda's return: inside a `for` it is `continue`, and only there
+    static LOOP_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Local names assigned more than once → declared `var` (else `val`).
-    static REASSIGNED: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    static REASSIGNED: RefCell<HashSet<String>> = RefCell::new(HashSet::default());
     /// For locals first assigned `nil`, the nullable Kotlin type taken
     /// from a later non-nil assignment — so `var x = null` (which Kotlin
     /// infers as `Nothing?`) becomes `var x: T? = null`.
-    static NIL_TYPES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    static NIL_TYPES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::default());
     /// For locals first assigned an empty `{}`/`[]`, the element type
     /// inferred from later `map[k]=v` / `list << x` — so the empty literal
     /// gets a precise declared type instead of `<Any?>`.
-    static CONTAINER_TYPES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    static CONTAINER_TYPES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::default());
     /// When set, `return` emits `return@<label>` — used for `initialize`
     /// bodies wrapped in `run { }` (Kotlin `init` blocks can't `return`).
     static RETURN_LABEL: RefCell<Option<&'static str>> = const { RefCell::new(None) };
@@ -47,28 +49,28 @@ thread_local! {
     /// a Kotlin property read only when its name is in here; everything else
     /// is a method call needing `()`. Empty for `object`s (modules), whose
     /// self-sends are always method calls.
-    static INSTANCE_PROPS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    static INSTANCE_PROPS: RefCell<HashSet<String>> = RefCell::new(HashSet::default());
     /// camelCased parameter names of the method currently being emitted. A
     /// zero-arg, no-receiver `Send` whose name is in here is a reference to
     /// the parameter, not a self-method call — emit the bare identifier
     /// without `()`. (The view lowerer represents a partial local like
     /// `article` as a bare implicit-self `Send` in argument position but as
     /// a `Var` in receiver position; this reconciles the two.)
-    static PARAM_NAMES: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    static PARAM_NAMES: RefCell<HashSet<String>> = RefCell::new(HashSet::default());
     /// Instance property name → declared `Ty`, so a `self.col = <Any?>`
     /// write (the `assign_from_row`/`initialize`/`update` column shape,
     /// where the RHS is an untyped `row[k]`/`attrs[k]` lookup) can coerce
     /// the value to the column's scalar type. Kotlin won't assign `Any?`
     /// to a `Long`/`String` slot. Set per class beside `INSTANCE_PROPS`.
     static INSTANCE_PROP_TYPES: RefCell<HashMap<String, crate::ty::Ty>> =
-        RefCell::new(HashMap::new());
+        RefCell::new(HashMap::default());
     /// `"Object.prop"` keys for module/object-level accessor properties
     /// (`class << self; attr_accessor :adapter` → `ActiveRecord.adapter`).
     /// A `Const`-receiver zero-arg send keyed here reads as a property
     /// (`ActiveRecord.adapter`) instead of a call. Populated by a pre-scan
     /// of all runtime classes before rendering (see
     /// `library::register_object_accessors`).
-    static OBJECT_PROPS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    static OBJECT_PROPS: RefCell<HashSet<String>> = RefCell::new(HashSet::default());
     /// Name of the class currently being emitted, so an implicit-self
     /// `new(attrs)` (a companion factory like `Base.create`) resolves to
     /// the Kotlin constructor `Base(attrs)`. Empty for object/module emit.
@@ -79,7 +81,7 @@ thread_local! {
     /// members it inherits (Kotlin requires explicit `override`, unlike
     /// TS/Crystal). See `library::register_class_hierarchy`.
     static CLASS_HIERARCHY: RefCell<HashMap<String, (Option<String>, HashSet<String>)>> =
-        RefCell::new(HashMap::new());
+        RefCell::new(HashMap::default());
     /// Class simple name → camelCased names of its *zero-arg instance
     /// methods* (excludes `attr_*` / body-ivar properties). A zero-arg send
     /// to a typed-`Class` receiver whose member is in this set (walking
@@ -88,7 +90,7 @@ thread_local! {
     /// (has-many loader method) emit `article.comments()` while
     /// `article.title` (column property) stays `article.title`.
     static CLASS_INSTANCE_METHODS: RefCell<HashMap<String, HashSet<String>>> =
-        RefCell::new(HashMap::new());
+        RefCell::new(HashMap::default());
     /// `"Receiver.method"` → the callee's camelCased parameter names. Used
     /// to decide whether a call-site `kwargs:true` hash splats into Kotlin
     /// named arguments (`truncate(body, length = 100)`, when the keys are a
@@ -97,14 +99,14 @@ thread_local! {
     /// hand-written `Broadcasts` primitive) falls back to the map literal —
     /// the safe default.
     static METHOD_PARAMS: RefCell<HashMap<String, HashSet<String>>> =
-        RefCell::new(HashMap::new());
+        RefCell::new(HashMap::default());
     /// `"Receiver.method"` → positional parameter types (required and
     /// optional only, in call order). A hash literal passed in one of
     /// those slots is pinned to that `Hash[K, V]` instead of the
     /// blanket `<String, Any?>` — Kotlin maps are invariant, so
     /// `MutableMap<String, Any?>` is not a `MutableMap<String, String?>`.
     static METHOD_PARAM_TYS: RefCell<HashMap<String, Vec<crate::ty::Ty>>> =
-        RefCell::new(HashMap::new());
+        RefCell::new(HashMap::default());
     /// Full `var <name>: <T> = <default>` declarations for locals whose
     /// first assignment is inside a nested scope (an `if`/loop/block) yet are
     /// also assigned at an outer level — Kotlin would scope the in-branch
@@ -116,14 +118,14 @@ thread_local! {
     /// `if (!prop.nil?)` guard — read with a `!!` so Kotlin accepts them in a
     /// non-null position (it won't smart-cast a mutable property). Scoped to
     /// the guarded branch by `emit_if`.
-    static NONNULL_PROPS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    static NONNULL_PROPS: RefCell<HashSet<String>> = RefCell::new(HashSet::default());
     /// camelCased `@ivar` names of the current `object`/module that hold
     /// mutable singleton state (e.g. ViewHelpers' `@slots` content_for store).
     /// In a concurrent server (Javalin dispatches each request on its own
     /// thread) such process-global state would bleed across requests, so it's
     /// emitted as a `ThreadLocal`: reads become `name.get()`, whole-reassigns
     /// `name.set(…)`. Empty for instance classes (their ivars are per-object).
-    static OBJECT_TL_FIELDS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    static OBJECT_TL_FIELDS: RefCell<HashSet<String>> = RefCell::new(HashSet::default());
 }
 
 /// Install the current object's thread-local field names (see
@@ -493,7 +495,7 @@ pub(super) fn register_class_hierarchy(name: &str, parent: Option<&str>, members
 /// to get the set a member must be in to need an `override` modifier.
 /// Unknown classes (e.g. `RuntimeException`) contribute nothing.
 pub(super) fn ancestor_members(class_name: &str) -> HashSet<String> {
-    let mut out = HashSet::new();
+    let mut out = HashSet::default();
     let mut cur = Some(class_name.to_string());
     let mut guard = 0;
     while let Some(name) = cur {
@@ -520,7 +522,7 @@ pub(super) fn ancestor_members(class_name: &str) -> HashSet<String> {
 /// (a property defined on `ActionController::Base`) must read as a property,
 /// not a `()` call, even though it isn't in the subclass's own prop set.
 pub(super) fn ancestor_props(class_name: &str) -> HashSet<String> {
-    let mut out = HashSet::new();
+    let mut out = HashSet::default();
     let mut cur = Some(class_name.to_string());
     let mut guard = 0;
     while let Some(name) = cur {
@@ -618,8 +620,8 @@ pub(super) fn set_returns_unit(b: bool) {
 /// reassignment counts. Called by `library::emit_method` before the body
 /// is rendered.
 pub(super) fn begin_method(body: &Expr) {
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    let mut nil_types: HashMap<String, String> = HashMap::new();
+    let mut counts: HashMap<String, usize> = HashMap::default();
+    let mut nil_types: HashMap<String, String> = HashMap::default();
     count_assigns(body, &mut counts, &mut nil_types);
     DECLARED.with(|d| d.borrow_mut().clear());
     REASSIGNED.with(|r| {
@@ -634,7 +636,7 @@ pub(super) fn begin_method(body: &Expr) {
     NIL_TYPES.with(|t| *t.borrow_mut() = nil_types);
     set_return_label(None);
 
-    let mut container_types: HashMap<String, String> = HashMap::new();
+    let mut container_types: HashMap<String, String> = HashMap::default();
     scan_container_types(body, &mut container_types);
     CONTAINER_TYPES.with(|t| *t.borrow_mut() = container_types);
 
@@ -670,67 +672,20 @@ fn kt_default(ty: &str) -> &'static str {
     }
 }
 
-/// Find locals needing top-of-method hoisting: first assigned at a nested
-/// scope depth (>0) yet assigned more than once. Returns `(name, kotlin_ty)`
-/// pairs, the type taken from the first assignment's value.
+/// Locals needing top-of-method hoisting (`emit::shared::hoist`), as
+/// `(name, kotlin_ty)` pairs, the type taken from the first assignment's
+/// value.
 fn scan_hoist(body: &Expr) -> Vec<(String, String)> {
-    // name → (first-assignment depth, total assignment count, type)
-    let mut info: std::collections::BTreeMap<String, (usize, usize, String)> =
-        std::collections::BTreeMap::new();
-    walk_hoist(body, 0, &mut info);
-    info.into_iter()
-        .filter(|(_, (depth, count, _))| *depth > 0 && *count > 1)
-        .map(|(n, (_, _, ty))| (n, ty))
+    crate::emit::shared::hoist::hoisted_locals(body)
+        .into_iter()
+        .map(|h| {
+            let ty = match h.tys.first() {
+                Some(Some(t)) => kotlin_ty(t),
+                _ => "Any?".to_string(),
+            };
+            (camel(&h.name), ty)
+        })
         .collect()
-}
-
-fn walk_hoist(
-    e: &Expr,
-    depth: usize,
-    info: &mut std::collections::BTreeMap<String, (usize, usize, String)>,
-) {
-    if let ExprNode::Assign { target: LValue::Var { name, .. }, value } = &*e.node {
-        let n = camel(name.as_str());
-        let ty = match value.ty.as_ref() {
-            Some(t) if !matches!(t, crate::ty::Ty::Nil) => kotlin_ty(t),
-            _ => "Any?".to_string(),
-        };
-        let entry = info.entry(n).or_insert((depth, 0, ty));
-        entry.1 += 1;
-    }
-    // Recurse, deepening only into genuinely nested scopes (branch/loop/block
-    // bodies); a `Seq` and an `if` condition stay at the current depth.
-    match &*e.node {
-        ExprNode::Seq { exprs } => {
-            for c in exprs {
-                walk_hoist(c, depth, info);
-            }
-        }
-        ExprNode::If { cond, then_branch, else_branch } => {
-            walk_hoist(cond, depth, info);
-            walk_hoist(then_branch, depth + 1, info);
-            walk_hoist(else_branch, depth + 1, info);
-        }
-        ExprNode::While { cond, body, .. } => {
-            walk_hoist(cond, depth, info);
-            walk_hoist(body, depth + 1, info);
-        }
-        ExprNode::Case { scrutinee, arms } => {
-            walk_hoist(scrutinee, depth, info);
-            for a in arms {
-                walk_hoist(&a.body, depth + 1, info);
-            }
-        }
-        ExprNode::Lambda { body, .. } => walk_hoist(body, depth + 1, info),
-        ExprNode::Assign { value, .. } | ExprNode::OpAssign { value, .. } => {
-            walk_hoist(value, depth, info)
-        }
-        _ => {
-            for c in children(e) {
-                walk_hoist(c, depth, info);
-            }
-        }
-    }
 }
 
 /// Infer element types for empty-container locals from how they're later
@@ -794,6 +749,15 @@ fn count_assigns(
     if let ExprNode::OpAssign { target: LValue::Var { name, .. }, .. } = &*e.node {
         *counts.entry(camel(name.as_str())).or_insert(0) += 2;
     }
+    // `buf << x` on a String local rebinds it (`buf += x`), so it is a `var` too
+    if let ExprNode::Send { recv: Some(r), method, args, .. } = &*e.node
+        && method.as_str() == "<<"
+        && args.len() == 1
+        && let ExprNode::Var { name, .. } = &*r.node
+        && matches!(r.ty.as_ref().map(|t| t.peel_nilable()), Some(crate::ty::Ty::Str))
+    {
+        *counts.entry(camel(name.as_str())).or_insert(0) += 2;
+    }
     if let ExprNode::Assign { target: LValue::Var { name, .. }, value } = &*e.node {
         let cn = camel(name.as_str());
         *counts.entry(cn.clone()).or_insert(0) += 1;
@@ -852,6 +816,12 @@ fn children(e: &Expr) -> Vec<&Expr> {
         }
         ExprNode::Return { value } | ExprNode::Raise { value } => v.push(value),
         ExprNode::Lambda { body, .. } => v.push(body),
+        ExprNode::BeginRescue { body, rescues, else_branch, ensure, .. } => {
+            v.push(body);
+            v.extend(rescues.iter().map(|r| &r.body));
+            v.extend(else_branch.as_deref());
+            v.extend(ensure.as_deref());
+        }
         _ => {}
     }
     v
@@ -880,7 +850,7 @@ pub fn emit_expr(e: &Expr) -> String {
 /// Mirrors `crystal::expr::try_string_builder`. Non-hinted sites fall
 /// through to the normal node emit.
 fn try_string_builder(e: &Expr) -> Option<String> {
-    match e.hint? {
+    match e.hint().as_ref()? {
         IrHint::MutableStringLiteral => None, // emitted as the plain literal
         IrHint::StringBuilderInit => {
             if let ExprNode::Assign { target: LValue::Var { name, .. }, .. } = &*e.node {
@@ -1039,8 +1009,95 @@ fn emit_node(n: &ExprNode, e: &Expr) -> String {
             emit_expr(expr),
             emit_expr(fallback)
         ),
-        other => format!("/* TODO {} */", other.kind_str()),
+        ExprNode::Let { name, value, body, .. } => {
+            format!("run {{\n{}\n}}", indent(&format!("val {} = {}\n{}", camel(name.as_str()), emit_expr(value), emit_expr(body))))
+        }
+        ExprNode::Next { .. } if LOOP_DEPTH.with(|l| l.get()) > 0 => "continue".to_string(),
+        ExprNode::BeginRescue { body, rescues, else_branch, ensure, .. } => {
+            emit_begin_rescue(body, rescues, else_branch.as_deref(), ensure.as_deref())
+        }
+        other => crate::emit::diagnostics::report_unsupported(e.span, "kotlin", other.kind_str(), "no Kotlin form for this construct here"),
     }
+}
+
+// Not declared inside `try`: Kotlin scopes a try block's locals to it, and rescue and ensure read what the body bound
+fn emit_begin_rescue(
+    body: &Expr,
+    rescues: &[crate::expr::RescueClause],
+    else_branch: Option<&Expr>,
+    ensure: Option<&Expr>,
+) -> String {
+    fn assigned(e: &Expr, out: &mut Vec<(String, Option<crate::ty::Ty>)>) {
+        if let ExprNode::Assign { target: LValue::Var { name, .. }, value } = &*e.node {
+            let n = camel(name.as_str());
+            if !out.iter().any(|(m, _)| *m == n) {
+                out.push((n, value.ty.clone()));
+            }
+        }
+        if !matches!(&*e.node, ExprNode::Lambda { .. }) {
+            for c in children(e) {
+                assigned(c, out);
+            }
+        }
+    }
+    let mut locals = Vec::new();
+    assigned(body, &mut locals);
+    let declared = DECLARED.with(|d| d.borrow().clone());
+    let mut prelude = String::new();
+    for (n, ty) in locals.iter().filter(|(n, _)| !declared.contains(n)) {
+        let kt = match ty {
+            Some(t) if !matches!(t, crate::ty::Ty::Nil) => {
+                let k = kotlin_ty(t);
+                if k.ends_with('?') { k } else { format!("{k}?") }
+            }
+            _ => "Any?".to_string(),
+        };
+        prelude.push_str(&format!("var {n}: {kt} = null\n"));
+        DECLARED.with(|d| d.borrow_mut().insert(n.clone()));
+    }
+    let mut try_body = emit_expr(body);
+    if let Some(eb) = else_branch {
+        try_body.push('\n');
+        try_body.push_str(&emit_expr(eb));
+    }
+    // Not a `try` with neither handler: Kotlin requires a catch or a finally, and a bare `begin … end` has none
+    if rescues.is_empty() && ensure.is_none() {
+        return if prelude.is_empty() { try_body } else { format!("run {{\n{}\n}}", indent(&format!("{prelude}{try_body}"))) };
+    }
+    let mut out = format!("try {{\n{}\n}}", indent(&try_body));
+    if !rescues.is_empty() {
+        let mut chain = String::new();
+        for (i, r) in rescues.iter().enumerate() {
+            let test = if r.classes.is_empty() {
+                "__rescued is RuntimeException".to_string()
+            } else {
+                r.classes
+                    .iter()
+                    .map(|c| match &*c.node {
+                        ExprNode::Const { path } => {
+                            let joined = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+                            format!("__rescued is {}", kotlin_exception_class(&joined))
+                        }
+                        _ => "__rescued is Exception".to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" || ")
+            };
+            let bind = r.binding.as_ref().map(|b| format!("val {} = __rescued\n", camel(b.as_str()))).unwrap_or_default();
+            chain.push_str(&format!(
+                "{}if ({test}) {{\n{}\n}}",
+                if i == 0 { "" } else { " else " },
+                indent(&format!("{bind}{}", emit_expr(&r.body)))
+            ));
+        }
+        chain.push_str(" else {\n    throw __rescued\n}");
+        // Not `Exception`: Kotlin's NotImplementedError is an Error, as Ruby's is no StandardError, and `rescue NotImplementedError` still names it
+        out.push_str(&format!(" catch (__rescued: Throwable) {{\n{}\n}}", indent(&chain)));
+    }
+    if let Some(en) = ensure {
+        out.push_str(&format!(" finally {{\n{}\n}}", indent(&emit_expr(en))));
+    }
+    if prelude.is_empty() { out } else { format!("run {{\n{}\n}}", indent(&format!("{prelude}{out}"))) }
 }
 
 fn emit_literal(lit: &Literal) -> String {
@@ -1062,13 +1119,68 @@ fn emit_literal(lit: &Literal) -> String {
         Literal::Str { value } => format!("\"{}\"", escape_str(value)),
         // No symbol type in Kotlin → string.
         Literal::Sym { value } => format!("\"{}\"", escape_str(value.as_str())),
-        Literal::Regex { pattern, .. } => {
+        Literal::Regex { pattern, flags } => {
             // Ruby `/[\r\n\0\t]/` carries a backslash-zero NUL escape.
             // Java `Pattern` rejects `\0` (octal needs more digits); use
             // `\u0000` which both Kotlin's string literal and Pattern accept.
             let normalized = normalize_java_regex_nul(pattern);
-            format!("Regex(\"{}\")", escape_str(&normalized))
+            let options = kotlin_regex_options(flags);
+            if options.is_empty() {
+                format!("Regex(\"{}\")", escape_str(&normalized))
+            } else {
+                format!("Regex(\"{}\", setOf({options}))", escape_str(&normalized))
+            }
         }
+    }
+}
+
+/// Ruby regex flags this build can reproduce exactly: `i` →
+/// `RegexOption.IGNORE_CASE`. Ruby's `m` (dot-matches-newline) is
+/// `RegexOption.DOT_MATCHES_ALL`. Ruby's `^`/`$` are always line
+/// anchors, so a flagged `m` also adds `RegexOption.MULTILINE`.
+/// Any other flag character stays an ingest-time gap, so none
+/// reaches here.
+fn kotlin_regex_options(flags: &str) -> String {
+    let bits = crate::emit::shared::regex_literal::parse_ruby_regex_flags(flags);
+    let mut parts: Vec<&str> = Vec::new();
+    if bits.ignore_case {
+        parts.push("RegexOption.IGNORE_CASE");
+    }
+    if bits.dot_matches_newline {
+        parts.push("RegexOption.DOT_MATCHES_ALL");
+        parts.push("RegexOption.MULTILINE");
+    }
+    parts.join(", ")
+}
+
+#[cfg(test)]
+mod regex_flag_tests {
+    #[test]
+    fn rubys_m_keeps_line_anchors_as_well_as_dotall() {
+        assert_eq!(kotlin_regex_options("m"), "RegexOption.DOT_MATCHES_ALL, RegexOption.MULTILINE");
+    }
+
+    use super::{emit_literal, kotlin_regex_options};
+    use crate::expr::Literal;
+
+    #[test]
+    fn no_flags_drop_the_options_set() {
+        let lit = Literal::Regex { pattern: "a.b".into(), flags: "".into() };
+        assert_eq!(emit_literal(&lit), r#"Regex("a.b")"#);
+    }
+
+    #[test]
+    fn ignore_case_maps_to_regexoption_ignore_case() {
+        assert_eq!(kotlin_regex_options("i"), "RegexOption.IGNORE_CASE");
+    }
+
+    #[test]
+    fn ignore_case_and_dot_matches_newline_combine_in_a_set() {
+        let lit = Literal::Regex { pattern: "a.b".into(), flags: "im".into() };
+        assert_eq!(
+            emit_literal(&lit),
+            r#"Regex("a.b", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL, RegexOption.MULTILINE))"#
+        );
     }
 }
 
@@ -1219,6 +1331,34 @@ pub(super) fn emit_return_value(e: &Expr) -> String {
     emit_expr(e)
 }
 
+/// A value method's tail `If`, as the `return`ed Kotlin `if` expression.
+/// Ruby's missing (nil) arm is Kotlin's `null` — an `if` used as a value
+/// needs its `else` — and a `{}`/`[]` literal arm drops its type
+/// arguments so the declared return type drives inference, as a bare
+/// return-position literal does (`c ? { k: true } : {}` would otherwise
+/// type one arm `<String, Any?>` against a `<String, Boolean>` return).
+pub(super) fn emit_if_return_value(cond: &Expr, then_branch: &Expr, else_branch: &Expr) -> String {
+    let c = emit_expr(cond);
+    let (mut then_nn, mut else_nn) = (Vec::new(), Vec::new());
+    guarded_nonnull(cond, &mut then_nn, &mut else_nn);
+    let then = with_nonnull(&then_nn, || indent(&emit_value_arm(then_branch)));
+    let els = if is_empty_branch(else_branch) {
+        indent("null")
+    } else {
+        with_nonnull(&else_nn, || indent(&emit_value_arm(else_branch)))
+    };
+    format!("if ({c}) {{\n{then}\n}} else {{\n{els}\n}}")
+}
+
+fn emit_value_arm(e: &Expr) -> String {
+    match &*e.node {
+        ExprNode::Hash { entries, .. } if entries.is_empty() => "mutableMapOf()".to_string(),
+        ExprNode::Array { elements, .. } if elements.is_empty() => "mutableListOf()".to_string(),
+        ExprNode::If { cond, then_branch, else_branch } => emit_if_return_value(cond, then_branch, else_branch),
+        _ => emit_return_value(e),
+    }
+}
+
 fn emit_array(elements: &[Expr], e: &Expr) -> String {
     if elements.is_empty() {
         // Use the annotated element type when present, else Any?.
@@ -1260,12 +1400,13 @@ fn emit_bool_op(op: BoolOpKind, left: &Expr, right: &Expr, e: &Expr) -> String {
         BoolOpKind::And => format!("{l} && {r}"),
         // `||` is logical-or for Bool results, but Ruby's `x || default`
         // nil-coalescing idiom maps to Kotlin's `?:` when the result
-        // isn't a Bool.
+        // isn't a Bool. `?:` binds looser than a call, so the coalesce is
+        // parenthesized to stay whole as a receiver (`(x ?: "").isEmpty()`).
         BoolOpKind::Or => {
             if matches!(e.ty.as_ref(), Some(crate::ty::Ty::Bool)) {
                 format!("{l} || {r}")
             } else {
-                format!("{l} ?: {r}")
+                format!("({l} ?: {r})")
             }
         }
     }
@@ -1323,7 +1464,8 @@ fn emit_case(scrutinee: &Expr, arms: &[Arm]) -> String {
                 lines.push(format!("    {} -> {body_block}", emit_literal(value)));
             }
             other => {
-                lines.push(format!("    /* TODO pattern {other:?} */ else -> {body_block}"));
+                let stub = crate::emit::diagnostics::report_unsupported(arm.body.span, "kotlin", "case pattern", format!("{other:?}").split([' ', '(', '{']).next().unwrap_or("").to_string());
+                lines.push(format!("    else -> {{ {stub} }}"));
                 has_else = true;
             }
         }
@@ -1353,6 +1495,10 @@ fn emit_assign(target: &LValue, value: &Expr) -> String {
         _ => emit_expr(value),
     };
     match target {
+        // `_ = x`: Ruby's discard, which evaluates `x` and keeps nothing.
+        // Kotlin reserves `_` as a name, and an expression statement
+        // already evaluates its value and drops it.
+        LValue::Var { name, .. } if name.as_str() == "_" => val,
         LValue::Var { name, .. } => {
             let n = camel(name.as_str());
             let already = DECLARED.with(|d| d.borrow().contains(&n));
@@ -1438,7 +1584,7 @@ fn emit_op_assign(target: &LValue, op: OpAssignOp, value: &Expr) -> String {
         OpAssignOp::Mul => format!("{lhs} *= {v}"),
         OpAssignOp::Div => format!("{lhs} /= {v}"),
         OpAssignOp::Mod => format!("{lhs} %= {v}"),
-        _ => format!("{lhs} = {lhs} /* TODO op-assign */ {v}"),
+        other => crate::emit::diagnostics::report_unsupported(value.span, "kotlin", "OpAssign", format!("{other:?}")),
     }
 }
 
@@ -1555,7 +1701,14 @@ fn emit_slice_range(
 }
 
 fn emit_lambda(params: &[crate::ident::Symbol], body: &Expr, destructure: bool) -> String {
+    // A local the block declares is the block's own (Ruby scopes it the
+    // same way), so a sibling block assigning the same name declares its
+    // own too. See `emit::shared::hoist`.
+    let outer = DECLARED.with(|d| d.borrow().clone());
+    let loops = LOOP_DEPTH.with(|l| l.replace(0));
     let body_s = emit_expr(body);
+    LOOP_DEPTH.with(|l| l.set(loops));
+    DECLARED.with(|d| *d.borrow_mut() = outer);
     if params.is_empty() {
         format!("{{ {body_s} }}")
     } else {
@@ -1600,6 +1753,10 @@ fn emit_send(
     args: &[Expr],
     block: Option<&Expr>,
 ) -> String {
+    if let Some(recv) = crate::emit::shared::fn_call::function_receiver(recv, method, block) {
+        let args_s: Vec<String> = args.iter().map(emit_expr).collect();
+        return format!("{}({})", emit_expr(recv), args_s.join(", "));
+    }
     // A bare implicit-self zero-arg send that names a parameter is a
     // reference to that local, not a method call — emit the identifier
     // without `()`. (See `PARAM_NAMES`: the view lowerer renders a partial
@@ -1614,7 +1771,11 @@ fn emit_send(
         return format!("!({})", emit_expr(&args[0]));
     }
 
-    let args_s: Vec<String> = args.iter().map(emit_expr).collect();
+    // Not each argument rendered as it is: a Range has no Kotlin value here, and the slice paths below read its bounds instead
+    let args_s: Vec<String> = args
+        .iter()
+        .map(|a| if matches!(&*a.node, ExprNode::Range { .. }) { String::new() } else { emit_expr(a) })
+        .collect();
 
     // `self.class.METHOD(...)` → unqualified `METHOD(...)`. Ruby's
     // `self.class` reflection has no Kotlin analog, but a per-model class
@@ -1717,10 +1878,8 @@ fn emit_send(
             let joined = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
             // Not `ArgumentError(...)`: Kotlin has no such class, and its stdlib spelling is IllegalArgumentException.
             let cls = match joined.as_str() {
-                "" | "RuntimeError" => "RuntimeException".to_string(),
-                "ArgumentError" => "IllegalArgumentException".to_string(),
-                "IndexError" => "IndexOutOfBoundsException".to_string(),
-                _ => type_name(&joined),
+                "" => "RuntimeException".to_string(),
+                other => kotlin_exception_class(other),
             };
             return format!("throw {cls}({})", args_s[1..].join(", "));
         }
@@ -1781,11 +1940,32 @@ fn emit_send(
                 "Integer" => format!("{rs} is Long"),
                 "Float" => format!("{rs} is Double"),
                 "String" => format!("{rs} is String"),
+                // Not `is Symbol`: a Symbol is emitted as a String, so the two read alike here
+                "Symbol" => format!("{rs} is String"),
                 "Numeric" => format!("{rs} is Number"),
                 "Hash" => format!("{rs} is Map<*, *>"),
                 "Array" => format!("{rs} is List<*>"),
                 other => format!("{rs} is {}", type_name(other)),
             };
+        }
+    }
+
+    // `recv.gsub(regexp, "literal")` → `regexp.replace(recv, "literal")`.
+    // Only for a Regexp pattern (a String needle is not a `Regex`
+    // receiver), and only for a literal with no `\`: a Ruby `\1`/`\0`
+    // back-reference keeps the previous path rather than coming out as
+    // literal text. Kotlin reads `$` as a group reference, so a literal
+    // holding one goes through `Regex.escapeReplacement`.
+    if method == "gsub" && args.len() == 2 {
+        if let (Some(r), ExprNode::Lit { value: Literal::Str { value: repl } }) = (recv, &*args[1].node) {
+            if !repl.contains('\\') && crate::emit::shared::regex_literal::is_regexp_pattern(&args[0]) {
+                let repl_s = if repl.contains('$') {
+                    format!("Regex.escapeReplacement({})", args_s[1])
+                } else {
+                    args_s[1].clone()
+                };
+                return format!("{}.replace({}, {repl_s})", args_s[0], emit_expr(r));
+            }
         }
     }
 
@@ -1807,6 +1987,13 @@ fn emit_send(
             "start_with?" => return format!("{}.startsWith({})", emit_expr(r), args_s[0]),
             "end_with?" => return format!("{}.endsWith({})", emit_expr(r), args_s[0]),
             "include?" => return format!("{}.contains({})", emit_expr(r), args_s[0]),
+            // Not indexOf as it is: Ruby answers nil, not -1, for a miss
+            "index" if recv_is_array(r) => {
+                return format!("{}.indexOf({}).let {{ __at -> if (__at < 0) null else __at.toLong() }}", emit_expr(r), args_s[0]);
+            }
+            "rindex" if !recv_is_array(r) && !recv_is_hash(r) => {
+                return format!("{}.lastIndexOf({}).let {{ __at -> if (__at < 0) null else __at.toLong() }}", emit_expr(r), args_s[0]);
+            }
             // `String#match?(re)` → `re.containsMatchIn(s)`. Kotlin's
             // `Regex` is the receiver; a bare `matchPred` on String
             // does not exist (same flip TypeScript/`re.test` uses).
@@ -1856,6 +2043,10 @@ fn emit_send(
                 if recv_is_array(r) {
                     return format!("{rs}[({}).toInt()]", args_s[0]);
                 }
+                // Not `s[i]`, a Char at an Int: Ruby answers a one-character String, or nil past the end
+                if matches!(r.ty.as_ref().map(|t| t.peel_nilable()), Some(crate::ty::Ty::Str)) {
+                    return format!("rhStrAt({rs}, ({}).toLong())", args_s[0]);
+                }
                 return format!("{rs}[{}]", args_s[0]);
             }
             if args.len() == 2 {
@@ -1864,6 +2055,10 @@ fn emit_send(
                 // it (`"abc"[1, 10]` is `"bc"`; `substring` throws).
                 let start = &args_s[0];
                 let len = &args_s[1];
+                // Ruby's Array#[](start, length): nil past the end, clamped otherwise
+                if recv_is_array(r) {
+                    return format!("rhListSlice({rs}, ({start}).toLong(), ({len}).toLong())");
+                }
                 return format!(
                     "{rs}.let {{ __s -> __s.substring(minOf(({start}).toInt(), __s.length), minOf((({start}) + ({len})).toInt(), __s.length)) }}"
                 );
@@ -1879,6 +2074,12 @@ fn emit_send(
         match crate::emit::shared::ops::classify_binop(method) {
             crate::emit::shared::ops::BinopCase::NativeInfix(op) => {
                 return format!("{} {} {}", emit_expr(r), op, args_s[0]);
+            }
+            // Not `.add` on a String: Kotlin strings are immutable, so `buf << x` rebinds the buffer
+            crate::emit::shared::ops::BinopCase::Append
+                if matches!(r.ty.as_ref().map(|t| t.peel_nilable()), Some(crate::ty::Ty::Str)) =>
+            {
+                return format!("{} += {}", emit_expr(r), args_s[0]);
             }
             // `<<` / `push` → MutableList.add.
             crate::emit::shared::ops::BinopCase::Append => {
@@ -1989,6 +2190,12 @@ fn emit_send(
             "upcase" => return format!("{rs}.uppercase()"),
             "downcase" => return format!("{rs}.lowercase()"),
             "strip" => return format!("{rs}.trim()"),
+            "lstrip" => return format!("{rs}.trimStart()"),
+            "rstrip" => return format!("{rs}.trimEnd()"),
+            "abs" => return format!("kotlin.math.abs({rs})"),
+            // Not `.first` / `.last` properties: Ruby answers nil on an empty Array
+            "first" if recv_is_array(r) => return format!("{rs}.firstOrNull()"),
+            "last" if recv_is_array(r) => return format!("{rs}.lastOrNull()"),
             // `Array#join` with no separator → `joinToString("")`.
             "join" => return format!("{rs}.joinToString(\"\")"),
             // `.length`/`.size`: collections use `.size`, strings `.length`.
@@ -2068,6 +2275,21 @@ fn emit_send(
     if let Some(b) = block {
         let recv_arr = recv.is_some_and(|r| ty_is(r.ty.as_ref(), |t| matches!(t, crate::ty::Ty::Array { .. })));
         let recv_hash = recv.is_some_and(|r| ty_is(r.ty.as_ref(), |t| matches!(t, crate::ty::Ty::Hash { .. })));
+        // Not `forEach`: the JVM backend's inliner crashes on a loop nested in a large inlined lambda, and `next` needs a loop to continue
+        if method == "each"
+            && args_s.is_empty()
+            && let (Some(r), ExprNode::Lambda { params, body, .. }) = (recv, &*b.node)
+            && ((recv_arr && params.len() == 1) || (recv_hash && params.len() == 2))
+        {
+            let ps: Vec<String> = params.iter().map(|p| camel(p.as_str())).collect();
+            let head = if recv_hash { format!("({})", ps.join(", ")) } else { ps[0].clone() };
+            let outer = DECLARED.with(|d| d.borrow().clone());
+            LOOP_DEPTH.with(|l| l.set(l.get() + 1));
+            let body_s = emit_expr(body);
+            LOOP_DEPTH.with(|l| l.set(l.get() - 1));
+            DECLARED.with(|d| *d.borrow_mut() = outer);
+            return format!("for ({head} in {}) {{\n{}\n}}", emit_expr(r), indent(&body_s));
+        }
         let kt_method = if method == "each" && (recv_arr || recv_hash) {
             "forEach".to_string()
         } else {
@@ -2348,5 +2570,87 @@ mod equal_and_hash_pin_tests {
         let out = emit_expr(&send(var("headers"), "merge!", vec![quota_hash()]));
         assert!(out.contains("mutableMapOf<String, Any?>("), "{out}");
         assert!(!out.contains(".also"), "{out}");
+    }
+}
+
+/// The Kotlin class a Ruby core exception raises and is subclassed as.
+pub(super) fn kotlin_exception_class(name: &str) -> String {
+    match name {
+        "StandardError" | "RuntimeError" => "RuntimeException".to_string(),
+        "ArgumentError" => "IllegalArgumentException".to_string(),
+        "IndexError" => "IndexOutOfBoundsException".to_string(),
+        other => type_name(other),
+    }
+}
+
+#[cfg(test)]
+mod gsub_string_replacement_tests {
+    use super::emit_expr;
+    use crate::expr::{Expr, ExprNode, Literal};
+    use crate::ident::{ClassId, Symbol, VarId};
+    use crate::span::Span;
+    use crate::ty::Ty;
+
+    fn node(n: ExprNode) -> Expr {
+        Expr::new(Span::synthetic(), n)
+    }
+
+    /// A pattern constant, typed `Regexp` as the analyzer types one.
+    fn regexp_const() -> Expr {
+        let mut e = node(ExprNode::Const { path: vec![Symbol::from("PATTERN")] });
+        e.ty = Some(Ty::Class { id: ClassId(Symbol::from("Regexp")), args: vec![].into() });
+        e
+    }
+
+    fn regex_lit() -> Expr {
+        node(ExprNode::Lit { value: Literal::Regex { pattern: "[ab]".into(), flags: "".into() } })
+    }
+
+    /// A String-typed variable used as the pattern (a needle, not a Regex).
+    fn string_var() -> Expr {
+        let mut e = node(ExprNode::Var { id: VarId(1), name: Symbol::from("needle") });
+        e.ty = Some(Ty::Str);
+        e
+    }
+
+    fn gsub_with(pattern: Expr, repl: &str) -> Expr {
+        node(ExprNode::Send {
+            recv: Some(node(ExprNode::Var { id: VarId(0), name: Symbol::from("name") })),
+            method: Symbol::from("gsub"),
+            args: vec![pattern, node(ExprNode::Lit { value: Literal::Str { value: repl.to_string() } })],
+            block: None,
+            parenthesized: true,
+        })
+    }
+
+    fn gsub(repl: &str) -> Expr {
+        gsub_with(regexp_const(), repl)
+    }
+
+    /// A String replacement is the replacement, not a table to look the
+    /// match up in (`("_")[it.value]` does not compile).
+    #[test]
+    fn a_string_replacement_is_passed_to_regex_replace() {
+        assert_eq!(emit_expr(&gsub("_")), "PATTERN.replace(name, \"_\")");
+        assert!(emit_expr(&gsub_with(regex_lit(), "_")).ends_with(".replace(name, \"_\")"));
+    }
+
+    /// `$` is a group reference to `Regex.replace`.
+    #[test]
+    fn a_replacement_with_a_dollar_is_escaped() {
+        assert!(emit_expr(&gsub("$")).starts_with("PATTERN.replace(name, Regex.escapeReplacement("));
+    }
+
+    /// A String-typed pattern is a needle: not this arm.
+    #[test]
+    fn a_string_pattern_does_not_take_the_regex_arm() {
+        assert!(!emit_expr(&gsub_with(string_var(), "_")).contains("needle.replace(name, \"_\")"));
+    }
+
+    /// A Ruby back-reference (`\\1`) keeps the previous path.
+    #[test]
+    fn a_back_reference_does_not_take_the_regex_arm() {
+        let out = emit_expr(&gsub("(\\1)"));
+        assert!(!out.contains("PATTERN.replace(name, "), "{out}");
     }
 }

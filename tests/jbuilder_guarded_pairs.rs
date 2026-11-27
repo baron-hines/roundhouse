@@ -11,6 +11,8 @@
 //! plain Structs for records) against what Rails 8.1 + jbuilder 2.15
 //! render for the same templates and rows.
 
+#[path = "support/scratch.rs"]
+mod scratch;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -124,7 +126,7 @@ fn view<'a>(files: &'a [(String, String)], suffix: &str) -> &'a str {
 fn every_emitted_view_parses() {
     for (path, source) in emitted().iter().filter(|(p, _)| p.ends_with(".rb")) {
         let result = ruby_prism::parse(source.as_bytes());
-        let errors: Vec<String> = result.errors().map(|e| e.message().to_string()).collect();
+        let errors: Vec<String> = result.errors().map(|e| String::from_utf8_lossy(e.message()).into_owned()).collect();
         assert!(errors.is_empty(), "{path} does not parse: {errors:?}\n{source}");
     }
 }
@@ -161,10 +163,7 @@ fn a_begin_with_an_ensure_is_left_alone() {
 #[test]
 fn the_templates_render_what_jbuilder_renders() {
     let files = emitted();
-    let dir = std::env::temp_dir().join(format!(
-        "roundhouse-jbuilder-guarded-pairs-{}",
-        std::process::id()
-    ));
+    let dir = scratch::dir("roundhouse-jbuilder-guarded-pairs");
     // The emitted tree as it is laid out. `app/views.rb` is the views
     // index a partial call requires; it holds nothing these templates
     // need.

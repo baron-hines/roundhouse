@@ -4,11 +4,13 @@
 //! `synthesize_implicit_render` so the synthesized symbol-form render
 //! shows up here as a plain `Send`.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
+use crate::det::HashSet;
 
 use crate::dialect::Action;
 use crate::expr::{ArrayStyle, Expr, ExprNode, LValue, Literal};
 use crate::ident::{Symbol, VarId};
+use crate::lower::scope_chain::{AssocBuildTarget, AssocRegistry};
 use crate::span::Span;
 use crate::ty::Ty;
 
@@ -37,7 +39,7 @@ use super::util::{map_expr, map_expr_mut};
 /// `partial: "users/sidebars/rooms/shared", locals: { room: room }` →
 /// `Views::Users::Sidebars::Rooms.shared(room)`, bound against the
 /// partial's DEF-SITE contract: the record by the partial's record-arg
-/// convention, closure ivars as `@<name>` (a same-named local wins),
+/// convention, closure ivars as `@<name>` (never a same-named local),
 /// extras from `locals:` (nil-filled, trailing-trimmed).
 ///
 /// Shared by the render rewrite and the broadcast rewrite — a broadcast
@@ -52,9 +54,10 @@ pub(super) fn partial_view_call(
     locals: &[(Symbol, Expr)],
     module_name: Option<&str>,
     partials: &super::PartialMap,
+    request: Option<(Option<&str>, &str, bool)>,
     span: Span,
 ) -> Option<Expr> {
-    partial_view_call_with_record(partial, locals, None, module_name, partials, span)
+    partial_view_call_with_record(partial, locals, None, module_name, partials, request, span)
 }
 
 /// `partial_view_call` with the record supplied directly, for a caller
@@ -72,6 +75,7 @@ pub(super) fn partial_view_call_with_record(
     record_override: Option<&Expr>,
     module_name: Option<&str>,
     partials: &super::PartialMap,
+    request: Option<(Option<&str>, &str, bool)>,
     span: Span,
 ) -> Option<Expr> {
     let (module_dir, base_name) = match partial.rsplit_once('/') {
@@ -99,14 +103,50 @@ pub(super) fn partial_view_call_with_record(
         .or_else(|| record_override.cloned())
         .unwrap_or_else(|| nil_expr(span))];
     for n in &contract.closure {
-        view_args.push(lookup(n).unwrap_or_else(|| ivar(n.as_str(), span)));
+        view_args.push(ivar(n.as_str(), span));
     }
-    view_args.extend(contract.extras_args(lookup, || nil_expr(span), span));
+    // An action's render passes its own action, controller and path parameters, as a view's call passes them to a partial.
+    let request_value = |name: &str| -> Option<Expr> {
+        let (action, controller, overlaid) = request?;
+        // Not over a strict partial's own declared default (`action_name: "fallback"`).
+        if contract.declared.iter().any(|d| d == name) {
+            return None;
+        }
+        match name {
+            // Not a helper's own name: it is not the action, so the request's is read.
+            "action_name" => Some(match action {
+                Some(action) => str_lit(span, action),
+                None => Expr::new(
+                    span,
+                    ExprNode::Send { recv: None, method: Symbol::from("action_name"), args: vec![], block: None, parenthesized: false },
+                ),
+            }),
+            // Not a helper's own controller: an inherited one (ApplicationController's) renders for the subclass the request reached.
+            "controller_name" => Some(match action {
+                Some(_) if !controller.is_empty() => str_lit(span, controller),
+                _ => Expr::new(
+                    span,
+                    ExprNode::Send { recv: None, method: Symbol::from("controller_path"), args: vec![], block: None, parenthesized: false },
+                ),
+            }),
+            "path_parameters" => Some(view_path_parameters(overlaid, span)),
+            // The request's flash, as the action's own view gets it
+            // (`flash_lookup`): a `render partial: "shared/flash"` in a
+            // turbo-stream response reads `notice`. By slot
+            // (`flash_slot_of`): the partial may spell it `notice_`, and
+            // a `local_assigns[:notice_]` it reads is no slot. A
+            // strict-locals partial takes no flash.
+            _ => crate::lower::view_to_library::flash_slot_of(&contract.extras, name)
+                .filter(|_| !contract.keyword_extras)
+                .map(|slot| flash_lookup(span, slot)),
+        }
+    };
+    view_args.extend(contract.extras_args(lookup, request_value, None, || nil_expr(span), span));
     Some(Expr::new(
         span,
         ExprNode::Send {
             recv: Some(const_path(&["Views", &module_dir], span)),
-            method: crate::lower::view::view_method_name(&stem),
+            method: contract.method.clone(),
             args: view_args,
             block: None,
             parenthesized: true,
@@ -122,10 +162,20 @@ pub(super) fn rewrite_render_to_views(
     view_ivars: &super::ViewIvarMap,
     partials: &super::PartialMap,
     current_action: &str,
+    // An action's own body, whose name is the request's action; a helper's is not.
+    is_action: bool,
+    preserve_named_layout: bool,
     // The Views modules of every controller that INHERITS this one —
     // where a template this controller lacks may still live. See the
     // `subclass_template_hook` arm below.
     inheritor_modules: &[String],
+    // Whether the controller has `route_param_recall::OVERLAY`, which its views take as the request's path parameters.
+    overlaid: bool,
+    // Views modules of the controller's ancestors, nearest first: where
+    // a bare partial name falls back to when the controller's own
+    // directory has none (`partial: "flash"` in `VotesController` finds
+    // `application/_flash`).
+    ancestor_modules: &[String],
 ) -> Expr {
     // A controller with no Views module of its own (ApplicationController)
     // still renders: `allow_browser`'s fallback is `render template:
@@ -150,12 +200,35 @@ pub(super) fn rewrite_render_to_views(
             // produces the bare `Views::X.y(...)` call, which IS a
             // string. Trailing options (`layout: false`) are dropped.
             let to_string = method.as_str() == "render_to_string";
+            // Only the application layout and literal Boolean selectors
+            // are honored by this template path. Preserve every other
+            // explicit selector, including nil and computed expressions,
+            // instead of silently substituting the application layout.
+            // JSON and inline responses do not select a template.
+            if preserve_named_layout && args.iter().any(|arg| {
+                matches!(&*arg.node, ExprNode::Hash { entries, kwargs: true }
+                    if entries.iter().any(|(key, value)| {
+                        matches!(&*key.node, ExprNode::Lit { value: Literal::Sym { value } }
+                            if value.as_str() == "layout")
+                            && !(matches!(&*value.node, ExprNode::Lit { value: Literal::Str { value } }
+                                    if value == "application")
+                                || matches!(&*value.node, ExprNode::Lit { value: Literal::Bool { .. } }))
+                    }))
+            }) && !args.iter().any(|arg| {
+                matches!(&*arg.node, ExprNode::Hash { entries, kwargs: true }
+                    if entries.iter().any(|(key, _)| {
+                        matches!(&*key.node, ExprNode::Lit { value: Literal::Sym { value } }
+                            if matches!(value.as_str(), "json" | "plain" | "html" | "body"))
+                    }))
+            }) {
+                return None;
+            }
             // Controller-side partial render: `render partial:
             // "commentbox", layout: false, content_type: …, locals:
             // {comment: c}` (lobsters' reply). Bind against the
             // partial's def-site contract: record by the partial's
-            // record-arg convention, closure ivars as `@<name>` (a
-            // same-named local wins), extras from locals (nil-filled,
+            // record-arg convention, closure ivars as `@<name>` (never
+            // a same-named local), extras from locals (nil-filled,
             // trailing-trimmed). `layout:` drops (Rails renders
             // partials without one); other kwargs (content_type:,
             // status:) ride the render.
@@ -194,7 +267,7 @@ pub(super) fn rewrite_render_to_views(
                 }
                 if let Some(pname) = partial_name {
                     let view_call =
-                        partial_view_call(&pname, &locals_entries, module_name, partials, e.span)?;
+                        partial_view_call(&pname, &locals_entries, module_name, partials, Some((is_action.then_some(current_action.as_str()), controller_name.as_str(), overlaid)), e.span)?;
                     if to_string {
                         return Some(view_call);
                     }
@@ -268,11 +341,69 @@ pub(super) fn rewrite_render_to_views(
                         }
                     }
                     let view_call =
-                        partial_view_call(tname, &locals_entries, module_name, partials, e.span)?;
+                        partial_view_call(tname, &locals_entries, module_name, partials, Some((is_action.then_some(current_action.as_str()), controller_name.as_str(), overlaid)), e.span)?;
                     let mut new_args = vec![view_call];
                     if !rest.is_empty() {
                         new_args.push(Expr::new(e.span, ExprNode::Hash { entries: rest, kwargs: true }));
                     }
+                    return Some(Expr::new(
+                        e.span,
+                        ExprNode::Send {
+                            recv: None,
+                            method: Symbol::from("render"),
+                            args: new_args,
+                            block: block.clone(),
+                            parenthesized: true,
+                        },
+                    ));
+                }
+            }
+            // `render turbo_stream: <builders>[, status:]` — turbo-rails'
+            // renderer, which answers the builders' markup under
+            // `text/vnd.turbo-stream.html; charset=utf-8` (unless the
+            // action already named a type). Composed here from the same
+            // `Broadcasts.turbo_stream_fragment` the `.turbo_stream.erb`
+            // lowering writes, so the `<turbo-stream>` element keeps one
+            // owner per target.
+            if let ExprNode::Hash { entries, kwargs: true } = &*args[0].node {
+                let ts_pos = entries.iter().position(|(k, _)| {
+                    matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } }
+                        if value.as_str() == "turbo_stream")
+                });
+                if let Some(pos) = ts_pos {
+                    let rest: Vec<(Expr, Expr)> = entries
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| *i != pos)
+                        .map(|(_, kv)| kv.clone())
+                        .collect();
+                    let body = match turbo_stream_render_body(&entries[pos].1, module_name, ancestor_modules, partials, Some((is_action.then_some(current_action.as_str()), controller_name.as_str(), overlaid))) {
+                        Ok(body) => body,
+                        Err(reason) => {
+                            crate::lower::controller::body::report_unrunnable_arm(
+                                "turbo_stream",
+                                e.span,
+                                reason,
+                            );
+                            return None;
+                        }
+                    };
+                    if to_string {
+                        return Some(body);
+                    }
+                    let mut new_args = vec![body];
+                    if !rest.is_empty() {
+                        new_args.push(Expr::new(
+                            args[0].span,
+                            ExprNode::Hash { entries: rest, kwargs: true },
+                        ));
+                    }
+                    merge_or_append_kwarg(
+                        &mut new_args,
+                        "content_type",
+                        crate::lower::controller::body::mime_for_format("turbo_stream"),
+                        e.span,
+                    );
                     return Some(Expr::new(
                         e.span,
                         ExprNode::Send {
@@ -329,6 +460,16 @@ pub(super) fn rewrite_render_to_views(
                 }
                 ExprNode::Hash { entries, kwargs: true } => {
                     let mut name: Option<Symbol> = None;
+                    let callback = entries.iter().find_map(|(key, value)| {
+                        matches!(&*key.node, ExprNode::Lit { value: Literal::Sym { value } }
+                            if value.as_str() == "callback").then_some(value)
+                    });
+                    let jsonp = callback.is_some_and(|value| matches!(&*value.node,
+                        ExprNode::Lit { value: Literal::Str { value } } if !value.trim().is_empty()));
+                    // `template:` / `action:` naming a value only the
+                    // running program knows (`render(template: template)`
+                    // with `template` a local).
+                    let mut dynamic_template: Option<Expr> = None;
                     // (expr, content_type-to-tag) — html carries None
                     // (text/html is the runtime default).
                     let mut body: Option<(Expr, Option<&str>)> = None;
@@ -344,7 +485,12 @@ pub(super) fn rewrite_render_to_views(
                             // own `allow_browser` fallback is `render
                             // template: "sessions/incompatible_browser"`
                             // in campfire. The slash is resolved below.
-                            "action" | "template" => name = render_target_symbol(v),
+                            "action" | "template" => {
+                                name = render_target_symbol(v);
+                                if name.is_none() {
+                                    dynamic_template = Some(v.clone());
+                                }
+                            }
                             // `render html:` / `render plain:` — a body
                             // expression, not a template name. Normalized
                             // below to the positional-body form the runtime
@@ -383,14 +529,57 @@ pub(super) fn rewrite_render_to_views(
                             // "application/json"`, the writer's text.
                             "json" => {
                                 // Not encoded again: Rails' json renderer sends a String as it is (`json.to_json unless json.kind_of?(String)`); `json_render_encode`'s other callers encode one.
-                                let encoded = if matches!(v.ty.as_ref(), Some(Ty::Str)) { v.clone() } else { json_render_body(v) };
-                                body = Some((encoded, Some("application/json")))
+                                let mut encoded = if matches!(v.ty.as_ref(), Some(Ty::Str)) { v.clone() } else { json_render_body(v, jsonp) };
+                                if jsonp {
+                                    encoded = Expr::new(v.span, ExprNode::Send {
+                                        recv: Some(Expr::new(v.span, ExprNode::Const { path: vec![Symbol::from("JsonBuilder")] })),
+                                        method: Symbol::from("jsonp"), args: vec![encoded, callback.unwrap().clone()],
+                                        block: None, parenthesized: true,
+                                    });
+                                }
+                                body = Some((encoded, Some(if jsonp { "text/javascript" } else { JSON_RESPONSE_TYPE })))
                             }
                             // The flattener's dispatch marker, read by
                             // `render_kwargs_have_format` above.
                             "format" => {}
                             _ => rest.push((k.clone(), v.clone())),
                         }
+                    }
+                    if entries.iter().any(|(key, _)| matches!(&*key.node,
+                        ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "json"))
+                    {
+                        if jsonp {
+                            for (key, value) in &mut rest {
+                                if matches!(&*key.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "content_type") {
+                                    match &*value.node {
+                                        ExprNode::Lit { value: Literal::Str { value: mime } }
+                                            if mime == "application/json" || mime.strip_prefix("application/json;")
+                                                .is_some_and(|parameters| parameters.trim_start().starts_with("charset=")) => {
+                                            // Rails replaces the exact JSON media type, preserving
+                                            // its existing charset. Non-charset parameters remain
+                                            // part of Rails' media type and pass through unchanged.
+                                            let suffix = &mime["application/json".len()..];
+                                            *value = str_lit(value.span, &format!("text/javascript{suffix}"));
+                                        }
+                                        ExprNode::Lit { value: Literal::Str { .. } } => {}
+                                        _ => {
+                                            let mut d = crate::lower::residue_diagnostic("controller_render", "jsonp_content_type", value.span,
+                                                "jsonp_content_type_not_modelled", "JSONP content_type must be a literal media type".into());
+                                            d.severity = crate::diagnostic::Severity::Error;
+                                            crate::emit::diagnostics::push(d);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Literal blank callbacks do not wrap a response.
+                        // Nonliteral callback options retain previous handling.
+                        if callback.is_none_or(|v| matches!(&*v.node,
+                            ExprNode::Lit { value: Literal::Str { .. } | Literal::Nil | Literal::Bool { value: false } })) {
+                            rest.retain(|(key, _)| !matches!(&*key.node,
+                                ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "callback"));
+                        }
+                        refuse_serializer_options(&mut rest);
                     }
                     if name.is_none() {
                         // Non-template render: `render html: X, layout:
@@ -400,6 +589,37 @@ pub(super) fn rewrite_render_to_views(
                         // status: N, content_type: "text/plain")`. A
                         // `layout: false` entry is dropped (no layout is
                         // already the runtime default for a body render).
+                        // Views are compiled to one method each, found by
+                        // a name written in the source; one named at run
+                        // time has none to call. It raises what a render
+                        // of an unemitted template does, naming it.
+                        if let (None, Some(template)) = (&body, &dynamic_template) {
+                            let span = e.span;
+                            return Some(Expr::new(
+                                span,
+                                ExprNode::Raise {
+                                    value: Expr::new(
+                                        span,
+                                        ExprNode::Send {
+                                            recv: Some(typed_exception_const(&["ActionView", "MissingTemplate"], span)),
+                                            method: Symbol::from("new"),
+                                            args: vec![Expr::new(
+                                                span,
+                                                ExprNode::Send {
+                                                    recv: Some(template.clone()),
+                                                    method: Symbol::from("to_s"),
+                                                    args: Vec::new(),
+                                                    block: None,
+                                                    parenthesized: true,
+                                                },
+                                            )],
+                                            block: None,
+                                            parenthesized: true,
+                                        },
+                                    ),
+                                },
+                            ));
+                        }
                         let Some((body_expr, tagged_content_type)) = body else { return None };
                         rest.retain(|(k, v)| {
                             let is_layout_false = matches!(
@@ -487,6 +707,26 @@ pub(super) fn rewrite_render_to_views(
             // implicit render's js arm — same qualified-stem rule.
             let is_js = render_kwargs_have_format(args, "js");
             let is_json = render_kwargs_have_format(args, "json");
+            // Mastodon's `custom_css#show`: `resolve_formats_only_render`
+            // plants the same `format:` marker for a resolvable
+            // `content_type:`, so this reads the same way `svg` does.
+            let is_css = render_kwargs_have_format(args, "css");
+            // Unlike `svg`/`js`/`json`, a css-marked render isn't
+            // guaranteed a `_css`-suffixed template: `render
+            // content_type: :css` names no template at all, and an
+            // action can answer it with its ONLY (format-agnostic)
+            // template — a bare `show.erb`, ingested as the `html`
+            // view — the same way a feed format falls back to a
+            // format-agnostic template below. `css_qualified` gates
+            // the contract-stem and final dispatch the same way
+            // `feed_qualified` already does, so a controller with no
+            // `show.css.erb` sibling gets its one template (with
+            // `content_type: "text/css"` still set) instead of a
+            // `MissingTemplate` raise for a template that was never
+            // going to exist (CodeRabbit 4277530506).
+            let css_qualified = is_css
+                && view_ivars.contains_key(&(render_module.clone(), format!("{}_css", view_method.as_str())));
+            let is_md = render_kwargs_have_format(args, "md");
             // A feed branch (`format.rss { render action: "stories" }`):
             // the format-qualified template (`stories.rss.builder` →
             // `stories_rss`) when there is one, else a format-AGNOSTIC
@@ -505,8 +745,12 @@ pub(super) fn rewrite_render_to_views(
                 format!("{}_turbo_stream", view_method.as_str())
             } else if is_svg {
                 format!("{}_svg", view_method.as_str())
+            } else if css_qualified {
+                format!("{}_css", view_method.as_str())
             } else if is_js {
                 format!("{}_js", view_method.as_str())
+            } else if is_md {
+                format!("{}_md", view_method.as_str())
             } else if is_json {
                 // Same reason the two above are qualified: the contract
                 // is keyed by the FORMAT-QUALIFIED stem. Asking for the
@@ -534,7 +778,7 @@ pub(super) fn rewrite_render_to_views(
             // that is right there. Same trap the `svg` note above
             // describes, entered from the other side.
             let mut json_only = false;
-            if contract.is_none() && !is_json && !is_turbo_stream && !is_svg {
+            if contract.is_none() && !is_json && !is_turbo_stream && !is_svg && !is_css && !is_md {
                 let json_stem = format!("{}_json", view_method.as_str());
                 if let Some(c) = view_ivars.get(&(render_module.clone(), json_stem)) {
                     contract = Some(c);
@@ -580,7 +824,7 @@ pub(super) fn rewrite_render_to_views(
             let mut subclass_hook: Option<Symbol> = None;
             if contract.is_none() {
                 let mut stems: Vec<(String, bool)> = vec![(contract_stem.clone(), false)];
-                if !is_json && !is_turbo_stream && !is_svg {
+                if !is_json && !is_turbo_stream && !is_svg && !is_css && !is_md {
                     stems.push((format!("{}_json", view_method.as_str()), true));
                 }
                 'stems: for (stem, via_json_only) in stems {
@@ -643,12 +887,12 @@ pub(super) fn rewrite_render_to_views(
                 if is_turbo_stream {
                     (
                         Symbol::from(format!("{}_turbo_stream", view_method.as_str())),
-                        Some("text/vnd.turbo-stream.html"),
+                        Some(crate::lower::controller::body::mime_for_format("turbo_stream")),
                     )
                 } else if json_format {
                     (
                         Symbol::from(format!("{}_json", view_method.as_str())),
-                        Some("application/json"),
+                        Some(JSON_RESPONSE_TYPE),
                     )
                 } else if is_svg {
                     // campfire's avatar initials. Same shape as the two
@@ -659,10 +903,31 @@ pub(super) fn rewrite_render_to_views(
                         Symbol::from(format!("{}_svg", view_method.as_str())),
                         Some(crate::lower::controller::body::mime_for_format("svg")),
                     )
+                } else if is_css {
+                    // Mastodon's `custom_css#show` — same shape as
+                    // `svg`, but the view method is the qualified one
+                    // only when `show.css.erb` actually exists
+                    // (`css_qualified`); otherwise the action's only
+                    // (format-agnostic) template answers, same as
+                    // `feed_fmt` below falls back for rss/atom/xml.
+                    // The MIME is `text/css` either way — that's the
+                    // whole point of `render content_type: :css` with
+                    // no template name.
+                    let m = if css_qualified {
+                        Symbol::from(format!("{}_css", view_method.as_str()))
+                    } else {
+                        view_method
+                    };
+                    (m, Some(crate::lower::controller::body::mime_for_format("css")))
                 } else if is_js {
                     (
                         Symbol::from(format!("{}_js", view_method.as_str())),
                         Some(crate::lower::controller::body::mime_for_format("js")),
+                    )
+                } else if is_md {
+                    (
+                        Symbol::from(format!("{}_md", view_method.as_str())),
+                        Some(crate::lower::controller::body::mime_for_format("md")),
                     )
                 } else if let Some(f) = feed_fmt {
                     // The feed's MIME either way; the method is the
@@ -695,13 +960,33 @@ pub(super) fn rewrite_render_to_views(
                 view_args.push(flash_lookup(e.span, "notice"));
                 view_args.push(flash_lookup(e.span, "alert"));
                 if pass_action_name {
-                    view_args.push(str_lit(e.span, &current_action));
+                    view_args.push(if is_action {
+                        str_lit(e.span, &current_action)
+                    } else {
+                        Expr::new(e.span, ExprNode::Send {
+                            recv: Some(Expr::new(e.span, ExprNode::SelfRef)),
+                            method: Symbol::from("action_name"),
+                            args: vec![],
+                            block: None,
+                            parenthesized: true,
+                        })
+                    });
                 }
                 if pass_controller_name {
-                    view_args.push(str_lit(e.span, &controller_name));
+                    view_args.push(if is_action {
+                        str_lit(e.span, &controller_name)
+                    } else {
+                        Expr::new(e.span, ExprNode::Send {
+                            recv: Some(Expr::new(e.span, ExprNode::SelfRef)),
+                            method: Symbol::from("controller_name"),
+                            args: vec![],
+                            block: None,
+                            parenthesized: true,
+                        })
+                    });
                 }
                 if pass_path_parameters {
-                    view_args.push(ivar("path_parameters", e.span));
+                    view_args.push(view_path_parameters(overlaid, e.span));
                 }
             }
             // Digit-leading stems (`about/404`) carry a `_` prefix on the
@@ -842,7 +1127,7 @@ fn strip_format_kwarg(arg: &Expr) -> Option<Expr> {
 /// append the entry to it; otherwise push a fresh kwarg Hash with
 /// just this entry. The runtime's `render(body, status:, content_type:)`
 /// expects ONE kwargs hash, not multiple.
-/// `ActionController::JsonRender.encode(<value>)` — the runtime JSON
+/// `ActionController::JsonRender.encode_escaped(<value>)` — the runtime JSON
 /// encoder behind inline `render json: <expr>` whose value neither
 /// `as_json_poro` nor the primitive-collection path handles. The ruby family
 /// answers it via runtime/spinel/action_controller_json_render.rb
@@ -896,14 +1181,79 @@ fn html_escape_call(value: &Expr) -> Expr {
     )
 }
 
+/// active_model_serializers' `render json:` options. The runtime
+/// `render(body, status:, content_type:, location:)` takes none of
+/// them, so passed through they raised `ArgumentError (unknown
+/// keywords)` on the first request, and the body would have been the
+/// value's own `to_json` rather than the serializer's. Rendering through
+/// the serializer is not modelled: each such render is an error residue
+/// (it keeps the route with Rails), and its keywords are not emitted.
+const SERIALIZER_OPTIONS: [&str; 4] = ["serializer", "each_serializer", "adapter", "root"];
+
+///
+/// The residue sits on the option's key, inside the action alone: the
+/// render call's own start is shared by the controller's synthesized
+/// methods (`controller_name`, …) every route reaches, so anchored there
+/// it would keep the controller's other actions with Rails too.
+fn refuse_serializer_options(rest: &mut Vec<(Expr, Expr)>) {
+    let key_of = |k: &Expr| match &*k.node {
+        ExprNode::Lit { value: Literal::Sym { value } } => SERIALIZER_OPTIONS.iter().position(|o| *o == value.as_str()),
+        _ => None,
+    };
+    let Some((first, span)) = rest.iter().filter_map(|(k, _)| key_of(k).map(|i| (i, k.span))).min_by_key(|(i, _)| *i) else {
+        return;
+    };
+    rest.retain(|(k, _)| key_of(k).is_none());
+    let option = SERIALIZER_OPTIONS[first];
+    let mut d = crate::lower::residue_diagnostic(
+        "controller_render",
+        "render_json_serializer",
+        span,
+        "serializer_render_not_modelled",
+        format!(
+            "`render json:` with `{option}:` is not lowered: rendering through an active_model_serializers \
+             serializer is not modelled, and the runtime `render` takes no serializer options"
+        ),
+    );
+    d.severity = crate::diagnostic::Severity::Error;
+    crate::emit::diagnostics::push(d);
+}
+
 /// `json_render_encode`, with a value that may be a String at run time sent as it is (`JsonRender.body`).
-fn json_render_body(value: &Expr) -> Expr {
+fn json_render_body(value: &Expr, jsonp: bool) -> Expr {
     let mut encoded = json_render_encode(value);
+    if let ExprNode::Send { method, .. } = &mut *encoded.node
+        && method.as_str() == "encode_escaped"
+    {
+        *method = Symbol::from("encode");
+    }
+    if let ExprNode::Send { method, args, .. } = &mut *encoded.node
+        && method.as_str() == "escape_html_entities"
+    {
+        *method = Symbol::from("escape_json_response");
+        if jsonp {
+            args.push(Expr::new(value.span, ExprNode::Lit { value: Literal::Bool { value: true } }));
+        }
+    }
     if may_be_str(value.ty.as_ref())
         && let ExprNode::Send { method, .. } = &mut *encoded.node
         && method.as_str() == "encode"
     {
         *method = Symbol::from("body");
+    }
+    if jsonp && let ExprNode::Send { method, .. } = &mut *encoded.node {
+        match method.as_str() {
+            "encode" => *method = Symbol::from("encode_for_callback"),
+            "body" => *method = Symbol::from("body_for_callback"),
+            _ => {}
+        }
+    }
+    if !jsonp && let ExprNode::Send { method, args, .. } = &mut *encoded.node
+        && matches!(method.as_str(), "encode" | "body" | "escape_json_response")
+    {
+        args.push(Expr::new(value.span, ExprNode::Send {
+            recv: None, method: Symbol::from("json_render_escape"), args: vec![], block: None, parenthesized: true,
+        }));
     }
     encoded
 }
@@ -939,7 +1289,7 @@ pub(super) fn json_render_encode(value: &Expr) -> Expr {
         value.span,
         ExprNode::Send {
             recv: Some(recv),
-            method: Symbol::from(if primitive_collection { "generate" } else { "encode" }),
+            method: Symbol::from(if primitive_collection { "generate" } else { "encode_escaped" }),
             args: vec![if primitive_collection { crate::lower::to_json::finite_floats(value.clone()) } else { value.clone() }],
             block: None,
             parenthesized: true,
@@ -978,7 +1328,7 @@ fn json_collection_type(ty: &Ty) -> bool {
 
 /// Prove primitive contents from inferred types or nested literal shapes,
 /// including empty literals whose element types remain unconstrained.
-fn json_primitive_value(value: &Expr) -> bool {
+pub(crate) fn json_primitive_value(value: &Expr) -> bool {
     if value.ty.as_ref().is_some_and(json_primitive_type) {
         return true;
     }
@@ -1075,19 +1425,38 @@ fn merge_or_append_kwarg(args: &mut Vec<Expr>, key: &str, value: &str, span: Spa
 // to children of the parent. Spinel doesn't have association proxies;
 // the parent linkage has to be made explicit at the call site.
 //
-//   @x = @parent.<assoc>.build(<args>)
+//   @x = @parent.<assoc>.build(<args>)   (or `.new(<args>)`)
 //   ─────────────────────────────────────────────────────────────────
 //   attrs = <args>.to_h
-//   attrs[:<parent>_id] = @parent.id
-//   @x = <Singular>.new(attrs)
+//   attrs[:<foreign_key>] = @parent.id
+//   @x = <Target>.new(attrs)
 //
 //   @x = @parent.<assoc>.find(<args>)
 //   ─────────────────────────────────────────────────────────────────
-//   @x = <Singular>.find(<args>)
-//   if @x.<parent>_id != @parent.id
+//   @x = <Target>.find(<args>)
+//   if @x.<foreign_key> != @parent.id
 //     head(:not_found)
 //     return
 //   end
+//
+// <Target> and <foreign_key> are the class and foreign key of the
+// declaration the parent's model reads (its own, else its nearest
+// superclass's; the last one when a model declares the name twice, as
+// with a concern's `has_many` and the model's own after the `include`).
+// A parent of no known model reads the declaration of the model its name
+// gives, when that model has the association, else the one every
+// declarer agrees on. An association no model declares keeps the
+// name-derived form (`<Singular>`, `<parent>_id`). One declared in a way
+// this call cannot reproduce (a scope that changes what it builds or
+// finds), one whose extension defines this call (`find`, `build`, …), or
+// one the parent's model does not declare (or, for a parent typed as a
+// union of models, does not declare alike) is left as written.
+//
+// A `.new` here is one `association_new` left as written. Where the
+// extension defines `build`, the proxy's `new` is Rails' own `build`
+// still, so it expands as one; an extension defining `new` declines it,
+// and a read not analyzed as the target's collection is left alone, as
+// `association_new` leaves it.
 //
 // One Assign expands to a Seq of multiple Exprs — the outer Seq the
 // emitter walks for line-per-statement output flattens implicitly.
@@ -1097,16 +1466,25 @@ pub(super) fn rewrite_assoc_through_parent_typed(
     expr: &Expr,
     privs: &[Action],
     params_specs: &ParamsSpecs,
+    assocs: &AssocRegistry,
 ) -> Expr {
     let helper_specs = super::params::helper_spec_map(privs, params_specs);
+    let sources = super::params_sources::ParamsSources::new(
+        expr,
+        helper_specs.iter().map(|(name, spec)| (name.clone(), spec.class_id.clone())).collect(),
+        params_specs,
+    );
+    let mut names = HashSet::default();
+    collect_build_local_names(expr, &mut names);
+    let names = std::cell::RefCell::new(names);
+    let mut expression_assigns = HashSet::default();
+    collect_expression_assigns(expr, true, &mut expression_assigns);
     map_expr(expr, &|e| {
         let ExprNode::Assign { target, value } = &*e.node else {
             return None;
         };
-        // Build/Find expansions synthesize `@<lhs>`-shaped follow-on
-        // statements, so they require an ivar LHS; the single-statement
-        // FindBy rewrite works for local assigns too (`comment =
-        // @article.comments.find_by(id: x)`).
+        // Find/Create retain their instance-variable destination contract.
+        // Declared builds and the single-statement FindBy also admit locals.
         let lhs = match target {
             LValue::Ivar { name } => Some(name),
             _ => None,
@@ -1122,7 +1500,7 @@ pub(super) fn rewrite_assoc_through_parent_typed(
             return None;
         };
         let kind = match outer_method.as_str() {
-            "build" => AssocKind::Build,
+            "build" | "new" => AssocKind::Build,
             // Rails' `create` on an association is `build` + save, over
             // an attribute HASH. A typed params object handed to the
             // runtime's `create` would be indexed like a Hash and
@@ -1135,7 +1513,8 @@ pub(super) fn rewrite_assoc_through_parent_typed(
             "find_by" => AssocKind::FindBy,
             _ => return None,
         };
-        if lhs.is_none() && !matches!(kind, AssocKind::FindBy) {
+        let local_build = matches!(target, LValue::Var { .. }) && matches!(kind, AssocKind::Build);
+        if lhs.is_none() && !local_build && !matches!(kind, AssocKind::FindBy) {
             return None;
         }
         // `find` needs its id arg; `build` may be bare (`@story.comments.
@@ -1162,32 +1541,108 @@ pub(super) fn rewrite_assoc_through_parent_typed(
         let ExprNode::Ivar { name: parent_name } = &*inner_recv.node else {
             return None;
         };
-        // The foreign key below comes from the ivar's name and the
-        // parent's value from `.id`; an association keyed on another
-        // owner column (`primary_key:`) needs the declaration instead.
-        if params_specs.is_keyed_assoc(assoc_method) {
+        // The class and foreign key come from the declaration
+        // (`class_name:`, `foreign_key:`) the parent's analyzed class
+        // (or, untyped, its name) reads, the parent's value from `.id`.
+        // A declaration that expansion cannot reproduce (`primary_key:`,
+        // `through:`, `as:`, a scope that changes what this call builds
+        // or finds), an extension method by this call's name, or a
+        // parent model without the association (any of a union's) is
+        // declined, and the typed association seed handles or refuses
+        // the call instead.
+        // `find_by(id: …)`: at most one row, whatever the scope's order.
+        // Not an Array or Range of ids, which can match several, so the
+        // order still picks among them.
+        let by_id = matches!(kind, AssocKind::FindBy)
+            && outer_args.first().is_some_and(|arg| match &*arg.node {
+                ExprNode::Hash { entries, kwargs: true } => entries.iter().any(|(k, v)| {
+                    matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "id")
+                        && !matches!(&*v.node, ExprNode::Array { .. } | ExprNode::Range { .. })
+                        && !matches!(v.ty.as_ref(), Some(crate::ty::Ty::Array { .. }))
+                        && !matches!(v.ty.as_ref(), Some(crate::ty::Ty::Class { id, .. }) if id.0.as_str() == "Range")
+                }),
+                _ => false,
+            });
+        let (model_class, fk) = match assocs.build_target(inner_recv, assoc_method, outer_method, by_id) {
+            AssocBuildTarget::Declared { target, foreign_key } => {
+                (target.0.as_str().to_string(), foreign_key.as_str().to_string())
+            }
+            AssocBuildTarget::Declined => return None,
+            AssocBuildTarget::Undeclared if local_build || outer_method.as_str() == "new" => return None,
+            AssocBuildTarget::Undeclared => (
+                crate::naming::singularize_camelize(assoc_method.as_str()),
+                format!("{}_id", parent_name.as_str()),
+            ),
+        };
+        // `association_new`'s guard, for the `.new` it left: a method
+        // named like an association may return an unrelated class.
+        if outer_method.as_str() == "new" && !reads_collection_of(outer_recv, &model_class) {
             return None;
         }
-        let model_class = crate::naming::singularize_camelize(assoc_method.as_str());
-        let fk = format!("{}_id", parent_name.as_str());
         Some(match kind {
             AssocKind::Build => {
-                let lhs = lhs.expect("checked above");
-                if outer_args.is_empty() {
-                    return Some(expand_build_bare(&model_class, &fk, parent_name, lhs, e.span));
+                let spec = outer_args.first().and_then(|arg| {
+                    let class = sources.class(arg, params_specs)?;
+                    params_specs.iter().find(|spec| spec.class_id == class)
+                });
+                if let Some(spec) = spec {
+                    if !has_typed_factory(&model_class, spec) {
+                        return None;
+                    }
+                } else if outer_args.first().is_some_and(|arg| !sources.is_hash(arg)) {
+                    return None;
                 }
-                if let Some(spec) = match_params_helper(&outer_args[0], &helper_specs, params_specs) {
-                    return Some(expand_build_typed(
+                // Resolve the owner before evaluating attributes, which may
+                // reassign the parent ivar. Generated names cannot capture
+                // a written local or block parameter in this action.
+                let mut names = names.borrow_mut();
+                let owner_name = fresh_build_local("owner", &mut names);
+                let owner = Expr::new(e.span, ExprNode::Var { id: VarId(0), name: owner_name.clone() });
+                let mut owner_read = inner_recv.clone();
+                owner_read.decisions |= crate::expr::BUILD_OWNER;
+                let capture = Expr::new(e.span, ExprNode::Assign {
+                    target: LValue::Var { id: VarId(0), name: owner_name },
+                    value: owner_read,
+                });
+                let build_target = if spec.is_some() || outer_args.is_empty() {
+                    LValue::Var { id: VarId(0), name: fresh_build_local("record", &mut names) }
+                } else {
+                    target.clone()
+                };
+                let built = if outer_args.is_empty() {
+                    expand_build_bare(&model_class, &fk, &owner, &build_target, e.span)
+                } else if let Some(spec) = spec {
+                    expand_build_typed(
                         &model_class,
                         &fk,
-                        parent_name,
-                        lhs,
+                        &owner,
+                        &build_target,
                         &outer_args[0],
                         super::params::model_from_params_name(spec),
                         e.span,
-                    ));
+                    )
+                } else {
+                    expand_build(&model_class, &fk, &owner, target, &outer_args[0], e.span)
+                };
+                let ExprNode::Seq { mut exprs } = *built.node else { unreachable!("build sequence") };
+                if spec.is_some() || outer_args.is_empty() {
+                    // The source destination is assigned only after the
+                    // constructor and FK setter have both completed.
+                    let value = exprs.pop().expect("build result");
+                    exprs.push(Expr::new(e.span, ExprNode::Assign { target: target.clone(), value }));
                 }
-                expand_build(&model_class, &fk, parent_name, lhs, &outer_args[0], e.span)
+                let body = Expr::new(e.span, ExprNode::Seq {
+                    exprs: std::iter::once(capture).chain(exprs).collect(),
+                });
+                if !expression_assigns.contains(&e.span) {
+                    return Some(body);
+                }
+                // A local assignment can itself be a call argument or a
+                // short-circuit operand. Keep its statements at that exact
+                // evaluation site and return the assigned record.
+                Expr::new(e.span, ExprNode::BeginRescue {
+                    body, rescues: vec![], else_branch: None, ensure: None, implicit: false,
+                })
             }
             // Only the TYPED arm is recognized. An attribute-Hash
             // `create` already works through the runtime, and turning it
@@ -1195,6 +1650,9 @@ pub(super) fn rewrite_assoc_through_parent_typed(
             AssocKind::Create { bang } => {
                 let lhs = lhs.expect("checked above");
                 let spec = match_params_helper(&outer_args[0], &helper_specs, params_specs)?;
+                if !has_typed_factory(&model_class, spec) {
+                    return None;
+                }
                 expand_create_typed(
                     &model_class,
                     &fk,
@@ -1245,7 +1703,7 @@ pub(super) fn rewrite_assoc_through_parent_typed(
                         value: Expr::new(
                             e.span,
                             ExprNode::Send {
-                                recv: Some(const_path(&[&model_class], e.span)),
+                                recv: Some(model_const(&model_class, e.span)),
                                 method: Symbol::from("find_by"),
                                 args: vec![Expr::new(
                                     e.span,
@@ -1273,9 +1731,8 @@ pub(super) fn rewrite_assoc_through_parent_typed(
 ///   - the typed factory the permit chain has ALREADY become — this runs
 ///     after `rewrite_to_from_raw`, so a chain written inline at the call
 ///     site reads `<Class>.from_raw(@params)` by now;
-///   - either of those under an in-place filter (`.except(:reason)`,
-///     `.compact`), which clears presence flags and returns the object
-///     itself. lobsters writes exactly that:
+///   - either of those under a filter (`.except(:reason)`, `.compact`)
+///     returning the same params class. lobsters writes exactly that:
 ///     `@hat_request.update!(params.require(:hat_request)
 ///     .permit(:hat, :link, :reason).except(:reason))`. Matching only the
 ///     first spelling left the typed object in a plain `update!`, whose
@@ -1305,6 +1762,26 @@ fn match_params_helper<'a>(
     helper_specs.get(method).copied()
 }
 
+/// Whether `<model_class>.<factory>` exists for this params class: the
+/// model lowerer synthesizes the typed factories only on the model a
+/// list's resource names, so `has_many :comments, class_name:
+/// "Feedback"` building from `comment_params` has none to call.
+fn has_typed_factory(model_class: &str, spec: &ParamsSpec) -> bool {
+    crate::naming::snake_case(model_class) == spec.resource.as_str()
+}
+
+/// Whether `read` is analyzed as a collection of `model_class`, the
+/// reader of an association to it.
+fn reads_collection_of(read: &Expr, model_class: &str) -> bool {
+    match read.ty.as_ref().map(Ty::peel_nilable) {
+        Some(Ty::Array { elem }) => {
+            matches!(elem.peel_nilable(), Ty::Class { id, .. } if id.0.as_str() == model_class)
+        }
+        Some(Ty::Relation { of }) => of.0.as_str() == model_class,
+        _ => false,
+    }
+}
+
 enum AssocKind {
     Build,
     /// `@parent.<assoc>.create!(<params>)` — `Build` plus the save it
@@ -1328,8 +1805,8 @@ enum AssocKind {
 pub(super) fn expand_build_typed(
     model_class: &str,
     fk: &str,
-    parent: &Symbol,
-    lhs: &Symbol,
+    parent: &Expr,
+    lhs: &LValue,
     arg: &Expr,
     factory: Symbol,
     span: Span,
@@ -1337,7 +1814,7 @@ pub(super) fn expand_build_typed(
     let from_params_call = Expr::new(
         span,
         ExprNode::Send {
-            recv: Some(const_path(&[model_class], span)),
+            recv: Some(model_const(model_class, span)),
             method: factory,
             args: vec![arg.clone()],
             block: None,
@@ -1347,7 +1824,7 @@ pub(super) fn expand_build_typed(
     let lhs_assign = Expr::new(
         span,
         ExprNode::Assign {
-            target: LValue::Ivar { name: lhs.clone() },
+            target: lhs.clone(),
             value: from_params_call,
         },
     );
@@ -1355,7 +1832,7 @@ pub(super) fn expand_build_typed(
     let parent_id = Expr::new(
         span,
         ExprNode::Send {
-            recv: Some(ivar(parent.as_str(), span)),
+            recv: Some(parent.clone()),
             method: Symbol::from("id"),
             args: vec![],
             block: None,
@@ -1365,7 +1842,7 @@ pub(super) fn expand_build_typed(
     let fk_setter = Expr::new(
         span,
         ExprNode::Send {
-            recv: Some(ivar(lhs.as_str(), span)),
+            recv: Some(build_target_read(lhs, span)),
             method: Symbol::from(format!("{fk}=")),
             args: vec![parent_id],
             block: None,
@@ -1373,7 +1850,7 @@ pub(super) fn expand_build_typed(
         },
     );
 
-    Expr::new(span, ExprNode::Seq { exprs: vec![lhs_assign, fk_setter] })
+    Expr::new(span, ExprNode::Seq { exprs: vec![lhs_assign, fk_setter, build_target_read(lhs, span)] })
 }
 
 /// `@<lhs> = @<parent>.<assoc>.create!(<params>)` — the typed build,
@@ -1392,9 +1869,13 @@ fn expand_create_typed(
     bang: bool,
     span: Span,
 ) -> Expr {
-    let built = expand_build_typed(model_class, fk, parent, lhs, arg, factory, span);
+    let built = expand_build_typed(
+        model_class, fk, &ivar(parent.as_str(), span),
+        &LValue::Ivar { name: lhs.clone() }, arg, factory, span,
+    );
     let ExprNode::Seq { exprs } = &*built.node else { unreachable!("build expands to a Seq") };
     let mut exprs = exprs.clone();
+    exprs.pop().expect("typed build result");
     exprs.push(Expr::new(
         span,
         ExprNode::Send {
@@ -1420,14 +1901,14 @@ fn expand_create_typed(
 fn expand_build_bare(
     model_class: &str,
     fk: &str,
-    parent: &Symbol,
-    lhs: &Symbol,
+    parent: &Expr,
+    lhs: &LValue,
     span: Span,
 ) -> Expr {
     let new_call = Expr::new(
         span,
         ExprNode::Send {
-            recv: Some(const_path(&[model_class], span)),
+            recv: Some(model_const(model_class, span)),
             method: Symbol::from("new"),
             args: vec![],
             block: None,
@@ -1436,12 +1917,12 @@ fn expand_build_bare(
     );
     let lhs_assign = Expr::new(
         span,
-        ExprNode::Assign { target: LValue::Ivar { name: lhs.clone() }, value: new_call },
+        ExprNode::Assign { target: lhs.clone(), value: new_call },
     );
     let parent_id = Expr::new(
         span,
         ExprNode::Send {
-            recv: Some(ivar(parent.as_str(), span)),
+            recv: Some(parent.clone()),
             method: Symbol::from("id"),
             args: vec![],
             block: None,
@@ -1451,41 +1932,34 @@ fn expand_build_bare(
     let fk_setter = Expr::new(
         span,
         ExprNode::Send {
-            recv: Some(ivar(lhs.as_str(), span)),
+            recv: Some(build_target_read(lhs, span)),
             method: Symbol::from(format!("{fk}=")),
             args: vec![parent_id],
             block: None,
             parenthesized: false,
         },
     );
-    Expr::new(span, ExprNode::Seq { exprs: vec![lhs_assign, fk_setter] })
+    Expr::new(span, ExprNode::Seq { exprs: vec![lhs_assign, fk_setter, build_target_read(lhs, span)] })
 }
 
 pub(super) fn expand_build(
     model_class: &str,
     fk: &str,
-    parent: &Symbol,
-    lhs: &Symbol,
+    parent: &Expr,
+    lhs: &LValue,
     arg: &Expr,
     span: Span,
 ) -> Expr {
-    // attrs = <arg>
-    // The `.to_h` wrap is added by the params-helpers pass when <arg>
-    // is a `<x>_params` call — keeping the two concerns separate avoids
-    // double-wrapping if <arg> already has `.to_h` for some reason.
-    let attrs_assign = Expr::new(
-        span,
-        ExprNode::Assign {
-            target: LValue::Var { id: VarId(0), name: Symbol::from("attrs") },
-            value: arg.clone(),
-        },
-    );
-
-    // attrs[:<fk>] = @<parent>.id
+    // Hash#merge copies the caller's attributes and lets the declared
+    // owner key win. Both the attributes and the owner id run once.
+    let mut value = arg.clone();
+    if let ExprNode::Hash { kwargs, .. } = &mut *value.node {
+        *kwargs = false;
+    }
     let parent_id = Expr::new(
         span,
         ExprNode::Send {
-            recv: Some(ivar(parent.as_str(), span)),
+            recv: Some(parent.clone()),
             method: Symbol::from("id"),
             args: vec![],
             block: None,
@@ -1496,25 +1970,18 @@ pub(super) fn expand_build(
         span,
         ExprNode::Lit { value: Literal::Sym { value: Symbol::from(fk) } },
     );
-    let attrs_var = Expr::new(
-        span,
-        ExprNode::Var { id: VarId(0), name: Symbol::from("attrs") },
-    );
-    let index_assign = Expr::new(
-        span,
-        ExprNode::Assign {
-            target: LValue::Index { recv: attrs_var.clone(), index: fk_sym },
-            value: parent_id,
-        },
-    );
-
-    // @<lhs> = <Class>.new(attrs)
+    let attributes = Expr::new(span, ExprNode::Send {
+        recv: Some(value), method: Symbol::from("merge"),
+        args: vec![Expr::new(span, ExprNode::Hash {
+            entries: vec![(fk_sym, parent_id)], kwargs: true,
+        })], block: None, parenthesized: true,
+    });
     let new_call = Expr::new(
         span,
         ExprNode::Send {
-            recv: Some(const_path(&[model_class], span)),
+            recv: Some(model_const(model_class, span)),
             method: Symbol::from("new"),
-            args: vec![attrs_var],
+            args: vec![attributes],
             block: None,
             parenthesized: true,
         },
@@ -1522,15 +1989,97 @@ pub(super) fn expand_build(
     let final_assign = Expr::new(
         span,
         ExprNode::Assign {
-            target: LValue::Ivar { name: lhs.clone() },
+            target: lhs.clone(),
             value: new_call,
         },
     );
 
     Expr::new(
         span,
-        ExprNode::Seq { exprs: vec![attrs_assign, index_assign, final_assign] },
+        ExprNode::Seq { exprs: vec![final_assign] },
     )
+}
+
+fn build_target_read(target: &LValue, span: Span) -> Expr {
+    Expr::new(span, match target {
+        LValue::Var { id, name } => ExprNode::Var { id: *id, name: name.clone() },
+        LValue::Ivar { name } => ExprNode::Ivar { name: name.clone() },
+        _ => unreachable!("build destination is a local or instance variable"),
+    })
+}
+
+fn fresh_build_local(role: &str, names: &mut HashSet<Symbol>) -> Symbol {
+    // No leading underscore: Elixir reads `_name` as "deliberately
+    // ignored" and warns when the body then uses it; the elixir
+    // toolchain compiles with `--warnings-as-errors`. Same rule as
+    // `synth_has_many_id_reader`'s `rh_id_record`.
+    for n in 0.. {
+        let name = Symbol::from(format!("rh_build_{role}_{n}"));
+        if names.insert(name.clone()) { return name; }
+    }
+    unreachable!("local name space exhausted")
+}
+
+fn collect_build_local_names(expr: &Expr, names: &mut HashSet<Symbol>) {
+    match &*expr.node {
+        ExprNode::Var { name, .. } | ExprNode::Let { name, .. } => { names.insert(name.clone()); }
+        ExprNode::Assign { target: LValue::Var { name, .. }, .. }
+        | ExprNode::OpAssign { target: LValue::Var { name, .. }, .. } => { names.insert(name.clone()); }
+        ExprNode::MultiAssign { targets, .. } => {
+            for target in targets {
+                if let LValue::Var { name, .. } = target { names.insert(name.clone()); }
+            }
+        }
+        ExprNode::Lambda { params, rest_param, extra_params, block_param, .. } => {
+            names.extend(params.iter().chain(rest_param.iter()).chain(block_param.iter()).cloned());
+            names.extend(extra_params.iter().map(|p| p.name.clone()));
+        }
+        ExprNode::BeginRescue { rescues, .. } => {
+            names.extend(rescues.iter().filter_map(|r| r.binding.clone()));
+        }
+        _ => {}
+    }
+    expr.node.for_each_child(&mut |child| collect_build_local_names(child, names));
+}
+
+fn collect_expression_assigns(expr: &Expr, statement: bool, spans: &mut HashSet<Span>) {
+    if !statement && matches!(&*expr.node, ExprNode::Assign { .. }) {
+        spans.insert(expr.span);
+    }
+    match &*expr.node {
+        ExprNode::Seq { exprs } => {
+            for child in exprs { collect_expression_assigns(child, true, spans); }
+        }
+        ExprNode::If { cond, then_branch, else_branch } => {
+            collect_expression_assigns(cond, false, spans);
+            collect_expression_assigns(then_branch, true, spans);
+            collect_expression_assigns(else_branch, true, spans);
+        }
+        ExprNode::While { cond, body, .. } => {
+            collect_expression_assigns(cond, false, spans);
+            collect_expression_assigns(body, true, spans);
+        }
+        ExprNode::Lambda { body, extra_params, .. } => {
+            for param in extra_params {
+                if let Some(default) = &param.default { collect_expression_assigns(default, false, spans); }
+            }
+            collect_expression_assigns(body, true, spans);
+        }
+        ExprNode::Case { scrutinee, arms } => {
+            collect_expression_assigns(scrutinee, false, spans);
+            for arm in arms { collect_expression_assigns(&arm.body, true, spans); }
+        }
+        ExprNode::BeginRescue { body, rescues, else_branch, ensure, .. } => {
+            collect_expression_assigns(body, true, spans);
+            for rescue in rescues {
+                for class in &rescue.classes { collect_expression_assigns(class, false, spans); }
+                collect_expression_assigns(&rescue.body, true, spans);
+            }
+            if let Some(branch) = else_branch { collect_expression_assigns(branch, true, spans); }
+            if let Some(branch) = ensure { collect_expression_assigns(branch, true, spans); }
+        }
+        _ => expr.node.for_each_child(&mut |child| collect_expression_assigns(child, false, spans)),
+    }
 }
 
 pub(super) fn expand_find(
@@ -1545,7 +2094,7 @@ pub(super) fn expand_find(
     let find_call = Expr::new(
         span,
         ExprNode::Send {
-            recv: Some(const_path(&[model_class], span)),
+            recv: Some(model_const(model_class, span)),
             method: Symbol::from("find"),
             args: vec![arg.clone()],
             block: None,
@@ -1747,9 +2296,9 @@ pub(super) fn rewrite_update_to_typed_variant(
         // The variant exists only on the model the resource is named
         // after. With none (a record wrapped under another key), the
         // call stays Rails' `update` / `update!`; once the body is typed,
-        // `params::hand_update_the_attrs` gives it the attribute Hash
+        // `typed_update::hand_update_the_attrs` gives it the attribute Hash
         // when the argument turns out to be the params object (#856).
-        if !params_specs.has_typed_update(spec) {
+        if !super::typed_update::has_typed_update(params_specs, spec) {
             return None;
         }
         Some(Expr::new(
@@ -1760,6 +2309,36 @@ pub(super) fn rewrite_update_to_typed_variant(
                 args: vec![args[0].clone()],
                 block: None,
                 parenthesized: *parenthesized,
+            },
+        ))
+    })
+}
+
+pub(super) fn rewrite_assign_to_typed_variant(
+    expr: &Expr,
+    privs: &[Action],
+    params_specs: &ParamsSpecs,
+) -> Expr {
+    let helpers: BTreeMap<Symbol, crate::ident::ClassId> = super::params::helper_spec_map(privs, params_specs)
+        .into_iter()
+        .map(|(name, spec)| (name, spec.class_id.clone()))
+        .collect();
+    let sources = super::params_sources::ParamsSources::new(expr, helpers, params_specs);
+    map_expr(expr, &|e| {
+        let (recv, value) = super::params::attributes_assignment(e)?;
+        let class = super::params::assigned_params_class(value, &|v| sources.class(v, params_specs))?;
+        let spec = params_specs.by_class(&class)?;
+        if !spec.wants_assign || !super::typed_update::has_typed_update(params_specs, spec) {
+            return None;
+        }
+        Some(Expr::new(
+            e.span,
+            ExprNode::Send {
+                recv: Some(recv.clone()),
+                method: super::params::model_assign_name(spec),
+                args: vec![value.clone()],
+                block: None,
+                parenthesized: true,
             },
         ))
     })
@@ -1913,12 +2492,36 @@ pub(super) fn rewrite_request_format(expr: &Expr) -> Expr {
 pub(super) fn rewrite_params(expr: &Expr) -> Expr {
     map_expr(expr, &|e| match &*e.node {
         // `params.expect(...)` — recognized first so the recv is still
-        // the bare `params` Send, not the @params ivar (which would lose
-        // the recognition pattern).
+        // the original params receiver, before recursive rewrites change it.
         ExprNode::Send { recv: Some(recv), method, args, block, parenthesized }
-            if method.as_str() == "expect" && is_bare_params(recv) =>
+            if method.as_str() == "expect"
+                && is_bare_params(recv) =>
         {
             Some(rewrite_expect(args, block.as_ref(), *parenthesized, e.span))
+        }
+        ExprNode::Send { recv: Some(recv), method, args, .. }
+            if method.as_str() == "expect"
+                && matches!(&*recv.node, ExprNode::Ivar { name } if name.as_str() == "params") =>
+        {
+            let [arg] = args.as_slice() else { return None };
+            let ExprNode::Hash { entries, .. } = &*arg.node else { return None };
+            params_expect_array(entries, e.span)
+        }
+        // Not left to the emitter's typed key coercion: a guard or filter body spliced in after analysis reaches it with `@params` typed as the controller's ivar, not the String-keyed store.
+        ExprNode::Send { recv: Some(recv), method, args, block: None, parenthesized }
+            if method.as_str() == "[]" && args.len() == 1 && is_bare_params(recv) && sym_arg(&args[0]).is_some() =>
+        {
+            let key = sym_arg(&args[0])?;
+            Some(Expr::new(
+                e.span,
+                ExprNode::Send {
+                    recv: Some(Expr::new(recv.span, ExprNode::Ivar { name: Symbol::from("params") })),
+                    method: method.clone(),
+                    args: vec![Expr::new(args[0].span, ExprNode::Lit { value: Literal::Str { value: key } })],
+                    block: None,
+                    parenthesized: *parenthesized,
+                },
+            ))
         }
         // Bare `params` (no recv, no args, no block) → `@params`.
         ExprNode::Send { recv: None, method, args, block: None, .. }
@@ -2115,7 +2718,8 @@ fn sym_or_str_arg(arg: &Expr) -> Option<String> {
 
 pub(super) fn rewrite_redirect_to(
     expr: &Expr,
-    route_helpers: &std::collections::HashMap<String, Vec<bool>>,
+    shadowed: &HashSet<Symbol>,
+    route_helpers: &crate::det::HashMap<String, Vec<bool>>,
 ) -> Expr {
     map_expr(expr, &|e| match &*e.node {
         ExprNode::Send { recv: None, method, args, block, .. }
@@ -2123,7 +2727,7 @@ pub(super) fn rewrite_redirect_to(
         {
             // Two recognized first-arg shapes:
             //   - `@x` (Ivar) → wrap as `RouteHelpers.<x>_path(@x.id)`.
-            //   - `<x>_path` (no-recv Send ending in _path) → prefix
+            //   - Unshadowed `<x>_path` (no-recv Send) → prefix
             //     with RouteHelpers so all redirect_to call sites
             //     render uniformly with the parenthesized form.
             //
@@ -2157,7 +2761,7 @@ pub(super) fn rewrite_redirect_to(
                     )
                 }
                 ExprNode::Send { recv: None, method: m, args: m_args, block: m_block, parenthesized }
-                    if m.as_str().ends_with("_path") =>
+                    if m.as_str().ends_with("_path") && !shadowed.contains(m) =>
                 {
                     Expr::new(
                         first.span,
@@ -2170,10 +2774,36 @@ pub(super) fn rewrite_redirect_to(
                         },
                     )
                 }
-                _ => return None,
+                _ => first.clone(),
             };
             let mut new_args = vec![new_first];
-            new_args.extend(args.iter().skip(1).cloned());
+            let mut dropped = false;
+            for a in args.iter().skip(1) {
+                if let ExprNode::Hash { entries, kwargs: true } = &*a.node {
+                    // Not passed on: a key that is no flash type the app registered (lobsters' `success:` with no `add_flash_types`) is one Rails' redirect_to ignores, and the runtime's takes no such keyword.
+                    let kept: Vec<_> = entries
+                        .iter()
+                        .filter(|(k, _)| match &*k.node {
+                            ExprNode::Lit { value: Literal::Sym { value } } => {
+                                matches!(value.as_str(), "notice" | "alert" | "status" | "flash" | "allow_other_host")
+                            }
+                            _ => true,
+                        })
+                        .cloned()
+                        .collect();
+                    if kept.len() != entries.len() {
+                        dropped = true;
+                        if !kept.is_empty() {
+                            new_args.push(Expr::new(a.span, ExprNode::Hash { entries: kept, kwargs: true }));
+                        }
+                        continue;
+                    }
+                }
+                new_args.push(a.clone());
+            }
+            if !dropped && new_args[0] == args[0] {
+                return None;
+            }
             Some(Expr::new(
                 e.span,
                 ExprNode::Send {
@@ -2321,7 +2951,7 @@ fn polymorphic_path(ivar_name: &Symbol, span: Span) -> Expr {
 /// The `Rails.application.routes.url_helpers` receiver chain — Rails'
 /// spelling for reaching a path helper from somewhere with no helper
 /// mixin (a model, a job, a test body).
-fn is_rails_url_helpers_chain(e: &Expr) -> bool {
+pub(crate) fn is_rails_url_helpers_chain(e: &Expr) -> bool {
     let mut node = &*e.node;
     for step in ["url_helpers", "routes", "application"] {
         let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = node else {
@@ -2356,7 +2986,7 @@ fn strip_url_helpers_receiver(expr: &Expr) -> Expr {
         if !is_rails_url_helpers_chain(r) {
             return None;
         }
-        Some(Expr::new(
+        let mut bare = Expr::new(
             e.span,
             ExprNode::Send {
                 recv: None,
@@ -2365,14 +2995,23 @@ fn strip_url_helpers_receiver(expr: &Expr) -> Expr {
                 block: block.as_ref().map(strip_url_helpers_receiver),
                 parenthesized: *parenthesized,
             },
-        ))
+        );
+        // Not left to `route_url_options`: it ran while the receiver was on, and its chained form is the library emit's.
+        // Only with a `host:`: without one it would drop a `protocol:` that `url_from_path` cannot take.
+        let names_host = args.last().is_some_and(|a| matches!(&*a.node, ExprNode::Hash { entries, .. }
+            if entries.iter().any(|(k, _)| matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "host"))));
+        if names_host {
+            let helper: crate::det::HashSet<String> = std::iter::once(method.as_str().to_string()).collect();
+            crate::lower::route_url_options::rewrite_node(&mut bare, &helper);
+        }
+        Some(bare)
     })
 }
 
 pub fn rewrite_route_helpers(
     expr: &Expr,
     shadowed: &HashSet<Symbol>,
-    id_segments: &std::collections::HashMap<String, Vec<bool>>,
+    id_segments: &crate::det::HashMap<String, Vec<bool>>,
 ) -> Expr {
     rewrite_route_helpers_with(expr, shadowed, id_segments, false)
 }
@@ -2393,7 +3032,7 @@ pub fn rewrite_route_helpers(
 pub fn rewrite_controller_route_helpers(
     expr: &Expr,
     shadowed: &HashSet<Symbol>,
-    id_segments: &std::collections::HashMap<String, Vec<bool>>,
+    id_segments: &crate::det::HashMap<String, Vec<bool>>,
 ) -> Expr {
     rewrite_route_helpers_with(expr, shadowed, id_segments, true)
 }
@@ -2401,7 +3040,7 @@ pub fn rewrite_controller_route_helpers(
 fn rewrite_route_helpers_with(
     expr: &Expr,
     shadowed: &HashSet<Symbol>,
-    id_segments: &std::collections::HashMap<String, Vec<bool>>,
+    id_segments: &crate::det::HashMap<String, Vec<bool>>,
     absolute_urls: bool,
 ) -> Expr {
     let expr = &strip_url_helpers_receiver(expr);
@@ -2462,13 +3101,16 @@ fn rewrite_route_helpers_with(
                 Some(i) => &args[..i],
                 None => args.as_slice(),
             };
-            let projected_args: Vec<Expr> = args
+            let mut projected_args: Vec<Expr> = args
                 .iter()
                 .enumerate()
                 .map(|(i, arg)| {
                     let id_segment =
                         shape.map_or(true, |s| s.get(i).copied().unwrap_or(true));
-                    let needs_id = id_segment && match &*arg.node {
+                    // Not a value typed as a scalar: a call answering a
+                    // String or an Integer is its own `to_param`
+                    // (`shelf_path(Links.locale_for(user), 4)`).
+                    let needs_id = id_segment && !types_to_a_scalar(arg) && match &*arg.node {
                         ExprNode::Ivar { .. } => true,
                         ExprNode::Send { recv: Some(r), method, .. }
                             if method.as_str() != "id" =>
@@ -2502,6 +3144,28 @@ fn rewrite_route_helpers_with(
                     }
                 })
                 .collect();
+            // The path, with its query suffix when the call carried one;
+            // a controller's `_url` then takes the host half on top.
+            let absolute = absolute_urls && raw.ends_with("_url");
+            // Not query keys: a `_url`'s `protocol:` and `port:` are the host half, over the class's `default_url_options`.
+            let mut call_protocol: Option<Expr> = None;
+            let mut call_port: Option<Expr> = None;
+            if absolute
+                && let Some(last) = projected_args.last_mut()
+                && let ExprNode::Hash { entries, kwargs: true } = &mut *last.node
+            {
+                let mut take = |key: &str| {
+                    entries
+                        .iter()
+                        .position(|(k, _)| matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == key))
+                        .map(|i| entries.remove(i).1)
+                };
+                call_protocol = take("protocol");
+                call_port = take("port");
+                if entries.is_empty() {
+                    projected_args.pop();
+                }
+            }
             let call = Expr::new(
                 e.span,
                 ExprNode::Send {
@@ -2514,19 +3178,26 @@ fn rewrite_route_helpers_with(
                     parenthesized: *parenthesized,
                 },
             );
-            // The path, with its query suffix when the call carried one;
-            // a controller's `_url` then takes the host half on top.
-            let absolute = absolute_urls && raw.ends_with("_url");
             let to_url = |path: Expr| {
                 if !absolute {
                     return path;
+                }
+                let nil = || Expr::new(e.span, ExprNode::Lit { value: Literal::Nil });
+                let mut url_args = vec![path];
+                if call_protocol.is_some() || call_port.is_some() {
+                    url_args.push(call_protocol.clone().unwrap_or_else(nil));
+                }
+                if let Some(port) = call_port.clone() {
+                    // Not the port alone: an explicit `port: nil` clears the class's port, as an omitted one does not.
+                    url_args.push(port);
+                    url_args.push(Expr { ty: Some(crate::ty::Ty::Bool), ..Expr::new(e.span, ExprNode::Lit { value: Literal::Bool { value: true } }) });
                 }
                 Expr::new(
                     e.span,
                     ExprNode::Send {
                         recv: None,
                         method: Symbol::from("url_from_path"),
-                        args: vec![path],
+                        args: url_args,
                         block: None,
                         parenthesized: true,
                     },
@@ -2594,7 +3265,7 @@ fn rewrite_route_helpers_with(
 pub fn route_helper_query_splat_index(
     method: &str,
     args: &[Expr],
-    id_segments: &std::collections::HashMap<String, Vec<bool>>,
+    id_segments: &crate::det::HashMap<String, Vec<bool>>,
 ) -> Option<usize> {
     let dispatch = method
         .strip_suffix("_url")
@@ -2648,17 +3319,22 @@ fn params_option_value(arg: &Expr) -> Option<&Expr> {
 /// body-typer. A route helper's segment parameter is an id; an argument
 /// that types to a class is a record standing where its id belongs.
 /// Idempotent — a projected argument types `Integer`, not a class.
-pub fn project_route_helper_ids(expr: &Expr) -> Expr {
-    map_expr(expr, &project_route_helper_ids_node)
+///
+/// `direct_helpers` (`routes::direct_helper_names`) are the app's
+/// `direct` helpers: a block that receives its options hash as written
+/// (`options[:preview]`, where `"false"` would be truthy), so a scalar
+/// under one of their keys is left as it is.
+pub fn project_route_helper_ids(expr: &Expr, direct_helpers: &crate::det::HashSet<String>) -> Expr {
+    map_expr(expr, &|e: &Expr| project_route_helper_ids_node(e, direct_helpers))
 }
 
 /// In-place twin. Returns whether any argument was projected so the
 /// test lowerer can skip a follow-up typing pass.
-pub fn project_route_helper_ids_in_place(expr: &mut Expr) -> bool {
-    map_expr_mut(expr, &project_route_helper_ids_node)
+pub fn project_route_helper_ids_in_place(expr: &mut Expr, direct_helpers: &crate::det::HashSet<String>) -> bool {
+    map_expr_mut(expr, &|e: &Expr| project_route_helper_ids_node(e, direct_helpers))
 }
 
-fn project_route_helper_ids_node(e: &Expr) -> Option<Expr> {
+fn project_route_helper_ids_node(e: &Expr, direct_helpers: &crate::det::HashSet<String>) -> Option<Expr> {
     let ExprNode::Send { recv: Some(r), method, args, block, parenthesized } = &*e.node else {
         return None;
     };
@@ -2670,10 +3346,17 @@ fn project_route_helper_ids_node(e: &Expr) -> Option<Expr> {
     if !(method.as_str().ends_with("_path") || method.as_str().ends_with("_url")) {
         return None;
     }
-    if !args.iter().any(arg_carries_a_model) && !args.iter().any(query_carries_an_int) {
+    let direct = direct_helpers.contains(method.as_str());
+    if !args.iter().any(arg_carries_a_model) && (direct || !args.iter().any(query_carries_a_scalar)) {
         return None;
     }
-    let projected: Vec<Expr> = args.iter().map(project_arg).collect();
+    // A helper call nested in an argument (`next: inner_path(flag: true)`)
+    // is projected first: the walk doesn't revisit a replacement, so once
+    // this call is rebuilt the nested one would keep its own options.
+    let projected: Vec<Expr> = args
+        .iter()
+        .map(|a| project_arg(&project_route_helper_ids(a, direct_helpers), direct))
+        .collect();
     Some(Expr::new(
         e.span,
         ExprNode::Send {
@@ -2684,6 +3367,21 @@ fn project_route_helper_ids_node(e: &Expr) -> Option<Expr> {
             parenthesized: *parenthesized,
         },
     ))
+}
+
+/// Is `arg` typed as a String, Symbol, number or boolean (or a union of
+/// them, nil included)? Rails renders such a value with its own
+/// `to_param`; it has no `id`.
+fn types_to_a_scalar(arg: &Expr) -> bool {
+    use crate::ty::Ty;
+    fn scalar(t: &Ty) -> bool {
+        match t {
+            Ty::Str | Ty::Sym | Ty::Int | Ty::Float | Ty::Bool | Ty::Nil => true,
+            Ty::Union { variants } => variants.iter().all(scalar),
+            _ => false,
+        }
+    }
+    arg.ty.as_ref().is_some_and(scalar)
 }
 
 /// A route-helper argument with every model instance in it projected
@@ -2698,9 +3396,10 @@ fn project_route_helper_ids_node(e: &Expr) -> Option<Expr> {
 /// at all — campfire's `messages_controller_test` pages this way twice.
 ///
 /// Only the VALUES move. A key is a Symbol by construction.
-fn project_arg(a: &Expr) -> Expr {
+fn project_arg(a: &Expr, direct: bool) -> Expr {
+    let query_text = |k: &Expr, v: &Expr| !direct && query_text_in_slot(k, v);
     if let ExprNode::Hash { entries, kwargs } = &*a.node {
-        if entries.iter().any(|(k, v)| records_a_model(v) || int_in_query_slot(k, v)) {
+        if entries.iter().any(|(k, v)| records_a_model(v) || query_text(k, v)) {
             // `to_param`, not `id`: a query value is a String on the
             // wire and the helper's option is typed `String?` (the
             // name-based rule in `routes_to_library::param_ty` — only
@@ -2715,7 +3414,7 @@ fn project_arg(a: &Expr) -> Expr {
                 .map(|(k, v)| {
                     let v = if records_a_model(v) {
                         to_s_of(id_of(v))
-                    } else if int_in_query_slot(k, v) {
+                    } else if query_text(k, v) {
                         to_s_of(v.clone())
                     } else {
                         v.clone()
@@ -2727,31 +3426,69 @@ fn project_arg(a: &Expr) -> Expr {
         }
         return a.clone();
     }
-    if records_a_model(a) {
+    // A `direct` helper's block is given the record itself; its own
+    // `route_for` takes the id where a segment wants one.
+    if records_a_model(a) && !direct {
         return id_of(a);
     }
     a.clone()
 }
 
-/// An Integer-typed value under a query key the helper types
+/// How a scalar under a query key reaches a helper that types the key
 /// `String?` — every key but `id` / `*_id` (Integer segments) and
-/// `format`.
-pub(crate) fn int_in_query_slot(k: &Expr, v: &Expr) -> bool {
+/// `format`. Rails writes a query value with `to_param`, which on a
+/// scalar is its `to_s` (`featured: true` is `?featured=true`, `ratio:
+/// 1.5` is `?ratio=1.5`), and leaves a nil value out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum QueryScalar {
+    /// An Integer, Float or boolean: its `to_s`.
+    Text,
+    /// One of those or nil: its `to_s` when it isn't nil, so the helper
+    /// still leaves the key out for a nil.
+    TextOrNil,
+}
+
+pub(crate) fn scalar_in_query_slot(k: &Expr, v: &Expr) -> Option<QueryScalar> {
     let ExprNode::Lit { value: crate::expr::Literal::Sym { value: key } } = &*k.node else {
-        return false;
+        return None;
     };
     let key = key.as_str();
     if key == "id" || key.ends_with("_id") || key == "format" {
-        return false;
+        return None;
     }
-    matches!(v.ty, Some(crate::ty::Ty::Int))
+    scalar_value(v)
 }
 
-/// Is there an Integer in a String-typed query slot anywhere
+/// What a scalar value needs to reach a `String?` query slot: its
+/// `to_s`, or its `to_s` with nil kept. `None` for anything else.
+pub(crate) fn scalar_value(v: &Expr) -> Option<QueryScalar> {
+    use crate::ty::Ty;
+    let scalar = |t: &Ty| matches!(t, Ty::Int | Ty::Float | Ty::Bool);
+    match v.ty.as_ref()? {
+        t if scalar(t) => Some(QueryScalar::Text),
+        Ty::Union { variants }
+            if variants.contains(&Ty::Nil)
+                && variants.iter().any(|t| scalar(t))
+                && variants.iter().all(|t| scalar(t) || *t == Ty::Nil) =>
+        {
+            Some(QueryScalar::TextOrNil)
+        }
+        _ => None,
+    }
+}
+
+/// A value under a query key that `project_arg` turns into its `to_s`.
+/// A test body has no fresh local to keep a nil in, so only a value
+/// that can't be nil counts here.
+fn query_text_in_slot(k: &Expr, v: &Expr) -> bool {
+    scalar_in_query_slot(k, v) == Some(QueryScalar::Text)
+}
+
+/// Is there a scalar in a String-typed query slot anywhere
 /// `project_arg` would reach?
-fn query_carries_an_int(a: &Expr) -> bool {
+fn query_carries_a_scalar(a: &Expr) -> bool {
     match &*a.node {
-        ExprNode::Hash { entries, .. } => entries.iter().any(|(k, v)| int_in_query_slot(k, v)),
+        ExprNode::Hash { entries, .. } => entries.iter().any(|(k, v)| query_text_in_slot(k, v)),
         _ => false,
     }
 }
@@ -2823,6 +3560,205 @@ pub(crate) fn const_path(segments: &[&str], span: Span) -> Expr {
     )
 }
 
+/// The type a json RENDER goes out under: Rails stamps the charset on
+/// `render json:` and on a json template, but not on a bodyless `head`
+/// (`head :ok, content_type: :json` is bare `application/json`, which
+/// is why `mime_for_format` keeps that spelling).
+pub(crate) const JSON_RESPONSE_TYPE: &str = "application/json; charset=utf-8";
+
+/// The String a `render turbo_stream: <value>` answers: one
+/// `Broadcasts.turbo_stream_fragment` per builder call, joined without a
+/// separator (turbo-rails hands the renderer an Array and Rails
+/// concatenates it). `Err` carries why this value is not one the
+/// lowering can write down EXACTLY; the caller reports it as an error.
+///
+/// Supported: `turbo_stream.<append|prepend|replace|update|before|after>
+/// (target, partial: "p"[, locals: {…}])` and `turbo_stream.remove(
+/// target)`, with a String/Symbol target or a `dom_id(…)` /
+/// `helpers.dom_id(…)` call, singly or as an Array literal. Everything
+/// else needs turbo-rails behavior the runtime does not carry: the
+/// `*_all` actions (`targets=`), option attributes (`method: :morph`),
+/// block and positional-content forms, `refresh`/custom actions, and
+/// values built by app code (`responder.render(view_context)`).
+fn turbo_stream_render_body(
+    value: &Expr,
+    module_name: Option<&str>,
+    ancestor_modules: &[String],
+    partials: &super::PartialMap,
+    request: Option<(Option<&str>, &str, bool)>,
+) -> Result<Expr, &'static str> {
+    let span = value.span;
+    if let ExprNode::Array { elements, .. } = &*value.node {
+        let parts = elements
+            .iter()
+            .map(|el| turbo_stream_render_body(el, module_name, ancestor_modules, partials, request))
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(Expr::new(
+            span,
+            ExprNode::Send {
+                recv: Some(Expr::new(
+                    span,
+                    ExprNode::Array { elements: parts, style: crate::expr::ArrayStyle::Brackets },
+                )),
+                method: Symbol::from("join"),
+                args: vec![],
+                block: None,
+                parenthesized: true,
+            },
+        ));
+    }
+    let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*value.node else {
+        return Err("the value is not a `turbo_stream.<action>(…)` builder call; markup built by \
+                    app code (a responder, a helper) is not lowered");
+    };
+    let is_builder = match &*recv.node {
+        ExprNode::Send { recv: None, method, args, block: None, .. } => {
+            method.as_str() == "turbo_stream" && args.is_empty()
+        }
+        ExprNode::Var { name, .. } => name.as_str() == "turbo_stream",
+        _ => false,
+    };
+    if !is_builder {
+        return Err("the value is not a `turbo_stream.<action>(…)` builder call; markup built by \
+                    app code (a responder, a helper) is not lowered");
+    }
+    let action = method.as_str();
+    if !matches!(action, "append" | "prepend" | "replace" | "update" | "before" | "after" | "remove") {
+        return Err("only append, prepend, replace, update, before, after and remove are \
+                    lowered (`*_all` targets a selector, and the rest are custom actions)");
+    }
+    let Some(target) = args.first() else {
+        return Err("the builder call names no target");
+    };
+    let target = match &*target.node {
+        ExprNode::Lit { value: Literal::Str { .. } } => target.clone(),
+        // The element's `target` attribute is escaped by turbo-rails' tag
+        // helper; the runtime composer writes it as given.
+        ExprNode::StringInterp { .. } => html_escape_call(target),
+        ExprNode::Lit { value: Literal::Sym { value } } => {
+            Expr::new(span, ExprNode::Lit { value: Literal::Str { value: value.as_str().to_string() } })
+        }
+        ExprNode::Send { recv: r, method, args: dom_args, block: None, .. }
+            if method.as_str() == "dom_id"
+                && (1..=2).contains(&dom_args.len())
+                && r.as_ref().is_none_or(|r| {
+                    matches!(&*r.node, ExprNode::Send { recv: None, method, args, .. }
+                        if method.as_str() == "helpers" && args.is_empty())
+                }) =>
+        {
+            crate::lower::view_to_library::view_helpers_call("dom_id", dom_args.clone())
+        }
+        _ => {
+            return Err("the target is not a String (literal or interpolated), a Symbol, or a `dom_id(…)` call");
+        }
+    };
+    let html = if action == "remove" {
+        if args.len() != 1 {
+            return Err("`remove` takes only a target");
+        }
+        Expr::new(span, ExprNode::Lit { value: Literal::Str { value: String::new() } })
+    } else {
+        let [_, options] = args.as_slice() else {
+            return Err("the builder call takes a target and `partial:`/`locals:` options only");
+        };
+        let ExprNode::Hash { entries, .. } = &*options.node else {
+            return Err("positional content and the block form are not lowered; use \
+                        `partial:` (+ `locals:`)");
+        };
+        let mut partial_name: Option<String> = None;
+        let mut locals: Vec<(Symbol, Expr)> = Vec::new();
+        for (k, v) in entries {
+            let ExprNode::Lit { value: Literal::Sym { value: key } } = &*k.node else {
+                return Err("an option key is not a Symbol literal");
+            };
+            match key.as_str() {
+                "partial" => match &*v.node {
+                    ExprNode::Lit { value: Literal::Str { value } } => partial_name = Some(value.clone()),
+                    _ => return Err("`partial:` is not a String literal"),
+                },
+                "locals" => {
+                    let ExprNode::Hash { entries: le, .. } = &*v.node else {
+                        return Err("`locals:` is not a Hash literal");
+                    };
+                    for (lk, lv) in le {
+                        let ExprNode::Lit { value: Literal::Sym { value } } = &*lk.node else {
+                            return Err("a `locals:` key is not a Symbol literal");
+                        };
+                        locals.push((value.clone(), lv.clone()));
+                    }
+                }
+                _ => {
+                    return Err("only `partial:` and `locals:` are lowered (`method: :morph` and \
+                                other attributes need a turbo-stream attribute writer)");
+                }
+            }
+        }
+        let Some(partial_name) = partial_name else {
+            return Err("the builder call names no `partial:`");
+        };
+        // Rails looks a bare name up in the controller's own directory,
+        // then each ancestor's. A slashed name names its directory.
+        let (module, stem) = match partial_name.rsplit_once('/') {
+            Some((dir, name)) => (
+                crate::naming::camelize_path(&crate::naming::snake_case(dir)),
+                name.trim_start_matches('_').to_string(),
+            ),
+            None => {
+                let stem = partial_name.trim_start_matches('_').to_string();
+                let found = module_name
+                    .into_iter()
+                    .map(str::to_string)
+                    .chain(ancestor_modules.iter().cloned())
+                    .find(|m| partials.contains_key(&(m.clone(), stem.clone())));
+                match found {
+                    Some(m) => (m, stem),
+                    None => return Err("the partial is not a template this app defines (or is not \
+                                        reachable from this controller)"),
+                }
+            }
+        };
+        let Some(contract) = partials.get(&(module.clone(), stem.clone())) else {
+            return Err("the partial is not a template this app defines");
+        };
+        // A local the partial does not declare would be silently dropped
+        // (the partial's lowered function has no parameter for it).
+        if locals.iter().any(|(name, _)| {
+            let n = name.as_str();
+            n != contract.record
+                && !contract.closure.iter().any(|c| c == n)
+                && !contract.extras.iter().any(|c| c == n)
+        }) {
+            return Err("`locals:` names a local the partial does not declare");
+        }
+        let qualified = format!("{}/{}", crate::naming::underscore(&module), stem);
+        match partial_view_call(&qualified, &locals, Some(&module), partials, request, span) {
+            Some(call) => call,
+            None => return Err("the partial is not a template this app defines (or is not \
+                                reachable from this controller)"),
+        }
+    };
+    Ok(Expr::new(
+        span,
+        ExprNode::Send {
+            recv: Some(const_path(&["Broadcasts"], span)),
+            method: Symbol::from("turbo_stream_fragment"),
+            args: vec![
+                Expr::new(span, ExprNode::Lit { value: Literal::Str { value: action.to_string() } }),
+                target,
+                html,
+            ],
+            block: None,
+            parenthesized: true,
+        },
+    ))
+}
+
+/// A model class as a constant, one path segment per `::`-separated
+/// name (`class_name: "Push::Subscription"`).
+fn model_const(model_class: &str, span: Span) -> Expr {
+    const_path(&model_class.split("::").collect::<Vec<_>>(), span)
+}
+
 /// Like `const_path`, but stamps `Ty::Class` so the emit-time
 /// ruby-family availability gate sees lowers-added raises
 /// (`MissingTemplate` from a missing `render`).
@@ -2849,6 +3785,7 @@ fn is_bare_params(e: &Expr) -> bool {
 /// Lower `params.expect(...)` based on its argument shape:
 /// - `params.expect(:id)` → `@params[:id].to_i`
 /// - `params.expect(post: [:title, :body])` → `@params.require(:post).permit(:title, :body)`
+/// - `params.expect(posts: [[:title]])` → `Params.expect_array(...)`
 ///
 /// Anything else (no args, multi-arg, unrecognized arg shape) is left
 /// as `@params.expect(args...)` so we don't silently drop an idiom we
@@ -2867,6 +3804,9 @@ fn rewrite_expect(
         }
         // Single-keyword-hash form → @params.require(:k).permit(:f1, :f2, ...)
         if let ExprNode::Hash { entries, .. } = &*arg.node {
+            if let Some(array) = params_expect_array(entries, span) {
+                return array;
+            }
             if let Some(pair) = single_resource_hash(entries) {
                 return params_require_permit(pair.0, pair.1, span);
             }
@@ -2946,6 +3886,54 @@ fn params_index_to_i(sym: &Symbol, span: Span) -> Expr {
     )
 }
 
+fn params_expect_array(entries: &[(Expr, Expr)], span: Span) -> Option<Expr> {
+    use crate::lower::typing::with_ty;
+    use crate::ty::Ty;
+    let [(key, value)] = entries else { return None };
+    let name = |expr: &Expr| match &*expr.node {
+        ExprNode::Lit { value: Literal::Sym { value } } => Some(value.as_str().to_string()),
+        ExprNode::Lit { value: Literal::Str { value } } => Some(value.clone()),
+        _ => None,
+    };
+    let key = name(key)?;
+    let ExprNode::Array { elements, .. } = &*value.node else { return None };
+    let [inner] = elements.as_slice() else { return None };
+    let ExprNode::Array { elements, .. } = &*inner.node else { return None };
+    let mut fields = Vec::new();
+    let mut scalar_arrays = Vec::new();
+    for field in elements {
+        if let Some(field) = name(field) {
+            fields.push(field);
+        } else if let ExprNode::Hash { entries, .. } = &*field.node {
+            for (key, filter) in entries {
+                let ExprNode::Array { elements, .. } = &*filter.node else { return None };
+                if !elements.is_empty() { return None; }
+                scalar_arrays.push(name(key)?);
+            }
+        } else {
+            return None;
+        }
+    }
+    let string = |value: String| with_ty(
+        Expr::new(span, ExprNode::Lit { value: Literal::Str { value } }), Ty::Str,
+    );
+    let strings = |values: Vec<String>| with_ty(
+        Expr::new(span, ExprNode::Array { elements: values.into_iter().map(string).collect(), style: ArrayStyle::Brackets }),
+        Ty::Array { elem: Ty::Str.into() },
+    );
+    let hash_ty = Ty::Hash {
+        key: Ty::Str.into(),
+        value: Ty::Class { id: crate::ident::ClassId(Symbol::from("Roundhouse::ParamValue")), args: vec![].into() }.into(),
+    };
+    Some(with_ty(Expr::new(span, ExprNode::Send {
+        recv: Some(const_path(&["Params"], span)),
+        method: Symbol::from("expect_array"),
+        args: vec![with_ty(ivar("params", span), hash_ty.clone()), string(key), strings(fields), strings(scalar_arrays)],
+        block: None,
+        parenthesized: true,
+    }), Ty::Array { elem: hash_ty.into() }))
+}
+
 /// `@params.require(:resource).permit(:f1, :f2, ...)` — the strong-
 /// params chain spinel's runtime implements. Returns None at the call
 /// site if the entries don't match the single-resource shape.
@@ -3021,6 +4009,17 @@ fn params_require_permit(resource: Symbol, fields: Vec<Symbol>, span: Span) -> E
 
 fn nil_expr(span: Span) -> Expr {
     Expr::new(span, ExprNode::Lit { value: Literal::Nil })
+}
+
+/// The path parameters an action hands its views: the request's, with
+/// `default_url_options`' segments laid over them when the controller
+/// has the `route_param_recall::OVERLAY` method.
+fn view_path_parameters(overlaid: bool, span: Span) -> Expr {
+    if !overlaid {
+        return ivar("path_parameters", span);
+    }
+    let method = Symbol::from(crate::lower::route_param_recall::OVERLAY);
+    Expr::new(span, ExprNode::Send { recv: None, method, args: vec![], block: None, parenthesized: false })
 }
 
 fn ivar(name: &str, span: Span) -> Expr {

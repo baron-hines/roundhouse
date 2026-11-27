@@ -366,8 +366,8 @@ where
                         body: map_expr(&r.body, f),
                     })
                     .collect(),
-                else_branch: else_branch.as_ref().map(|e| map_expr(e, f)),
-                ensure: ensure.as_ref().map(|e| map_expr(e, f)),
+                else_branch: else_branch.as_ref().map(|e| Box::new(map_expr(e, f))),
+                ensure: ensure.as_ref().map(|e| Box::new(map_expr(e, f))),
                 implicit: *implicit,
             }
         }
@@ -381,8 +381,7 @@ where
         ty: expr.ty.clone(),
         effects: expr.effects.clone(),
         leading_blank_line: expr.leading_blank_line,
-        diagnostic: expr.diagnostic.clone(),
-        hint: expr.hint,
+        cold: expr.cold.clone(),
         decisions: expr.decisions,
     }
 }

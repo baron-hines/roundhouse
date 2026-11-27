@@ -6,10 +6,10 @@
 //! the value, so ingest builds the Kernel `Rational` call from Prism's
 //! numerator and denominator. Native Ruby on the same source is the oracle.
 
+#[path = "support/scratch.rs"]
+mod scratch;
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
-
-use roundhouse::project::BuildTarget;
 
 const RAT: &str = r#"module Ratlab
   class Limits
@@ -38,8 +38,7 @@ const CONFIG: &str = "Rails.application.configure do\n  config.eager_load = fals
 
 #[test]
 fn rational_literals_keep_their_exact_value_like_native() {
-    let dir = std::env::temp_dir().join(format!("roundhouse-rational-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch::dir("roundhouse-rational");
     let rat = dir.join("limits.rb");
     std::fs::write(&rat, RAT).unwrap();
     let native = emit_and_run::ruby()
@@ -68,7 +67,7 @@ fn rational_literals_keep_their_exact_value_like_native() {
         .write("config/environments/development.rb", CONFIG)
         .write("lib/ratlab/limits.rb", RAT)
         .run_ruby(REPORT);
-    assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+    run.assert_passes();
     let source = std::fs::read_to_string(run.emitted.join("app/models/ratlab/limits.rb"))
         .expect("emitted limits");
     for lowered in [

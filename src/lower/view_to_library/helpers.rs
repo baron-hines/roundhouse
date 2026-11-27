@@ -51,6 +51,50 @@ pub(super) fn is_turbo_stream_builder(recv: Option<&Expr>) -> bool {
     }
 }
 
+/// `turbo_stream.<action> target, partial: "…"` with optional `locals:`,
+/// `collection:` and `as:`: the option form, rendering a partial.
+pub(super) struct TurboStreamPartial<'a> {
+    pub target: &'a Expr,
+    pub partial: &'a str,
+    pub locals: Option<&'a [(Expr, Expr)]>,
+    pub collection: Option<&'a Expr>,
+    pub as_name: Option<&'a str>,
+}
+
+/// The option form the walker lowers, for it and for the render graph
+/// alike, so the graph has an edge exactly where a partial is rendered.
+/// None for an option it does not read (`layout:`), a `partial:` or
+/// `locals:` that is not a literal, or `as:` without `collection:` —
+/// dropping any of them would render the partial wrong.
+pub(super) fn turbo_stream_partial<'a>(
+    recv: Option<&Expr>,
+    method: &str,
+    args: &'a [Expr],
+) -> Option<TurboStreamPartial<'a>> {
+    let renders = matches!(method, "append" | "prepend" | "replace" | "update" | "before" | "after");
+    if !renders || !is_turbo_stream_builder(recv) {
+        return None;
+    }
+    let [target, opts] = args else { return None };
+    let ExprNode::Hash { entries, .. } = &*opts.node else { return None };
+    let (mut partial, mut locals, mut collection, mut as_name) = (None, None, None, None);
+    for (k, v) in entries {
+        let ExprNode::Lit { value: Literal::Sym { value: key } } = &*k.node else { return None };
+        match (key.as_str(), &*v.node) {
+            ("partial", ExprNode::Lit { value: Literal::Str { value } }) => partial = Some(value.as_str()),
+            ("locals", ExprNode::Hash { entries, .. }) => locals = Some(entries.as_slice()),
+            ("collection", _) => collection = Some(v),
+            ("as", ExprNode::Lit { value: Literal::Sym { value } }) => as_name = Some(value.as_str()),
+            ("as", ExprNode::Lit { value: Literal::Str { value } }) => as_name = Some(value.as_str()),
+            _ => return None,
+        }
+    }
+    if as_name.is_some() && collection.is_none() {
+        return None;
+    }
+    Some(TurboStreamPartial { target, partial: partial?, locals, collection, as_name })
+}
+
 /// The `<turbo-stream target=…>` value for a `turbo_stream.<action>`
 /// call's first argument. Shared by all three spellings — positional,
 /// option-hash and block — so they cannot disagree about what a bare
@@ -119,13 +163,15 @@ pub(super) fn emit_turbo_stream_fragment(
             // string, a nested call) would need the partial machinery a
             // `render` call site gets, so decline and leave the source
             // shape for the residue ledger.
+            // turbo-rails renders it `formats: :html` (`render_record`),
+            // whatever template the builder is written in.
             let name = record_name(content)?;
             let partial = format!("{}/{}", pluralize_snake(&name), name);
             super::partial::named_partial_call(
                 &partial,
                 Some(&rewrite_helpers_in_expr(content, ctx)),
                 None,
-                ctx,
+                &ctx.in_formats(&["html"]),
             )?
         }
     };
@@ -160,10 +206,14 @@ pub(super) fn emit_view_helper_call(kind: &ViewHelperKind<'_>, ctx: &ViewCtx) ->
             }
             Some(view_helpers_call("dom_id", args))
         }
+        // Rails' `pluralize` returns a String that isn't html-safe (the
+        // word is the caller's), so the template escapes it, as it does
+        // `truncate`'s.
         Pluralize { count, word } => {
-            Some(crate::lower::view::pluralize_helper_call(
+            let pluralized = crate::lower::view::pluralize_helper_call(
                 (*count).clone(), (*word).clone(),
-            ))
+            );
+            Some(view_helpers_call("html_escape", vec![pluralized]))
         }
         Truncate { text, opts } => {
             // Spinel-blog convention: `truncate` returns a plain
@@ -184,6 +234,22 @@ pub(super) fn emit_view_helper_call(kind: &ViewHelperKind<'_>, ctx: &ViewCtx) ->
             let truncated = view_helpers_call("truncate", args);
             Some(view_helpers_call("html_escape", vec![truncated]))
         }
+        // Rails' `simple_format` with `sanitize: false` writes the text as
+        // it is (`raw`) inside each paragraph's tag and returns an html-safe
+        // buffer: appended as it is. The text gets `.to_s` as `truncate`'s
+        // does (a nullable column read; Rails renders nil as one empty
+        // paragraph, as it does ""). A literal `nil` is that `""` already.
+        SimpleFormat { text, html_opts, wrapper_tag } => {
+            let text = match &*text.node {
+                ExprNode::Lit { value: Literal::Nil } => lit_str(String::new()),
+                _ => lit_str_coerce((*text).clone()),
+            };
+            let mut args = vec![text, lit_sym(wrapper_tag.clone())];
+            if let Some(o) = html_opts {
+                args.push((*o).clone());
+            }
+            Some(view_helpers_call("simple_format", args))
+        }
         WordWrap { text, opts } => {
             let mut args = vec![lit_str_coerce((*text).clone())];
             if let Some(o) = opts {
@@ -191,6 +257,106 @@ pub(super) fn emit_view_helper_call(kind: &ViewHelperKind<'_>, ctx: &ViewCtx) ->
             }
             let wrapped = view_helpers_call("word_wrap", args);
             Some(view_helpers_call("html_escape", vec![wrapped]))
+        }
+        // `content_tag_html` with the content escaped here: the runtime's
+        // `content_tag` is that, but its optional `content` makes Go's
+        // signature variadic `interface{}`, which takes no options map.
+        // The name is checked and the options written through
+        // `render_attrs` there, so the String is appended unescaped. The
+        // options take the block form's shape: a positional Hash (Crystal
+        // binds no keyword to `opts`), with a literal `class:` Array
+        // space-joined.
+        ContentTag { name, content, opts } => {
+            // Rails escapes the content unless it is html-safe: an
+            // `x.html_safe` or `raw(x)` (`x.to_s.html_safe`), an escape the
+            // template applied (`h(x)`), or a helper
+            // whose call here is markup (`link_to`, a nested `content_tag`,
+            // `turbo_stream_from`'s element, `content_for`'s capture). A
+            // `truncate` or `word_wrap` (an html-safe buffer, alone or in a
+            // `+`) is written as it is below, by `safe_buffer_value`; a
+            // `pluralize`, a plain String, is escaped once. The other kinds
+            // (`dom_id`) are escaped like any String.
+            let is_helper_markup = |e: &Expr| matches!(&*e.node,
+                ExprNode::Send { recv: None, method, args, block: None, parenthesized }
+                    if matches!(
+                        super::walker::classify_template_helper(method.as_str(), args, *parenthesized, ctx),
+                        Some(LinkTo { .. } | LinkToIf { .. } | ButtonTo { .. } | ContentTag { .. }
+                            | CsrfMetaTags | CspMetaTag | StylesheetLinkTag { .. }
+                            | JavascriptImportmapTags { .. } | EngineImportmapTags { .. }
+                            | TurboStreamFrom { .. } | ContentForGetter { .. })
+                    ));
+            let helper_markup = is_helper_markup(content);
+            let raw_value = match &*content.node {
+                ExprNode::Send { recv: None, method, args, block: None, .. }
+                    if method.as_str() == "raw" && args.len() == 1 && !ctx.is_local("raw") =>
+                {
+                    Some(args[0].clone())
+                }
+                _ => None,
+            };
+            // An escape the template already applied (`h(x)`,
+            // `ERB::Util.html_escape(x)`) is html-safe in Rails too: escaped
+            // here once, through the view helpers' `html_escape`.
+            let escaped_value = match &*content.node {
+                ExprNode::Send { recv: None, method, args, block: None, .. }
+                    if method.as_str() == "h" && args.len() == 1 && !ctx.is_local("h") =>
+                {
+                    Some(&args[0])
+                }
+                ExprNode::Send { recv: Some(r), method, args, block: None, .. }
+                    if matches!(method.as_str(), "html_escape" | "h")
+                        && args.len() == 1
+                        && matches!(&*r.node, ExprNode::Const { path } if path.iter().map(|p| p.as_str()).eq(["ERB", "Util"])) =>
+                {
+                    Some(&args[0])
+                }
+                _ => None,
+            };
+            let content = match raw_value.or_else(|| super::walker::html_safe_value(content, ctx)) {
+                Some(safe) => lit_str_coerce(rewrite_helpers_in_expr(&safe, ctx)),
+                None if helper_markup => lit_str_coerce(rewrite_helpers_in_expr(content, ctx)),
+                None => {
+                    // `h` leaves an html-safe argument as it is
+                    // (`h(x.html_safe)`, `h(raw(x))`, `h(content_tag(…))`,
+                    // a helper's markup as the bare content takes it).
+                    let safe_arg = escaped_value.and_then(|v| match &*v.node {
+                        ExprNode::Send { recv: None, method, args, block: None, .. }
+                            if method.as_str() == "raw" && args.len() == 1 && !ctx.is_local("raw") =>
+                        {
+                            Some(args[0].clone())
+                        }
+                        _ if is_helper_markup(v) => Some(v.clone()),
+                        _ => super::walker::html_safe_value(v, ctx),
+                    });
+                    match safe_arg {
+                        Some(safe) => lit_str_coerce(rewrite_helpers_in_expr(&safe, ctx)),
+                        None => {
+                            let lowered = rewrite_helpers_in_expr(escaped_value.unwrap_or(content), ctx);
+                            // Content Rails holds as an html-safe buffer
+                            // (`truncate(x)`, `truncate(x) + "!"`) is written
+                            // as it is, and `h` leaves one as it is too; a
+                            // `pluralize` or any other String is escaped.
+                            match super::walker::safe_buffer_value(&lowered, ctx) {
+                                Some(safe) if matches!(&*safe.node, ExprNode::Send { method, .. } if matches!(method.as_str(), "html_escape" | "+")) => safe,
+                                Some(safe) => lit_str_coerce(safe),
+                                None => view_helpers_call("html_escape", vec![lit_str_coerce(lowered)]),
+                            }
+                        }
+                    }
+                }
+            };
+            let mut args = vec![rewrite_helpers_in_expr(name, ctx), content];
+            if let Some(o) = opts {
+                let o = match &*o.node {
+                    ExprNode::Hash { entries, kwargs } => Expr::new(o.span, ExprNode::Hash {
+                        entries: entries.iter().map(|(k, v)| (k.clone(), super::form_with::simplify_opts_value(k, v))).collect(),
+                        kwargs: *kwargs,
+                    }),
+                    _ => (*o).clone(),
+                };
+                args.push(rewrite_helpers_in_expr(&o, ctx));
+            }
+            Some(view_helpers_call("content_tag_html", args))
         }
         ContentForGetter { slot } => Some(view_helpers_call(
             "content_for_get",
@@ -208,38 +374,77 @@ pub(super) fn emit_view_helper_call(kind: &ViewHelperKind<'_>, ctx: &ViewCtx) ->
         // runtime `link_to`, which escapes its label itself — so a
         // label the Truncate arm already wrapped is handed over
         // unwrapped, and escaped once either way.
-        LinkToIf { cond, text, url, opts } => {
+        LinkToIf { cond, text, url, opts, negate } => {
             // The label as the template's own helpers lower it: a
             // `truncate(…)` arrives as `html_escape(truncate(…))`,
             // already escape-correct, which the two branches below
-            // each take exactly once.
-            let lowered = rewrite_helpers_in_expr(text, ctx);
-            let pre_escaped = match &*lowered.node {
-                ExprNode::Send { recv: Some(r), method, args, .. }
-                    if method.as_str() == "html_escape"
+            // each take exactly once. Only the view helpers' own
+            // `html_escape`: an app's may not escape. `ERB::Util`'s
+            // escape (that exact constant) is the same escape, and is
+            // written as the view helpers' one.
+            // Its argument is kept as the pre-escaped text before the
+            // escape is built, since a literal's escape folds to text that
+            // no longer looks escaped.
+            let erb_util_arg = match &*text.node {
+                ExprNode::Send { recv: Some(r), method, args, block: None, .. }
+                    if matches!(method.as_str(), "html_escape" | "h")
                         && args.len() == 1
-                        && matches!(&*r.node, ExprNode::Const { .. }) =>
+                        && matches!(&*r.node, ExprNode::Const { path } if path.iter().map(|p| p.as_str()).eq(["ERB", "Util"])) =>
                 {
-                    Some(args[0].clone())
+                    Some(lit_str_coerce(rewrite_helpers_in_expr(&args[0], ctx)))
                 }
                 _ => None,
+            };
+            let (lowered, pre_escaped) = match erb_util_arg {
+                Some(arg) => (view_helpers_call("html_escape", vec![arg.clone()]), Some(arg)),
+                None => {
+                    let lowered = rewrite_helpers_in_expr(text, ctx);
+                    let pre_escaped = match &*lowered.node {
+                        ExprNode::Send { recv: Some(r), method, args, .. }
+                            if method.as_str() == "html_escape"
+                                && args.len() == 1
+                                && matches!(&*r.node, ExprNode::Const { path } if path.iter().map(|p| p.as_str()).eq(["ActionView", "ViewHelpers"])) =>
+                        {
+                            Some(args[0].clone())
+                        }
+                        _ => None,
+                    };
+                    (lowered, pre_escaped)
+                }
             };
             let linked = match emit_link_to_inline(text, url, *opts, ctx) {
                 Some(inline) => inline,
                 None => {
                     let label = pre_escaped.clone().unwrap_or_else(|| lit_str_coerce(lowered.clone()));
-                    let mut args = vec![label, rewrite_helpers_in_expr(url, ctx)];
+                    // `:back` is Rails' `url_for(:back)`, the referrer, not a String to escape.
+                    let href = if matches!(&*url.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "back") {
+                        view_helpers_call("back_url", Vec::new())
+                    } else {
+                        rewrite_helpers_in_expr(url, ctx)
+                    };
+                    let mut args = vec![label, href];
                     if let Some(o) = opts {
                         args.push((*o).clone());
                     }
                     view_helpers_call("link_to", args)
                 }
             };
+            // The label as a bare `<%= %>` shows it: a buffer (`x.html_safe`,
+            // a marked app method's call, a `truncate`, any of them on the
+            // left of a `+`) as it is, the `+`'s plain operand escaped;
+            // anything else escaped whole.
             let bare = if pre_escaped.is_some() {
                 lowered
             } else {
-                view_helpers_call("html_escape", vec![lit_str_coerce(lowered)])
+                match super::walker::safe_buffer_value(&lowered, ctx) {
+                    Some(safe) if matches!(&*safe.node, ExprNode::Send { method, .. } if matches!(method.as_str(), "html_escape" | "+")) => safe,
+                    Some(safe) => lit_str_coerce(safe),
+                    None => view_helpers_call("html_escape", vec![lit_str_coerce(lowered)]),
+                }
             };
+            // `link_to_unless` links when the condition doesn't hold: the
+            // same branches, swapped.
+            let (then_branch, else_branch) = if *negate { (bare, linked) } else { (linked, bare) };
             Some(Expr::new(
                 Span::synthetic(),
                 ExprNode::If {
@@ -253,8 +458,8 @@ pub(super) fn emit_view_helper_call(kind: &ViewHelperKind<'_>, ctx: &ViewCtx) ->
                         &ctx.reference_reads,
                         &ctx.nilable_scalar_reads,
                     ),
-                    then_branch: linked,
-                    else_branch: bare,
+                    then_branch,
+                    else_branch,
                 },
             ))
         }
@@ -279,6 +484,19 @@ pub(super) fn emit_view_helper_call(kind: &ViewHelperKind<'_>, ctx: &ViewCtx) ->
                     ExprNode::Const { path: vec![Symbol::from("Importmap")] },
                 )),
                 "pins",
+                vec![],
+                None,
+                true,
+            );
+            Some(view_helpers_call("javascript_importmap_tags", vec![pins, (*entry).clone()]))
+        }
+        EngineImportmapTags { entry, module } => {
+            let pins = super::send(
+                Some(Expr::new(
+                    Span::synthetic(),
+                    ExprNode::Const { path: vec![Symbol::from("Importmap")] },
+                )),
+                &crate::lower::importmap_to_library::engine_pins_name(module),
                 vec![],
                 None,
                 true,
@@ -508,17 +726,70 @@ fn emit_link_to_inline(
     opts: Option<&Expr>,
     ctx: &ViewCtx,
 ) -> Option<Expr> {
-    let (prefix, suffix) = link_to_wrapper_parts(url, opts, ctx)?;
+    let (prefix, suffix) = link_to_wrapper_parts(url, opts, ctx, inert_label(text, ctx))?;
     let mut parts = prefix;
-    parts.push(InterpPart::Expr {
-        // Same `.to_s` the bare-interpolation path applies: the label
-        // can be a nullable column read (`link_to article.title, …`),
-        // and `html_escape` is deliberately monomorphic `(String) ->
-        // String`. `nil.to_s == ""` is what Rails renders.
-        expr: view_helpers_call("html_escape", vec![lit_str_coerce(text.clone())]),
-    });
+    parts.push(InterpPart::Expr { expr: escaped_label(text, ctx) });
     parts.extend(suffix);
     Some(string_interp(parts))
+}
+
+/// Whether a `link_to` / `button_to` label runs no code when evaluated (a
+/// literal, a local, an ivar, a constant, or an interpolation of those),
+/// so writing it after the url can't change what either does.
+fn inert_label(text: &Expr, ctx: &ViewCtx) -> bool {
+    match &*text.node {
+        ExprNode::Lit { .. } | ExprNode::Var { .. } | ExprNode::Ivar { .. } | ExprNode::Const { .. } | ExprNode::SelfRef => true,
+        ExprNode::Send { recv: None, method, args, block: None, parenthesized: false } => {
+            args.is_empty() && ctx.binds_local(method.as_str())
+        }
+        ExprNode::StringInterp { parts } => parts.iter().all(|p| match p {
+            InterpPart::Text { .. } => true,
+            InterpPart::Expr { expr } => inert_label(expr, ctx),
+        }),
+        _ => false,
+    }
+}
+
+/// A `link_to` / `button_to` label, escaped once. Its helpers are lowered
+/// as the template's own are, so a `pluralize(…)` or `truncate(…)` label
+/// reaches its runtime call on every target; one that lowers to
+/// `ActionView::ViewHelpers.html_escape(…)` already is escape-correct and is
+/// taken as it is. Only that receiver: an app's own `html_escape` may not
+/// escape. Else the same `.to_s` the bare-interpolation path applies: the
+/// label can be a nullable column read (`link_to article.title, …`), and
+/// `html_escape` is deliberately monomorphic `(String) -> String`.
+/// `nil.to_s == ""` is what Rails renders.
+fn escaped_label(text: &Expr, ctx: &ViewCtx) -> Expr {
+    // An escape the template applied (`h(x)`, `ERB::Util.html_escape(x)`)
+    // is html-safe in Rails: escaped here once, before the rewrite folds a
+    // literal one to text that no longer looks escaped.
+    let escaped_arg = match &*text.node {
+        ExprNode::Send { recv: None, method, args, block: None, .. }
+            if method.as_str() == "h" && args.len() == 1 && !ctx.is_local("h") =>
+        {
+            Some(&args[0])
+        }
+        ExprNode::Send { recv: Some(r), method, args, block: None, .. }
+            if matches!(method.as_str(), "html_escape" | "h")
+                && args.len() == 1
+                && matches!(&*r.node, ExprNode::Const { path } if path.iter().map(|p| p.as_str()).eq(["ERB", "Util"])) =>
+        {
+            Some(&args[0])
+        }
+        _ => None,
+    };
+    if let Some(arg) = escaped_arg {
+        return view_helpers_call("html_escape", vec![lit_str_coerce(rewrite_helpers_in_expr(arg, ctx))]);
+    }
+    // A label Rails holds as an html-safe buffer (an escape the view helpers
+    // applied, `truncate(x) + "!"`, `x.html_safe`) is written as it is.
+    let lowered = rewrite_helpers_in_expr(text, ctx);
+    match super::walker::safe_buffer_value(&lowered, ctx) {
+        // The view helpers' escape and a `+` of buffers are Strings already.
+        Some(safe) if matches!(&*safe.node, ExprNode::Send { method, .. } if matches!(method.as_str(), "html_escape" | "+")) => safe,
+        Some(safe) => lit_str_coerce(safe),
+        None => view_helpers_call("html_escape", vec![lit_str_coerce(lowered)]),
+    }
 }
 
 /// The anchor both spellings share, split where the link's CONTENT
@@ -527,8 +798,9 @@ fn link_to_wrapper_parts(
     url: &Expr,
     opts: Option<&Expr>,
     ctx: &ViewCtx,
+    string_ok: bool,
 ) -> Option<(Vec<InterpPart>, Vec<InterpPart>)> {
-    let url_expr = emit_url_arg(url, ctx)?;
+    let url_expr = emit_url_arg(url, ctx, string_ok)?;
     Some(link_to_wrapper_markup(url_expr, hash_entries(opts)))
 }
 
@@ -579,15 +851,9 @@ fn emit_button_to_inline(
     opts: Option<&Expr>,
     ctx: &ViewCtx,
 ) -> Option<Expr> {
-    let (prefix, suffix) = button_to_wrapper_parts(url, opts, ctx)?;
+    let (prefix, suffix) = button_to_wrapper_parts(url, opts, ctx, inert_label(text, ctx))?;
     let mut parts = prefix;
-    parts.push(InterpPart::Expr {
-        // Same `.to_s` the bare-interpolation path applies: the label
-        // can be a nullable column read (`link_to article.title, …`),
-        // and `html_escape` is deliberately monomorphic `(String) ->
-        // String`. `nil.to_s == ""` is what Rails renders.
-        expr: view_helpers_call("html_escape", vec![lit_str_coerce(text.clone())]),
-    });
+    parts.push(InterpPart::Expr { expr: escaped_label(text, ctx) });
     parts.extend(suffix);
     Some(string_interp(parts))
 }
@@ -621,8 +887,10 @@ pub(super) fn emit_inline_helper_block(
     let url = args.first()?;
     let opts = args.get(1);
     let (prefix, suffix) = match method {
-        "button_to" => button_to_wrapper_parts(url, opts, ctx)?,
-        "link_to" => link_to_wrapper_parts(url, opts, ctx)?,
+        // The url is evaluated before the block's content, as the
+        // markup writes them.
+        "button_to" => button_to_wrapper_parts(url, opts, ctx, true)?,
+        "link_to" => link_to_wrapper_parts(url, opts, ctx, true)?,
         _ => return None,
     };
     let mut out = vec![super::accumulator_append_call(string_interp(prefix), ctx)];
@@ -640,8 +908,9 @@ fn button_to_wrapper_parts(
     url: &Expr,
     opts: Option<&Expr>,
     ctx: &ViewCtx,
+    string_ok: bool,
 ) -> Option<(Vec<InterpPart>, Vec<InterpPart>)> {
-    let url_expr = emit_url_arg(url, ctx)?;
+    let url_expr = emit_url_arg(url, ctx, string_ok)?;
     Some(button_to_wrapper_markup(url_expr, hash_entries(opts)))
 }
 
@@ -739,15 +1008,15 @@ fn typed_record_path(ctx: &ViewCtx, model: &str, record: &Expr) -> Option<Expr> 
 /// rewrite to `RouteHelpers.<name>(...)`, bare local records rewrite
 /// to `RouteHelpers.<singular>_path(name.id)`. Nested arrays defer
 /// to a later slice (form_with's nested-resource fixture forces them).
-fn emit_url_arg(url: &Expr, ctx: &ViewCtx) -> Option<Expr> {
+fn emit_url_arg(url: &Expr, ctx: &ViewCtx, string_ok: bool) -> Option<Expr> {
     // A CONDITIONAL url (`@root_path ? "/page/#{n}" : {controller: …}`
     // — every lobsters index's pagination link) is two urls, not one.
     // Resolve each branch on its own; the classifier below sees only the
     // whole `If` and gives up on it, which is how the options-hash
     // branch reached the tag renderer as attributes.
     if let ExprNode::If { cond, then_branch, else_branch } = &*url.node {
-        let then_url = emit_url_arg(then_branch, ctx)?;
-        let else_url = emit_url_arg(else_branch, ctx)?;
+        let then_url = emit_url_arg(then_branch, ctx, string_ok)?;
+        let else_url = emit_url_arg(else_branch, ctx, string_ok)?;
         return Some(Expr::new(
             url.span,
             ExprNode::If {
@@ -764,6 +1033,29 @@ fn emit_url_arg(url: &Expr, ctx: &ViewCtx) -> Option<Expr> {
     if matches!(&*url.node, ExprNode::StringInterp { .. }) {
         return Some(rewrite_helpers_in_expr(url, ctx));
     }
+    // An Active Storage Blob, Attachment or Attached links where Rails'
+    // `resolve("ActiveStorage::Blob")` / `resolve("ActiveStorage::Attachment")`
+    // route it: `rails_blob_path`, the blob's redirect route. Keyed off
+    // the type, ahead of the name convention below, which read a `blob`
+    // local as `blob_path(blob.id)`. A nilable one (`Attached#blob` is
+    // `Blob?`) too: the runtime answers "" for nil rather than raising.
+    if let Some(crate::ty::Ty::Class { id, .. }) = url.ty.as_ref().map(crate::ty::Ty::peel_nilable)
+        && matches!(id.0.as_str(), "ActiveStorage::Blob" | "ActiveStorage::Attachment" | "ActiveStorage::Attached")
+    {
+        return Some(route_helpers_call("rails_blob_path", vec![rewrite_helpers_in_expr(url, ctx)]));
+    }
+    // The `active_storage/blobs/_blob` override's own record local, which
+    // stays untyped (`record_arg_ty`): a Blob from the app's own render,
+    // or Action Text's Attachment, which answers `blob` as Rails' delegates
+    // to it. Either links to the blob's redirect route.
+    let is_record_local = match &*url.node {
+        ExprNode::Var { name, .. } => name.as_str() == ctx.arg_name,
+        ExprNode::Send { recv: None, method, args, .. } => args.is_empty() && method.as_str() == ctx.arg_name,
+        _ => false,
+    };
+    if ctx.resource_dir == "active_storage/blobs" && !ctx.arg_name.is_empty() && is_record_local {
+        return Some(route_helpers_call("rails_blob_path", vec![rewrite_helpers_in_expr(url, ctx)]));
+    }
     // A read `case_class_narrow` pinned to a model (`ma.item` inside
     // `when ModMail`) links through that model's route.
     if let ExprNode::Cast { target_ty: crate::ty::Ty::Class { id, .. }, .. } = &*url.node {
@@ -776,6 +1068,20 @@ fn emit_url_arg(url: &Expr, ctx: &ViewCtx) -> Option<Expr> {
     // `lower_url_option_helpers`).
     if let Some(resolved) = emit_url_options_hash(url, ctx) {
         return Some(resolved);
+    }
+    // A Hash known only at run time resolves there, against this request
+    // (`routes_to_library::lower_dynamic_url_helper`).
+    if super::dynamic_url_hash(url) {
+        let local = |name: &str| var_ref(Symbol::from(name));
+        let recall = if ctx.locals.iter().any(|l| l == "path_parameters") {
+            local("path_parameters")
+        } else {
+            Expr::new(Span::synthetic(), ExprNode::Hash { entries: vec![], kwargs: false })
+        };
+        return Some(route_helpers_call(
+            "path_for_params",
+            vec![local("controller_name"), local("action_name"), rewrite_helpers_in_expr(url, ctx), recall],
+        ));
     }
     // Association-reader record URL (`link_to text,
     // showing_user.invited_by_user`) — Rails resolves the record
@@ -808,22 +1114,52 @@ fn emit_url_arg(url: &Expr, ctx: &ViewCtx) -> Option<Expr> {
             }
         }
     }
+    // An app helper of the name is what the bare call reaches first:
+    // Rails mixes the app's helpers in above the url helpers, so
+    // `link_to name, device_path(id)` links to what the helper answers.
+    // A bare read of a template local of that name is the local.
+    if let ExprNode::Send { recv: None, method, block: None, .. } = &*url.node
+        && ctx.app_helper_names.contains(method.as_str())
+        && !ctx.reads_local(url)
+    {
+        return Some(rewrite_helpers_in_expr(url, ctx));
+    }
     // Bare `<x>_url` absolute helpers (`button_to "Verify",
     // twofa_verify_url`) — RouteHelpers has no `_url` functions;
-    // ground to the shared absolute interp.
-    if let ExprNode::Send { recv: None, method, args, block: None, .. } = &*url.node {
+    // ground to the shared absolute interp. A bare read of a template
+    // local of that name is the local.
+    if let ExprNode::Send { recv: None, method, args, block: None, .. } = &*url.node
+        && !ctx.reads_local(url)
+    {
         if let Some(stem) = method.as_str().strip_suffix("_url") {
             return Some(super::absolute_url_interp(stem, args.clone()));
         }
     }
+    // A url the template computes as a String (`"/x" + "y"`, a String
+    // local, `"/X".downcase`, `articles_path + "?p=1"`) is the url, as an
+    // interpolated one is: Rails' `url_for` returns a String unchanged.
+    // Without this it fell through to a `link_to` no compiled runtime
+    // defines (#1865). A record local's name convention doesn't apply to
+    // a String either. Only where the label before it is inert
+    // (`string_ok`): the markup writes the href first, and Rails
+    // evaluates the label first, so a label and a url that both run code
+    // keep the runtime helper, which evaluates them in order.
+    let string_url = || (string_ok && matches!(url.ty, Some(crate::ty::Ty::Str))).then(|| rewrite_helpers_in_expr(url, ctx));
     let is_local = |n: &str| ctx.is_local(n);
-    let kind = classify_view_url_arg(url, &is_local)?;
+    let Some(kind) = classify_view_url_arg(url, &is_local) else {
+        return string_url();
+    };
+    if matches!(kind, ViewUrlArg::RecordRef { .. })
+        && let Some(url) = string_url()
+    {
+        return Some(url);
+    }
     match kind {
         ViewUrlArg::Literal { value } => Some(lit_str(value.to_string())),
         // The local already holds the url — read it.
         ViewUrlArg::LocalUrl { name } => Some(var_ref(Symbol::from(name))),
         ViewUrlArg::PathHelper { name, args } => {
-            let route_args: Vec<Expr> = args.iter().map(|a| rewrite_path_arg(a, ctx)).collect();
+            let route_args = rewrite_path_args(name, args, ctx);
             Some(route_helpers_call(name, route_args))
         }
         ViewUrlArg::RecordRef { name } => {
@@ -842,9 +1178,10 @@ fn emit_url_arg(url: &Expr, ctx: &ViewCtx) -> Option<Expr> {
                     }
                 }
             }
+            let param = if ctx.slug_models.contains(&singular) { "to_param" } else { "id" };
             let id_expr = send(
                 Some(var_ref(Symbol::from(name))),
-                "id",
+                param,
                 Vec::new(),
                 None,
                 false,
@@ -900,6 +1237,11 @@ fn emit_url_options_hash(url: &Expr, ctx: &ViewCtx) -> Option<Expr> {
     // `**splat` into a route helper goes through.
     if let ExprNode::Send { recv: Some(base), method, args, block: None, .. } = &*url.node {
         if method.as_str() == "merge" && args.len() == 1 {
+            // The merged keys could name the action, so a base without
+            // one is not the index here.
+            if !crate::lower::routes_to_library::url_hash_names_action(base) {
+                return None;
+            }
             let path = emit_url_options_hash(base, ctx)?;
             let extra = rewrite_helpers_in_expr(&args[0], ctx);
             return Some(send(
@@ -925,7 +1267,14 @@ fn emit_url_options_hash(url: &Expr, ctx: &ViewCtx) -> Option<Expr> {
         by_key.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone())
     };
     let controller = take("controller")?;
-    let action = take("action")?;
+    // Rails' route set normalizes a Hash that names a controller:
+    // `action ||= "index"`, so no action, or a nil one, is the index.
+    let index = || Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Str { value: "index".to_string() } });
+    let action = match take("action") {
+        None => index(),
+        Some(a) if matches!(&*a.node, ExprNode::Lit { value: Literal::Nil }) => index(),
+        Some(a) => a,
+    };
     let mut extras: Vec<(String, Expr)> = by_key
         .iter()
         .filter(|(k, _)| k != "controller" && k != "action")
@@ -993,7 +1342,30 @@ fn nested_element_parts(kind: &NestedUrlElement<'_>) -> (String, Expr) {
 /// shape) and the bareword `Send { recv: None, args: [], block: None }`
 /// shape Prism produces for partial-scope locals. Anything else
 /// passes through unchanged.
+/// [`rewrite_path_arg`] over a helper's arguments. A lone record handed
+/// to the member helper of a model that overrides `to_param` (lobsters'
+/// `user_path(user)`, a username) projects to that, as Rails renders it.
+/// An argument that isn't a bound local projects by its type, as a nested
+/// call's does (`walker::record_segment_method`): a local the template
+/// assigns (`<% rec = @article %>`) is typed as the record. Not for a
+/// helper whose body the app wrote, an app helper of the name or a
+/// `direct` route, which reads the record.
+pub(super) fn rewrite_path_args(helper: &str, args: &[Expr], ctx: &ViewCtx) -> Vec<Expr> {
+    if ctx.direct_route_helpers.contains(helper) {
+        return args.to_vec();
+    }
+    let resource = helper.trim_end_matches("_path").trim_end_matches("_url");
+    let resource = resource.strip_prefix("edit_").unwrap_or(resource);
+    let param = if args.len() == 1 && ctx.slug_models.iter().any(|m| m == resource) { "to_param" } else { "id" };
+    let typed = !(ctx.app_helper_names.contains(helper) || ctx.direct_route_helpers.contains(helper));
+    args.iter().map(|a| project_path_arg(a, ctx, param, typed)).collect()
+}
+
 pub(super) fn rewrite_path_arg(arg: &Expr, ctx: &ViewCtx) -> Expr {
+    project_path_arg(arg, ctx, "id", false)
+}
+
+fn project_path_arg(arg: &Expr, ctx: &ViewCtx, param: &str, typed: bool) -> Expr {
     let local_name = match &*arg.node {
         ExprNode::Var { name, .. } if ctx.is_local(name.as_str()) => Some(name.clone()),
         ExprNode::Send {
@@ -1006,13 +1378,15 @@ pub(super) fn rewrite_path_arg(arg: &Expr, ctx: &ViewCtx) -> Expr {
         _ => None,
     };
     match local_name {
-        Some(name) => send(
-            Some(var_ref(name)),
-            "id",
-            Vec::new(),
-            None,
-            false,
-        ),
+        Some(name) => {
+            // The record's own `to_param` whatever the helper (`edit_mod_domain_path(domain)` is a domain name).
+            let own = ctx.slug_models.iter().any(|m| *m == singularize(name.as_str()));
+            send(Some(var_ref(name)), if own { "to_param" } else { param }, Vec::new(), None, false)
+        }
+        None if typed => match super::walker::record_segment_method(arg, ctx) {
+            Some(method) => send(Some(arg.clone()), method, Vec::new(), None, false),
+            None => arg.clone(),
+        },
         None => arg.clone(),
     }
 }
