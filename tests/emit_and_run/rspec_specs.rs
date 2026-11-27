@@ -148,6 +148,24 @@ fn failing_block_expectations_fail_the_emitted_test() {
     }
 }
 
+// Two `after` hooks: the generated teardown loads (each hook in its own `begin`/`ensure`), and the
+// second still runs when the first raises.
+#[test]
+fn every_after_hook_runs_when_one_raises() {
+    let spec = SPEC.replacen(
+        "  describe \"let\" do\n",
+        "  describe \"let\" do\n    after { raise \"second hook ran\" }\n    after { raise \"first hook ran\" }\n",
+        1,
+    );
+    let run = app(&spec).run_test("test/models/models_article_let_spec_test.rb");
+    assert!(run.errors.is_empty(), "{:?}", run.errors);
+    let out = format!("{}{}", run.stdout, run.stderr);
+    assert!(!run.program_succeeded(), "the raising hooks did not fail the test:\n{out}");
+    assert!(!out.contains("syntax error") && !out.contains("SyntaxError"), "{out}");
+    // RSpec runs `after` hooks in reverse: the one written last first, and the other after it raises.
+    assert!(out.contains("second hook ran"), "the hook after the raising one did not run:\n{out}");
+}
+
 // An `after` hook runs after the example: one that raises fails it.
 #[test]
 fn after_hooks_run_after_the_example() {
