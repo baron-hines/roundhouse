@@ -25,7 +25,7 @@
 //!   a string, or both, and `type: :model | :request | :lib` metadata;
 //! - `let`, `let!`, `subject`, `subject(:name)`, `described_class`, the
 //!   implicit `subject` (`described_class.new`);
-//! - `before` / `before(:each)` / `before(:example)`;
+//! - `before` and `after`, bare or `(:each)` / `(:example)`;
 //! - `it` / `specify` / `example` with a block; `xit` and block-less
 //!   examples are pending in RSpec, so they are not tests here either;
 //! - helper `def`s in a group body;
@@ -33,7 +33,11 @@
 //!   `eql`, `equal`, `be(x)`, `be_nil`, `be_truthy`, `be_falsey`, `be_a` /
 //!   `be_an` / `be_kind_of` / `be_a_kind_of`, `be_instance_of` /
 //!   `be_an_instance_of`, `be_<predicate>`, `have_<predicate>` and
-//!   `include` of plain values.
+//!   `include` of plain values;
+//! - `expect { }.to raise_error` (any `Exception`, a class, a literal
+//!   message, or both), `not_to raise_error`, and `change { value }` /
+//!   `change(receiver, :message)` bare or with `by`, `by_at_least`,
+//!   `by_at_most`, `from`, `to`.
 
 use crate::det::HashMap;
 
@@ -170,6 +174,8 @@ struct Frame {
     lets: Vec<(String, Expr, Span)>,
     /// This group's `before` hooks and `let!` calls, in declaration order.
     hooks: Vec<Expr>,
+    /// This group's `after` hooks, in declaration order.
+    afters: Vec<Expr>,
     defs: Vec<MethodDef>,
 }
 
@@ -226,6 +232,12 @@ impl Reader<'_> {
         let stmts = block.body().map(flatten_statements).unwrap_or_default();
         for stmt in &stmts {
             if let Some(def) = stmt.as_def_node() {
+                // The test's own hooks: RSpec has none by these names.
+                if matches!(constant_id_str(&def.name()), "setup" | "teardown") {
+                    self.refuse(stmt, &format!("`def {}` in an example group", constant_id_str(&def.name())))?;
+                    refused = true;
+                    continue;
+                }
                 frame.defs.retain(|d| d.name.as_str() != constant_id_str(&def.name()));
                 frame.defs.push(ingest_library_method(&def, &owner, self.file)?);
                 continue;
@@ -248,7 +260,8 @@ impl Reader<'_> {
                 }
                 "let" | "let!" => self.read_let(&item, &mut frame, name == "let!")?,
                 "subject" => self.read_subject(&item, &mut frame)?,
-                "before" => self.read_before(&item, &mut frame)?,
+                "before" => self.read_hook(&item, &mut frame, "before")?,
+                "after" => self.read_hook(&item, &mut frame, "after")?,
                 "it" | "specify" | "example" => match self.example(&item)? {
                     Some((desc, body)) => {
                         examples.push((desc, item.as_node(), body));
@@ -335,6 +348,7 @@ impl Reader<'_> {
             spec_type,
             lets: Vec::new(),
             hooks: Vec::new(),
+            afters: Vec::new(),
             defs: Vec::new(),
         }))
     }
@@ -398,17 +412,26 @@ impl Reader<'_> {
         Ok(true)
     }
 
-    /// `before do ... end`, `before(:each)`, `before(:example)`. A hook
-    /// that runs once per group (`:all`, `:context`) is refused: every
-    /// example here runs on a fresh instance, as `:each` hooks need.
-    fn read_before(&self, call: &ruby_prism::CallNode<'_>, frame: &mut Frame) -> IngestResult<bool> {
+    /// `before` / `after` with a block, bare or `(:each)` / `(:example)`.
+    /// A hook that runs once per group (`:all`, `:context`) is refused:
+    /// every example here runs on a fresh instance, as `:each` hooks need.
+    fn read_hook(&self, call: &ruby_prism::CallNode<'_>, frame: &mut Frame, kind: &str) -> IngestResult<bool> {
         let node = call.as_node();
         if call.arguments().is_some() && !matches!(single_symbol_arg(call).as_deref(), Some("each" | "example")) {
             self.refuse(&node, &format!("`{}`", self.text(&node).lines().next().unwrap_or_default()))?;
             return Ok(false);
         }
-        let Some(body) = self.block_body(call, "before")? else { return Ok(false) };
-        frame.hooks.push(body);
+        let Some(body) = self.block_body(call, kind)? else { return Ok(false) };
+        // The body becomes a method's (setup/teardown): a bare `next`/`break` there does not parse, and a `return` skips the rest.
+        if jumps(&body) {
+            self.refuse(&node, &format!("`next`, `break` or `return` in a `{kind}` hook"))?;
+            return Ok(false);
+        }
+        if kind == "after" {
+            frame.afters.push(body);
+        } else {
+            frame.hooks.push(body);
+        }
         Ok(true)
     }
 
@@ -565,6 +588,26 @@ impl Reader<'_> {
         let setup = (!setup_stmts.is_empty())
             .then(|| Expr::new(Span::synthetic(), ExprNode::Seq { exprs: setup_stmts }));
 
+        // RSpec runs `after` hooks inner group first, and within a group
+        // in reverse of declaration (they are prepended), after the
+        // example whether it passed or not.
+        let mut after_stmts = Vec::new();
+        for hook in chain.iter().rev().flat_map(|f| f.afters.iter().rev()) {
+            match rewrite(hook) {
+                Ok(h) => after_stmts.push(h),
+                Err(what) => {
+                    super::survey::continue_or_fail(IngestError::Unsupported {
+                        file: self.file.into(),
+                        message: format!("RSpec: {what} in an `after` hook is not supported"),
+                    })?;
+                    return Ok(());
+                }
+            }
+        }
+        if !after_stmts.is_empty() {
+            helpers.push(teardown_method(after_stmts, &class));
+        }
+
         let mut tests = Vec::new();
         let mut seen: HashMap<String, usize> = HashMap::default();
         for (desc, node, body) in examples {
@@ -680,6 +723,64 @@ fn let_method(name: &str, body: Expr, span: Span, owner: &ClassId) -> MethodDef 
     }
 }
 
+/// `def teardown; <hooks>; ensure; super(); end`. The harness calls the
+/// test's `teardown` after every test, passed or failed; `super` is
+/// TestBase's own teardown (stub verification), which must still run
+/// when a hook raises. The same shape `ingest::test` gives a Minitest
+/// class's `teardown do ... end` blocks.
+fn teardown_method(hooks: Vec<Expr>, owner: &ClassId) -> MethodDef {
+    let syn = Span::synthetic();
+    // Each hook in its own `ensure`, not one around them all: RSpec runs every `after` hook when an earlier one raises.
+    let mut body = Expr::new(syn, ExprNode::Super { args: Some(Vec::new()) });
+    let count = hooks.len();
+    for (i, hook) in hooks.into_iter().rev().enumerate() {
+        // Only the outermost is the method body's own `ensure`: a nested one needs its `begin`/`end`.
+        let implicit = i + 1 == count;
+        // In a block of its own (`tap { … }`, self unchanged): a hook's locals are not another's, as each RSpec hook is its own block.
+        let scoped = Expr::new(
+            syn,
+            ExprNode::Send {
+                recv: None,
+                method: Symbol::from("tap"),
+                args: Vec::new(),
+                block: Some(Expr::new(
+                    syn,
+                    ExprNode::Lambda {
+                        params: Vec::new(),
+                        rest_param: None,
+                        extra_params: Vec::new(),
+                        block_param: None,
+                        body: hook,
+                        block_style: crate::expr::BlockStyle::Brace,
+                    },
+                )),
+                parenthesized: false,
+            },
+        );
+        body = Expr::new(
+            syn,
+            ExprNode::BeginRescue { body: scoped, rescues: Vec::new(), else_branch: None, ensure: Some(Box::new(body)), implicit },
+        );
+    }
+    MethodDef {
+        name_span: syn,
+        name: Symbol::from("teardown"),
+        receiver: MethodReceiver::Instance,
+        visibility: MethodVisibility::Public,
+        params: Vec::new(),
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        body,
+        signature: None,
+        effects: EffectSet::default(),
+        enclosing_class: Some(owner.0.clone()),
+        kind: AccessorKind::Method,
+        is_async: false,
+        mutates_self: false,
+        block_param: None,
+    }
+}
+
 fn nil(span: Span) -> Expr {
     Expr::new(span, ExprNode::Lit { value: Literal::Nil })
 }
@@ -763,13 +864,9 @@ fn expectation(expr: &Expr, described: Option<&[String]>) -> Result<Option<Expr>
     else {
         return Ok(None);
     };
-    let actual = match (target_method.as_str(), target_args.as_slice(), target_block) {
-        ("expect", [actual], None) => desugar(actual, described)?,
-        ("is_expected", [], None) => self_call("subject", target.span),
-        ("expect", [], Some(_)) => return Err("block expectations (`expect { ... }`)".into()),
-        ("expect" | "is_expected", _, _) => return Err("this form of `expect`".into()),
-        _ => return Ok(None),
-    };
+    if !matches!(target_method.as_str(), "expect" | "is_expected") {
+        return Ok(None);
+    }
     if block.is_some() {
         return Err("a block passed to `to` / `not_to`".into());
     }
@@ -777,6 +874,15 @@ fn expectation(expr: &Expr, described: Option<&[String]>) -> Result<Option<Expr>
         return Err("`to` / `not_to` without exactly one matcher".into());
     };
     let span = expr.span;
+    let actual = match (target_method.as_str(), target_args.as_slice(), target_block) {
+        ("expect", [actual], None) => desugar(actual, described)?,
+        ("is_expected", [], None) => self_call("subject", target.span),
+        ("expect", [], Some(block)) => {
+            let body = lambda_body(&desugar(block, described)?)?;
+            return block_expectation(span, body, positive, matcher, described).map(Some);
+        }
+        _ => return Err("this form of `expect`".into()),
+    };
     let conditions = matcher_conditions(matcher, actual, described)?;
     // `include(a, b)` holds when every value is included; its negation
     // when none is, so each value is its own assertion either way.
@@ -789,6 +895,347 @@ fn expectation(expr: &Expr, described: Option<&[String]>) -> Result<Option<Expr>
     } else {
         Expr::new(span, ExprNode::Seq { exprs: asserts })
     }))
+}
+
+/// The body of `expect { body }`'s block. It runs in the example's own
+/// scope here, so a block that jumps out (`next`, `break`, `return`)
+/// would mean something else there and is refused.
+fn lambda_body(block: &Expr) -> Result<Expr, String> {
+    let ExprNode::Lambda { params, rest_param, extra_params, block_param, body, .. } = &*block.node else {
+        return Err("a block argument to `expect`".into());
+    };
+    if !params.is_empty() || rest_param.is_some() || !extra_params.is_empty() || block_param.is_some() {
+        return Err("block parameters on `expect { }`".into());
+    }
+    if jumps(body) {
+        return Err("`next`, `break` or `return` inside `expect { }`".into());
+    }
+    Ok(body.clone())
+}
+
+fn jumps(expr: &Expr) -> bool {
+    jumps_in(expr, false)
+}
+
+/// `nested`: inside a block given to a call in the body. That block owns
+/// its `next` and `break`, but a `return` in it still leaves the example,
+/// which RSpec reports as a LocalJumpError. A lambda literal owns its
+/// `return` as well.
+fn jumps_in(expr: &Expr, nested: bool) -> bool {
+    match &*expr.node {
+        ExprNode::Return { .. } => return true,
+        ExprNode::Next { .. } | ExprNode::Break { .. } | ExprNode::Redo | ExprNode::Retry if !nested => return true,
+        ExprNode::Lambda { .. } => return false,
+        // A loop owns its `next` and `break`; a `return` in it still leaves the example.
+        ExprNode::While { cond, body, .. } => return jumps_in(cond, nested) || jumps_in(body, true),
+        _ => {}
+    }
+    let mut found = false;
+    let mut probe = expr.clone();
+    let block: Option<*const Expr> = match &*probe.node {
+        ExprNode::Send { block: Some(b), .. } | ExprNode::Apply { block: Some(b), .. } => Some(b as *const Expr),
+        _ => None,
+    };
+    probe.node.for_each_child_mut(&mut |child| {
+        found |= if block == Some(child as *const Expr) {
+            match &*child.node {
+                ExprNode::Lambda { body, .. } => jumps_in(body, true),
+                _ => jumps_in(child, true),
+            }
+        } else {
+            jumps_in(child, nested)
+        };
+    });
+    found
+}
+
+/// `expect { body }.to raise_error(...)` / `change(...)`.
+fn block_expectation(
+    span: Span,
+    body: Expr,
+    positive: bool,
+    matcher: &Expr,
+    described: Option<&[String]>,
+) -> Result<Expr, String> {
+    // Peel the qualifier chain: `change(X, :count).by(1)` is
+    // `by(1)` sent to `change(X, :count)`.
+    let mut qualifiers: Vec<(String, Vec<Expr>)> = Vec::new();
+    let mut base = matcher;
+    while let ExprNode::Send { recv: Some(inner), method, args, block: None, .. } = &*base.node {
+        let args = args.iter().map(|a| desugar(a, described)).collect::<Result<Vec<_>, _>>()?;
+        qualifiers.insert(0, (method.as_str().to_string(), args));
+        base = inner;
+    }
+    let ExprNode::Send { recv: None, method, args, block, .. } = &*base.node else {
+        return Err("this matcher on a block expectation".into());
+    };
+    let args = args.iter().map(|a| desugar(a, described)).collect::<Result<Vec<_>, _>>()?;
+    match method.as_str() {
+        "raise_error" | "raise_exception" => {
+            if block.is_some() {
+                return Err("a block on `raise_error`".into());
+            }
+            if let Some((q, _)) = qualifiers.first() {
+                return Err(format!("`raise_error(...).{q}`"));
+            }
+            raise_error_expectation(span, body, positive, args)
+        }
+        "change" => {
+            // `change(receiver, :message)` evaluates the receiver once, as `change` is called; the message goes to that object twice.
+            let mut receiver: Option<Expr> = None;
+            let value = match (args.as_slice(), block) {
+                ([], Some(b)) => lambda_body(&desugar(b, described)?)?,
+                ([recv, name], None) => match &*name.node {
+                    ExprNode::Lit { value: Literal::Sym { value } } => {
+                        let bound = format!("__rspec_receiver_{}", span.start);
+                        receiver = Some(assign_var(&bound, recv.clone(), span));
+                        send(Some(var(&bound, span)), value.as_str(), Vec::new(), span)
+                    }
+                    _ => return Err("`change(receiver, message)` with a message that is not a symbol".into()),
+                },
+                _ => return Err("this form of `change`".into()),
+            };
+            let expectation = change_expectation(span, body, positive, value, qualifiers)?;
+            Ok(match receiver {
+                Some(bind) => Expr::new(span, ExprNode::Seq { exprs: vec![bind, expectation] }),
+                None => expectation,
+            })
+        }
+        other => Err(format!("the `{other}` matcher on a block expectation")),
+    }
+}
+
+/// `raise_error` with no argument matches any `Exception`, as in RSpec. A
+/// String message must equal the error's message; a Regexp must match it.
+///
+/// ```ruby
+/// __rspec_error = assert_raises(Klass) { body }   # lowered later
+/// assert(__rspec_error.message == "text")         # with a message
+/// ```
+///
+/// `not_to raise_error` here takes no argument (RSpec runs one and warns
+/// of a false positive; this lowering refuses it), and means: run the
+/// block; an exception fails the example.
+fn raise_error_expectation(span: Span, body: Expr, positive: bool, args: Vec<Expr>) -> Result<Expr, String> {
+    if !positive {
+        if !args.is_empty() {
+            return Err("`not_to raise_error` with an argument (a Roundhouse limit: RSpec runs it and warns of a false positive)".into());
+        }
+        return Ok(Expr::new(
+            span,
+            ExprNode::BeginRescue { body, rescues: Vec::new(), else_branch: None, ensure: None, implicit: false },
+        ));
+    }
+    let is_message = |e: &Expr| matches!(&*e.node, ExprNode::Lit { value: Literal::Str { .. } | Literal::Regex { .. } });
+    let is_class = |e: &Expr| matches!(&*e.node, ExprNode::Const { .. });
+    let (class, message) = match args.as_slice() {
+        [] => (None, None),
+        [c] if is_class(c) => (Some(c.clone()), None),
+        [m] if is_message(m) => (None, Some(m.clone())),
+        [c, m] if is_class(c) && is_message(m) => (Some(c.clone()), Some(m.clone())),
+        _ => return Err("`raise_error` arguments other than a constant class and a literal message".into()),
+    };
+    let class = class.unwrap_or_else(|| constant(&["Exception".to_string()], span));
+    let block = Expr::new(
+        span,
+        ExprNode::Lambda {
+            params: Vec::new(),
+            rest_param: None,
+            extra_params: Vec::new(),
+            block_param: None,
+            body,
+            block_style: crate::expr::BlockStyle::Brace,
+        },
+    );
+    let raises = Expr::new(
+        span,
+        ExprNode::Send {
+            recv: None,
+            method: Symbol::from("assert_raises"),
+            args: vec![class],
+            block: Some(block),
+            parenthesized: true,
+        },
+    );
+    let Some(message) = message else { return Ok(raises) };
+    let error = "__rspec_error";
+    // RSpec's own source for the text: `original_message` where the error has one (a NameError's undecorated text).
+    let text = Expr::new(
+        span,
+        ExprNode::If {
+            cond: send(Some(var(error, span)), "respond_to?", vec![Expr::new(span, ExprNode::Lit { value: Literal::Sym { value: Symbol::from("original_message") } })], span),
+            then_branch: send(Some(send(Some(var(error, span)), "original_message", Vec::new(), span)), "to_s", Vec::new(), span),
+            else_branch: send(Some(send(Some(var(error, span)), "message", Vec::new(), span)), "to_s", Vec::new(), span),
+        },
+    );
+    let check = match &*message.node {
+        ExprNode::Lit { value: Literal::Regex { .. } } => send(Some(message.clone()), "match?", vec![text], span),
+        _ => send(Some(text), "==", vec![message.clone()], span),
+    };
+    Ok(Expr::new(
+        span,
+        ExprNode::Seq { exprs: vec![assign_var(error, raises, span), send(None, "assert", vec![check], span)] },
+    ))
+}
+
+/// `change { value }` / `change(receiver, :message)`, as RSpec's
+/// `ChangeDetails` computes it: the value and its `hash` before the block
+/// and after it, the value itself not copied, so that a value changed in
+/// place reads as a change through its `hash`.
+///
+/// ```ruby
+/// __rspec_by_N = 1                                  # .by(1), read first
+/// __rspec_before_N = value
+/// __rspec_before_hash_N = __rspec_before_N.hash
+/// body
+/// __rspec_after_N = value
+/// __rspec_after_hash_N = __rspec_after_N.hash
+/// __rspec_delta_N = __rspec_after_N - __rspec_before_N
+/// assert(__rspec_by_N === __rspec_delta_N || __rspec_delta_N == __rspec_by_N)
+/// ```
+///
+/// `N` is the expectation's offset, so a nested `change` keeps its own
+/// names. `from` / `to` / a bare `change` also need the value to have
+/// changed (`before != after || before_hash != after_hash`); `from` is
+/// matched before the block runs. Expected values match the way RSpec's
+/// `values_match?` does for plain values: `expected === actual ||
+/// actual == expected`.
+fn change_expectation(
+    span: Span,
+    body: Expr,
+    positive: bool,
+    value: Expr,
+    qualifiers: Vec<(String, Vec<Expr>)>,
+) -> Result<Expr, String> {
+    // Names of this expectation's own: a nested `change` in the block must not overwrite them.
+    let at = span.start;
+    let name = |base: &str| format!("__rspec_{base}_{at}");
+    let (before, after, before_hash, after_hash) = (name("before"), name("after"), name("before_hash"), name("after_hash"));
+    let mut by: Option<(String, Expr)> = None;
+    let mut from: Option<Expr> = None;
+    let mut to: Option<Expr> = None;
+    // Each argument as its call in the chain runs, in the chain's order (`.to(…).from(…)` reads `to`'s first).
+    let mut stmts = Vec::new();
+    for (qualifier, args) in qualifiers {
+        let [arg] = args.as_slice() else {
+            return Err(format!("`change.{qualifier}` without exactly one argument"));
+        };
+        // RSpec matches an Array or Hash expected element by element (`Integer` against an element);
+        // only a whole-value match is lowered, so a pattern inside one is refused.
+        if matches!(qualifier.as_str(), "from" | "to") && collection_with_patterns(arg) {
+            return Err(format!("`change.{qualifier}` with a pattern inside an Array or Hash"));
+        }
+        let slot = match qualifier.as_str() {
+            "by" | "by_at_least" | "by_at_most" if by.is_none() => "by",
+            "from" if from.is_none() => "from",
+            "to" if to.is_none() => "to",
+            _ => return Err(format!("`change.{qualifier}` here")),
+        };
+        let bound = name(slot);
+        stmts.push(assign_var(&bound, arg.clone(), span));
+        let read = var(&bound, span);
+        match slot {
+            "by" => by = Some((qualifier.clone(), read)),
+            "from" => from = Some(read),
+            _ => to = Some(read),
+        }
+    }
+    if by.is_some() && (from.is_some() || to.is_some()) {
+        return Err("`change` with both `by` and `from` / `to`".into());
+    }
+    if !positive && (by.is_some() || to.is_some()) {
+        return Err("`not_to change` with `by` or `to`".into());
+    }
+
+    // RSpec's ChangeDetails: the value is not copied; its `hash` before and after tells an in-place change apart.
+    stmts.push(assign_var(&before, value.clone(), span));
+    stmts.push(assign_var(&before_hash, send(Some(var(&before, span)), "hash", Vec::new(), span), span));
+    let assert = |cond: Expr| send(None, "assert", vec![cond], span);
+    // `from` matches before the event runs, as RSpec matches it on the value it yields then.
+    let from_matched = from.map(|x| {
+        let matched = name("from_matched");
+        stmts.push(assign_var(&matched, values_match(x, var(&before, span), span), span));
+        var(&matched, span)
+    });
+    stmts.push(body);
+    stmts.push(assign_var(&after, value, span));
+    stmts.push(assign_var(&after_hash, send(Some(var(&after, span)), "hash", Vec::new(), span), span));
+
+    let changed = Expr::new(
+        span,
+        ExprNode::BoolOp {
+            op: crate::expr::BoolOpKind::Or,
+            surface: Default::default(),
+            left: send(Some(var(&before, span)), "!=", vec![var(&after, span)], span),
+            right: send(Some(var(&before_hash, span)), "!=", vec![var(&after_hash, span)], span),
+        },
+    );
+    match by {
+        Some((kind, n)) => {
+            // The delta once: a matcher compares it twice (`===`, then `==`).
+            let delta = name("delta");
+            stmts.push(assign_var(&delta, send(Some(var(&after, span)), "-", vec![var(&before, span)], span), span));
+            stmts.push(assert(match kind.as_str() {
+                "by" => values_match(n, var(&delta, span), span),
+                "by_at_least" => send(Some(var(&delta, span)), ">=", vec![n], span),
+                _ => send(Some(var(&delta, span)), "<=", vec![n], span),
+            }));
+        }
+        None => {
+            if let Some(m) = from_matched {
+                stmts.push(assert(m));
+            }
+            // The change first: RSpec never asks `to`'s matcher of a value the event left as it was.
+            stmts.push(send(None, if positive { "assert" } else { "refute" }, vec![changed], span));
+            if let Some(y) = to {
+                stmts.push(assert(values_match(y, var(&after, span), span)));
+            }
+        }
+    }
+    Ok(Expr::new(span, ExprNode::Seq { exprs: stmts }))
+}
+
+/// An Array or Hash literal holding something other than plain literals (a class, a matcher, a
+/// lambda), which RSpec would match element by element.
+fn collection_with_patterns(e: &Expr) -> bool {
+    match &*e.node {
+        ExprNode::Array { elements, .. } => elements.iter().any(|el| !plain_literal(el)),
+        ExprNode::Hash { entries, .. } => entries.iter().any(|(k, v)| !plain_literal(k) || !plain_literal(v)),
+        _ => false,
+    }
+}
+
+fn plain_literal(e: &Expr) -> bool {
+    match &*e.node {
+        ExprNode::Lit { .. } => true,
+        ExprNode::Array { elements, .. } => elements.iter().all(plain_literal),
+        ExprNode::Hash { entries, .. } => entries.iter().all(|(k, v)| plain_literal(k) && plain_literal(v)),
+        _ => false,
+    }
+}
+
+/// RSpec's `values_match?(expected, actual)` for plain values.
+fn values_match(expected: Expr, actual: Expr, span: Span) -> Expr {
+    Expr::new(
+        span,
+        ExprNode::BoolOp {
+            op: crate::expr::BoolOpKind::Or,
+            surface: Default::default(),
+            left: send(Some(expected.clone()), "===", vec![actual.clone()], span),
+            right: send(Some(actual), "==", vec![expected], span),
+        },
+    )
+}
+
+fn var(name: &str, span: Span) -> Expr {
+    Expr::new(span, ExprNode::Var { id: crate::ident::VarId(0), name: Symbol::from(name) })
+}
+
+fn assign_var(name: &str, value: Expr, span: Span) -> Expr {
+    Expr::new(
+        span,
+        ExprNode::Assign { target: LValue::Var { id: crate::ident::VarId(0), name: Symbol::from(name) }, value },
+    )
 }
 
 /// What `matcher` checks of `actual`, as conditions that hold when the
@@ -974,9 +1421,123 @@ end
         assert!(err.to_string().contains("contain_exactly"), "{err}");
     }
 
+    fn body_of(src: &str) -> String {
+        let tms = ingest(src);
+        format!("{:?}", tms[0].tests[0].body)
+    }
+
+    fn example(body: &str) -> String {
+        format!("describe Article do\n  it \"x\" do\n    {body}\n  end\nend\n")
+    }
+
     #[test]
-    fn mocks_and_block_expectations_are_refused() {
-        for body in ["allow(Article).to receive(:count).and_return(1)", "expect { Article.create! }.to raise_error"] {
+    fn raise_error_becomes_assert_raises_with_the_block() {
+        let body = body_of(&example("expect { Article.find(1) }.to raise_error(ActiveRecord::RecordNotFound)"));
+        assert!(body.contains("assert_raises") && body.contains("RecordNotFound") && body.contains("find"), "{body}");
+        // No class: any Exception, as in RSpec.
+        let body = body_of(&example("expect { boom }.to raise_error"));
+        assert!(body.contains("assert_raises") && body.contains("\"Exception\""), "{body}");
+        // A literal message must equal the error's message.
+        let body = body_of(&example("expect { boom }.to raise_error(ArgumentError, \"bad\")"));
+        assert!(body.contains("__rspec_error") && body.contains("message") && body.contains("\"==\""), "{body}");
+    }
+
+    #[test]
+    fn not_to_raise_error_runs_the_block() {
+        let body = body_of(&example("expect { work }.not_to raise_error"));
+        assert!(!body.contains("assert_raises") && body.contains("work"), "{body}");
+        let src = example("expect { work }.not_to raise_error(ArgumentError)");
+        assert!(ingest_spec_files(src.as_bytes(), "/app/spec/models/article_spec.rb").is_err());
+    }
+
+    #[test]
+    fn change_by_compares_the_values_around_the_block() {
+        let tms = ingest(&example("expect { Article.create! }.to change(Article, :count).by(1)"));
+        fn kinds(e: &Expr, out: &mut Vec<String>) {
+            match &*e.node {
+                ExprNode::Seq { exprs } => exprs.iter().for_each(|e| kinds(e, out)),
+                ExprNode::Assign { target: LValue::Var { name, .. }, .. } => out.push(format!("{} =", name.as_str())),
+                ExprNode::Send { method, .. } => out.push(method.as_str().to_string()),
+                other => out.push(format!("{other:?}")),
+            }
+        }
+        let mut order = Vec::new();
+        kinds(&tms[0].tests[0].body, &mut order);
+        // Without the expectation's own offset suffix.
+        let order: Vec<String> = order
+            .into_iter()
+            .map(|k| match k.strip_suffix(" =").and_then(|n| n.rsplit_once('_')) {
+                Some((base, n)) if n.chars().all(|c| c.is_ascii_digit()) => format!("{base} ="),
+                _ => k,
+            })
+            .collect();
+        // `by`'s argument is read first, as RSpec builds the matcher before the block; the delta once.
+        assert_eq!(
+            order,
+            ["__rspec_receiver =", "__rspec_by =", "__rspec_before =", "__rspec_before_hash =", "create!", "__rspec_after =", "__rspec_after_hash =", "__rspec_delta =", "assert"]
+        );
+    }
+
+    #[test]
+    fn change_from_to_compares_hashes_and_needs_a_change() {
+        let body = body_of(&example("expect { list << 1 }.to change { list }.from([]).to([1])"));
+        assert!(!body.contains("dup") && body.contains("\"hash\"") && body.contains("\"!=\"") && body.contains("\"===\""), "{body}");
+        for refused in [
+            "expect { x }.not_to change { y }.by(1)",
+            "expect { x }.to change { y }.by(1).from(0)",
+            "expect { x }.to output(\"a\").to_stdout",
+            "expect { next }.to change { y }",
+            // `return` in a nested block leaves the example: LocalJumpError in RSpec.
+            "expect { list.each { |i| return if i.nil? } }.to change { y }",
+        ] {
+            let src = example(refused);
+            assert!(ingest_spec_files(src.as_bytes(), "/app/spec/models/article_spec.rb").is_err(), "{refused}");
+        }
+    }
+
+    // A nested block owns its `next`; a lambda literal owns its `return`.
+    // Both run the same in RSpec, so the example is read.
+    #[test]
+    fn a_jump_its_own_block_or_lambda_owns_is_read() {
+        for kept in [
+            "expect { list.each { |i| next if i.nil? } }.to change { y }",
+            "expect { f = -> { return 5 }; f.call }.to change { y }",
+        ] {
+            let src = example(kept);
+            assert!(ingest_spec_files(src.as_bytes(), "/app/spec/models/article_spec.rb").is_ok(), "{kept}");
+        }
+    }
+
+    // RSpec runs `after` hooks inner group first, each group's in reverse.
+    #[test]
+    fn after_hooks_become_teardown_inner_first() {
+        let src = "describe Article do\n  after { outer_one }\n  after { outer_two }\n  context \"c\" do\n    after { inner }\n    it \"x\" do\n      expect(1).to eq(1)\n    end\n  end\nend\n";
+        let tms = ingest(src);
+        let teardown = helper(&tms[0], "teardown");
+        // Each hook in its own `ensure`, `super` innermost: a raising hook still runs the ones after it.
+        let mut order: Vec<&str> = Vec::new();
+        let mut at = &teardown.body;
+        while let ExprNode::BeginRescue { body, ensure: Some(ensure), .. } = &*at.node {
+            let inner = match &*body.node {
+                ExprNode::Send { method, block: Some(b), .. } if method.as_str() == "tap" => match &*b.node {
+                    ExprNode::Lambda { body, .. } => body,
+                    _ => body,
+                },
+                _ => body,
+            };
+            order.push(match &*inner.node {
+                ExprNode::Send { method, .. } => method.as_str(),
+                _ => "?",
+            });
+            at = ensure;
+        }
+        assert!(matches!(&*at.node, ExprNode::Super { .. }));
+        assert_eq!(order, ["inner", "outer_two", "outer_one"]);
+    }
+
+    #[test]
+    fn mocks_are_refused() {
+        for body in ["allow(Article).to receive(:count).and_return(1)", "expect(Article).to receive(:count)"] {
             let src = format!("describe Article do\n  it \"x\" do\n    {body}\n  end\nend\n");
             assert!(ingest_spec_files(src.as_bytes(), "/app/spec/models/article_spec.rb").is_err(), "{body}");
         }

@@ -1,7 +1,7 @@
 use super::emit_and_run;
 
 // RSpec's verdict on CRuby is the expectation: the spec is written to pass
-// unchanged under `rspec` in the generated blog (5 examples). The
+// unchanged under `rspec` in the generated blog (7 examples). The
 // emitted tests must pass on the same app, and fail where RSpec fails.
 const SPEC: &str = r#"require "rails_helper"
 
@@ -54,6 +54,23 @@ RSpec.describe Article, type: :model do
       expect(saved).to be_persisted
     end
   end
+
+  describe "block expectations" do
+    it "raise errors" do
+      expect { Article.find(-1) }.to raise_error(ActiveRecord::RecordNotFound)
+      expect { raise ArgumentError, "bad value" }.to raise_error(ArgumentError, "bad value")
+      expect { raise ArgumentError, "bad value" }.to raise_error(/bad/)
+      expect { article.valid? }.not_to raise_error
+    end
+
+    it "change values" do
+      expect { Article.create!(title: "New", body: "A body that is long enough.") }.to change(Article, :count).by(1)
+      expect { article.title = "Renamed" }.to change { article.title }.from("Getting Started").to("Renamed")
+      # `from`'s argument is read when the matcher is built, before the block runs.
+      expect { article.title = "Again" }.to change { article.title }.from(article.title).to("Again")
+      expect { article.valid? }.not_to change { Article.count }
+    end
+  end
 end
 "#;
 
@@ -67,12 +84,13 @@ fn app(spec: &str) -> emit_and_run::Overlay {
 
 // One emitted test file per example group that owns examples, named by
 // the spec file and the group.
-const FILES: [(&str, usize); 5] = [
+const FILES: [(&str, usize); 6] = [
     ("models_article_spec", 1),
     ("models_article_without_title_spec", 1),
     ("models_article_with_short_body_spec", 1),
     ("models_article_let_spec", 1),
     ("models_article_let_spec2", 1),
+    ("models_article_block_expectations_spec", 2),
 ];
 
 #[test]
@@ -114,6 +132,52 @@ fn spec_files_with_the_same_module_name_keep_their_own_tests() {
     let second = overlay().run_test("test/models/models_article_comments_spec2_test.rb");
     assert!(first.errors.is_empty() && second.errors.is_empty(), "{:?} {:?}", first.errors, second.errors);
     assert!(first.program_succeeded() != second.program_succeeded(), "one file passes and the other fails:\n{}\n{}", first.stdout, second.stdout);
+}
+
+// The block expectations fail where RSpec's do.
+#[test]
+fn failing_block_expectations_fail_the_emitted_test() {
+    for (find, replace) in [
+        ("raise_error(ArgumentError, \"bad value\")", "raise_error(ArgumentError, \"other\")"),
+        ("change(Article, :count).by(1)", "change(Article, :count).by(2)"),
+        ("not_to change { Article.count }", "to change { Article.count }"),
+    ] {
+        let run = app(&SPEC.replacen(find, replace, 1)).run_test("test/models/models_article_block_expectations_spec_test.rb");
+        assert!(run.errors.is_empty(), "{find}: {:?}", run.errors);
+        assert!(!run.program_succeeded(), "`{replace}` passed:\n{}\n{}", run.stdout, run.stderr);
+    }
+}
+
+// Two `after` hooks: the generated teardown loads (each hook in its own `begin`/`ensure`), and the
+// second still runs when the first raises.
+#[test]
+fn every_after_hook_runs_when_one_raises() {
+    let spec = SPEC.replacen(
+        "  describe \"let\" do\n",
+        "  describe \"let\" do\n    after { raise \"second hook ran #{defined?(local_of_first) ? \"seeing\" : \"blind to\"} the first's local\" }\n    after { local_of_first = 1; raise \"first hook ran\" }\n",
+        1,
+    );
+    let run = app(&spec).run_test("test/models/models_article_let_spec_test.rb");
+    assert!(run.errors.is_empty(), "{:?}", run.errors);
+    let out = format!("{}{}", run.stdout, run.stderr);
+    assert!(!run.program_succeeded(), "the raising hooks did not fail the test:\n{out}");
+    assert!(!out.contains("syntax error") && !out.contains("SyntaxError"), "{out}");
+    // RSpec runs `after` hooks in reverse: the one written last first, and the other after it raises.
+    assert!(out.contains("second hook ran blind to the first's local"), "the hook after the raising one did not run on its own locals:\n{out}");
+}
+
+// An `after` hook runs after the example: one that raises fails it.
+#[test]
+fn after_hooks_run_after_the_example() {
+    let spec = SPEC.replacen(
+        "  describe \"let\" do\n",
+        "  describe \"let\" do\n    after { raise \"after hook ran\" }\n",
+        1,
+    );
+    let run = app(&spec).run_test("test/models/models_article_let_spec_test.rb");
+    assert!(run.errors.is_empty(), "{:?}", run.errors);
+    assert!(!run.program_succeeded(), "the raising after hook did not fail the test:\n{}\n{}", run.stdout, run.stderr);
+    assert!(format!("{}{}", run.stdout, run.stderr).contains("after hook ran"), "{}\n{}", run.stdout, run.stderr);
 }
 
 // The point of the lane: the same examples run inside the Spinel build.
