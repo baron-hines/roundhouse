@@ -731,7 +731,7 @@ fn teardown_method(hooks: Vec<Expr>, owner: &ClassId) -> MethodDef {
             body: Expr::new(syn, ExprNode::Seq { exprs: hooks }),
             rescues: Vec::new(),
             else_branch: None,
-            ensure: Some(Expr::new(syn, ExprNode::Super { args: Some(Vec::new()) })),
+            ensure: Some(Box::new(Expr::new(syn, ExprNode::Super { args: Some(Vec::new()) }))),
             implicit: true,
         },
     );
