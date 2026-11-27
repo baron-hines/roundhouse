@@ -123,11 +123,10 @@ The supported subset:
   class, a literal message (equal to the error's message, or matched by a
   Regexp), or both; `expect { }.not_to raise_error`;
 - `expect { }.to change { value }` and `change(receiver, :message)`, bare
-  or with `by`, `by_at_least`, `by_at_most`, `from` and `to`; a collection
-  or String value is copied before the block runs, as RSpec does. RSpec
-  also compares the value's `hash` before and after; roundhouse does not,
-  so another object changed in place with an unchanged `==` is not seen
-  as a change.
+  or with `by`, `by_at_least`, `by_at_most`, `from` and `to`. As in
+  RSpec, the value is not copied: it and its `hash` are compared before
+  and after the block, so a value changed in place reads as a change, and
+  `from` is matched before the block runs.
 
 Anything else is refused by name: `roundhouse check` reports it, and
 `--continue` lists every refused construct and leaves out the examples

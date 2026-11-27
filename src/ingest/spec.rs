@@ -422,6 +422,11 @@ impl Reader<'_> {
             return Ok(false);
         }
         let Some(body) = self.block_body(call, kind)? else { return Ok(false) };
+        // The body becomes a method's (setup/teardown): a bare `next`/`break` there does not parse, and a `return` skips the rest.
+        if jumps(&body) {
+            self.refuse(&node, &format!("`next`, `break` or `return` in a `{kind}` hook"))?;
+            return Ok(false);
+        }
         if kind == "after" {
             frame.afters.push(body);
         } else {
@@ -952,17 +957,25 @@ fn block_expectation(
             raise_error_expectation(span, body, positive, args)
         }
         "change" => {
+            // `change(receiver, :message)` evaluates the receiver once, as `change` is called; the message goes to that object twice.
+            let mut receiver: Option<Expr> = None;
             let value = match (args.as_slice(), block) {
                 ([], Some(b)) => lambda_body(&desugar(b, described)?)?,
                 ([recv, name], None) => match &*name.node {
                     ExprNode::Lit { value: Literal::Sym { value } } => {
-                        send(Some(recv.clone()), value.as_str(), Vec::new(), span)
+                        let bound = format!("__rspec_receiver_{}", span.start);
+                        receiver = Some(assign_var(&bound, recv.clone(), span));
+                        send(Some(var(&bound, span)), value.as_str(), Vec::new(), span)
                     }
                     _ => return Err("`change(receiver, message)` with a message that is not a symbol".into()),
                 },
                 _ => return Err("this form of `change`".into()),
             };
-            change_expectation(span, body, positive, value, qualifiers)
+            let expectation = change_expectation(span, body, positive, value, qualifiers)?;
+            Ok(match receiver {
+                Some(bind) => Expr::new(span, ExprNode::Seq { exprs: vec![bind, expectation] }),
+                None => expectation,
+            })
         }
         other => Err(format!("the `{other}` matcher on a block expectation")),
     }
@@ -976,12 +989,13 @@ fn block_expectation(
 /// assert(__rspec_error.message == "text")         # with a message
 /// ```
 ///
-/// `not_to raise_error` takes no argument in RSpec (with one it is an
-/// error), and means: run the block; an exception fails the example.
+/// `not_to raise_error` here takes no argument (RSpec runs one and warns
+/// of a false positive; this lowering refuses it), and means: run the
+/// block; an exception fails the example.
 fn raise_error_expectation(span: Span, body: Expr, positive: bool, args: Vec<Expr>) -> Result<Expr, String> {
     if !positive {
         if !args.is_empty() {
-            return Err("`not_to raise_error` with an argument (RSpec refuses it too)".into());
+            return Err("`not_to raise_error` with an argument (a Roundhouse limit: RSpec runs it and warns of a false positive)".into());
         }
         return Ok(Expr::new(
             span,
@@ -1021,7 +1035,15 @@ fn raise_error_expectation(span: Span, body: Expr, positive: bool, args: Vec<Exp
     );
     let Some(message) = message else { return Ok(raises) };
     let error = "__rspec_error";
-    let text = send(Some(var(error, span)), "message", Vec::new(), span);
+    // RSpec's own source for the text: `original_message` where the error has one (a NameError's undecorated text).
+    let text = Expr::new(
+        span,
+        ExprNode::If {
+            cond: send(Some(var(error, span)), "respond_to?", vec![Expr::new(span, ExprNode::Lit { value: Literal::Sym { value: Symbol::from("original_message") } })], span),
+            then_branch: send(Some(var(error, span)), "original_message", Vec::new(), span),
+            else_branch: send(Some(var(error, span)), "message", Vec::new(), span),
+        },
+    );
     let check = match &*message.node {
         ExprNode::Lit { value: Literal::Regex { .. } } => send(Some(message.clone()), "match?", vec![text], span),
         _ => send(Some(text), "==", vec![message.clone()], span),
@@ -1033,20 +1055,25 @@ fn raise_error_expectation(span: Span, body: Expr, positive: bool, args: Vec<Exp
 }
 
 /// `change { value }` / `change(receiver, :message)`, as RSpec's
-/// `ChangeDetails` computes it: the value before the block and after it,
-/// a collection or String copied before the block runs so that changing
-/// it in place still reads as a change.
+/// `ChangeDetails` computes it: the value and its `hash` before the block
+/// and after it, the value itself not copied, so that a value changed in
+/// place reads as a change through its `hash`.
 ///
 /// ```ruby
-/// __rspec_before = value
-/// __rspec_before = __rspec_before.dup if __rspec_before.is_a?(Enumerable) || __rspec_before.is_a?(String)
+/// __rspec_by_N = 1                                  # .by(1), read first
+/// __rspec_before_N = value
+/// __rspec_before_hash_N = __rspec_before_N.hash
 /// body
-/// __rspec_after = value
-/// assert(1 === __rspec_after - __rspec_before || __rspec_after - __rspec_before == 1)   # .by(1)
+/// __rspec_after_N = value
+/// __rspec_after_hash_N = __rspec_after_N.hash
+/// __rspec_delta_N = __rspec_after_N - __rspec_before_N
+/// assert(__rspec_by_N === __rspec_delta_N || __rspec_delta_N == __rspec_by_N)
 /// ```
 ///
-/// `from` / `to` / a bare `change` also need the value to have changed
-/// (`before != after`). Expected values match the way RSpec's
+/// `N` is the expectation's offset, so a nested `change` keeps its own
+/// names. `from` / `to` / a bare `change` also need the value to have
+/// changed (`before != after || before_hash != after_hash`); `from` is
+/// matched before the block runs. Expected values match the way RSpec's
 /// `values_match?` does for plain values: `expected === actual ||
 /// actual == expected`.
 fn change_expectation(
@@ -1056,7 +1083,10 @@ fn change_expectation(
     value: Expr,
     qualifiers: Vec<(String, Vec<Expr>)>,
 ) -> Result<Expr, String> {
-    let (before, after) = ("__rspec_before", "__rspec_after");
+    // Names of this expectation's own: a nested `change` in the block must not overwrite them.
+    let at = span.start;
+    let name = |base: &str| format!("__rspec_{base}_{at}");
+    let (before, after, before_hash, after_hash) = (name("before"), name("after"), name("before_hash"), name("after_hash"));
     let mut by: Option<(String, Expr)> = None;
     let mut from: Option<Expr> = None;
     let mut to: Option<Expr> = None;
@@ -1075,58 +1105,60 @@ fn change_expectation(
         return Err("`change` with both `by` and `from` / `to`".into());
     }
     if !positive && (by.is_some() || to.is_some()) {
-        return Err("`not_to change` with `by` or `to` (RSpec refuses it too)".into());
+        return Err("`not_to change` with `by` or `to`".into());
     }
 
     // RSpec builds the matcher, so evaluates these arguments, before it runs the block; each is read once.
     let mut stmts = Vec::new();
-    let mut bind = |name: &str, arg: Expr| {
-        stmts.push(assign_var(name, arg, span));
-        var(name, span)
+    let mut bind = |var_name: String, arg: Expr| {
+        stmts.push(assign_var(&var_name, arg, span));
+        var(&var_name, span)
     };
-    let by = by.map(|(kind, n)| (kind, bind("__rspec_by", n)));
-    let from = from.map(|x| bind("__rspec_from", x));
-    let to = to.map(|y| bind("__rspec_to", y));
-    stmts.push(assign_var(before, value.clone(), span));
-    if by.is_none() {
-        let copyable = Expr::new(
-            span,
-            ExprNode::BoolOp {
-                op: crate::expr::BoolOpKind::Or,
-                surface: Default::default(),
-                left: send(Some(var(before, span)), "is_a?", vec![constant(&["Enumerable".to_string()], span)], span),
-                right: send(Some(var(before, span)), "is_a?", vec![constant(&["String".to_string()], span)], span),
-            },
-        );
-        stmts.push(Expr::new(
-            span,
-            ExprNode::If {
-                cond: copyable,
-                then_branch: assign_var(before, send(Some(var(before, span)), "dup", Vec::new(), span), span),
-                else_branch: nil(span),
-            },
-        ));
-    }
-    stmts.push(body);
-    stmts.push(assign_var(after, value, span));
-
-    let delta = || send(Some(var(after, span)), "-", vec![var(before, span)], span);
-    let changed = || send(Some(var(after, span)), "!=", vec![var(before, span)], span);
+    let by = by.map(|(kind, n)| (kind, bind(name("by"), n)));
+    let from = from.map(|x| bind(name("from"), x));
+    let to = to.map(|y| bind(name("to"), y));
+    // RSpec's ChangeDetails: the value is not copied; its `hash` before and after tells an in-place change apart.
+    stmts.push(assign_var(&before, value.clone(), span));
+    stmts.push(assign_var(&before_hash, send(Some(var(&before, span)), "hash", Vec::new(), span), span));
     let assert = |cond: Expr| send(None, "assert", vec![cond], span);
+    // `from` matches before the event runs, as RSpec matches it on the value it yields then.
+    let from_matched = from.map(|x| {
+        let matched = name("from_matched");
+        stmts.push(assign_var(&matched, values_match(x, var(&before, span), span), span));
+        var(&matched, span)
+    });
+    stmts.push(body);
+    stmts.push(assign_var(&after, value, span));
+    stmts.push(assign_var(&after_hash, send(Some(var(&after, span)), "hash", Vec::new(), span), span));
+
+    let changed = Expr::new(
+        span,
+        ExprNode::BoolOp {
+            op: crate::expr::BoolOpKind::Or,
+            surface: Default::default(),
+            left: send(Some(var(&before, span)), "!=", vec![var(&after, span)], span),
+            right: send(Some(var(&before_hash, span)), "!=", vec![var(&after_hash, span)], span),
+        },
+    );
     match by {
-        Some((kind, n)) => stmts.push(assert(match kind.as_str() {
-            "by" => values_match(n, delta(), span),
-            "by_at_least" => send(Some(delta()), ">=", vec![n], span),
-            _ => send(Some(delta()), "<=", vec![n], span),
-        })),
+        Some((kind, n)) => {
+            // The delta once: a matcher compares it twice (`===`, then `==`).
+            let delta = name("delta");
+            stmts.push(assign_var(&delta, send(Some(var(&after, span)), "-", vec![var(&before, span)], span), span));
+            stmts.push(assert(match kind.as_str() {
+                "by" => values_match(n, var(&delta, span), span),
+                "by_at_least" => send(Some(var(&delta, span)), ">=", vec![n], span),
+                _ => send(Some(var(&delta, span)), "<=", vec![n], span),
+            }));
+        }
         None => {
-            if let Some(x) = from {
-                stmts.push(assert(values_match(x, var(before, span), span)));
+            if let Some(m) = from_matched {
+                stmts.push(assert(m));
             }
             if let Some(y) = to {
-                stmts.push(assert(values_match(y, var(after, span), span)));
+                stmts.push(assert(values_match(y, var(&after, span), span)));
             }
-            stmts.push(send(None, if positive { "assert" } else { "refute" }, vec![changed()], span));
+            stmts.push(send(None, if positive { "assert" } else { "refute" }, vec![changed], span));
         }
     }
     Ok(Expr::new(span, ExprNode::Seq { exprs: stmts }))
@@ -1381,14 +1413,25 @@ end
         }
         let mut order = Vec::new();
         kinds(&tms[0].tests[0].body, &mut order);
-        // `by`'s argument is read first, as RSpec builds the matcher before the block; no copy of the value: it is a difference.
-        assert_eq!(order, ["__rspec_by =", "__rspec_before =", "create!", "__rspec_after =", "assert"]);
+        // Without the expectation's own offset suffix.
+        let order: Vec<String> = order
+            .into_iter()
+            .map(|k| match k.strip_suffix(" =").and_then(|n| n.rsplit_once('_')) {
+                Some((base, n)) if n.chars().all(|c| c.is_ascii_digit()) => format!("{base} ="),
+                _ => k,
+            })
+            .collect();
+        // `by`'s argument is read first, as RSpec builds the matcher before the block; the delta once.
+        assert_eq!(
+            order,
+            ["__rspec_receiver =", "__rspec_by =", "__rspec_before =", "__rspec_before_hash =", "create!", "__rspec_after =", "__rspec_after_hash =", "__rspec_delta =", "assert"]
+        );
     }
 
     #[test]
-    fn change_from_to_copies_the_value_and_needs_a_change() {
+    fn change_from_to_compares_hashes_and_needs_a_change() {
         let body = body_of(&example("expect { list << 1 }.to change { list }.from([]).to([1])"));
-        assert!(body.contains("dup") && body.contains("\"!=\"") && body.contains("\"===\""), "{body}");
+        assert!(!body.contains("dup") && body.contains("\"hash\"") && body.contains("\"!=\"") && body.contains("\"===\""), "{body}");
         for refused in [
             "expect { x }.not_to change { y }.by(1)",
             "expect { x }.to change { y }.by(1).from(0)",
