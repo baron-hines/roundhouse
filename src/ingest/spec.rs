@@ -1078,7 +1078,16 @@ fn change_expectation(
         return Err("`not_to change` with `by` or `to` (RSpec refuses it too)".into());
     }
 
-    let mut stmts = vec![assign_var(before, value.clone(), span)];
+    // RSpec builds the matcher, so evaluates these arguments, before it runs the block; each is read once.
+    let mut stmts = Vec::new();
+    let mut bind = |name: &str, arg: Expr| {
+        stmts.push(assign_var(name, arg, span));
+        var(name, span)
+    };
+    let by = by.map(|(kind, n)| (kind, bind("__rspec_by", n)));
+    let from = from.map(|x| bind("__rspec_from", x));
+    let to = to.map(|y| bind("__rspec_to", y));
+    stmts.push(assign_var(before, value.clone(), span));
     if by.is_none() {
         let copyable = Expr::new(
             span,
