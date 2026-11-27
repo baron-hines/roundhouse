@@ -40,17 +40,27 @@ const EXPECTED: &str = include_str!("support/turbo_respond_to/expected.json");
 const FLASH_PARTIAL: &str = include_str!("support/turbo_respond_to/views/probes/_flash.html.erb");
 const IMPLICIT_TEMPLATE: &str =
     include_str!("support/turbo_respond_to/views/probes/implicit.turbo_stream.erb");
-const HTML_BARE_HTML: &str = include_str!("support/turbo_respond_to/views/probes/html_bare.html.erb");
-const HTML_BARE_TURBO: &str =
-    include_str!("support/turbo_respond_to/views/probes/html_bare.turbo_stream.erb");
+/// (path, content) of every probe template beyond the ones above.
+const PLAIN_TEMPLATES: &[(&str, &str)] = &[
+    ("plain_all.html.erb", include_str!("support/turbo_respond_to/views/probes/plain_all.html.erb")),
+    ("plain_all.turbo_stream.erb", include_str!("support/turbo_respond_to/views/probes/plain_all.turbo_stream.erb")),
+    ("plain_all.json.jbuilder", include_str!("support/turbo_respond_to/views/probes/plain_all.json.jbuilder")),
+    ("plain_two.html.erb", include_str!("support/turbo_respond_to/views/probes/plain_two.html.erb")),
+    ("plain_two.turbo_stream.erb", include_str!("support/turbo_respond_to/views/probes/plain_two.turbo_stream.erb")),
+    ("plain_turbo_only.turbo_stream.erb", include_str!("support/turbo_respond_to/views/probes/plain_turbo_only.turbo_stream.erb")),
+    ("plain_html_only.html.erb", include_str!("support/turbo_respond_to/views/probes/plain_html_only.html.erb")),
+    ("html_bare.html.erb", include_str!("support/turbo_respond_to/views/probes/html_bare.html.erb")),
+    ("html_bare.turbo_stream.erb", include_str!("support/turbo_respond_to/views/probes/html_bare.turbo_stream.erb")),
+];
+
 const BANNER_PARTIAL: &str = include_str!("support/turbo_respond_to/views/application/_banner.html.erb");
 const AFTER_BLOCK_TEMPLATE: &str =
     include_str!("support/turbo_respond_to/views/probes/after_block.turbo_stream.erb");
 
 const PROBE_ACTIONS: &[&str] = &[
     "implicit", "inline", "many", "head_arm", "render_sym", "after_block", "turbo_only",
-    "turbo_first", "html_json", "any_arm", "inherited",
-    "html_bare",
+    "turbo_first", "html_json", "any_arm", "inherited", "plain_all", "plain_two",
+    "plain_turbo_only", "plain_html_only", "plain_none", "html_bare",
 ];
 
 fn routes_for(actions: &[&str]) -> String {
@@ -62,14 +72,16 @@ fn routes_for(actions: &[&str]) -> String {
 }
 
 fn probes() -> emit_and_run::Overlay {
-    emit_and_run::real_blog()
+    let mut overlay = emit_and_run::real_blog();
+    for (name, content) in PLAIN_TEMPLATES {
+        overlay = overlay.write(&format!("app/views/probes/{name}"), content);
+    }
+    overlay
         .edit("config/routes.rb", "  root \"articles#index\"\n", &routes_for(PROBE_ACTIONS))
         .write("app/controllers/probes_controller.rb", PROBES)
         .write("app/views/probes/_flash.html.erb", FLASH_PARTIAL)
         .write("app/views/application/_banner.html.erb", BANNER_PARTIAL)
         .write("app/views/probes/implicit.turbo_stream.erb", IMPLICIT_TEMPLATE)
-        .write("app/views/probes/html_bare.html.erb", HTML_BARE_HTML)
-        .write("app/views/probes/html_bare.turbo_stream.erb", HTML_BARE_TURBO)
         .write("app/views/probes/after_block.turbo_stream.erb", AFTER_BLOCK_TEMPLATE)
 }
 
@@ -110,7 +122,7 @@ fn replay_script() -> String {
 fn every_probe_answers_what_rails_answers_for_every_accept() {
     let run = probes().run_ruby(&replay_script());
     run.assert_passes();
-    assert!(run.stdout.contains("replayed 124 responses"), "stdout: {}", run.stdout);
+    assert!(run.stdout.contains("replayed 174 responses"), "stdout: {}", run.stdout);
 }
 
 #[test]
@@ -216,6 +228,22 @@ t = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 huge = (["text/html;q=0.5", "application/json;q=0.4", "x/y"] * 70_000).join(",")
 raise "huge" unless ActionDispatch::MimeNegotiation.accepted_formats(huge) == ["html", "json"]
 raise "slow" if Process.clock_gettime(Process::CLOCK_MONOTONIC) - t > 5
+puts "accept ok"
+"##;
+    let run = probes().run_ruby(script);
+    run.assert_passes();
+    assert!(run.stdout.contains("accept ok"), "stdout: {}", run.stdout);
+}
+
+#[test]
+fn accept_is_parsed_by_the_dispatcher_and_read_by_negotiation() {
+    let script = r##"
+c = ActionController::Base.new
+c.accept_header = "text/vnd.turbo-stream.html"
+c.accepted_format_names = ActionDispatch::MimeNegotiation.accepted_formats(c.accept_header)
+raise "turbo" unless c.negotiate_format(["html", "turbo_stream"]) == "turbo_stream"
+other = ActionController::Base.new
+raise "a fresh controller reads html" unless other.accepted_format_names == ["html"]
 puts "accept ok"
 "##;
     let run = probes().run_ruby(script);

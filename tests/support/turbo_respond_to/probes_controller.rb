@@ -112,6 +112,32 @@ class ProbesController < ApplicationController
     end
   end
 
+  # --- actions with NO respond_to: the implicit render picks the template ---
+
+  # html + turbo_stream + json templates all exist
+  def plain_all
+    @who = "plain_all"
+  end
+
+  # html + turbo_stream templates
+  def plain_two
+    @who = "plain_two"
+  end
+
+  # only a turbo_stream template
+  def plain_turbo_only
+    @who = "plain_turbo_only"
+  end
+
+  # only an html template
+  def plain_html_only
+    @who = "plain_html_only"
+  end
+
+  # no template at all
+  def plain_none
+  end
+
   # a bare html arm, with a turbo_stream template beside the html one: the
   # arm runs html, so the template is the html one whatever Accept lists first
   def html_bare

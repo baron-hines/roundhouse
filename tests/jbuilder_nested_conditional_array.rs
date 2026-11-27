@@ -67,6 +67,8 @@ require_relative "app/controllers/widgets_controller"
 def render_for(widget)
   controller = WidgetsController.new
   controller.params = { "id" => widget.id.to_s, "format" => "json" }
+  # A direct call skips the dispatcher, which is what reads `params[:format]` as the pinned format.
+  controller.request_format = :json
   controller.process_action(:show)
   controller.body
 end
@@ -92,6 +94,8 @@ require_relative "app/controllers/widgets_controller"
 def render_nils(widget)
   controller = WidgetsController.new
   controller.params = { "id" => widget.id.to_s, "format" => "json" }
+  # A direct call skips the dispatcher, which is what reads `params[:format]` as the pinned format.
+  controller.request_format = :json
   controller.process_action(:nils)
   controller.body
 end

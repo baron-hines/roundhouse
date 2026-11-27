@@ -170,3 +170,17 @@ fn bare_format_any_renders_the_negotiated_template() {
 fn nested_blocks_keep_their_own_parameter() {
     replay(&["nested_named ", "nested_rest ", "nested_it "]);
 }
+
+/// `?format=` values on an action with no `respond_to`: the implicit render
+/// looks a template up, so a value Rails does not register (`bogus`, `JSON`,
+/// `all`, an empty one) pins nothing and `js` falls back to html.
+#[test]
+fn query_format_matrix_for_the_implicit_render() {
+    replay(&["plain_two ?format", "plain_two ."]);
+}
+
+/// Accept ranking behind the implicit render (the same headers as above).
+#[test]
+fn accept_ranking_implicit() {
+    replay(&["plain_two acc "]);
+}

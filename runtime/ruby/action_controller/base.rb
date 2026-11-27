@@ -747,6 +747,9 @@ module ActionController
     # set both; `negotiate_format` is the only reader.
     attr_accessor :accept_header
     attr_accessor :explicit_format
+    # Whether `Mime[explicit_format]` names a registered type: the
+    # dispatcher asks, as `Mime` is not on every target this class goes to.
+    attr_accessor :explicit_format_registered
     # Rails' `ActionController::MimeResponds#respond_to` selection, for
     # the arms the lowering registered (`order`, in source order, as
     # format names: "html", "turbo_stream", "json", "any", …). Answers
@@ -762,13 +765,36 @@ module ActionController
     # parsed `Accept` list, else html.
     #
     # A caller that only set `request_format` (the test harness) pins it.
+    #
+    # `negotiate_template_format` is the implicit render's selection (`default_render`
+    # looks a TEMPLATE up against the request's formats, where a
+    # `respond_to` matches arms): a pinned format Rails' registry does not
+    # know (`?format=bogus`, `JSON`, `all`, an empty value) leaves the
+    # lookup unconstrained, so it takes the first template, as `*/*` does;
+    # a pinned `js` falls back to html (ActionView's `formats=`). Any
+    # other pinned format that has no template answers "" (406).
     def negotiate_format(order)
+      negotiate_in(order, false)
+    end
+
+    # The implicit render's selection (see `template` above). A separate
+    # method rather than an optional argument: Spinel resolves calls by
+    # arity and does not honour the default.
+    def negotiate_template_format(order)
+      negotiate_in(order, true)
+    end
+
+    def negotiate_in(order, template)
       pinned = @explicit_format
       if pinned.empty? && @accept_header.empty? && @request_format != :html
         pinned = @request_format.to_s
       end
       if !pinned.empty?
         return pinned if order.include?(pinned)
+        if template
+          return "html" if pinned == "js" && order.include?("html")
+          return order[0].to_s unless @explicit_format_registered
+        end
         return "any" if order.include?("any")
         return ""
       end
@@ -871,6 +897,7 @@ module ActionController
       @accepts_any_format = false
       @accept_header = +""
       @explicit_format = +""
+      @explicit_format_registered = true
       @accepted_format_names = ["html"]
       @vary_on_accept = false
       @content_type = "text/html; charset=utf-8"

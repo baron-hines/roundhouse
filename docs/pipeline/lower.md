@@ -231,6 +231,17 @@ warning and answers its html arm, as before. The expected responses
 are measured from actionpack + turbo-rails by
 `tests/support/turbo_respond_to/oracle.rb`.
 
+An action with NO `respond_to` takes the same road: the implicit render
+(`implicit_terminal` in `body.rs`) is `negotiate_format` over the
+templates that exist for the action, in the order a bare `*/*` expands to
+(html, js, json, turbo_stream), because Rails' `default_render` looks
+templates up against `request.formats`. A request none of them answers is
+`UnknownFormat` (406) when the action has some template and `head
+:no_content` when it has none. The dispatcher's `request_format` Accept
+sniff is still what the legacy chain reads, and is used only by trees
+without `negotiate_format` (`FormatBreadth::negotiates` false) and by
+`request.format` predicates.
+
 ### `resolve_before_actions` + `inline_before_filters`
 
 `before_action :set_article` doesn't produce any IR of its own in the

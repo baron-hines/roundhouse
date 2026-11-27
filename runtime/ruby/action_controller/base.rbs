@@ -142,10 +142,14 @@ module ActionController
     def accepts_any_format: () -> bool
     def accepts_any_format=: (bool) -> bool
     def accept_header: () -> String
-    def accept_header=: (String) -> String
+    def accept_header=: (String value) -> String
     def explicit_format: () -> String
     def explicit_format=: (String) -> String
+    def explicit_format_registered: () -> bool
+    def explicit_format_registered=: (bool) -> bool
     def negotiate_format: (Array[String] order) -> String
+    def negotiate_template_format: (Array[String] order) -> String
+    def negotiate_in: (Array[String] order, bool template) -> String
     def accepted_format_names: () -> Array[String]
     def accepted_format_names=: (Array[String]) -> Array[String]
     def unacceptable_requested_json?: () -> bool
@@ -160,7 +164,9 @@ module ActionController
     @headers: ActionController::HeaderStore
     @content_type_explicit: bool
     @accept_header: String
+    @accepted_format_names: Array[String]
     @explicit_format: String
+    @explicit_format_registered: bool
     @head_response: bool
     @cache_control: ActionController::CacheControlStore
     def action_name: () -> String

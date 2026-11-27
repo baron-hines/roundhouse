@@ -13,6 +13,8 @@ require "rails"
 require "action_controller/railtie"
 require "action_view/railtie"
 require "turbo-rails"
+require "jbuilder"
+require "jbuilder/railtie"
 require "rack/mock"
 require "json"
 
@@ -31,7 +33,7 @@ class OracleApp < Rails::Application
     PROBES.each { |a| match "/probes/#{a}", to: "probes##{a}", via: [:get, :post] }
   end
 end
-PROBES = %w[implicit inline many head_arm render_sym after_block turbo_only turbo_first html_json any_arm inherited html_bare]
+PROBES = %w[implicit inline many head_arm render_sym after_block turbo_only turbo_first html_json any_arm inherited plain_all plain_two plain_turbo_only plain_html_only plain_none html_bare]
 Rails.application.initialize!
 class ApplicationController < ActionController::Base; end
 ActionController::Base.prepend_view_path(File.join(HERE, "views"))

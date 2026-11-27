@@ -3740,10 +3740,12 @@ fn lower_action_body(
         // Two reasons to want that: the tail is about to move to the
         // dispatcher because something else (a subclass past `super`) may
         // respond, or a private helper in this body already has.
-        synthesize_deferred_implicit_render(&unwrapped, action_name, variants, any_template_exists, html_exists)
+        synthesize_deferred_implicit_render(
+            &unwrapped, action_name, variants, any_template_exists, html_exists, format_breadth.negotiates,
+        )
     } else {
         crate::lower::controller::body::synthesize_implicit_render_with_html(
-            &unwrapped, action_name, variants, any_template_exists, html_exists,
+            &unwrapped, action_name, variants, any_template_exists, html_exists, format_breadth.negotiates,
         )
     };
     let module_name = views_module_name(controller);
