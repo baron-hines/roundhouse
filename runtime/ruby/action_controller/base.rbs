@@ -145,6 +145,8 @@ module ActionController
     def accept_header=: (String value) -> String
     def explicit_format: () -> String
     def explicit_format=: (String) -> String
+    def explicit_format_registered: () -> bool
+    def explicit_format_registered=: (bool) -> bool
     def negotiate_format: (Array[String] order) -> String
     def negotiate_template_format: (Array[String] order) -> String
     def negotiate_in: (Array[String] order, bool template) -> String
@@ -164,6 +166,7 @@ module ActionController
     @accept_header: String
     @accepted_format_names: Array[String]
     @explicit_format: String
+    @explicit_format_registered: bool
     @head_response: bool
     @cache_control: ActionController::CacheControlStore
     def action_name: () -> String

@@ -1839,6 +1839,12 @@ fn implicit_terminal(
             order.push(fmt);
         }
     }
+    // The action's other templates (`show.md.erb` under a route pinning `format: "md"`) are candidates too.
+    for fmt in variants {
+        if !order.contains(fmt) {
+            order.push(fmt);
+        }
+    }
     if order.is_empty() {
         // "No template found": a POST answers 204.
         return head_no_content(span);

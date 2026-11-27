@@ -747,6 +747,9 @@ module ActionController
     # set both; `negotiate_format` is the only reader.
     attr_accessor :accept_header
     attr_accessor :explicit_format
+    # Whether `Mime[explicit_format]` names a registered type: the
+    # dispatcher asks, as `Mime` is not on every target this class goes to.
+    attr_accessor :explicit_format_registered
     # Rails' `ActionController::MimeResponds#respond_to` selection, for
     # the arms the lowering registered (`order`, in source order, as
     # format names: "html", "turbo_stream", "json", "any", …). Answers
@@ -790,7 +793,7 @@ module ActionController
         return pinned if order.include?(pinned)
         if template
           return "html" if pinned == "js" && order.include?("html")
-          return order[0].to_s if Mime[pinned].nil?
+          return order[0].to_s unless @explicit_format_registered
         end
         return "any" if order.include?("any")
         return ""
@@ -894,6 +897,7 @@ module ActionController
       @accepts_any_format = false
       @accept_header = +""
       @explicit_format = +""
+      @explicit_format_registered = true
       @accepted_format_names = ["html"]
       @vary_on_accept = false
       @content_type = "text/html; charset=utf-8"

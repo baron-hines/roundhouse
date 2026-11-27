@@ -318,6 +318,7 @@ module Main
     controller.accept_header = accept
     controller.accepted_format_names = ActionDispatch::MimeNegotiation.accepted_formats(accept)
     controller.explicit_format = explicit_format
+    controller.explicit_format_registered = explicit_format.empty? || !Mime[explicit_format].nil?
     # Rails' `Vary: Accept` on a render whose format came from the Accept
     # header (runtime/action_dispatch/mime_negotiation.rb), as the spinel
     # dispatcher decides it.
