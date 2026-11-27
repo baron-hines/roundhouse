@@ -732,10 +732,13 @@ fn teardown_method(hooks: Vec<Expr>, owner: &ClassId) -> MethodDef {
     let syn = Span::synthetic();
     // Each hook in its own `ensure`, not one around them all: RSpec runs every `after` hook when an earlier one raises.
     let mut body = Expr::new(syn, ExprNode::Super { args: Some(Vec::new()) });
-    for hook in hooks.into_iter().rev() {
+    let count = hooks.len();
+    for (i, hook) in hooks.into_iter().rev().enumerate() {
+        // Only the outermost is the method body's own `ensure`: a nested one needs its `begin`/`end`.
+        let implicit = i + 1 == count;
         body = Expr::new(
             syn,
-            ExprNode::BeginRescue { body: hook, rescues: Vec::new(), else_branch: None, ensure: Some(Box::new(body)), implicit: true },
+            ExprNode::BeginRescue { body: hook, rescues: Vec::new(), else_branch: None, ensure: Some(Box::new(body)), implicit },
         );
     }
     MethodDef {
@@ -902,6 +905,8 @@ fn jumps_in(expr: &Expr, nested: bool) -> bool {
         ExprNode::Return { .. } => return true,
         ExprNode::Next { .. } | ExprNode::Break { .. } | ExprNode::Redo | ExprNode::Retry if !nested => return true,
         ExprNode::Lambda { .. } => return false,
+        // A loop owns its `next` and `break`; a `return` in it still leaves the example.
+        ExprNode::While { cond, body, .. } => return jumps_in(cond, nested) || jumps_in(body, true),
         _ => {}
     }
     let mut found = false;
@@ -1038,8 +1043,8 @@ fn raise_error_expectation(span: Span, body: Expr, positive: bool, args: Vec<Exp
         span,
         ExprNode::If {
             cond: send(Some(var(error, span)), "respond_to?", vec![Expr::new(span, ExprNode::Lit { value: Literal::Sym { value: Symbol::from("original_message") } })], span),
-            then_branch: send(Some(var(error, span)), "original_message", Vec::new(), span),
-            else_branch: send(Some(var(error, span)), "message", Vec::new(), span),
+            then_branch: send(Some(send(Some(var(error, span)), "original_message", Vec::new(), span)), "to_s", Vec::new(), span),
+            else_branch: send(Some(send(Some(var(error, span)), "message", Vec::new(), span)), "to_s", Vec::new(), span),
         },
     );
     let check = match &*message.node {
@@ -1094,6 +1099,11 @@ fn change_expectation(
         let [arg] = args.as_slice() else {
             return Err(format!("`change.{qualifier}` without exactly one argument"));
         };
+        // RSpec matches an Array or Hash expected element by element (`Integer` against an element);
+        // only a whole-value match is lowered, so a pattern inside one is refused.
+        if matches!(qualifier.as_str(), "from" | "to") && collection_with_patterns(arg) {
+            return Err(format!("`change.{qualifier}` with a pattern inside an Array or Hash"));
+        }
         let slot = match qualifier.as_str() {
             "by" | "by_at_least" | "by_at_most" if by.is_none() => "by",
             "from" if from.is_none() => "from",
@@ -1154,13 +1164,33 @@ fn change_expectation(
             if let Some(m) = from_matched {
                 stmts.push(assert(m));
             }
+            // The change first: RSpec never asks `to`'s matcher of a value the event left as it was.
+            stmts.push(send(None, if positive { "assert" } else { "refute" }, vec![changed], span));
             if let Some(y) = to {
                 stmts.push(assert(values_match(y, var(&after, span), span)));
             }
-            stmts.push(send(None, if positive { "assert" } else { "refute" }, vec![changed], span));
         }
     }
     Ok(Expr::new(span, ExprNode::Seq { exprs: stmts }))
+}
+
+/// An Array or Hash literal holding something other than plain literals (a class, a matcher, a
+/// lambda), which RSpec would match element by element.
+fn collection_with_patterns(e: &Expr) -> bool {
+    match &*e.node {
+        ExprNode::Array { elements, .. } => elements.iter().any(|el| !plain_literal(el)),
+        ExprNode::Hash { entries, .. } => entries.iter().any(|(k, v)| !plain_literal(k) || !plain_literal(v)),
+        _ => false,
+    }
+}
+
+fn plain_literal(e: &Expr) -> bool {
+    match &*e.node {
+        ExprNode::Lit { .. } => true,
+        ExprNode::Array { elements, .. } => elements.iter().all(plain_literal),
+        ExprNode::Hash { entries, .. } => entries.iter().all(|(k, v)| plain_literal(k) && plain_literal(v)),
+        _ => false,
+    }
 }
 
 /// RSpec's `values_match?(expected, actual)` for plain values.
