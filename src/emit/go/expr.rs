@@ -511,11 +511,20 @@ pub(super) fn emit_expr(ctx: &EmitCtx, e: &Expr) -> String {
                 // Not with a nullable column on the right too: the function answers the left's scalar, and the right is a pointer.
                 if let Some(ptr) = nullable_read_go_ty(left)
                     && let Some(scalar) = ptr.strip_prefix('*')
-                    && primitive_kind(&right.ty)
+                    && (primitive_kind(&right.ty) || matches!(right.ty, Some(Ty::Bool)))
                     && nullable_read_go_ty(right).is_none()
                 {
+                    let right_go = match right.ty {
+                        Some(Ty::Str | Ty::Sym) => "string",
+                        Some(Ty::Int) => "int64",
+                        Some(Ty::Float) => "float64",
+                        _ => "bool",
+                    };
+                    // Not the left's scalar when the right is another type: Ruby answers either, so Go holds both.
+                    let result = if right_go == scalar { scalar } else { "interface{}" };
+                    let set = if scalar == "bool" { "p != nil && *p" } else { "p != nil" };
                     return format!(
-                        "func() {scalar} {{ if p := {}; p != nil {{ return *p }}; return {} }}()",
+                        "func() {result} {{ if p := {}; {set} {{ return *p }}; return {} }}()",
                         emit_expr_as_value(ctx, left),
                         emit_expr_as_value(ctx, right)
                     );
