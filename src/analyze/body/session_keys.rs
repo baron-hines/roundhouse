@@ -42,8 +42,14 @@ fn literal_key(e: &Expr) -> Option<String> {
 }
 
 fn is_session(recv: &Expr) -> bool {
+    let request = |r: &Expr| {
+        matches!(&r.ty, Some(Ty::Class { id, .. }) if id.0.as_str() == "ActionDispatch::Request")
+            || matches!(&*r.node, ExprNode::Send { recv: None, method, args, .. } if method.as_str() == "request" && args.is_empty())
+    };
     matches!(&recv.ty, Some(Ty::Class { id, .. }) if id.0.as_str() == SESSION)
         || matches!(&*recv.node, ExprNode::Send { recv: None, method, args, .. } if method.as_str() == "session" && args.is_empty())
+        // `request.session[:k] = v`, the same session.
+        || matches!(&*recv.node, ExprNode::Send { recv: Some(r), method, args, .. } if method.as_str() == "session" && args.is_empty() && request(r))
 }
 
 /// Every literal key the app writes, with the join of the values written under it. Empty (every read

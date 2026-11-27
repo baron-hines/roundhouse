@@ -1560,6 +1560,15 @@ impl Analyzer {
 
     /// Build a body-typer borrowing this analyzer's dispatch tables.
     /// Cheap — just a struct with a reference.
+    /// Re-join what the app stores under each session key (`body::app_session_key_types`); true when it
+    /// moved, so a write typed this round retypes every read of its key, wherever it is.
+    fn refresh_session_key_types(&mut self, app: &App) -> bool {
+        let keys = body::app_session_key_types(app);
+        let moved = keys != self.session_key_types;
+        self.session_key_types = keys;
+        moved
+    }
+
     fn body_typer(&self) -> BodyTyper<'_> {
         let typer = BodyTyper::new(&self.classes)
             .with_module_self_types(&self.module_self_types)
@@ -1796,10 +1805,7 @@ impl Analyzer {
                 self.unify_params_from_call_sites(app, UnifyScope::Production)
             });
             self.settle_oscillations(&prev_hints.sig);
-            // A session write typed this round retypes every read of its key, wherever it is.
-            let session_keys = body::app_session_key_types(app);
-            let session_moved = session_keys != self.session_key_types;
-            self.session_key_types = session_keys;
+            let session_moved = self.refresh_session_key_types(app);
             // Returns+params settle independently of block-value
             // verdicts (`DirtyHints`); both must be quiet before the
             // loop stops, or a newly block-valued method leaves its
@@ -1971,13 +1977,15 @@ impl Analyzer {
                 }
                 self.overlay_test_params(app);
                 self.settle_oscillations(&absorb_hints.sig);
-                if self.inference_matches(&absorb_hints.sig)
+                let session_moved = self.refresh_session_key_types(app);
+                if !session_moved
+                    && self.inference_matches(&absorb_hints.sig)
                     && self.block_value_matches(&absorb_hints)
                 {
                     rounds.absorb = LoopEnd::Settled(round);
                     break;
                 }
-                absorb_dirty = self.dirty_classes_for_retype(app, &absorb_hints);
+                absorb_dirty = if session_moved { None } else { self.dirty_classes_for_retype(app, &absorb_hints) };
                 absorb_hints = self.capture_dirty_hints();
             }
         } else {
@@ -2058,8 +2066,13 @@ impl Analyzer {
             self.overlay_test_params(app);
             self.apply_pinned_params();
             self.settle.params(&mut self.inferred_params, &before);
+            let session_moved = self.refresh_session_key_types(app);
+            if session_moved {
+                // Its readers anywhere; the frontier below reads only what the param rows moved.
+                fed = None;
+            }
             // Not pinned while the loop still moves: a `Var` mid-loop may be an argument the next round types.
-            if self.inferred_params == before && returns_settled && !(app.pins_unresolved_params && self.pin_open_params()) {
+            if !session_moved && self.inferred_params == before && returns_settled && !(app.pins_unresolved_params && self.pin_open_params()) {
                 rounds.restamp.end = LoopEnd::Settled(round);
                 break;
             }
