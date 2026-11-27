@@ -736,9 +736,30 @@ fn teardown_method(hooks: Vec<Expr>, owner: &ClassId) -> MethodDef {
     for (i, hook) in hooks.into_iter().rev().enumerate() {
         // Only the outermost is the method body's own `ensure`: a nested one needs its `begin`/`end`.
         let implicit = i + 1 == count;
+        // In a block of its own (`tap { … }`, self unchanged): a hook's locals are not another's, as each RSpec hook is its own block.
+        let scoped = Expr::new(
+            syn,
+            ExprNode::Send {
+                recv: None,
+                method: Symbol::from("tap"),
+                args: Vec::new(),
+                block: Some(Expr::new(
+                    syn,
+                    ExprNode::Lambda {
+                        params: Vec::new(),
+                        rest_param: None,
+                        extra_params: Vec::new(),
+                        block_param: None,
+                        body: hook,
+                        block_style: crate::expr::BlockStyle::Brace,
+                    },
+                )),
+                parenthesized: false,
+            },
+        );
         body = Expr::new(
             syn,
-            ExprNode::BeginRescue { body: hook, rescues: Vec::new(), else_branch: None, ensure: Some(Box::new(body)), implicit },
+            ExprNode::BeginRescue { body: scoped, rescues: Vec::new(), else_branch: None, ensure: Some(Box::new(body)), implicit },
         );
     }
     MethodDef {
@@ -1497,7 +1518,14 @@ end
         let mut order: Vec<&str> = Vec::new();
         let mut at = &teardown.body;
         while let ExprNode::BeginRescue { body, ensure: Some(ensure), .. } = &*at.node {
-            order.push(match &*body.node {
+            let inner = match &*body.node {
+                ExprNode::Send { method, block: Some(b), .. } if method.as_str() == "tap" => match &*b.node {
+                    ExprNode::Lambda { body, .. } => body,
+                    _ => body,
+                },
+                _ => body,
+            };
+            order.push(match &*inner.node {
                 ExprNode::Send { method, .. } => method.as_str(),
                 _ => "?",
             });
