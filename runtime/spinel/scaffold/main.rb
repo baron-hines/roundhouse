@@ -686,6 +686,7 @@ module Main
     controller.request_format = request_format
     controller.accepts_any_format = Main.accepts_any_format?(req.req_headers.fetch("accept", ""))
     controller.accept_header = req.req_headers.fetch("accept", "")
+    controller.accepted_format_names = ActionDispatch::MimeNegotiation.accepted_formats(controller.accept_header)
     controller.explicit_format = explicit_format
     # Rails' `Vary: Accept` on a render whose format came from the Accept
     # header (runtime/action_dispatch/mime_negotiation.rb). A `format`

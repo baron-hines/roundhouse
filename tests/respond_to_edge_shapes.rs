@@ -52,7 +52,9 @@ fn probes_overlay(file: &str, controller: &str, routes: &[(&str, &str)]) -> emit
     let mut o = emit_and_run::real_blog()
         .edit("config/routes.rb", "  root \"articles#index\"\n", &r)
         .write(&format!("app/controllers/{file}"), controller);
-    for v in VIEWS {
+    // Only this controller's own views: the other controller's templates read ivars nothing here sets.
+    let dir = format!("{}/", file.trim_end_matches("_controller.rb"));
+    for v in VIEWS.iter().filter(|v| v.starts_with(&dir)) {
         o = o.write(&format!("app/views/{v}"), &view(v));
     }
     o

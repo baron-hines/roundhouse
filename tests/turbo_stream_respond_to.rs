@@ -202,19 +202,19 @@ fn accept_parsing_is_exact_and_linear() {
 # Exact: a late q=1 turbo item outranks 32 earlier html q=0.5 items, as in
 # Rails; unknown types and empty items change nothing.
 many = (["text/html;q=0.5"] * 32 + ["text/vnd.turbo-stream.html"] * 8).join(",")
-raise ActionController.accepted_formats(many).inspect unless ActionController.accepted_formats(many) == ["turbo_stream", "html"]
+raise ActionDispatch::MimeNegotiation.accepted_formats(many).inspect unless ActionDispatch::MimeNegotiation.accepted_formats(many) == ["turbo_stream", "html"]
 late = (["image/png"] * 33 + ["text/html"]).join(",")
-raise "late html" unless ActionController.accepted_formats(late) == ["png", "html"]
-raise "empties" unless ActionController.accepted_formats((["" ] * 40 + ["text/html"]).join(",")) == ["html"]
+raise "late html" unless ActionDispatch::MimeNegotiation.accepted_formats(late) == ["png", "html"]
+raise "empties" unless ActionDispatch::MimeNegotiation.accepted_formats((["" ] * 40 + ["text/html"]).join(",")) == ["html"]
 # The best item of a format counts, wherever it sits; ties keep header order.
-raise "best q" unless ActionController.accepted_formats("text/html;q=0.1, application/json;q=0.5, text/html;q=0.9") == ["html", "json"]
-raise "tie" unless ActionController.accepted_formats("application/json, text/html, application/json") == ["json", "html"]
+raise "best q" unless ActionDispatch::MimeNegotiation.accepted_formats("text/html;q=0.1, application/json;q=0.5, text/html;q=0.9") == ["html", "json"]
+raise "tie" unless ActionDispatch::MimeNegotiation.accepted_formats("application/json, text/html, application/json") == ["json", "html"]
 # A header can break across lines: `text/html,\n*/*` is a browser list.
-raise "newline" unless ActionController.accepted_formats("text/html,\n*/*") == ["html"]
+raise "newline" unless ActionDispatch::MimeNegotiation.accepted_formats("text/html,\n*/*") == ["html"]
 # Linear in the header, not quadratic: 210000 items answer at once.
 t = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 huge = (["text/html;q=0.5", "application/json;q=0.4", "x/y"] * 70_000).join(",")
-raise "huge" unless ActionController.accepted_formats(huge) == ["html", "json"]
+raise "huge" unless ActionDispatch::MimeNegotiation.accepted_formats(huge) == ["html", "json"]
 raise "slow" if Process.clock_gettime(Process::CLOCK_MONOTONIC) - t > 5
 puts "accept ok"
 "##;

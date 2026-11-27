@@ -585,11 +585,24 @@ fn flatten_negotiated(body: &Expr, breadth: FormatBreadth, ctx: ActionFormats<'_
             let mut arms: Vec<NegotiatedArm> = Vec::new();
             let mut other: Vec<Expr> = Vec::new();
             let mut branched = false;
-            let direct_arms = exprs.iter().any(|e| matches!(classify_negotiated_stmt(e, true), NegotiatedStmt::Arm(..)));
+            let direct_arms = exprs.iter().any(|e| {
+                matches!(
+                    classify_negotiated_stmt(e, true),
+                    NegotiatedStmt::Arm(..) | NegotiatedStmt::Arms(..) | NegotiatedStmt::Dynamic(..)
+                )
+            });
             for e in exprs {
                 match classify_negotiated_stmt(e, false) {
                     NegotiatedStmt::Arm(fmt, arm_body) => {
                         register_arm(&mut arms, fmt.as_str(), arm_body, e.span)
+                    }
+                    NegotiatedStmt::Arms(fmts, arm_body) => {
+                        for fmt in fmts {
+                            register_arm(&mut arms, fmt.as_str(), arm_body.clone(), e.span)
+                        }
+                    }
+                    NegotiatedStmt::Dynamic(list, arm_body) => {
+                        register_dynamic_arm(&mut arms, recurse_outer(&list), arm_body, e.span)
                     }
                     NegotiatedStmt::Refused => {}
                     NegotiatedStmt::Other => other.push(recurse_outer(e)),
@@ -643,6 +656,18 @@ fn flatten_negotiated(body: &Expr, breadth: FormatBreadth, ctx: ActionFormats<'_
                 register_arm(&mut arms, fmt.as_str(), arm_body, body.span);
                 build_negotiated_dispatch(arms, Vec::new(), body.span, breadth, ctx)
             }
+            NegotiatedStmt::Arms(fmts, arm_body) => {
+                let mut arms = Vec::new();
+                for fmt in fmts {
+                    register_arm(&mut arms, fmt.as_str(), arm_body.clone(), body.span);
+                }
+                build_negotiated_dispatch(arms, Vec::new(), body.span, breadth, ctx)
+            }
+            NegotiatedStmt::Dynamic(list, arm_body) => {
+                let mut arms = Vec::new();
+                register_dynamic_arm(&mut arms, recurse_outer(&list), arm_body, body.span);
+                build_negotiated_dispatch(arms, Vec::new(), body.span, breadth, ctx)
+            }
             NegotiatedStmt::Refused | NegotiatedStmt::Branches(_) => {
                 Expr::new(body.span, ExprNode::Seq { exprs: vec![] })
             }
@@ -658,6 +683,10 @@ fn flatten_negotiated(body: &Expr, breadth: FormatBreadth, ctx: ActionFormats<'_
 enum NegotiatedStmt {
     /// A direct `format.<x> [{ … }]` registration.
     Arm(Symbol, Expr),
+    /// `format.any(:a, :b) { … }`: one registration per named format, sharing the block.
+    Arms(Vec<Symbol>, Expr),
+    /// `format.any(*list) { … }`: a registration per format of `list`, read at request time.
+    Dynamic(Expr, Expr),
     /// A registration this lowering cannot honor; an error is reported.
     Refused,
     /// Anything else: ordinary code that runs before negotiation.
@@ -675,18 +704,38 @@ enum NegotiatedStmt {
 fn classify_negotiated_stmt(e: &Expr, quiet: bool) -> NegotiatedStmt {
     if let ExprNode::Send { recv: Some(recv), method, args, .. } = &*e.node {
         if is_format_binding(recv) {
-            if method.as_str() == "any" && !args.is_empty() {
+            // Rails' `alias all any`: with no list, the arm answers every format no other arm claims.
+            if matches!(method.as_str(), "any" | "all") && !args.is_empty() {
+                let (_, body) = classify_format_stmt(e).expect("a format binding call");
+                let names: Option<Vec<Symbol>> = args
+                    .iter()
+                    .map(|a| match &*a.node {
+                        ExprNode::Lit { value: Literal::Sym { value } } => Some(value.clone()),
+                        ExprNode::Lit { value: Literal::Str { value } } => Some(Symbol::from(value.as_str())),
+                        _ => None,
+                    })
+                    .collect();
+                if let Some(names) = names {
+                    return NegotiatedStmt::Arms(names, body);
+                }
+                // `format.any(*navigational_formats)` (Devise): the list is only known when the request runs.
+                if let [one] = args.as_slice()
+                    && let ExprNode::Splat { value } = &*one.node
+                {
+                    return NegotiatedStmt::Dynamic(value.clone(), body);
+                }
                 if !quiet {
                     report_unrunnable_arm(
-                    "any",
-                    e.span,
-                    "a mime list (`format.any(:json, :turbo_stream)`) would be dropped, and the \
-                     arm would answer formats it never named",
-                );
+                        method.as_str(),
+                        e.span,
+                        "a mime list other than literal formats or one splatted list would be \
+                         dropped, and the arm would answer formats it never named",
+                    );
                 }
                 return NegotiatedStmt::Refused;
             }
             if let Some((fmt, body)) = classify_format_stmt(e) {
+                let fmt = if fmt.as_str() == "all" { Symbol::from("any") } else { fmt };
                 return NegotiatedStmt::Arm(fmt, body);
             }
         }
@@ -737,15 +786,24 @@ struct NegotiatedArm {
     fmt: String,
     body: Expr,
     span: Span,
+    /// `Some(list)` for a `format.any(*list)` arm (`fmt` is then empty).
+    dynamic: Option<Expr>,
 }
 
 /// Rails' `Collector#custom` keeps the FIRST registration of a mime
 /// type (`@responses[mime_type] ||= …`), so a repeated arm is dead code.
 fn register_arm(arms: &mut Vec<NegotiatedArm>, fmt: &str, body: Expr, span: Span) {
-    if arms.iter().any(|a| a.fmt == fmt) {
+    if arms.iter().any(|a| a.dynamic.is_none() && a.fmt == fmt) {
         return;
     }
-    arms.push(NegotiatedArm { fmt: fmt.to_string(), body, span });
+    arms.push(NegotiatedArm { fmt: fmt.to_string(), body, span, dynamic: None });
+}
+
+/// A `format.any(*list)` arm. Which of its formats an earlier arm already
+/// claimed is only known at request time; the dispatch chain checks the
+/// arms in source order, so the earlier registration still wins.
+fn register_dynamic_arm(arms: &mut Vec<NegotiatedArm>, list: Expr, body: Expr, span: Span) {
+    arms.push(NegotiatedArm { fmt: String::new(), body, span, dynamic: Some(list) });
 }
 
 fn build_negotiated_dispatch(
@@ -758,27 +816,33 @@ fn build_negotiated_dispatch(
     if arms.is_empty() {
         return Expr::new(span, ExprNode::Seq { exprs: other });
     }
-    let order: Vec<String> = arms.iter().map(|a| a.fmt.clone()).collect();
-    let outcomes: Vec<(String, Span, ArmOutcome)> = arms
+    let order = negotiated_order(&arms, span);
+    let outcomes: Vec<(String, Span, ArmOutcome, Option<Expr>)> = arms
         .iter()
-        .map(|a| (a.fmt.clone(), a.span, lower_negotiated_arm(a, breadth, ctx)))
+        .map(|a| {
+            let outcome = match &a.dynamic {
+                Some(_) => lower_dynamic_arm(a, breadth, ctx),
+                None => lower_negotiated_arm(a, breadth, ctx),
+            };
+            (a.fmt.clone(), a.span, outcome, a.dynamic.as_ref().map(|l| format_names_call(l, span)))
+        })
         .collect();
     // The html arm (or `format.any`, which answers html when nothing
     // else claims it) is what a json arm the tree cannot encode falls
     // back to — the behavior the warning on that arm has always named.
-    let html_body: Option<Expr> = outcomes.iter().find_map(|(fmt, _, o)| match o {
+    let html_body: Option<Expr> = outcomes.iter().find_map(|(fmt, _, o, _)| match o {
         ArmOutcome::Body(b) if fmt == "html" => Some(b.clone()),
         _ => None,
     });
     let html_body = html_body.or_else(|| {
-        outcomes.iter().find_map(|(fmt, _, o)| match o {
+        outcomes.iter().find_map(|(fmt, _, o, _)| match o {
             ArmOutcome::Body(b) if fmt == "any" => Some(b.clone()),
             _ => None,
         })
     });
     // Innermost first: whatever no arm answers is UnknownFormat.
     let mut chain = raise_unknown_format(span);
-    for (fmt, arm_span, outcome) in outcomes.into_iter().rev() {
+    for (fmt, arm_span, outcome, names) in outcomes.into_iter().rev() {
         let body = match outcome {
             ArmOutcome::Body(b) => b,
             ArmOutcome::Refused => continue,
@@ -793,14 +857,11 @@ fn build_negotiated_dispatch(
                 }
             },
         };
-        chain = Expr::new(
-            span,
-            ExprNode::If {
-                cond: negotiated_format_is(span, &order, &fmt),
-                then_branch: body,
-                else_branch: chain,
-            },
-        );
+        let cond = match names {
+            Some(names) => negotiated_format_in(span, &order, names),
+            None => negotiated_format_is(span, &order, &fmt),
+        };
+        chain = Expr::new(span, ExprNode::If { cond, then_branch: body, else_branch: chain });
     }
     if other.is_empty() {
         chain
@@ -885,6 +946,21 @@ fn lower_negotiated_arm(arm: &NegotiatedArm, breadth: FormatBreadth, ctx: Action
             ArmOutcome::Refused
         }
     }
+}
+
+/// A `format.any(*list)` arm's body. With no block, Rails renders the
+/// action's template in whichever format was negotiated, which the list
+/// leaves unknown until the request runs.
+fn lower_dynamic_arm(arm: &NegotiatedArm, breadth: FormatBreadth, ctx: ActionFormats<'_>) -> ArmOutcome {
+    if matches!(&*arm.body.node, ExprNode::Seq { exprs } if exprs.is_empty()) {
+        report_unrunnable_arm(
+            "any",
+            arm.span,
+            "a `format.any(*list)` arm with no block renders a template per negotiated format",
+        );
+        return ArmOutcome::Refused;
+    }
+    ArmOutcome::Body(unwrap_respond_to_inner(&arm.body, true, breadth, ctx))
 }
 
 /// The html arm, finished the way Rails finishes it.
@@ -1016,25 +1092,88 @@ fn is_inline_primitive_json_render(body: &Expr) -> bool {
     json_value.is_some_and(crate::lower::controller_to_library::rewrites::json_primitive_value)
 }
 
-/// `negotiate_format(["a", "b"]) == "<fmt>"`.
-fn negotiated_format_is(span: Span, order: &[String], fmt: &str) -> Expr {
+/// The arms' format names in registration order: `["a", "b"]`, with a
+/// `format.any(*list)` arm's names spliced in where it registers
+/// (`["a"] + MimeNegotiation.format_names(list) + ["b"]`).
+fn negotiated_order(arms: &[NegotiatedArm], span: Span) -> Expr {
     let str_lit = |s: &str| Expr::new(span, ExprNode::Lit { value: Literal::Str { value: s.to_string() } });
-    let negotiate = Expr::new(
+    let array = |names: Vec<Expr>| {
+        Expr::new(span, ExprNode::Array { elements: names, style: crate::expr::ArrayStyle::Brackets })
+    };
+    let mut parts: Vec<Expr> = Vec::new();
+    let mut statics: Vec<Expr> = Vec::new();
+    for a in arms {
+        match &a.dynamic {
+            None => statics.push(str_lit(&a.fmt)),
+            Some(list) => {
+                if !statics.is_empty() {
+                    parts.push(array(std::mem::take(&mut statics)));
+                }
+                parts.push(format_names_call(list, span));
+            }
+        }
+    }
+    if !statics.is_empty() || parts.is_empty() {
+        parts.push(array(statics));
+    }
+    let mut parts = parts.into_iter();
+    let first = parts.next().expect("at least one part");
+    parts.fold(first, |acc, part| {
+        Expr::new(
+            span,
+            ExprNode::Send { recv: Some(acc), method: Symbol::from("+"), args: vec![part], block: None, parenthesized: false },
+        )
+    })
+}
+
+/// `ActionDispatch::MimeNegotiation.format_names(list)`: a runtime list's formats as names.
+fn format_names_call(list: &Expr, span: Span) -> Expr {
+    Expr::new(
+        span,
+        ExprNode::Send {
+            recv: Some(Expr::new(
+                span,
+                ExprNode::Const { path: vec![Symbol::from("ActionDispatch"), Symbol::from("MimeNegotiation")] },
+            )),
+            method: Symbol::from("format_names"),
+            args: vec![list.clone()],
+            block: None,
+            parenthesized: true,
+        },
+    )
+}
+
+fn negotiate_call(span: Span, order: &Expr) -> Expr {
+    Expr::new(
         span,
         ExprNode::Send {
             recv: None,
             method: Symbol::from("negotiate_format"),
-            args: vec![Expr::new(
-                span,
-                ExprNode::Array {
-                    elements: order.iter().map(|f| str_lit(f)).collect(),
-                    style: crate::expr::ArrayStyle::Brackets,
-                },
-            )],
+            args: vec![order.clone()],
             block: None,
             parenthesized: true,
         },
-    );
+    )
+}
+
+/// `names.include?(negotiate_format(order))`, for a `format.any(*list)` arm.
+fn negotiated_format_in(span: Span, order: &Expr, names: Expr) -> Expr {
+    Expr::new(
+        span,
+        ExprNode::Send {
+            recv: Some(names),
+            method: Symbol::from("include?"),
+            args: vec![negotiate_call(span, order)],
+            block: None,
+            parenthesized: true,
+        },
+    )
+}
+
+/// `negotiate_format(["a", "b"]) == "<fmt>"`.
+fn negotiated_format_is(span: Span, order: &Expr, fmt: &str) -> Expr {
+    let str_lit = |s: &str| Expr::new(span, ExprNode::Lit { value: Literal::Str { value: s.to_string() } });
+    let negotiate = negotiate_call(span, order);
     Expr::new(
         span,
         ExprNode::Send {

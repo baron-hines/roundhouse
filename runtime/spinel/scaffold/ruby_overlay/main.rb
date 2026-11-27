@@ -316,6 +316,7 @@ module Main
     accept = request.fetch(:accept, "").to_s
     controller.accepts_any_format = !accept.include?(",") && accept.split(";", 2)[0].to_s.strip == "*/*"
     controller.accept_header = accept
+    controller.accepted_format_names = ActionDispatch::MimeNegotiation.accepted_formats(accept)
     controller.explicit_format = explicit_format
     # Rails' `Vary: Accept` on a render whose format came from the Accept
     # header (runtime/action_dispatch/mime_negotiation.rb), as the spinel
