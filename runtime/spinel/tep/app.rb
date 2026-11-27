@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Tep::App -- per-process singleton holding the fan-out registries the
 # connection threads share.
 #
@@ -50,8 +51,13 @@ module Tep
     # (Tep.display_name). Set by scaffold/main.rb; empty until then.
     attr_accessor :name
 
+    # The address the server listens on (`rails server -b`). Empty: every
+    # interface, the listener the server always had. Set by scaffold/main.rb.
+    attr_accessor :bind_host
+
     def initialize
       @name = ""
+      @bind_host = ""
       # Type-seed the Broadcast subscriber registry: a first push pins
       # the element type, then it is dropped.
       @broadcast_subs = [Tep::BroadcastSubscription.new(
@@ -103,7 +109,12 @@ module Tep
     #
     # A GET/HEAD reads through one SQLite snapshot (Db.read_snapshot_begin);
     # any write still works, the shim ends the snapshot before it.
+    #
+    # Tep::THRUSTER_CACHE (thruster_cache.rb) answers first: a stored
+    # `Cache-Control: public` response goes back without a lease, as
+    # Thruster answers before Puma is reached.
     def dispatch(req, res)
+      return true if Tep::THRUSTER_CACHE.answer(req, res)
       Db.with_connection do
         snapshot = req.verb == "GET" || req.verb == "HEAD"
         Db.read_snapshot_begin if snapshot
@@ -117,6 +128,8 @@ module Tep
         # hold a void there.
         true
       end
+      Tep::THRUSTER_CACHE.store(req, res)
+      true
     end
   end
 

@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Per-request context reachable from module-function helpers. Rails
 # helpers run in the view context, which delegates `request` to the
 # controller; the emitted helpers are module functions with no such
@@ -10,8 +11,8 @@
 # Module-ivar statics rather than `class << self` (the overlay's
 # shape): explicit `def self.` accessors are the statically-resolvable
 # form every ingest/AOT path handles. The controller is parked (not
-# its session) because `reset_session` swaps the controller's @session
-# mid-action — a parked session reference would go stale.
+# its session) because the controller's @session can be swapped
+# (a test's `session=`) — a parked session reference would go stale.
 module ActionController
   class Base
     attr_accessor :request
@@ -19,7 +20,10 @@ module ActionController
     def request_host_for_redirect
       r = @request
       return "" if r.nil?
-      r.host.to_s
+      # Same authority as `request.host` / `request.url`
+      # (`Request#raw_host_with_port`): last `X-Forwarded-Host` from a
+      # loopback or private peer, otherwise the Host header.
+      r.raw_host_with_port.to_s
     end
 
     def request_protocol_for_url
@@ -30,6 +34,12 @@ module ActionController
 
     def request_for_csrf
       @request
+    end
+
+    # The dynamic sources a controller's `content_security_policy` blocks give, by index; each such controller answers
+    # its own (`ingest::controller_csp`).
+    def content_security_policy_source(index)
+      ""
     end
 
     def csrf_header_token

@@ -8,14 +8,14 @@
 //! later one is measured against the same contract: the app's own
 //! suite, run by Rails, passes against the emitted tree.
 
+#[path = "support/scratch.rs"]
+mod scratch;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("roundhouse-futamura-{name}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
+    let dir = scratch::dir(&format!("roundhouse-futamura-{name}"));
     dir
 }
 
@@ -196,6 +196,1162 @@ end
     assert!(!out.join("vendor/futamura/lowered/test").exists());
     // The app itself is still the app.
     assert_eq!(fs::read(out.join("app/models/post.rb")).unwrap(), fs::read(src.join("app/models/post.rb")).unwrap());
+}
+
+/// A receiverless call in a controller (`request`, `params`) dispatches
+/// on the controller's own lookup — its ancestors and included modules —
+/// never on an unrelated concrete class that happens to define a method
+/// of the same name. Two ways the planner used to get this wrong, fixed
+/// together:
+///
+///   * a bare receiverless call not found on the class used to fan out
+///     to every app definer, including plain classes (here, `Gadget`);
+///   * `request.x` was treated as reaching app code merely because some
+///     app class defines `request`, instead of asking whether the
+///     *current* class's own lookup resolves it (here it does not, so
+///     `request` is the runtime's, and `.path` never reaches
+///     `PathExploder#path`).
+///
+/// Neither `Gadget` nor `PathExploder` is reachable from `widgets#index`,
+/// so the route is clean and clears.
+#[test]
+fn receiverless_calls_resolve_through_the_controllers_own_lookup_not_an_unrelated_class() {
+    let src = scratch("recv-src");
+    let out = scratch("recv-out");
+    write(&src, "Gemfile", b"source \"https://rubygems.org\"\ngem \"rails\"\n");
+    write(&src, "config/routes.rb", b"Rails.application.routes.draw do\n  get \"widgets\" => \"widgets#index\"\nend\n");
+    write(&src, "app/controllers/application_controller.rb", b"class ApplicationController < ActionController::Base\nend\n");
+    write(&src, "app/controllers/widgets_controller.rb", br#"class WidgetsController < ApplicationController
+  def index
+    @path = request.path
+  end
+end
+"#);
+    write(&src, "app/views/widgets/index.html.erb", b"<%= @path %>\n");
+    // A plain (non-module) class that happens to define `request`: the
+    // planner must not treat `WidgetsController`'s bare `request` call as
+    // reaching it.
+    write(&src, "app/lib/gadget.rb", br#"class Gadget
+  def request
+    Frobnicator::Spinner.new.spin
+  end
+end
+"#);
+    // A plain class defining `path`: only reachable if `request.path` is
+    // wrongly treated as app-rooted once `request` itself resolves to
+    // nothing on the controller.
+    write(&src, "app/lib/path_exploder.rb", br#"class PathExploder
+  def path
+    Combobulator::Unit.new.run
+  end
+end
+"#);
+
+    let run = Command::new(env!("CARGO_BIN_EXE_roundhouse"))
+        .args(["--target", "futamura", "-o"])
+        .arg(&out)
+        .arg(&src)
+        .env("ROUNDHOUSE_FUTAMURA_LEDGER", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success(), "{stderr}");
+    assert!(stderr.contains("whole-route: 1 GET action(s) served by the lowered app; 0 left to Rails"), "{stderr}");
+    assert!(!stderr.contains("Gadget") && !stderr.contains("PathExploder"), "{stderr}");
+
+    fs::remove_dir_all(&src).unwrap();
+    fs::remove_dir_all(&out).unwrap();
+}
+
+/// #957's gap rule only checked the route's own controller file and its
+/// conventional view path. A gap in a file the route's reach actually
+/// walks into — here the layout every action renders through, via
+/// `apply_layout_lowering`'s `render(Views::Layouts.application(...))`
+/// wrap — went unblocked: the layout still lowers to a real
+/// `Views::Layouts.application` method (the dropped
+/// `vite_typescript_tag` call is only a gap, not a parse failure), so
+/// the route used to clear even though the lowered app cannot serve
+/// what that tag would have rendered. `routes::plan` now also blocks on
+/// any gap file the reach walk's `reached_files` contains.
+#[test]
+fn ingest_gap_in_a_rendered_layout_blocks_the_route() {
+    let src = scratch("layout-gap-src");
+    let out = scratch("layout-gap-out");
+    write(&src, "Gemfile", b"source \"https://rubygems.org\"\ngem \"rails\"\n");
+    write(&src, "config/routes.rb", b"Rails.application.routes.draw do\n  get \"widgets\" => \"widgets#index\"\nend\n");
+    write(&src, "app/controllers/application_controller.rb", b"class ApplicationController < ActionController::Base\nend\n");
+    write(&src, "app/controllers/widgets_controller.rb", br#"class WidgetsController < ApplicationController
+  def index
+    @name = "hi"
+  end
+end
+"#);
+    write(&src, "app/views/widgets/index.html.erb", b"<%= @name %>\n");
+    // No Vite manifest: the tag call stays an unresolved gap on the
+    // layout's own file, not a parse failure — the layout still becomes
+    // a real `Views::Layouts.application` method the route's reach
+    // walks into.
+    write(&src, "app/views/layouts/application.html.erb", b"<html><head><%= vite_typescript_tag \"application\" %></head><body><%= yield %></body></html>\n");
+
+    let run = Command::new(env!("CARGO_BIN_EXE_roundhouse"))
+        .args(["--target", "futamura", "--survey", "-o"])
+        .arg(&out)
+        .arg(&src)
+        .env("ROUNDHOUSE_FUTAMURA_LEDGER", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success(), "{stderr}");
+    assert!(stderr.contains("whole-route: 0 GET action(s) served by the lowered app; 1 left to Rails"), "{stderr}");
+    let residue = stderr.lines().find(|l| l.contains("widgets#index")).unwrap_or_else(|| panic!("{stderr}"));
+    assert!(residue.contains("ingest gap") && residue.contains("layouts/application.html.erb") && residue.contains("vite_typescript_tag"), "{residue}");
+
+    fs::remove_dir_all(&src).unwrap();
+    fs::remove_dir_all(&out).unwrap();
+}
+
+/// Companion to `ingest_gap_in_a_rendered_layout_blocks_the_route`: on a
+/// large real app, a layout's `vite_typescript_tag "sign_up.ts",
+/// crossorigin: "anonymous"` was exactly this shape — a manifest entry
+/// resolves, but the extra `crossorigin:` keyword made the whole call an
+/// ingest gap, so the gap in the rendered layout blocked every route
+/// (301 of 314 on that app). With the pass-through modeled, the same
+/// layout lowers cleanly and the route clears.
+#[test]
+fn a_vite_tag_with_a_crossorigin_option_does_not_block_the_route() {
+    let src = scratch("layout-crossorigin-src");
+    let out = scratch("layout-crossorigin-out");
+    write(&src, "Gemfile", b"source \"https://rubygems.org\"\ngem \"rails\"\n");
+    write(&src, "config/routes.rb", b"Rails.application.routes.draw do\n  get \"widgets\" => \"widgets#index\"\nend\n");
+    write(&src, "app/controllers/application_controller.rb", b"class ApplicationController < ActionController::Base\nend\n");
+    write(&src, "app/controllers/widgets_controller.rb", br#"class WidgetsController < ApplicationController
+  def index
+    @name = "hi"
+  end
+end
+"#);
+    write(&src, "app/views/widgets/index.html.erb", b"<%= @name %>\n");
+    write(
+        &src,
+        "public/vite/.vite/manifest.json",
+        br#"{"entrypoints/application.ts": {"file": "assets/application-abc.js", "isEntry": true}}"#,
+    );
+    write(&src, "app/views/layouts/application.html.erb", b"<html><head><%= vite_typescript_tag \"application\", crossorigin: \"anonymous\" %></head><body><%= yield %></body></html>\n");
+
+    let run = Command::new(env!("CARGO_BIN_EXE_roundhouse"))
+        .args(["--target", "futamura", "--survey", "-o"])
+        .arg(&out)
+        .arg(&src)
+        .env("ROUNDHOUSE_FUTAMURA_LEDGER", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success(), "{stderr}");
+    assert!(stderr.contains("whole-route: 1 GET action(s) served by the lowered app; 0 left to Rails"), "{stderr}");
+    assert!(!stderr.contains("vite_typescript_tag"), "{stderr}");
+
+    fs::remove_dir_all(&src).unwrap();
+    fs::remove_dir_all(&out).unwrap();
+}
+
+/// A gap in a parent controller's class body (here an `around_action`
+/// block shape the ingester refuses, round-tripped as `Unknown` rather
+/// than lowered into the filter chain) must block every subclass route,
+/// not only routes that reach the parent's file through a call —
+/// #957's rule named only the route's own controller file, so a gap in
+/// `ApplicationController` left every subclass route unblocked.
+#[test]
+fn ingest_gap_in_a_parent_controllers_class_body_blocks_the_route() {
+    let src = scratch("parent-gap-src");
+    let out = scratch("parent-gap-out");
+    write(&src, "Gemfile", b"source \"https://rubygems.org\"\ngem \"rails\"\n");
+    write(&src, "config/routes.rb", b"Rails.application.routes.draw do\n  get \"widgets\" => \"widgets#index\"\nend\n");
+    // Three block parameters: a shape `around_block_filter` refuses
+    // (only 0, 1, or 2 — controller and continuation — are supported),
+    // recorded as a gap on this file and kept as `Unknown` rather than
+    // becoming a filter. `unrelated_helper` is never called by
+    // `widgets#index`, so nothing about this route's own reach touches
+    // this file either — only the ancestor-chain check does.
+    write(&src, "app/controllers/application_controller.rb", br#"class ApplicationController < ActionController::Base
+  around_action { |controller, block, extra| block.call }
+
+  def unrelated_helper
+    "ok"
+  end
+end
+"#);
+    write(&src, "app/controllers/widgets_controller.rb", br#"class WidgetsController < ApplicationController
+  def index
+    @name = "hi"
+  end
+end
+"#);
+    write(&src, "app/views/widgets/index.html.erb", b"<%= @name %>\n");
+
+    let run = Command::new(env!("CARGO_BIN_EXE_roundhouse"))
+        .args(["--target", "futamura", "--survey", "-o"])
+        .arg(&out)
+        .arg(&src)
+        .env("ROUNDHOUSE_FUTAMURA_LEDGER", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success(), "{stderr}");
+    assert!(stderr.contains("whole-route: 0 GET action(s) served by the lowered app; 1 left to Rails"), "{stderr}");
+    let residue = stderr.lines().find(|l| l.contains("widgets#index")).unwrap_or_else(|| panic!("{stderr}"));
+    assert!(residue.contains("ingest gap") && residue.contains("application_controller.rb") && residue.contains("around_action block declares 3 parameters"), "{residue}");
+
+    fs::remove_dir_all(&src).unwrap();
+    fs::remove_dir_all(&out).unwrap();
+}
+
+/// A gap in an `app/helpers/*_helper.rb` module must block every route
+/// that renders a view, not only ones whose reach happens to touch
+/// that file — Rails mixes every helper module into every view
+/// (`helper :all`, the default), and `ingest_library_classes` rejecting
+/// the helper outright means it was never a `LibraryClass` `reach`
+/// could have added to the route's own `blocking_files` in the first
+/// place (CodeRabbit 4281788796: the planner could replace a route
+/// while the emit lacks the helper, a NoMethodError at runtime).
+#[test]
+fn ingest_gap_in_a_helper_module_blocks_every_route_that_renders_a_view() {
+    let src = scratch("helper-gap-src");
+    let out = scratch("helper-gap-out");
+    write(&src, "Gemfile", b"source \"https://rubygems.org\"\ngem \"rails\"\n");
+    write(&src, "config/routes.rb", b"Rails.application.routes.draw do\n  get \"widgets\" => \"widgets#index\"\nend\n");
+    write(&src, "app/controllers/widgets_controller.rb", br#"class WidgetsController < ApplicationController
+  def index
+    @name = "hi"
+  end
+end
+"#);
+    write(&src, "app/views/widgets/index.html.erb", b"<%= @name %>\n");
+    // Mixing a `cattr_accessor ... default:` with a source `@@` write
+    // is a recorded ingest gap (`class-variable initializer with
+    // non-nil value`), on `application_helper.rb` — a file nothing in
+    // `widgets#index`'s own reach ever calls into.
+    write(&src, "app/helpers/application_helper.rb", br#"module ApplicationHelper
+  cattr_accessor :locale, default: "en"
+  @@locale = "fr"
+end
+"#);
+
+    let run = Command::new(env!("CARGO_BIN_EXE_roundhouse"))
+        .args(["--target", "futamura", "--survey", "-o"])
+        .arg(&out)
+        .arg(&src)
+        .env("ROUNDHOUSE_FUTAMURA_LEDGER", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success(), "{stderr}");
+    assert!(stderr.contains("whole-route: 0 GET action(s) served by the lowered app; 1 left to Rails"), "{stderr}");
+    let residue = stderr.lines().find(|l| l.contains("widgets#index")).unwrap_or_else(|| panic!("{stderr}"));
+    assert!(residue.contains("ingest gap") && residue.contains("application_helper.rb"), "{residue}");
+
+    fs::remove_dir_all(&src).unwrap();
+    fs::remove_dir_all(&out).unwrap();
+}
+
+/// The extended gap rule only blocks more: a route whose reached files
+/// (its own controller, its ancestor chain, and the layout it renders
+/// through) carry no gap at all still clears, same as before #957's
+/// rule was extended.
+#[test]
+fn route_with_clean_reached_files_still_clears() {
+    let src = scratch("clean-reach-src");
+    let out = scratch("clean-reach-out");
+    write(&src, "Gemfile", b"source \"https://rubygems.org\"\ngem \"rails\"\n");
+    write(&src, "config/routes.rb", b"Rails.application.routes.draw do\n  get \"widgets\" => \"widgets#index\"\nend\n");
+    write(&src, "app/controllers/application_controller.rb", br#"class ApplicationController < ActionController::Base
+  around_action :with_timing
+
+  def with_timing
+    yield
+  end
+end
+"#);
+    write(&src, "app/controllers/widgets_controller.rb", br#"class WidgetsController < ApplicationController
+  def index
+    @name = "hi"
+  end
+end
+"#);
+    write(&src, "app/views/layouts/application.html.erb", b"<html><body><%= yield %></body></html>\n");
+    write(&src, "app/views/widgets/index.html.erb", b"<%= @name %>\n");
+
+    let run = Command::new(env!("CARGO_BIN_EXE_roundhouse"))
+        .args(["--target", "futamura", "--survey", "-o"])
+        .arg(&out)
+        .arg(&src)
+        .env("ROUNDHOUSE_FUTAMURA_LEDGER", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success(), "{stderr}");
+    assert!(!stderr.contains("ingest gap"), "{stderr}");
+    assert!(stderr.contains("whole-route: 1 GET action(s) served by the lowered app; 0 left to Rails"), "{stderr}");
+
+    fs::remove_dir_all(&src).unwrap();
+    fs::remove_dir_all(&out).unwrap();
+}
+
+/// A view template format the ingester does not model (here `.ics.erb`
+/// — `erb` is only ingested for `html` and a short allow-list of other
+/// text formats) never becomes a `View`, so the action's `render` leaves
+/// no trace the planner can walk into: nothing reaches an error, and the
+/// route used to clear. The ingest gap this leaves behind has no span,
+/// so it is attributed by file: the gap's view template matches
+/// `gadget_styles#show`'s conventional path
+/// (`app/views/gadget_styles/show.`), which blocks the route even
+/// though its (ingested) code is clean.
+#[test]
+fn ingest_gaps_block_the_routes_whose_view_they_belong_to() {
+    let src = scratch("gap-src");
+    let out = scratch("gap-out");
+    write(&src, "Gemfile", b"source \"https://rubygems.org\"\ngem \"rails\"\n");
+    write(&src, "config/routes.rb", b"Rails.application.routes.draw do\n  get \"gadget.ics\", to: \"gadget_styles#show\"\nend\n");
+    write(&src, "app/controllers/application_controller.rb", b"class ApplicationController < ActionController::Base\nend\n");
+    write(&src, "app/controllers/gadget_styles_controller.rb", br#"class GadgetStylesController < ApplicationController
+  def show
+    @color = "teal"
+    render content_type: "text/calendar"
+  end
+end
+"#);
+    write(&src, "app/views/gadget_styles/show.ics.erb", b"BEGIN:VCALENDAR\nX-COLOR:<%= @color %>\nEND:VCALENDAR\n");
+
+    let run = Command::new(env!("CARGO_BIN_EXE_roundhouse"))
+        .args(["--target", "futamura", "--survey", "-o"])
+        .arg(&out)
+        .arg(&src)
+        .env("ROUNDHOUSE_FUTAMURA_LEDGER", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success(), "{stderr}");
+    assert!(stderr.contains("whole-route: 0 GET action(s) served by the lowered app; 1 left to Rails"), "{stderr}");
+    let residue = stderr.lines().find(|l| l.contains("gadget_styles#show")).unwrap_or_else(|| panic!("{stderr}"));
+    assert!(residue.contains("ingest gap") && residue.contains("show.ics.erb"), "{residue}");
+
+    fs::remove_dir_all(&src).unwrap();
+    fs::remove_dir_all(&out).unwrap();
+}
+
+/// A library module whose `include` names an external gem module the
+/// analyzer cannot resolve has no span to blame (ingest drops the
+/// call's span once `LibraryClass.includes` resolves the name), so the
+/// refusal used to block every route. Carrying the span (`include_spans`)
+/// gives it a real location, and the planner's existing per-file rule
+/// then blocks only the routes that reach `GadgetTools`' file —
+/// `widgets#index` never does, so it still clears. That's sound only if
+/// the box still LOADS with the include unresolved: futamura's own copy
+/// of the `ruby` emit guards it (`include X if defined?(X)`); plain
+/// `--target ruby` does not, and stays fail-loud.
+#[test]
+fn include_locations_free_routes_that_never_reach_them_and_the_box_still_loads() {
+    let src = scratch("inc-src");
+    let out = scratch("inc-out");
+    write(&src, "Gemfile", b"source \"https://rubygems.org\"\ngem \"rails\"\n");
+    write(&src, "config/routes.rb", b"Rails.application.routes.draw do\n  get \"widgets\" => \"widgets#index\"\nend\n");
+    write(&src, "app/controllers/application_controller.rb", b"class ApplicationController < ActionController::Base\nend\n");
+    write(&src, "app/controllers/widgets_controller.rb", br#"class WidgetsController < ApplicationController
+  def index
+    @name = "hi"
+  end
+end
+"#);
+    write(&src, "app/views/widgets/index.html.erb", b"<%= @name %>\n");
+    // Never reached by `widgets#index`: a library module that includes
+    // an unresolved external gem module, and a class that mixes it in.
+    write(&src, "app/lib/gadget_tools.rb", br#"module GadgetTools
+  include ExternalGem::Mixin
+
+  def polish
+    "shiny"
+  end
+end
+"#);
+    write(&src, "app/lib/gadget.rb", b"class Gadget\n  include GadgetTools\nend\n");
+
+    let run = Command::new(env!("CARGO_BIN_EXE_roundhouse"))
+        .args(["--target", "futamura", "--survey", "-o"])
+        .arg(&out)
+        .arg(&src)
+        .env("ROUNDHOUSE_FUTAMURA_LEDGER", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success(), "{stderr}");
+    let unowned = stderr
+        .lines()
+        .find(|l| l.contains("includes unresolved ExternalGem::Mixin"))
+        .unwrap_or_else(|| panic!("{stderr}"));
+    assert!(unowned.contains("gadget_tools.rb:2"), "{unowned}");
+    assert!(!unowned.contains("(no location)"), "{unowned}");
+    assert!(stderr.contains("whole-route: 1 GET action(s) served by the lowered app; 0 left to Rails"), "{stderr}");
+
+    let lowered = fs::read_to_string(out.join("vendor/futamura/lowered/app/models/gadget_tools.rb")).unwrap();
+    assert!(lowered.contains("include ExternalGem::Mixin if defined?(ExternalGem::Mixin)"), "{lowered}");
+    let ruby = Command::new("ruby")
+        .arg(out.join("vendor/futamura/lowered/app/models/gadget_tools.rb"))
+        .output()
+        .expect("ruby must be on PATH");
+    assert!(ruby.status.success(), "{}", String::from_utf8_lossy(&ruby.stderr));
+
+    // Plain `--target ruby` leaves the same include bare.
+    let out_ruby = scratch("inc-out-ruby");
+    let run_ruby = Command::new(env!("CARGO_BIN_EXE_roundhouse"))
+        .args(["--target", "ruby", "--survey", "--allow-unsupported", "-o"])
+        .arg(&out_ruby)
+        .arg(&src)
+        .output()
+        .unwrap();
+    assert!(run_ruby.status.success(), "{}", String::from_utf8_lossy(&run_ruby.stderr));
+    let plain = fs::read_to_string(out_ruby.join("app/models/gadget_tools.rb")).unwrap();
+    assert!(plain.contains("include ExternalGem::Mixin\n") && !plain.contains("if defined?"), "{plain}");
+
+    fs::remove_dir_all(&src).unwrap();
+    fs::remove_dir_all(&out).unwrap();
+    fs::remove_dir_all(&out_ruby).unwrap();
+}
+
+/// `Rack::Utils::HTTP_STATUS_CODES` is a real Rack constant the lowered
+/// runtime doesn't model: unresolved, a bare reference to it types as
+/// `Var` (the same sentinel a totally unknown name gets), which trips
+/// the Const arm's own "unresolved reference" diagnostic
+/// (`analyze::body::compute`) wherever the app reads it — every route
+/// that reaches the read, blocked directly, no fan-out needed. Typing
+/// it as `Hash[Integer, String]` in the registry (matching Rack's own
+/// table) resolves the constant, so the diagnostic — and the block —
+/// disappears.
+#[test]
+fn http_status_codes_constant_resolves_and_the_route_clears() {
+    let src = scratch("http-status-src");
+    let out = scratch("http-status-out");
+    write(&src, "Gemfile", b"source \"https://rubygems.org\"\ngem \"rails\"\n");
+    write(&src, "config/routes.rb", b"Rails.application.routes.draw do\n  get \"widgets\" => \"widgets#index\"\nend\n");
+    write(&src, "app/controllers/application_controller.rb", b"class ApplicationController < ActionController::Base\nend\n");
+    write(&src, "app/controllers/widgets_controller.rb", br#"class WidgetsController < ApplicationController
+  def index
+    @reason = Rack::Utils::HTTP_STATUS_CODES[200]
+  end
+end
+"#);
+    write(&src, "app/views/widgets/index.html.erb", b"<%= @reason %>\n");
+
+    let run = Command::new(env!("CARGO_BIN_EXE_roundhouse"))
+        .args(["--target", "futamura", "--survey", "-o"])
+        .arg(&out)
+        .arg(&src)
+        .env("ROUNDHOUSE_FUTAMURA_LEDGER", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success(), "{stderr}");
+    assert!(!stderr.contains("HTTP_STATUS_CODES"), "{stderr}");
+    assert!(stderr.contains("whole-route: 1 GET action(s) served by the lowered app; 0 left to Rails"), "{stderr}");
+
+    fs::remove_dir_all(&src).unwrap();
+    fs::remove_dir_all(&out).unwrap();
+}
+
+/// A method's own `&block` parameter (an `around_action` filter method
+/// written `def with_x(&block); block.call; end`) used to stay untyped
+/// through the controller→library lowering: `type_method_body` re-types
+/// each method body from scratch and seeded only the signature's
+/// params, never the method's own block param, so it read back as the
+/// unresolved `Var` sentinel. Untyped, the planner's `block.call` fanned
+/// out to every app method named `call`, including an unrelated class's
+/// unsupported one. Fixed by seeding the block param the same way the
+/// analyzer already does (`captured_block_ty`/the declared signature),
+/// so `classes_of` answers "no app class" and no fan-out happens.
+#[test]
+fn a_methods_own_block_param_is_not_app_dispatch() {
+    let src = scratch("blockcall-src");
+    let out = scratch("blockcall-out");
+    write(&src, "Gemfile", b"source \"https://rubygems.org\"\ngem \"rails\"\n");
+    write(&src, "config/routes.rb", b"Rails.application.routes.draw do\n  get \"widgets\" => \"widgets#index\"\nend\n");
+    write(&src, "app/controllers/application_controller.rb", br#"class ApplicationController < ActionController::Base
+  around_action :with_x
+
+  def with_x(&block)
+    block.call
+  end
+end
+"#);
+    write(&src, "app/controllers/widgets_controller.rb", br#"class WidgetsController < ApplicationController
+  def index
+    @name = "hi"
+  end
+end
+"#);
+    write(&src, "app/views/widgets/index.html.erb", b"<%= @name %>\n");
+    // Unrelated: its own `call`, with an unsupported body. Before the
+    // fix, `block.call`'s untyped receiver fans out to this.
+    write(&src, "app/lib/gadget.rb", br#"class Gadget
+  def call
+    Frobnicator::Spinner.new.spin
+  end
+end
+"#);
+
+    let run = Command::new(env!("CARGO_BIN_EXE_roundhouse"))
+        .args(["--target", "futamura", "--survey", "-o"])
+        .arg(&out)
+        .arg(&src)
+        .env("ROUNDHOUSE_FUTAMURA_LEDGER", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success(), "{stderr}");
+    assert!(!stderr.contains("Gadget") && !stderr.contains("Frobnicator"), "{stderr}");
+    assert!(stderr.contains("whole-route: 1 GET action(s) served by the lowered app; 0 left to Rails"), "{stderr}");
+
+    fs::remove_dir_all(&src).unwrap();
+    fs::remove_dir_all(&out).unwrap();
+}
+
+/// INTERIM planner fallback (rubys/roundhouse#58, G2/G3): `routes::plan`
+/// re-lowers every controller body from scratch
+/// (`lower::typing::type_method_body`), which loses the analyzer's type
+/// for a local bound to a framework helper's result (Devise's
+/// `current_<scope>`) and for the app's own private helpers (pinned
+/// `Untyped` on purpose by #810). Untyped, the planner's `enqueue_send`
+/// fans a send out to every app method of that name — here, an unrelated
+/// `Gadget`'s unsupported body — blocking routes that never actually
+/// reach it. Three shapes of the same gap, all now covered by falling
+/// back to the analyzer's own (closed) stamp for the receiver's span:
+/// a local assigned from `current_user`, `current_user&.x` directly, and
+/// a private helper's result used with `&.`. A fourth action keeps the
+/// control: a receiver with no closed type on *either* side (a fully
+/// dynamic `send`) must still fan out and stay blocked, so the fallback
+/// never masks a genuinely unresolved call.
+#[test]
+fn planner_falls_back_to_the_analyzers_type_for_framework_and_private_helper_receivers() {
+    let src = scratch("stamps-src");
+    let out = scratch("stamps-out");
+    write(&src, "Gemfile", b"source \"https://rubygems.org\"\ngem \"rails\"\n");
+    write(&src, "config/routes.rb", br#"Rails.application.routes.draw do
+  get "widgets/a" => "widgets#action_a"
+  get "widgets/b" => "widgets#action_b"
+  get "widgets/c" => "widgets#action_c"
+  get "widgets/d" => "widgets#action_d"
+end
+"#);
+    write(&src, "db/schema.rb", br#"ActiveRecord::Schema.define do
+  create_table "users", force: :cascade do |t|
+    t.string "email", null: false
+  end
+  create_table "widgets", force: :cascade do |t|
+    t.string "name"
+  end
+end
+"#);
+    write(&src, "app/models/application_record.rb", b"class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n");
+    // Declaring `devise` makes `current_user` resolve to `User | nil`
+    // in the analyzer's own registry (`analyze/registry/controllers.rs`).
+    write(&src, "app/models/user.rb", b"class User < ApplicationRecord\n  devise :database_authenticatable, :registerable\nend\n");
+    write(&src, "app/models/widget.rb", b"class Widget < ApplicationRecord\nend\n");
+    write(&src, "app/controllers/application_controller.rb", b"class ApplicationController < ActionController::Base\nend\n");
+    write(&src, "app/controllers/widgets_controller.rb", br#"class WidgetsController < ApplicationController
+  def action_a
+    u = current_user
+    @email = u&.email
+  end
+
+  def action_b
+    @email = current_user&.email
+  end
+
+  def action_c
+    @name = current_widget&.name
+  end
+
+  def action_d
+    target = [:current_widget].sample
+    @thing = send(target)&.email
+  end
+
+  private
+
+  def current_widget
+    Widget.first
+  end
+end
+"#);
+    write(&src, "app/views/widgets/action_a.html.erb", b"<%= @email %>\n");
+    write(&src, "app/views/widgets/action_b.html.erb", b"<%= @email %>\n");
+    write(&src, "app/views/widgets/action_c.html.erb", b"<%= @name %>\n");
+    write(&src, "app/views/widgets/action_d.html.erb", b"<%= @thing %>\n");
+    // Unrelated: defines both receiver method names with an unsupported
+    // body. Before the fix, every action's untyped receiver fans out
+    // here; after, only the genuinely dynamic `action_d` still does.
+    write(&src, "app/lib/gadget.rb", br#"class Gadget
+  def email
+    Frobnicator::Spinner.new.spin
+  end
+
+  def name
+    Frobnicator::Spinner.new.spin
+  end
+end
+"#);
+
+    let run = Command::new(env!("CARGO_BIN_EXE_roundhouse"))
+        .args(["--target", "futamura", "--survey", "-o"])
+        .arg(&out)
+        .arg(&src)
+        .env("ROUNDHOUSE_FUTAMURA_LEDGER", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success(), "{stderr}");
+    assert!(stderr.contains("whole-route: 3 GET action(s) served by the lowered app; 1 left to Rails"), "{stderr}");
+    for cleared in ["widgets#action_a", "widgets#action_b", "widgets#action_c"] {
+        assert!(stderr.contains(&format!("lowered     {cleared}")), "{stderr}");
+    }
+    // The control: a fully dynamic `send` still has no closed type on
+    // either side, so it still fans out to `Gadget` and stays blocked.
+    let residue = stderr.lines().find(|l| l.contains("rails ") && l.contains("widgets#action_d")).unwrap_or_else(|| panic!("{stderr}"));
+    assert!(residue.contains("Gadget#email") && residue.contains("Frobnicator"), "{residue}");
+    // None of the three cleared routes' call chains reach Gadget.
+    for cleared in ["action_a", "action_b", "action_c"] {
+        assert!(
+            stderr.lines().find(|l| l.contains(cleared)).unwrap().matches("Gadget").count() == 0,
+            "{stderr}"
+        );
+    }
+
+    fs::remove_dir_all(&src).unwrap();
+    fs::remove_dir_all(&out).unwrap();
+}
+
+/// The whole-route planner must reach every app method a route can run,
+/// or it clears a route that runs unsupported code. Each fixture below
+/// has one `widgets#index` route whose action reaches `Frobnicator`, a
+/// constant the lowered app cannot resolve, through one call shape the
+/// walk used to miss, and so must stay with Rails.
+fn reach_ledger(name: &str, action: &str, helpers: &str, extra: &[(&str, &str)]) -> String {
+    let src = scratch(&format!("{name}-src"));
+    let out = scratch(&format!("{name}-out"));
+    write(&src, "Gemfile", b"source \"https://rubygems.org\"\ngem \"rails\"\n");
+    write(&src, "config/routes.rb", b"Rails.application.routes.draw do\n  get \"widgets\" => \"widgets#index\"\nend\n");
+    write(&src, "app/controllers/application_controller.rb", b"class ApplicationController < ActionController::Base\nend\n");
+    let controller = format!(
+        "class WidgetsController < ApplicationController\n{helpers}\n  def index\n{action}\n  end\n\n  private\n\n  def pick\n    Widget.new\n  end\nend\n"
+    );
+    write(&src, "app/controllers/widgets_controller.rb", controller.as_bytes());
+    write(&src, "app/views/widgets/index.html.erb", b"<%= @name %>\n");
+    write(&src, "app/lib/widget.rb", b"class Widget\nend\n");
+    for (path, body) in extra {
+        write(&src, path, body.as_bytes());
+    }
+    let run = Command::new(env!("CARGO_BIN_EXE_roundhouse"))
+        .args(["--target", "futamura", "--survey", "-o"])
+        .arg(&out)
+        .arg(&src)
+        .env("ROUNDHOUSE_FUTAMURA_LEDGER", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
+    assert!(run.status.success(), "{stderr}");
+    fs::remove_dir_all(&src).unwrap();
+    fs::remove_dir_all(&out).unwrap();
+    stderr
+}
+
+const GADGET: (&str, &str) = ("app/lib/gadget.rb", "class Gadget\n  def call\n    Frobnicator::Spinner.new.spin\n  end\nend\n");
+
+fn assert_left_to_rails(stderr: &str, via: &str) {
+    assert!(stderr.contains("whole-route: 0 GET action(s) served by the lowered app; 1 left to Rails"), "{stderr}");
+    let residue = stderr.lines().find(|l| l.contains("rails ") && l.contains("widgets#index")).unwrap_or_else(|| panic!("{stderr}"));
+    assert!(residue.contains("Frobnicator") && residue.contains(via), "{residue}");
+}
+
+/// A record out of a relation is an app object: the walk used to skip
+/// any send on a framework call's result (`ActiveRecord::Relation.new(
+/// Post).where(…)…`, as the lowering spells it), and cleared the route.
+#[test]
+fn a_send_on_a_record_from_a_relation_is_followed() {
+    let stderr = reach_ledger(
+        "reach-relation",
+        "    @name = Post.where(title: \"x\").to_a.sample.call",
+        "",
+        &[
+            (
+                "db/schema.rb",
+                "ActiveRecord::Schema.define do\n  create_table \"posts\", force: :cascade do |t|\n    t.string \"title\", null: false\n  end\nend\n",
+            ),
+            ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n"),
+            ("app/models/post.rb", "class Post < ApplicationRecord\n  def call\n    Frobnicator::Spinner.new.spin\n  end\nend\n"),
+        ],
+    );
+    assert_left_to_rails(&stderr, "Post#call");
+}
+
+/// A value read back from the cache is whatever some request stored:
+/// the walk used to skip the send because `Rails.cache` is the
+/// framework's.
+#[test]
+fn a_send_on_a_value_from_the_cache_is_followed() {
+    let stderr = reach_ledger("reach-cache", "    @name = Rails.cache.read(\"gadget\").call", "", &[GADGET]);
+    assert_left_to_rails(&stderr, "Gadget#call");
+}
+
+/// A class-side `method_missing` answers a name no class method defines
+/// (`Setting.some_key`).
+#[test]
+fn a_class_side_method_missing_is_followed() {
+    let stderr = reach_ledger(
+        "reach-cmissing",
+        "    @name = Gizmo.anything",
+        "",
+        &[("app/lib/gizmo.rb", "class Gizmo\n  def self.method_missing(name, *args)\n    Frobnicator::Spinner.new.spin\n  end\nend\n")],
+    );
+    assert_left_to_rails(&stderr, "Gizmo.method_missing");
+}
+
+/// An instance-side `method_missing` answers an untyped send of a name
+/// its class does not define. (A typed `Gizmo.new.anything` needs no
+/// test here: the analysis already refuses it.)
+#[test]
+fn an_instance_side_method_missing_is_followed() {
+    let stderr = reach_ledger(
+        "reach-imissing",
+        "    @name = Rails.cache.read(\"k\").anything",
+        "",
+        &[("app/lib/gizmo.rb", "class Gizmo\n  def method_missing(name, *args)\n    Frobnicator::Spinner.new.spin\n  end\nend\n")],
+    );
+    assert_left_to_rails(&stderr, "Gizmo#method_missing");
+}
+
+/// A typed value's class may answer a send directly on one side
+/// (class or instance) while the other side has no definition of it
+/// but does have its own `method_missing`. A hit on one side must not
+/// suppress the other side's `method_missing` — each side is checked
+/// on its own.
+#[test]
+fn a_hit_on_one_side_does_not_suppress_the_other_sides_method_missing() {
+    // `foo` is an instance method, so `w.foo` is a direct hit on the
+    // instance side; the class side has no `foo` but does have its own
+    // `method_missing`. The instance hit must not suppress that check.
+    // (`@name` stays a literal: rendering an untyped ivar would call
+    // `to_s` and sweep in any class with an INSTANCE `method_missing`
+    // through the unrelated general fan-out, masking this bug — this
+    // repro needs the class-side one, which that fan-out never touches.)
+    let stderr = reach_ledger(
+        "reach-mixed-sides",
+        "    w = Widget.new\n    w.foo\n    @name = \"ok\"",
+        "",
+        &[(
+            "app/lib/widget.rb",
+            "class Widget\n  def foo\n  end\n\n  def self.method_missing(name, *args)\n    Frobnicator::Spinner.new.spin\n  end\nend\n",
+        )],
+    );
+    assert_left_to_rails(&stderr, "Widget.method_missing");
+}
+
+/// `"#{x}"` calls `x.to_s`.
+#[test]
+fn string_interpolation_calls_to_s() {
+    // RTA bounds an untyped send to the route's live classes: `Gadget`
+    // must actually be built on this route (not merely defined) for its
+    // `to_s` to be a real dispatch target, so the action also builds one.
+    let stderr = reach_ledger(
+        "reach-interp",
+        "    @other = Gadget.new\n    @name = \"<#{{ w: pick }[:w]}>\"",
+        "",
+        &[("app/lib/gadget.rb", "class Gadget\n  def to_s\n    Frobnicator::Spinner.new.spin\n  end\nend\n")],
+    );
+    assert_left_to_rails(&stderr, "Gadget#to_s");
+}
+
+/// `x.public_send(:call)` is `x.call`.
+#[test]
+fn public_send_with_a_literal_name_is_that_call() {
+    let stderr = reach_ledger("reach-public-send", "    @name = Gadget.new.public_send(:call)", "", &[GADGET]);
+    assert_left_to_rails(&stderr, "Gadget#call");
+}
+
+/// A constant holding an object, not a class: a send on it dispatches
+/// on what it holds.
+#[test]
+fn a_send_on_a_value_constant_is_followed() {
+    let stderr = reach_ledger("reach-value-const", "    @name = SPARE.call", "  SPARE = Gadget.new\n", &[GADGET]);
+    assert_left_to_rails(&stderr, "Gadget#call");
+}
+
+/// A top-level value constant dispatches even when its own name also
+/// matches a namespaced class by its last segment (`Admin::SPARE`):
+/// the planner cannot tell which one a bare path like `SPARE` names,
+/// so it has to reach through both, not just whichever it finds.
+#[test]
+fn a_value_constant_dispatches_despite_a_namespaced_class_of_the_same_last_segment() {
+    // Referenced bare from the view (not from inside `WidgetsController`,
+    // whose own scope would otherwise get prefixed onto the path ahead
+    // of the match): the path stays plain `SPARE`, which also matches
+    // `Admin::SPARE` by its last segment.
+    let stderr = reach_ledger(
+        "reach-value-const-collision",
+        "    @name = \"ok\"",
+        "  SPARE = Gadget.new\n",
+        &[
+            GADGET,
+            ("app/lib/admin/spare.rb", "module Admin\n  class SPARE\n  end\nend\n"),
+            ("app/views/widgets/index.html.erb", "<%= SPARE.call %>\n"),
+        ],
+    );
+    assert_left_to_rails(&stderr, "Gadget#call");
+}
+
+/// A parameter's default value runs in the method.
+#[test]
+fn a_parameter_default_is_walked() {
+    let stderr = reach_ledger(
+        "reach-default",
+        "    label\n    @name = \"hi\"",
+        "  def label(text = Gadget.new.call)\n    text\n  end\n",
+        &[GADGET],
+    );
+    assert_left_to_rails(&stderr, "Gadget#call");
+}
+
+/// Rapid type analysis: an untyped send reaches only the classes that
+/// can have an instance while the route runs. Each fixture below sends
+/// `call` from `widgets#index` to a value neither the lowering nor the
+/// analyzer types (a helper's result read back out of a Hash literal),
+/// and `Gadget#call`, on an unrelated plain class, has a body the
+/// lowered app cannot run. Whether the route clears depends only on
+/// whether a `Gadget` can exist on it.
+fn rta_ledger(name: &str, action: &str, helpers: &str, extra: &[(&str, &str)]) -> String {
+    rta_ledger_env(name, action, helpers, extra, &[])
+}
+
+/// `rta_ledger`, with extra environment variables set on the run (the
+/// `ROUNDHOUSE_FUTAMURA_TRUST_BOX_CACHE` switch).
+fn rta_ledger_env(name: &str, action: &str, helpers: &str, extra: &[(&str, &str)], envs: &[(&str, &str)]) -> String {
+    let src = scratch(&format!("{name}-src"));
+    let out = scratch(&format!("{name}-out"));
+    write(&src, "Gemfile", b"source \"https://rubygems.org\"\ngem \"rails\"\n");
+    write(&src, "config/routes.rb", b"Rails.application.routes.draw do\n  get \"widgets\" => \"widgets#index\"\nend\n");
+    write(&src, "app/controllers/application_controller.rb", b"class ApplicationController < ActionController::Base\nend\n");
+    let controller = format!(
+        "class WidgetsController < ApplicationController\n  def index\n{action}\n  end\n\n  private\n\n  def pick\n    Widget.new\n  end\n{helpers}end\n"
+    );
+    write(&src, "app/controllers/widgets_controller.rb", controller.as_bytes());
+    write(&src, "app/views/widgets/index.html.erb", b"<%= @name %>\n");
+    write(&src, "app/lib/widget.rb", b"class Widget\n  def call\n    \"hi\"\n  end\nend\n");
+    write(&src, "app/lib/gadget.rb", b"class Gadget\n  def call\n    Frobnicator::Spinner.new.spin\n  end\nend\n");
+    for (path, body) in extra {
+        write(&src, path, body.as_bytes());
+    }
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_roundhouse"));
+    cmd.args(["--target", "futamura", "--survey", "-o"]).arg(&out).arg(&src).env("ROUNDHOUSE_FUTAMURA_LEDGER", "2");
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let run = cmd.output().unwrap();
+    let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
+    assert!(run.status.success(), "{stderr}");
+    fs::remove_dir_all(&src).unwrap();
+    fs::remove_dir_all(&out).unwrap();
+    stderr
+}
+
+/// Only a `Widget` is ever built, so the untyped `call` can only be
+/// `Widget#call`: `Gadget#call` is not reached and the route clears.
+#[test]
+fn rta_untyped_send_reaches_only_classes_the_route_can_build() {
+    let stderr = rta_ledger("rta-live", "    @name = { w: pick }[:w].call", "", &[]);
+    assert!(stderr.contains("whole-route: 1 GET action(s) served by the lowered app; 0 left to Rails"), "{stderr}");
+    assert!(!stderr.contains("Frobnicator"), "{stderr}");
+    assert!(stderr.contains("rta         widgets#index: bounded"), "{stderr}");
+}
+
+/// Control: the route also builds a `Gadget` (in a helper it calls), so
+/// the same untyped `call` may be `Gadget#call`.
+#[test]
+fn rta_untyped_send_reaches_a_class_the_route_builds() {
+    let stderr = rta_ledger(
+        "rta-built",
+        "    @name = { w: pick }[:w].call\n    @other = spare",
+        "\n  def spare\n    Gadget.new\n  end\n",
+        &[],
+    );
+    assert!(stderr.contains("whole-route: 0 GET action(s) served by the lowered app; 1 left to Rails"), "{stderr}");
+    assert!(stderr.contains("app/lib/gadget.rb:3") && stderr.contains("Gadget#call"), "{stderr}");
+    assert!(stderr.contains("rta         widgets#index: bounded"), "{stderr}");
+}
+
+/// A record the database hands back is live. The runtime builds models
+/// by name (its generated `instantiate-named` table), so every model is
+/// live on every route, and a query's result is a framework value the
+/// walk follows: the untyped `call` on a record out of a relation (the
+/// lowering spells it `ActiveRecord::Relation.new(Post).where(…)`)
+/// reaches `Post#call`. It does not reach `Gadget#call`: the route
+/// reaches one error, not two.
+#[test]
+fn rta_a_record_from_a_finder_is_live() {
+    let stderr = rta_ledger(
+        "rta-model",
+        "    @name = Post.where(title: \"x\").to_a.sample.call",
+        "",
+        &[
+            (
+                "db/schema.rb",
+                "ActiveRecord::Schema.define do\n  create_table \"posts\", force: :cascade do |t|\n    t.string \"title\", null: false\n  end\nend\n",
+            ),
+            ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n"),
+            ("app/models/post.rb", "class Post < ApplicationRecord\n  def call\n    Combobulator::Unit.new.run\n  end\nend\n"),
+        ],
+    );
+    let residue = stderr.lines().find(|l| l.contains("rails ") && l.contains("widgets#index")).unwrap_or_else(|| panic!("{stderr}"));
+    assert!(residue.contains("reaches 1 error(s)") && residue.contains("app/models/post.rb:3"), "{residue}");
+    assert!(!stderr.contains("Frobnicator"), "{stderr}");
+}
+
+/// A value read from the cache may have been written by another
+/// request, by Rails code outside any box, or directly by an operator
+/// (a console session, a migration) — the box's own reach can never
+/// confirm or rule any of that out from the box's code alone. So by
+/// default a cache read goes to full fan-out (case 5 in the design-doc
+/// comment above `reach`), exactly like `constantize` or `Marshal.load`:
+/// `Gadget` is never built anywhere in this fixture, yet it is still
+/// reached.
+#[test]
+fn rta_cache_read_is_conservative_by_default() {
+    let stderr = rta_ledger("rta-cache-default", "    @name = Rails.cache.read(\"gadget\").call", "", &[]);
+    assert!(stderr.contains("whole-route: 0 GET action(s) served by the lowered app; 1 left to Rails"), "{stderr}");
+    assert!(stderr.contains("app/lib/gadget.rb:3"), "{stderr}");
+    assert!(stderr.contains("rta         widgets#index: full fan-out: Rails.cache.read in WidgetsController#index"), "{stderr}");
+}
+
+/// `ROUNDHOUSE_FUTAMURA_TRUST_BOX_CACHE=1` opts into the narrower,
+/// unconfirmed assumption that this box's cache only ever holds a value
+/// some box code wrote: the read is then bounded to the app-wide live
+/// set instead of fanning out by name. Nothing in this fixture ever
+/// builds a `Gadget`, so under the switch the route actually clears —
+/// the switch is not merely a different ledger label, it changes what
+/// the route reaches.
+#[test]
+fn rta_cache_read_is_bounded_with_the_trust_switch() {
+    let stderr = rta_ledger_env(
+        "rta-cache-trust",
+        "    @name = Rails.cache.read(\"gadget\").call",
+        "",
+        &[],
+        &[("ROUNDHOUSE_FUTAMURA_TRUST_BOX_CACHE", "1")],
+    );
+    assert!(stderr.contains("whole-route: 1 GET action(s) served by the lowered app; 0 left to Rails"), "{stderr}");
+    assert!(!stderr.contains("Frobnicator"), "{stderr}");
+    assert!(stderr.contains("rta         widgets#index: every app-live class: Rails.cache.read in WidgetsController#index"), "{stderr}");
+}
+
+/// The trust switch still catches a `Gadget` the app genuinely builds
+/// (in a helper this route never calls): bounded is not the same as
+/// unreached, only narrower than full fan-out.
+#[test]
+fn rta_cache_read_trust_switch_still_reaches_a_class_the_app_builds() {
+    let stderr = rta_ledger_env(
+        "rta-cache-trust-built",
+        "    @name = Rails.cache.read(\"gadget\").call",
+        "\n  def warm\n    Rails.cache.write(\"gadget\", Gadget.new)\n  end\n",
+        &[],
+        &[("ROUNDHOUSE_FUTAMURA_TRUST_BOX_CACHE", "1")],
+    );
+    assert!(stderr.contains("whole-route: 0 GET action(s) served by the lowered app; 1 left to Rails"), "{stderr}");
+    assert!(stderr.contains("app/lib/gadget.rb:3"), "{stderr}");
+    assert!(stderr.contains("rta         widgets#index: every app-live class: Rails.cache.read in WidgetsController#index"), "{stderr}");
+}
+
+/// A class named by data can be any class, built or not: the route goes
+/// back to full fan-out, and `Gadget#call` is reached though nothing in
+/// the app ever builds a `Gadget`.
+#[test]
+fn rta_a_class_from_data_falls_back_to_full_fan_out() {
+    let stderr = rta_ledger("rta-constantize", "    kind = params[:kind].constantize\n    @name = kind.new.call", "", &[]);
+    assert!(stderr.contains("whole-route: 0 GET action(s) served by the lowered app; 1 left to Rails"), "{stderr}");
+    assert!(stderr.contains("app/lib/gadget.rb:3"), "{stderr}");
+    assert!(stderr.contains("rta         widgets#index: full fan-out: `constantize` in WidgetsController#index"), "{stderr}");
+}
+
+/// A registry the app fills at load time, read back on the route
+/// (`Registry.items.first`): nothing in the route names the class
+/// whose object it holds.
+const REGISTRY: (&str, &str) = (
+    "app/lib/registry.rb",
+    "class Registry\n  ITEMS = []\n\n  def self.items\n    ITEMS\n  end\nend\n",
+);
+
+fn registering_gadget(arg: &str) -> String {
+    format!(
+        "class Gadget\n  def self.register(x)\n    Registry::ITEMS << x\n  end\n  register({arg})\n\n  def call\n    Frobnicator::Spinner.new.spin\n  end\nend\n"
+    )
+}
+
+/// A class body runs with the class as `self`: `register(new)` builds
+/// a `Gadget` at load time and hands it on, written receiverless or on
+/// `self`, with `new` or `allocate`. The `Gadget` is live, so the
+/// untyped `call` on what the registry holds reaches `Gadget#call`.
+#[test]
+fn rta_a_class_body_that_builds_its_own_instance_makes_it_live() {
+    for arg in ["new", "allocate", "self.new", "self.allocate"] {
+        let gadget = registering_gadget(arg);
+        let stderr = rta_ledger(
+            &format!("rta-body-{}", arg.replace('.', "-")),
+            "    @name = Registry.items.first.call",
+            "",
+            &[REGISTRY, ("app/lib/gadget.rb", &gadget)],
+        );
+        assert!(stderr.contains("whole-route: 0 GET action(s) served by the lowered app; 1 left to Rails"), "{arg}: {stderr}");
+        assert!(stderr.contains("app/lib/gadget.rb:8") && stderr.contains("Gadget#call"), "{arg}: {stderr}");
+    }
+}
+
+/// `register(self)` hands on the class object itself: whoever holds it
+/// can build one (`Registry.items.first.new.call`).
+#[test]
+fn rta_a_class_body_that_hands_on_self_makes_the_class_live() {
+    let gadget = registering_gadget("self");
+    let stderr = rta_ledger(
+        "rta-body-self",
+        "    @name = Registry.items.first.new.call",
+        "",
+        &[REGISTRY, ("app/lib/gadget.rb", &gadget)],
+    );
+    assert!(stderr.contains("whole-route: 0 GET action(s) served by the lowered app; 1 left to Rails"), "{stderr}");
+    assert!(stderr.contains("app/lib/gadget.rb:8") && stderr.contains("Gadget#call"), "{stderr}");
+}
+
+/// Precision: a class body that only makes framework calls (`include`,
+/// `attr_reader`) hands nothing on, so `Gadget` stays dead and the
+/// untyped `call` on a `Widget` still clears.
+#[test]
+fn rta_a_class_body_of_framework_calls_keeps_the_class_dead() {
+    let stderr = rta_ledger(
+        "rta-body-framework",
+        "    @name = { w: pick }[:w].call",
+        "",
+        &[(
+            "app/lib/gadget.rb",
+            "class Gadget\n  include Comparable\n  attr_reader :size\n\n  def call\n    Frobnicator::Spinner.new.spin\n  end\nend\n",
+        )],
+    );
+    assert!(stderr.contains("whole-route: 1 GET action(s) served by the lowered app; 0 left to Rails"), "{stderr}");
+    assert!(!stderr.contains("Frobnicator"), "{stderr}");
+}
+
+/// Ruby passes each subclass to its parent's `inherited` hook when the
+/// subclass loads, with nothing in the subclass' body to show for it:
+/// every class under an app `inherited` hook is live.
+#[test]
+fn rta_an_inherited_hook_makes_every_subclass_live() {
+    let stderr = rta_ledger(
+        "rta-inherited",
+        "    @name = Registry.items.first.new.call",
+        "",
+        &[
+            REGISTRY,
+            ("app/lib/base.rb", "class Base\n  def self.inherited(k)\n    Registry::ITEMS << k\n  end\nend\n"),
+            ("app/lib/gadget.rb", "class Gadget < Base\n  def call\n    Frobnicator::Spinner.new.spin\n  end\nend\n"),
+        ],
+    );
+    assert!(stderr.contains("whole-route: 0 GET action(s) served by the lowered app; 1 left to Rails"), "{stderr}");
+    assert!(stderr.contains("app/lib/gadget.rb:3") && stderr.contains("Gadget#call"), "{stderr}");
+}
+
+/// `Gadget` gets into the registry through a module, with nothing in
+/// its own body but `include` / `extend`: the module's `included` /
+/// `extended` hook, or an extended module's method that the class body
+/// calls. Each makes `Gadget` live.
+#[test]
+fn rta_a_module_that_hands_on_its_includer_makes_it_live() {
+    let cases = [
+        (
+            "included-hook",
+            "module Registrable\n  def self.included(base)\n    Registry::ITEMS << base\n  end\nend\n",
+            "include Registrable",
+        ),
+        (
+            "extended-hook",
+            "module Registrable\n  def self.extended(base)\n    Registry::ITEMS << base\n  end\nend\n",
+            "extend Registrable",
+        ),
+        (
+            "extended-method",
+            "module Registrable\n  def register\n    Registry::ITEMS << self\n  end\nend\n",
+            "extend Registrable\n  register",
+        ),
+    ];
+    let mut failed = Vec::new();
+    for (name, module, body) in cases {
+        let gadget = format!("class Gadget\n  {body}\n\n  def call\n    Frobnicator::Spinner.new.spin\n  end\nend\n");
+        let stderr = rta_ledger(
+            &format!("rta-module-{name}"),
+            "    @name = Registry.items.first.new.call",
+            "",
+            &[REGISTRY, ("app/lib/registrable.rb", module), ("app/lib/gadget.rb", &gadget)],
+        );
+        if !(stderr.contains("whole-route: 0 GET action(s) served by the lowered app; 1 left to Rails") && stderr.contains("Gadget#call")) {
+            failed.push(format!("{name}: {stderr}"));
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n\n"));
+}
+
+/// A class-side `method_missing` answers a name no class defines
+/// (`Setting.some_key`): the walk follows it, so an error behind it
+/// blocks the route. (This is already covered independently of RTA's
+/// bounding — see `a_class_side_method_missing_is_followed` above —
+/// but is ported here too since it is one of RTA's own 6 tests.)
+#[test]
+fn a_class_side_method_missing_is_reached() {
+    let stderr = rta_ledger(
+        "rta-missing",
+        "    @name = Gizmo.anything",
+        "",
+        &[("app/lib/gizmo.rb", "class Gizmo\n  def self.method_missing(name, *args)\n    Frobnicator::Spinner.new.spin\n  end\nend\n")],
+    );
+    assert!(stderr.contains("app/lib/gizmo.rb:3") && stderr.contains("Gizmo.method_missing"), "{stderr}");
+    assert!(stderr.contains("whole-route: 0 GET action(s) served by the lowered app; 1 left to Rails"), "{stderr}");
+}
+
+/// INTERIM (rubys/roundhouse#58, same re-lowering as the fallback above):
+/// a send whose receiver is typed to ANOTHER class's value constant
+/// (`Gadget::DEFAULT`, with `class Gadget; DEFAULT = Gadget.new; ...`)
+/// re-lowers as `Ty::Class { id: "Gadget::DEFAULT" }` — a class that
+/// doesn't exist, since the re-lowering only seeds the enclosing class's
+/// own constants. Left unguarded, `index.lookup` finds nothing for that
+/// made-up id and the send dispatches to NOTHING instead of falling back
+/// to RTA, an unsound clear. Each case below reads `Gadget::DEFAULT` a
+/// different way (out of a Hash literal, through a local, out of an
+/// Array literal) and must still reach `Gadget#call`.
+///
+/// The top-level counterpart (`DEFAULT_GADGET = Gadget.new`, read back
+/// bare) was tried too: the re-lowering does mistype it the same way,
+/// but a bare top-level constant is already a construct the main
+/// analysis diagnoses as unsupported on its own (`constant not
+/// supported: DEFAULT_GADGET`, independent of this guard), so that
+/// route is already blocked before the planner's RTA fallback ever
+/// matters — not a case that can show this bug.
+#[test]
+fn typed_send_on_another_classs_value_constant_falls_back_to_rta() {
+    let gadget = "class Gadget\n  DEFAULT = Gadget.new\n\n  def call\n    Frobnicator::Spinner.new.spin\n  end\nend\n";
+    let cases = [
+        ("hash", "    @name = { w: Gadget::DEFAULT }[:w].call"),
+        ("local", "    x = Gadget::DEFAULT\n    @name = x.call"),
+        ("array", "    @name = [Gadget::DEFAULT].first.call"),
+    ];
+    let mut failed = Vec::new();
+    for (name, action) in cases {
+        let stderr = rta_ledger(&format!("rta-unknown-class-{name}"), action, "", &[("app/lib/gadget.rb", gadget)]);
+        let ok = stderr.contains("whole-route: 0 GET action(s) served by the lowered app; 1 left to Rails") && stderr.contains("Gadget#call");
+        if !ok {
+            failed.push(format!("{name}: {stderr}"));
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n\n"));
 }
 
 /// A minimal app whose `ruby` emit refuses one association (a `through:`
@@ -419,5 +1575,372 @@ mod preload_scopes {
         let init = &files.iter().find(|(p, _)| p == INITIALIZER).expect("initializer").1;
         assert!(init.contains("Futamura::Preload.static_scopes(\"User#published_posts\")\n"), "{init}");
         assert!(!init.contains("User#seen_posts"), "{init}");
+    }
+}
+
+/// A `where` value typed as a collection on every path: a `pluck` result,
+/// or a Relation held in a local. `ActiveRecord::StatementCache` refuses
+/// an Array, Hash, Range or Relation bind (`unsupported_value?`), so a
+/// site bound to one always runs its fallback: Rails answers, and the
+/// specialization is never used. Such a chain is left to Rails, as a
+/// literal collection already is. A value that is a collection on some
+/// paths only (`params[:name]`) is still bound.
+mod collection_binds {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    use roundhouse::analyze::Analyzer;
+    use roundhouse::emit::futamura::specialize;
+    use roundhouse::ingest::ingest_app_from_tree;
+
+    const CONTROLLER: &str = r#"class MembersController < ApplicationController
+  def index
+    rows = Member.where(active: true)
+    @named = Member.where(name: rows.pluck(:name)).to_a
+    @within = Member.where(id: rows).to_a
+    @one = Member.where(name: params[:name]).to_a
+  end
+end
+"#;
+
+    fn report() -> roundhouse::emit::futamura::Report {
+        let files: Vec<(&str, &str)> = vec![
+            (
+                "db/schema.rb",
+                "ActiveRecord::Schema[8.1].define(version: 1) do\n  create_table \"members\", force: :cascade do |t|\n    t.string \"name\"\n    t.boolean \"active\"\n  end\nend\n",
+            ),
+            ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n"),
+            ("app/models/member.rb", "class Member < ApplicationRecord\nend\n"),
+            ("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n"),
+            ("app/controllers/members_controller.rb", CONTROLLER),
+            ("config/routes.rb", "Rails.application.routes.draw do\n  resources :members, only: [:index]\nend\n"),
+        ];
+        let tree: HashMap<PathBuf, Vec<u8>> =
+            files.iter().map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec())).collect();
+        let mut app = ingest_app_from_tree(tree).expect("ingest");
+        Analyzer::new(&app).analyze(&mut app);
+        let mut out: Vec<(String, String)> = files.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect();
+        specialize(&app, &mut out).unwrap()
+    }
+
+    fn left_to_rails(report: &roundhouse::emit::futamura::Report, line: usize) -> bool {
+        report.residue.iter().any(|r| {
+            r.contains(&format!("members_controller.rb:{line}:")) && r.contains("where value is a collection")
+        })
+    }
+
+    #[test]
+    fn a_pluck_result_is_not_a_bind() {
+        let report = report();
+        assert!(left_to_rails(&report, 4), "{:?}", report.residue);
+        assert!(!report.specialized.iter().any(|s| s.contains("members_controller.rb:4:")), "{:?}", report.specialized);
+    }
+
+    #[test]
+    fn a_relation_is_not_a_bind() {
+        let report = report();
+        assert!(left_to_rails(&report, 5), "{:?}", report.residue);
+        assert!(!report.specialized.iter().any(|s| s.contains("members_controller.rb:5:")), "{:?}", report.specialized);
+    }
+
+    #[test]
+    fn a_value_that_may_be_a_scalar_is_still_bound() {
+        let report = report();
+        assert!(report.specialized.iter().any(|s| s.contains("members_controller.rb:6:")), "{:?}", report.specialized);
+    }
+
+    /// A scope's parameter takes its call site's type: `by_names(rows.pluck(:name))`
+    /// binds an Array where the scope says `where(name: names)`, and is
+    /// left to Rails; `by_names(params[:name])` is still bound.
+    #[test]
+    fn a_scope_argument_carries_its_type() {
+        let files: Vec<(&str, &str)> = vec![
+            (
+                "db/schema.rb",
+                "ActiveRecord::Schema[8.1].define(version: 1) do\n  create_table \"members\", force: :cascade do |t|\n    t.string \"name\"\n    t.boolean \"active\"\n  end\nend\n",
+            ),
+            ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n"),
+            ("app/models/member.rb", "class Member < ApplicationRecord\n  scope :by_names, ->(names) { where(name: names) }\nend\n"),
+            ("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n"),
+            (
+                "app/controllers/members_controller.rb",
+                "class MembersController < ApplicationController\n  def index\n    rows = Member.where(active: true)\n    @named = Member.by_names(rows.pluck(:name)).to_a\n    @one = Member.by_names(params[:name]).to_a\n  end\nend\n",
+            ),
+            ("config/routes.rb", "Rails.application.routes.draw do\n  resources :members, only: [:index]\nend\n"),
+        ];
+        let tree: HashMap<PathBuf, Vec<u8>> =
+            files.iter().map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec())).collect();
+        let mut app = ingest_app_from_tree(tree).expect("ingest");
+        Analyzer::new(&app).analyze(&mut app);
+        let mut out: Vec<(String, String)> = files.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect();
+        let report = specialize(&app, &mut out).unwrap();
+        assert!(
+            report.residue.iter().any(|r| r.contains("members_controller.rb:4:") && r.contains("where value is a collection")),
+            "{:?}",
+            report.residue
+        );
+        assert!(report.specialized.iter().any(|s| s.contains("members_controller.rb:5:")), "{:?}", report.specialized);
+    }
+
+    /// A PostgreSQL array column (`array: true`) is an Array on every path,
+    /// though the analysis types it as its element: a `where` over one, read
+    /// in the model (`tag_ids`) or through a record (`@member.tag_ids`), is
+    /// left to Rails. A plain column read is still bound.
+    #[test]
+    fn an_array_column_read_is_not_a_bind() {
+        let files: Vec<(&str, &str)> = vec![
+            (
+                "db/schema.rb",
+                "ActiveRecord::Schema[8.1].define(version: 1) do\n  create_table \"members\", force: :cascade do |t|\n    t.string \"name\"\n    t.bigint \"tag_ids\", array: true, default: [], null: false\n  end\nend\n",
+            ),
+            ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n"),
+            (
+                "app/models/member.rb",
+                "class Member < ApplicationRecord\n  scope :by_ids, ->(ids) { where(id: ids) }\n  scope :named, ->(n) { where(name: n) }\n\n  def peers\n    Member.where(id: tag_ids).to_a\n  end\n\n  def namesakes\n    Member.where(name: name).to_a\n  end\n\n  def scoped_peers\n    Member.by_ids(tag_ids).to_a\n  end\n\n  def either_peers\n    Member.where(id: tag_ids || nil).to_a\n  end\n\n  def local_peers\n    ids = tag_ids\n    Member.where(id: ids).to_a\n  end\n\n  def scoped_namesakes\n    Member.named(name).to_a\n  end\n\n  def deep_peers\n    Member.where(id: tag_ids || nil || nil || nil || nil || nil || nil || nil || nil || nil).to_a\n  end\n\n  def chained_namesakes\n    Member.where(name: name || nil).to_a\n  end\nend\n",
+            ),
+            ("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n"),
+            (
+                "app/controllers/members_controller.rb",
+                "class MembersController < ApplicationController\n  def index\n    @member = Member.find(params[:id])\n    @peers = Member.where(id: @member.tag_ids).to_a\n  end\nend\n",
+            ),
+            ("config/routes.rb", "Rails.application.routes.draw do\n  resources :members, only: [:index]\nend\n"),
+        ];
+        let tree: HashMap<PathBuf, Vec<u8>> =
+            files.iter().map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec())).collect();
+        let mut app = ingest_app_from_tree(tree).expect("ingest");
+        Analyzer::new(&app).analyze(&mut app);
+        let mut out: Vec<(String, String)> = files.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect();
+        let report = specialize(&app, &mut out).unwrap();
+        let left = |file: &str, line: usize| {
+            report.residue.iter().any(|r| r.contains(&format!("{file}:{line}:")) && r.contains("where value is a collection"))
+        };
+        assert!(left("member.rb", 6), "{:?}", report.residue);
+        assert!(left("members_controller.rb", 4), "{:?}", report.residue);
+        assert!(report.specialized.iter().any(|s| s.contains("member.rb:10:")), "{:?}", report.specialized);
+        // Through a scope's parameter, a `||` operand and a local.
+        assert!(left("member.rb", 14), "{:?}", report.residue);
+        assert!(left("member.rb", 18), "{:?}", report.residue);
+        assert!(left("member.rb", 23), "{:?}", report.residue);
+        // A scope bound to a plain column read is still specialized.
+        assert!(report.specialized.iter().any(|s| s.contains("member.rb:27:")), "{:?}", report.specialized);
+        // Nested past the walk's limit, the value is left to Rails; a
+        // shallow plain-column value is still specialized.
+        assert!(left("member.rb", 31), "{:?}", report.residue);
+        assert!(report.specialized.iter().any(|s| s.contains("member.rb:35:")), "{:?}", report.specialized);
+    }
+
+    /// A parameter whose inferred type still holds a variable is not
+    /// evidence: callers passing `[]` and `nil` type `name` as `Array[T] |
+    /// nil`, while a call with a String is what the app runs. The site
+    /// stays bound.
+    #[test]
+    fn a_partly_inferred_collection_type_is_still_bound() {
+        let files: Vec<(&str, &str)> = vec![
+            (
+                "db/schema.rb",
+                "ActiveRecord::Schema[8.1].define(version: 1) do\n  create_table \"members\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n",
+            ),
+            ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n"),
+            ("app/models/member.rb", "class Member < ApplicationRecord\nend\n"),
+            ("app/services/fetch_member_service.rb", "class FetchMemberService\n  def call(name)\n    Member.find_by(name:)\n  end\nend\n"),
+            (
+                "app/services/batch_service.rb",
+                "class BatchService\n  def first_batch\n    FetchMemberService.new.call([])\n  end\n\n  def none\n    FetchMemberService.new.call(nil)\n  end\nend\n",
+            ),
+            ("config/routes.rb", "Rails.application.routes.draw do\nend\n"),
+        ];
+        let tree: HashMap<PathBuf, Vec<u8>> =
+            files.iter().map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec())).collect();
+        let mut app = ingest_app_from_tree(tree).expect("ingest");
+        Analyzer::new(&app).analyze(&mut app);
+        let mut out: Vec<(String, String)> = files.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect();
+        let report = specialize(&app, &mut out).unwrap();
+        assert!(report.specialized.iter().any(|s| s.contains("fetch_member_service.rb:3:")), "{:?}", report.specialized);
+    }
+}
+
+mod runtime_stats {
+    use std::fs;
+    use std::process::Command;
+
+    use roundhouse::emit::futamura::INITIALIZER;
+
+    // The emitted initializer carries an opt-in measurement block. It must
+    // stay inert unless FUTAMURA_STATS names a directory, and the file must
+    // stay valid Ruby with it.
+    #[test]
+    fn emitted_runtime_has_an_opt_in_stats_block_and_stays_valid_ruby() {
+        let dir = super::scratch::dir("roundhouse-futamura-stats");
+        let src = dir.join("src");
+        let out = dir.join("out");
+        fs::create_dir_all(src.join("app/models")).unwrap();
+        fs::create_dir_all(src.join("config")).unwrap();
+        fs::create_dir_all(src.join("db")).unwrap();
+        fs::write(src.join("Gemfile"), "source \"https://rubygems.org\"\ngem \"rails\"\n").unwrap();
+        fs::write(src.join("config/routes.rb"), "Rails.application.routes.draw do\nend\n").unwrap();
+        fs::write(
+            src.join("db/schema.rb"),
+            "ActiveRecord::Schema.define do\n  create_table \"pages\", force: :cascade do |t|\n    t.string \"slug\"\n  end\nend\n",
+        )
+        .unwrap();
+        fs::write(src.join("app/models/application_record.rb"), "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n").unwrap();
+        fs::write(
+            src.join("app/models/page.rb"),
+            "class Page < ApplicationRecord\n  def self.live_by(slug)\n    where(slug: slug).first\n  end\nend\n",
+        )
+        .unwrap();
+        let run = Command::new(env!("CARGO_BIN_EXE_roundhouse"))
+            .args(["--target", "futamura", "-o"])
+            .arg(&out)
+            .arg(&src)
+            .output()
+            .unwrap();
+        assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+        let init = fs::read_to_string(out.join(INITIALIZER)).unwrap();
+        // One guarded block, after the runtime module, that counts calls per
+        // site and why each fell back; FUTAMURA_STATS_AB times the chain too.
+        assert!(init.contains("if ENV[\"FUTAMURA_STATS\"].to_s != \"\""), "{init}");
+        assert!(init.contains("singleton_class.prepend(Stats::Instrument)"), "{init}");
+        assert!(init.contains("FUTAMURA_STATS_AB"), "{init}");
+        for reason in ["default_scopes", "root_not_model", "relation_needs_rails"] {
+            assert!(init.contains(reason), "{reason}: {init}");
+        }
+        // The whole file, block included, parses.
+        if let Ok(ruby) = Command::new("ruby").arg("-c").arg(out.join(INITIALIZER)).output() {
+            assert!(ruby.status.success(), "{}", String::from_utf8_lossy(&ruby.stderr));
+        }
+    }
+}
+
+mod rooted_constants {
+    use std::path::PathBuf;
+
+    use roundhouse::analyze::Analyzer;
+    use roundhouse::emit::futamura::specialize;
+    use roundhouse::ingest::ingest_app_from_tree;
+
+    #[test]
+    fn a_rooted_model_constant_roots_a_chain_like_the_bare_one() {
+        let files: Vec<(&str, &str)> = vec![
+            ("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"rooms\", force: :cascade do |t|\n    t.string \"name\", null: false\n  end\nend\n"),
+            ("app/models/room.rb", "class Room < ApplicationRecord\nend\n"),
+            ("app/services/lookup/finder.rb", "module Lookup\n  class Finder\n    def self.named(x)\n      ::Room.where(name: x).to_a\n    end\n  end\nend\n"),
+        ];
+        let tree: std::collections::HashMap<PathBuf, Vec<u8>> =
+            files.iter().map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec())).collect();
+        let mut app = ingest_app_from_tree(tree).expect("ingest");
+        Analyzer::new(&app).analyze(&mut app);
+        let mut tree_files: Vec<(String, String)> = files.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect();
+        let report = specialize(&app, &mut tree_files).unwrap();
+        assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
+    }
+}
+
+/// A concern's method is analyzed once for each class that includes it, but
+/// its source is one text: copies that specialize alike are spliced once,
+/// not reported as overlapping.
+mod shared_concern_sites {
+    use std::path::PathBuf;
+
+    use roundhouse::analyze::Analyzer;
+    use roundhouse::emit::futamura::specialize;
+    use roundhouse::ingest::ingest_app_from_tree;
+
+    #[test]
+    fn one_site_in_a_concern_included_twice_is_specialized_once() {
+        let files: Vec<(&str, &str)> = vec![
+            ("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"things\", force: :cascade do |t|\n    t.string \"name\"\n  end\n  create_table \"others\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n"),
+            ("app/models/concerns/findable.rb", "module Findable\n  extend ActiveSupport::Concern\n  def same_named\n    Thing.where(name: name).to_a\n  end\nend\n"),
+            ("app/models/thing.rb", "class Thing < ApplicationRecord\n  include Findable\nend\n"),
+            ("app/models/other.rb", "class Other < ApplicationRecord\n  include Findable\nend\n"),
+        ];
+        let tree: std::collections::HashMap<PathBuf, Vec<u8>> =
+            files.iter().map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec())).collect();
+        let mut app = ingest_app_from_tree(tree).expect("ingest");
+        Analyzer::new(&app).analyze(&mut app);
+        let mut tree_files: Vec<(String, String)> = files.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect();
+        let report = specialize(&app, &mut tree_files).unwrap();
+        assert_eq!(report.specialized.len(), 1, "{:?}", report.residue);
+        assert!(report.residue.is_empty(), "{:?}", report.residue);
+    }
+}
+
+/// One source site analyzed for several owners (a macro replayed into
+/// each model) where one copy specializes and another does not: the whole
+/// site stays Rails'. Splicing the specializing copy into the shared text
+/// would run its compiled query for the owner that could not be compiled.
+mod shared_sites_with_a_residue {
+    use std::path::PathBuf;
+
+    use roundhouse::analyze::Analyzer;
+    use roundhouse::dialect::ModelBodyItem;
+    use roundhouse::emit::futamura::specialize;
+    use roundhouse::ingest::ingest_app_from_tree;
+
+    #[test]
+    fn a_site_one_owner_cannot_specialize_is_not_spliced() {
+        // `tag_ids` is an array column on `things` (a collection bind, not
+        // specialized) and a scalar on `others` (specialized).
+        let files: Vec<(&str, &str)> = vec![
+            ("db/schema.rb", "ActiveRecord::Schema[8.1].define(version: 1) do\n  create_table \"things\", force: :cascade do |t|\n    t.bigint \"tag_ids\", array: true, default: [], null: false\n  end\n  create_table \"others\", force: :cascade do |t|\n    t.bigint \"tag_ids\"\n  end\n  create_table \"items\", force: :cascade do |t|\n    t.bigint \"tag_id\"\n  end\nend\n"),
+            ("app/models/concerns/tagged.rb", "module Tagged\n  def tagged_items\n    Item.where(tag_id: tag_ids).to_a\n  end\nend\n"),
+            ("app/models/item.rb", "class Item < ApplicationRecord\nend\n"),
+            ("app/models/thing.rb", "class Thing < ApplicationRecord\nend\n"),
+            ("app/models/other.rb", "class Other < ApplicationRecord\nend\n"),
+        ];
+        let tree: std::collections::HashMap<PathBuf, Vec<u8>> =
+            files.iter().map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec())).collect();
+        let mut app = ingest_app_from_tree(tree).expect("ingest");
+        Analyzer::new(&app).analyze(&mut app);
+        // The replay: the module's one method body, owned by each model.
+        let method = app.library_classes.iter().find(|l| l.name.0.as_str() == "Tagged").unwrap().methods[0].clone();
+        app.library_classes.retain(|l| l.name.0.as_str() != "Tagged");
+        for m in app.models.iter_mut().filter(|m| matches!(m.name.0.as_str(), "Thing" | "Other")) {
+            m.body.push(ModelBodyItem::Method { method: method.clone(), leading_comments: vec![], leading_blank_line: false });
+        }
+        let mut tree_files: Vec<(String, String)> = files.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect();
+        let report = specialize(&app, &mut tree_files).unwrap();
+        assert!(report.specialized.is_empty(), "{:?} / {:?}", report.specialized, report.residue);
+        assert!(report.residue.iter().any(|r| r.contains("tagged.rb")), "{:?}", report.residue);
+        let tagged = &tree_files.iter().find(|(p, _)| p == "app/models/concerns/tagged.rb").unwrap().1;
+        assert!(!tagged.contains("Futamura.records"), "{tagged}");
+    }
+}
+
+/// The same shared site where one owner's receiver is not a relation at
+/// all: that copy is not a query and reports nothing, but the text is one,
+/// so the copy that specializes is not spliced into it either.
+mod shared_sites_with_a_non_relation_copy {
+    use std::path::PathBuf;
+
+    use roundhouse::analyze::Analyzer;
+    use roundhouse::dialect::ModelBodyItem;
+    use roundhouse::emit::futamura::specialize;
+    use roundhouse::ingest::ingest_app_from_tree;
+
+    #[test]
+    fn a_site_another_owner_does_not_read_as_a_query_is_not_spliced() {
+        let files: Vec<(&str, &str)> = vec![
+            ("db/schema.rb", "ActiveRecord::Schema[8.1].define(version: 1) do\n  create_table \"things\", force: :cascade do |t|\n    t.string \"name\"\n  end\n  create_table \"others\", force: :cascade do |t|\n    t.string \"name\"\n  end\n  create_table \"items\", force: :cascade do |t|\n    t.bigint \"thing_id\"\n  end\nend\n"),
+            ("app/models/concerns/picking.rb", "module Picking\n  def picked\n    self.items.first\n  end\nend\n"),
+            ("app/models/thing.rb", "class Thing < ApplicationRecord\n  has_many :items\nend\n"),
+            ("app/models/item.rb", "class Item < ApplicationRecord\n  belongs_to :thing\nend\n"),
+            ("app/models/other.rb", "class Other < ApplicationRecord\n  #: () -> Array[String]\n  def items\n    [\"a\"]\n  end\nend\n"),
+        ];
+        let tree: std::collections::HashMap<PathBuf, Vec<u8>> =
+            files.iter().map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec())).collect();
+        let mut app = ingest_app_from_tree(tree).expect("ingest");
+        Analyzer::new(&app).analyze(&mut app);
+        let method = app.library_classes.iter().find(|l| l.name.0.as_str() == "Picking").unwrap().methods[0].clone();
+        app.library_classes.retain(|l| l.name.0.as_str() != "Picking");
+        for m in app.models.iter_mut().filter(|m| matches!(m.name.0.as_str(), "Thing" | "Other")) {
+            m.body.push(ModelBodyItem::Method { method: method.clone(), leading_comments: vec![], leading_blank_line: false });
+        }
+        Analyzer::new(&app).analyze(&mut app);
+        let mut tree_files: Vec<(String, String)> = files.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect();
+        let report = specialize(&app, &mut tree_files).unwrap();
+        assert!(report.specialized.is_empty(), "{:?} / {:?}", report.specialized, report.residue);
+        let picking = &tree_files.iter().find(|(p, _)| p == "app/models/concerns/picking.rb").unwrap().1;
+        assert!(!picking.contains("Futamura"), "{picking}");
     }
 }

@@ -215,12 +215,13 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 if [[ -z "$REUSE" ]]; then
-    # `--allow-unsupported` for the same reason the walk uses it: campfire is
-    # a ledger app. The point is to run what DOES work and count it.
+    # Strict emit: tip Campfire checks at 0 errors, so the suite no longer
+    # needs `--allow-unsupported`. An unsupported construct is an error —
+    # the same contract as campfire-conformance's spinel strict emit.
     step "transpiling $APP → $OUT (target: $TARGET)"
     rm -rf "$OUT"
     roundhouse_run \
-        --target "$TARGET" "$APP" -o "$OUT" --allow-unsupported 2>"$OUT.log" | tail -1
+        --target "$TARGET" "$APP" -o "$OUT" 2>"$OUT.log" | tail -1
     echo "  emit diagnostics: $OUT.log"
 
     # The suite's own fixtures populate every table, so the database only
@@ -292,12 +293,12 @@ if [[ "$TARGET" == spinel ]]; then
     #
     # `tail -1` because a COLD cache prints its `cc bcrypt/...` progress
     # above the flag line, and `$(shell)` would fold those into the
-    # arguments too. `--require-gate` is stripped for the reason the
+    # arguments too. `--strict-require` (`--require-gate` before Spinel 6aaec4f41) is stripped for the reason the
     # Makefile strips it: a test tree requires gems with no spinel surface
     # at all (vips, mocha, webmock), and gating them fails the compile
     # ahead of the type errors this lane exists to count.
     step "resolving package flags"
-    SPIN_FLAGS="$( (cd "$OUT" && spin flags 2>/dev/null) | tail -1 | sed 's/--require-gate //' )"
+    SPIN_FLAGS="$( (cd "$OUT" && spin flags 2>/dev/null) | tail -1 | sed -e 's/--strict-require //' -e 's/--require-gate //' )"
     if [[ -z "$SPIN_FLAGS" ]]; then
         echo "campfire-suite: \`spin flags\` produced nothing in $OUT." >&2
         echo "  Every test would compile without its dependencies and the run would" >&2
@@ -357,7 +358,7 @@ tests_skip=0
 #
 # `n` is this file's denominator in the row; `tests_total` is the
 # suite's, already credited the full count from the shim's
-# `__t.test_*` calls. The shim prints one `SKIP <Class>#<test>: <why>`
+# `__t.__txn_test_*` calls. The shim prints one `SKIP <Class>#<test>: <why>`
 # line per skip (emit/ruby.rs::render_autorun_shim).
 take_skips_out() {
     local ns
@@ -506,9 +507,10 @@ for t in "${TESTS[@]}"; do
     # The emitted autorun shim (emit/ruby.rs::render_autorun_shim) runs
     # EVERY test and prints one `FAIL <Class>#<test>: <msg>` line per
     # failure, so a file's score is tests, not a boolean. The
-    # denominator comes from the shim's own `__t.test_*` calls, which
-    # exist even when the file dies before running any of them.
-    n=$(grep -cE '^  __t\.test_' "$t.rb" || true)
+    # denominator comes from the shim's own `__t.__txn_test_*` calls,
+    # which exist even when the file dies before running any of them.
+    # Each one is the fixture-transaction wrapper around a `test_*`.
+    n=$(grep -cE '^  __t\.__txn_test_' "$t.rb" || true)
     tests_total=$((tests_total + n))
     # THE THIRD STATUS, and only the spinel lane can produce it: a file
     # that never linked ran nothing, so nothing can be credited and its

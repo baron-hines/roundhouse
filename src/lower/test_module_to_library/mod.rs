@@ -10,7 +10,7 @@
 
 pub mod inline_assertions;
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::analyze::ClassInfo;
 use crate::dialect::{
@@ -20,7 +20,7 @@ use crate::effect::EffectSet;
 use crate::expr::{Expr, ExprNode};
 use crate::ident::{ClassId, Symbol};
 use crate::span::Span;
-use crate::ty::Ty;
+use crate::ty::{FnTy, Ty};
 
 /// One lowered test module: the test class itself plus any classes
 /// that were declared inline inside its body. Inner classes are
@@ -58,8 +58,9 @@ pub fn ruby_family_absolute_test_urls(modules: &[TestModule]) -> Vec<TestModule>
     modules
         .iter()
         .map(|tm| {
-            let shadows: std::collections::HashSet<Symbol> =
-                tm.helpers.iter().map(|h| h.name.clone()).collect();
+            let mut shadows: crate::det::HashSet<Symbol> =
+                tm.helpers.iter().map(|h| h.name.clone()).chain(tm.included_module_methods().cloned()).collect();
+            shadows.extend(ancestor_helper_names(tm, modules));
             let rewrite = |e: &Expr| absolute_test_url(e, &shadows);
             let mut tm = tm.clone();
             for t in &mut tm.tests {
@@ -74,7 +75,7 @@ pub fn ruby_family_absolute_test_urls(modules: &[TestModule]) -> Vec<TestModule>
         .collect()
 }
 
-fn absolute_test_url(expr: &Expr, shadows: &std::collections::HashSet<Symbol>) -> Expr {
+fn absolute_test_url(expr: &Expr, shadows: &crate::det::HashSet<Symbol>) -> Expr {
     crate::lower::controller_to_library::util::map_expr(expr, &|e| match &*e.node {
         ExprNode::Send { recv: None, method, args, block, parenthesized }
             if method.as_str().ends_with("_url") && !shadows.contains(method) =>
@@ -123,9 +124,10 @@ pub fn lower_test_modules_to_library_classes(
     fixtures: &[Fixture],
     models: &[Model],
     extras: Vec<(ClassId, ClassInfo)>,
-    route_id_segments: &std::collections::HashMap<String, Vec<bool>>,
+    route_id_segments: &crate::det::HashMap<String, Vec<bool>>,
+    direct_helpers: &crate::det::HashSet<String>,
 ) -> Vec<LibraryClass> {
-    lower_test_modules_with_inner(test_modules, fixtures, models, extras, route_id_segments)
+    lower_test_modules_with_inner(test_modules, fixtures, models, extras, route_id_segments, direct_helpers)
         .into_iter()
         .map(|m| m.test_class)
         .collect()
@@ -143,9 +145,27 @@ pub fn lower_test_modules_with_inner(
     // Which route-helper segments are id-shaped, so a record argument
     // projects to `.id` only where an id is what the segment holds —
     // `crate::lower::routes::helper_id_segments`.
-    route_id_segments: &std::collections::HashMap<String, Vec<bool>>,
+    route_id_segments: &crate::det::HashMap<String, Vec<bool>>,
+    // The app's `direct` helpers (`crate::lower::routes::direct_helper_names`),
+    // whose options reach them as written.
+    direct_helpers: &crate::det::HashSet<String>,
 ) -> Vec<LoweredTestModule> {
-    let mut classes: HashMap<ClassId, ClassInfo> = HashMap::new();
+    lower_test_modules_with_inner_opts(test_modules, fixtures, models, extras, route_id_segments, direct_helpers, false)
+}
+
+/// `lower_test_modules_with_inner`, with `owner_objects` for the Ruby
+/// family: an association constructor hands its owner OBJECT to the
+/// automatic inverse (see `rewrite_assoc_create_with_models_in_place`).
+pub fn lower_test_modules_with_inner_opts(
+    test_modules: &[TestModule],
+    fixtures: &[Fixture],
+    models: &[Model],
+    extras: Vec<(ClassId, ClassInfo)>,
+    route_id_segments: &crate::det::HashMap<String, Vec<bool>>,
+    direct_helpers: &crate::det::HashSet<String>,
+    owner_objects: bool,
+) -> Vec<LoweredTestModule> {
+    let mut classes: HashMap<ClassId, ClassInfo> = HashMap::default();
     for (id, info) in extras {
         classes.insert(id, info);
     }
@@ -203,7 +223,7 @@ pub fn lower_test_modules_with_inner(
                 new_sym.clone(),
                 crate::lower::typing::fn_sig(
                     vec![],
-                    Ty::Class { id: inner.name.clone(), args: Vec::new() },
+                    Ty::Class { id: inner.name.clone(), args: Vec::new().into() },
                 ),
             );
             info.class_method_kinds
@@ -230,7 +250,7 @@ pub fn lower_test_modules_with_inner(
     let mut out: Vec<LoweredTestModule> = Vec::new();
     let mut all_lcs: Vec<LibraryClass> = test_modules
         .iter()
-        .map(|tm| build_library_class(tm, route_id_segments))
+        .map(|tm| build_library_class(tm, test_modules, route_id_segments))
         .map(|mut lc| {
             for m in &mut lc.methods {
                 m.body = crate::lower::rewrite_fixture_calls(&m.body, &fixture_names);
@@ -264,7 +284,7 @@ pub fn lower_test_modules_with_inner(
             info.instance_methods.entry(sym.clone()).or_insert_with(|| sig());
             info.instance_method_kinds
                 .entry(sym)
-                .or_insert(AccessorKind::Method);
+                .or_insert(minitest_kind(name));
         }
         // Mix in fixture helpers — `articles(:one)` returns Article.
         for (helper_name, sig) in &fixture_helpers {
@@ -290,7 +310,7 @@ pub fn lower_test_modules_with_inner(
         classes.insert(lc.name.clone(), info);
     }
 
-    let empty_ivars: HashMap<Symbol, Ty> = HashMap::new();
+    let empty_ivars: HashMap<Symbol, Ty> = HashMap::default();
 
     // Type inner-class methods first — they may reference each other
     // and need their bodies typed for downstream emit. `type_inner_class`
@@ -328,7 +348,7 @@ pub fn lower_test_modules_with_inner(
     // return, and BEFORE the test bodies are typed against the
     // registry. A body the typer cannot name keeps the nil default
     // rather than gaining `untyped`; a test method is never a helper.
-    let synthesized_per_module: Vec<std::collections::HashSet<Symbol>> = test_modules
+    let synthesized_per_module: Vec<crate::det::HashSet<Symbol>> = test_modules
         .iter()
         .map(|tm| {
             tm.helpers
@@ -354,8 +374,9 @@ pub fn lower_test_modules_with_inner(
             if matches!(body_ty, Ty::Untyped | Ty::Nil) {
                 continue;
             }
-            if let Some(Ty::Fn { ret, .. }) = &mut method.signature {
-                *ret = Box::new(body_ty);
+            if let Some(Ty::Fn(fn_ty)) = &mut method.signature {
+                let FnTy { ret, .. } = &mut **fn_ty;
+                *ret = std::sync::Arc::new(body_ty);
             }
             if let Some(sig) = &method.signature {
                 lifted.push((method.name.clone(), sig.clone()));
@@ -392,7 +413,7 @@ pub fn lower_test_modules_with_inner(
             // covers both rewritten nodes and ivar reads. Without the
             // ivar seed, `@messages = ….to_a` binds nothing and
             // `@messages.third` is a read off an untyped ivar.
-            let mut ivars: HashMap<Symbol, Ty> = HashMap::new();
+            let mut ivars: HashMap<Symbol, Ty> = HashMap::default();
             crate::analyze::extract_ivar_assignments(&method.body, &mut ivars);
             ivars.retain(|_, ty| !ty.is_unknown());
             // Has-many `.create` / `.build` rewrite needs the parent
@@ -404,7 +425,7 @@ pub fn lower_test_modules_with_inner(
             // `lowered_real_blog_typing_residual` enforces a
             // 0-untyped ceiling.
             let mut rewritten = crate::lower::seeds_to_library::
-                rewrite_assoc_create_with_models_in_place(&mut method.body, models);
+                rewrite_assoc_create_with_models_in_place(&mut method.body, models, owner_objects);
             // A record standing where a route helper wants an id.
             // Type-directed, so it must be here and not back where the
             // `RouteHelpers.` receiver was added: at THAT point a test
@@ -414,7 +435,7 @@ pub fn lower_test_modules_with_inner(
             // recognize, and both asserted a redirect to
             // `/rooms/#<Room:0x000000012339eda0>`.
             rewritten |= crate::lower::controller_to_library::rewrites::
-                project_route_helper_ids_in_place(&mut method.body);
+                project_route_helper_ids_in_place(&mut method.body, direct_helpers);
             // Inline assert_*/refute_* sends — replaces vacuous
             // Minitest dispatch with real `raise` so spinel's
             // assertion-correctness signal is non-fake. See
@@ -509,13 +530,14 @@ fn inherit_parent_surface(
 /// the signature rather than from `MethodDef.params` would otherwise
 /// declare `name` and leave the body reading an unbound `field`.
 fn adopt_param_names(ty: Ty, params: &[crate::dialect::Param]) -> Ty {
-    let Ty::Fn { params: sig_params, block, ret, effects } = ty else { return ty };
+    let Ty::Fn(fn_ty) = ty else { return ty };
+    let FnTy { params: sig_params, block, ret, effects } = *fn_ty;
     let renamed = sig_params
         .into_iter()
         .zip(params)
         .map(|(sp, p)| crate::ty::Param { name: p.name.clone(), ..sp })
         .collect();
-    Ty::Fn { params: renamed, block, ret, effects }
+    Ty::Fn(Box::new(FnTy { params: renamed, block, ret, effects }))
 }
 
 fn type_inner_class(
@@ -523,7 +545,7 @@ fn type_inner_class(
     classes: &HashMap<ClassId, ClassInfo>,
     passed: &HashMap<(Symbol, Symbol), Vec<Expr>>,
 ) {
-    let empty_ivars: HashMap<Symbol, Ty> = HashMap::new();
+    let empty_ivars: HashMap<Symbol, Ty> = HashMap::default();
 
     // An override has to keep the shape it overrides. `def
     // process_action(action_name)` in a `< ActionController::Base`
@@ -538,7 +560,7 @@ fn type_inner_class(
     // A parent signature may name its receiver (`-> instance`); the
     // receiver is this inner class, so substitute on adoption rather
     // than emit a self type as a declaration.
-    let self_ty = Ty::Class { id: inner.name.clone(), args: Vec::new() };
+    let self_ty = Ty::Class { id: inner.name.clone(), args: Vec::new().into() };
     let parent_methods: HashMap<Symbol, Ty> = inner
         .parent
         .as_ref()
@@ -574,7 +596,7 @@ fn type_inner_class(
                 .get(&method.name)
                 .filter(|_| method.name.as_str() != "initialize")
                 .filter(|ty| {
-                    matches!(ty, Ty::Fn { params, .. } if params.len() == method.params.len())
+                    matches!(ty, Ty::Fn(fn_ty) if fn_ty.params.len() == method.params.len())
                 })
                 .cloned()
                 .map(|ty| adopt_param_names(ty, &method.params));
@@ -594,7 +616,7 @@ fn type_inner_class(
     // is — and with an unannotated param it only widens the ivar to
     // `untyped`. The attribute's real type comes from `initialize` and
     // direct assignments, which the non-writer methods carry.
-    let mut ivars: HashMap<Symbol, Ty> = HashMap::new();
+    let mut ivars: HashMap<Symbol, Ty> = HashMap::default();
     for method in &inner.methods {
         if method.name.as_str().ends_with('=') {
             continue;
@@ -626,14 +648,16 @@ fn type_inner_class(
             .and_then(|a| ivars.get(&Symbol::from(a)))
             .cloned();
         if let Some(ivar_ty) = writer_ivar {
-            if let Some(Ty::Fn { params, ret, .. }) = &mut method.signature {
+            if let Some(Ty::Fn(fn_ty)) = &mut method.signature {
+                let FnTy { params, ret, .. } = &mut **fn_ty;
                 if let Some(first) = params.first_mut() {
-                    first.ty = ivar_ty.clone();
+                    first.ty = ivar_ty.clone().into();
                 }
-                *ret = Box::new(ivar_ty);
+                *ret = std::sync::Arc::new(ivar_ty);
             }
-        } else if let Some(Ty::Fn { ret, .. }) = &mut method.signature {
-            *ret = Box::new(if method.name.as_str() == "initialize" {
+        } else if let Some(Ty::Fn(fn_ty)) = &mut method.signature {
+            let FnTy { ret, .. } = &mut **fn_ty;
+            *ret = std::sync::Arc::new(if method.name.as_str() == "initialize" {
                 Ty::Nil
             } else {
                 method.body.ty.clone().unwrap_or(Ty::Untyped)
@@ -682,15 +706,15 @@ fn signature_from_params(
                     }
                 }
             }
-            TyParam { name: p.name.clone(), ty, kind: p.ty_kind() }
+            TyParam { name: p.name.clone(), ty: ty.into(), kind: p.ty_kind() }
         })
         .collect();
-    Ty::Fn {
-        params: ty_params,
+    Ty::Fn(Box::new(FnTy {
+        params: ty_params.into(),
         block: None,
-        ret: Box::new(ret),
+        ret: std::sync::Arc::new(ret),
         effects: EffectSet::pure(),
-    }
+    }))
 }
 
 /// The literal keyword arguments the test modules' own code passes, by
@@ -713,7 +737,7 @@ fn keyword_args_passed(modules: &[TestModule]) -> HashMap<(Symbol, Symbol), Vec<
         }
         e.node.for_each_child(&mut |c| walk(c, out));
     }
-    let mut out = HashMap::new();
+    let mut out = HashMap::default();
     for tm in modules {
         for t in &tm.tests {
             walk(&t.body, &mut out);
@@ -775,18 +799,47 @@ fn collect_self_setter_ivars(body: &Expr, out: &mut HashMap<Symbol, Ty>) {
     }
 }
 
+/// The instance methods the test modules above `tm` define or include.
+/// A test class inherits its parent's `foo_url` helper, so a call to it in a subclass
+/// is that helper, not the route helper of the same name.
+fn ancestor_helper_names(tm: &TestModule, modules: &[TestModule]) -> Vec<Symbol> {
+    let mut names = Vec::new();
+    let mut seen: Vec<&ClassId> = vec![&tm.name];
+    let mut next = tm.parent.as_ref();
+    while let Some(parent) = next {
+        if seen.contains(&parent) {
+            break;
+        }
+        seen.push(parent);
+        let Some(found) = modules.iter().find(|m| &m.name == parent) else { break };
+        // Instance methods only, its own and its included modules', as
+        // `TestModule::defines_instance_method` reads them.
+        names.extend(
+            found
+                .helpers
+                .iter()
+                .filter(|h| h.receiver == MethodReceiver::Instance)
+                .map(|h| h.name.clone())
+                .chain(found.included_module_methods().cloned()),
+        );
+        next = found.parent.as_ref();
+    }
+    names
+}
+
 /// Single-module entry point — kept for tests/probes. For whole-app
 /// emit, prefer the bulk entry which threads a shared registry.
 pub fn lower_test_module_to_library_class(
     tm: &TestModule,
-    route_id_segments: &std::collections::HashMap<String, Vec<bool>>,
+    route_id_segments: &crate::det::HashMap<String, Vec<bool>>,
 ) -> LibraryClass {
-    build_library_class(tm, route_id_segments)
+    build_library_class(tm, &[], route_id_segments)
 }
 
 fn build_library_class(
     tm: &TestModule,
-    route_id_segments: &std::collections::HashMap<String, Vec<bool>>,
+    all_modules: &[TestModule],
+    route_id_segments: &crate::det::HashMap<String, Vec<bool>>,
 ) -> LibraryClass {
     // Inline setup body at the start of every test method. The
     // body-typer's Seq walk picks up `@article = articles(:one)` and
@@ -796,10 +849,12 @@ fn build_library_class(
     // A test class's own `*_path` / `*_url` helpers shadow the route
     // helpers of the same name — same rule the controller lowering
     // applies to its ancestry.
-    let helper_shadows: std::collections::HashSet<Symbol> = tm
+    let helper_shadows: crate::det::HashSet<Symbol> = tm
         .helpers
         .iter()
         .map(|h| h.name.clone())
+        .chain(tm.included_module_methods().cloned())
+        .chain(ancestor_helper_names(tm, all_modules))
         .filter(|n| n.as_str().ends_with("_path") || n.as_str().ends_with("_url"))
         .collect();
     let mut methods: Vec<MethodDef> = tm
@@ -843,16 +898,16 @@ fn build_library_class(
                 .iter()
                 .map(|p| crate::ty::Param {
                     name: p.name.clone(),
-                    ty: Ty::Untyped,
+                    ty: Ty::Untyped.into(),
                     kind: p.ty_kind(),
                 })
                 .collect();
-            m.signature = Some(Ty::Fn {
-                params: ty_params,
+            m.signature = Some(Ty::Fn(Box::new(FnTy {
+                params: ty_params.into(),
                 block: None,
-                ret: Box::new(Ty::Nil),
+                ret: std::sync::Arc::new(Ty::Nil),
                 effects: crate::effect::EffectSet::pure(),
-            });
+            })));
         }
         m.enclosing_class = Some(tm.name.0.clone());
         methods.push(m);
@@ -863,10 +918,12 @@ fn build_library_class(
         parent: tm.parent.clone(),
         parent_span: Default::default(),
         includes: tm.includes.clone(),
+        include_spans: Vec::new(),
         methods,
         nullable_columns: Vec::new(),
         origin: None,
         constants: Vec::new(),
+        conditional_definitions: Vec::new(),
         unknown_calls: Vec::new(),
         class_ivar_initializers: Vec::new(),
     }
@@ -881,8 +938,8 @@ fn test_to_method_def(
     owner: &ClassId,
     t: &Test,
     setup: Option<&Expr>,
-    shadows: &std::collections::HashSet<Symbol>,
-    route_id_segments: &std::collections::HashMap<String, Vec<bool>>,
+    shadows: &crate::det::HashSet<Symbol>,
+    route_id_segments: &crate::det::HashMap<String, Vec<bool>>,
 ) -> MethodDef {
     let snake = sanitize_test_name(&t.name);
     let method_name = Symbol::from(format!("test_{snake}"));
@@ -1042,6 +1099,11 @@ const MINITEST_INSTANCE_METHODS: &[(&str, SigBuilder)] = &[
     ("flash", || crate::lower::typing::fn_sig(vec![], Ty::Untyped)),
 ];
 
+/// `response` is a reader: every test runtime keeps it as a field (TypeScript's `response: any`, Python's `TestResponse`), so a call to it fails.
+fn minitest_kind(name: &str) -> AccessorKind {
+    if name == "response" { AccessorKind::AttributeReader } else { AccessorKind::Method }
+}
+
 fn fn_sig_one(p: Ty, ret: Ty) -> Ty {
     crate::lower::typing::fn_sig(vec![(Symbol::from("arg"), p)], ret)
 }
@@ -1072,20 +1134,20 @@ fn fn_sig_two(a: Ty, b: Ty, ret: Ty) -> Ty {
 /// The SIGNED jar really is nullable — verification can fail — so it
 /// answers `Str | Nil` and grounds through the union arm instead.
 fn cookie_jar_ty() -> Ty {
-    Ty::Class { id: ClassId(Symbol::from("ActionController::CookieJar")), args: vec![] }
+    Ty::Class { id: ClassId(Symbol::from("ActionController::CookieJar")), args: vec![].into() }
 }
 
 fn permanent_cookie_jar_ty() -> Ty {
-    Ty::Class { id: ClassId(Symbol::from("ActionController::PermanentCookieJar")), args: vec![] }
+    Ty::Class { id: ClassId(Symbol::from("ActionController::PermanentCookieJar")), args: vec![].into() }
 }
 
 fn signed_cookie_jar_ty() -> Ty {
-    Ty::Class { id: ClassId(Symbol::from("ActionController::SignedCookieJar")), args: vec![] }
+    Ty::Class { id: ClassId(Symbol::from("ActionController::SignedCookieJar")), args: vec![].into() }
 }
 
 fn insert_cookie_jar_baseline(classes: &mut HashMap<ClassId, ClassInfo>) {
     use crate::lower::typing::fn_sig;
-    let str_hash_arg = || Ty::Hash { key: Box::new(Ty::Str), value: Box::new(Ty::Str) };
+    let str_hash_arg = || Ty::Hash { key: std::sync::Arc::new(Ty::Str), value: std::sync::Arc::new(Ty::Str) };
     let str_hash = str_hash_arg();
     let key = || (Symbol::from("key"), Ty::Untyped);
     let value = || (Symbol::from("value"), Ty::Untyped);
@@ -1114,7 +1176,7 @@ fn insert_cookie_jar_baseline(classes: &mut HashMap<ClassId, ClassInfo>) {
         // cookie answers nil, which is what campfire's
         // `Session.find_signed(cookies.signed[:session_token])` is
         // written against.
-        ("[]", fn_sig(vec![key()], Ty::Union { variants: vec![Ty::Str, Ty::Nil] })),
+        ("[]", fn_sig(vec![key()], Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() })),
         ("[]=", fn_sig(vec![key(), value()], Ty::Untyped)),
         ("delete", fn_sig(vec![key()], Ty::Str)),
         ("permanent", fn_sig(vec![], signed_cookie_jar_ty())),
@@ -1182,7 +1244,7 @@ fn insert_minitest_test_baseline(classes: &mut HashMap<ClassId, ClassInfo>) {
     for (name, sig) in MINITEST_INSTANCE_METHODS.iter() {
         let sym = Symbol::from(*name);
         info.instance_methods.insert(sym.clone(), sig());
-        info.instance_method_kinds.insert(sym, AccessorKind::Method);
+        info.instance_method_kinds.insert(sym, minitest_kind(name));
     }
     classes.insert(
         ClassId(Symbol::from("Minitest::Test")),
@@ -1196,7 +1258,10 @@ fn insert_minitest_test_baseline(classes: &mut HashMap<ClassId, ClassInfo>) {
     classes.insert(ClassId(Symbol::from("TestCase")), info);
 }
 
-/// `response.headers["X-Total-Count"]` → `response.headers["x-total-count"]`.
+/// `response.headers["X-Total-Count"]` → `response.headers["x-total-count"]`,
+/// and the same through `response.header`, Rails' alias of `headers`.
+/// On the response, a key known only at run time reads as
+/// `key.to_s.downcase`.
 ///
 /// Rails' `response.headers` is case-insensitive (Rack 3's `Headers`);
 /// the harness's is a plain Hash keyed the way Rack normalizes —
@@ -1218,8 +1283,26 @@ fn lowercase_header_reads(expr: &mut Expr) -> bool {
     if method.as_str() != "[]" || args.len() != 1 {
         return changed;
     }
-    let ExprNode::Send { method: inner, args: inner_args, .. } = &*recv.node else { return changed };
-    if inner.as_str() != "headers" || !inner_args.is_empty() {
+    let ExprNode::Send { recv: inner_recv, method: inner, args: inner_args, .. } = &*recv.node else {
+        return changed;
+    };
+    // `header` only on the response itself: the name is a common one,
+    // and another object's `header` Hash is not case-insensitive.
+    let on_response = || match inner_recv.as_ref().map(|r| &*r.node) {
+        Some(ExprNode::Send { recv, method, args, .. }) => {
+            method.as_str() == "response"
+                && args.is_empty()
+                && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+        }
+        Some(ExprNode::Ivar { name }) => name.as_str() == "response",
+        _ => false,
+    };
+    let header_read = match inner.as_str() {
+        "headers" => true,
+        "header" => on_response(),
+        _ => false,
+    };
+    if !header_read || !inner_args.is_empty() {
         return changed;
     }
     if let ExprNode::Lit { value: crate::expr::Literal::Str { value } } = &mut *args[0].node {
@@ -1228,6 +1311,16 @@ fn lowercase_header_reads(expr: &mut Expr) -> bool {
             *value = lower;
             return true;
         }
+        return changed;
+    }
+    // A key known only at run time, on the response: lowercased there.
+    let lowered = matches!(&*args[0].node, ExprNode::Send { method, .. } if method.as_str() == "downcase");
+    if on_response() && !lowered {
+        let key = args[0].clone();
+        let span = key.span;
+        let to_s = Expr::new(span, ExprNode::Send { recv: Some(key), method: Symbol::from("to_s"), args: vec![], block: None, parenthesized: false });
+        args[0] = Expr::new(span, ExprNode::Send { recv: Some(to_s), method: Symbol::from("downcase"), args: vec![], block: None, parenthesized: false });
+        return true;
     }
     changed
 }

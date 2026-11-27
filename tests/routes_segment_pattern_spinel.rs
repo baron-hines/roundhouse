@@ -109,3 +109,66 @@ puts "PASS Spinel segment-pattern recognition"
 "#;
     constrained_app().run_spinel(script).assert_passes();
 }
+
+/// `\w` inside a bracket (#1374): `[\w-]+` is word characters and `-`.
+/// The encoding is the lowering's own, so a regression in the bracket
+/// parse shows up here as well as in `tests/route_bracket_word_class.rs`.
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn spinel_target_reads_a_word_escape_in_a_bracket_as_the_word_class() {
+    use roundhouse::lower::segment_pattern::{compile, encode_route_constraints};
+    let program = compile(r"[\w-]+").expect("[\\w-]+ compiles");
+    let token = encode_route_constraints(&[("token".to_string(), program)]);
+    // Guard the script against a pattern it can't hold as a Ruby literal.
+    assert!(!token.contains(['"', '\\', '#']), "{token}");
+    let script = format!(
+        r#"
+R = ActionDispatch::Router
+def check(path, seg_constraints, expect_match)
+  hit = R.match_pattern("/tickets/:token", path, "", seg_constraints)
+  matched = !hit.nil?
+  raise "path=#{{path}} matched=#{{matched}} expected=#{{expect_match}}" unless matched == expect_match
+end
+token = "{token}"
+["abc", "abc_1", "abc-def", "w", "w-w"].each {{ |t| check("/tickets/" + t, token, true) }}
+["a.b", "a@b"].each {{ |t| check("/tickets/" + t, token, false) }}
+puts "PASS Spinel word class in a bracket"
+"#
+    );
+    constrained_app().run_spinel(&script).assert_passes();
+}
+
+/// The `(.:format)` requirement (`tests/routes_format_requirement.rs` has
+/// the Ruby-target and Rails cases): an extension is held to it, no
+/// extension passes, `format: false` refuses any, and a member route never
+/// binds a refused extension into its `:id`. Direct `Router.match` calls
+/// over routes carrying the encodings the lowering produces.
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn spinel_target_holds_the_format_extension_to_its_requirement() {
+    let script = r##"
+R = ActionDispatch::Router
+T = [
+  ActionDispatch::Router::Route.new("GET", "/exports/:id/export", :widgets, :export, nil, "", "6.format9.L1003.csv"),
+  ActionDispatch::Router::Route.new("GET", "/raw/:id", :widgets, :raw, nil, "", "6.format1.A"),
+  ActionDispatch::Router::Route.new("GET", "/members/:id", :widgets, :member, nil, "", "6.format10.L1004.json"),
+]
+
+def check(path, want)
+  hit = R.match("GET", path, T)
+  got = hit.nil? ? "404" : hit.action.to_s + ":" + hit.path_params.fetch("format", "")
+  raise "#{path}: #{got}, expected #{want}" unless got == want
+end
+
+check("/exports/1/export", "export:")
+check("/exports/1/export.csv", "export:csv")
+check("/exports/1/export.json", "404")
+check("/raw/1", "raw:")
+check("/raw/1.json", "404")
+check("/members/1.json", "member:json")
+check("/members/1.csv", "404")
+
+puts "PASS Spinel format requirement"
+"##;
+    constrained_app().run_spinel(script).assert_passes();
+}

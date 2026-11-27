@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # All FFI plumbing lives at the top level so spinel's name resolver
 # finds it from anywhere in the Tep tree (nested modules confuse it).
 #
@@ -19,6 +20,7 @@ module Sock
   ffi_func :sp_net_listen,                [:int, :int],       :int
   ffi_func :sp_net_accept,                [:int],             :int
   ffi_func :sp_net_accept_nb,             [:int],             :int
+  ffi_func :sp_net_peer_ip,               [:int],             :str
   ffi_func :sp_net_set_nonblock,          [:int],             :int
   ffi_func :sp_net_close,                 [:int],             :int
   ffi_func :sp_net_write_str,             [:int, :str],       :int
@@ -37,10 +39,25 @@ module Sock
   ffi_func :sp_net_poll_run,              [:int],             :int
   ffi_func :sp_net_poll_ready,            [:int],             :int
   ffi_func :sp_net_shell_capture,         [:str, :int],       :binstr
+  ffi_func :sp_net_listen_host,           [:str, :int, :int], :int
+  ffi_func :sp_net_unix_listen,           [:str, :int],       :int
 
   # Delegators: keep the existing `Sock.sphttp_*` call sites unchanged
   # while routing them through sp_net (Stage 1 of retiring sphttp.c).
-  def self.sphttp_listen(port, reuse);      Sock.sp_net_listen(port, reuse);      end
+def self.sphttp_listen(port, reuse);      Sock.sp_net_listen(port, reuse);      end
+
+# The listener on `host` (`rails server -b`): every interface for "" or
+# "0.0.0.0" (the SO_REUSEPORT listener prefork workers share), otherwise
+# that address. "localhost" binds 127.0.0.1: Puma binds each loopback
+# address the name resolves to, and the address-specific listener takes
+# only the first, which may be ::1 alone.
+def self.sphttp_listen_on(host, port, reuse)
+  if host.empty? || host == "0.0.0.0"
+    Sock.sp_net_listen(port, reuse)
+  else
+    Sock.sp_net_listen_host(host == "localhost" ? "127.0.0.1" : host, port, 1024)
+  end
+end
   def self.sphttp_accept(sfd);              Sock.sp_net_accept(sfd);              end
   def self.sphttp_accept_nb(sfd);           Sock.sp_net_accept_nb(sfd);           end
   def self.sphttp_set_nonblock(fd);         Sock.sp_net_set_nonblock(fd);         end
@@ -92,10 +109,10 @@ module Sock
       while out.bytesize < n
         # Match the other two drains' per-read deadline. EOF or timeout
         # discards this incomplete drain; Request checks the byte count.
-        if io.wait_readable(5).nil?
+        if io.wait_readable(Tep::BODY_READ_TIMEOUT).nil?
           return ""
         end
-        chunk = Sock.sp_net_recv_some(fd, n - out.bytesize)
+        chunk = Sock.sp_net_recv_some(fd, n - out.bytesize).b
         if chunk.bytesize == 0
           return ""
         end
@@ -170,4 +187,11 @@ module Crypto
   # derivation; do NOT use it for anything else (collision-broken).
   ffi_func :sp_crypto_sha1_hex,             [:str],             :str
   ffi_func :sp_crypto_websocket_accept,     [:str],             :str
+end
+
+# shutdown wakes a parked receiver without releasing its fd number. The
+# threaded server remains the only owner that closes the descriptor.
+module TepSocketControl
+  ffi_lib "c"
+  ffi_func :shutdown, [:int, :int], :int
 end

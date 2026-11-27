@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # BCrypt — password hashing. `has_secure_password`'s `authenticate` does
 # `BCrypt::Password.new(digest) == password`, and the login controller
 # reads `Engine::DEFAULT_COST`. LOGIN IS ON THE BENCHMARK PATH (the
@@ -11,6 +12,24 @@
 # Own file rather than a gem_facades.rb section so the swap is
 # whole-file — the same grain every other façade mechanism uses.
 module BCrypt
+  class Error < StandardError
+  end
+
+  # The gem's own, raised where it rejects its input: a caller's `rescue BCrypt::Errors::InvalidHash` names one.
+  module Errors
+    class InvalidSalt < BCrypt::Error
+    end
+
+    class InvalidHash < BCrypt::Error
+    end
+
+    class InvalidCost < BCrypt::Error
+    end
+
+    class InvalidSecret < BCrypt::Error
+    end
+  end
+
   module Engine
     DEFAULT_COST = 12
   end
@@ -33,6 +52,11 @@ module BCrypt
 
     def to_s
       GemFacade.fail!("BCrypt::Password#to_s")
+      ""
+    end
+
+    def salt
+      GemFacade.fail!("BCrypt::Password#salt")
       ""
     end
   end

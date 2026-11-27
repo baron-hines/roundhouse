@@ -117,7 +117,7 @@ fn ivar_ty(app: &roundhouse::App, name: &str) -> Ty {
 }
 
 fn hash_of_int_keys() -> Ty {
-    Ty::Hash { key: Box::new(Ty::Int), value: Box::new(Ty::Int) }
+    Ty::Hash { key: std::sync::Arc::new(Ty::Int), value: std::sync::Arc::new(Ty::Int) }
 }
 
 #[test]
@@ -164,7 +164,7 @@ fn select_distinct_count_is_still_an_integer() {
 #[test]
 fn keys_on_a_grouped_count_dispatches() {
     let app = analyzed_app();
-    assert_eq!(ivar_ty(&app, "feed_ids"), Ty::Array { elem: Box::new(Ty::Int) });
+    assert_eq!(ivar_ty(&app, "feed_ids"), Ty::Array { elem: std::sync::Arc::new(Ty::Int) });
     let diags = diagnose(&app);
     let failed: Vec<_> = diags
         .iter()
@@ -196,4 +196,30 @@ fn the_typed_terminal_is_the_one_the_lowering_emits() {
         }
     }
     assert_eq!(found, 3, "grouped counts (plain, scoped, having) should lower to `group_count`");
+}
+
+#[test]
+fn controller_keyword_default_keeps_its_hash_type_when_lowered() {
+    let mut files = tree();
+    files.insert(
+        PathBuf::from("app/controllers/articles_controller.rb"),
+        br#"class ArticlesController < ApplicationController
+  def index(counts: Article.where(read: false).group(:feed_id).count)
+    counts.values.sum
+  end
+end
+"#.to_vec(),
+    );
+    let mut app = ingest_app_from_tree(files).expect("ingest");
+    Analyzer::new(&app).analyze(&mut app);
+    let default = |app: &roundhouse::App| {
+        app.controllers.iter().flat_map(|c| c.actions())
+            .find(|a| a.name.as_str() == "index").unwrap()
+            .kw_params[0].1.clone().expect("keyword default")
+    };
+    assert_eq!(default(&app).ty, Some(hash_of_int_keys()));
+    roundhouse::lower::apply_group_count_lowering(&mut app);
+    let lowered = default(&app);
+    assert_eq!(lowered.ty, Some(hash_of_int_keys()));
+    assert!(matches!(&*lowered.node, ExprNode::Send { method, .. } if method.as_str() == "group_count"));
 }

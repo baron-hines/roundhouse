@@ -184,7 +184,7 @@ fn typed_value(pair: &JsonPair, enc: &PairEncoding) -> Expr {
         PairEncoding::Scalar(ty) => json_builder_call("encode_value", value(ty.clone())),
         PairEncoding::StringArray => json_builder_call(
             "encode_string_array",
-            value(Ty::Array { elem: Box::new(Ty::Str) }),
+            value(Ty::Array { elem: std::sync::Arc::new(Ty::Str) }),
         ),
         PairEncoding::DateColumn | PairEncoding::ZonedTime => {
             let PairValue::Reader(name) = &pair.value else {
@@ -192,14 +192,14 @@ fn typed_value(pair: &JsonPair, enc: &PairEncoding) -> Expr {
             };
             let raw = with_ty(
                 self_send(&format!("{}_raw", name.as_str())),
-                Ty::Union { variants: vec![Ty::Str, Ty::Nil] },
+                Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() },
             );
             let text = if matches!(enc, PairEncoding::DateColumn) {
                 date_column_text(raw)
             } else {
                 with_ty(
                     send(Some(const_ref("ActiveSupport")), "json_time", vec![raw], true),
-                    Ty::Union { variants: vec![Ty::Str, Ty::Nil] },
+                    Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() },
                 )
             };
             json_builder_call("encode_value", text)
@@ -245,7 +245,7 @@ fn writer_body_with(
     // Init/Result stamps, as the jbuilder lowerer leaves them: the
     // accumulator triple every target's string-builder emit keys on.
     let mut result = var_ref(ACC);
-    result.hint = Some(IrHint::StringBuilderResult);
+    result.set_hint(Some(IrHint::StringBuilderResult));
     out.push(result);
     Ok(out)
 }
@@ -271,7 +271,7 @@ fn encoded_value(pair: &JsonPair, table: Option<&Table>) -> Expr {
                     "encode_value",
                     date_column_text(with_ty(
                         self_send(&raw),
-                        Ty::Union { variants: vec![Ty::Str, Ty::Nil] },
+                        Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() },
                     )),
                 ),
                 Some(ColumnType::DateTime | ColumnType::Time) => {
@@ -292,14 +292,14 @@ fn column_type(table: Option<&Table>, name: &Symbol) -> Option<ColumnType> {
 /// `YYYY-MM-DD`, or nil for NULL and for the "" an unset nonnullable
 /// raw slot (or an adapter's NULL) holds. Same seam as the public
 /// reader, so JSON never disagrees with `record.<col>`.
-fn date_column_text(raw: Expr) -> Expr {
+pub(super) fn date_column_text(raw: Expr) -> Expr {
     let date = with_ty(
         send(Some(const_ref("ActiveSupport")), "parse_db_date", vec![raw], true),
-        Ty::Union { variants: vec![Ty::Date, Ty::Nil] },
+        Ty::Union { variants: vec![Ty::Date, Ty::Nil].into() },
     );
     with_ty(
         send(Some(const_ref("ActiveSupport")), "format_db_date", vec![date], true),
-        Ty::Union { variants: vec![Ty::Str, Ty::Nil] },
+        Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() },
     )
 }
 
@@ -307,13 +307,13 @@ fn date_column_text(raw: Expr) -> Expr {
 
 fn io_append_lit(s: &str) -> Expr {
     let mut e = with_ty(send(Some(var_ref(ACC)), "<<", vec![lit_str(s)], false), Ty::Str);
-    e.hint = Some(IrHint::StringBuilderAppend);
+    e.set_hint(Some(IrHint::StringBuilderAppend));
     e
 }
 
 fn io_append_call(call: Expr) -> Expr {
     let mut e = with_ty(send(Some(var_ref(ACC)), "<<", vec![call], false), Ty::Str);
-    e.hint = Some(IrHint::StringBuilderAppend);
+    e.set_hint(Some(IrHint::StringBuilderAppend));
     e
 }
 
@@ -333,6 +333,14 @@ fn self_send(method: &str) -> Expr {
             vec![],
             false,
         ),
+        Ty::Untyped,
+    )
+}
+
+/// `self.<method>()`, parenthesized as a method call.
+pub(super) fn self_call(method: &str) -> Expr {
+    with_ty(
+        send(Some(Expr::new(Span::synthetic(), ExprNode::SelfRef)), method, vec![], true),
         Ty::Untyped,
     )
 }
@@ -362,7 +370,7 @@ fn assign_local(name: &str, value: Expr) -> Expr {
         ),
         Ty::Str,
     );
-    e.hint = Some(IrHint::StringBuilderInit);
+    e.set_hint(Some(IrHint::StringBuilderInit));
     e
 }
 

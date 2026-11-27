@@ -11,6 +11,8 @@
 //!
 //! Native Ruby on the same source is the oracle.
 
+#[path = "support/scratch.rs"]
+mod scratch;
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
@@ -52,7 +54,7 @@ const REPORT: &str = "Operandlab::Probe.report.each { |r| p r }\n";
 #[test]
 fn statement_operands_keep_their_parentheses() {
     let dir =
-        std::env::temp_dir().join(format!("roundhouse-operand-parens-{}", std::process::id()));
+        scratch::dir("roundhouse-operand-parens");
     std::fs::create_dir_all(&dir).unwrap();
     let probe = dir.join("probe.rb");
     std::fs::write(&probe, PROBE).unwrap();
@@ -83,7 +85,7 @@ fn statement_operands_keep_their_parentheses() {
     let source = std::fs::read_to_string(emitted.join("app/models/operandlab/probe.rb"))
         .expect("emitted probe");
     let parse = ruby_prism::parse(source.as_bytes());
-    let parse_errors: Vec<String> = parse.errors().map(|e| e.message().to_string()).collect();
+    let parse_errors: Vec<String> = parse.errors().map(|e| String::from_utf8_lossy(e.message()).into_owned()).collect();
     assert!(parse_errors.is_empty(), "{parse_errors:?} in:\n{source}");
 
     let main = emitted.join("main").display().to_string();

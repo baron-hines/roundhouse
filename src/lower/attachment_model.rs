@@ -97,6 +97,7 @@ pub fn synthesize_attachment_model(app: &mut App) {
             name: Symbol::from("record"),
             target: ClassId(Symbol::from("Record")),
             foreign_key: Symbol::from("record_id"),
+            foreign_key_explicit: false,
             optional: false,
             polymorphic: true,
             polymorphic_targets: Vec::new(),
@@ -104,6 +105,7 @@ pub fn synthesize_attachment_model(app: &mut App) {
             touch: None,
             foreign_type: None,
             primary_key: None,
+            scope: None,
         },
         leading_comments: Vec::new(),
         leading_blank_line: false,
@@ -111,6 +113,8 @@ pub fn synthesize_attachment_model(app: &mut App) {
     }];
     app.models.push(Model {
         sti_subclass_names: Vec::new(),
+        mixin_sends: Vec::new(),
+        select_aliases: Vec::new(),
         i18n: Default::default(),
         name: class,
         parent: Some(ClassId(Symbol::from("ApplicationRecord"))),
@@ -137,20 +141,20 @@ pub(crate) fn push_attachment_record_methods(methods: &mut Vec<MethodDef>, model
     }
     let blob_ty = Ty::Class {
         id: ClassId(Symbol::from("ActiveStorage::Blob")),
-        args: vec![],
+        args: vec![].into(),
     };
     let maybe_blob = Ty::Union {
-        variants: vec![blob_ty.clone(), Ty::Nil],
+        variants: vec![blob_ty.clone(), Ty::Nil].into(),
     };
     let filename_ty = Ty::Class {
         id: ClassId(Symbol::from("ActiveStorage::Filename")),
-        args: vec![],
+        args: vec![].into(),
     };
     let maybe_filename = Ty::Union {
-        variants: vec![filename_ty, Ty::Nil],
+        variants: vec![filename_ty, Ty::Nil].into(),
     };
     let maybe_str = Ty::Union {
-        variants: vec![Ty::Str, Ty::Nil],
+        variants: vec![Ty::Str, Ty::Nil].into(),
     };
 
     // def blob; ActiveStorage::Blob.find(@blob_id); end

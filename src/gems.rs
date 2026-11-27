@@ -18,8 +18,299 @@
 //! judged — nobody chose them. Classification is a table plus a few
 //! family rules (`rubocop-*`, `opentelemetry-*`, `aws-sdk-*`); a gem
 //! the table has never seen is `Unknown`, honestly.
+//!
+//! Ruby-family gem require and demand tables also live here. Shared extension
+//! validation reads them on both native and WASM builds.
 
 use serde::{Deserialize, Serialize};
+
+/// How an emitted body asks for a gem: a constant name or literal text.
+pub(crate) enum Marker {
+    Constant(&'static str),
+    AnyText(&'static [&'static str]),
+}
+
+/// CRuby-preloaded libraries supplied on the Ruby family and Spinel:
+/// (require feature, namespace, modeled classes). An app declaration
+/// reopens these constants; it does not replace the library.
+pub(crate) const PRELOADED: &[(&str, &str, &[&str])] = &[
+    ("did_you_mean", "DidYouMean", &["DidYouMean::SpellChecker"]),
+];
+
+pub(crate) fn preloaded_constant(name: &str) -> bool {
+    PRELOADED.iter().any(|(_, namespace, classes)| *namespace == name || classes.contains(&name))
+}
+
+mod rack_mini_profiler;
+
+/// Not a section of `gem_facades.rb`: a package keeps one gem's Ruby, signatures and assets under `runtime/gems/<dir>/`, so it moves as a unit.
+pub(crate) struct GemPackage {
+    pub gem: &'static str,
+    pub dir: &'static str,
+    pub entry: &'static str,
+    pub config_receiver: Option<&'static str>,
+    pub config_setters: &'static [&'static str],
+}
+
+pub(crate) const GEM_PACKAGES: &[GemPackage] = &[rack_mini_profiler::PACKAGE];
+
+/// The emitted constructor call for declared Active Storage variants.
+/// Project assembly uses it to select the image processor. An app without
+/// variants never emits this call.
+pub(crate) const VARIATION_MARKER: &str = "ActiveStorage::Variation.new(";
+
+/// The gems every ruby-family tree guarded-requires, written once.
+///
+/// Under Rails, Bundler auto-requires these; the transpiled tree loads
+/// them so app classes that reach gem constants at LOAD time (lobsters'
+/// `html_encoder.rb` runs `HTMLEntities.new` in its class body;
+/// campfire's `ApplicationPlatform < PlatformAgent` names its
+/// superclass) or at request time (bcrypt behind the synthesized
+/// `User#authenticate`, rotp behind 2FA, markly+nokogiri behind
+/// `Markdowner.to_html`) resolve.
+///
+/// svg-graph loads by file path: the gem has no `svg-graph.rb` entry
+/// file, and lobsters' Gemfile declares `require: "SVG/Graph/TimeSeries"`.
+///
+/// Kept in step with `RUNTIME_GEMS` — that table is the DEMAND (what
+/// the emitted Gemfile declares, derived from the constants `app/`
+/// names), this one is the LOAD.
+pub(crate) const GEM_REQUIRES: &[&str] = &[
+    "bcrypt",
+    "htmlentities",
+    "rotp",
+    "markly",
+    // Current lobsters' Markdowner renders through commonmarker 2.x (the
+    // ruby-bench snapshot used markly).
+    "commonmarker",
+    "nokogiri",
+    "parslet",
+    "typeid",
+    "rqrcode",
+    "rqrcode_core",
+    "SVG/Graph/TimeSeries",
+    "sentry-ruby",
+    "rails-html-sanitizer",
+    "net/http/persistent",
+    "web-push",
+    "faye/websocket",
+    "eventmachine",
+    "faraday",
+    "faraday/multipart",
+    "faraday/retry",
+    "retryable",
+    "jwt",
+    // Not the gem's entry file: it loads the Railtie whenever `Rails::VERSION` is defined, which this tree's is, with no `Rails::Railtie` under it.
+    "mini_profiler",
+    "rest-client",
+    "elastic_apm",
+];
+
+/// Requires in `GEM_REQUIRES` a tree loads only when `app/` names the
+/// constant: (require, constant). Loading rest-client pulls in
+/// http-cookie, whose circular require warns under `-w` in every app
+/// that has the gem installed, used or not.
+pub(crate) const DEMAND_REQUIRES: &[(&str, &str)] = &[
+    ("faye/websocket", "Faye"), ("eventmachine", "EventMachine"),
+    ("rest-client", "RestClient"), ("elastic_apm", "ElasticAPM"),
+];
+
+/// Whether the compiler's own tables have a Ruby-family tree declare or
+/// require `gem`: the runtime gems the emitted Gemfile declares on demand
+/// and the guarded requires in `gem_facades.rb`. Extensions validate a
+/// `rails_dependent` fact against it (`crate::extensions`).
+pub(crate) fn compiler_tree_loads_gem(gem: &str) -> bool {
+    compiler_runtime_gems().iter().any(|(_, loaded)| *loaded == gem) || GEM_REQUIRES.contains(&gem)
+}
+
+/// The compiler's own runtime gem rows; an app's extensions append to them
+/// in `apply_runtime_gem_wiring`.
+pub(crate) fn compiler_runtime_gems() -> &'static [(Marker, &'static str)] {
+    // Kept in step with the guarded list in `runtime/gem_facades.rb`:
+    // (constant an emitted body names, gem that defines it). Only gems
+    // whose absence is a RUNTIME error belong here — the list is the
+    // façade's, not a survey of what an app might like.
+    const RUNTIME_GEMS: [(Marker, &str); 28] = [
+        (Marker::Constant("Faye"), "faye-websocket"),
+        (Marker::Constant("EventMachine"), "eventmachine"),
+        (Marker::Constant("BCrypt"), "bcrypt"),
+        (Marker::Constant("HTMLEntities"), "htmlentities"),
+        (Marker::Constant("ROTP"), "rotp"),
+        (Marker::Constant("Markly"), "markly"),
+        (Marker::Constant("Commonmarker"), "commonmarker"),
+        (Marker::Constant("Nokogiri"), "nokogiri"),
+        (Marker::Constant("Parslet"), "parslet"),
+        (Marker::Constant("TypeID"), "typeid"),
+        (Marker::Constant("RQRCode"), "rqrcode"),
+        (Marker::Constant("RQRCodeCore"), "rqrcode_core"),
+        // campfire's web push builds one `Net::HTTP::Persistent` pool
+        // per process (`WebPush::Pool`), and the gem went undeclared
+        // exactly as bcrypt did — the façade names the constant and
+        // nothing put it in the Gemfile.
+        //
+        // ITS ABSENCE IS FATAL TO A WRITE, not to a feature, and that
+        // is why it belongs in this table rather than in a ledger. The
+        // job adapter is `:inline`, so `Room::MessagePusher` runs
+        // INSIDE the message-create request: with no gem, every
+        // `POST /rooms/N/messages` answers 500 with
+        // `uninitialized constant Net::HTTP::Persistent`. Found by the
+        // ruby socket lane, which is the first harness to post a
+        // message on this tree WITHOUT the walk's stubs spliced in —
+        // the HTTP bench lanes only GET, and campfire-compare stubs the
+        // pusher. A gem the app depends on is not a modeling gap; it is
+        // a line in the Gemfile.
+        (Marker::Constant("Net::HTTP::Persistent"), "net-http-persistent"),
+        // The thread pools that same `WebPush::Pool` posts to. Ported for
+        // spinel (runtime/spinel/concurrent.rb) and swapped for the gem on
+        // this lane (`ruby_runtime_files`), so the tree must declare it —
+        // it is only ever in the lock today as sentry-ruby's dependency.
+        (Marker::Constant("Concurrent"), "concurrent-ruby"),
+        // The gem those pools deliver through. `WEB_PUSH_STUB_REOPEN`
+        // was written to sit on top of it — `alias_method
+        // :payload_send_without_stub, :payload_send if method_defined?` —
+        // and nothing had ever put the gem underneath: the app's
+        // `WebPush::Pool#deliver` rescues `WebPush::ExpiredSubscription`,
+        // a constant only the gem defines on this lane, and its suite
+        // raises one through the slot. With the gem in the tree an
+        // unstubbed `payload_send` is a real delivery.
+        (Marker::Constant("WebPush"), "web-push"),
+        // campfire's message helpers rescue through
+        // `Sentry.capture_exception`, and the gem was standing in
+        // `scripts/campfire-walk-stubs.rb` as a hand-written module. A
+        // gem the app depends on is not a modeling gap; it is a line in
+        // the Gemfile, which is what this table is for. MEASURED: the
+        // real gem loads in the emitted tree under CRuby.
+        //
+        (Marker::Constant("Sentry"), "sentry-ruby"),
+        // `platform_agent` USED TO BE HERE, and is deliberately not any
+        // more: `runtime/ruby/user_agent.rb` ports it, along with the
+        // `useragent` it delegates to. Requiring the gem beside the port
+        // would redefine `PlatformAgent` and `UserAgent` on the CRuby
+        // tree alone, so the ruby lane would be running the GEM while
+        // every strict lane ran the port — and a sibling lane is
+        // evidence only if it runs the same code. The port's own suite
+        // (`runtime/ruby/test/user_agent_test.rb`) compares it against
+        // the real gems instead, which is where that comparison belongs.
+        // rails-html-sanitizer, and it is the first entry whose demand
+        // is OURS rather than the app's: no campfire file names
+        // `Rails::HTML`, but `ActionView::ViewHelpers.sanitize` is what
+        // a bare `sanitize` / `strip_tags` / `auto_link` in an app body
+        // lowers to, and the CRuby overlay serves those from the real
+        // gem. So the marker is the emitted CALL, the same shape the
+        // test table already uses for mocha.
+        //
+        // A Gemfile line rather than a port because the safe-list pass
+        // is HTML5 tree construction, not filtering — see the header of
+        // ruby_overlay/runtime/action_view_sanitize.rb. Its closure is
+        // loofah + crass + nokogiri, and nokogiri is already declared by
+        // an entry above for any app that reaches this one.
+        (
+            Marker::AnyText(&[
+                "ActionView::ViewHelpers.sanitize(",
+                "ActionView::ViewHelpers.strip_tags(",
+                "ActionView::ViewHelpers.auto_link(",
+            ]),
+            "rails-html-sanitizer",
+        ),
+        // A declared variant is an image processor's demand: the
+        // reopen `apply_image_processor_wiring` swaps in requires
+        // "vips", and the marker is the constructor call every
+        // `attachable.variant …` lowers to. The gem needs libvips
+        // installed, which the app's own Gemfile (image_processing →
+        // ruby-vips) already asked of the machine.
+        (Marker::AnyText(&[VARIATION_MARKER]), "ruby-vips"),
+        // Not only the variant marker: an app's own `Vips::Image` (lobsters' StoryImage) needs the gem too.
+        (Marker::Constant("Vips"), "ruby-vips"),
+        // The HTTP client an app calls. The real gem runs on this lane;
+        // the strict targets refuse it (`lower::ruby_family_gems`). `Constant`
+        // matches `Faraday.new` / `Faraday::…` / `rescue Faraday`; the
+        // `AnyText` needles catch bare value uses (`CLIENT = Faraday`,
+        // `register(Faraday)`) that `names_constant` skips — without
+        // matching identifiers like `FaradayHolder`.
+        (Marker::Constant("Faraday"), "faraday"),
+        (Marker::AnyText(&["= Faraday", "(Faraday)", "Faraday,", ", Faraday"]), "faraday"),
+        // Its middleware gems. `request :multipart` / `request :retry`
+        // name no constant, and without the gem Faraday raises at the
+        // first connection that registers them.
+        (
+            Marker::AnyText(&[
+                "Faraday::Multipart",
+                "Faraday::UploadIO",
+                "Faraday::FilePart",
+                "Faraday::ParamPart",
+                "Faraday::CompositeReadIO",
+                "request :multipart",
+                "request(:multipart",
+            ]),
+            "faraday-multipart",
+        ),
+        (
+            Marker::AnyText(&["Faraday::Retry", "request :retry", "request(:retry"]),
+            "faraday-retry",
+        ),
+        // Retryable, JWT and ElasticAPM, as Faraday: the real gems on this lane,
+        // refused on the strict targets (`lower::ruby_family_gems`).
+        (Marker::Constant("Retryable"), "retryable"),
+        (Marker::Constant("JWT"), "jwt"),
+        // lobsters' `Rack::MiniProfiler.authorize_request` for every
+        // moderator: the real gem on this lane, its package
+        // (`GEM_PACKAGES`) on spinel.
+        (Marker::Constant("Rack::MiniProfiler"), "rack-mini-profiler"),
+        // RestClient, the same way.
+        (Marker::Constant("RestClient"), "rest-client"),
+        (Marker::Constant("ElasticAPM"), "elastic-apm"),
+    ];
+    &RUNTIME_GEMS
+}
+
+/// One `PATH` source in a `Gemfile.lock`: the recorded directory and the
+/// gem names listed under it. A single `path:` gem has one spec. A path
+/// block (`path "engines" do`) records the parent once and lists each gem.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PathSource {
+    pub remote: String,
+    pub specs: Vec<String>,
+}
+
+/// Every `PATH` source in a `Gemfile.lock`, lock order. Remotes are as
+/// written: relative to the lockfile unless the Gemfile gave an absolute
+/// path. Spec names are the indent-4 lines, not the indent-6 dependencies.
+pub fn lock_path_sources(text: &str) -> Vec<PathSource> {
+    let mut sources = Vec::new();
+    let mut in_path = false;
+    let mut current: Option<PathSource> = None;
+    for line in text.lines() {
+        if !line.starts_with(' ') {
+            if let Some(source) = current.take() {
+                sources.push(source);
+            }
+            in_path = line.trim() == "PATH";
+            continue;
+        }
+        if !in_path {
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        let body = line.trim();
+        if indent == 2 {
+            if let Some(remote) = body.strip_prefix("remote: ") {
+                if let Some(source) = current.take() {
+                    sources.push(source);
+                }
+                current = Some(PathSource { remote: remote.trim().to_string(), specs: Vec::new() });
+            }
+        } else if indent == 4 && current.is_some() && body != "specs:" {
+            let name = body.split(' ').next().unwrap_or(body);
+            if !name.is_empty() {
+                current.as_mut().expect("just checked").specs.push(name.to_string());
+            }
+        }
+    }
+    if let Some(source) = current {
+        sources.push(source);
+    }
+    sources
+}
 
 /// The `remote:` of every `PATH` section in a `Gemfile.lock`, lock
 /// order — the directories of the app's path-sourced gems
@@ -27,18 +318,7 @@ use serde::{Deserialize, Serialize};
 /// as written: relative to the lockfile unless the Gemfile gave an
 /// absolute path.
 pub fn lock_path_remotes(text: &str) -> Vec<String> {
-    let mut remotes = Vec::new();
-    let mut in_path = false;
-    for line in text.lines() {
-        if !line.starts_with(' ') {
-            in_path = line.trim() == "PATH";
-        } else if in_path {
-            if let Some(remote) = line.strip_prefix("  remote: ") {
-                remotes.push(remote.trim().to_string());
-            }
-        }
-    }
-    remotes
+    lock_path_sources(text).into_iter().map(|source| source.remote).collect()
 }
 
 /// A parsed `Gemfile.lock`: every resolved spec and the direct
@@ -54,19 +334,96 @@ pub struct Lockfile {
     /// analyzed like the rest of the app rather than being a boundary.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub in_repo: Vec<String>,
-    /// Specs resolved from a `GIT` source. Emitting a rubygems.org
-    /// `gem "name", "= version"` pin would lie about their origin — the
-    /// locked-external wiring path skips these fail-closed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub from_git: Vec<String>,
+    pub source: Vec<String>,
+    /// Git repositories and locked revisions, in source order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub git: Vec<GitSource>,
+    /// Runtime dependencies of each resolved spec, in lockfile order.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub spec_deps: std::collections::BTreeMap<String, Vec<String>>,
+    /// The `PLATFORMS` section.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub platforms: Vec<String>,
+    /// The app Gemfile's `require:` per gem (`gem "svg-graph", require:
+    /// "SVG/Graph/TimeSeries"`): what Bundler loads in place of the gem's
+    /// name. An empty list is `require: false`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub gemfile_requires: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+/// Every `gem "<name>", …, require: <String | [String] | false>` in a
+/// Gemfile, at its top level or inside a block (`group :x do … end`).
+pub fn gemfile_requires(source: &str) -> std::collections::BTreeMap<String, Vec<String>> {
+    struct Gems(std::collections::BTreeMap<String, Vec<String>>);
+    fn string(node: &ruby_prism::Node<'_>) -> Option<String> {
+        node.as_string_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned())
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Gems {
+        fn visit_call_node(&mut self, call: &ruby_prism::CallNode<'pr>) {
+            if call.receiver().is_none() && call.name().as_slice() == b"gem" {
+                let args: Vec<ruby_prism::Node<'_>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+                if let Some(name) = args.first().and_then(string) {
+                    for arg in &args[1..] {
+                        let Some(hash) = arg.as_keyword_hash_node() else { continue };
+                        for element in hash.elements().iter() {
+                            let Some(pair) = element.as_assoc_node() else { continue };
+                            let is_require = pair.key().as_symbol_node().is_some_and(|k| k.unescaped() == b"require");
+                            if !is_require {
+                                continue;
+                            }
+                            let value = pair.value();
+                            let features = if value.as_false_node().is_some() {
+                                Some(Vec::new())
+                            } else if let Some(one) = string(&value) {
+                                Some(vec![one])
+                            } else {
+                                value.as_array_node().and_then(|a| a.elements().iter().map(|e| string(&e)).collect())
+                            };
+                            if let Some(features) = features {
+                                self.0.insert(name.clone(), features);
+                            }
+                        }
+                    }
+                }
+            }
+            ruby_prism::visit_call_node(self, call);
+        }
+    }
+    let parsed = ruby_prism::parse(source.as_bytes());
+    let mut gems = Gems(std::collections::BTreeMap::new());
+    ruby_prism::Visit::visit(&mut gems, &parsed.node());
+    gems.0
+}
+
+/// One `GIT` source from a Bundler lockfile.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct GitSource {
+    pub remote: String,
+    pub revision: String,
+    pub specs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub glob: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub submodules: bool,
+}
+
+impl GitSource {
+    /// Bundler's installed checkout directory for this source.
+    pub fn checkout_dir(&self) -> String {
+        let base = self.remote.trim_end_matches('/').rsplit(['/', ':']).next().unwrap_or("");
+        let base = base.strip_suffix(".git").unwrap_or(base);
+        let revision: String = self.revision.chars().take(12).collect();
+        format!("{base}-{revision}")
+    }
 }
 
 impl Lockfile {
     /// Parse the Bundler lockfile format: section headers at column 0,
     /// specs at four spaces under `specs:`, dependencies at two spaces
-    /// under `DEPENDENCIES`. Deeper indentation is a spec's own
-    /// dependency list and is skipped. Tolerant: an unfamiliar section
-    /// is ignored, a malformed line is skipped.
+    /// under `DEPENDENCIES`. Six-space lines name each spec's runtime
+    /// dependencies. An unfamiliar section is ignored; malformed spec
+    /// lines retain the existing tolerant parser behavior.
     pub fn parse(text: &str) -> Lockfile {
         let mut lock = Lockfile::default();
         let mut section = "";
@@ -78,6 +435,9 @@ impl Lockfile {
             if !line.starts_with(' ') {
                 section = line.trim();
                 in_specs = false;
+                if section == "GIT" {
+                    lock.git.push(GitSource::default());
+                }
                 continue;
             }
             let indent = line.len() - line.trim_start().len();
@@ -86,6 +446,18 @@ impl Lockfile {
                 "GEM" | "PATH" | "GIT" | "PLUGIN SOURCE" => {
                     if indent == 2 {
                         in_specs = body == "specs:";
+                        if section == "GIT" {
+                            let git = lock.git.last_mut().expect("GIT section");
+                            if let Some(remote) = body.strip_prefix("remote:") {
+                                git.remote = remote.trim().to_string();
+                            } else if let Some(revision) = body.strip_prefix("revision:") {
+                                git.revision = revision.trim().to_string();
+                            } else if let Some(glob) = body.strip_prefix("glob:") {
+                                git.glob = Some(glob.trim().to_string());
+                            } else if let Some(submodules) = body.strip_prefix("submodules:") {
+                                git.submodules = submodules.trim() == "true";
+                            }
+                        }
                     } else if indent == 4 && in_specs {
                         // `rails (8.0.2)` — the version in parens; a
                         // platform suffix (`nokogiri (1.18.3-arm64-darwin)`)
@@ -96,8 +468,18 @@ impl Lockfile {
                         if section == "PATH" {
                             lock.in_repo.push(name.to_string());
                         } else if section == "GIT" {
-                            lock.from_git.push(name.to_string());
+                            lock.git.last_mut().expect("GIT section").specs.push(name.to_string());
                         }
+                    } else if indent == 6 && in_specs {
+                        if let Some((spec, _)) = lock.specs.last() {
+                            let dependency = body.split(' ').next().unwrap_or(body);
+                            lock.spec_deps.entry(spec.clone()).or_default().push(dependency.to_string());
+                        }
+                    }
+                }
+                "PLATFORMS" => {
+                    if indent == 2 {
+                        lock.platforms.push(body.to_string());
                     }
                 }
                 "DEPENDENCIES" => {
@@ -126,13 +508,68 @@ impl Lockfile {
         self.in_repo.iter().any(|n| n == name)
     }
 
+    pub fn is_source(&self, name: &str) -> bool {
+        self.source.iter().any(|n| n == name)
+    }
+
+    /// The repository and revision that provide `name`, if it is Git-backed.
+    pub fn git_source_of(&self, name: &str) -> Option<&GitSource> {
+        self.git.iter().find(|source| source.specs.iter().any(|spec| spec == name))
+    }
+
+    /// Git specs in the requested dependency closure, dependencies first.
+    pub fn git_specs_in_closure(&self, roots: &[&str]) -> Vec<String> {
+        let mut seen = crate::det::HashSet::default();
+        let mut out = Vec::new();
+        for root in roots {
+            let mut pending = vec![(*root, false)];
+            while let Some((name, expanded)) = pending.pop() {
+                if expanded {
+                    if self.is_from_git(name) {
+                        out.push(name.to_string());
+                    }
+                } else if seen.insert(name) {
+                    pending.push((name, true));
+                    if let Some(dependencies) = self.spec_deps.get(name) {
+                        pending.extend(dependencies.iter().rev().map(|dependency| (dependency.as_str(), false)));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether `name` depends on `target`, directly or through its own dependencies.
+    pub fn reaches(&self, name: &str, target: &str) -> bool {
+        let mut seen = crate::det::HashSet::default();
+        let mut pending = vec![name];
+        while let Some(gem) = pending.pop() {
+            if !seen.insert(gem) {
+                continue;
+            }
+            for dep in self.spec_deps.get(gem).into_iter().flatten() {
+                if dep == target {
+                    return true;
+                }
+                pending.push(dep.as_str());
+            }
+        }
+        false
+    }
+
     /// Is `name` resolved from a `GIT` source?
     pub fn is_from_git(&self, name: &str) -> bool {
-        self.from_git.iter().any(|n| n == name)
+        self.git_source_of(name).is_some()
     }
 
     pub fn version_of(&self, name: &str) -> Option<&str> {
         self.specs.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str())
+    }
+
+    // Not cut at the first `-`: `1.2.3-alpha` is a prerelease, only a listed platform is a suffix.
+    pub fn release_version_of(&self, name: &str) -> Option<&str> {
+        let version = self.version_of(name)?;
+        Some(self.platforms.iter().find_map(|p| version.strip_suffix(p.as_str())?.strip_suffix('-')).unwrap_or(version))
     }
 }
 
@@ -160,6 +597,7 @@ pub enum GemFate {
     /// analyzer has to model: a dispatch that fails on its constants is
     /// a fact about the analysis of that code, and is reported as such.
     InRepo,
+    Source,
 }
 
 impl GemFate {
@@ -171,6 +609,7 @@ impl GemFate {
             GemFate::Infrastructure => "infrastructure",
             GemFate::Unknown => "unknown",
             GemFate::InRepo => "in-repo",
+            GemFate::Source => "source",
         }
     }
 }
@@ -204,7 +643,13 @@ impl GemCensus {
             .map(|name| GemEntry {
                 name: name.clone(),
                 version: lock.version_of(name).map(|v| v.to_string()),
-                fate: if lock.is_in_repo(name) { GemFate::InRepo } else { fate_of(name) },
+                fate: if lock.is_in_repo(name) {
+                    GemFate::InRepo
+                } else if lock.is_source(name) {
+                    GemFate::Source
+                } else {
+                    fate_of(name)
+                },
             })
             .collect();
         let transitive = lock.specs.len().saturating_sub(gems.len());
@@ -230,6 +675,7 @@ impl GemCensus {
             GemFate::Modeled,
             GemFate::Infrastructure,
             GemFate::InRepo,
+            GemFate::Source,
         ] {
             let n = self.count(fate);
             if n > 0 {
@@ -288,9 +734,11 @@ const FATES: &[(&str, GemFate)] = &[
     ("bigdecimal", GemFate::Stdlib),
     ("cgi", GemFate::Stdlib),
     ("csv", GemFate::Stdlib),
+    ("date", GemFate::Stdlib),
     ("digest", GemFate::Stdlib),
     ("drb", GemFate::Stdlib),
     ("erb", GemFate::Stdlib),
+    ("find", GemFate::Stdlib),
     ("ipaddr", GemFate::Stdlib),
     ("irb", GemFate::Stdlib),
     ("json", GemFate::Stdlib),
@@ -301,6 +749,7 @@ const FATES: &[(&str, GemFate)] = &[
     ("net-pop", GemFate::Stdlib),
     ("net-smtp", GemFate::Stdlib),
     ("observer", GemFate::Stdlib),
+    ("openssl", GemFate::Stdlib),
     ("ostruct", GemFate::Stdlib),
     ("racc", GemFate::Stdlib),
     ("rake", GemFate::Stdlib),
@@ -308,31 +757,54 @@ const FATES: &[(&str, GemFate)] = &[
     ("rexml", GemFate::Stdlib),
     ("rss", GemFate::Stdlib),
     ("securerandom", GemFate::Stdlib),
+    ("set", GemFate::Stdlib),
+    ("singleton", GemFate::Stdlib),
+    ("strscan", GemFate::Stdlib),
+    ("time", GemFate::Stdlib),
+    ("tmpdir", GemFate::Stdlib),
     ("tsort", GemFate::Stdlib),
     ("uri", GemFate::Stdlib),
     ("yaml", GemFate::Stdlib),
+    ("zlib", GemFate::Stdlib),
     // ── Modeled (each row names where) ───────────────────────────
+    ("acts_as_tenant", GemFate::Modeled), // ingest/acts_as_tenant: acts_as_tenant -> belongs_to + dynamic default_scope + create stamp; validates_uniqueness_to_tenant; ActsAsTenant as CurrentAttributes (current_tenant, with_tenant, without_tenant); set_current_tenant_through_filter (not has_global_records/through/polymorphic/require_tenant/subdomain/immutability)
     ("acts_as_votable", GemFate::Modeled), // ingest/acts_as_votable: ActsAsVotable::Vote on `votes`; acts_as_votable/acts_as_voter macros -> votes_for/votes + vote_by/liked_by/unvote_by/update_cached_votes (not vote_up_for/get_voted/association extensions)
-    ("addressable", GemFate::Modeled), // catalog/gems: Addressable::URI
+    // Not Modeled: the catalog types Addressable::URI, but no tree has a body for it, so it runs as the gem itself.
+    ("addressable", GemFate::Unknown),
+    // Not Modeled: its routes depend on the modules every model and gem registers, which only its own source draws.
+    ("devise", GemFate::Unknown),
     ("bcrypt", GemFate::Modeled),      // catalog/gems: BCrypt::*; has_secure_password
-    ("devise", GemFate::Modeled), // helpers; devise_for = static 4 mappings (not model-module-driven); no Warden route guards
-    ("discard", GemFate::Modeled),     // ingest/discard: include Discard::Model -> scopes + predicates + discard/undiscard (not discard_all/undiscard_all); Relation#unscope(where:)
+    ("commonmarker", GemFate::Modeled), // catalog/gems: Commonmarker, Commonmarker::Node
+    ("discard", GemFate::Modeled),
+    ("elastic-apm", GemFate::Modeled), // catalog/gems: ElasticAPM, SpanHelpers; the real gem on ruby and jruby, lower/ruby_family_gems refuses every other target     // ingest/discard: include Discard::Model -> scopes + predicates + discard/undiscard (not discard_all/undiscard_all); Relation#unscope(where:)
+    ("faye-websocket", GemFate::Modeled), // Spinel faye_websocket: text/open/message/close; no protocols/error events
+    ("eventmachine", GemFate::Modeled), // Spinel faye_websocket: schedule runs on the caller, no reactor
     ("faker", GemFate::Modeled),       // catalog/gems: Faker::*
     ("friendly_id", GemFate::Modeled), // lower/friendly_id + registry: friendly_id/friendly/to_param, Relation#friendly_find (slugged [+history] finder only; slug generation on save, :scoped/:finders/:simple_i18n unmodeled)
     ("geared_pagination", GemFate::Modeled), // registry/controllers: set_page_and_extract_portion_from
+    ("faraday", GemFate::Modeled),     // catalog/gems: Faraday; the real gem on ruby and jruby, lower/ruby_family_gems refuses every other target
+    ("faraday-multipart", GemFate::Modeled), // catalog/gems: Faraday::Multipart, as faraday
+    ("faraday-retry", GemFate::Modeled), // request :retry, as faraday
     ("htmlentities", GemFate::Modeled), // catalog/gems: HTMLEntities
     ("image_processing", GemFate::Modeled), // active_storage variants seam
+    ("inertia_rails", GemFate::Modeled), // ingest/inertia: render inertia:, inertia_share; runtime action_controller/inertia
     ("invisible_captcha", GemFate::Modeled), // before_action + spam? on subtitle honeypot only
+    ("jwt", GemFate::Modeled),         // catalog/gems: JWT; the real gem on ruby and jruby, lower/ruby_family_gems refuses every other target
     ("kaminari", GemFate::Modeled),    // Relation#page / per / paginate
     ("mail", GemFate::Modeled),        // catalog/gems: Mail::Address; ActionMailer
     ("mocha", GemFate::Modeled),       // lower/mocha bridge
+    ("multi_json", GemFate::Modeled), // ingest/multi_json + lower/oj: on the oj adapter, dump on ruby, jruby and spinel; load, other adapters and every other target refused
     ("nokogiri", GemFate::Modeled),    // catalog/gems: Nokogiri
-    ("pagy", GemFate::Modeled),        // registry/controllers + analyze/body/pagy + runtime action_controller/pagy.rb: pagy(scope[, limit: n]) offset paginator, Pagy#series_nav/info_tag/readers (English); other paginators/options/helpers refused
+    ("oj", GemFate::Modeled),          // ingest/oj + lower/oj: under Oj.mimic_JSON, load/generate on ruby, jruby and spinel; dump and every other target refused
+    ("pagy", GemFate::Modeled),        // registry/controllers + analyze/body/pagy + runtime action_controller/pagy.rb: pagy(scope[, limit: n]) offset paginator, Pagy#series_nav/info_tag/readers (English); before 43, pagy9.rb: pagy/pagy_array(limit:, page:, items:), readers, series, vars[k], pagy_url_for, the overflow/array extras; other paginators/options/helpers refused
     ("pdf-reader", GemFate::Modeled),  // catalog/gems: PDF::Reader
     ("platform_agent", GemFate::Modeled), // useragent port
     ("pretender", GemFate::Modeled), // impersonates with local current_* → true_* wrap + impersonate_*; inherited-only stays unsupported
     ("pushover", GemFate::Modeled),    // catalog/gems: Pushover
     ("rack-mini-profiler", GemFate::Modeled), // catalog/gems: Rack::MiniProfiler
+    ("representable", GemFate::Modeled), // ingest/representable: Decorator + JSON, property/collection subset
+    ("rest-client", GemFate::Modeled), // catalog/gems: RestClient; the real gem on ruby and jruby, lower/ruby_family_gems refuses every other target
+    ("retryable", GemFate::Modeled),   // catalog/gems: Retryable; the real gem on ruby and jruby, lower/ruby_family_gems refuses every other target
     ("rotp", GemFate::Modeled),        // catalog/gems: ROTP::*
     ("rqrcode", GemFate::Modeled),     // catalog/gems: RQRCode::QRCode
     ("ruby-vips", GemFate::Modeled),   // active_storage variants seam
@@ -356,7 +828,6 @@ const FATES: &[(&str, GemFate)] = &[
     ("bundler-audit", GemFate::Infrastructure),
     ("capybara", GemFate::Infrastructure),
     ("climate_control", GemFate::Infrastructure),
-    ("connection_pool", GemFate::Infrastructure),
     ("database_consistency", GemFate::Infrastructure),
     ("debug", GemFate::Infrastructure),
     ("dockerfile-rails", GemFate::Infrastructure),
@@ -394,9 +865,10 @@ const FATES: &[(&str, GemFate)] = &[
     ("pry", GemFate::Infrastructure),
     ("pry-rails", GemFate::Infrastructure),
     ("puma", GemFate::Infrastructure),
-    ("rack-attack", GemFate::Infrastructure),
-    ("rack-cors", GemFate::Infrastructure),
-    ("rack-protection", GemFate::Infrastructure),
+    // Not rack-attack, rack-cors or rack-protection: a middleware that
+    // throttles a request, writes its CORS headers or refuses one it reads
+    // as an attack changes what the app answers, and nothing in the app
+    // calls it for a dispatch failure to show that it is missing.
     ("rack-test", GemFate::Infrastructure),
     ("rails-controller-testing", GemFate::Infrastructure),
     ("rails-dom-testing", GemFate::Infrastructure),
@@ -452,7 +924,121 @@ const FAMILIES: &[(&str, GemFate)] = &[
 ];
 
 /// Classify a gem by name.
+/// Whether a standard-library gem's namespace is `root` (Ruby ships it whether or not the lockfile lists it).
+/// The known gems the lockfile lacks whose own nested namespace sits
+/// below every locked gem's (tzinfo-data's `TZInfo::Data` under tzinfo's
+/// `TZInfo`): Ruby has nothing under such a namespace to find. Built once
+/// per lockfile; [`AbsentGemNamespaces::owner`] asks it per constant.
+pub(crate) struct AbsentGemNamespaces {
+    locked: Vec<Vec<String>>,
+    absent: Vec<(&'static str, Vec<String>)>,
+}
+
+impl AbsentGemNamespaces {
+    pub(crate) fn new(lock: &Lockfile) -> Self {
+        let split = |ns: &str| ns.split("::").map(|s| s.to_ascii_lowercase()).collect::<Vec<_>>();
+        let nested = |gem: &str| gem.split('-').map(camelize).collect::<Vec<_>>().join("::");
+        let locked = lock
+            .specs
+            .iter()
+            .flat_map(|(name, _)| std::iter::once(nested(name)).chain(namespace_candidates(name)).map(|ns| split(&ns)).collect::<Vec<_>>())
+            .collect();
+        // Not a standard-library gem, which Ruby ships whether or not the lockfile lists it (net-http's `Net::HTTP`), nor one roundhouse models, which the emitted Gemfile declares when the app uses it (faraday-multipart).
+        let absent = FATES
+            .iter()
+            .filter(|(gem, fate)| matches!(fate, GemFate::Infrastructure | GemFate::Unknown) && lock.version_of(gem).is_none())
+            .map(|(gem, _)| (*gem, split(&nested(gem))))
+            .filter(|(_, ns)| ns.len() >= 2)
+            .collect();
+        Self { locked, absent }
+    }
+
+    /// The absent gem and its namespace's depth, for a constant under it.
+    pub(crate) fn owner(&self, path: &str) -> Option<(&'static str, usize)> {
+        let segs: Vec<String> = path.trim_start_matches("::").split("::").filter(|s| !s.is_empty()).map(|s| s.to_ascii_lowercase()).collect();
+        let under = |ns: &[String]| ns.len() <= segs.len() && ns.iter().zip(&segs).all(|(a, b)| a == b);
+        let (gem, ns) = self.absent.iter().find(|(_, ns)| under(ns))?;
+        let locked = self.locked.iter().filter(|ns| under(ns)).map(|ns| ns.len()).max().unwrap_or(0);
+        (ns.len() > locked).then_some((*gem, ns.len()))
+    }
+}
+
+pub(crate) fn is_stdlib_namespace(root: &str) -> bool {
+    // Ruby's core and the standard library it ships, gem-packaged or not.
+    const RUBY_OWN: &[&str] = &[
+        "Abbrev", "Base64", "Benchmark", "BigDecimal", "Comparable", "Coverage", "CSV", "Date", "DateTime", "Digest", "DRb",
+        "Encoding", "English", "ERB", "Errno", "Etc", "Fiber", "Fiddle", "FileUtils", "Find", "Forwardable", "GC",
+        "GetoptLong", "IO", "IPAddr", "JSON", "Kernel", "Logger", "Marshal", "Math", "Matrix", "Monitor", "MonitorMixin",
+        "Mutex", "Net", "NKF", "ObjectSpace", "Observable", "Open3", "OpenSSL", "OpenStruct", "OptionParser", "PP",
+        "Pathname", "PrettyPrint", "Prime", "Process", "Psych", "Racc", "Ractor", "RbConfig", "RDoc", "Readline",
+        "Reline", "Resolv", "Rinda", "Ripper", "RubyVM", "SecureRandom", "Set", "Shellwords", "Signal", "Singleton",
+        "Socket", "StringIO", "StringScanner", "Syslog", "Tempfile", "Thread", "Time", "Timeout", "TracePoint",
+        "TSort", "UNIXSocket", "URI", "Warning", "WeakRef", "YAML", "Zlib", "TCPSocket", "UDPSocket", "Addrinfo",
+    ];
+    RUBY_OWN.contains(&root)
+        || PRELOADED.iter().any(|(_, namespace, _)| namespace.eq_ignore_ascii_case(root))
+        || FATES.iter().any(|(gem, fate)| matches!(fate, GemFate::Stdlib) && namespace_of(gem).eq_ignore_ascii_case(root))
+}
+
+/// Ruby's core classes and modules. The modules `is_stdlib_namespace`'s
+/// RUBY_OWN already holds (Kernel, Comparable, Math, Marshal, GC,
+/// ObjectSpace, Process, Signal, IO, Encoding, Fiber, Mutex, Warning) are
+/// not repeated here.
+const RUBY_CORE: &[&str] = &[
+    "ArgumentError", "Array", "BasicObject", "Binding", "Class", "ClosedQueueError", "ConditionVariable", "Complex",
+    "Data", "Dir", "EncodingError", "EOFError", "Enumerable", "Enumerator", "Exception", "FalseClass", "File",
+    "FileTest", "FiberError", "Float", "FloatDomainError", "FrozenError", "Hash", "IndexError", "Integer",
+    "Interrupt", "IOError", "KeyError", "LoadError", "LocalJumpError", "Method", "Module", "NameError", "NilClass",
+    "NoMatchingPatternError", "NoMatchingPatternKeyError", "NoMemoryError", "NoMethodError", "NotImplementedError",
+    "Numeric", "Object", "Proc", "Queue", "Random", "Range", "RangeError", "Rational", "Refinement", "Regexp",
+    "RegexpError", "RuntimeError", "ScriptError", "SecurityError", "SignalException", "SizedQueue", "StandardError",
+    "StopIteration", "String", "Struct", "Symbol", "SyntaxError", "SystemCallError", "SystemExit", "SystemStackError",
+    "ThreadError", "ThreadGroup", "TrueClass", "TypeError", "UnboundMethod", "UncaughtThrowError", "ZeroDivisionError",
+];
+
+/// A constant Ruby's core always defines: a core class or module itself, or
+/// a class or value constant Ruby declares inside one (`Enumerator::Lazy`,
+/// `Float::INFINITY`). Not any name under a core root: `String::Nope` is
+/// Ruby's NameError. A leading `Object::` is the top level.
+pub(crate) fn is_core_constant(written: &[&str]) -> bool {
+    let mut path = written;
+    while path.len() > 1 && path[0] == "Object" {
+        path = &path[1..];
+    }
+    match path {
+        [root] => RUBY_CORE.contains(root),
+        [root, ..] if RUBY_CORE.contains(root) => {
+            let full = path.join("::");
+            crate::emit::audit::CORE_CONSTANTS.binary_search(&full.as_str()).is_ok()
+                || crate::analyze::is_core_value_constant(&full)
+        }
+        _ => false,
+    }
+}
+
+/// A feature of the Rails frameworks (`active_support/core_ext/…`,
+/// `rails`): the runtime ports are the framework in an emitted tree, and
+/// no such file is on its load path.
+pub(crate) fn is_framework_feature(feature: &str) -> bool {
+    let root = feature.split('/').next().unwrap_or(feature);
+    // Not required as written: the runtime ports a Framework-fate `-rails` gem's engine (MC's importmap-rails); i18n is the real gem.
+    if feature == root && root.ends_with("-rails") && !compiler_tree_loads_gem(root) && FATES.iter().any(|(name, fate)| *name == root && *fate == GemFate::Framework) {
+        return true;
+    }
+    matches!(
+        root,
+        "rails" | "railties" | "active_support" | "activesupport" | "active_record" | "activerecord" | "arel"
+            | "active_model" | "activemodel" | "active_job" | "activejob" | "action_pack" | "actionpack"
+            | "action_controller" | "action_dispatch" | "abstract_controller" | "action_view" | "actionview"
+            | "action_mailer" | "actionmailer" | "action_cable" | "actioncable" | "action_text" | "actiontext"
+            | "active_storage" | "activestorage" | "action_mailbox" | "actionmailbox"
+    )
+}
+
 pub fn fate_of(name: &str) -> GemFate {
+    if PRELOADED.iter().any(|(feature, _, _)| *feature == name) {
+        return GemFate::Stdlib;
+    }
     if let Some((_, fate)) = FATES.iter().find(|(n, _)| *n == name) {
         return *fate;
     }
@@ -511,6 +1097,10 @@ pub(crate) fn gem_providing_dsl(lock: &Lockfile, dsl: &str) -> Option<&'static s
         .copied()
 }
 
+pub fn claims_surface(gem: &str) -> bool {
+    SURFACES.iter().any(|(name, _)| *name == gem)
+}
+
 /// The gem whose surface a method name belongs to, if any of the
 /// gems in `lock` claim it. `None` when no present gem claims the
 /// name. Modeled gems never claim (their surface resolves).
@@ -532,23 +1122,29 @@ pub fn namespace_of(gem: &str) -> String {
         ("aws-sdk-core", "Aws"),
         ("bcrypt", "BCrypt"),
         ("cancancan", "CanCan"),
+        ("caxlsx", "Axlsx"),
         ("combine_pdf", "CombinePDF"),
+        ("duckdb", "DuckDB"),
+        ("elastic-apm", "ElasticAPM"),
         ("fast_excel", "FastExcel"),
         ("graphql", "GraphQL"),
         ("htmlentities", "HTMLEntities"),
         ("http", "HTTP"),
         ("i18n", "I18n"),
         ("jwt", "JWT"),
+        ("mcp", "MCP"),
         ("mini_magick", "MiniMagick"),
         ("net-http-persistent", "Net"),
         ("nokogiri", "Nokogiri"),
         ("oj", "Oj"),
         ("pdf-reader", "PDF"),
         ("pg", "PG"),
+        ("polars-df", "Polars"),
         ("rack-attack", "Rack"),
         ("rqrcode", "RQRCode"),
         ("rotp", "ROTP"),
         ("ruby-vips", "Vips"),
+        ("ruby_llm", "RubyLLM"),
         ("rubyzip", "Zip"),
         // sorbet-runtime's entire app-facing surface is `T` — `T.let`,
         // `T::Enum`, `T::Struct` — which the name-derived namespace
@@ -566,6 +1162,25 @@ pub fn namespace_of(gem: &str) -> String {
     camelize(gem)
 }
 
+/// Whether `boot.rb` should `require` a locked unknown gem by its own name
+/// once the emitted program names that gem's namespace.
+///
+/// A normal gem's entry file is `lib/<gem>.rb`, and the constant lowercases
+/// to that name, its underscores aside (`duckdb` → `DuckDB`, `message_bus`
+/// → `MessageBus`, `ruby_llm` → `RubyLLM`): Bundler requires the gem by
+/// that name. The same file exists for two irregular constants: `caxlsx`
+/// (`lib/caxlsx.rb`) and `polars-df` (`lib/polars-df.rb`). Requiring the
+/// lowercased constant (`axlsx`, `polars`) is not that entry.
+///
+/// `rubyzip` is not in this set. `require "rubyzip"` is not a file; the gem
+/// loads as `zip`.
+pub fn loads_by_gem_name(gem: &str) -> bool {
+    if namespace_of(gem).eq_ignore_ascii_case(&gem.replace('_', "")) {
+        return true;
+    }
+    matches!(gem, "caxlsx" | "polars-df")
+}
+
 /// The top-level constants a gem might define, best guess first: the
 /// whole name camelized, then — for a dashed name — its first segment
 /// alone.
@@ -577,12 +1192,14 @@ pub fn namespace_of(gem: &str) -> String {
 /// hand-written version of the rule, and every private gem that follows
 /// the same convention needed its own entry to be attributable at all —
 /// which, by definition, it cannot have here.
-fn namespace_candidates(gem: &str) -> Vec<String> {
+pub(crate) fn namespace_candidates(gem: &str) -> Vec<String> {
     let mut candidates = vec![namespace_of(gem)];
-    if let Some((head, _)) = gem.split_once('-') {
-        let first = camelize(head);
-        if !candidates.contains(&first) {
-            candidates.push(first);
+    // Each run of leading words as one name too: rails-settings-cached's is `RailsSettings`.
+    let words: Vec<&str> = gem.split('-').collect();
+    for n in 1..words.len() {
+        let joined = camelize(&words[..n].join("-"));
+        if !candidates.contains(&joined) {
+            candidates.push(joined);
         }
     }
     candidates
@@ -599,6 +1216,110 @@ fn camelize(gem: &str) -> String {
             }
         })
         .collect()
+}
+
+/// The resolved specs whose namespace `constant_path` sits under. A gem's
+/// own spelling nests at its dashes (`rack-attack` → `Rack::Attack`); its
+/// conventional namespace and first segment count too, below that. The
+/// longest match wins, and ties at the same rank are all returned.
+pub fn lock_gems_owning_constant<'a>(lock: &'a Lockfile, constant_path: &str) -> Vec<&'a str> {
+    let path = constant_path.trim_start_matches("::");
+    // Not case-sensitive: `OmniAuth` is the omniauth gem's, `PgHero` pghero's.
+    let under = |ns: &str| {
+        path.len() >= ns.len()
+            && path.is_char_boundary(ns.len())
+            && path[..ns.len()].eq_ignore_ascii_case(ns)
+            && (path.len() == ns.len() || path[ns.len()..].starts_with("::"))
+    };
+    let mut best: Vec<&str> = Vec::new();
+    let mut best_rank = (0usize, false);
+    for (name, _) in &lock.specs {
+        let nested = name.split('-').map(camelize).collect::<Vec<_>>().join("::");
+        let rank = if under(&nested) {
+            (nested.len(), true)
+        } else if let Some(ns) = namespace_candidates(name).into_iter().filter(|ns| under(ns)).max_by_key(|ns| ns.len()) {
+            (ns.len(), false)
+        } else {
+            continue;
+        };
+        if rank > best_rank {
+            best_rank = rank;
+            best.clear();
+        }
+        if rank == best_rank && !best.contains(&name.as_str()) {
+            best.push(name.as_str());
+        }
+    }
+    best
+}
+
+/// Namespace candidates of one immutable lockfile. Repeated constant asks
+/// inspect only gems sharing the path's first segment, without rebuilding
+/// every gem's candidate spellings. Bucket order is lock order.
+pub(crate) struct LockGemIndex<'a> {
+    entries: Vec<LockGemNamespaces<'a>>,
+    by_head: crate::det::HashMap<String, Vec<usize>>,
+}
+
+struct LockGemNamespaces<'a> {
+    name: &'a str,
+    nested: String,
+    alternatives: Vec<String>,
+}
+
+impl<'a> LockGemIndex<'a> {
+    pub(crate) fn new(lock: &'a Lockfile) -> Self {
+        let entries: Vec<_> = lock.specs.iter().map(|(name, _)| LockGemNamespaces {
+            name,
+            nested: name.split('-').map(camelize).collect::<Vec<_>>().join("::"),
+            alternatives: namespace_candidates(name),
+        }).collect();
+        let mut by_head: crate::det::HashMap<String, Vec<usize>> = Default::default();
+        for (i, entry) in entries.iter().enumerate() {
+            let mut heads = Vec::new();
+            for ns in std::iter::once(&entry.nested).chain(&entry.alternatives) {
+                let head = ns.split("::").next().unwrap_or("").to_ascii_lowercase();
+                if !heads.contains(&head) {
+                    by_head.entry(head.clone()).or_default().push(i);
+                    heads.push(head);
+                }
+            }
+        }
+        Self { entries, by_head }
+    }
+
+    pub(crate) fn owners(&self, constant_path: &str) -> Vec<&'a str> {
+        let path = constant_path.trim_start_matches("::");
+        let head = path.split("::").next().unwrap_or("").to_ascii_lowercase();
+        let under = |ns: &str| {
+            path.len() >= ns.len()
+                && path.is_char_boundary(ns.len())
+                && path[..ns.len()].eq_ignore_ascii_case(ns)
+                && (path.len() == ns.len() || path[ns.len()..].starts_with("::"))
+        };
+        let mut best = Vec::new();
+        let mut best_rank = (0usize, false);
+        for &i in self.by_head.get(&head).into_iter().flatten() {
+            let entry = &self.entries[i];
+            // Nested spelling wins over this gem's alternatives, even if
+            // an alternative is longer, exactly as in the original scan.
+            let rank = if under(&entry.nested) {
+                (entry.nested.len(), true)
+            } else if let Some(ns) = entry.alternatives.iter().filter(|ns| under(ns)).max_by_key(|ns| ns.len()) {
+                (ns.len(), false)
+            } else {
+                continue;
+            };
+            if rank > best_rank {
+                best_rank = rank;
+                best.clear();
+            }
+            if rank == best_rank && !best.contains(&entry.name) {
+                best.push(entry.name);
+            }
+        }
+        best
+    }
 }
 
 /// The unique resolved unknown gem whose namespace `constant_path`
@@ -620,21 +1341,29 @@ pub fn statically_resolved_external_includes(
     let census = GemCensus::of(lock);
     let mut resolved = std::collections::BTreeMap::new();
     for class in &app.library_classes {
-        let source = source_for_library_class(app, class);
-        let Some(source) = source else { continue };
-        for included in &class.includes {
-            let Some(gem) = gem_owning_constant(&census, included.0.as_str()) else {
-                continue;
-            };
+        // The gem owning each include first: most classes include none,
+        // and finding a class's source can scan every file of the app.
+        let gems: Vec<(&crate::ident::ClassId, &str)> = class
+            .includes
+            .iter()
+            .filter_map(|included| gem_owning_constant(&census, included.0.as_str()).map(|gem| (included, gem)))
             // Fail-closed: Git-sourced gems have no Gemfile pin path that
             // preserves the git remote — keep their includes unresolved.
-            if lock.is_from_git(gem) {
-                continue;
-            }
+            // A gem a project extension says reaches Rails is never
+            // required natively (`crate::extensions`).
+            .filter(|(_, gem)| !lock.is_from_git(gem) && !app.extensions.is_rails_dependent(gem))
+            .collect();
+        if gems.is_empty() {
+            continue;
+        }
+        let Some(source) = source_for_library_class(app, class) else { continue };
+        let file_requires = literal_file_level_requires(&source.text);
+        for (included, gem) in gems {
             let gem_name = gem.to_ascii_lowercase();
             let namespace = namespace_of(gem).to_ascii_lowercase();
-            let requires: Vec<String> = literal_file_level_requires(&source.text)
-                .into_iter()
+            let requires: Vec<String> = file_requires
+                .iter()
+                .cloned()
                 .filter(|feature| {
                     feature
                         .split('/')
@@ -729,20 +1458,265 @@ fn source_declaring_class<'a>(
 
 /// Namespaces owned by unknown gems that are pinned in this app's lockfile.
 /// Ruby project emission uses these only when it also wires the exact gems.
+/// A gem a project extension says reaches Rails is not wired, so its
+/// constants stay refused (`crate::extensions`).
 pub fn locked_external_gem_namespaces(app: &crate::App) -> std::collections::BTreeSet<String> {
     let Some(lock) = app.gem_lock.as_ref() else {
         return Default::default();
     };
-    GemCensus::of(lock)
+    let mut namespaces: std::collections::BTreeSet<String> = GemCensus::of(lock)
         .unknown()
-        .filter(|gem| !lock.is_from_git(&gem.name))
+        .filter(|gem| !lock.is_from_git(&gem.name) && !app.extensions.is_rails_dependent(&gem.name))
         .map(|gem| namespace_of(&gem.name))
-        .collect()
+        .collect();
+    namespaces.extend(native_extension_gem_namespaces(app));
+    namespaces
+}
+
+/// Native extension constants available on both Ruby-family targets.
+/// A lock entry alone does not add a namespace to this set.
+pub fn native_extension_gem_namespaces(app: &crate::App) -> std::collections::BTreeSet<String> {
+    let Some(lock) = app.gem_lock.as_ref() else { return Default::default() };
+    let mut names = std::collections::BTreeSet::new();
+    let gems = app.extensions.runtime_gems.iter().map(|row| row.gem.as_str())
+        .chain(app.gem_boundary.loaded.iter().map(String::as_str));
+    for gem in gems.filter(|gem| lock.has(gem) && !lock.is_in_repo(gem) && !app.extensions.is_rails_dependent(gem)) {
+        match app.gem_boundary.namespaces.get(gem) {
+            Some(owned) => names.extend(owned.iter().cloned()),
+            None => { names.insert(namespace_of(gem)); }
+        }
+        for row in app.extensions.runtime_gems.iter().filter(|row| row.gem == gem) {
+            if let crate::extensions::Demand::Constant(name) = &row.demand {
+                names.insert(name.clone());
+            }
+        }
+    }
+    names
+}
+
+/// The extension fact that refuses the gem owning this constant.
+/// RBI ownership takes precedence over a gem-name namespace estimate.
+pub fn rails_dependent_owner<'a>(
+    app: &'a crate::App,
+    detail: &str,
+) -> Option<&'a crate::extensions::RailsDependentGem> {
+    let app_owned = AppConstants::of(app);
+    app.extensions
+        .rails_dependent
+        .iter()
+        .find(|row| extension_owns_constant(app, &app_owned, &row.gem, detail))
+}
+
+/// Constants the app itself defines, indexed once so that asking whether a
+/// gem owns a path does not rescan every model, controller and class.
+struct AppConstants {
+    /// Names of models, controllers and library classes.
+    classes: crate::det::HashSet<String>,
+    /// `Owner::NAME` for each constant an app class or model body assigns.
+    values: crate::det::HashSet<String>,
+}
+
+impl AppConstants {
+    fn of(app: &crate::App) -> Self {
+        let mut classes = crate::det::HashSet::default();
+        let mut values = crate::det::HashSet::default();
+        classes.extend(app.models.iter().map(|model| model.name.0.as_str().to_string()));
+        classes.extend(app.controllers.iter().map(|controller| controller.name.0.as_str().to_string()));
+        classes.extend(app.library_classes.iter().map(|class| class.name.0.as_str().to_string()));
+        for class in app.library_classes.iter().chain(app.rails_application.iter()) {
+            for (name, _) in &class.constants {
+                values.insert(format!("{}::{}", class.name.0.as_str(), name.as_str()));
+            }
+        }
+        for model in &app.models {
+            for item in &model.body {
+                if let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item {
+                    if let crate::expr::ExprNode::Assign {
+                        target: crate::expr::LValue::Const { path: assigned }, ..
+                    } = &*expr.node
+                    {
+                        if let [name] = assigned.as_slice() {
+                            values.insert(format!("{}::{}", model.name.0.as_str(), name.as_str()));
+                        }
+                    }
+                }
+            }
+        }
+        AppConstants { classes, values }
+    }
+
+    fn defines(&self, path: &str) -> bool {
+        self.classes.contains(path) || self.values.contains(path)
+    }
+}
+
+fn extension_owns_constant(app: &crate::App, app_owned: &AppConstants, gem: &str, path: &str) -> bool {
+    let path = path.trim_start_matches("::");
+    if crate::gem_boundary::RUBY_CORE.contains(&path) {
+        return false;
+    }
+    if app_owned.defines(path) {
+        return false;
+    }
+    if app.gem_boundary.classes.get(&crate::ident::ClassId(crate::ident::Symbol::from(path)))
+        .is_some_and(|class| class.gem == gem)
+    {
+        return true;
+    }
+    match app.gem_boundary.declares_path(gem, path) {
+        Some(declares) => declares,
+        None => {
+            let namespace = namespace_of(gem);
+            path == namespace || path.strip_prefix(&namespace).is_some_and(|rest| rest.starts_with("::"))
+        }
+    }
+}
+
+/// What owns a constant path; the same path recurs across many references.
+#[derive(Clone, Copy)]
+enum Owner<'a> {
+    None,
+    RailsDependent(&'a crate::extensions::RailsDependentGem),
+    Native(&'a str),
+}
+
+/// Answers "which gem owns this path" once per distinct path.
+struct Refuser<'a> {
+    app: &'a crate::App,
+    target: Option<&'a str>,
+    /// Whether a `rails_dependent` row inferred from the lockfile owns a path.
+    inferred: bool,
+    app_owned: AppConstants,
+    owners: std::cell::RefCell<crate::det::HashMap<String, Owner<'a>>>,
+}
+
+impl<'a> Refuser<'a> {
+    fn owner(&self, path: &str) -> Owner<'a> {
+        if let Some(owner) = self.owners.borrow().get(path) {
+            return *owner;
+        }
+        let app = self.app;
+        let owner = if let Some(row) = app.extensions.rails_dependent.iter()
+            .filter(|row| self.inferred || !row.inferred)
+            .find(|row| extension_owns_constant(app, &self.app_owned, &row.gem, path))
+        {
+            Owner::RailsDependent(row)
+        } else if self.target.is_some_and(|target| !matches!(target, "ruby" | "jruby")) {
+            app.extensions.runtime_gems.iter().map(|row| row.gem.as_str())
+                .chain(app.gem_boundary.loaded.iter().map(String::as_str))
+                .find(|gem| extension_owns_constant(app, &self.app_owned, gem, path))
+                .map_or(Owner::None, Owner::Native)
+        } else {
+            Owner::None
+        };
+        self.owners.borrow_mut().insert(path.to_string(), owner);
+        owner
+    }
+}
+
+/// Extension-owned constants need both their declared type and a runtime.
+/// `None` checks source analysis; a target also checks native availability.
+pub(crate) fn extension_gem_refusals(app: &crate::App, target: Option<&str>) -> Vec<crate::diagnostic::Diagnostic> {
+    gem_refusals(app, target, true)
+}
+
+/// The [`extension_gem_refusals`] that refuse a whole target: not a
+/// `rails_dependent` row inferred from the lockfile (a gem that depends on
+/// railties), whose references analysis reports as errors that
+/// `--allow-unsupported` downgrades, but a row a project extension writes
+/// and a target's native-gem refusals (#2280).
+pub(crate) fn extension_gem_boundary_refusals(app: &crate::App, target: &str) -> Vec<crate::diagnostic::Diagnostic> {
+    gem_refusals(app, Some(target), false)
+}
+
+fn gem_refusals(app: &crate::App, target: Option<&str>, inferred: bool) -> Vec<crate::diagnostic::Diagnostic> {
+    use crate::diagnostic::Diagnostic;
+    use crate::expr::{Expr, ExprNode};
+    use crate::span::Span;
+    if app.extensions.is_empty() || matches!(target, Some("blog" | "futamura")) {
+        return Vec::new();
+    }
+    let native_target = target.is_some_and(|target| !matches!(target, "ruby" | "jruby"));
+    if app.extensions.rails_dependent.is_empty()
+        && (!native_target || (app.extensions.runtime_gems.is_empty() && app.gem_boundary.loaded.is_empty()))
+    {
+        return Vec::new();
+    }
+    fn refusal(refuser: &Refuser, path: &str, span: Span) -> Option<Diagnostic> {
+        match refuser.owner(path) {
+            Owner::RailsDependent(row) => Some(Diagnostic::unsupported(
+                span,
+                None,
+                "gem_requires_rails",
+                if row.inferred {
+                    format!("{path}: gem {} {}, so requiring it loads Rails, which no emitted tree carries", row.gem, row.why)
+                } else {
+                    format!("{path}: a project extension marks gem {} rails_dependent: {}", row.gem, row.why)
+                },
+            )),
+            Owner::Native(owner) => {
+                let target = refuser.target?;
+                Some(Diagnostic::unsupported(
+                    span,
+                    Some(crate::ident::Symbol::from(target)),
+                    "native_extension_gem",
+                    format!("{path} is provided by gem {owner}; this target does not load native Ruby gems"),
+                ))
+            }
+            Owner::None => None,
+        }
+    }
+    fn visit(
+        expr: &Expr, refuser: &Refuser,
+        defined: &impl Fn(Span, &[crate::ident::Symbol]) -> bool, out: &mut Vec<Diagnostic>,
+    ) {
+        if let ExprNode::Const { path } = &*expr.node {
+            if expr.decisions & crate::expr::GENERATED_CONST_REF == 0 && defined(expr.span, path) {
+                return;
+            }
+            let path = path.iter().map(|part| part.as_str()).collect::<Vec<_>>().join("::");
+            if let Some(diagnostic) = refusal(refuser, &path, expr.span) {
+                out.push(diagnostic);
+            }
+        }
+        expr.node.for_each_child(&mut |child| visit(child, refuser, defined, out));
+    }
+    let refuser = Refuser { app, target, inferred, app_owned: AppConstants::of(app), owners: Default::default() };
+    let mut out = Vec::new();
+    let resolver = app.const_resolver.for_sources(&app.sources);
+    let defined = |span, path: &[crate::ident::Symbol]| resolver.has_definition(span, path);
+    crate::lower::for_each_emit_body_ref(app, &mut |expr| visit(expr, &refuser, &defined, &mut out));
+    for model in &app.models {
+        for item in &model.body {
+            if let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item {
+                visit(expr, &refuser, &defined, &mut out);
+            }
+        }
+    }
+    let defined_names = resolver.defined_names();
+    for class in app.library_classes.iter().chain(app.rails_application.iter()) {
+        for parent in class.parent.iter().chain(&class.includes) {
+            if defined_names.contains(parent.0.as_str()) {
+                continue;
+            }
+            if let Some(diagnostic) = refusal(&refuser, parent.0.as_str(), class.parent_span) {
+                out.push(diagnostic);
+            }
+        }
+    }
+    let mut seen = crate::det::HashSet::default();
+    out.retain(|diagnostic| seen.insert((
+        diagnostic.span.file.0, diagnostic.span.start, diagnostic.span.end, diagnostic.code(),
+    )));
+    out
 }
 
 /// True when `detail` names a constant under `root` (`Rouge::X`), not a
 /// longer identifier that merely ends with the root (`NotRouge::X`).
 pub fn detail_names_external_namespace(detail: &str, root: &str) -> bool {
+    if detail.trim_start_matches("::") == root {
+        return true;
+    }
     let needle = format!("{root}::");
     let bytes = detail.as_bytes();
     let mut start = 0;
@@ -755,6 +1729,57 @@ pub fn detail_names_external_namespace(detail: &str, root: &str) -> bool {
         start = abs + 1;
     }
     false
+}
+
+/// Hash index over external gem namespace roots: answers
+/// `roots.iter().any(|r| detail_names_external_namespace(detail, r))` by
+/// probing the roots a detail could contain instead of scanning every root,
+/// memoized per detail (the same details repeat across an app).
+#[derive(Default)]
+pub struct ExternalRootIndex {
+    roots: crate::det::HashSet<String>,
+    memo: crate::det::HashMap<String, bool>,
+}
+
+impl ExternalRootIndex {
+    pub fn new<'a>(namespaces: impl IntoIterator<Item = &'a String>) -> Self {
+        Self { roots: namespaces.into_iter().cloned().collect(), memo: Default::default() }
+    }
+
+    /// True when some root satisfies `detail_names_external_namespace`.
+    pub fn names_any(&mut self, detail: &str) -> bool {
+        if self.roots.is_empty() {
+            return false;
+        }
+        if let Some(&hit) = self.memo.get(detail) {
+            return hit;
+        }
+        let hit = self.probe(detail);
+        self.memo.insert(detail.to_string(), hit);
+        hit
+    }
+
+    fn probe(&self, detail: &str) -> bool {
+        if self.roots.contains(detail.trim_start_matches("::")) {
+            return true;
+        }
+        let bytes = detail.as_bytes();
+        // Every `::` is where a root-plus-`::` needle could end.
+        let seps: Vec<usize> = (0..bytes.len().saturating_sub(1))
+            .filter(|&i| bytes[i] == b':' && bytes[i + 1] == b':')
+            .collect();
+        for abs in 0..bytes.len() {
+            // The path-start rule of `detail_names_external_namespace`.
+            if !detail.is_char_boundary(abs) || (abs > 0 && is_ruby_ident_byte(bytes[abs - 1])) {
+                continue;
+            }
+            let first = seps.partition_point(|&p| p < abs);
+            if seps[first..].iter().any(|&p| self.roots.contains(&detail[abs..p])) {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 fn is_ruby_ident_byte(b: u8) -> bool {
@@ -913,6 +1938,143 @@ pub(crate) fn gems_owning_constant_with<'a>(census: &'a GemCensus, constant_path
 mod tests {
     use super::*;
 
+    /// A core class and what Ruby declares in it are defined; any other name
+    /// under a core root is not (`String::Nope` is Ruby's NameError).
+    #[test]
+    fn only_what_ruby_declares_under_a_core_class_is_a_core_constant() {
+        for defined in [&["Object"][..], &["String"], &["Object", "String"], &["Enumerator", "Lazy"], &["Float", "INFINITY"]] {
+            assert!(is_core_constant(defined), "{defined:?}");
+        }
+        for missing in [&["Object", "Missing"][..], &["String", "Nope"], &["Missing"], &["Float", "Nope"]] {
+            assert!(!is_core_constant(missing), "{missing:?}");
+        }
+    }
+
+    /// rotp's façade only raises, so the gem is compiled from source; WebPush's
+    /// also raises in gem_facades.rb, but the Spinel tree ports it, and a
+    /// sourced gem would drop the port's stub slots with the façade.
+    #[test]
+    fn a_ported_namespace_is_not_a_stub_facade() {
+        let stubs = stub_facade_namespaces();
+        assert!(stubs.contains("ROTP"), "{stubs:?}");
+        assert!(!stubs.contains("WebPush"), "{stubs:?}");
+    }
+
+    /// mission_control-jobs' engine requires importmap-rails, turbo-rails and stimulus-rails, which the runtime ports;
+    /// a gem the app ships stays a require.
+    #[test]
+    fn a_framework_fate_gem_is_a_framework_feature() {
+        for feature in ["importmap-rails", "turbo-rails", "stimulus-rails", "rails/engine"] {
+            assert!(is_framework_feature(feature), "{feature}");
+        }
+        assert!(!is_framework_feature("rotp"));
+        assert!(!is_framework_feature("i18n/backend/simple"));
+        assert!(!is_framework_feature("i18n"));
+    }
+
+    /// lobsters' own `Vips::Image` needs ruby-vips loaded, not only an Active Storage variant.
+    #[test]
+    fn an_app_s_vips_constant_needs_ruby_vips() {
+        assert!(compiler_runtime_gems().iter().any(|(marker, gem)| *gem == "ruby-vips" && matches!(marker, Marker::Constant("Vips"))));
+    }
+
+    #[test]
+    fn gemfile_requires_reads_each_spelling() {
+        let found = gemfile_requires(
+            "gem \"svg-graph\", require: \"SVG/Graph/TimeSeries\"\n\
+             gem \"plain\"\n\
+             group :development do\n  gem \"quiet\", require: false\nend\n\
+             gem \"both\", \"~> 1.0\", require: [\"a\", \"b/c\"]\n",
+        );
+        assert_eq!(found.get("svg-graph"), Some(&vec!["SVG/Graph/TimeSeries".to_string()]));
+        assert_eq!(found.get("quiet"), Some(&Vec::new()));
+        assert_eq!(found.get("both"), Some(&vec!["a".to_string(), "b/c".to_string()]));
+        assert!(!found.contains_key("plain"));
+    }
+
+    #[test]
+    fn external_root_index_matches_the_linear_scan() {
+        let roots: std::collections::BTreeSet<String> =
+            ["Rouge", "Outer::Root", "Root", "A", "Foo::Bar::Baz", "Zeitwerk"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        let details = [
+            "Rouge", "::Rouge", "::::Rouge", "Rouge::X", "::Rouge::X", "NotRouge::X",
+            "App::Types::Rouge::X", "App::Rouge", "Outer::Root::X", "::Outer::Root::X",
+            "X::Outer::Root::Y", "XRoot::Y", "Root::Y::Z", "Q::Root::Y", "_Root::Y", "9Root::Y",
+            "Foo::Bar::Baz::Q", "Foo::Bar::Baz", "X::Foo::Bar::Baz::Q", "Bar::Baz::Q", "A::B",
+            "A", "::A", "", "::", ":::", "::::", "Rouge:Rouge::X", " Rouge::X", "(Rouge::X)",
+            "Rouge::Rouge", "Zeitwerk::Loader::Foo", "Zeit::Foo", "Rouge::", "::Rouge::",
+            "É::Rouge::X", "ÉRouge::X", "Foo::Bar::Qux::Baz::Q", "Outer::Outer::Root::X",
+            "Outer:: Root::X", "Root::", "X Root::Y",
+        ];
+        for set in [roots, std::collections::BTreeSet::new(), ["".to_string()].into()] {
+            let mut index = ExternalRootIndex::new(&set);
+            for detail in details {
+                let linear = set.iter().any(|root| detail_names_external_namespace(detail, root));
+                assert_eq!(index.names_any(detail), linear, "{detail:?} against {set:?}");
+                assert_eq!(index.names_any(detail), linear, "memoized {detail:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_release_version_drops_only_a_listed_platform() {
+        let lock = Lockfile::parse("GEM\n  specs:\n    nokogiri (1.18.3-arm64-darwin)\n    pre (1.2.3-alpha)\n    rails (8.0.2)\n\nPLATFORMS\n  arm64-darwin\n  ruby\n");
+        assert_eq!(lock.release_version_of("nokogiri"), Some("1.18.3"));
+        assert_eq!(lock.release_version_of("pre"), Some("1.2.3-alpha"));
+        assert_eq!(lock.release_version_of("rails"), Some("8.0.2"));
+        assert_eq!(lock.release_version_of("absent"), None);
+    }
+
+    #[test]
+    fn git_activation_orders_dependencies_and_terminates_cycles() {
+        let lock = Lockfile::parse("GIT\n  remote: https://example.invalid/parent.git\n  revision: 1111111111111111111111111111111111111111\n  specs:\n    parent (1.0)\n      child\n\nGIT\n  remote: https://example.invalid/child.git\n  revision: 2222222222222222222222222222222222222222\n  specs:\n    child (2.0)\n      parent\n\nGEM\n  specs:\n    client (3.0)\n      parent\n\nDEPENDENCIES\n  client\n");
+        assert_eq!(lock.git_specs_in_closure(&["client", "parent"]), ["child", "parent"]);
+    }
+
+    #[test]
+    fn a_constant_belongs_to_the_gem_nested_deepest_over_it() {
+        let lock = Lockfile::parse("GEM\n  specs:\n    omniauth (2.1.2)\n    rack (3.1.8)\n    rack-attack (6.7.0)\n    rack-cors (2.0.2)\n    sentry-rails (5.0)\n    sentry-ruby (5.0)\n\nDEPENDENCIES\n  omniauth\n  rack-attack\n  rack-cors\n  sentry-rails\n  sentry-ruby\n");
+        assert_eq!(lock_gems_owning_constant(&lock, "Rack::Attack"), ["rack-attack"]);
+        assert_eq!(lock_gems_owning_constant(&lock, "Rack::Utils"), ["rack"]);
+        assert_eq!(lock_gems_owning_constant(&lock, "OmniAuth::Strategies"), ["omniauth"]);
+        assert_eq!(lock_gems_owning_constant(&lock, "Sentry"), ["sentry-rails", "sentry-ruby"]);
+        assert!(lock_gems_owning_constant(&lock, "Devise").is_empty());
+    }
+
+    #[test]
+    fn a_gem_may_name_its_namespace_by_its_leading_words_joined() {
+        let lock = Lockfile::parse("GEM\n  specs:\n    rails-settings-cached (2.9.6)\n\nDEPENDENCIES\n  rails-settings-cached\n");
+        assert_eq!(lock_gems_owning_constant(&lock, "RailsSettings::Base"), ["rails-settings-cached"]);
+    }
+
+    #[test]
+    fn lock_namespace_index_matches_the_ordered_scan() {
+        let mut names = vec!["caxlsx", "rubyzip", "sorbet-runtime", "net-http-persistent",
+            "polars-df", "ruby_llm", "svg-graph", "twilio-ruby", "sqlite3", "jwt", "zip_kit"];
+        names.extend(["rack", "rack-attack", "rack-cors", "rack_attack", "sentry-rails", "sentry-ruby",
+            "aws-sdk-s3", "a", "a-b", "a-b-c", "a_b", "A-b", "é", "é-b", "", "-", "--"]);
+        let mut paths = vec!["NotAGem".to_string(), "Rackette::Attack".into(), "::".into(), ":".into()];
+        for name in &names {
+            let nested = name.split('-').map(camelize).collect::<Vec<_>>().join("::");
+            for ns in std::iter::once(nested).chain(namespace_candidates(name)) {
+                paths.extend([ns.clone(), format!("::{ns}::Child"), ns.to_ascii_lowercase(),
+                    format!("{ns}ish"), format!("{ns}:Child"), format!("{ns}::")]);
+            }
+        }
+        let mut specs: Vec<_> = names.iter().map(|n| (n.to_string(), "1.0".to_string())).collect();
+        specs.push(("rack-attack".into(), "1.0-platform".into()));
+        for specs in [specs.clone(), specs.into_iter().rev().collect()] {
+            let lock = Lockfile { specs, ..Default::default() };
+            let index = LockGemIndex::new(&lock);
+            for path in &paths {
+                assert_eq!(index.owners(path), lock_gems_owning_constant(&lock, path), "{path:?}");
+            }
+        }
+    }
+
     #[test]
     fn graphql_owns_the_graphql_namespace() {
         // Name-derived, it would be `Graphql`; graphql-ruby's is `GraphQL`.
@@ -994,9 +2156,18 @@ BUNDLED WITH
         assert_eq!(fate_of("rubocop-rails"), GemFate::Infrastructure);
         assert_eq!(fate_of("opentelemetry-instrumentation-pg"), GemFate::Infrastructure);
         assert_eq!(fate_of("never-heard-of-it"), GemFate::Unknown);
+        assert_eq!(fate_of("inertia_rails"), GemFate::Modeled);
         assert_eq!(namespace_of("front_matter_parser"), "FrontMatterParser");
         assert_eq!(namespace_of("aws-sdk-s3"), "Aws");
         assert_eq!(namespace_of("rubyzip"), "Zip");
+        assert_eq!(namespace_of("polars-df"), "Polars");
+        assert_eq!(namespace_of("ruby_llm"), "RubyLLM");
+        assert_eq!(namespace_of("caxlsx"), "Axlsx");
+        assert_eq!(namespace_of("duckdb"), "DuckDB");
+        assert_eq!(namespace_of("mcp"), "MCP");
+        for gem in ["polars-df", "ruby_llm", "caxlsx", "duckdb", "mcp", "rubyzip"] {
+            assert_eq!(fate_of(gem), GemFate::Unknown, "{gem} stays unmodeled");
+        }
         let census = GemCensus::of(&Lockfile::parse(LOCK));
         assert_eq!(gem_owning_constant(&census, "Redcarpet::Markdown"), Some("redcarpet"));
         assert_eq!(namespace_of("sorbet-runtime"), "T");
@@ -1018,6 +2189,120 @@ BUNDLED WITH
         let lock = Lockfile::parse(LOCK);
         assert_eq!(gem_claiming_method(&lock, "policy_scope"), Some("pundit"));
         assert_eq!(gem_claiming_method(&lock, "acts_as_list"), None, "acts-as-list is not in this lock");
+    }
+
+    #[test]
+    fn irregular_namespaces_pass_through_ruby_emit_for_any_lockfile() {
+        let lock = "\
+GEM
+  remote: https://rubygems.org/
+  specs:
+    caxlsx (4.2.0)
+    duckdb (1.3.1)
+    mcp (0.4.0)
+    polars-df (0.20.0)
+    ruby_llm (1.8.2)
+    rubyzip (2.3.2)
+
+DEPENDENCIES
+  caxlsx
+  duckdb
+  mcp
+  polars-df
+  ruby_llm
+  rubyzip
+";
+        let source = "\
+class Export
+  def run
+    Zip::File.open(\"a.zip\")
+    Polars::DataFrame.new
+    RubyLLM.chat
+    Axlsx::Package.new
+    DuckDB::Database.open
+    MCP::Server.new
+  end
+end
+";
+        let tree = [
+            ("Gemfile.lock", lock),
+            ("lib/export.rb", source),
+        ]
+        .into_iter()
+        .map(|(path, text)| (std::path::PathBuf::from(path), text.as_bytes().to_vec()))
+        .collect();
+        let app = crate::ingest::ingest_app_from_tree(tree).expect("ingest locked irregular gems");
+        let namespaces = locked_external_gem_namespaces(&app);
+        for name in ["Zip", "Polars", "RubyLLM", "Axlsx", "DuckDB", "MCP"] {
+            assert!(namespaces.contains(name), "{name} missing from {namespaces:?}");
+        }
+        for miss in ["Rubyzip", "PolarsDf", "RubyLlm", "Caxlsx", "Duckdb", "Mcp"] {
+            assert!(
+                !namespaces.contains(miss),
+                "camelized miss {miss} must not be the Ruby-emit pass-through key"
+            );
+        }
+        assert!(
+            !detail_names_external_namespace("Mcp::Tool", "MCP"),
+            "an app module Mcp is a different constant from the mcp gem"
+        );
+        let census = GemCensus::of(app.gem_lock.as_ref().expect("lock"));
+        for gem in ["caxlsx", "duckdb", "mcp", "polars-df", "ruby_llm", "rubyzip"] {
+            assert_eq!(
+                census.gems.iter().find(|g| g.name == gem).map(|g| g.fate),
+                Some(GemFate::Unknown),
+                "{gem} must stay unknown"
+            );
+        }
+        assert_eq!(gem_owning_constant(&census, "Polars::DataFrame"), Some("polars-df"));
+        assert_eq!(gem_owning_constant(&census, "RubyLLM::Chat"), Some("ruby_llm"));
+        assert_eq!(gem_owning_constant(&census, "Axlsx::Package"), Some("caxlsx"));
+        assert_eq!(gem_owning_constant(&census, "DuckDB::Database"), Some("duckdb"));
+        assert_eq!(gem_owning_constant(&census, "MCP::Server"), Some("mcp"));
+        assert_eq!(gem_owning_constant(&census, "Zip::File"), Some("rubyzip"));
+
+        let files = crate::project::target_files(&app, std::path::Path::new("."), crate::project::BuildTarget::Ruby)
+            .expect("emit Ruby project");
+        let export = files
+            .iter()
+            .find(|(_, content)| content.contains("class Export"))
+            .map(|(_, content)| content.as_str())
+            .expect("emitted Export");
+        for konst in ["Zip::File", "Polars::DataFrame", "RubyLLM.chat", "Axlsx::Package", "DuckDB::Database", "MCP::Server"] {
+            assert!(
+                export.contains(konst),
+                "Ruby emit must keep locked gem constant {konst}:\n{export}"
+            );
+        }
+        assert!(
+            !export.contains("PolarsDf") && !export.contains("RubyLlm") && !export.contains("Caxlsx"),
+            "emit must not rewrite the gem's real constant:\n{export}"
+        );
+        let gemfile = files.iter().find(|(path, _)| path == "Gemfile").expect("Gemfile").1.as_str();
+        for pin in [
+            "gem \"caxlsx\", \"= 4.2.0\"",
+            "gem \"duckdb\", \"= 1.3.1\"",
+            "gem \"mcp\", \"= 0.4.0\"",
+            "gem \"polars-df\", \"= 0.20.0\"",
+            "gem \"ruby_llm\", \"= 1.8.2\"",
+            "gem \"rubyzip\", \"= 2.3.2\"",
+        ] {
+            assert!(gemfile.contains(pin), "missing {pin} in\n{gemfile}");
+        }
+        let boot = files.iter().find(|(path, _)| path == "boot.rb").expect("boot.rb").1.as_str();
+        for feature in ["caxlsx", "duckdb", "mcp", "polars-df", "ruby_llm"] {
+            assert!(
+                boot.contains(&format!("require {feature:?}")),
+                "boot must load {feature} by gem name:\n{boot}"
+            );
+        }
+        assert!(
+            !boot.contains("require \"rubyzip\""),
+            "rubyzip has no rubyzip.rb entry; boot must not require that name:\n{boot}"
+        );
+        assert!(loads_by_gem_name("duckdb") && loads_by_gem_name("mcp"));
+        assert!(loads_by_gem_name("message_bus") && loads_by_gem_name("ruby_llm"));
+        assert!(!loads_by_gem_name("rubyzip"));
     }
 
     #[test]
@@ -1071,6 +2356,13 @@ GEM
     rails (8.0.2)
 ";
         assert_eq!(lock_path_remotes(lock), vec!["lib/billing", "../shared"]);
+        assert_eq!(
+            lock_path_sources(lock),
+            vec![
+                PathSource { remote: "lib/billing".into(), specs: vec!["billing".into()] },
+                PathSource { remote: "../shared".into(), specs: vec!["shared".into()] },
+            ]
+        );
         assert!(lock_path_remotes(LOCK).is_empty());
         let parsed = Lockfile::parse(lock);
         assert!(parsed.is_from_git("widgets"));
@@ -1088,3 +2380,82 @@ pub const GEM_STYLESHEETS: &[(&str, &[&str])] = &[
     ("action_text-trix", &["trix"]),
     ("lexxy", &["lexxy-content", "lexxy-editor", "lexxy-variables", "lexxy"]),
 ];
+
+/// Every class and module `runtime/spinel/*.rb` declares, by full name: a gem's
+/// constant ported there (`Net::HTTP::Persistent`) runs on the Spinel tree.
+pub(crate) fn spinel_runtime_constants() -> &'static crate::det::HashSet<String> {
+    static NAMES: std::sync::OnceLock<crate::det::HashSet<String>> = std::sync::OnceLock::new();
+    NAMES.get_or_init(|| declared_runtime_constants(&["runtime/spinel"]))
+}
+
+/// The same over the shared ports too (`runtime/ruby/typeid.rb`'s `TypeID`),
+/// which every Ruby-family tree and the Spinel one carry. Not a façade: its
+/// raising stand-in is what a gem compiled from source replaces.
+pub(crate) fn ported_runtime_constants() -> &'static crate::det::HashSet<String> {
+    static NAMES: std::sync::OnceLock<crate::det::HashSet<String>> = std::sync::OnceLock::new();
+    NAMES.get_or_init(|| declared_runtime_constants(&["runtime/spinel", "runtime/ruby"]))
+}
+
+/// Top-level namespaces whose façade in `runtime/ruby/gem_facades.rb`
+/// answers a call by `GemFacade.fail!` (rotp's `ROTP`): the Spinel tree
+/// has no working body for them.
+pub(crate) fn stub_facade_namespaces() -> &'static crate::det::HashSet<String> {
+    static NAMES: std::sync::OnceLock<crate::det::HashSet<String>> = std::sync::OnceLock::new();
+    NAMES.get_or_init(|| {
+        let mut out = crate::det::HashSet::default();
+        let Ok(text) = crate::runtime_files::read_to_string("runtime/ruby/gem_facades.rb") else { return out };
+        let mut current: Option<String> = None;
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("module ").or_else(|| line.strip_prefix("class ")) {
+                let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                current = (!name.is_empty() && name != "GemFacade").then_some(name);
+            } else if line.contains("GemFacade.fail!")
+                && let Some(name) = &current
+            {
+                out.insert(name.clone());
+            }
+        }
+        // Not one the Spinel tree ports (`runtime/spinel/web_push.rb`): the sourced gem would drop the whole façade, and the port's stub slots with it.
+        out.retain(|name| !spinel_runtime_constants().contains(name));
+        out
+    })
+}
+
+fn declared_runtime_constants(dirs: &[&str]) -> crate::det::HashSet<String> {
+    struct Declared {
+        nesting: Vec<String>,
+        out: crate::det::HashSet<String>,
+    }
+    impl Declared {
+        fn enter(&mut self, path: &ruby_prism::Node<'_>) {
+            let name = String::from_utf8_lossy(path.location().as_slice()).trim_start_matches("::").to_string();
+            self.nesting.push(name);
+            self.out.insert(self.nesting.join("::"));
+        }
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Declared {
+        fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
+            self.enter(&node.constant_path());
+            ruby_prism::visit_module_node(self, node);
+            self.nesting.pop();
+        }
+        fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+            self.enter(&node.constant_path());
+            ruby_prism::visit_class_node(self, node);
+            self.nesting.pop();
+        }
+    }
+    let mut files = Vec::new();
+    for dir in dirs {
+        let _ = crate::runtime_files::walk_flat(dir, &["rb"], "runtime/", &mut files);
+    }
+    let mut declared = Declared { nesting: Vec::new(), out: crate::det::HashSet::default() };
+    for (path, source) in &files {
+        if path.ends_with("facade.rb") || path.ends_with("facades.rb") {
+            continue;
+        }
+        let parsed = ruby_prism::parse(source.as_bytes());
+        ruby_prism::Visit::visit(&mut declared, &parsed.node());
+    }
+    declared.out
+}

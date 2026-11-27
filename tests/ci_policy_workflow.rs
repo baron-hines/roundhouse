@@ -1,122 +1,11 @@
+#[path = "support/scratch.rs"]
+mod scratch;
+#[cfg(all(target_os = "linux", debug_assertions))]
+#[path = "support/test_subprocess.rs"]
+mod test_subprocess;
+
 use std::fs;
 
-#[test]
-fn unit_batches_all_targets_without_reducing_coverage() {
-    let ci: serde_yaml_ng::Value =
-        serde_yaml_ng::from_str(&fs::read_to_string(".github/workflows/ci.yml").unwrap()).unwrap();
-    let unit = &ci["jobs"]["unit"];
-    assert!(unit.get("if").is_none());
-    assert!(unit.get("continue-on-error").is_none());
-    assert_eq!(unit["runs-on"].as_str(), Some("ubuntu-latest"));
-    assert_eq!(unit["strategy"]["fail-fast"].as_bool(), Some(false));
-    assert_eq!(unit["strategy"]["max-parallel"].as_u64(), Some(4));
-    assert_eq!(
-        unit["strategy"]["matrix"]["shard"],
-        serde_yaml_ng::from_str::<serde_yaml_ng::Value>("[0, 1, 2, 3]").unwrap()
-    );
-    assert!(
-        unit.get("outputs").is_none(),
-        "no racing matrix artifact output"
-    );
-    assert_eq!(
-        unit["env"]["CARGO_PROFILE_TEST_SPLIT_DEBUGINFO"].as_str(),
-        Some("unpacked")
-    );
-    assert!(
-        ci["env"]
-            .get("CARGO_PROFILE_TEST_SPLIT_DEBUGINFO")
-            .is_none()
-    );
-    let steps = unit["steps"].as_sequence().unwrap();
-    let gems = steps
-        .iter()
-        .position(|step| {
-            step["name"].as_str()
-                == Some("Install gems used by emitted Ruby and Campfire harness tests")
-        })
-        .expect("install sqlite3, bcrypt and ruby-vips before the unit batches");
-    let install = steps[gems]["run"].as_str().unwrap();
-    assert!(
-        install.contains("sqlite3")
-            && install.contains("bcrypt")
-            && install.contains("ruby-vips")
-            && install.contains("rails-html-sanitizer")
-            && install.contains("activerecord"),
-        "{install}"
-    );
-    let vips = steps
-        .iter()
-        .position(|step| {
-            step["name"].as_str() == Some("System libvips for the emitted ruby-vips processor")
-        })
-        .expect("install libvips42 before ruby-vips");
-    let vips_run = steps[vips]["run"].as_str().unwrap();
-    assert!(
-        vips_run.contains("ci-apt-install") && vips_run.contains("libvips42"),
-        "{vips_run}"
-    );
-    assert!(
-        vips < gems,
-        "ruby-vips binds the system libvips; the package must be on the box first"
-    );
-    let tests = steps
-        .iter()
-        .position(|step| step["name"].as_str() == Some("Build and run all test targets in batches"))
-        .expect("batch every lib/bin/integration target through Cargo");
-    assert!(
-        gems < tests,
-        "Campfire launcher regressions require bcrypt before the batches"
-    );
-    assert!(steps[tests].get("if").is_none());
-    assert!(steps[tests].get("continue-on-error").is_none());
-    let body = steps[tests]["run"].as_str().unwrap();
-    assert!(body.contains("--out \"$RUNNER_TEMP/unit-resources/tests\" --"));
-    assert!(body.contains("python3 scripts/ci-unit-tests.py"));
-    assert!(body.contains(
-        "--shard-index ${{ strategy.job-index }} --shard-count ${{ strategy.job-total }}"
-    ));
-    assert!(
-        !body.contains("cargo test --locked --all-targets"),
-        "all-target peak must not rebuild every integration executable at once"
-    );
-    let timings = steps
-        .iter()
-        .find(|step| {
-            step["with"]["name"].as_str() == Some("unit-build-timings-${{ matrix.shard }}")
-        })
-        .expect("retain build timings for investigation");
-    assert_eq!(timings["if"].as_str(), Some("always()"));
-    assert_eq!(
-        timings["with"]["path"].as_str(),
-        Some("target/cargo-timings/")
-    );
-    let bench = steps
-        .iter()
-        .find(|step| {
-            step["name"].as_str()
-                == Some("Emit every bench lane in the debug profile (scripts/bench's shape)")
-        })
-        .expect("retain the independent dev-profile stack-overflow gate");
-    assert_eq!(bench["if"].as_str(), Some("matrix.shard == 0"));
-    assert!(bench.get("continue-on-error").is_none());
-    let body = bench["run"].as_str().unwrap();
-    assert!(body.contains("bash -euo pipefail -c"));
-    assert!(body.contains("typescript crystal rust python elixir go kotlin swift csharp"));
-    assert!(body.contains("target/debug/emit_preview --target"));
-    assert!(
-        !body.contains("cargo run"),
-        "shard 0 already built bins; do not pay cargo startup per lane"
-    );
-    let resources = steps
-        .iter()
-        .find(|step| step["with"]["name"].as_str() == Some("unit-resources-${{ matrix.shard }}"))
-        .expect("retain phase samples even when a command fails");
-    assert_eq!(resources["if"].as_str(), Some("always()"));
-    assert_eq!(
-        resources["with"]["path"].as_str(),
-        Some("${{ runner.temp }}/unit-resources/")
-    );
-}
 
 #[test]
 fn speculative_fanout_retains_selection_and_real_prerequisites() {
@@ -124,9 +13,14 @@ fn speculative_fanout_retains_selection_and_real_prerequisites() {
         serde_yaml_ng::from_str(&fs::read_to_string(".github/workflows/ci.yml").unwrap()).unwrap();
     let jobs = &ci["jobs"];
     assert!(jobs.get("writebook-inventory").is_none());
-    assert_eq!(jobs["unit"]["needs"].as_str(), Some("generate-fixture"));
+    assert_eq!(jobs["unit-build"]["needs"].as_str(), Some("generate-fixture"));
+    assert_eq!(
+        jobs["unit"]["needs"],
+        serde_yaml_ng::from_str::<serde_yaml_ng::Value>("[generate-fixture, unit-build]").unwrap()
+    );
     assert_eq!(jobs["generate-fixture"]["needs"].as_str(), Some("plan"));
     assert!(jobs["generate-fixture"].get("if").is_none());
+    assert!(jobs["unit-build"].get("if").is_none());
     assert!(jobs["unit"].get("if").is_none());
     for name in [
         "build-roundhouse",
@@ -135,19 +29,25 @@ fn speculative_fanout_retains_selection_and_real_prerequisites() {
     ] {
         assert_eq!(jobs[name]["needs"].as_str(), Some("plan"), "{name}");
     }
-    for name in [
-        "store-check",
-        "browser-smoke-typescript",
-        "compare",
-        "compare-extra",
-        "compare-ruby",
-        "compare-ruby-next",
-        "compare-jruby",
-    ] {
+    for name in ["store-check", "browser-smoke-typescript"] {
         assert_eq!(
             jobs[name]["needs"],
             serde_yaml_ng::from_str::<serde_yaml_ng::Value>("[generate-fixture, plan]").unwrap(),
             "{name} must not wait for tests, or lose its fixture/selection"
+        );
+    }
+    // The CRuby and JRuby compare jobs wait for the builds they reuse, never for tests.
+    for (name, needs) in [
+        ("compare-ruby", "[generate-fixture, plan, unit-build, build-roundhouse]"),
+        ("compare-jruby", "[generate-fixture, plan, unit-build, build-roundhouse]"),
+        ("compare-ruby-next", "[generate-fixture, plan, unit-build]"),
+        ("compare", "[generate-fixture, plan, unit-build]"),
+        ("compare-extra", "[generate-fixture, plan, unit-build]"),
+    ] {
+        assert_eq!(
+            jobs[name]["needs"],
+            serde_yaml_ng::from_str::<serde_yaml_ng::Value>(needs).unwrap(),
+            "{name} must wait only for the builds it consumes"
         );
     }
     for name in [
@@ -174,6 +74,7 @@ fn speculative_fanout_retains_selection_and_real_prerequisites() {
     for name in ["compact-required", "ci-summary"] {
         let needs = jobs[name]["needs"].as_sequence().unwrap();
         for required in [
+            "unit-build",
             "unit",
             "build-roundhouse",
             "campfire-conformance",
@@ -253,14 +154,34 @@ fn shared_debug_compiler_is_selected_and_built_without_waiting_for_tests() {
 fn campfire_consumers_require_shared_debug_binary_and_do_not_rebuild() {
     let ci: serde_yaml_ng::Value =
         serde_yaml_ng::from_str(&fs::read_to_string(".github/workflows/ci.yml").unwrap()).unwrap();
-    for job_name in ["campfire-compare", "campfire-conformance"] {
+    for job_name in [
+        "campfire-compare",
+        "campfire-conformance",
+        "campfire-spinel-build",
+        "campfire-spinel-db",
+    ] {
         let job = &ci["jobs"][job_name];
-        assert_eq!(job["needs"][0].as_str(), Some("build-roundhouse"));
-        assert_eq!(job["needs"][1].as_str(), Some("plan"));
-        let expected_if = format!(
-            "${{{{ contains(fromJSON(needs.plan.outputs.jobs), '{job_name}') && needs.build-roundhouse.outputs.roundhouse-bin-artifact-id != '' }}}}"
+        let needs: Vec<_> = job["needs"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(|n| n.as_str())
+            .collect();
+        assert!(
+            needs.contains(&"build-roundhouse") && needs.contains(&"plan"),
+            "{job_name}: {needs:?}"
         );
-        assert_eq!(job["if"].as_str(), Some(expected_if.as_str()), "{job_name}");
+        let if_expr = job["if"].as_str().unwrap();
+        assert!(
+            if_expr.contains(&format!(
+                "contains(fromJSON(needs.plan.outputs.jobs), '{job_name}')"
+            )),
+            "{job_name}: {if_expr}"
+        );
+        assert!(
+            if_expr.contains("needs.build-roundhouse.outputs.roundhouse-bin-artifact-id != ''"),
+            "{job_name}: {if_expr}"
+        );
         let steps = job["steps"].as_sequence().unwrap();
         assert!(
             steps.iter().all(|step| {
@@ -288,14 +209,22 @@ fn campfire_consumers_require_shared_debug_binary_and_do_not_rebuild() {
             .iter()
             .find(|step| step["name"].as_str() == Some("Stage shared debug roundhouse binary"))
             .unwrap_or_else(|| panic!("{job_name}: stage shared binary"));
-        let body = stage["run"].as_str().unwrap();
-        assert!(body.contains("chmod +x roundhouse-debug-bin/roundhouse"));
+        // Anchors must expand: every consumer keeps the stage body, not just the
+        // `&stage-roundhouse-debug-bin` definition on campfire-compare.
+        let body = stage["run"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{job_name}: stage step missing run body after YAML load"));
         assert!(
-            body.contains("ROUNDHOUSE_BIN=${GITHUB_WORKSPACE}/roundhouse-debug-bin/roundhouse")
+            body.contains("chmod +x roundhouse-debug-bin/roundhouse"),
+            "{job_name}"
         );
-        assert!(body.contains("ROUNDHOUSE_BIN_TRACE=1"));
-        assert!(body.contains("source_sha=${GITHUB_SHA}"));
-        assert!(body.contains("profile=debug"));
+        assert!(
+            body.contains("ROUNDHOUSE_BIN=${GITHUB_WORKSPACE}/roundhouse-debug-bin/roundhouse"),
+            "{job_name}"
+        );
+        assert!(body.contains("ROUNDHOUSE_BIN_TRACE=1"), "{job_name}");
+        assert!(body.contains("source_sha=${GITHUB_SHA}"), "{job_name}");
+        assert!(body.contains("profile=debug"), "{job_name}");
         // No cargo in the job body outside comments.
         let runs: Vec<_> = steps
             .iter()
@@ -343,6 +272,75 @@ fn campfire_consumers_require_shared_debug_binary_and_do_not_rebuild() {
     );
 }
 
+/// compare-ruby and compare-ruby-next once spent most of their minutes
+/// compiling Roundhouse twice (the test profile for the CRuby gates, release
+/// for `bin/rh transpile`) to run a few seconds of tests. They now run those
+/// gates from unit-build's archive and emit with build-roundhouse's binary.
+#[test]
+fn cruby_compare_jobs_run_archived_gates_and_do_not_rebuild_roundhouse() {
+    let ci: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(&fs::read_to_string(".github/workflows/ci.yml").unwrap()).unwrap();
+    for (job_name, selectors) in [
+        ("compare-ruby", &["framework_tests_ruby", "uuid_key_ruby", "tiny_api:cruby_gate_", "roda_toolchain"][..]),
+        ("compare-ruby-next", &["framework_tests_ruby", "uuid_key_ruby", "tiny_api:cruby_gate_"][..]),
+    ] {
+        let job = &ci["jobs"][job_name];
+        assert_eq!(
+            job["env"]["CARGO_TARGET_DIR"].as_str(),
+            Some("${{ github.workspace }}/target"),
+            "{job_name}: the archive's paths are the producer's"
+        );
+        let steps = job["steps"].as_sequence().unwrap();
+        let bundle = steps
+            .iter()
+            .find(|step| step["name"].as_str() == Some("Download current-run test bundle"))
+            .unwrap_or_else(|| panic!("{job_name}: download the unit-build archive"));
+        assert_eq!(
+            bundle["with"]["artifact-ids"].as_str(),
+            Some("${{ needs.unit-build.outputs.unit-test-artifact-id }}"),
+            "{job_name}"
+        );
+        assert!(
+            steps.iter().any(|step| step["uses"].as_str() == Some("./.github/actions/setup-nextest")),
+            "{job_name}: the pinned Nextest runs the archive"
+        );
+        let gates = steps
+            .iter()
+            .find(|step| step["name"].as_str() == Some("Run the CRuby gates from the unit-build archive"))
+            .and_then(|step| step["run"].as_str())
+            .unwrap_or_else(|| panic!("{job_name}: archived CRuby gates"));
+        assert!(gates.contains("python3 scripts/ci-unit-tests.py select"), "{job_name}");
+        for selector in selectors {
+            assert!(gates.contains(&format!("--select {selector}")), "{job_name}: {selector}");
+        }
+        for run in steps.iter().filter_map(|step| step["run"].as_str()) {
+            for line in run.lines().map(str::trim).filter(|line| !line.starts_with('#')) {
+                assert!(
+                    !line.contains("cargo test") && !line.contains("cargo run") && !line.contains("cargo build"),
+                    "{job_name} must not compile Roundhouse: {line}"
+                );
+            }
+        }
+    }
+    // scripts/compare's `bin/rh transpile ruby` uses the staged compiler.
+    let steps = ci["jobs"]["compare-ruby"]["steps"].as_sequence().unwrap();
+    let stage = steps
+        .iter()
+        .find(|step| step["name"].as_str() == Some("Stage shared debug roundhouse binary"))
+        .and_then(|step| step["run"].as_str())
+        .expect("compare-ruby stages build-roundhouse's binary");
+    assert!(stage.contains("ROUNDHOUSE_BIN=${GITHUB_WORKSPACE}/roundhouse-debug-bin/roundhouse"));
+    let staged = steps
+        .iter()
+        .position(|step| step["name"].as_str() == Some("Stage shared debug roundhouse binary"))
+        .unwrap();
+    let compare = steps
+        .iter()
+        .position(|step| step["run"].as_str() == Some("scripts/compare ruby"))
+        .expect("compare-ruby runs scripts/compare ruby");
+    assert!(staged < compare, "the binary is staged before scripts/compare runs");
+}
+
 /// The strict-emit ceiling counts `error[` lines. An ingest abort prints
 /// none and exits nonzero, so the step must fail on the exit status too;
 /// a clean emit inside the ceiling must still pass.
@@ -360,8 +358,7 @@ fn strict_emit_ceiling_fails_an_ingest_abort_that_prints_no_error_line() {
         .and_then(|step| step["run"].as_str())
         .expect("strict-emit ceiling")
         .to_owned();
-    let dir = std::env::temp_dir().join(format!("roundhouse-ceiling-{}", std::process::id()));
-    fs::create_dir_all(&dir).unwrap();
+    let dir = scratch::dir("roundhouse-ceiling");
     let step = |bin_body: &str, ceiling: &str| {
         let bin = dir.join("roundhouse");
         fs::write(&bin, format!("#!/bin/sh\n{bin_body}\n")).unwrap();
@@ -392,57 +389,6 @@ fn strict_emit_ceiling_fails_an_ingest_abort_that_prints_no_error_line() {
     fs::remove_dir_all(&dir).ok();
 }
 
-/// campfire-latest's survey: a recorded gap count wins; no survey line
-/// after a run that finished or stopped at counted errors is zero gaps;
-/// a crash with neither is `unknown`, which keeps the suite from running.
-#[test]
-#[cfg(unix)]
-fn campfire_latest_survey_tells_zero_gaps_from_an_unknown_result() {
-    use std::os::unix::fs::PermissionsExt;
-    let ci: serde_yaml_ng::Value =
-        serde_yaml_ng::from_str(&fs::read_to_string(".github/workflows/ci.yml").unwrap()).unwrap();
-    let job = &ci["jobs"]["campfire-latest"];
-    let steps = job["steps"].as_sequence().unwrap();
-    let run = steps
-        .iter()
-        .find(|step| step["id"].as_str() == Some("survey"))
-        .and_then(|step| step["run"].as_str())
-        .expect("survey step")
-        .to_owned();
-    let suite_if = steps
-        .iter()
-        .find(|step| step["id"].as_str() == Some("suite"))
-        .and_then(|step| step["if"].as_str())
-        .expect("suite step condition");
-    assert_eq!(suite_if, "${{ steps.survey.outputs.gaps == '0' }}");
-    let dir = std::env::temp_dir().join(format!("roundhouse-survey-{}", std::process::id()));
-    fs::create_dir_all(&dir).unwrap();
-    let gaps = |bin_body: &str| {
-        let bin = dir.join("roundhouse");
-        fs::write(&bin, format!("#!/bin/sh\n{bin_body}\n")).unwrap();
-        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
-        let out = dir.join("output");
-        fs::write(&out, "").unwrap();
-        let status = std::process::Command::new("bash")
-            .args(["-c", &run])
-            .env("ROUNDHOUSE_BIN", &bin)
-            .env("GITHUB_OUTPUT", &out)
-            .status()
-            .unwrap();
-        assert!(status.success(), "the survey step itself never fails");
-        fs::read_to_string(&out)
-            .unwrap()
-            .lines()
-            .find_map(|l| l.strip_prefix("gaps=").map(str::to_owned))
-            .expect("gaps output")
-    };
-    assert_eq!(gaps("echo '── Survey: 2 ingest gap(s), 2 distinct kind(s) ──'; exit 1"), "2");
-    assert_eq!(gaps("echo 'x.rb:1:1: error[unsupported]: nope'; exit 1"), "0");
-    assert_eq!(gaps("echo 'emitted 3 files'; exit 0"), "0");
-    assert_eq!(gaps("echo 'thread main panicked'; exit 101"), "unknown");
-    fs::remove_dir_all(&dir).ok();
-}
-
 #[test]
 #[cfg(all(target_os = "linux", debug_assertions))]
 fn test_backtraces_retain_library_and_integration_source_locations() {
@@ -457,15 +403,11 @@ fn test_backtraces_retain_library_and_integration_source_locations() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let root = std::env::temp_dir().join(format!(
-        "roundhouse-backtrace-{}-{unique}",
-        std::process::id()
-    ));
-    fs::create_dir(&root).unwrap();
+    let root = scratch::dir(&format!("roundhouse-backtrace-{unique}"));
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "test_backtraces_retain_library_and_integration_source_locations",
+            test_subprocess::name!("test_backtraces_retain_library_and_integration_source_locations"),
             "--nocapture",
         ])
         .env(PROBE, "1")
@@ -517,6 +459,7 @@ fn routing_and_required_results_reject_false_green() {
         "tests/ci_plan_test.py",
         "tests/ci_plan_focus_test.py",
         "tests/ci_archive_evidence_test.py",
+        "tests/ci_site_test.py",
     ] {
         let result = std::process::Command::new("python3")
             .args(["-B", test, "-v"])
@@ -553,21 +496,23 @@ fn compact_and_extra_compare_share_commands_but_not_results() {
         controller_identity["if"].as_str(),
         Some("${{ !cancelled() && matrix.target == 'rust' }}")
     );
+    // The archive selection fails unless the inventory names exactly this ignored case and
+    // Nextest runs it (`--no-tests fail`), which is what the old success-line grep proved.
     let identity_run = controller_identity["run"].as_str().unwrap();
-    let cargo_command = concat!(
-        "cargo test --locked --test rust_toolchain ",
-        "real_blog_controller_identity_values_match_rails -- --ignored --nocapture --exact"
-    );
     assert!(
-        identity_run.contains(&format!("if output=$({cargo_command} 2>&1); then")),
-        "the required Rust toolchain command and exact filter must be preserved:\n{identity_run}"
+        identity_run.contains("python3 scripts/ci-unit-tests.py select")
+            && identity_run.contains(
+                "--select rust_toolchain::real_blog_controller_identity_values_match_rails"
+            ),
+        "the required Rust toolchain case must be selected exactly:\n{identity_run}"
     );
-    let success_check =
-        "grep -Fxq 'test real_blog_controller_identity_values_match_rails ... ok' <<< \"$output\"";
-    assert!(
-        identity_run.contains(success_check),
-        "the selected outer test must produce its exact success line:\n{identity_run}"
-    );
+    for step in compare_steps {
+        let run = step["run"].as_str().unwrap_or("");
+        assert!(
+            !run.contains("cargo test") && !run.contains("cargo build"),
+            "compare legs run their suites from unit-build's archive:\n{run}"
+        );
+    }
     assert!(
         controller_identity["continue-on-error"].is_null()
             || controller_identity["continue-on-error"].as_bool() == Some(false),
@@ -594,6 +539,7 @@ fn compact_and_extra_compare_share_commands_but_not_results() {
     let spinel_coe = "${{ needs.plan.outputs.spinel-advisory == 'true' }}";
     for name in [
         "spinel-build",
+        "spinel-toolchain-build",
         "spinel-toolchain",
         "spinel-compare",
         "spinel-framework",
@@ -604,6 +550,44 @@ fn compact_and_extra_compare_share_commands_but_not_results() {
             "{name} CoE must follow plan spinel-advisory"
         );
     }
+    let toolchain = &jobs["spinel-toolchain"];
+    let toolchain_needs: Vec<_> = toolchain["needs"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .filter_map(|n| n.as_str())
+        .collect();
+    assert!(
+        toolchain_needs.contains(&"spinel-toolchain-build"),
+        "shards must wait on the compile-once producer: {toolchain_needs:?}"
+    );
+    assert!(
+        toolchain["if"]
+            .as_str()
+            .unwrap()
+            .contains("needs.spinel-toolchain-build.outputs.artifact-id != ''"),
+        "missing toolchain binaries must block shards, not cargo-rebuild"
+    );
+    let producer_steps = jobs["spinel-toolchain-build"]["steps"]
+        .as_sequence()
+        .unwrap();
+    assert!(
+        producer_steps.iter().any(|step| {
+            step["uses"]
+                .as_str()
+                .is_some_and(|u| u.contains("setup-rust"))
+        }),
+        "producer compiles with Rust"
+    );
+    assert!(
+        toolchain["steps"].as_sequence().unwrap().iter().all(|step| {
+            step["uses"]
+                .as_str()
+                .map(|u| !u.contains("setup-rust") && !u.contains("rust-cache"))
+                .unwrap_or(true)
+        }),
+        "toolchain shards must not recompile"
+    );
     assert_eq!(
         ci["jobs"]["plan"]["outputs"]["spinel-advisory"].as_str(),
         Some("${{ steps.plan.outputs.spinel-advisory }}")
@@ -705,80 +689,6 @@ fn compact_and_extra_compare_share_commands_but_not_results() {
     assert!(ci["permissions"].get("id-token").is_none());
 }
 
-/// Verifies the required Rust identity step needs execution and preserves Cargo failures.
-#[cfg(unix)]
-#[test]
-fn rust_identity_ci_guard_requires_execution_and_propagates_failure() {
-    use std::os::unix::fs::PermissionsExt;
-    use std::process::Command;
-
-    let ci: serde_yaml_ng::Value =
-        serde_yaml_ng::from_str(&fs::read_to_string(".github/workflows/ci.yml").unwrap()).unwrap();
-    let step = ci["jobs"]["compare"]["steps"]
-        .as_sequence()
-        .unwrap()
-        .iter()
-        .find(|step| {
-            step["name"].as_str()
-                == Some("cargo test --test rust_toolchain controller identity values")
-        })
-        .unwrap();
-
-    let unique = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let root = std::env::temp_dir().join(format!(
-        "rust-identity-ci-{}-{unique}",
-        std::process::id()
-    ));
-    fs::create_dir(&root).unwrap();
-    let cargo = root.join("cargo");
-    fs::write(
-        &cargo,
-        r#"#!/bin/sh
-printf '<%s>\n' "$@" >> "$CARGO_LOG"
-case "$CARGO_MODE" in
-  success) printf '%s\n' 'test real_blog_controller_identity_values_match_rails ... ok'; exit 0 ;;
-  zero_match) printf '%s\n' 'running 0 tests'; exit 0 ;;
-  forged_success_on_failure) printf '%s\n' 'test real_blog_controller_identity_values_match_rails ... ok'; exit 37 ;;
-  *) exit 64 ;;
-esac
-"#,
-    )
-    .unwrap();
-    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
-
-    let cargo_args = "<test>\n<--locked>\n<--test>\n<rust_toolchain>\n<real_blog_controller_identity_values_match_rails>\n<-->\n<--ignored>\n<--nocapture>\n<--exact>\n";
-    for (mode, expected_status) in [
-        ("success", 0),
-        ("zero_match", 1),
-        ("forged_success_on_failure", 37),
-    ] {
-        let log = root.join("cargo.log");
-        fs::write(&log, "").unwrap();
-        let result = Command::new("bash")
-            .args(["-e", "-o", "pipefail", "-c", step["run"].as_str().unwrap()])
-            .env("CARGO_LOG", &log)
-            .env("CARGO_MODE", mode)
-            .env("CARGO_TERM_COLOR", "always")
-            .env(
-                "PATH",
-                format!("{}:{}", root.display(), std::env::var("PATH").unwrap()),
-            )
-            .output()
-            .unwrap();
-        assert_eq!(
-            result.status.code(),
-            Some(expected_status),
-            "{mode}: {result:?}"
-        );
-        assert_eq!(fs::read_to_string(log).unwrap(), cargo_args);
-    }
-
-    fs::remove_dir_all(root).unwrap();
-}
-
 #[test]
 fn generated_npm_projects_cache_downloads_without_skipping_preparation() {
     let workflow: serde_yaml_ng::Value =
@@ -869,8 +779,7 @@ fn archive_smoke_reuses_setup_ruby_cache_without_skipping_readme_execution() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let root = std::env::temp_dir().join(format!("archive-bundle-{}-{unique}", std::process::id()));
-    fs::create_dir(&root).unwrap();
+    let root = scratch::dir(&format!("archive-bundle-{unique}"));
     let output = std::process::Command::new("bash")
         .args([
             "-euo",
@@ -939,44 +848,55 @@ fn focused_framework_loop_runs_every_selection_and_preserves_failure() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let root = std::env::temp_dir().join(format!("framework-loop-{}-{unique}", std::process::id()));
-    fs::create_dir(&root).unwrap();
+    let root = scratch::dir(&format!("framework-loop-{unique}"));
+    // `cargo test --no-run` answers each suite's binary; the binary logs how it ran and fails for `fails`.
     let cargo = root.join("cargo");
     fs::write(
         &cargo,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CARGO_LOG\"\n[ \"$3\" != fails ]\n",
+        concat!(
+            "#!/bin/sh\n",
+            "prev=\n",
+            "for a in \"$@\"; do\n",
+            "  if [ \"$prev\" = --test ]; then\n",
+            "    printf '{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"%s\",\"kind\":[\"test\"]},\"executable\":\"%s/%s\"}\\n' \"$a\" \"$STUBS\" \"$a\"\n",
+            "  fi\n",
+            "  prev=$a\n",
+            "done\n",
+        ),
     )
     .unwrap();
     fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+    let stubs = root.join("stubs");
+    fs::create_dir(&stubs).unwrap();
+    for name in ["first", "second", "fails", "survivor", "param_binds", "param_binds_values", "param_binds_cleanup", "framework_tests_spinel"] {
+        let stub = stubs.join(name);
+        fs::write(&stub, format!("#!/bin/sh\nprintf '{name} %s\\n' \"$*\" >> \"$RUN_LOG\"\n[ {name} != fails ]\n")).unwrap();
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+    }
     for (tests, expected_success, expected_log) in [
-        (
-            "first second",
-            true,
-            "test --test first -- --ignored --nocapture\ntest --test second -- --ignored --nocapture\n",
-        ),
-        (
-            "fails survivor",
-            false,
-            "test --test fails -- --ignored --nocapture\ntest --test survivor -- --ignored --nocapture\n",
-        ),
+        ("first second", true, "first --ignored --nocapture\nsecond --ignored --nocapture\n"),
+        ("fails survivor", false, "fails --ignored --nocapture\nsurvivor --ignored --nocapture\n"),
         (
             "param_binds param_binds_values param_binds_cleanup framework_tests_spinel",
             true,
             concat!(
-                "test --test param_binds -- --ignored --nocapture _spinel\n",
-                "test --test param_binds_values -- --ignored --nocapture _spinel\n",
-                "test --test param_binds_cleanup -- --ignored --nocapture _spinel\n",
-                "test --test framework_tests_spinel -- --ignored --nocapture\n",
+                "framework_tests_spinel --ignored --nocapture\n",
+                "param_binds --ignored --nocapture _spinel\n",
+                "param_binds_cleanup --ignored --nocapture _spinel\n",
+                "param_binds_values --ignored --nocapture _spinel\n",
             ),
         ),
         ("", false, ""),
     ] {
-        let log = root.join("cargo.log");
+        let log = root.join("run.log");
         fs::write(&log, "").unwrap();
         let result = Command::new("bash")
             .args(["-e", "-o", "pipefail", "-c", step["run"].as_str().unwrap()])
             .env("TESTS", tests)
-            .env("CARGO_LOG", &log)
+            .env("RUN_LOG", &log)
+            .env("STUBS", &stubs)
+            .env("RUNNER_TEMP", &root)
+            .env_remove("CI_SPINEL_TIMINGS_OUT")
             .env(
                 "PATH",
                 format!("{}:{}", root.display(), std::env::var("PATH").unwrap()),
@@ -984,8 +904,167 @@ fn focused_framework_loop_runs_every_selection_and_preserves_failure() {
             .output()
             .unwrap();
         assert_eq!(result.status.success(), expected_success, "{result:?}");
-        assert_eq!(fs::read_to_string(log).unwrap(), expected_log);
+        // The suites run side by side, so in any order.
+        let mut ran: Vec<String> = fs::read_to_string(log).unwrap().lines().map(String::from).collect();
+        ran.sort();
+        // Not one run per suite: each first runs to record its shareable Spinel cases (`RH_SPINEL_BUNDLE_COLLECT`).
+        let collected: Vec<String> = expected_log.lines().map(|l| l.replace(" --nocapture", "")).collect();
+        let mut expected: Vec<&str> = expected_log.lines().chain(collected.iter().map(String::as_str)).collect();
+        expected.sort();
+        assert_eq!(ran, expected, "{result:?}");
     }
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// A slow suite is stopped and named inside the job's limit, with the shard's
+/// other suites reported and timed; `spinel` runs at the lane's `-O` level.
+#[cfg(unix)]
+#[test]
+fn framework_loop_stops_a_slow_suite_and_compiles_at_its_opt_level() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = scratch::dir(&format!("framework-budget-{unique}"));
+    let executable = |path: &std::path::Path, body: String| {
+        fs::write(path, body).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    executable(
+        &root.join("cargo"),
+        concat!(
+            "#!/bin/sh\n",
+            "prev=\n",
+            "for a in \"$@\"; do\n",
+            "  if [ \"$prev\" = --test ]; then\n",
+            "    printf '{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"%s\",\"kind\":[\"test\"]},\"executable\":\"%s/%s\"}\\n' \"$a\" \"$STUBS\" \"$a\"\n",
+            "  fi\n",
+            "  prev=$a\n",
+            "done\n",
+        )
+        .to_string(),
+    );
+    executable(&root.join("spinel"), "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$RUN_LOG\"\n".to_string());
+    let stubs = root.join("stubs");
+    fs::create_dir(&stubs).unwrap();
+    executable(&stubs.join("slow"), "#!/bin/sh\nsleep 60\n".to_string());
+    executable(&stubs.join("quick"), "#!/bin/sh\necho quick-output\nspinel app.rb -o app\n".to_string());
+
+    for (opt, expected) in [(Some("0"), "-O0 app.rb -o app\n"), (Some("2"), "-O2 app.rb -o app\n"), (None, "app.rb -o app\n")] {
+        let log = root.join("run.log");
+        fs::write(&log, "").unwrap();
+        let timings = root.join("timings.jsonl");
+        fs::write(&timings, "").unwrap();
+        let mut command = Command::new("bash");
+        command
+            .args(["-e", "-o", "pipefail", "-c", "scripts/ci-spinel-framework.sh"])
+            .env("TESTS", "slow quick")
+            .env("RUN_LOG", &log)
+            .env("STUBS", &stubs)
+            .env("RUNNER_TEMP", &root)
+            .env("CI_SPINEL_TIMINGS_OUT", &timings)
+            .env("CI_SPINEL_FRAMEWORK_BUDGET", "3")
+            .env("CI_SPINEL_OPT", opt.unwrap_or(""))
+            .env("PATH", format!("{}:{}", root.display(), std::env::var("PATH").unwrap()));
+        let start = std::time::Instant::now();
+        let result = command.output().unwrap();
+        assert!(start.elapsed().as_secs() < 30, "the budget did not stop the suite: {result:?}");
+        assert!(!result.status.success(), "a stopped suite fails the shard: {result:?}");
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        assert!(stdout.contains("::error::slow stopped at this shard's 3s budget"), "{stdout}");
+        assert!(stdout.contains("::group::quick") && stdout.contains("quick-output"), "{stdout}");
+        assert_eq!(fs::read_to_string(&log).unwrap(), expected, "{stdout}");
+        let recorded = fs::read_to_string(&timings).unwrap();
+        assert!(
+            recorded.lines().any(|l| l.contains("\"name\": \"slow\"") && l.contains("\"timed_out\": true")),
+            "{recorded}"
+        );
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn framework_loop_runs_a_suite_beside_the_build_of_its_shared_cases() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = scratch::dir(&format!("framework-bundle-{unique}"));
+    let executable = |path: &std::path::Path, body: &str| {
+        fs::write(path, body).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    executable(
+        &root.join("cargo"),
+        concat!(
+            "#!/bin/sh\n",
+            "prev=\n",
+            "for a in \"$@\"; do\n",
+            "  if [ \"$prev\" = --test ]; then\n",
+            "    printf '{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"%s\",\"kind\":[\"test\"]},\"executable\":\"%s/%s\"}\\n' \"$a\" \"$STUBS\" \"$a\"\n",
+            "  fi\n",
+            "  prev=$a\n",
+            "done\n",
+        ),
+    );
+    let stubs = root.join("stubs");
+    fs::create_dir(&stubs).unwrap();
+    executable(
+        &stubs.join("shared"),
+        concat!(
+            "#!/bin/sh\n",
+            "if [ -n \"$RH_SPINEL_BUNDLE_COLLECT\" ]; then echo '{\"test\":\"shared::case\"}' > \"$RH_SPINEL_BUNDLE_COLLECT/k.json\"; exit 101; fi\n",
+            "echo shared-started >> \"$RUN_LOG\"\n",
+            "until [ -e \"$RH_SPINEL_BUNDLE/finished\" ]; do sleep 0.1; done\n",
+            "printf 'shared %s bundle=%s\\n' \"$*\" \"$RH_SPINEL_BUNDLE\" >> \"$RUN_LOG\"\n",
+        ),
+    );
+    executable(&stubs.join("alone"), "#!/bin/sh\n[ -n \"$RH_SPINEL_BUNDLE_COLLECT\" ] || printf 'alone %s\\n' \"$*\" >> \"$RUN_LOG\"\n");
+    executable(
+        &stubs.join("spinel_bundle"),
+        concat!(
+            "#!/bin/sh\n",
+            "echo '[\"k\"]' > \"$RH_SPINEL_BUNDLE_OUT/pending.json\"\n",
+            "i=0; until grep -q shared-started \"$RUN_LOG\" 2> /dev/null || [ $i -gt 100 ]; do i=$((i+1)); sleep 0.1; done\n",
+            "printf 'spinel_bundle %s cases=%s\\n' \"$*\" \"$(ls \"$RH_SPINEL_BUNDLE_COLLECT\")\" >> \"$RUN_LOG\"\n",
+            "echo '{\"shared::case\": 40}' > \"$RH_SPINEL_BUNDLE_OUT/seconds.json\"\n",
+        ),
+    );
+    let log = root.join("run.log");
+    let timings = root.join("timings.jsonl");
+    let result = Command::new("bash")
+        .args(["-e", "-o", "pipefail", "-c", "scripts/ci-spinel-framework.sh"])
+        .env("TESTS", "shared alone")
+        .env("RUN_LOG", &log)
+        .env("STUBS", &stubs)
+        .env("RUNNER_TEMP", &root)
+        .env("CI_SPINEL_TIMINGS_OUT", &timings)
+        .env("PATH", format!("{}:{}", root.display(), std::env::var("PATH").unwrap()))
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "{result:?}");
+    let ran = fs::read_to_string(&log).unwrap();
+    let bundle = ran.lines().position(|l| l == "spinel_bundle --ignored --exact spinel_bundle_build --nocapture cases=k.json");
+    let shared = ran.lines().position(|l| {
+        l == format!("shared --ignored --nocapture bundle={}/spinel-framework/bundles", root.display())
+    });
+    let started = ran.lines().position(|l| l == "shared-started");
+    assert!(started.is_some() && bundle.is_some() && shared.is_some() && started < bundle && bundle < shared, "{ran}");
+    assert!(ran.lines().any(|l| l == "alone --ignored --nocapture"), "{ran}");
+    let recorded = fs::read_to_string(&timings).unwrap();
+    let seconds = recorded
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .find(|r| r["name"] == "shared")
+        .map(|r| r["seconds"].as_u64().unwrap());
+    assert!(seconds.is_some_and(|s| s >= 40), "the shared build is charged to its suite: {recorded}");
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -1009,7 +1088,7 @@ fn framework_loop_supplies_postgres_and_pinned_spinel_pg_to_the_pg_gate() {
     let steps = job["steps"].as_sequence().unwrap();
     let checkout = steps
         .iter()
-        .find(|step| step["with"]["repository"].as_str() == Some("rubys/spinel-pg"))
+        .find(|step| step["with"]["repository"].as_str() == Some("roundhouse-rb/spinel-pg"))
         .expect("spinel-pg checkout");
     assert_eq!(
         checkout["with"]["ref"].as_str(),
@@ -1026,11 +1105,14 @@ fn framework_loop_supplies_postgres_and_pinned_spinel_pg_to_the_pg_gate() {
         Some("${{ github.workspace }}/spinel-pg")
     );
     assert!(
-        run["env"]["DATABASE_URL"]
+        run["env"]["ROUNDHOUSE_PG_TEST_URL"]
             .as_str()
             .unwrap()
             .contains("@127.0.0.1:5432/")
     );
+    // Required where the server is provided: an unset URL fails the
+    // gate there instead of skipping it.
+    assert_eq!(run["env"]["ROUNDHOUSE_PG_TEST_REQUIRED"].as_str(), Some("1"));
 }
 
 #[test]
@@ -1129,6 +1211,11 @@ fn spinel_jobs_are_selected_explicitly_and_archive_evidence_reaches_pages() {
         })
         .unwrap();
     assert!(verify < pages);
+    assert_eq!(
+        steps[pages]["with"]["name"].as_str(),
+        Some("github-pages-${{ github.run_attempt }}"),
+        "per-attempt Pages artifact avoids duplicate github-pages on rerun --failed"
+    );
     assert!(
         jobs["ci-summary"]["needs"]
             .as_sequence()
@@ -1145,7 +1232,7 @@ fn full_scheduler_runs_every_preflight_success_fresh_and_never_grants_pr_deploy_
             .unwrap();
     assert_eq!(
         full["on"]["schedule"][0]["cron"].as_str(),
-        Some("17 */4 * * *")
+        Some("17 */3 * * *")
     );
     assert!(full["on"].get("push").is_none());
     assert!(full["on"].get("pull_request").is_none());
@@ -1196,6 +1283,11 @@ fn full_scheduler_runs_every_preflight_success_fresh_and_never_grants_pr_deploy_
     );
     assert!(deploy.get("continue-on-error").is_none());
     assert_eq!(deploy["permissions"]["pages"].as_str(), Some("write"));
+    assert_eq!(
+        deploy["permissions"]["actions"].as_str(),
+        Some("read"),
+        "deploy artifact resolver lists this run's github-pages-* uploads"
+    );
     let deploy_text = serde_yaml_ng::to_string(deploy).unwrap();
     assert!(
         !deploy_text.contains("VALIDATED_SHA"),
@@ -1205,9 +1297,32 @@ fn full_scheduler_runs_every_preflight_success_fresh_and_never_grants_pr_deploy_
         !deploy_text.contains("Refuse to publish a superseded main snapshot"),
         "main advancing mid-run must not starve github-pages"
     );
+    let deploy_steps = deploy["steps"].as_sequence().unwrap();
+    let resolve = deploy_steps
+        .iter()
+        .find(|step| step["name"].as_str() == Some("Resolve Pages artifact"))
+        .expect("deploy-only rerun needs attempt fallback resolution");
+    let resolve_run = resolve["run"].as_str().unwrap();
+    assert!(
+        resolve_run.contains("github-pages-$n"),
+        "resolver must walk github-pages-N attempt names"
+    );
+    assert!(
+        resolve_run.contains("--paginate"),
+        "artifact list must paginate (Full val exceeds default page size)"
+    );
+    let deploy_pages = deploy_steps
+        .iter()
+        .find(|step| {
+            step["uses"]
+                .as_str()
+                .is_some_and(|uses| uses.starts_with("actions/deploy-pages@"))
+        })
+        .expect("deploy-pages step");
     assert_eq!(
-        deploy["steps"][0]["uses"].as_str(),
-        Some("actions/deploy-pages@v5")
+        deploy_pages["with"]["artifact_name"].as_str(),
+        Some("${{ steps.pages-artifact.outputs.name }}"),
+        "deploy must consume the resolved per-attempt assemble-site Pages artifact"
     );
 }
 
@@ -1227,8 +1342,7 @@ fn scheduler_preflight_executes_publication_guards_and_unknown_input_fallback() 
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let root = std::env::temp_dir().join(format!("full-preflight-{}-{unique}", std::process::id()));
-    fs::create_dir(&root).unwrap();
+    let root = scratch::dir(&format!("full-preflight-{unique}"));
     for (name, script) in [(
         "gh",
         "#!/bin/sh\nprintf 'called\\n' >> \"$GH_LOG\"\n[ \"$MOCK_SPINEL\" != unavailable ] || exit 1\nprintf '%s\\n' \"$MOCK_SPINEL\"\n",
@@ -1241,7 +1355,7 @@ fn scheduler_preflight_executes_publication_guards_and_unknown_input_fallback() 
     for (event, repo, reference, publish, revision, expected) in [
         (
             "schedule",
-            "rubys/roundhouse",
+            "roundhouse-rb/roundhouse",
             "refs/heads/main",
             "false",
             spinel_sha,
@@ -1249,7 +1363,7 @@ fn scheduler_preflight_executes_publication_guards_and_unknown_input_fallback() 
         ),
         (
             "schedule",
-            "rubys/roundhouse",
+            "roundhouse-rb/roundhouse",
             "refs/heads/main",
             "false",
             "unavailable",
@@ -1257,11 +1371,27 @@ fn scheduler_preflight_executes_publication_guards_and_unknown_input_fallback() 
         ),
         (
             "schedule",
-            "rubys/roundhouse",
+            "roundhouse-rb/roundhouse",
             "refs/heads/main",
             "false",
             "malformed",
             Some(("true", "master")),
+        ),
+        (
+            "workflow_dispatch",
+            "roundhouse-rb/roundhouse",
+            "refs/heads/main",
+            "true",
+            spinel_sha,
+            Some(("true", spinel_sha)),
+        ),
+        (
+            "workflow_dispatch",
+            "contributor/roundhouse",
+            "refs/heads/main",
+            "true",
+            spinel_sha,
+            None,
         ),
         (
             "workflow_dispatch",
@@ -1272,16 +1402,24 @@ fn scheduler_preflight_executes_publication_guards_and_unknown_input_fallback() 
             Some(("false", spinel_sha)),
         ),
         (
+            "schedule",
+            "rubys/roundhouse",
+            "refs/heads/main",
+            "false",
+            spinel_sha,
+            None,
+        ),
+        (
             "workflow_dispatch",
             "rubys/roundhouse",
             "refs/heads/main",
             "true",
             spinel_sha,
-            Some(("true", spinel_sha)),
+            None,
         ),
         (
             "workflow_dispatch",
-            "rubys/roundhouse",
+            "roundhouse-rb/roundhouse",
             "refs/heads/topic",
             "true",
             spinel_sha,

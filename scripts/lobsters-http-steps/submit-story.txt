@@ -1,0 +1,8 @@
+# submit a story with a description, find it on /newest and /recent, then edit it
+GET /stories/new
+POST /stories story[title]=A+story+from+the+replay&story[url]=https://example.com/replay&story[description]=Plain&story[user_is_author]=0&story[tags][]=ruby
+GET /newest
+GET /recent
+GET /stories/{last_story}/edit
+POST /stories/{last_story} _method=patch&story[title]=An+edited+story&story[description]=Edited&story[tags][]=ruby
+GET /newest

@@ -26,13 +26,13 @@ comments, nested routes, validations, Turbo Streams, Action Cable,
 Tailwind, JSON endpoints) is the shared DOM-equivalence fixture for
 **every server target** in scheduled full validation. Ordinary PRs run the
 Ruby floor plus selected target lanes; pushes to canonical `main` run Ruby
-plus Spinel. The extra-language matrix waits for the four-hour schedule or
+plus Spinel. The extra-language matrix waits for the three-hour schedule or
 `ci:full`. See [CI coverage](../ci/README.md).
 A passing target's comparison proves the blog's features on that target.
 
 **Campfire** (Basecamp's chat product — file attachments with image
 variants, rich text, web push, bots and webhooks, full-text search,
-signed cookies and sessions, `Current`, fragment caching, rate
+signed and encrypted cookies and sessions, `Current`, fragment caching, rate
 limiting, ~70 routes) is what the **Ruby shape** — running on CRuby,
 and compiled by [Spinel](spinel.md) — passes the same gate against,
 along with Campfire's own test suite and its cable broadcasts. What
@@ -133,7 +133,7 @@ diagnostic corpus until its independent framework and Spinel gaps close.
 |---|---|---|
 | Attributes | From `db/schema.rb` (migrations as fallback), typed per column; `id`, timestamps, defaults, nullability | + `enum`, `serialize`/`has_json` columns, `has_secure_token`, `has_secure_password` (real bcrypt) |
 | Associations | `belongs_to`, `has_many` (with `dependent:`), `has_one`; association readers, builders, `<assoc>_ids` | + `has_many :through`, polymorphic, `touch:`, `has_one_attached`/`has_many_attached`, `has_rich_text` |
-| Validations | `presence`, `absence`, `length` (min/max), `numericality` (bounds, `only_integer`), `format`, `inclusion`, `uniqueness`; `errors`, `full_messages`, `valid?` | + custom `validate` methods, conditional `if:`/`unless:` |
+| Validations | `presence` (a NOT NULL integer column with no default reads nil until it is assigned, as in Rails; on a NOT NULL float, decimal or reference column with no default, or one the model writes through its own `<col>=`, it is a reported gap on every target), `absence`, `length` (min/max), `numericality` (bounds, `only_integer`), `format`, `inclusion`, `uniqueness` (`scope:`, `case_sensitive:`, `allow_nil:`/`allow_blank:`; a strict target probes each rule with one `SELECT 1 … LIMIT 1`, and one over a temporal, JSON, enum, array or polymorphic column is a reported gap there); `errors`, `full_messages`, `valid?` | + custom `validate` methods, conditional `if:`/`unless:`, `confirmation` (`case_sensitive:`; the `<attr>_confirmation` accessor where the model has none), and each `validates_<kind>_of` form as the `validates` call Rails makes of it (`validates_comparison_of`'s `comparison:` rule is a reported gap) |
 | Callbacks | `after_create_commit` and the Turbo `broadcasts_to` family | + `before_save`/`after_save`, `before_destroy`, `after_touch`, STI-aware callback inheritance |
 | Queries | `where` (hash and string), `order`, `limit`, `find`, `find_by`, `first`/`last`, `count`, `exists?`, `includes`, `pluck`, named `scope`s — folded to SQL by the Arel builder | + `joins`, `left_joins`, `group`/`count`, `select`, `distinct`, `or`, `none`, `find_or_create_by`, `insert_all`, `update_all`, `in_batches`, `sum`; a live `Relation` for chains the builder can't fold |
 | Persistence | `create`, `save`, `update`, `destroy`, `new`/`build` | + `destroy!`, `increment!`, `update_columns`, transactions, dirty tracking predicates |
@@ -171,10 +171,30 @@ not add generic class-object/Relation support to strict targets.
 |---|---|---|
 | Actions | The seven RESTful actions and any other; implicit render | + Rails 8.1.4 `head(status, options = nil)` on Ruby + Spinel (see below), `send_file`, `rescue_from`, `rate_limit` (`to:`/`within:`/`by:`/`with:`/`only:`/`except:`, counted in the app's cache as in Rails), `invisible_captcha` (`only:`/`except:`/`prepend:` → honeypot `spam?` on `subtitle` only; rotated/custom names unmodeled), pretender `impersonates :scope` when the controller defines a local `current_<scope>` (wraps it as `true_<scope>`, adds `impersonate_` / `stop_impersonating_`; inherited-only Devise helpers stay unsupported) |
 | Filters | `before_action` with `only:`/`except:`, ivar flow into views | + `around_action`, `after_action`, `if:`/`unless:` guards (symbol and lambda), `skip_before_action`, filters from concerns |
-| Params | `params.expect`, `params.require(...).permit(...)`, `params[:id]`; typed by the schema they're assigned to | + nested permits, arrays, `params.merge`, indifferent access; a missing resource answers 400; JSON bodies wrapped under the model name (`wrap_parameters`, on by default since `load_defaults 7.0`) |
+| Params | `params.expect`, `params.require(...).permit(...)`, `params[:id]`; typed by the schema they're assigned to | + nested permits, arrays, `params.merge`, indifferent access; a missing resource answers 400; JSON bodies wrapped under the model name (`wrap_parameters`, on by default since `load_defaults 7.0`); multiparameter keys (`title(1)`, `body(2i)`) on a String or Text attribute, stored as Rails stores them (see below) |
 | Responses | `render` (template, partial, `json:`, `status:`), `redirect_to` (record, path, `status:`), `respond_to` with `format.html`/`format.json`, `flash` and `flash.now` | + `expires_in`, `stale?`/`fresh_when` (answered as always fresh — a deliberate divergence), `cookies` and `cookies.signed`/`.permanent`, `session`, `helper_method`, `layout` |
 | Concerns | `include`d modules with `included do` filter blocks | + `class_methods`, concern-defined actions and helpers |
-| Auth | — | `Current` attributes, `authenticate_by`, signed/global ids, `has_secure_password` sessions |
+| Auth and request | — | `Current` attributes, `authenticate_by`, signed/global ids, `has_secure_password` sessions; `request.headers` (`[]`, `fetch`, `key?`, case-insensitive HTTP and Rack names), `request.authorization` (including Rack and legacy authorization env keys), route-only `request.path_parameters`, and HTTP Token/Bearer and Basic auth helpers |
+
+**Multiparameter keys.** Rails' `permit(:title)` also keeps `title(1)`,
+`title(2i)` and `title(3f)`, the parts `date_select` submits, and
+assignment rebuilds the attribute from them. For a String or Text
+attribute (and `has_secure_password`'s password, confirmation and
+challenge), Rails assigns the text of the parts Hash, so `title(1)=T`
+stores `{1 => "T"}`. Roundhouse reproduces that text, Ruby 3.4's
+`Hash#inspect` form, for parts that are plain printable ASCII (no `"`,
+`\` or `#`) or `i` integers, with a blank part as `nil`. Validations see
+it, and a save writes it, as in Rails. Any other attribute type (a date
+column builds a Date), an `f` part, other text, or only blank parts raise
+an error naming the gap before the record changes. `date_select` itself
+is not supported. This is the Ruby family (Ruby and Spinel) only: the
+other targets ignore multiparameter keys.
+
+The Spinel dispatcher forwards incoming request headers into the request's
+Rack env (`HTTP_*`, plus unprefixed `CONTENT_TYPE` and `CONTENT_LENGTH`).
+Token and Bearer schemes are matched case-insensitively. This covers the
+request/authentication surface, not application-specific authorization
+policy or unsupported route behavior.
 
 `ActionController::Head#head` takes a positional status and optional
 options hash. Roundhouse supports registered status symbols, integer
@@ -210,7 +230,7 @@ promise in the API prose.
 | | Blog tier | Campfire tier |
 |---|---|---|
 | Templates | ERB; partials (`render "form"`, `render @articles`, `render partial:` with locals and collections); layouts; `content_for`/`yield` | + HAML is read by the analyzer; emit is ERB-only today |
-| Helpers | `link_to`, `button_to`, `form_with` and the form builder (`label`, `text_field`, `text_area`, `submit`, `hidden_field`), `dom_id`, `pluralize`, `truncate`, `l`/`t` with the app's locale files, `csrf_meta_tags`, `stylesheet_link_tag`, `javascript_importmap_tags`, `turbo_stream_from`, `cache` | + `image_tag`/`asset_path` with digests, `tag.*` builders, `content_tag`, `sanitize` (safe-list sanitizer port), `turbo_frame_tag`, the rest of the form builder (`select`, `check_box`, `radio_button`, `button`, `url_field`, `email_field`, `password_field`, `file_field`, `rich_text_area`, `fields_for`), `hidden_field_tag`, `time_ago_in_words`, `number_to_human`, `url_for` |
+| Helpers | `link_to`, `button_to`, `form_with` and the form builder (`label`, `text_field`, `text_area`, `submit`, `hidden_field`), `dom_id`, `pluralize`, `truncate`, `l`/`t` with the app's locale files, `csrf_meta_tags`/`csrf_meta_tag`, `stylesheet_link_tag`, `javascript_importmap_tags`, `turbo_stream_from`, `cache` | + `image_tag`/`asset_path` with digests, `tag.*` builders, `content_tag`, `sanitize` (safe-list sanitizer port), `turbo_frame_tag`, the rest of the form builder (`select`, `check_box`, `radio_button`, `button`, `url_field`, `email_field`, `number_field`, `range_field`, `search_field`, `telephone_field`/`phone_field`, `password_field`, `file_field`, `rich_text_area`, `fields_for`; any other builder method, and the `in:`/`within:` and `autosave:`/`onsearch:` options Rails rewrites at render, is an error), `hidden_field_tag`, `time_ago_in_words`, `number_to_human`, `url_for` |
 | JSON | jbuilder views (`json.extract!`, `json.array!`, partials) | + `as_json`/`to_json` shapes on records and plain objects |
 | Turbo | Turbo Streams broadcast on model commit, `turbo_stream` responses, frames | + custom stream targets and `broadcast_*_later` |
 
@@ -218,15 +238,15 @@ promise in the API prose.
 
 | Component | Status |
 |---|---|
-| Action Cable | Every server target: `/cable`, `turbo_stream_from` subscriptions, model broadcasts. Campfire tier adds application channels with `subscribed`/`unsubscribed`, `stream_for`, and presence. |
-| Active Job | Campfire tier: `perform_later` runs on an in-process queue in the app; `ActiveJob::TestHelper` assertions in the tests. No external queue adapter. |
+| Action Cable | Every server target: `/cable`, `turbo_stream_from` subscriptions, model broadcasts. Campfire tier adds application channels with `subscribed`/`unsubscribed`, `stream_for`, and presence, and client actions (`subscription.perform(action, data)`) with Rails' rules for which methods are actions and which receive `data`. |
+| Active Job | Campfire tier: `perform_later` runs on an in-process queue in the app; `ActiveJob::TestHelper` assertions in the tests. On the Ruby-family lanes a job is queued as a serialized ActiveJob payload (GlobalID records, primitives, Symbols, Times and Arrays of them), honoring `queue_as`, `discard_on ActiveJob::DeserializationError` and `enqueue_after_transaction_commit`; a job with other argument types keeps a closure, with a warning. With `queue_adapter :sidekiq` on `ApplicationJob`, those lanes push payload jobs to Redis in Sidekiq 8's format instead, honoring literal `set(wait:, wait_until:, queue:)`; the same build runs them as a Sidekiq worker (`./app sidekiq`, `ruby sidekiq.rb`) reading config/sidekiq.yml, with broadcasts through Redis under config/cable.yml's `adapter: redis`, or a Ruby Sidekiq process can. The worker retries failed jobs with Sidekiq's rules (`retry`, `retry_for`, `dead: false`, `:max_retries:`) and its scheduler moves due retries and scheduled jobs back onto their queues. Literal `retry_on`, `discard_on`, `retry_jitter` and `sidekiq_options` (`retry`, `retry_queue`, `retry_for`, `dead`) are honored as Active Job and Sidekiq honor them. The other targets warn and run jobs in process. Under `queue_adapter :solid_queue` the in-process queue keeps each job's queue (`queue_as`, literal `set(queue:)`), and on the Ruby-family lanes `SolidQueue::Queue.find_by_name(name).clear` drops that queue's waiting jobs; `SolidQueue::Semaphore` is always empty, since `limits_concurrency` is not modeled, and `wait:`/`wait_until:` are dropped with a warning. No other external queue adapter. |
 | Active Storage | Campfire tier: blobs and attachments, the disk service, the engine's routes (redirect and representation), variants via libvips on Spinel. No cloud services. |
 | Action Text | Campfire tier: `has_rich_text`, the safe-list sanitizer, attachment rendering. |
-| Action Mailer | Ruby tier: mailer classes, `mail(...)`, `deliver_now`/`deliver_later` — delivery appends to `ActionMailer::Base.deliveries` (Rails' `:test` method, which the emitted tests assert against). No SMTP. |
-| Routing | `resources`/`resource` (nested, `only:`/`except:`, `member`/`collection`), `namespace`/`scope`, `root`, `get`/`post`/…, `constraints`, format suffixes, Active Storage's mounted engine, Devise's `devise_for` (static default four: session/registration/password/confirmation + `controllers:` overrides for those mappings only — not model-module-driven), `devise_scope` as a path-transparent wrapper, and `with_options` (its options deep-merged into each block-free route call inside, the call's own keys winning; a child with its own block, a block parameter, or two hash values under one key is declined). Not: Devise `authenticate`/`authenticated`/`unauthenticated` route guards (unsupported because Warden constraints are not enforced; strict ingest fails, while survey mode records a gap and omits their route blocks), `concern`, `direct` (a custom URL helper with an arbitrary body — dropped), `mount` of any other engine, Doorkeeper's DSL, Devise OmniAuth callback routes, Devise `skip:`/`only:`/`path:` options, model-driven module narrowing. |
-| Configuration | `config.x.*`, initializers that define constants or mix modules into models, `Rails.application.config` reads, the app's inflections. Not: `Rails.application.credentials`. |
+| Action Mailer | Ruby tier: mailer classes, `mail(...)`, `deliver_now`/`deliver_later` — delivery appends to `ActionMailer::Base.deliveries`, one log every mailer's `deliveries` answers (Rails' `:test` method, which the emitted tests assert against); `default_params` and `_prefixes` as Rails derives them. No SMTP. |
+| Routing | `resources`/`resource` (nested, `only:`/`except:`, `member`/`collection`), `namespace`/`scope`, `root`, `get`/`post`/…, `constraints` (on path segments; a request constraint — a lambda, a guard object's `matches?`, or a `host:`/`subdomain:`/`protocol:`/`domain:`/`port:` key — is asked with the request by the CRuby/JRuby/Spinel router, which goes on to the next route when it refuses, and refuses the routes it guards on the other targets, which keep their URL helpers), format suffixes, Active Storage's mounted engine, Devise's `devise_for` (drawn from the installed Devise source, so the model's modules, `controllers:`, `path:`, `path_names:`, `skip:`/`only:` and gem-added modules are Devise's own; OmniAuth callbacks whose providers are not known are left out and reported), `devise_scope` as a path-transparent wrapper, and `with_options` (its options deep-merged into each block-free route call inside, the call's own keys winning; a child with its own block, a block parameter, or two hash values under one key is declined). Not: Devise `authenticate`/`authenticated`/`unauthenticated` route guards (unsupported because Warden constraints are not enforced; strict ingest fails, while survey mode records a gap and omits their route blocks), `concern`, `direct` (a custom URL helper with an arbitrary body — dropped), `mount` of any other engine, Doorkeeper's DSL. |
+| Configuration | `config.x.*`, initializers that define constants or mix modules into models (an in-tree engine's initializers define top-level constants too), `Rails.application.config` reads, the app's inflections. An autoloaded file that holds only constants (`LegacyName = CurrentName`) defines them on the CRuby and JRuby trees; other targets refuse it. `Rails.application.credentials` answers as an unconfigured store (every key nil, `fetch` of a missing key raises), since the master key is not in the tree; `ActiveSupport::KeyGenerator` / `CachingKeyGenerator` derive by PBKDF2-SHA256 (a `load_defaults 7.0` app's digest; SHA1 is not available). A source gem's `Mod.setup do |config| … end`, where `setup` is `yield self`, runs at boot. |
 | Caching | Fragment caching (`cache` in views, keyed by record) and `Rails.cache.fetch`, in-process. |
-| Gems | The census names what is modeled. Modeled today: bcrypt, devise (route helpers + static `devise_for`; no Warden route guards), image_processing/ruby-vips (Spinel), invisible_captcha, pretender, rqrcode, useragent, web-push, net-http-persistent, concurrent-ruby's thread pool, importmap-rails, turbo-rails, stimulus-rails, tailwindcss-rails, jbuilder, propshaft. Everything else in a Gemfile is either infrastructure (never enters the analysis) or unknown. |
+| Gems | The census names what is modeled. Modeled today: bcrypt, image_processing/ruby-vips (Spinel), inertia_rails (`render inertia:` with a literal component and props, `inertia_share`, optional and deferred props written inline as `InertiaRails.optional { }` or `InertiaRails.defer { }`, partial reloads, the version check, `inertia: { errors: }` redirects; no SSR, no merge/scroll/once props, no dot-path partial keys, no optional or deferred wrapper returned from a helper method), invisible_captcha, pretender, representable (`Representable::Decorator` with `include Representable::JSON`: `property` / `collection`, rendered as JSON; Roar is not), rqrcode, useragent, web-push, net-http-persistent, concurrent-ruby's thread pool, importmap-rails, turbo-rails, stimulus-rails, tailwindcss-rails, jbuilder, propshaft. devise is compiled from its installed source (warden, orm_adapter and responders with it) for its routes; its controller helpers are typed but no target ships Devise or Warden at run time. addressable (URI parsing and its errors, query values, IDNA, Template) runs as the installed gem on the Ruby-family lanes and is compiled from its installed source, with public_suffix, for Spinel. Everything else in a Gemfile is either infrastructure (never enters the analysis) or unknown. |
 
 ## What is not lowered, anywhere
 
@@ -307,6 +327,16 @@ What differs from Rails, and why:
   an empty session or no message. The session payload is not Rails'
   JSON either, so a migration from Rails starts every session afresh;
   Campfire's login rides its own signed cookie and carries over.
+  On Ruby and Spinel, non-String flash values are JSON-encoded and
+  signed with a separate `flash.json.<cookie name>` purpose. String
+  flash values keep the existing cookie format. Strict targets keep
+  String notice/alert values.
+  `cookies.encrypted` is Rails' jar (AES-256-GCM, the "authenticated
+  encrypted cookie" key from `SECRET_KEY_BASE`, JSON values), so a value
+  either side encrypted reads on the other; the session store does not
+  use it yet. An `expires:` given with a signed or encrypted write is
+  dropped: no `Expires` is sent and the value carries no expiry, so it
+  reads for as long as the browser keeps it.
 - **An unset `SECRET_KEY_BASE` is generated, not fatal.** Rails
   development keeps a generated key in `tmp/local_secret.txt`, and
   production refuses to boot without one. The ruby family generates the
@@ -323,14 +353,20 @@ What differs from Rails, and why:
   handler.** Those strategies are recognized as forgery filters but are
   not modeled as empty-session / wipe pass-throughs. `prepend:` and a
   custom `store:` remain unmodeled.
-- **Action Cable's Origin check uses Rails' defaults only.** On the
-  ruby family, a `/cable` handshake must carry an `Origin` naming the
-  request's own host (compared by host, as above), or in development
-  any `localhost` port. Otherwise the answer is Rails' 404 and the app's
-  `connect` never runs; a handshake with no `Origin` is refused, as in
-  Rails. An app's own `config.action_cable.allowed_request_origins` and
-  `disable_request_forgery_protection` are not read. The strict
-  targets' sockets check no Origin.
+- **Action Cable's Origin check follows the app's `config.action_cable`.**
+  On the ruby family, a `/cable` handshake passes Rails'
+  `allow_request_origin?`: everything when
+  `disable_request_forgery_protection` is set; else an `Origin` naming
+  the request's own scheme and `Host` (unless `allow_same_origin_as_host`
+  is false), or one `===` an entry of `allowed_request_origins` (in
+  development, any `localhost` port unless the app lists its own).
+  Otherwise the answer is Rails' 404 and the app's `connect` never runs;
+  a handshake with no `Origin` is refused, as in Rails. The settings are
+  read per environment from `config/application.rb`,
+  `config/environments/*.rb` and initializers; a list that is not a
+  literal or an Array literal (it might be an Array at run time) is
+  refused at build time. Listed values are evaluated per handshake, not
+  once at boot. The strict targets' sockets check no Origin.
 
 The strict targets issue no token (`form_authenticity_token` is empty
 there) and check none: an app emitted for them is not protected

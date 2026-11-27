@@ -99,3 +99,51 @@ module ActionController
     end
   end
 end
+
+# Rack::ETag's body digest through OpenSSL, which takes the CPU's SHA
+# instructions where `Digest::SHA256` does not: the same hex, 1.65 ms ->
+# 0.23 ms for a 396 KB campfire room page on the bench box (29% of a
+# render whose message fragments were cached).
+#
+# One digest object per THREAD, reset by `hexdigest(body)` itself, rather
+# than one per call: building it is half the cost of digesting a small
+# body (`/up`'s: 740 -> 400 ns). A thread variable, not `Thread.current[]`,
+# which is per fiber — under Falcon, per request.
+require "openssl"
+
+module ActionController
+  class Base
+    def self.body_sha256_hex(body)
+      sha256_digest.hexdigest(body)
+    end
+
+    def self.sha256_digest
+      thread = Thread.current
+      thread.thread_variable_get(:roundhouse_sha256) ||
+        thread.thread_variable_set(:roundhouse_sha256, OpenSSL::Digest.new("SHA256"))
+    end
+  end
+end
+
+# The app's OWN `Digest::SHA256.hexdigest(string)` calls, through the same
+# digest. campfire's messages#index ETags its body that way
+# (`fresh_when etag: Digest::SHA256.hexdigest(body)`), and its message
+# fragment keys digest a JSON encoding per message: the digest gem's
+# portable C took 1.04 ms for the 367 KB messages page where OpenSSL takes
+# 0.15, 46% of that page's render. Same bytes, same encodings (US-ASCII
+# hex, binary raw). Anything but one String argument keeps the gem's own
+# path.
+require "digest"
+
+module RoundhouseOpenSSLSHA256
+  def hexdigest(*args)
+    return super unless args.length == 1 && args[0].instance_of?(String)
+    ActionController::Base.sha256_digest.hexdigest(args[0])
+  end
+
+  def digest(*args)
+    return super unless args.length == 1 && args[0].instance_of?(String)
+    ActionController::Base.sha256_digest.digest(args[0])
+  end
+end
+Digest::SHA256.singleton_class.prepend(RoundhouseOpenSSLSHA256)

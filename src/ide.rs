@@ -18,7 +18,7 @@
 //! code units, not bytes or Unicode scalars), so multi-byte and astral
 //! characters land where the editor expects.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::analyze::ClassInfo;
 use crate::app::App;
@@ -26,7 +26,7 @@ use crate::dialect::{AccessorKind, ControllerBodyItem, ModelBodyItem};
 use crate::expr::{Expr, ExprNode, LValue};
 use crate::ident::{ClassId, Symbol, VarId};
 use crate::span::{FileId, SourceFile, Span};
-use crate::ty::{Row, Ty};
+use crate::ty::{FnTy, Row, Ty};
 
 /// A zero-based LSP-style position: `line` plus a UTF-16 `character`
 /// offset into that line. (LSP's default `positionEncoding`.)
@@ -241,7 +241,8 @@ pub fn def_of<'a>(app: &'a App, owner: &ClassId, name: &Symbol, class_side: bool
 /// type, so nilability reads the way it does on a call.
 fn describe_def(def: &DefSite<'_>) -> TypeAt {
     let (display, ret): (String, Option<Ty>) = match def.signature {
-        Some(Ty::Fn { params, ret, .. }) => {
+        Some(Ty::Fn(fn_ty)) => {
+            let FnTy { params, ret, .. } = &**fn_ty;
             let ps: Vec<String> = params
                 .iter()
                 .map(|p| format!("{}: {}", p.name.as_str(), render_ty(&p.ty)))
@@ -476,13 +477,13 @@ pub fn members_of(
     class_id: &ClassId,
     side: MemberSide,
 ) -> Vec<Member> {
-    let mut out: HashMap<Symbol, Member> = HashMap::new();
+    let mut out: HashMap<Symbol, Member> = HashMap::default();
     // Own class first, then includes, then up the parent chain (BFS via
     // pop_front so includes are consulted before the parent, mirroring
     // dispatch) — insert-if-absent makes the nearest definition win.
     let mut queue: std::collections::VecDeque<&ClassId> = std::collections::VecDeque::new();
     queue.push_back(class_id);
-    let mut visited: HashSet<&ClassId> = HashSet::new();
+    let mut visited: HashSet<&ClassId> = HashSet::default();
     while let Some(id) = queue.pop_front() {
         if !visited.insert(id) {
             continue;
@@ -766,7 +767,7 @@ pub fn related_files(app: &App, path: &str) -> Vec<RelatedFile> {
 /// classes, and everything else resolve through their first
 /// real-spanned body expression.
 pub fn class_file_index(app: &App) -> HashMap<ClassId, FileId> {
-    let mut out = HashMap::new();
+    let mut out = HashMap::default();
     for m in &app.models {
         if !m.span.is_synthetic() {
             out.insert(m.name.clone(), m.span.file);
@@ -1034,7 +1035,7 @@ pub fn root_class(ty: &Ty) -> Option<ClassId> {
 /// contribute). The substrate for `@` completion and for typing an
 /// ivar receiver on a line the stale snapshot hasn't seen.
 pub fn file_ivars(app: &App, path: &str) -> HashMap<Symbol, Option<Ty>> {
-    let mut seen: HashMap<Symbol, Option<Ty>> = HashMap::new();
+    let mut seen: HashMap<Symbol, Option<Ty>> = HashMap::default();
     let Some(file) = file_id(app, path) else { return seen };
     nodes_in_range(app, file, 0, u32::MAX, &mut |e| {
         match &*e.node {
@@ -1123,7 +1124,8 @@ pub fn render_ty(ty: &Ty) -> String {
                 format!("{}[{}]", id, render_list(args))
             }
         }
-        Ty::Fn { params, ret, .. } => {
+        Ty::Fn(fn_ty) => {
+            let FnTy { params, ret, .. } = &**fn_ty;
             let ps = params.iter().map(|p| render_ty(&p.ty)).collect::<Vec<_>>().join(", ");
             format!("^({}) -> {}", ps, render_ty(ret))
         }
@@ -1540,7 +1542,7 @@ fn variable_references(app: &App, file: FileId, offset: u32) -> Option<Vec<Refer
 
 /// First occurrence wins; order is the caller's.
 fn dedup_keep_order(refs: Vec<Reference>) -> Vec<Reference> {
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = crate::det::HashSet::default();
     refs.into_iter().filter(|r| seen.insert((r.span.file.0, r.span.start, r.span.end))).collect()
 }
 
@@ -2022,7 +2024,7 @@ pub fn traceroute(app: &App, query: &str) -> Option<Trace> {
     // Applicable `skip_before_action` declarations, target → declarer.
     // Rails' skip gating is itself `only:`/`except:`-scoped, so apply
     // per-action here rather than at persist time.
-    let mut skips: HashMap<Symbol, ClassId> = HashMap::new();
+    let mut skips: HashMap<Symbol, ClassId> = HashMap::default();
     for rf in &resolution.filter_chain {
         if matches!(rf.filter.kind, crate::dialect::FilterKind::Skip)
             && crate::analyze::before_filter_applies(&rf.filter, &action_name)
@@ -2173,7 +2175,7 @@ pub fn traceroute(app: &App, query: &str) -> Option<Trace> {
             applies,
             skipped_by: skipped_by.map(|c| c.0.as_str().to_string()),
             assigns: render_assigns(&rf.assigns),
-            effects: rf.effects.effects.iter().map(render_effect).collect(),
+            effects: rf.effects.effects().iter().map(render_effect).collect(),
             n_plus_one,
         }));
     }
@@ -2193,12 +2195,12 @@ pub fn traceroute(app: &App, query: &str) -> Option<Trace> {
         let (file, line, effects, assigns) = match action_def {
             Some((_, a)) => {
                 let (f, l) = expr_location(app, &a.body);
-                let mut ivars: HashMap<Symbol, Ty> = HashMap::new();
+                let mut ivars: HashMap<Symbol, Ty> = HashMap::default();
                 crate::analyze::extract_ivar_assignments(&a.body, &mut ivars);
                 (
                     f,
                     l,
-                    a.effects.effects.iter().map(render_effect).collect(),
+                    a.effects.effects().iter().map(render_effect).collect(),
                     render_assigns(&ivars),
                 )
             }
@@ -2272,7 +2274,9 @@ pub fn traceroute(app: &App, query: &str) -> Option<Trace> {
                 partials,
                 n_plus_one: preloads_in_files(app, &preload_diags, &view_files, &path_bodies),
             });
-            if let Some(layout) = &resolution.layout {
+            let layout = crate::controller_layout::Layouts::new(&app.controllers, &app.views)
+                .for_action(controller_id.0.as_str(), action_name.as_str());
+            if let crate::controller_layout::Layout::Template(layout) = &layout {
                 let file = view_location(app, layout);
                 let n_plus_one = match &file {
                     Some(f) => preloads_in_files(
@@ -2330,7 +2334,7 @@ pub struct TraceTarget {
 /// routes first (in table order) then unrouted view-rendering actions.
 pub fn trace_targets(app: &App) -> Vec<TraceTarget> {
     let mut out: Vec<TraceTarget> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut seen: HashSet<String> = HashSet::default();
     for r in crate::lower::routes::flatten_routes(app) {
         let query = format!("{}#{}", r.controller.0.as_str(), r.action.as_str());
         if !seen.insert(query.clone()) {
@@ -2420,29 +2424,12 @@ fn find_action<'a>(
     }
 }
 
-/// The parent controller, resolving single-segment parents against the
-/// child's namespace (mirrors analyze's lexical resolution).
+/// The parent controller. Ingest stored the parent as Rubydex resolved it.
 fn parent_of<'a>(
     app: &'a App,
     controller: &'a crate::dialect::Controller,
 ) -> Option<&'a crate::dialect::Controller> {
-    let parent = controller.parent.as_ref()?;
-    find_controller(app, parent).or_else(|| {
-        if parent.0.as_str().contains("::") {
-            return None;
-        }
-        let mut segs: Vec<&str> = controller.name.0.as_str().split("::").collect();
-        segs.pop();
-        while !segs.is_empty() {
-            let candidate =
-                ClassId(Symbol::from(format!("{}::{}", segs.join("::"), parent.0.as_str())));
-            if let Some(c) = find_controller(app, &candidate) {
-                return Some(c);
-            }
-            segs.pop();
-        }
-        None
-    })
+    find_controller(app, controller.parent.as_ref()?)
 }
 
 /// The IR body of `class_id#method`, if ingested — controllers keep
@@ -2526,7 +2513,7 @@ fn response_terminal(body: &Expr) -> Option<String> {
 /// (a helper from a gem, a model method) contributes nothing.
 fn with_helper_bodies<'a>(app: &'a App, chain: &[ClassId], body: &'a Expr) -> Vec<&'a Expr> {
     let mut out: Vec<&'a Expr> = vec![body];
-    let mut seen: HashSet<Symbol> = HashSet::new();
+    let mut seen: HashSet<Symbol> = HashSet::default();
     let mut i = 0;
     while i < out.len() {
         let mut calls: Vec<Symbol> = Vec::new();
@@ -3066,16 +3053,16 @@ pub fn candidate_signature(
         .enumerate()
         .map(|(i, name)| crate::ty::Param {
             name: name.clone(),
-            ty: inferred.and_then(|ts| ts.get(i)).cloned().unwrap_or(Ty::Untyped),
+            ty: inferred.and_then(|ts| ts.get(i)).cloned().unwrap_or(Ty::Untyped).into(),
             kind: crate::ty::ParamKind::Required,
         })
         .collect();
-    let fn_ty = Ty::Fn {
-        params,
+    let fn_ty = Ty::Fn(Box::new(FnTy {
+        params: params.into(),
         block: None,
-        ret: Box::new(known.clone()),
+        ret: std::sync::Arc::new(known.clone()),
         effects: crate::effect::EffectSet::pure(),
-    };
+    }));
     crate::rbs::print_method_signature(method.as_str(), &fn_ty)
 }
 
@@ -3457,7 +3444,7 @@ mod tests {
     use crate::ident::{ClassId, Symbol, TyVar};
 
     fn class(name: &str) -> Ty {
-        Ty::Class { id: ClassId(Symbol::new(name)), args: vec![] }
+        Ty::Class { id: ClassId(Symbol::new(name)), args: vec![].into() }
     }
 
     /// A `def` header has a position now: hover answers with the
@@ -3522,9 +3509,9 @@ mod tests {
         assert_eq!(render_ty(&Ty::Str), "String");
         assert_eq!(render_ty(&Ty::Bool), "bool");
         assert_eq!(render_ty(&Ty::Nil), "nil");
-        assert_eq!(render_ty(&Ty::Array { elem: Box::new(Ty::Int) }), "Array[Integer]");
+        assert_eq!(render_ty(&Ty::Array { elem: std::sync::Arc::new(Ty::Int) }), "Array[Integer]");
         assert_eq!(
-            render_ty(&Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(Ty::Str) }),
+            render_ty(&Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Str) }),
             "Hash[Symbol, String]"
         );
         assert_eq!(render_ty(&class("Article")), "Article");
@@ -3532,10 +3519,10 @@ mod tests {
 
     #[test]
     fn render_ty_collapses_nilable_union_to_question_mark() {
-        let t = Ty::Union { variants: vec![class("Article"), Ty::Nil] };
+        let t = Ty::Union { variants: vec![class("Article"), Ty::Nil].into() };
         assert_eq!(render_ty(&t), "Article?");
         // Wider unions keep an explicit `nil` arm.
-        let wide = Ty::Union { variants: vec![Ty::Int, Ty::Str, Ty::Nil] };
+        let wide = Ty::Union { variants: vec![Ty::Int, Ty::Str, Ty::Nil].into() };
         assert_eq!(render_ty(&wide), "Integer | String | nil");
     }
 
@@ -3548,7 +3535,7 @@ mod tests {
     #[test]
     fn can_be_nil_only_for_provable_nil() {
         assert!(can_be_nil(&Ty::Nil));
-        assert!(can_be_nil(&Ty::Union { variants: vec![class("Article"), Ty::Nil] }));
+        assert!(can_be_nil(&Ty::Union { variants: vec![class("Article"), Ty::Nil].into() }));
         assert!(!can_be_nil(&class("Article")));
         assert!(!can_be_nil(&Ty::Var { var: TyVar(0) }));
         assert!(!can_be_nil(&Ty::Untyped));
@@ -3672,7 +3659,7 @@ mod tests {
         // Provable yes.
         assert_eq!(nil_verdict(Some(&Ty::Nil)), Some(true));
         assert_eq!(
-            nil_verdict(Some(&Ty::Union { variants: vec![class("Article"), Ty::Nil] })),
+            nil_verdict(Some(&Ty::Union { variants: vec![class("Article"), Ty::Nil].into() })),
             Some(true)
         );
         // Provable no.
@@ -3683,13 +3670,13 @@ mod tests {
         assert_eq!(nil_verdict(Some(&Ty::Untyped)), None);
         assert_eq!(nil_verdict(Some(&Ty::Var { var: TyVar(0) })), None);
         assert_eq!(
-            nil_verdict(Some(&Ty::Union { variants: vec![Ty::Untyped, Ty::Str] })),
+            nil_verdict(Some(&Ty::Union { variants: vec![Ty::Untyped, Ty::Str].into() })),
             None
         );
         assert_eq!(nil_verdict(None), None);
         // An unknown arm doesn't retract a proven nil arm.
         assert_eq!(
-            nil_verdict(Some(&Ty::Union { variants: vec![Ty::Untyped, Ty::Nil] })),
+            nil_verdict(Some(&Ty::Union { variants: vec![Ty::Untyped, Ty::Nil].into() })),
             Some(true)
         );
     }
@@ -3982,7 +3969,7 @@ mod tests {
 
 
     fn tree_app(files: &[(&str, &str)]) -> App {
-        let tree: std::collections::HashMap<std::path::PathBuf, Vec<u8>> = files
+        let tree: crate::vfs::FileTree = files
             .iter()
             .map(|(p, c)| (std::path::PathBuf::from(p), c.as_bytes().to_vec()))
             .collect();

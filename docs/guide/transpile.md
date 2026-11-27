@@ -32,33 +32,20 @@ roundhouse --target LANG [-o OUT] [INPUT] [--survey] [--allow-unsupported]
   files a previous run left behind are not removed, so regenerate into
   a clean directory when the app has lost files.
 
-## Test folders
+## Configuration
 
-Roundhouse reads every `.rb` file recursively from these folders by default:
+An optional [`roundhouse.yml`](roundhouse-yml.md) at the app root adds
+test folders (`test_paths`) and lists project extensions (`extensions`)
+that describe gems and class-body DSLs Roundhouse does not know.
+`check` and the editor read the same file, so their diagnostics match
+what transpile sees.
 
-- `test/models`
-- `test/controllers`
-- `test/helpers`
-- `test/channels`
-- `test/lib`
-
-The app root can contain a `roundhouse.yml` file that adds folders:
-
-```yaml
-test_paths:
-  - test/unit
-  - quality/specs
-```
-
-`test_paths` adds folders. It does not replace the default folders. Each
-value must name a literal directory relative to the app root. Roundhouse
-does not expand globs, environment variables, or `~`. A configuration
-error stops ingestion.
-Roundhouse rejects a configured path with a symbolic link. It does not
-follow symbolic links below selected folders.
-
-Roundhouse reads `test/test_helper.rb`, `test/test_helpers/`, and
-`test/fixtures/` outside this folder list.
+A [`gems.yml`](roundhouse-yml.md#gemsyml) supplies facts for gem RBI
+selection. It also controls native gem loads in `ruby` and `jruby`
+projects. The facts can pin and require a locked gem at boot or declare
+a gem when `app/` names it. They can also refuse a gem that loads Rails.
+Constants from a refused gem stay errors, including constants known
+through an RBI.
 
 Transpilation is the analysis from [`check.md`](check.md) followed by
 lowering and emit. It requires zero analysis errors and a runtime for
@@ -105,10 +92,11 @@ rather than dropping the callback or evaluating its producer per item.
 Existing literal blocks, local block variables and bound-method
 references retain their target-specific support and limitations.
 
-Roundhouse currently refuses generated enum `*_before_type_cast` readers.
-Rails returns the original input after an unsaved assignment and stored data
-after persistence; the compiler has only the stored enum slot. Negative enum
-scopes are supported. Source-defined readers keep their ordinary behavior.
+Generated enum `*_before_type_cast` readers run on the ruby family and
+Spinel. As in Rails, they return the original input after an unsaved assignment
+and stored data after persistence. Other targets refuse them, since they have
+only the stored enum slot. Negative enum scopes are supported. Source-defined
+readers keep their ordinary behavior.
 
 ## Apps that aren't fully covered yet
 
@@ -203,7 +191,7 @@ Emitted code is meant to be read. Method names, file layout and the
 order of things follow the Ruby they came from; the runtime library is
 a few files of ordinary code in the target language, not a framework.
 The emitted tests come from the default test folders and any additional
-folders in `roundhouse.yml`.
+folders in [`roundhouse.yml`](roundhouse-yml.md#test_paths).
 
 ## Regenerating
 
@@ -214,6 +202,13 @@ by someone who has only the output. If you find yourself patching the
 emitted code, that is a bug report: either a construct roundhouse
 should lower and doesn't, or a translation it gets wrong — and the
 [compare oracle](verifying.md) is how to show the second kind.
+
+Some files outside `app/` are read when the app is transpiled, not when
+the output runs. One example is the YAML file that `config_for(:name)`
+reads (`config/<name>.yml`). The output keeps the file's text with its
+ERB compiled, so a change to that file needs a new transpile. The `ruby`
+and `jruby` targets run `config_for` on their runtime, and `futamura`
+runs it on Rails itself. The other targets report it as unsupported.
 
 ## Which target
 

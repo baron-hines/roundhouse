@@ -145,23 +145,23 @@ fn article_renders_validate_with_inline_checks() {
     // docs/archive/rust-migration-plan.md) — no helper-call into the
     // Validations runtime module. Error messages become string-literal
     // constants; the type-erased `value: untyped` channel is gone.
-    // The Ruby emitter uses postfix-modifier form for single-line
-    // if's, so the assertion matches the natural output shape.
+    // Each message is pushed with the error Rails records for it.
     assert!(
-        src.contains(r#"errors << "Title can't be blank" if @title.nil?"#),
+        src.contains("self.errors << \"Title can't be blank\"\n      self.error_details << ActiveRecord::ErrorDetail.new(\"title\", \"blank\", \"can't be blank\", \"Title can't be blank\", true, true)"),
         "{src}",
     );
     assert!(
-        src.contains(r#"errors << "Body can't be blank" if @body.nil?"#),
+        src.contains("self.errors << \"Body can't be blank\"\n      self.error_details << ActiveRecord::ErrorDetail.new(\"body\", \"blank\", \"can't be blank\", \"Body can't be blank\", true, true)"),
         "{src}",
     );
-    // Length is now also inline (third slice of Phase 2.5(a)).
-    // Expansion: `unless @body.nil?; len = ...; errors << "..." if len < N; end`.
-    // Message matches Rails' full_messages: humanized attribute +
-    // "characters" suffix (see model_to_library::validations::humanize).
+    // Length is inline. A nil body fails the minimum (Rails does not
+    // skip it); a present body compares `len`. Message matches Rails'
+    // full_messages: humanized attribute + "characters" suffix
+    // (see model_to_library::validations::humanize). Attributed push
+    // pairs each message with `error_attributes`.
     assert!(
         src.contains(
-            r#"errors << "Body is too short (minimum is 10 characters)" if len < 10"#
+            r#"errors << "Body is too short (minimum is 10 characters)""#
         ),
         "{src}",
     );
@@ -195,16 +195,20 @@ fn article_renders_residualized_fill_timestamps() {
     // nil — a fixture's `created_at: 36.minutes.ago` survives the
     // insert — while an UPDATE restamps `updated_at` unconditionally.
     assert!(
-        src.contains("if !(creating) || @updated_at_raw.nil? || (@updated_at_raw || \"\").empty?\n      @__t_updated_at = nil\n      @updated_at_raw = now"),
+        src.contains("if !(creating) || @updated_at_raw.nil? || @updated_at_raw.empty?\n      @__t_updated_at = nil\n      @updated_at_raw = now"),
         "{src}",
     );
     assert!(
-        src.contains("if creating && (@created_at_raw.nil? || (@created_at_raw || \"\").empty?)\n      @__t_created_at = nil\n      @created_at_raw = now"),
+        src.contains("if creating && (@created_at_raw.nil? || @created_at_raw.empty?)\n      @__t_created_at = nil\n      @created_at_raw = now"),
         "{src}",
     );
-    // The runtime schema probe must be fully residualized away.
+    // The runtime schema probe must be fully residualized away. Read in
+    // `fill_timestamps` itself: a partial row's serializers ask
+    // `@__unloaded_columns.include?(:updated_at)`, which is no schema probe.
+    let start = src.find("def fill_timestamps(creating)").unwrap();
+    let body = &src[start..start + src[start..].find("\n  end\n").unwrap()];
     assert!(
-        !src.contains(".include?(:updated_at)") && !src.contains(".include?(:created_at)"),
+        !body.contains(".include?(:updated_at)") && !body.contains(".include?(:created_at)"),
         "fill_timestamps still probes the schema at runtime:\n{src}",
     );
 }
@@ -536,18 +540,11 @@ fn schema_emits_create_index_lines_for_table_indexes() {
     );
 }
 
+/// Not dropped: Rails' SQLite schema carries the constraint and its adapter turns `foreign_keys` on, so a row naming a missing parent raises `InvalidForeignKey` there.
 #[test]
-fn schema_drops_foreign_key_constraints() {
-    // Real-blog has `add_foreign_key "comments", "articles"` — but the
-    // spinel runtime models relationships at the app layer (e.g.
-    // belongs_to lowers to `Article.find_by(id: @article_id)`), so the
-    // DB-level constraint is dropped per yagni-on-round-trip:
-    // structural compile-equivalence, not source-equivalence.
+fn schema_keeps_foreign_key_constraints() {
     let src = lowered_real_blog_schema();
-    assert!(
-        !src.contains("FOREIGN KEY") && !src.contains("REFERENCES"),
-        "spinel schema should not emit FK constraints; got:\n{src}",
-    );
+    assert!(src.contains("FOREIGN KEY (article_id) REFERENCES articles (id)"), "{src}");
 }
 
 #[test]
@@ -1208,18 +1205,22 @@ fn comments_build_expansion_uses_typed_factory() {
 #[test]
 fn comments_create_expands_assoc_build_to_typed_factory_with_fk() {
     // `@comment = @article.comments.build(comment_params)` lowers to:
-    //   @comment = Comment.from_params(comment_params)
-    //   @comment.article_id = @article.id
+    //   owner = @article
+    //   record = Comment.from_params(comment_params)
+    //   record.article_id = owner.id
+    //   @comment = record
     // The typed factory absorbs the permitted-fields assignment; the
     // FK setter follows the model's typed `attr_writer`.
     let files = lowered_real_blog_controllers();
     let src = find(&files, "comments_controller.rb");
     assert!(
-        src.contains("@comment = Comment.from_params(self.comment_params)"),
+        src.contains("rh_build_record_0 = Comment.from_params(self.comment_params)"),
         "expected typed-factory in build; got:\n{src}",
     );
     assert!(
-        src.contains("@comment.article_id = @article.id"),
+        src.contains("rh_build_owner_0 = @article")
+            && src.contains("rh_build_record_0.article_id = rh_build_owner_0.id")
+            && src.contains("@comment = rh_build_record_0"),
         "expected FK setter after typed factory; got:\n{src}",
     );
     assert!(
@@ -1421,19 +1422,18 @@ fn lowered_index_view_auto_escapes_bare_interpolation() {
 
 #[test]
 fn lowered_index_view_rewrites_present_to_negated_empty() {
-    // Rails-style `notice.present?` lowers to `! recv.empty?` in spinel
-    // shape (collection emptiness rather than the Rails predicate). The
-    // unary-not is emitted via `Send { recv: None, method: "!", args:
-    // [empty_call] }` so the surface form is `! notice.empty?`, not
-    // `notice.empty?.!`.
+    // Rails-style `notice.present?` lowers to `!((notice || "").empty?)`.
+    // No `strip`: the view receiver is untyped. The unary-not is a send,
+    // so the surface is `! (notice || "").empty?`, not `notice.empty?.!`.
     let files = lowered_real_blog_views();
     let src = find(&files, "app/views/articles/index.rb");
-    // The Ruby path additionally guards the receiver (`(notice ||
-    // "").empty?`) — nullable columns hydrate to real nil there
-    // (apply_nilsafe_empty_lowering).
     assert!(
         src.contains("! (notice || \"\").empty?"),
         "expected `! (notice || \"\").empty?`; got:\n{src}",
+    );
+    assert!(
+        !src.contains("notice.strip"),
+        "view present? must not strip an untyped receiver:\n{src}",
     );
     assert!(
         !src.contains("notice.present?"),
@@ -1443,12 +1443,11 @@ fn lowered_index_view_rewrites_present_to_negated_empty() {
         !src.contains("notice.empty?.!"),
         "unary-! should not render as method-call form; got:\n{src}",
     );
-    // Same rewrite applies to `@articles.any?` (after ivar rewrite to
-    // `articles.any?`) — the `<% if @articles.any? %>` branch, with
-    // the same nil-safe receiver guard.
+    // `@articles.any?` is a collection predicate, so it stays `empty?`
+    // with no string nil-guard and no `strip`.
     assert!(
-        src.contains("! (articles || \"\").empty?"),
-        "expected `! (articles || \"\").empty?` rewrite of `@articles.any?`; got:\n{src}",
+        src.contains("! articles.empty?"),
+        "expected `! articles.empty?` rewrite of `@articles.any?`; got:\n{src}",
     );
 }
 
@@ -1728,11 +1727,10 @@ fn lowered_form_partial_form_with_inline_expansion() {
 fn lowered_form_partial_errors_predicate_rewrite() {
     let files = lowered_real_blog_views();
     let src = find(&files, "app/views/articles/_form.rb");
-    // `<% if article.errors.any? %>` → `if ! (article.errors ||
-    // "").empty?` (predicate-cond rewrite through the receiver chain,
-    // plus the Ruby path's nil-safe receiver guard).
+    // `<% if article.errors.any? %>` → `if ! article.errors.empty?`.
+    // `any?` is a collection predicate, so it stays `empty?`.
     assert!(
-        src.contains("if ! (article.errors || \"\").empty?"),
+        src.contains("if ! article.errors.empty?"),
         "expected predicate-rewrite on errors.any?; got:\n{src}",
     );
     assert!(
@@ -1759,15 +1757,14 @@ fn lowered_form_partial_form_builder_methods() {
     );
     // `form.text_field :title, class: [...]` → inline `<input
     // type="text" name="article[title]" id="article_title"<value_attr>
-    // class="<simplified>">`. Class-array collapse + html_escape on
-    // the simplified literal land in the StringInterp.
+    // class="<class_names>">`.
     assert!(
         src.contains("name=\\\"article[title]\\\" id=\\\"article_title\\\""),
         "expected inline text_field name/id; got:\n{src}",
     );
     assert!(
-        src.contains("\"block shadow-sm rounded-md border px-3 py-2 mt-2 w-full border-gray-400 focus:outline-blue-600\""),
-        "expected class-array collapsed to base + first hash key; got:\n{src}",
+        src.contains("block shadow-sm rounded-md border px-3 py-2 mt-2 w-full#{if "),
+        "expected the class array to pick its classes per field at render time; got:\n{src}",
     );
     // `form.textarea :body, rows: 4, ...` → inline
     // `<textarea name="article[body]" id="article_body" rows="4"
@@ -1910,15 +1907,15 @@ fn lowered_show_view_emits_module_method() {
 fn lowered_show_view_renders_association_partial_via_each() {
     // `<%= render @article.comments %>` — has_many association
     // partial. Lowered to `article.comments.each { |c| io <<
-    // Views::Comments.comment_into(io, c, nil, nil) }`. The variant takes
-    // every parameter as required, so the call spells the partial's
-    // notice/alert defaults. The receiver is the
+    // Views::Comments.comment_into(io, c, notice, alert) }`. The variant
+    // takes every parameter as required, and the partial reads the
+    // caller's flash, so the call passes the view's own. The receiver is the
     // post-ivar-rewrite `article`; the var name is the singular's
     // first letter (`c`).
     let files = lowered_real_blog_views();
     let src = find(&files, "app/views/articles/show.rb");
     assert!(
-        src.contains("article.comments.each { |c| Views::Comments.comment_into(io, c, nil, nil) }"),
+        src.contains("article.comments.each { |c| Views::Comments.comment_into(io, c, notice, alert) }"),
         "expected article.comments.each association iteration; got:\n{src}",
     );
 }
@@ -2154,8 +2151,8 @@ fn lowered_new_view_dispatches_named_partial() {
         "expected `def self._new(article, notice, alert)`; got:\n{src}",
     );
     assert!(
-        src.contains("Views::Articles.form_into(io, article, nil, nil)"),
-        "expected named-partial dispatch to Views::Articles.form_into(io, article, nil, nil); got:\n{src}",
+        src.contains("Views::Articles.form_into(io, article, notice, alert)"),
+        "expected named-partial dispatch to Views::Articles.form_into(io, article, notice, alert); got:\n{src}",
     );
 }
 
@@ -2169,7 +2166,7 @@ fn lowered_edit_view_dispatches_named_partial_and_record_link() {
     );
     // Same shared partial as `new.html.erb`.
     assert!(
-        src.contains("Views::Articles.form_into(io, article, nil, nil)"),
+        src.contains("Views::Articles.form_into(io, article, notice, alert)"),
         "expected named-partial dispatch; got:\n{src}",
     );
     // `<%= link_to "Show this article", @article, ... %>` — the URL
@@ -2549,6 +2546,32 @@ fn block_tag_helper_appends_through_an_open_half_and_an_inline_close() {
     let after = view_src.find("<p>after</p>").unwrap();
     assert!(open < body && body < close && close < after, "{view_src}");
 }
+/// A rooted receiver gets the same rewrite. Inside `Views::Users`, the
+/// call to `Users::PanelsHelper` is spelled `::Users::PanelsHelper`
+/// (`apply_constant_rooting`); the pass's lookup has to read past the
+/// root marker, or every rooted helper call keeps its capture buffer.
+#[test]
+fn a_rooted_block_tag_helper_receiver_appends_through_an_open_half() {
+    let mut app = ingest_tree(&[
+        ("db/schema.rb", "ActiveRecord::Schema.define(version: 1) do\nend\n"),
+        (
+            "app/helpers/users/panels_helper.rb",
+            "module Users::PanelsHelper\n  def panel_tag(kind, &)\n    tag.div class: \"panel panel--#{kind}\", &\n  end\nend\n",
+        ),
+        (
+            "app/views/users/index.html.erb",
+            "<%= panel_tag(\"wide\") do %>\n  <p>inside</p>\n<% end %>\n",
+        ),
+    ]);
+    let mut analyzer = roundhouse::analyze::Analyzer::new(&app);
+    analyzer.analyze(&mut app);
+    roundhouse::lower::apply_post_analyze_lowerings(&mut app, analyzer.class_registry());
+    let view_files = ruby::emit_lowered_views(&app);
+    let view_src = find(&view_files, "app/views/users/index.rb");
+    assert!(view_src.contains("::Users::PanelsHelper.panel_tag_open_into(io, \"wide\")"), "{view_src}");
+    assert!(!view_src.contains("_cap = String.new"), "no capture buffer remains:\n{view_src}");
+}
+
 
 /// A tag helper that takes only the block (`def search_results_tag(&)`)
 /// has no signature when the variant is built; its `_open_into` still
@@ -2636,11 +2659,11 @@ fn unsupported_expressions_raise_without_breaking_ruby_syntax() {
     let mut expr = Expr::new(Span::synthetic(), ExprNode::Const {
         path: vec![Symbol::from("Missing")],
     });
-    expr.diagnostic = Some(DiagnosticKind::Unsupported {
+    expr.set_diagnostic(Some(DiagnosticKind::Unsupported {
         target: None,
         construct: Symbol::from("constant"),
         detail: "Missing".into(),
-    });
+    }));
     let stub = ruby::emit_expr(&expr);
     for context in [
         format!("[1] + {stub}"),

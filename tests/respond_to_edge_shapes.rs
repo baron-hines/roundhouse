@@ -98,7 +98,7 @@ fn replay(names: &[&str]) {
     );
     let run = probes_overlay("probes_controller.rb", PROBES, ROUTES).run_ruby(&script);
     eprintln!("emit errors: {:?}", run.errors);
-    assert!(run.success, "ruby failed:\n{}\n{}", run.stdout, run.stderr);
+    run.assert_passes();
     assert!(run.stdout.contains(", 0 differ"), "differs from Rails:\n{}", run.stdout);
 }
 

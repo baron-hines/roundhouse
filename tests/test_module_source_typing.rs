@@ -1,6 +1,8 @@
 //! Source test bodies must be typed before any emission-only cloning.
+use roundhouse::analyze::LoopEnd;
 use roundhouse::ingest::ingest_app_from_tree;
 use roundhouse::{App, Expr, ExprNode, Ty};
+use roundhouse::ty::FnTy;
 use std::path::PathBuf;
 
 fn ingest(source: &str) -> App {
@@ -99,8 +101,8 @@ end
         "source calls must not acquire synthetic self"
     );
     assert!(
-        matches!(module.helpers[0].signature, Some(Ty::Fn { ref ret, .. })
-        if matches!(&**ret, Ty::Array { .. })),
+        matches!(module.helpers[0].signature, Some(Ty::Fn(ref fn_ty))
+        if matches!(&*fn_ty.ret, Ty::Array { .. })),
         "converged helper signature"
     );
 }
@@ -132,7 +134,7 @@ end
     assert_eq!(
         receivers[0],
         Some(Ty::Array {
-            elem: Box::new(Ty::Int)
+            elem: std::sync::Arc::new(Ty::Int)
         })
     );
     assert!(
@@ -199,7 +201,7 @@ end
     let class_ty = |name: &str| {
         Some(Ty::Class {
             id: roundhouse::ident::ClassId(name.into()),
-            args: vec![],
+            args: vec![].into(),
         })
     };
     assert_eq!(exprs[0].ty, class_ty("Push::Subscription"));
@@ -256,16 +258,16 @@ end
         .iter_mut()
         .find(|module| module.name.0.as_str() == "SourceProbeTest")
         .unwrap();
-    child.helpers[0].signature = Some(Ty::Fn {
+    child.helpers[0].signature = Some(Ty::Fn(Box::new(FnTy {
         params: vec![roundhouse::ty::Param {
             name: "value".into(),
-            ty: Ty::Int,
+            ty: Ty::Int.into(),
             kind: roundhouse::ty::ParamKind::Required,
-        }],
+        }].into(),
         block: None,
-        ret: Box::new(Ty::Int),
+        ret: std::sync::Arc::new(Ty::Int),
         effects: roundhouse::effect::EffectSet::pure(),
-    });
+    })));
     roundhouse::analyze::Analyzer::new(&app).analyze(&mut app);
     let child = app
         .test_modules
@@ -277,11 +279,11 @@ end
     assert_eq!(
         receivers,
         vec![Some(Ty::Array {
-            elem: Box::new(Ty::Int)
+            elem: std::sync::Arc::new(Ty::Int)
         })]
     );
     assert_eq!(child.helpers[0].body.ty, Some(Ty::Int));
-    assert!(matches!(child.helpers[0].signature, Some(Ty::Fn { ref ret, .. }) if **ret == Ty::Int));
+    assert!(matches!(child.helpers[0].signature, Some(Ty::Fn(ref fn_ty)) if *fn_ty.ret == Ty::Int));
 }
 
 #[test]
@@ -305,7 +307,7 @@ end
     let helper = &app.test_modules[0].helpers[0];
     assert_eq!(helper.params[1].default.as_ref().unwrap().ty, Some(Ty::Str));
     let strings = Ty::Array {
-        elem: Box::new(Ty::Str),
+        elem: std::sync::Arc::new(Ty::Str),
     };
     assert_eq!(
         helper.params[2].default.as_ref().unwrap().ty,
@@ -339,17 +341,18 @@ end
     );
     roundhouse::analyze::Analyzer::new(&app).analyze(&mut app);
     let helper = &app.test_modules[0].helpers[1];
-    let Some(Ty::Fn { params, .. }) = &helper.signature else {
+    let Some(Ty::Fn(fn_ty)) = &helper.signature else {
         panic!("target helper signature: {:?}", helper.signature);
     };
+    let FnTy { params, .. } = &**fn_ty;
     assert_eq!(
         params[0].ty,
-        Ty::Int,
+        Ty::Int.into(),
         "real positional sites survive forwarding"
     );
     assert_eq!(
         params[1].ty,
-        Ty::Str,
+        Ty::Str.into(),
         "keyword hash is not the keyword value"
     );
 }
@@ -374,14 +377,15 @@ end
     roundhouse::analyze::Analyzer::new(&app).analyze(&mut app);
     let helper = &app.test_modules[0].helpers[1];
     let hash = Ty::Hash {
-        key: Box::new(Ty::Sym),
-        value: Box::new(Ty::Str),
+        key: std::sync::Arc::new(Ty::Sym),
+        value: std::sync::Arc::new(Ty::Str),
     };
     assert_eq!(helper.body.ty, Some(hash.clone()));
-    let Some(Ty::Fn { params, .. }) = &helper.signature else {
+    let Some(Ty::Fn(fn_ty)) = &helper.signature else {
         panic!("positional Hash helper signature: {:?}", helper.signature);
     };
-    assert_eq!(params[0].ty, hash);
+    let FnTy { params, .. } = &**fn_ty;
+    assert_eq!(params[0].ty, hash.into());
 }
 
 #[test]
@@ -409,8 +413,8 @@ end
     assert_eq!(
         helper.body.ty,
         Some(Ty::Hash {
-            key: Box::new(Ty::Sym),
-            value: Box::new(Ty::Str),
+            key: std::sync::Arc::new(Ty::Sym),
+            value: std::sync::Arc::new(Ty::Str),
         }),
         "keyword-rest is a real Hash binding, not an individual named keyword"
     );
@@ -441,7 +445,7 @@ end
     assert_eq!(
         base.helpers[0].body.ty,
         Some(Ty::Array {
-            elem: Box::new(Ty::Str)
+            elem: std::sync::Arc::new(Ty::Str)
         })
     );
     let key = (base.name.clone(), "values".into());
@@ -519,7 +523,7 @@ end
             assert_eq!(
                 app.inferred_method_params.get(&key),
                 Some(&vec![Ty::Array {
-                    elem: Box::new(Ty::Str)
+                    elem: std::sync::Arc::new(Ty::Str)
                 }])
             );
         }
@@ -577,7 +581,7 @@ end
     assert_eq!(
         receivers,
         vec![Some(Ty::Array {
-            elem: Box::new(Ty::Str)
+            elem: std::sync::Arc::new(Ty::Str)
         })],
         "fixture must not hide a real inherited source method"
     );
@@ -621,11 +625,11 @@ end
                 .find(|module| module.name.0.as_str() == name)
                 .unwrap();
             let expected = Ty::Array {
-                elem: Box::new(element),
+                elem: std::sync::Arc::new(element),
             };
             assert_eq!(module.helpers[0].body.ty, Some(expected.clone()), "{name}");
             assert!(matches!(&module.helpers[0].signature,
-                Some(Ty::Fn { ret, .. }) if **ret == expected));
+                Some(Ty::Fn(fn_ty)) if *fn_ty.ret == expected));
             let mut receivers = Vec::new();
             each_receivers(&module.tests[0].body, &mut receivers);
             assert_eq!(
@@ -633,7 +637,7 @@ end
                 expected_receivers
                     .into_iter()
                     .map(|elem| Some(Ty::Array {
-                        elem: Box::new(elem)
+                        elem: std::sync::Arc::new(elem)
                     }))
                     .collect::<Vec<_>>()
             );
@@ -643,7 +647,7 @@ end
                         expr.ty.as_ref().is_some_and(|ty| !ty.is_unknown()),
                         "{expr:?}"
                     );
-                    assert!(expr.diagnostic.is_none(), "{expr:?}");
+                    assert!(expr.diagnostic().is_none(), "{expr:?}");
                 }
                 expr.node.for_each_child(&mut check_values);
             }
@@ -676,7 +680,7 @@ end
         module.helpers[0].body.ty,
         Some(Ty::Class {
             id: roundhouse::ident::ClassId("LocalStandIn".into()),
-            args: vec![],
+            args: vec![].into(),
         })
     );
     let mut receivers = Vec::new();
@@ -684,7 +688,7 @@ end
     assert_eq!(
         receivers,
         vec![Some(Ty::Array {
-            elem: Box::new(Ty::Int)
+            elem: std::sync::Arc::new(Ty::Int)
         })]
     );
 }
@@ -715,7 +719,7 @@ fn test_constants_do_not_replace_or_poison_production_view_fallbacks() {
     assert_eq!(
         receivers,
         vec![Some(Ty::Array {
-            elem: Box::new(Ty::Int)
+            elem: std::sync::Arc::new(Ty::Int)
         })]
     );
     receivers.clear();
@@ -731,7 +735,36 @@ fn test_constants_do_not_replace_or_poison_production_view_fallbacks() {
         receivers,
         vec![Some(Ty::Class {
             id: roundhouse::ident::ClassId("TEST_ONLY".into()),
-            args: vec![],
+            args: vec![].into(),
         })]
+    );
+}
+
+#[test]
+fn a_helper_passed_its_own_returned_value_settles() {
+    let mut app = ingest(
+        r#"
+class SourceProbeTest < ActiveSupport::TestCase
+  test "the second probe reuses the first connection" do
+    connection, channel = open_probe
+    open_probe(connection:)
+  end
+
+  private
+
+  def open_probe(connection: nil)
+    connection ||= Connection.new
+    [connection, Channel.new]
+  end
+end
+"#,
+    );
+    let mut analyzer = roundhouse::analyze::Analyzer::new(&app);
+    analyzer.analyze(&mut app);
+    let rounds = analyzer.fixpoint_rounds();
+    assert!(
+        matches!(rounds.views_and_tests, LoopEnd::Settled(_))
+            && matches!(rounds.restamp.end, LoopEnd::Settled(_)),
+        "the test rounds stopped on a round cap: {rounds:?}"
     );
 }

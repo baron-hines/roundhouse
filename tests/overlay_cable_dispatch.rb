@@ -23,6 +23,7 @@ root = ARGV[0] or abort "usage: overlay_cable_dispatch.rb <repo-root>"
 root = File.expand_path(root)
 
 require "json"
+require "stringio"
 
 # --- what boot.rb has standing before cable.rb loads -----------------
 load "#{root}/runtime/spinel/base64.rb"
@@ -84,6 +85,9 @@ load "#{root}/runtime/spinel/global_id_locator.rb"
 module NIO; end
 module WebSocket; end
 
+# boot.rb loads runtime/redis_cable.rb first; on a tree that keeps
+# broadcasts in process that is this no-op facade.
+load "#{root}/runtime/spinel/redis_cable.rb"
 load "#{root}/runtime/spinel/scaffold/ruby_overlay/cable.rb"
 
 puts "vendor ruby #{RUBY_VERSION}"
@@ -346,6 +350,169 @@ check("broadcasting_for joins the channel name to the record's gid",
 # Channel bodies read `params[:room_id]`; the wire has string keys only.
 params = ActionCable::Channel::Parameters.new({ "room_id" => 1 })
 check("params read indifferently", [params[:room_id], params["room_id"]], [1, 1])
+
+# --- a `message` frame: the client's `perform` (#71 item 6) ----------
+#
+# Through the connection's own frame handler, as the reactor calls it.
+# The connection is allocated rather than built (no socket, no driver);
+# the worker pool and the database lease run in line, so each frame has
+# finished when `handle_message` returns. Which methods are actions and
+# how they are called is the emitted contract's job
+# (`emit_and_run::a_cable_action_runs_with_rails_rules`); this is the
+# routing: the right subscription, JSON types kept, and every way a
+# frame can be wrong dropped without escaping.
+class ActionProbeChannel < ApplicationCable::Channel
+  SEEN = []
+  def input(data) = SEEN << [:input, data["d"]]
+  def speech(data) = SEEN << [:speech, data["on"]]
+  def boom(_data) = raise("boom")
+end
+
+Cable::Workers.define_singleton_method(:post) { |&block| block.call }
+unless defined?(Db)
+  module Db
+    def self.with_connection = yield
+  end
+end
+
+PROBE_ID = '{"channel":"ActionProbeChannel"}'
+socket_conn = Cable::Connection.allocate
+socket_conn.instance_variable_set(:@channels, {
+  PROBE_ID => ActionProbeChannel.new(nil, PROBE_ID, ActionCable::Channel::Parameters.new({})),
+  '{"channel":"Pending"}' => :pending
+})
+frame = ->(identifier, data) { JSON.generate("command" => "message", "identifier" => identifier, "data" => data) }
+
+socket_conn.send(:handle_message, frame.(PROBE_ID, '{"action":"input","d":"ls\r"}'))
+socket_conn.send(:handle_message, frame.(PROBE_ID, '{"action":"speech","on":false}'))
+check("a message frame runs the action on that subscription, JSON types kept",
+      ActionProbeChannel::SEEN, [[:input, "ls\r"], [:speech, false]])
+
+ActionProbeChannel::SEEN.clear
+socket_conn.send(:handle_message, frame.('{"channel":"Nobody"}', '{"action":"input","d":"x"}'))
+socket_conn.send(:handle_message, frame.('{"channel":"Pending"}', '{"action":"input","d":"x"}'))
+socket_conn.send(:handle_message, frame.(PROBE_ID, '["input"]'))
+socket_conn.send(:handle_message, frame.(PROBE_ID, "not json"))
+check("no subscription, a pending one, or data that is not an object runs nothing",
+      ActionProbeChannel::SEEN, [])
+
+survived = begin
+  socket_conn.send(:handle_message, frame.(PROBE_ID, '{"action":"boom"}'))
+  true
+rescue StandardError
+  false
+end
+check("an action that raises is contained", survived, true)
+
+# --- remote_connections.where(current_user:).disconnect --------------
+#
+# Rails' two halves: the broadcast on `action_cable/<identifier>`, and
+# the identified connection that subscribed to that internal channel
+# closing itself on it. The transport delivers in line, as the reactor
+# would on its own thread.
+module Broadcasts
+  def self.log_append(entry) = LOG << entry
+end
+Broadcasts::TRANSPORTS[0] = Object.new.tap do |t|
+  t.define_singleton_method(:broadcast) { |stream, payload| Cable::Registry.deliver(stream, payload) }
+end
+class User
+  def to_gid_param = GlobalID.param("User", id)
+end
+
+kicked = User.new(7, [])
+identity = ActionCable::Connection::Base.new(nil)
+identity.current_user = kicked
+bystander_identity = ActionCable::Connection::Base.new(nil)
+bystander_identity.current_user = User.new(8, [])
+
+sent = Hash.new { |h, k| h[k] = [] }
+closed = []
+live = [identity, bystander_identity].map do |ident|
+  conn = Cable::Connection.allocate
+  conn.instance_variable_set(:@identity, ident)
+  conn.define_singleton_method(:send_text) { |text| sent[ident.current_user.id] << JSON.parse(text) }
+  conn.define_singleton_method(:on_writable) { nil }
+  conn.define_singleton_method(:close) { closed << ident.current_user.id; Cable::Registry.unsubscribe_all(self) }
+  conn.subscribe_internal_channel
+  conn
+end
+
+check("an identified connection names its internal channel by gid",
+      live[0].internal_channel?("action_cable/#{kicked.to_gid_param}"), true)
+
+ActionCable.server.remote_connections.where(current_user: kicked).disconnect(reconnect: true)
+check("disconnect broadcasts Rails' internal message",
+      Broadcasts::LOG.last,
+      { action: :message, stream: "action_cable/#{kicked.to_gid_param}",
+        payload: { type: "disconnect", reconnect: true } })
+check("only the selected user's socket is told, then closed",
+      [sent[7], sent[8], closed],
+      [[{ "type" => "disconnect", "reason" => "remote", "reconnect" => true }], [], [7]])
+
+# --- the heartbeat's `beat`, and `close(reason:)` ---------------------
+#
+# Rails' heartbeat calls every connection's `beat`; campfire's override
+# looks its session up again now and then (through `perform_work`) and
+# closes the socket once the session is gone, telling the client why.
+# The reactor's posts run in line here, as the worker pool's already do.
+Cable::Reactor.define_singleton_method(:post) { |&block| block.call }
+class SessionCheckingConnection < ActionCable::Connection::Base
+  attr_reader :beats
+  attr_accessor :gone, :explode
+  def beat
+    super
+    @beats = (@beats || 0) + 1
+    raise "beat failed" if @explode
+    perform_work -> { close(reason: ActionCable::INTERNAL[:disconnect_reasons][:unauthorized]) if @gone }, :call
+  end
+end
+
+def beating_socket(identity, frames, shut)
+  socket = Cable::Connection.allocate
+  socket.instance_variable_set(:@identity, identity)
+  socket.instance_variable_set(:@closed, false)
+  identity.transport = socket    # what Connection#initialize does
+  socket.define_singleton_method(:send_json) { |value| frames << value }
+  socket.define_singleton_method(:on_writable) { nil }
+  socket.define_singleton_method(:close) { shut << :closed; @closed = true }
+  socket
+end
+
+kept_frames, kept_shut = [], []
+kept = SessionCheckingConnection.new(nil)
+kept_socket = beating_socket(kept, kept_frames, kept_shut)
+ended_frames, ended_shut = [], []
+ended = SessionCheckingConnection.new(nil)
+ended.gone = true
+ended_socket = beating_socket(ended, ended_frames, ended_shut)
+
+kept_socket.app_beat
+ended_socket.app_beat
+check("the heartbeat calls the app connection's beat", [kept.beats, ended.beats], [1, 1])
+check("a connection whose session remains is left open", [kept_frames, kept_shut], [[], []])
+check("one whose session is gone is told why, then closed",
+      [ended_frames, ended_shut],
+      [[{ "type" => "disconnect", "reason" => "unauthorized", "reconnect" => true }], [:closed]])
+ended_socket.app_beat
+check("a closed socket's connection is not beaten again", ended.beats, 1)
+
+broken = SessionCheckingConnection.new(nil)
+broken.explode = true
+broken_socket = beating_socket(broken, [], [])
+$stderr = StringIO.new
+contained = begin
+  broken_socket.app_beat
+  true
+rescue StandardError
+  false
+end
+$stderr = STDERR
+check("a beat that raises is contained", contained, true)
+check("perform_work runs only a callable's call",
+      (begin; kept.perform_work(-> { 1 }, :run); :ran; rescue ArgumentError; :refused; end), :refused)
+check("ActionCable::INTERNAL carries Rails' disconnect reasons",
+      ActionCable::INTERNAL[:disconnect_reasons][:unauthorized], "unauthorized")
 
 if FAILURES.empty?
   puts "ALL OK"

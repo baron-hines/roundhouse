@@ -45,10 +45,14 @@ Db.with_connection do
     expect_cleanup_failure("reload") { row._adapter_reload }
     expect_cleanup_failure("hydrate") { controller.preloaded }
     expect_cleanup_failure("hydrate") { Reading._hydrate_all("SELECT id, parent_id, recorded_at, label FROM readings") }
+    # The adapter's own reader: a block that raises mid-iteration (the
+    # `instantiate(row)` of a Hash-row hydration) must not keep the
+    # statement it was stepping.
+    expect_cleanup_failure("each_row") { SqliteAdapter.each_row("SELECT id, label FROM readings") { |_row| CleanupFaults.trip("each_row") } }
     raise "lease no longer usable" unless row.time_count(needle) == 1
     raise "successful recovery retained a statement" unless Db.cleanup_owned_count == 0
   end
   true
 end
-puts "cleanup: " + (binds ? "24" : "21") + " rescued generated failures; every owned count was zero before lease end"
+puts "cleanup: " + (binds ? "27" : "24") + " rescued generated failures; every owned count was zero before lease end"
 Db.close

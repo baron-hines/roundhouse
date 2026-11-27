@@ -1,0 +1,7 @@
+# Typing for runtime/spinel/pg_driver.rb, spinel-pg's side of where
+# db_pg.rb's two drivers differ. PgClientCore and PgResult are spinel-pg's.
+module PgDriver
+  def self.open: (String host, Integer port, String database, String user, String password) -> PgClientCore
+  def self.command_tag: (PgResult result) -> String
+  def self.sqlstate: (PG::Error error) -> String
+end

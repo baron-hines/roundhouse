@@ -10,13 +10,25 @@
 # treats it as Integer here — sufficient for the lowered IR; per-target
 # narrowing happens at emit time.
 module Db
-  def self.configure: (String, ?pool_size: Integer) -> void
+  # `schema_search_path:` is Rails' database.yml key of that name, which
+  # only a PostgreSQL shim reads (runtime/spinel/db_pg.rb sets it on every
+  # connection); the SQLite shims have no schemas and don't take it.
+  def self.configure: (String, ?pool_size: Integer, ?schema_search_path: String) -> void
   # `ActiveRecord::Base.connection_db_config` and `transaction_open?`
   # (runtime/spinel/active_record_db_config.rb): the configured
   # database, the adapter name Rails reports for it, and whether the
   # holder is in a transaction of its own (not the request snapshot).
   def self.database_path: () -> String
   def self.adapter_name: () -> String
+  # The pool slot a connection handle taken now stays on (`ActiveRecord::Base.connection`), for Base itself or for the
+  # connection class; -1 on a Db with one database, where the handle is the shared one, and -2 before `configure`.
+  def self.connection_slot: (bool) -> Integer
+  # The pair a handle with a slot runs each statement between (`ActiveRecord::Connection`). Only a shim whose
+  # `connection_slot` answers a slot is called; the Spinel shims define them.
+  def self.enter_slot: (Integer, bool) -> nil
+  # Hold a handle's lease without selecting its slot for model queries.
+  def self.hold_slot: (Integer, bool) -> nil
+  def self.leave_slot: () -> nil
   def self.transaction_open?: () -> bool
   def self.close: () -> void
   def self.exec: (String) -> void
@@ -73,6 +85,7 @@ module Db
   def self.escape_string: (String) -> String
   def self.escape_int: (Integer) -> String
   def self.escape_int_list: (Array[Integer]) -> String
+  def self.escape_string_list: (Array[String]) -> String
   # Nullable-column writes: nil renders the SQL keyword NULL, so a
   # column the schema calls nullable round-trips as nil rather than as
   # the type's zero.
@@ -80,6 +93,14 @@ module Db
   def self.escape_int_opt: (Integer?) -> String
   def self.escape_float_opt: (Float?) -> String
   def self.escape_bool_opt: (bool?) -> String
+  # `t.binary` columns. The ruby family's shims tell bytes from text by
+  # the value's encoding and answer these as their text methods; Rust,
+  # whose strings carry none, holds bytes one char per byte and writes
+  # them as a hex BLOB literal.
+  def self.escape_binary: (String) -> String
+  def self.escape_binary_opt: (String?) -> String
+  def self.column_binary: (Integer, Integer) -> String
+  def self.column_binary_opt: (Integer, Integer) -> String?
   # Per-thread `ActiveRecord::Base.transaction` nesting depth
   # (connection.rb): 0 outside any open transaction, incremented by a
   # joining nested call. A typed accessor instead of a raw
@@ -90,4 +111,22 @@ module Db
   # `current_dbh`/`current_conn`).
   def self._txn_depth: () -> Integer
   def self._txn_depth=: (Integer) -> Integer
+  # Bit `depth - 1` is set when that frame can be joined. A Rails
+  # fixture transaction is not joinable, so a save or destroy inside
+  # it opens a savepoint.
+  def self._txn_joinable_bits: () -> Integer
+  def self._txn_joinable_bits=: (Integer) -> Integer
+  # The writes the open transaction holds commit callbacks for
+  # (connection.rb's `_commit_enlisted`), per thread like the depth and
+  # boxed the same way. Empty outside a transaction.
+  def self._txn_records: () -> Array[ActiveRecord::EnlistedRecord]
+  def self._txn_callbacks: () -> Array[^() -> nil]
+  # The tables inside a `Model.unscoped` block on this thread, innermost
+  # last (relation.rb's `Relation.unscoped_tables`).
+  def self._unscoped_tables: () -> Array[String]
+  # The relations whose `scoping { }` block runs on this thread,
+  # innermost last (relation.rb's `Relation.current_scope_for`): nil
+  # until the first push, which seeds the list with its element.
+  def self._current_scopes: () -> Array[ActiveRecord::Relation]?
+  def self._push_current_scope: (ActiveRecord::Relation scope) -> Array[ActiveRecord::Relation]
 end

@@ -1,0 +1,10 @@
+# hide a tag through the filters, read the front page, then change a setting
+# (the form always sends the password fields, empty when unchanged)
+GET /filters
+POST /filters tags[ruby]=1
+GET /filters
+GET /
+GET /settings
+POST /settings user[about]=Edited+by+the+replay&user[email_replies]=1&user[password]=&user[password_confirmation]=&current_password=
+GET /settings
+GET /~{username}

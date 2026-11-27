@@ -34,6 +34,7 @@ module ActiveStorage
   end
 
   module Routes
+    CONTROLLER_PATHS: Hash[Symbol, String]
     def self.table: () -> Array[ActionDispatch::Router::Route]
     def self.instantiate_controller: (Symbol sym) -> ActionController::Base
   end
@@ -49,6 +50,12 @@ module ActiveStorage
       def process_action: (Symbol action_name) -> nil
       def show: () -> nil
     end
+
+    class ProxyController < ActionController::Base
+      @_headers: ActionController::HeaderStore
+      def process_action: (Symbol action_name) -> nil
+      def show: () -> nil
+    end
   end
 
   module Representations
@@ -59,7 +66,7 @@ module ActiveStorage
   end
 
   class DiskController < ActionController::Base
-    @headers: ActionController::HeaderStore
+    @_headers: ActionController::HeaderStore
     def process_action: (Symbol action_name) -> nil
     def show: () -> nil
   end

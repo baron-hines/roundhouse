@@ -26,9 +26,19 @@ fn dispatch_failures(action: &str) -> Vec<String> {
 #[test]
 fn unimplemented_errors_operations_are_refused() {
     let diags = dispatch_failures(
-        "    errors.added?(:base, :blank)\n    errors.import(other.errors.first)\n    errors.merge!(other.errors)\n    errors.delete(:base)\n    errors.where(:base).any?\n    errors.details[:base]\n    errors.map(&:type).include?(:x)\n    errors.errors[0].options[:code]\n    errors.attribute_names\n    errors.messages",
+        "    errors.added?(:base, :blank, count: 1)\n    errors.import(other.errors.first)\n    errors.merge!(other.errors)\n    errors.where(:base, :blank, count: 1).any?\n    errors.details[:base].first[:count]\n    errors.map(&:type).include?(:x)\n    errors.errors[0].options[:code]\n    errors.messages",
     );
-    for name in ["added?", "import", "merge!", "delete", "where", "details", "attribute_names"] {
+    for name in ["added?", "import", "merge!", "where", "`[]`"] {
         assert!(diags.iter().any(|d| d.contains(name)), "missing {name}: {diags:?}");
     }
+}
+
+/// `errors.delete(:field)` and `errors.delete(:field, type)` are grounded, on a tableless validator too: the
+/// record's own accumulator and details, which every lowering of an `ActiveModel::Validations` class has.
+#[test]
+fn a_delete_with_a_type_is_grounded() {
+    let diags = dispatch_failures(
+        "    errors.add(:base, :blank)\n    errors.delete(:base, :blank)\n    errors.delete(:name, \"is invalid\")",
+    );
+    assert!(diags.is_empty(), "{diags:?}");
 }

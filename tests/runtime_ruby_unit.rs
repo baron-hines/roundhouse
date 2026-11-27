@@ -20,6 +20,9 @@
 //! Or directly:
 //!     cd runtime/ruby && rake test
 
+#[path = "support/prerequisite.rs"]
+mod prerequisite;
+
 use std::path::Path;
 use std::process::Command;
 
@@ -36,10 +39,7 @@ fn framework_ruby_tests_pass() {
     // when it's missing — local contributors without Ruby installed
     // shouldn't be blocked by this gate.
     if Command::new("ruby").arg("--version").output().is_err() {
-        eprintln!(
-            "skipping: CRuby not available on PATH \
-             (install Ruby >= 3.2 to run framework unit tests)"
-        );
+        prerequisite::missing("CRuby not available on PATH (install Ruby >= 3.2 to run framework unit tests)");
         return;
     }
 

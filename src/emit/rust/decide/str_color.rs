@@ -20,12 +20,12 @@
 //! from `analyze/str_color` in Stage 2 of #22 to concentrate
 //! rust-local decisions under the decide module.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::dialect::{LibraryClass, LibraryFunction, MethodDef};
 use crate::expr::{Expr, ExprNode, InterpPart, LValue, Literal, OpAssignOp};
 use crate::ident::Symbol;
-use crate::ty::{ParamKind, Ty};
+use crate::ty::{FnTy, ParamKind, Ty};
 
 /// Direction of a string ownership coercion at a specific emit site.
 /// Internal to the str_color analysis; the public output is the
@@ -218,7 +218,7 @@ fn signature_from_function(func: &LibraryFunction) -> CallableSig {
 }
 
 fn from_sig(sig: Option<&Ty>, param_count: usize) -> CallableSig {
-    let Some(Ty::Fn { params, ret, .. }) = sig else {
+    let Some(Ty::Fn(fn_ty)) = sig else {
         // Untyped (no signature) — leave every position blank. The
         // pass treats `None` as "don't coerce here", which is the
         // conservative choice when we don't know the param types.
@@ -227,6 +227,7 @@ fn from_sig(sig: Option<&Ty>, param_count: usize) -> CallableSig {
             return_str_color: None,
         };
     };
+    let FnTy { params, ret, .. } = &**fn_ty;
     // Skip block params + keyword-rest in the color vector — those
     // don't show up as positional args in Send call sites.
     let positional: Vec<&crate::ty::Param> = params
@@ -309,8 +310,8 @@ pub fn color_method(method: &mut MethodDef, registry: &CallableRegistry) -> usiz
     let mut ctx = WalkCtx {
         registry,
         return_color,
-        owned_str_locals: std::collections::HashSet::new(),
-        owned_init_vars: std::collections::HashSet::new(),
+        owned_str_locals: crate::det::HashSet::default(),
+        owned_init_vars: crate::det::HashSet::default(),
     };
     let expect = return_color.map_or(ParentExpect::None, ParentExpect::Color);
     walk(&mut method.body, expect, &mut ctx)
@@ -332,7 +333,7 @@ struct WalkCtx<'a> {
     /// borrow coercion — and Rust rejects the call (no String→&str
     /// auto-coercion at arg position). The set scopes per-Seq via
     /// snapshot-restore so nested blocks don't leak bindings outward.
-    owned_str_locals: std::collections::HashSet<Symbol>,
+    owned_str_locals: crate::det::HashSet<Symbol>,
     /// Multi-assign coordination: Vars assigned more than once where
     /// at least one assignment produces `Owned`. Rust infers the
     /// binding's type from the FIRST assignment, so an init like
@@ -342,7 +343,7 @@ struct WalkCtx<'a> {
     /// `expect` to Owned for any assignment whose target Var is in
     /// the set — including the first-init, so the init's literal/
     /// borrow gets `.to_string()`'d up front.
-    owned_init_vars: std::collections::HashSet<Symbol>,
+    owned_init_vars: crate::det::HashSet<Symbol>,
 }
 
 /// What the parent of the current expression expects from a string
@@ -394,7 +395,7 @@ fn walk(e: &mut Expr, expect: ParentExpect, ctx: &mut WalkCtx<'_>) -> usize {
 
 /// Find owned assignments and aliases so every initializer agrees with
 /// the storage required by later writes, including string `+=`.
-fn collect_owned_var_assignments(e: &Expr, out: &mut std::collections::HashSet<Symbol>) {
+fn collect_owned_var_assignments(e: &Expr, out: &mut crate::det::HashSet<Symbol>) {
     if let ExprNode::Assign {
         target: LValue::Var { name, .. },
         value,
@@ -468,7 +469,7 @@ fn collect_owned_var_assignments(e: &Expr, out: &mut std::collections::HashSet<S
 
 fn producer_color_with_locals(
     e: &Expr,
-    owned_str_locals: &std::collections::HashSet<Symbol>,
+    owned_str_locals: &crate::det::HashSet<Symbol>,
 ) -> Option<StrColor> {
     match e.node.as_ref() {
         ExprNode::Var { name, .. } if owned_str_locals.contains(name) => Some(StrColor::Owned),
@@ -478,7 +479,8 @@ fn producer_color_with_locals(
 
 fn producer_color(e: &Expr) -> Option<StrColor> {
     match e.node.as_ref() {
-        ExprNode::Lit { value: Literal::Str { .. } } => Some(StrColor::Static),
+        // A Symbol literal renders as the same `&'static str` a String literal does
+        ExprNode::Lit { value: Literal::Str { .. } | Literal::Sym { .. } } => Some(StrColor::Static),
         ExprNode::StringInterp { .. } => Some(StrColor::Owned),
         ExprNode::Ivar { .. } => Some(StrColor::Owned),
         ExprNode::Send { .. } => Some(StrColor::Owned),
@@ -904,7 +906,7 @@ fn is_known_str_send(e: &Expr) -> bool {
 fn unify_branches_expect(
     then_branch: &Expr,
     else_branch: &Expr,
-    owned_str_locals: &std::collections::HashSet<Symbol>,
+    owned_str_locals: &crate::det::HashSet<Symbol>,
 ) -> ParentExpect {
     match (
         branch_tail_color(then_branch, owned_str_locals),
@@ -925,7 +927,7 @@ fn unify_branches_expect(
 /// inspects the immediate tail expression of a Seq, not deeper.
 fn branch_tail_color(
     e: &Expr,
-    owned_str_locals: &std::collections::HashSet<Symbol>,
+    owned_str_locals: &crate::det::HashSet<Symbol>,
 ) -> Option<StrColor> {
     let tail = tail_expr(e);
     match tail.node.as_ref() {
@@ -1006,7 +1008,7 @@ mod tests {
     use crate::expr::{Expr, ExprNode, InterpPart, Literal, LValue};
     use crate::ident::{ClassId, Symbol, VarId};
     use crate::span::Span;
-    use crate::ty::{Param as TyParam, ParamKind, Ty};
+    use crate::ty::{FnTy, Param as TyParam, ParamKind, Ty};
 
     // ----- Construction helpers -------------------------------------------
 
@@ -1051,19 +1053,19 @@ mod tests {
     }
 
     fn fn_sig(params: Vec<(&str, Ty)>, ret: Ty) -> Ty {
-        Ty::Fn {
+        Ty::Fn(Box::new(FnTy {
             params: params
                 .into_iter()
                 .map(|(n, ty)| TyParam {
                     name: Symbol::from(n),
-                    ty,
+                    ty: ty.into(),
                     kind: ParamKind::Required,
                 })
                 .collect(),
             block: None,
-            ret: Box::new(ret),
+            ret: std::sync::Arc::new(ret),
             effects: EffectSet::pure(),
-        }
+        }))
     }
 
     fn class(name: &str, methods: Vec<MethodDef>) -> LibraryClass {
@@ -1073,10 +1075,12 @@ mod tests {
             parent: None,
             parent_span: Default::default(),
             includes: vec![],
+            include_spans: Vec::new(),
             methods,
             nullable_columns: Vec::new(),
             origin: None,
             constants: Vec::new(),
+            conditional_definitions: Vec::new(),
             unknown_calls: Vec::new(),
             class_ivar_initializers: Vec::new(),
         }

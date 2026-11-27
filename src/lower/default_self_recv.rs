@@ -26,7 +26,7 @@ pub fn apply_default_self_recv(app: &mut App) -> Vec<Diagnostic> {
     for model in &mut app.models {
         let self_ty = Ty::Class {
             id: model.name.clone(),
-            args: vec![],
+            args: vec![].into(),
         };
         for item in &mut model.body {
             match item {
@@ -52,14 +52,24 @@ pub fn apply_default_self_recv(app: &mut App) -> Vec<Diagnostic> {
             }
         }
     }
+    let helper_modules: crate::det::HashSet<crate::ident::ClassId> = app
+        .helper_method_index
+        .values()
+        .filter(|id| !app.controllers.iter().any(|c| &c.name == *id))
+        .cloned()
+        .collect();
     for lc in app
         .library_classes
         .iter_mut()
         .chain(app.rails_application.iter_mut())
     {
+        // A helper module's methods become module functions with no view to dispatch to: the Ruby emit qualifies their bare sends itself, and a `self.` here would send `link_to` to the module.
+        if helper_modules.contains(&lc.name) {
+            continue;
+        }
         let self_ty = Ty::Class {
             id: lc.name.clone(),
-            args: vec![],
+            args: vec![].into(),
         };
         for method in &mut lc.methods {
             rewrite_method_defaults(method, &self_ty);

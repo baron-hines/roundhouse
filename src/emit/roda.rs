@@ -40,14 +40,16 @@ use indexmap::IndexMap;
 use std::path::PathBuf;
 
 use crate::app::App;
+use crate::diagnostic::DiagnosticKind;
 use crate::dialect::{
     Action, Association, Controller, ControllerBodyItem, Dependent, FilterKind, HttpMethod,
     Model, ModelBodyItem, RenderTarget, ValidationRule,
 };
 use crate::expr::{Expr, ExprNode, Literal};
 use crate::lower::routes::{flatten_routes_for_helpers, FlatRoute};
+use crate::lower::lower_model_to_library_class;
 use crate::naming;
-use crate::schema::{ColumnType, Table};
+use crate::schema::{ColumnType, Schema, Table};
 
 use super::ruby::emit_expr;
 use super::EmittedFile;
@@ -58,7 +60,11 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
     let mut files: Vec<EmittedFile> = Vec::new();
     files.push(file("Gemfile", GEMFILE));
     files.push(file("config.ru", CONFIG_RU));
-    files.push(file("db.rb", DB_RB));
+    // Sequel's SQLite connection makes LIKE case-sensitive unless told not
+    // to; Rails' leaves SQLite's default. A SQLite application's LIKE, its
+    // CHECKs included, keeps Rails' reading. Any other app's file is unchanged.
+    let sqlite = app.schema.expression_dialect == crate::schema::generated::GeneratedExpressionDialect::Sqlite;
+    files.push(file("db.rb", &if sqlite { DB_RB.replacen("__dir__)))", "__dir__)), case_sensitive_like: false)", 1) } else { DB_RB.to_string() }));
     files.extend(emit_migrations(app));
     files.extend(emit_models(app));
     files.push(emit_app_rb(app));
@@ -138,14 +144,16 @@ fn emit_migrations(app: &App) -> Vec<EmittedFile> {
 /// the DB-level cascade is the idiomatic equivalent (and what the
 /// reviewed exemplar does).
 fn migration_for(app: &App, table: &Table) -> String {
+    let ruby_str = crate::emit::ruby::expr::ruby_str_literal;
     let fk_cols: Vec<&str> = table
         .foreign_keys
         .iter()
-        .map(|fk| fk.from_column.as_str())
+        .filter(|fk| fk.from_columns.len() == 1)
+        .map(|fk| fk.from_columns[0].as_str())
         .collect();
     let mut lines: Vec<String> = Vec::new();
     for col in &table.columns {
-        if col.primary_key {
+        if col.primary_key && table.primary_key_columns.is_empty() {
             lines.push(format!("      primary_key :{}", col.name));
             continue;
         }
@@ -153,9 +161,20 @@ fn migration_for(app: &App, table: &Table) -> String {
             let fk = table
                 .foreign_keys
                 .iter()
-                .find(|fk| fk.from_column == col.name)
+                .find(|fk| fk.from_columns.as_slice() == std::slice::from_ref(&col.name))
                 .unwrap();
             let mut l = format!("      foreign_key :{}, :{}", col.name, fk.to_table);
+            // Without `key:`, Sequel references the target's primary key, so
+            // `key:` is left out only when that key is exactly `id`.
+            let target_key_is_id = app.schema.tables.get(&fk.to_table.0).is_some_and(|t| if t.primary_key_columns.is_empty() {
+                t.columns.iter().filter(|c| c.primary_key).map(|c| c.name.as_str()).eq(["id"])
+            } else {
+                t.primary_key_columns.iter().map(|c| c.as_str()).eq(["id"])
+            });
+            if !target_key_is_id || fk.to_columns.len() != 1 || fk.to_columns[0].as_str() != "id" {
+                l.push_str(&format!(", key: [{}]", fk.to_columns.iter().map(|c| crate::emit::ruby::expr::ruby_sym_literal(c.as_str())).collect::<Vec<_>>().join(", ")));
+            }
+            if let Some(timing) = fk.deferrable { l.push_str(&format!(", deferrable: :{}", if timing == crate::schema::Deferrable::Deferred { "deferred" } else { "immediate" })); }
             if !col.nullable {
                 l.push_str(", null: false");
             }
@@ -170,12 +189,33 @@ fn migration_for(app: &App, table: &Table) -> String {
         if !col.nullable {
             l.push_str(", null: false");
         }
+        if let Some(sql) = &col.default_expression {
+            l.push_str(&format!(", default: Sequel.lit({})", crate::emit::ruby::expr::ruby_str_literal(sql)));
+        }
         lines.push(l);
+    }
+    let list = |keys: &[crate::Symbol]| keys.iter().map(|c| crate::emit::ruby::expr::ruby_sym_literal(c.as_str())).collect::<Vec<_>>().join(", ");
+    if !table.primary_key_columns.is_empty() {
+        // Identifier expressions keep Sequel from imposing NOT NULL on SQLite's
+        // composite key columns. PostgreSQL enforces its own PK nullability.
+        let keys = table.primary_key_columns.iter().map(|c| format!("Sequel.identifier({})", crate::emit::ruby::expr::ruby_sym_literal(c.as_str()))).collect::<Vec<_>>().join(", ");
+        lines.push(format!("      primary_key [{keys}]"));
+    }
+    for fk in table.foreign_keys.iter().filter(|fk| fk.from_columns.len() > 1) {
+        let mut line = format!("      foreign_key [{}], {}, key: [{}]", list(&fk.from_columns), crate::emit::ruby::expr::ruby_sym_literal(fk.to_table.0.as_str()), list(&fk.to_columns));
+        if let Some(timing) = fk.deferrable { line.push_str(&format!(", deferrable: :{}", if timing == crate::schema::Deferrable::Deferred { "deferred" } else { "immediate" })); }
+        for (key, action) in [("on_delete", &fk.on_delete), ("on_update", &fk.on_update)] {
+            let action = match action { crate::schema::ReferentialAction::Cascade => "cascade", crate::schema::ReferentialAction::SetNull => "set_null", crate::schema::ReferentialAction::Restrict => "restrict", crate::schema::ReferentialAction::SetDefault => "set_default", _ => continue };
+            line.push_str(&format!(", {key}: :{action}"));
+        }
+        lines.push(line);
     }
     for idx in &table.indexes {
         // The FK line above doesn't auto-index; keep the schema's
         // explicit indexes (minus any on the primary key).
-        let cols = if idx.columns.len() == 1 {
+        let cols = if let Some(expression) = &idx.expression {
+            format!("Sequel.lit({})", ruby_str(expression))
+        } else if idx.columns.len() == 1 {
             format!(":{}", idx.columns[0])
         } else {
             format!(
@@ -184,7 +224,13 @@ fn migration_for(app: &App, table: &Table) -> String {
             )
         };
         let unique = if idx.unique { ", unique: true" } else { "" };
-        lines.push(format!("      index {cols}{unique}"));
+        let name = idx.expression.as_ref().map(|_| format!(", name: {}", ruby_str(idx.name.as_str()))).unwrap_or_default();
+        let predicate = idx.predicate.as_ref().filter(|sql| crate::emit::shared::schema_sql::sqlite_reads_predicate_alike(sql, table, app.schema.expression_dialect)).map(|sql| format!(", where: Sequel.lit({})", ruby_str(sql))).unwrap_or_default();
+        lines.push(format!("      index {cols}{unique}{name}{predicate}"));
+    }
+    for check in &table.check_constraints {
+        let name = check.name.as_ref().map(|n| ruby_str(n)).unwrap_or_else(|| "nil".into());
+        lines.push(format!("      constraint({name}, Sequel.lit({}))", ruby_str(&check.expression)));
     }
     format!(
         "Sequel.migration do\n  change do\n    create_table(:{}) do\n{}\n    end\n  end\nend\n",
@@ -229,11 +275,12 @@ fn sequel_column_type(ty: &ColumnType) -> (&'static str, &'static str) {
         ColumnType::DateTime => ("DateTime", ""),
         ColumnType::Time => ("Time", ""),
         ColumnType::Binary => ("File", ""),
-        // No 1:1 Sequel generic type; store as text and note the source type.
-        ColumnType::Json => ("String", ", text: true # was json"),
-        ColumnType::Jsonb => ("String", ", text: true # was jsonb"),
-        ColumnType::Uuid => ("String", ", fixed: true, size: 36 # was uuid"),
-        ColumnType::Reference { .. } => ("Integer", " # was t.references"),
+        // No 1:1 Sequel generic type; store as text.
+        ColumnType::Json => ("String", ", text: true"),
+        ColumnType::Jsonb => ("String", ", text: true"),
+        ColumnType::Uuid => ("String", ", fixed: true, size: 36"),
+        ColumnType::Interval => ("String", ", text: true"),
+        ColumnType::Reference { .. } => ("Integer", ""),
     }
 }
 
@@ -255,34 +302,103 @@ fn emit_models(app: &App) -> Vec<EmittedFile> {
                 "models/{}.rb",
                 naming::snake_case(m.name.0.as_str())
             )),
-            content: model_for(m),
+            content: model_for(m, &app.schema),
         })
         .collect()
 }
 
-fn model_for(model: &Model) -> String {
+fn model_for(model: &Model, schema: &Schema) -> String {
+    // Roda converts from the ingest-shape IR directly (see the module
+    // doc), so a `ModelBodyItem::Alias` here has never been through
+    // `lower::model_to_library::resolve_model_aliases` — the pass that
+    // decides whether `old` names anything (a hand-written def, an
+    // enum method, an association reader, attr_accessor, an inherited
+    // ActiveRecord method) or is simply undefined. Emitting an
+    // unresolved alias verbatim produced `alias missing not_defined`,
+    // valid Ruby syntax that raises NameError the moment Sequel loads
+    // the class. Run the real resolver once (discarding the
+    // lowered-for-Ruby method bodies it also builds — Roda doesn't use
+    // them) to get the SAME diagnostic other targets raise for the
+    // same alias, reusing it instead of re-deriving "is this alias
+    // resolvable" from scratch. Only `alias_target_unresolved`
+    // diagnostics are kept: nothing else that lowering pass surfaces
+    // (rich text, typed_store, …) is Roda's concern.
+    let unresolved_alias_diags: Vec<crate::diagnostic::Diagnostic> =
+        if model.body.iter().any(|item| matches!(item, ModelBodyItem::Alias { .. })) {
+            let (_, diags) =
+                crate::emit::diagnostics::scope(|| lower_model_to_library_class(model, schema));
+            diags
+                .into_iter()
+                .filter(|d| {
+                    matches!(&d.kind, DiagnosticKind::Unsupported { construct, .. }
+                        if construct.as_str() == "alias_target_unresolved")
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
     let mut lines: Vec<String> = Vec::new();
     lines.push(format!("class {} < Sequel::Model", model.name.0));
 
     let mut validate_lines: Vec<String> = Vec::new();
     let mut presence: Vec<String> = Vec::new();
+    let ordered_presence = model.validations().any(|v| v.prepend);
 
-    for item in &model.body {
+    for item in model.validation_order() {
         match item {
             ModelBodyItem::Association { assoc, .. } => {
                 lines.push(format!("  {}", association_line(assoc)));
             }
             ModelBodyItem::Validation { validation, .. } => {
+                // A Symbol or lambda `if:` / `unless:` is lowered on the
+                // library path. Emitting the Sequel helper with no guard
+                // would check records Rails skips.
+                if validation.if_cond.is_some() || validation.unless_cond.is_some() {
+                    validate_lines.push(format!(
+                        "    # ROUNDHOUSE-TODO: conditional validation on :{} not emitted",
+                        validation.attribute
+                    ));
+                    continue;
+                }
+                // A `message:` String: Sequel's helpers take `message:` but
+                // interpolate none of Rails' `%{value}` / `%{attribute}` /
+                // `%{model}`, so a message using one is not emitted, the way
+                // a guarded validation is not.
+                if validation.message.as_deref().is_some_and(|m| m.contains("%{")) {
+                    validate_lines.push(format!(
+                        "    # ROUNDHOUSE-TODO: validation on :{} with an interpolated message not emitted",
+                        validation.attribute
+                    ));
+                    continue;
+                }
+                // Through the Ruby string encoder: a single-quoted `'#{x}'`
+                // message is literal text, not an interpolation. Sequel
+                // uses the String as given, so I18n's `%%` escape is
+                // rendered here as the `%` Rails shows.
+                let custom = validation
+                    .message
+                    .as_ref()
+                    .map(|m| format!(", message: {}", crate::emit::ruby::expr::ruby_str_literal(&m.replace("%%", "%"))))
+                    .unwrap_or_default();
                 for rule in &validation.rules {
                     match rule {
+                        ValidationRule::Presence if ordered_presence || !custom.is_empty() => {
+                            validate_lines.push(format!("    validates_presence :{}{custom}", validation.attribute));
+                        }
                         ValidationRule::Presence => {
                             presence.push(format!(":{}", validation.attribute));
                         }
-                        ValidationRule::Length { min, max, message } => {
+                        // Sequel's min/max validators do not share Rails'
+                        // three-state nil rule (unset fails minimum, skips
+                        // a lone maximum, `false` fails both). Emitting
+                        // `:allow_nil` here would claim that match. The
+                        // field is named so the drop is visible.
+                        ValidationRule::Length { min, max, is, message, allow_nil: _ } => {
                             let msg = message
                                 .as_ref()
-                                .map(|m| format!(", message: {m:?}"))
-                                .unwrap_or_default();
+                                .map(|m| format!(", message: {}", crate::emit::ruby::expr::ruby_str_literal(m)))
+                                .unwrap_or_else(|| custom.clone());
                             if let Some(min) = min {
                                 validate_lines.push(format!(
                                     "    validates_min_length {min}, :{}{msg}",
@@ -295,35 +411,94 @@ fn model_for(model: &Model) -> String {
                                     validation.attribute
                                 ));
                             }
+                            if let Some(is) = is {
+                                validate_lines.push(format!(
+                                    "    validates_exact_length {is}, :{}{msg}",
+                                    validation.attribute
+                                ));
+                            }
                         }
                         ValidationRule::Uniqueness { .. } => {
                             validate_lines.push(format!(
-                                "    validates_unique :{}",
+                                "    validates_unique :{}{custom}",
                                 validation.attribute
                             ));
                         }
-                        ValidationRule::Format { pattern } => {
+                        ValidationRule::Format { pattern, flags, allow_nil, allow_blank } => {
+                            let body = crate::emit::shared::regex_literal::escape_regex_delimiters(pattern);
+                            // Sequel's `allow_nil:` / `allow_blank:` (its
+                            // `blank_object?` is Rails' `blank?`), as on the
+                            // numericality helpers below.
+                            let mut opts = String::new();
+                            if *allow_nil == Some(true) {
+                                opts.push_str(", allow_nil: true");
+                            }
+                            if *allow_blank == Some(true) {
+                                opts.push_str(", allow_blank: true");
+                            }
                             validate_lines.push(format!(
-                                "    validates_format /{pattern}/, :{}",
+                                "    validates_format /{body}/{flags}, :{}{opts}{custom}",
                                 validation.attribute
                             ));
                         }
-                        ValidationRule::Numericality { only_integer, .. } => {
+                        ValidationRule::Numericality { only_integer, gt, lt, gte, lte, allow_nil, allow_blank, .. } => {
                             let helper =
                                 if *only_integer { "validates_integer" } else { "validates_numeric" };
+                            // Sequel's helpers skip nil under `allow_nil:` and
+                            // `blank_object?` (nil, false, whitespace-only
+                            // Strings, empty collections: Rails' `blank?`)
+                            // under `allow_blank:`, on every helper the rule
+                            // emits.
+                            let mut opts = String::new();
+                            if *allow_nil == Some(true) {
+                                opts.push_str(", allow_nil: true");
+                            }
+                            if *allow_blank == Some(true) {
+                                opts.push_str(", allow_blank: true");
+                            }
                             validate_lines.push(format!(
-                                "    {helper} :{}",
+                                "    {helper} :{}{opts}{custom}",
                                 validation.attribute
                             ));
+                            // `validates_numeric` ignores `:greater_than`.
+                            // `validates_operator` is the comparison Sequel runs.
+                            if let Some(n) = gt {
+                                validate_lines.push(format!(
+                                    "    validates_operator :>, {n}, :{}{opts}{custom}",
+                                    validation.attribute
+                                ));
+                            }
+                            if let Some(n) = lt {
+                                validate_lines.push(format!(
+                                    "    validates_operator :<, {n}, :{}{opts}{custom}",
+                                    validation.attribute
+                                ));
+                            }
+                            if let Some(n) = gte {
+                                validate_lines.push(format!(
+                                    "    validates_operator :>=, {n}, :{}{opts}{custom}",
+                                    validation.attribute
+                                ));
+                            }
+                            if let Some(n) = lte {
+                                validate_lines.push(format!(
+                                    "    validates_operator :<=, {n}, :{}{opts}{custom}",
+                                    validation.attribute
+                                ));
+                            }
                         }
-                        ValidationRule::Inclusion { values } => {
-                            let list = values
-                                .iter()
-                                .map(literal_src)
-                                .collect::<Vec<_>>()
-                                .join(", ");
+                        ValidationRule::Inclusion { values, range } => {
+                            let list = if let Some(range) = range {
+                                let dots = if range.exclusive { "..." } else { ".." };
+                                format!("({}{}{})", range.begin, dots, range.end)
+                            } else {
+                                format!(
+                                    "[{}]",
+                                    values.iter().map(literal_src).collect::<Vec<_>>().join(", ")
+                                )
+                            };
                             validate_lines.push(format!(
-                                "    validates_includes [{list}], :{}",
+                                "    validates_includes {list}, :{}{custom}",
                                 validation.attribute
                             ));
                         }
@@ -362,6 +537,23 @@ fn model_for(model: &Model) -> String {
                 // models are ordinary Ruby classes.
                 for l in super::ruby::emit_method(method).lines() {
                     lines.push(format!("  {l}").trim_end().to_string());
+                }
+            }
+            // A resolvable alias (naming a hand-written def, an enum
+            // method, an association reader, attr_accessor, or an
+            // inherited ActiveRecord method) re-emits as plain Ruby
+            // `alias` — Sequel models are ordinary Ruby classes, and
+            // by this point in the class body `old` is a real method,
+            // same as under every other target. An unresolved one
+            // (`resolve_model_aliases` above found nothing `old` could
+            // mean) pushes the SAME diagnostic the other targets raise
+            // for it instead of emitting the dead `alias` line: strict
+            // mode errors, survey mode records the gap.
+            ModelBodyItem::Alias { new, old, span, .. } => {
+                if let Some(diag) = unresolved_alias_diags.iter().find(|d| d.span == *span) {
+                    crate::emit::diagnostics::push(diag.clone());
+                } else {
+                    lines.push(format!("  alias {new} {old}"));
                 }
             }
             ModelBodyItem::Unknown { expr, .. } => {
@@ -1103,7 +1295,7 @@ fn emit_terminal_body(
     // callbacks and scoped/skipped declarations, until it is converted.
     if action.name_span.is_synthetic() {
         let mut current = Some(controller);
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = crate::det::HashSet::default();
         while let Some(c) = current {
             if !seen.insert(&c.name) || c.body.iter().any(|item| match item {
                 ControllerBodyItem::Filter { .. } => true,
@@ -2044,13 +2236,15 @@ mod tests {
             .split('/')
             .filter_map(|s| s.strip_prefix(':').map(|p| p.to_string()))
             .collect();
-        FlatRoute {
+        FlatRoute { request_defaults: Vec::new(),
             method,
+            source_path: path.to_string(),
             path: path.to_string(),
             controller: ClassId(Symbol::from(controller)),
             action: Symbol::from(action),
             as_name: String::new(),
             required_params: params.len(),
+            required_path: None,
             path_params: params,
             named: false,
             helpers_enabled: false,
@@ -2060,6 +2254,9 @@ mod tests {
             constraints: vec![],
             seg_patterns: vec![],
             refused: None,
+            format_required: false,
+            mount_root: false,
+            guards: Vec::new(),
         }
     }
 

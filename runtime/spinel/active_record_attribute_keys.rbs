@@ -1,0 +1,6 @@
+module ActiveRecord
+  class Base
+    def self.human_attribute_name: (String | Symbol attr, ?Hash[Symbol, untyped] options) -> String
+    def self.base_class: () -> singleton(ActiveRecord::Base)
+  end
+end

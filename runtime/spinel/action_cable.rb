@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # ActionCable — the spinel-subset sibling of the CRuby overlay's
 # `ruby_overlay/runtime/action_cable.rb`.
 #
@@ -249,6 +250,35 @@ module ActionCable
     JsonBuilder.escape_html_entities(JSON.generate(payload))
   end
 
+  # Rails' `ActionCable::INTERNAL`, the two tables an app reads:
+  # campfire closes a connection whose session has ended with
+  # `close reason: ActionCable::INTERNAL[:disconnect_reasons][:unauthorized]`.
+  # Rails' scalar entries (`default_mount_path`, `protocols`) are left out,
+  # so every value is a table of Strings. The CRuby overlay declares the
+  # same table.
+  INTERNAL = {
+    message_types: {
+      welcome: "welcome",
+      disconnect: "disconnect",
+      ping: "ping",
+      confirmation: "confirm_subscription",
+      rejection: "reject_subscription"
+    },
+    disconnect_reasons: {
+      unauthorized: "unauthorized",
+      invalid_request: "invalid_request",
+      server_restart: "server_restart",
+      remote: "remote"
+    }
+  }
+
+  # The frame `Connection::Base#close` sends before closing: Rails'
+  # `{"type":"disconnect","reason":…,"reconnect":…}`.
+  def self.disconnect_json(reason, reconnect)
+    "{\"type\":\"disconnect\",\"reason\":" + (reason.nil? ? "null" : JSON.generate(reason)) +
+      ",\"reconnect\":" + (reconnect ? "true" : "false") + "}"
+  end
+
   module Channel
     # THE CHANNEL A NAME OFF THE WIRE RESOLVES TO.
     #
@@ -281,6 +311,44 @@ module ActionCable
       nil
     end
     # <<< generated: cable-channels
+
+    # THE ACTION A `message` FRAME NAMES, run on the channel it was sent
+    # to. Rails' `Channel::Base#perform_action` finds the method by
+    # reflection (`action_methods`, `public_send`); a strict target has
+    # neither, so the set is decided at build time instead.
+    #
+    # GENERATED, between the markers, by `project::apply_cable_actions`:
+    # one arm per channel class, most derived first so a subclass is not
+    # answered by its parent's arm, and inside it one arm per action
+    # method - Rails' `action_methods`: the public methods the channel
+    # and its app ancestors and mixins define, less `Channel::Base`'s
+    # own. Private methods, the framework's methods and anything a
+    # client might spell are simply not arms, so the wire cannot widen
+    # the set (the rule `build` above follows for channel names).
+    #
+    # Rails' calling rule is decided per arm: a method of arity exactly
+    # 1 is passed `data`, anything else is called with no arguments
+    # (`def refresh`, `def redraw(_data = {})`), and one that cannot be
+    # called with none raises the ArgumentError Rails raises.
+    #
+    # true when an arm ran, false for an action the channel does not
+    # answer - the caller logs that, as Rails does.
+    # >>> generated: cable-actions
+    def self.perform(channel, action, data)
+      false
+    end
+    # <<< generated: cable-actions
+
+    # `(data["action"].presence || :receive)`, as a String: a frame
+    # without an action, or with an empty one, is `receive`.
+    def self.action_name(data)
+      action = data["action"]
+      if action.nil?
+        return "receive"
+      end
+      text = action.to_s
+      text.length == 0 ? "receive" : text
+    end
 
     class Base
       # A channel is an ORDINARY OBJECT with no transport in it: it is
@@ -320,6 +388,12 @@ module ActionCable
       def params
         @params
       end
+
+      def transmit(data)
+        @connection.transmit({ identifier: @identifier, message: data })
+        nil
+      end
+      private :transmit
 
       # THE TWO LIFECYCLE CALLBACKS, as no-ops.
       #
@@ -409,6 +483,12 @@ module ActionCable
         nil
       end
 
+      def stop_all_streams
+        @connection.stop_streams(@identifier) unless @connection.nil?
+        @streams.clear
+        nil
+      end
+
       # `broadcasting_for` is spelled ONCE, on the class, because
       # `stream_for` subscribes to that name and `broadcast_to`
       # publishes on it: two spellings would be a subscription nobody
@@ -487,6 +567,20 @@ module ActionCable
         @rejected
       end
 
+      # Rails' `perform_action`: the client's `perform("start", {...})`.
+      # `data` is the frame's decoded `data` object with its JSON types
+      # kept - `false` stays false, a number stays a number - and its
+      # `"action"` key still in it, as Rails hands it over. A rejected
+      # subscription and an action the channel does not answer run
+      # nothing and are logged.
+      def perform_action(data)
+        action = ActionCable::Channel.action_name(data)
+        if @rejected || !ActionCable::Channel.perform(self, action, data)
+          warn "[cable] Unable to process " + self.class.to_s + "#" + action
+        end
+        nil
+      end
+
       # `RoomChannel` -> `"room"`; `Turbo::StreamsChannel` ->
       # `"turbo:streams"`. actioncable 8.0:
       #
@@ -550,19 +644,10 @@ module ActionCable
     # it names — campfire's seven ask for `signed_stream_name` and
     # `room_id` — so nothing keeps the object around.
     #
-    # A STRING EVERY TIME, INCLUDING FOR A NUMBER. `RoomChannel` does
-    # `Room.find_by(id: params[:room_id])` and the client writes
-    # `{"room_id":5}` — a JSON number. Answering it as its digits is
-    # what makes the find work: the column is an integer and the
-    # adapter casts a numeric string, where a Ruby Integer and a Ruby
-    # String cannot both come out of one slot on a strict target.
-    # Rails' own `params` is string-valued for the same reason one hop
-    # earlier (a query string has no types), so this is the Rails
-    # answer rather than a concession.
-    #
-    # "" for a key the identifier does not carry, which is what a
-    # channel testing `if params[:signed_stream_name]` needs — a nil
-    # would make the slot nullable for every reader.
+    # Present values retain String conversion, including JSON numbers,
+    # so native channel readers keep their existing ID representation.
+    # Missing/null values stay nil: an empty String is truthy and would
+    # make `if params[:flag]` take the present branch.
     class Parameters
       def initialize(identifier)
         @identifier = identifier
@@ -582,16 +667,16 @@ module ActionCable
         h.is_a?(Hash) ? h : nil
       end
 
-      # One key of `text` as a String: "" when the key is absent or
+      # One key of `text` as a String, or nil when it is absent/null or
       # `text` is not an object; a number reads as its digits. The
       # cable glue reads subscribe frames through this too.
       def self.read(text, name)
         h = Parameters.object(text)
         if h.nil?
-          return ""
+          return nil
         end
         v = h[name]
-        v.nil? ? "" : v.to_s
+        v.nil? ? nil : v.to_s
       end
 
       def [](key)
@@ -674,8 +759,16 @@ module ActionCable
         @cookies
       end
 
+      attr_writer :request
+
+      def request
+        @request = ActionDispatch::Request.for({}) if @request.nil?
+        @request
+      end
+
       def initialize(cookies)
         @cookies = cookies
+        @request = nil
       end
 
       # Rails' Base does not define `connect`; a subclass that wants
@@ -694,6 +787,59 @@ module ActionCable
       def reject_unauthorized_connection
         raise Authorization::UnauthorizedError,
               "ActionCable::Connection: the handshake carried no identified user"
+      end
+
+      # Rails' `socket`: the live connection this one was accepted on
+      # (`Cable.upgrade` sets a `Cable::Socket` over its driver), or
+      # `Connection::TestCase`'s `TestSocket`. Rails 8.2 hands both
+      # `close` and `perform_work` to the socket, and so does this.
+      attr_accessor :transport
+
+      def stop_streams(identifier)
+        live = @transport
+        live.stop_streams(identifier) unless live.nil?
+        nil
+      end
+
+      def transmit(data)
+        live = @transport
+        live.transmit(data) unless live.nil?
+        nil
+      end
+
+      # Rails' `beat`, called on every server heartbeat (`Cable.app_beats`).
+      # Rails' transmits the ping; here the server's shared heartbeat
+      # writes it, so the base does nothing else and an app's override
+      # (campfire's session check) runs after it.
+      def beat
+        nil
+      end
+
+      # Rails' `perform_work(receiver, method)`, delegated to the socket as
+      # Rails 8.2 delegates it. Rails' live socket hands it to a worker;
+      # this lane's heartbeat has a thread of its own and calls `beat`
+      # under a database lease, so `Cable::Socket` runs it there, and a
+      # test's socket inline. With no socket, inline. Modeled for a
+      # callable and `:call`, the one shape an app passes.
+      def perform_work(receiver, method_name)
+        unless method_name.to_s == "call"
+          raise ArgumentError, "ActionCable perform_work: only (callable, :call) is modeled"
+        end
+        live = @transport
+        if live.nil?
+          receiver.call
+        else
+          live.perform_work(receiver)
+        end
+        nil
+      end
+
+      # Rails' `close(reason:, reconnect:)`: tell the client why and whether
+      # to come back, then close the socket.
+      def close(reason: nil, reconnect: true)
+        live = @transport
+        live.close_with_reason(reason, reconnect) unless live.nil?
+        nil
       end
     end
   end

@@ -12,16 +12,17 @@
 //!   - Kotlin requires every parameter typed, so params take their
 //!     signature type, falling back to `Any?`.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
+use crate::det::HashSet;
 use std::path::PathBuf;
 
 use crate::dialect::{AccessorKind, LibraryClass, MethodDef, MethodReceiver};
 use crate::emit::EmittedFile;
 use crate::expr::{Expr, ExprNode, LValue};
-use crate::ty::Ty;
+use crate::ty::{FnTy, Ty};
 
 use super::expr::{
-    begin_method, emit_expr, hoisted_decls, register_method_param_tys, register_method_params,
+    begin_method, emit_expr, emit_if_return_value, hoisted_decls, register_method_param_tys, register_method_params,
     set_current_class, set_instance_prop_types, set_instance_props, set_param_names,
     set_return_label, set_returns_unit,
 };
@@ -89,7 +90,7 @@ pub fn emit_function_module(funcs: &[crate::dialect::LibraryFunction]) -> Option
 /// (e.g. `inflector.rb`). The module name comes from the methods'
 /// `enclosing_class`.
 pub fn emit_module(methods: &[MethodDef]) -> Result<String, String> {
-    set_instance_prop_types(std::collections::HashMap::new());
+    set_instance_prop_types(crate::det::HashMap::default());
     set_current_class("");
     let name = methods
         .first()
@@ -160,7 +161,7 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
     // Kotlin `object`. Class-level `attr_accessor` (from `class << self`)
     // collapses to an object `var` property; everything else is a `fun`.
     if lc.is_module {
-        set_instance_prop_types(std::collections::HashMap::new());
+        set_instance_prop_types(crate::det::HashMap::default());
         set_current_class("");
         let accessor_props = class_accessor_props(&lc.methods);
         let mut out = format!("object {class_name} {{\n");
@@ -172,7 +173,22 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
         // `INSTANCE_PROPS` so body references read as properties.
         let ivars = emit_object_body_ivars(&lc.methods, &accessor_props);
         out.push_str(&ivars);
-        if !accessor_props.is_empty() || !ivars.is_empty() {
+        // A view module's hoisted helper calls (`hoist_pure_helper_constants`:
+        // the layout's stylesheet links and importmap tags) are built on
+        // first read and shared by every request after, like the Ruby
+        // emit's class constants. `lazy` (synchronized) rather than an
+        // eager `val`, so no object's initializer depends on the order in
+        // which the JVM happens to load ViewHelpers and Importmap. Views
+        // only (`Views::<Dir>`, and the bare `Views` a top-level template
+        // lowers to): a runtime module's constants are already emitted at
+        // file scope by the runtime-unit path.
+        let view_name = lc.name.0.as_str();
+        let view_constants: &[(crate::ident::Symbol, Expr)] =
+            if view_name == "Views" || view_name.starts_with("Views::") { &lc.constants } else { &[] };
+        for (name, value) in view_constants {
+            out.push_str(&format!("    val {} by lazy {{ {} }}\n", name.as_str(), emit_expr(value)));
+        }
+        if !accessor_props.is_empty() || !ivars.is_empty() || !view_constants.is_empty() {
             out.push('\n');
         }
         for m in &lc.methods {
@@ -190,7 +206,7 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
     // Instance classes have no thread-local singleton state — their `@ivar`s
     // are per-object (Flash/Session are instantiated per request). Clear any
     // registry left from a preceding object emit.
-    super::expr::set_object_tl_fields(HashSet::new());
+    super::expr::set_object_tl_fields(HashSet::default());
 
     // Temporal (Date/DateTime/Time) columns arrive from the shared
     // lowering already split: storage is an ordinary `<col>_raw` String
@@ -201,14 +217,14 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
     // Kotlin has one member per name — so Time-returning readers are
     // pulled out of the accessor→`var` collapse and emitted as explicit
     // computed getters below.
-    let mut temporal_names: HashSet<String> = HashSet::new();
+    let mut temporal_names: HashSet<String> = HashSet::default();
     let mut temporal_readers: Vec<(String, Ty, Expr)> = Vec::new();
     for m in &lc.methods {
         if m.kind == AccessorKind::AttributeReader && signature_ret_is_time(m.signature.as_ref()) {
             let name = camel(m.name.as_str());
             if temporal_names.insert(name.clone()) {
                 let ret = match m.signature.as_ref() {
-                    Some(Ty::Fn { ret, .. }) => (**ret).clone(),
+                    Some(Ty::Fn(fn_ty)) => (*fn_ty.ret).clone(),
                     _ => Ty::Time,
                 };
                 temporal_readers.push((name, ret, m.body.clone()));
@@ -226,18 +242,20 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
                 if temporal_names.contains(&camel(m.name.as_str())) {
                     continue;
                 }
-                if let Some(Ty::Fn { ret, .. }) = m.signature.as_ref() {
+                if let Some(Ty::Fn(fn_ty)) = m.signature.as_ref() {
+                    let FnTy { ret, .. } = &**fn_ty;
                     prop_types
                         .entry(camel(m.name.as_str()))
                         .or_insert_with(|| (**ret).clone());
                 }
             }
             AccessorKind::AttributeWriter => {
-                if let Some(Ty::Fn { params, .. }) = m.signature.as_ref() {
+                if let Some(Ty::Fn(fn_ty)) = m.signature.as_ref() {
+                    let FnTy { params, .. } = &**fn_ty;
                     if let Some(p) = params.first() {
                         // writer name is `foo=`; strip the `=`.
                         let base = m.name.as_str().trim_end_matches('=');
-                        prop_types.entry(camel(base)).or_insert_with(|| p.ty.clone());
+                        prop_types.entry(camel(base)).or_insert_with(|| (*p.ty).clone());
                     }
                 }
             }
@@ -266,13 +284,13 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
     // RuntimeException. A `super(args)` inside `initialize` becomes the
     // supertype constructor call in the header.
     let parent_name = lc.parent.as_ref().map(|p| {
-        let last = type_name(p.0.as_str());
-        match last.as_str() {
-            "StandardError" | "RuntimeError" => "RuntimeException".to_string(),
-            other => other.to_string(),
-        }
+        // Not a second table: a raise and a superclass name the same Ruby class, so they map alike
+        super::expr::kotlin_exception_class(&type_name(p.0.as_str()))
     });
     let super_args = init.and_then(|m| find_super_args(&m.body));
+    // Not the implicit no-arg constructor: `raise X, "message"` builds an exception subclass with its message
+    let message_ctor = init.is_none() && parent_name.as_deref().is_some_and(|p| p.ends_with("Exception"));
+    let super_args = if message_ctor { Some(vec!["message".to_string()]) } else { super_args };
     let parent_clause = match (&parent_name, &super_args) {
         (Some(pn), Some(args)) => format!(" : {pn}({})", args.join(", ")),
         (Some(pn), None) => format!(" : {pn}()"),
@@ -312,6 +330,7 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
         Some(m) => {
             format!("open class {class_name}({}){parent_clause}", method_params(m).join(", "))
         }
+        None if message_ctor => format!("open class {class_name}(message: String? = null){parent_clause}"),
         None => format!("open class {class_name}{parent_clause}"),
     };
     out.push_str(&header);
@@ -320,7 +339,7 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
     // Properties. Constructor-param-backed properties are assigned in the
     // `init` block, so they need no initializer (and a non-null type like
     // `Base` can't be defaulted to null anyway).
-    let ctor_param_names: std::collections::HashSet<String> = init
+    let ctor_param_names: crate::det::HashSet<String> = init
         .map(|m| m.params.iter().map(|p| camel(p.name.as_str())).collect())
         .unwrap_or_default();
     for (n, ty) in &prop_types {
@@ -375,12 +394,14 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
         out.push('\n');
     }
 
-    // The class's property names (accessor-backed + body ivars), so a
-    // `self.x` zero-arg send in a body emits as a property read; everything
-    // else gets `()`. Active for the rest of this function's method emit.
+    // The class's property names (accessor-backed + body ivars + the
+    // temporal computed getters), so a `self.x` zero-arg send in a body
+    // emits as a property read; everything else gets `()`. Active for the
+    // rest of this function's method emit.
     let instance_props: HashSet<String> = prop_types
         .keys()
         .chain(body_ivars.keys())
+        .chain(temporal_names.iter())
         .chain(inherited_props.iter())
         .cloned()
         .collect();
@@ -389,7 +410,7 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
     // coerces the untyped value to the property's type — plus inferred
     // body-ivar types (e.g. `@data: Hash[...]`) so a `data.keys`/`.length`
     // call dispatches as a Map even though `data` is a body ivar.
-    let mut prop_ty_map: std::collections::HashMap<String, Ty> =
+    let mut prop_ty_map: crate::det::HashMap<String, Ty> =
         prop_types.iter().map(|(n, t)| (n.clone(), t.clone())).collect();
     for (n, t) in &inferred_ivar_types {
         prop_ty_map.entry(n.clone()).or_insert_with(|| t.clone());
@@ -544,7 +565,7 @@ pub fn emit_test_class(
     // can't walk up to the framework base's parameter list, and the
     // kwargs hash stays a map literal the callee won't accept.
     register_class_hierarchy(inner_classes);
-    super::expr::set_object_tl_fields(HashSet::new());
+    super::expr::set_object_tl_fields(HashSet::default());
 
     let mut out = String::new();
 
@@ -596,7 +617,7 @@ pub fn emit_test_class(
     // Property registry so `self.@article` reads emit as a property name.
     let instance_props: HashSet<String> = body_ivars.keys().cloned().collect();
     set_instance_props(instance_props);
-    let prop_ty_map: std::collections::HashMap<String, Ty> = inferred_ivar_types
+    let prop_ty_map: crate::det::HashMap<String, Ty> = inferred_ivar_types
         .iter()
         .map(|(n, t)| (n.clone(), t.clone()))
         .collect();
@@ -704,13 +725,14 @@ fn register_params_for(receiver: &str, methods: &[MethodDef]) {
 /// Keyword, rest, and block params are not positional arguments.
 fn positional_signature_tys(m: &MethodDef) -> Vec<Ty> {
     use crate::ty::ParamKind;
-    let Some(Ty::Fn { params, .. }) = m.signature.as_ref() else {
+    let Some(Ty::Fn(fn_ty)) = m.signature.as_ref() else {
         return Vec::new();
     };
+    let FnTy { params, .. } = &**fn_ty;
     params
         .iter()
         .filter(|p| matches!(p.kind, ParamKind::Required | ParamKind::Optional))
-        .map(|p| p.ty.clone())
+        .map(|p| (*p.ty).clone())
         .collect()
 }
 
@@ -736,7 +758,7 @@ fn member_name(m: &MethodDef) -> String {
 /// register the class for override resolution and — via the ancestor union
 /// — to decide which members of a subclass need `override`.
 fn instance_member_names(lc: &LibraryClass) -> HashSet<String> {
-    let mut out = HashSet::new();
+    let mut out = HashSet::default();
     for m in &lc.methods {
         if m.receiver != MethodReceiver::Instance {
             continue;
@@ -824,16 +846,18 @@ fn emit_method(m: &MethodDef, modifier: &str) -> String {
     // block slot.
     if body_has_yield(&m.body) {
         let bt = match m.signature.as_ref() {
-            Some(Ty::Fn { block: Some(b), .. }) => kotlin_ty(b),
+            Some(Ty::Fn(fn_ty)) if let Some(b) = &fn_ty.block => kotlin_ty(b),
             _ => "(Any?) -> Unit".to_string(),
         };
         params.push(format!("block: {bt}"));
     }
 
     // Return type.
+    // Not Unit for a method without a signature: an app method's answer is its body's type
     let ret_ty = match m.signature.as_ref() {
-        Some(Ty::Fn { ret, .. }) => Some((**ret).clone()),
-        _ => None,
+        Some(Ty::Fn(fn_ty)) => Some((*fn_ty.ret).clone()),
+        _ if m.name.as_str() == "initialize" => None,
+        _ => m.body.ty.clone().filter(|t| !t.is_open()),
     };
     let returns_value = !force_unit && matches!(&ret_ty, Some(t) if !matches!(t, Ty::Nil));
     let ret_clause = if force_unit {
@@ -881,7 +905,7 @@ fn emit_method(m: &MethodDef, modifier: &str) -> String {
 /// back to `Any?` where the signature is missing.
 fn method_params(m: &MethodDef) -> Vec<String> {
     let sig_params = match m.signature.as_ref() {
-        Some(Ty::Fn { params, .. }) => Some(params),
+        Some(Ty::Fn(fn_ty)) => Some(&fn_ty.params),
         _ => None,
     };
     m.params
@@ -954,7 +978,19 @@ fn wrap_return(e: &Expr) -> String {
         ExprNode::Hash { .. } => {
             return format!("return {}", super::expr::emit_return_value(e));
         }
+        ExprNode::If { cond, then_branch, else_branch } => {
+            return format!("return {}", emit_if_return_value(cond, then_branch, else_branch));
+        }
         _ => {}
+    }
+    // Not the assignment alone: Ruby's assignment answers the value, and a value method must return it
+    if let ExprNode::Assign { target: target @ (crate::expr::LValue::Var { .. } | crate::expr::LValue::Ivar { .. }), .. } = &*e.node {
+        let read = match target {
+            crate::expr::LValue::Var { id, name } => ExprNode::Var { id: *id, name: name.clone() },
+            crate::expr::LValue::Ivar { name } => ExprNode::Ivar { name: name.clone() },
+            _ => unreachable!(),
+        };
+        return format!("{}\nreturn {}", emit_expr(e), emit_expr(&Expr::new(e.span, read)));
     }
     let s = emit_expr(e);
     // A `raise Class, msg` send emits as a `throw` (type `Nothing`); like a
@@ -1074,6 +1110,12 @@ fn expr_children(e: &Expr) -> Vec<&Expr> {
                 }
             }
         }
+        ExprNode::BeginRescue { body, rescues, else_branch, ensure, .. } => {
+            v.push(body);
+            v.extend(rescues.iter().map(|r| &r.body));
+            v.extend(else_branch.as_deref());
+            v.extend(ensure.as_deref());
+        }
         _ => {}
     }
     v
@@ -1108,15 +1150,17 @@ fn class_accessor_props(methods: &[MethodDef]) -> BTreeMap<String, Ty> {
         }
         match m.kind {
             AccessorKind::AttributeReader => {
-                if let Some(Ty::Fn { ret, .. }) = m.signature.as_ref() {
+                if let Some(Ty::Fn(fn_ty)) = m.signature.as_ref() {
+                    let FnTy { ret, .. } = &**fn_ty;
                     props.entry(camel(m.name.as_str())).or_insert_with(|| (**ret).clone());
                 }
             }
             AccessorKind::AttributeWriter => {
-                if let Some(Ty::Fn { params, .. }) = m.signature.as_ref() {
+                if let Some(Ty::Fn(fn_ty)) = m.signature.as_ref() {
+                    let FnTy { params, .. } = &**fn_ty;
                     if let Some(p) = params.first() {
                         let base = m.name.as_str().trim_end_matches('=');
-                        props.entry(camel(base)).or_insert_with(|| p.ty.clone());
+                        props.entry(camel(base)).or_insert_with(|| (*p.ty).clone());
                     }
                 }
             }
@@ -1187,9 +1231,10 @@ fn infer_body_ivar_types(methods: &[MethodDef]) -> BTreeMap<String, Ty> {
 
     // Signal 1: reader methods returning exactly an ivar.
     for m in methods {
-        if let (Some(ivar), Some(Ty::Fn { ret, .. })) =
+        if let (Some(ivar), Some(Ty::Fn(fn_ty))) =
             (body_returns_ivar(&m.body), m.signature.as_ref())
         {
+            let FnTy { ret, .. } = &**fn_ty;
             if !matches!(&**ret, Ty::Nil) {
                 out.entry(ivar).or_insert_with(|| (**ret).clone());
             }
@@ -1200,7 +1245,7 @@ fn infer_body_ivar_types(methods: &[MethodDef]) -> BTreeMap<String, Ty> {
     // = CacheControlStore.new`) and nothing assigns it a nilable value. A
     // READ carries `T | nil` (unset before `initialize`), which signal 1.5
     // would take first, but the slot is never nil once constructed.
-    let mut nilable_assigned: HashSet<String> = HashSet::new();
+    let mut nilable_assigned: HashSet<String> = HashSet::default();
     for m in methods {
         collect_nilable_ivar_assigns(&m.body, &mut nilable_assigned);
     }
@@ -1340,7 +1385,7 @@ fn signature_ret_is_time(sig: Option<&Ty>) -> bool {
             _ => false,
         }
     }
-    matches!(sig, Some(Ty::Fn { ret, .. }) if is_time(ret))
+    matches!(sig, Some(Ty::Fn(fn_ty)) if is_time(&fn_ty.ret))
 }
 
 /// Default initializer for a property type (Kotlin requires properties

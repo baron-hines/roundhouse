@@ -67,6 +67,7 @@ use std::collections::BTreeMap;
 use crate::app::App;
 use crate::expr::{Expr, ExprNode};
 use crate::ident::Symbol;
+use crate::ty::Ty;
 
 /// App-defined `to_fs` formats, as the lowering consults them.
 pub(crate) type TimeFormats = BTreeMap<Symbol, crate::app::TimeFormat>;
@@ -101,6 +102,15 @@ pub(crate) fn rewrite_time_current(expr: &mut Expr, formats: &TimeFormats) {
 }
 
 pub(crate) fn rewrite_node(expr: &mut Expr, formats: &TimeFormats) {
+    rewrite_node_inner(expr, formats);
+    // `Time.current` and `to_fs(:iso8601)` just became `Time.now.utc` and
+    // zero-arg `iso8601`. Crystal's spelling is applied here so every
+    // caller of this function (hooks, tests, route helpers, view classes)
+    // lands on one form.
+    super::time_calendar::ground_crystal_time_bridge(expr);
+}
+
+fn rewrite_node_inner(expr: &mut Expr, formats: &TimeFormats) {
     let is_target = matches!(
         &*expr.node,
         ExprNode::Send { recv: Some(r), method, args, block: None, .. }
@@ -159,7 +169,16 @@ pub(crate) fn rewrite_node(expr: &mut Expr, formats: &TimeFormats) {
         let span = expr.span;
         let node = std::mem::replace(&mut *expr.node, ExprNode::Seq { exprs: vec![] });
         let ExprNode::Send { recv: Some(t), .. } = node else { unreachable!() };
-        let getutc = Expr::new(
+        // Built after analysis, so typed here: `getutc` answers a Time
+        // for any time the receiver is, and stays gradual on an untyped
+        // receiver (`1.hour.from_now`). Untyped, it read to the
+        // post-lowering diagnostics as a method nothing defines.
+        let getutc_ty = match t.ty.as_ref() {
+            None | Some(Ty::Var { .. }) => None,
+            Some(Ty::Untyped) => Some(Ty::Untyped),
+            Some(_) => Some(Ty::Time),
+        };
+        let mut getutc = Expr::new(
             span,
             ExprNode::Send {
                 recv: Some(t),
@@ -169,6 +188,7 @@ pub(crate) fn rewrite_node(expr: &mut Expr, formats: &TimeFormats) {
                 parenthesized: false,
             },
         );
+        getutc.ty = getutc_ty;
         let fmt = Expr::new(
             span,
             ExprNode::Lit {
@@ -272,6 +292,8 @@ fn rewrite_to_fs(expr: &mut Expr, formats: &TimeFormats) {
                 }
                 let mut body = method.body.clone();
                 crate::lower::case_lambda::subst(&mut body, &param.name, &recv);
+                // The lambda was not in the tree this walk already grounded.
+                super::time_calendar::ground_crystal_time_bridge_tree(&mut body);
                 // `to_fs` is `formatter.call(self).to_s` — the `.to_s` is
                 // Rails', not ours, and it is what makes campfire's
                 // Integer-returning `:epoch` agree with the Str the

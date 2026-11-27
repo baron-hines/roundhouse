@@ -1,7 +1,7 @@
 //! The subcommands behind the multi-call `roundhouse` binary and the
-//! per-tool aliases (`roundhouse-check`, `roundhouse-lsp`,
-//! `roundhouse-mcp`). Both spellings run the code here, so a shipped
-//! single binary and a `cargo run --bin` dev loop cannot drift.
+//! per-tool entrypoints (`roundhouse-check`, `roundhouse-lsp`,
+//! `roundhouse-mcp`, `fractal`). Each uses the same implementation as
+//! the shipped binary.
 //!
 //! Host-only: every subcommand speaks stdio or walks a real directory.
 
@@ -10,6 +10,8 @@ use std::process::ExitCode;
 
 use crate::analyze::{diagnose, Analyzer, Diagnostic, DiagnosticKind, Severity};
 use crate::ingest::{ingest_app, survey, IngestError};
+
+pub mod fractal;
 
 /// `roundhouse lsp`: serve the read-only Language Server over stdio
 /// until the client hangs up. The workspace root comes from the LSP
@@ -100,27 +102,61 @@ pub fn check(args: &[String], default_app: &str) -> ExitCode {
         .unwrap_or(false);
     let mut fixture: Option<String> = None;
     let mut list_unknown_sends = false;
+    let mut inventory_path: Option<String> = None;
+    // Default on with `--continue`: the punch list alone is not a peel
+    // worklist. `--no-hotspots` opts out; `--hotspots` forces it on in
+    // strict mode too.
+    let mut hotspots: Option<bool> = None;
 
-    for arg in args {
+    // Not on by default: the boot runs the checked app's own code, which a static check never did.
+    let mut observe_boot = std::env::var_os("ROUNDHOUSE_OBSERVE_APP_BOOT").is_some_and(|v| v == "1");
+    let mut args = args.iter().peekable();
+    while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => {
                 println!(
-                    "Usage: roundhouse check [--continue|--strict] [--unknown-sends] [APP]\n\n\
+                    "Usage: roundhouse check [--continue|--strict] [--unknown-sends]\n\
+                     \x20                  [--inventory PATH] [--hotspots|--no-hotspots] [--observe-boot] [APP]\n\n\
                      Analyze the Rails app at APP (default {default_app}) and print the\n\
                      diagnostics; exit 1 on parse or type errors.\n\n\
                      Options:\n\
                        --continue   Record unsupported constructs as a punch list and keep\n\
-                                    going (also ROUNDHOUSE_INGEST_SURVEY=1).\n\
+                                    going (also ROUNDHOUSE_INGEST_SURVEY=1). Prints a ranked\n\
+                                    hotspot report unless --no-hotspots.\n\
                        --strict     Abort at the first unsupported construct (default).\n\
                        --unknown-sends\n\
                                     List each send on an unknown or gradual receiver (always\n\
-                                    counted in the summary; never an error)."
+                                    counted in the summary; never an error).\n\
+                       --inventory PATH\n\
+                                    Write a machine-readable JSON inventory (diagnostics,\n\
+                                    survey gaps, ranked hotspots) to PATH.\n\
+                       --hotspots   Print the ranked error/survey hotspot report (default\n\
+                                    on with --continue).\n\
+                       --no-hotspots\n\
+                                    Suppress the hotspot report.\n\
+                       --observe-boot\n\
+                                    Boot the app under its bundle (it runs the app's own\n\
+                                    code) to read what a gem defines on its classes as it\n\
+                                    loads (aasm's state methods). Also ROUNDHOUSE_OBSERVE_APP_BOOT=1."
                 );
                 return ExitCode::SUCCESS;
             }
             "--unknown-sends" => list_unknown_sends = true,
             "--continue" => continue_on_error = true,
             "--strict" => continue_on_error = false,
+            "--hotspots" => hotspots = Some(true),
+            "--no-hotspots" => hotspots = Some(false),
+            "--observe-boot" => observe_boot = true,
+            "--inventory" => {
+                let Some(path) = args.next() else {
+                    eprintln!("roundhouse-check: --inventory requires a PATH argument");
+                    return ExitCode::from(2);
+                };
+                inventory_path = Some(path.to_string());
+            }
+            other if other.starts_with("--inventory=") => {
+                inventory_path = Some(other["--inventory=".len()..].to_string());
+            }
             other if other.starts_with("--") => {
                 eprintln!("roundhouse-check: unknown flag {other}");
                 return ExitCode::from(2);
@@ -134,6 +170,7 @@ pub fn check(args: &[String], default_app: &str) -> ExitCode {
             }
         }
     }
+    let show_hotspots = hotspots.unwrap_or(continue_on_error);
 
     let fixture = fixture.unwrap_or_else(|| default_app.to_string());
     let path = Path::new(&fixture);
@@ -159,10 +196,48 @@ pub fn check(args: &[String], default_app: &str) -> ExitCode {
     // Ingest inside a parse-diagnostic scope so Prism syntax errors —
     // which the error-recovering parser otherwise drops — are collected
     // and reported alongside the analyze diagnostics.
-    let (ingest_result, parse_diags) =
+    let (mut ingest_result, mut parse_diags) =
         crate::timings::phase("ingest", || crate::ingest::prism::scope(|| ingest_app(path)));
 
     let mut survey_errors = if continue_on_error { survey::drain() } else { Vec::new() };
+
+    // What a gem does to a class it holds in a variable (aasm's `klass.send(:define_method, …)`) is read from the app's
+    // own boot under its bundle, when asked; a boot that fails leaves the app as ingested, where those calls stay reported.
+    if observe_boot
+        && let Ok(app) = &ingest_result
+        && let gems = crate::observed_shapes::needed(app)
+        && !gems.is_empty()
+        && let Ok(dir) = path.canonicalize()
+    {
+        let key = crate::observed_shapes::key(&dir);
+        let (patches, refused) = crate::timings::phase("observe shapes", || crate::observed_shapes::observe_app(&dir, &gems, &key));
+        for (gem, why) in &refused {
+            eprintln!("roundhouse-check: note: {gem} changes a class held in a variable, and observing the app's boot did not answer it: {why}");
+        }
+        match patches {
+            Ok(patches) if refused.len() < gems.len() => {
+                crate::observed_shapes::install(patches);
+                if continue_on_error {
+                    survey::activate();
+                }
+                let (patched, patched_diags) =
+                    crate::timings::phase("ingest", || crate::ingest::prism::scope(|| ingest_app(path)));
+                let patched_survey = if continue_on_error { survey::drain() } else { Vec::new() };
+                crate::observed_shapes::uninstall();
+                // Not the patched app when it does not ingest: the first one, whose report the check still gives.
+                match patched {
+                    Ok(app) => {
+                        ingest_result = Ok(app);
+                        parse_diags = patched_diags;
+                        survey_errors = patched_survey;
+                    }
+                    Err(why) => eprintln!("roundhouse-check: note: the app with the observed boot's patches does not ingest: {why}"),
+                }
+            }
+            Ok(_) => {}
+            Err(why) => eprintln!("roundhouse-check: note: the observed boot's patches do not apply: {why}"),
+        }
+    }
 
     let mut app = match ingest_result {
         Ok(app) => app,
@@ -192,9 +267,13 @@ pub fn check(args: &[String], default_app: &str) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let mut analyzer = Analyzer::new(&app);
+    let mut analyzer = Analyzer::for_source(&app);
     crate::timings::phase("analyze", || analyzer.analyze(&mut app));
+    // Not left to lowering: a branch the fold removes holds no code of the emitted program, which is what emit diagnoses.
+    crate::lower::defined_const_fold::apply_defined_const_fold(&mut app);
     let mut diags = crate::timings::phase("diagnose", || diagnose(&app));
+    crate::source_gem_shake::demote_unreached_gem_errors(&app, &mut diags);
+    crate::source_gem_shake::demote_unreached_gem_errors(&app, &mut parse_diags);
     // Survey mode: diagnostics that trace back to a recorded ingest gap
     // are the tool's coverage problem, not the app's — downgrade them to
     // notes with the root cause attached so the error count below means
@@ -247,6 +326,34 @@ pub fn check(args: &[String], default_app: &str) -> ExitCode {
         had_output = true;
     }
 
+    let inventory = crate::check_report::build(
+        &fixture,
+        path,
+        &app.sources,
+        &parse_diags,
+        &diags,
+        &survey_errors,
+        census.as_ref(),
+    );
+    if show_hotspots {
+        eprint!("{}", crate::check_report::render_hotspots(&inventory));
+        had_output = true;
+    }
+    if let Some(out_path) = &inventory_path {
+        match serde_json::to_string_pretty(&inventory) {
+            Ok(json) => {
+                if let Err(err) = std::fs::write(out_path, format!("{json}\n")) {
+                    eprintln!("roundhouse-check: failed to write --inventory {out_path}: {err}");
+                    return ExitCode::from(2);
+                }
+            }
+            Err(err) => {
+                eprintln!("roundhouse-check: failed to serialize inventory: {err}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+
     if had_output {
         eprintln!();
     }
@@ -282,7 +389,7 @@ pub fn check(args: &[String], default_app: &str) -> ExitCode {
     // away by becoming one of these was reclassified, not fixed.
     // A known receiver's unresolved send is already an error where
     // `diagnose` covers the body; only the uncovered sites count here.
-    let diagnosed: std::collections::HashSet<_> =
+    let diagnosed: crate::det::HashSet<_> =
         diags.iter().map(|d| (d.span.file, d.span.start, d.span.end)).collect();
     let unknown_sends: Vec<_> = crate::analyze::unknown_receiver_sends(&app, analyzer.class_registry())
         .into_iter()

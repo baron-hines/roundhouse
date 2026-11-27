@@ -21,7 +21,7 @@
 //! below is the parse_methods_with_rbs_in_ctx flow recreated for the
 //! library_class shape).
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::fs;
 use std::path::Path;
 
@@ -31,7 +31,7 @@ use roundhouse::expr::{Expr, ExprNode, InterpPart};
 use roundhouse::ident::{ClassId, Symbol};
 use roundhouse::ingest::ingest_library_classes;
 use roundhouse::rbs::{parse_app_ivars, parse_app_signatures};
-use roundhouse::ty::Ty;
+use roundhouse::ty::{FnTy, Ty};
 
 const RUNTIME_DIR: &str = "runtime/ruby/active_record";
 
@@ -48,6 +48,14 @@ const DEPENDENCY_RBS: &[&str] = &[
     "runtime/ruby/active_support_ext.rbs",
     // `Inflector.pluralize_word`, for the multi-id RecordNotFound message.
     "runtime/ruby/inflector_ext.rbs",
+    // File, Dir, and ENV are not part of the active_record sidecars.
+    // Declaring them there fails the runtime gate (a signature must
+    // match a method in the paired .rb). This probe does not load the
+    // stdlib registry, so the calls in tasks.rb need a sidecar.
+    "tests/fixtures/task_stdlib.rbs",
+    // `Rake::Task` lives beside ActiveRecord, not in this directory.
+    // `define_framework_tasks!` calls it.
+    "runtime/ruby/rake/task.rbs",
 ];
 
 /// Walk a typed expression tree, collecting every node whose `ty` is
@@ -251,7 +259,7 @@ fn seed_ivars_for_class(
     methods: &[roundhouse::dialect::MethodDef],
     rbs_ivars: &HashMap<ClassId, HashMap<Symbol, Ty>>,
 ) -> HashMap<Symbol, Ty> {
-    let mut flow: HashMap<Symbol, Ty> = HashMap::new();
+    let mut flow: HashMap<Symbol, Ty> = HashMap::default();
     for method in methods {
         roundhouse::analyze::extract_ivar_assignments(&method.body, &mut flow);
     }
@@ -282,7 +290,7 @@ fn seed_ivars_for_class(
             let wrapped = match &ty {
                 Ty::Union { variants } if variants.iter().any(|v| matches!(v, Ty::Nil)) => ty,
                 other => Ty::Union {
-                    variants: vec![other.clone(), Ty::Nil],
+                    variants: vec![other.clone(), Ty::Nil].into(),
                 },
             };
             (name, wrapped)
@@ -320,7 +328,7 @@ fn merge_ivar_maps(into: &mut HashMap<Symbol, Ty>, from: HashMap<Symbol, Ty>) {
                         match variants.len() {
                             0 => Ty::Nil,
                             1 => variants.pop().unwrap(),
-                            _ => Ty::Union { variants },
+                            _ => Ty::Union { variants: variants.into() },
                         }
                     }
                 });
@@ -357,8 +365,8 @@ fn build_class_registry() -> (
         entries.push(Path::new(dep).to_path_buf());
     }
 
-    let mut sigs: HashMap<ClassId, HashMap<Symbol, Ty>> = HashMap::new();
-    let mut ivars: HashMap<ClassId, HashMap<Symbol, Ty>> = HashMap::new();
+    let mut sigs: HashMap<ClassId, HashMap<Symbol, Ty>> = HashMap::default();
+    let mut ivars: HashMap<ClassId, HashMap<Symbol, Ty>> = HashMap::default();
     for path in entries {
         let source = fs::read_to_string(&path).unwrap_or_else(|e| {
             panic!("read {}: {e}", path.display())
@@ -391,8 +399,8 @@ fn build_class_registry() -> (
 fn registry_with_unique_aliases(
     sigs: &HashMap<ClassId, HashMap<Symbol, Ty>>,
 ) -> HashMap<ClassId, ClassInfo> {
-    let mut registry: HashMap<ClassId, ClassInfo> = HashMap::new();
-    let mut aliases: HashMap<ClassId, Option<ClassId>> = HashMap::new();
+    let mut registry: HashMap<ClassId, ClassInfo> = HashMap::default();
+    let mut aliases: HashMap<ClassId, Option<ClassId>> = HashMap::default();
     for (class_id, methods) in sigs {
         let entry = registry.entry(class_id.clone()).or_default();
         entry.instance_methods = methods.clone();
@@ -434,12 +442,13 @@ fn build_method_ctx(
     ivars: &HashMap<Symbol, Ty>,
 ) -> Ctx {
     let mut ctx = Ctx::default();
-    ctx.self_ty = Some(Ty::Class { id: class_id.clone(), args: vec![] });
+    ctx.self_ty = Some(Ty::Class { id: class_id.clone(), args: vec![].into() });
     ctx.ivar_bindings = ivars.clone();
     if let Some(class_sigs) = sigs.get(class_id) {
-        if let Some(Ty::Fn { params, .. }) = class_sigs.get(&method.name) {
+        if let Some(Ty::Fn(fn_ty)) = class_sigs.get(&method.name) {
+            let FnTy { params, .. } = &**fn_ty;
             for (param, p) in method.params.iter().zip(params.iter()) {
-                ctx.local_bindings.insert(param.name.clone(), p.ty.clone());
+                ctx.local_bindings.insert(param.name.clone(), (*p.ty).clone());
             }
         }
     }
@@ -480,10 +489,10 @@ fn qualified_runtime_signatures_seed_contexts_and_results() {
     let (registry, sigs, _) = build_class_registry();
     let classes = ingest_runtime_classes();
     let row = Ty::Hash {
-        key: Box::new(Ty::Str),
-        value: Box::new(Ty::Untyped),
+        key: std::sync::Arc::new(Ty::Str),
+        value: std::sync::Arc::new(Ty::Untyped),
     };
-    let rows = Ty::Array { elem: Box::new(row) };
+    let rows = Ty::Array { elem: std::sync::Arc::new(row) };
     for (class, method, name, expected) in [
         ("ActiveRecord::Result", "initialize", "rows", rows.clone()),
         ("ActiveRecord::Connection", "quote_string", "str", Ty::Str),
@@ -493,7 +502,7 @@ fn qualified_runtime_signatures_seed_contexts_and_results() {
             .find(|(_, lc)| lc.name.0.as_str() == class)
             .expect("runtime class");
         let method = lc.methods.iter().find(|m| m.name.as_str() == method).unwrap();
-        let ctx = build_method_ctx(&lc.name, method, &sigs, &HashMap::new());
+        let ctx = build_method_ctx(&lc.name, method, &sigs, &HashMap::default());
         assert_eq!(
             ctx.local_bindings.get(&Symbol::new(name)),
             Some(&expected),
@@ -510,7 +519,7 @@ fn qualified_runtime_signatures_seed_contexts_and_results() {
             Symbol::new("result"),
             Ty::Class {
                 id: ClassId(Symbol::new(class)),
-                args: vec![],
+                args: vec![].into(),
             },
         );
         typer.analyze_expr(&mut probes[0].methods[0].body, &ctx);
@@ -518,7 +527,7 @@ fn qualified_runtime_signatures_seed_contexts_and_results() {
         // the constructor above still takes the row hashes.
         assert_eq!(
             probes[0].methods[0].body.ty,
-            Some(Ty::Array { elem: Box::new(Ty::Array { elem: Box::new(Ty::Untyped) }) }),
+            Some(Ty::Array { elem: std::sync::Arc::new(Ty::Array { elem: std::sync::Arc::new(Ty::Untyped) }) }),
             "{class}"
         );
     }
@@ -531,7 +540,7 @@ fn qualified_finder_signatures_seed_contexts_and_results() {
     let (registry, sigs, _) = build_class_registry();
     let classes = ingest_runtime_classes();
     let key_class = ClassId(Symbol::new("ActiveRecord::IntegerKeyCast"));
-    let input = Ty::Union { variants: vec![Ty::Int, Ty::Float, Ty::Str, Ty::Nil] };
+    let input = Ty::Union { variants: vec![Ty::Int, Ty::Float, Ty::Str, Ty::Nil].into() };
     for (class, method, expected) in [
         ("ActiveRecord::IntegerKeyCast", "initialize", vec![("valid", Ty::Bool), ("value", Ty::Int)]),
         ("ActiveRecord::IntegerKeyCast", "parse", vec![("id", input.clone())]),
@@ -540,17 +549,18 @@ fn qualified_finder_signatures_seed_contexts_and_results() {
         let (_, lc) = classes.iter().find(|(_, lc)| lc.name.0.as_str() == class &&
             lc.methods.iter().any(|m| m.name.as_str() == method)).expect("runtime class/method");
         let method = lc.methods.iter().find(|m| m.name.as_str() == method).unwrap();
-        let ctx = build_method_ctx(&lc.name, method, &sigs, &HashMap::new());
+        let ctx = build_method_ctx(&lc.name, method, &sigs, &HashMap::default());
         for (name, ty) in expected {
             assert_eq!(ctx.local_bindings.get(&Symbol::new(name)), Some(&ty), "{class}.{name}");
         }
     }
-    let Ty::Fn { ret, .. } = &sigs[&key_class][&Symbol::new("parse")] else { panic!("parse signature"); };
-    assert_eq!(ret.as_ref(), &Ty::Class { id: key_class.clone(), args: vec![] });
+    let Ty::Fn(fn_ty) = &sigs[&key_class][&Symbol::new("parse")] else { panic!("parse signature"); };
+    let FnTy { ret, .. } = &**fn_ty;
+    assert_eq!(ret.as_ref(), &Ty::Class { id: key_class.clone(), args: vec![].into() });
     let source = b"class Probe; def valid(cast); cast.valid; end; def value(cast); cast.value; end; end";
     let mut probes = ingest_library_classes(source, "probe.rb").unwrap();
     let mut ctx = Ctx::default();
-    ctx.local_bindings.insert(Symbol::new("cast"), *ret.clone());
+    ctx.local_bindings.insert(Symbol::new("cast"), std::sync::Arc::unwrap_or_clone(ret.clone()));
     let typer = BodyTyper::new(&registry);
     for method in &mut probes[0].methods {
         typer.analyze_expr(&mut method.body, &ctx);
@@ -585,7 +595,7 @@ fn untyped_subexpressions_with_rbs_baseline() {
     for (_, lc) in &mut classes {
         let lc_name = lc.name.clone();
         for method in &mut lc.methods {
-            let empty: HashMap<Symbol, Ty> = HashMap::new();
+            let empty: HashMap<Symbol, Ty> = HashMap::default();
             let ctx = build_method_ctx(&lc_name, method, &sigs, &empty);
             typer.analyze_expr(&mut method.body, &ctx);
         }
@@ -594,7 +604,7 @@ fn untyped_subexpressions_with_rbs_baseline() {
     // Harvest ivars per ClassId across every stem (Base spans base.rb
     // + connection.rb). Union-merge so a later stem cannot wipe
     // initialize's writes. Overlay from parsed RBS `@ivar` decls.
-    let mut ivars_by_class: HashMap<ClassId, HashMap<Symbol, Ty>> = HashMap::new();
+    let mut ivars_by_class: HashMap<ClassId, HashMap<Symbol, Ty>> = HashMap::default();
     for (_, lc) in &classes {
         let seeded = seed_ivars_for_class(&lc.name, &lc.methods, &rbs_ivars);
         merge_ivar_maps(ivars_by_class.entry(lc.name.clone()).or_default(), seeded);
@@ -611,7 +621,7 @@ fn untyped_subexpressions_with_rbs_baseline() {
 
     // Walk every method body, collect untyped sub-expressions, and
     // tally per-file (per-source .rb) plus an overall total.
-    let mut by_file: HashMap<String, usize> = HashMap::new();
+    let mut by_file: HashMap<String, usize> = HashMap::default();
     let mut all_untyped: Vec<String> = Vec::new();
     for (stem, lc) in &classes {
         for method in &lc.methods {

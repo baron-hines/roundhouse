@@ -1,24 +1,70 @@
 module ActiveSupport
   module JSON
     def self.encode: (untyped value) -> String
+    def self.encode_without_escape: (untyped value) -> String
     def self.decode: (String text) -> untyped
+    def self.load: (String text) -> untyped
+    def self.dump: (untyped value) -> String
     def self.jsonable: (untyped value) -> untyped
+    def self.time_json: (::Time t) -> String
+    def self.time_fragment: (::Time? t) -> String
+    def self.written: (String text) -> String
+    def self.utc_zone?: () -> bool
+    def self.utc_zone_name?: (String name) -> bool
+    UTC_ZONE_NAMES: Array[String]
   end
+  def self.run_load_hooks: (Symbol name, ?untyped base) -> nil
   def self.deep_dup: (untyped value) -> untyped
   def self.blank?: (untyped value) -> bool
 
   def self.present?: (untyped value) -> bool
   def self.to_param: (untyped value) -> String
 
-  def self.to_query: (Hash[String, Roundhouse::ParamValue] value) -> String
-  def self.query_pairs: (Hash[String, Roundhouse::ParamValue] hash, String namespace) -> String
+  # Any key, as Rails' `Hash#to_query` (each is `to_s`'d): a literal
+  # `{ page: 2, q: params[:q] }.to_query` passes Symbols, and spinel
+  # refuses a Symbol-keyed Hash against a declared `Hash[String, _]`.
+  def self.to_query: (Hash[untyped, Roundhouse::ParamValue] value) -> String
+  def self.query_pairs: (Hash[untyped, Roundhouse::ParamValue] hash, String namespace) -> String
   def self.query_escape: (String text) -> String
   def self.query_value: (String name, Roundhouse::ParamValue item) -> String
   def self.presence: (untyped value) -> untyped
   def self.presence_in: (untyped value, Array[String] list) -> untyped
+  def self.symbol_presence_in: (untyped value, Array[Symbol] list) -> untyped
 
-  # `errors[:field]` -> the messages for that field, prefix stripped.
-  def self.errors_for: (Array[String] errors, String prefix) -> Array[String]
+  # `errors[:field]` -> the messages added on that attribute, prefix stripped.
+
+  # `errors.to_hash` -> each attribute to its messages, from the error details.
+  def self.errors_to_hash: (Array[ActiveRecord::ErrorDetail] details) -> Hash[Symbol, Array[String]]
+  def self.errors_messages: (Array[ActiveRecord::ErrorDetail] details) -> Hash[Symbol, Array[String]]
+  def self.errors_attribute_names: (Array[ActiveRecord::ErrorDetail] details) -> Array[Symbol]
+  def self.errors_delete: (Array[String] errors, Array[ActiveRecord::ErrorDetail] details, String attribute, Bool type_symbolic, String? type_kind) -> Array[String]?
+  def self.errors_details: (Array[ActiveRecord::ErrorDetail] details) -> Hash[Symbol, Array[ActiveRecord::ErrorDetail]]
+  def self.errors_group_by_attribute: (Array[ActiveRecord::ErrorDetail] details) -> Hash[Symbol, Array[ActiveRecord::ErrorDetail]]
+  def self.errors_import: (Array[String] errors, Array[ActiveRecord::ErrorDetail] details, ActiveRecord::ErrorDetail error, String? attribute, Hash[String, String] names, String before, String between, String after) -> Array[ActiveRecord::ErrorDetail]
+  def self.error_detail: (String name, String? kind, String? message, Hash[String, String] options, Hash[String, String] site, Hash[String, String] names, Hash[String, String] overrides, String before, String between, String after) -> ActiveRecord::ErrorDetail
+  def self.error_template: (Hash[String, String] table, String key, String? count) -> String?
+  def self.interpolate: (String template, Hash[String, String] values) -> String
+  def self.errors_merge: (Array[String] errors, Array[ActiveRecord::ErrorDetail] details, Array[ActiveRecord::ErrorDetail] others, Hash[String, String] names, String before, String between, String after) -> Array[ActiveRecord::ErrorDetail]
+  def self.errors_copy: (Array[String] errors, Array[ActiveRecord::ErrorDetail] details, Array[ActiveRecord::ErrorDetail] others, Hash[String, String] names, String before, String between, String after) -> Array[ActiveRecord::ErrorDetail]
+
+  def self.deprecation_line: (String line) -> nil
+
+  class Deprecation
+    @deprecation_horizon: String
+    @gem_name: String
+    @silenced: bool
+
+    def deprecation_horizon: () -> String
+    def gem_name: () -> String
+    def silenced: () -> bool
+    def silenced=: (bool value) -> bool
+
+    def initialize: (?String deprecation_horizon, ?String gem_name) -> void
+    def warn: (?String? message, ?untyped callstack) -> nil
+
+    module DeprecatedConstantAccessor
+    end
+  end
 
   # Rails' name for "this signed value does not verify" — see the .rb.
   class MessageVerifier
@@ -26,8 +72,40 @@ module ActiveSupport
       def initialize: (?String message) -> void
     end
   end
+  class KeyGenerator
+    @sha1: bool
+    @secret: String
+    @iterations: Integer
+    def initialize: (String secret, ?Hash[Symbol, untyped] options) -> void
+    def generate_key: (String salt, ?Integer key_size) -> String
+  end
+  class MessageEncryptor
+    def self.key_len: (?String cipher) -> Integer
+  end
+  module Messages
+    class RotationConfiguration
+      self.@shared: RotationConfiguration
+      @signed: Array[String]
+      @encrypted: Array[String]
+      def self.shared: () -> RotationConfiguration
+      def initialize: () -> void
+      def signed: () -> Array[String]
+      def encrypted: () -> Array[String]
+      def rotate: (Symbol kind, String secret) -> nil
+    end
+  end
+  class CachingKeyGenerator
+    @key_generator: KeyGenerator
+    @cache_keys: Hash[String, String]
+    def initialize: (KeyGenerator key_generator) -> void
+    def generate_key: (String salt, ?Integer key_size) -> String
+  end
   def self.index_by: (untyped list) { (untyped) -> untyped } -> Hash[untyped, untyped]
   def self.excluding: [A] (Array[A] list, *A elements) -> Array[A]
+  # `untyped list`, as `sole`'s: an `Array[String]` argument does not link against `Array[untyped]` on Spinel.
+  def self.assert_valid_keys: (Hash[Symbol, untyped] hash, Array[untyped] valid_keys) -> Hash[Symbol, untyped]
+  def self.extract_options!: (untyped list) -> Hash[untyped, untyped]
+  def self.pluck: (untyped list, *(Symbol | String | Integer) keys) -> Array[untyped]
   # The lowerer routes Array receivers here, Relation receivers to
   # `size > 1` (campfire `@room.users.many?`), and Array/Relation unions
   # the same way. An Array contract cannot coerce an association into
@@ -37,14 +115,35 @@ module ActiveSupport
   def self.to_sentence: (Array[untyped] list, String words_connector, String two_words_connector, String last_word_connector) -> String
   def self.symbolize_keys: (Hash[String, untyped] hash) -> Hash[Symbol, untyped]
   def self.stringify_keys: (Hash[Symbol, untyped] hash) -> Hash[String, untyped]
+  def self.deep_stringify_keys: (Hash[untyped, untyped] hash) -> Hash[String, untyped]
+  def self.deep_stringify_keys_value: (untyped value) -> untyped
   def self.indifferent: (untyped hash) -> Hash[untyped, untyped]
+  def self.indifferent_param: (untyped hash) -> untyped
   def self.indifferent_value: (untyped value, bool in_place) -> untyped
   def self.indifferent_key: (untyped key) -> untyped
   def self.indifferent_keys: (Array[untyped] keys) -> Array[untyped]
   def self.indifferent_to_hash: (untyped value) -> untyped
   def self.cast_boolean: (untyped value) -> bool?
+  # Any object or nil. The body calls `nil?`, `==`, `is_a?`, `to_s`, and
+  # `class` on that object, and `is_a?` narrows a branch to String, Integer,
+  # or Float before the cast uses that class.
+  def self.cast_string: (::Object? value) -> String?
+  def self.cast_integer: (::Object? value) -> Integer?
+  def self.integer_from_string: (String value) -> Integer?
+  def self.cast_float: (::Object? value) -> Float?
+  def self.cast_decimal: (::Object? value) -> Float?
+  def self.numeric_blank?: (::Object? value) -> bool
+  def self.numericality_number: (::Object? raw, ::Object? value) -> (Integer | Float)?
+  def self.float_from_string: (String value) -> Float?
+  def self.integer_from_bytes: (Array[Integer] raw) -> Integer
+  def self.string_first: (String text, Integer limit) -> String
+  def self.string_last: (String text, Integer limit) -> String
   def self.squish: (String text) -> String
   def self.squish!: (String text) -> String
+  def self.truncate: (String text, Integer truncate_to, String? omission, String? separator) -> String
+  def self.word_space_byte?: (Integer b) -> bool
+  def self.truncate_words: (String text, Integer words_count, String? omission) -> String
+  def self.truncate_bytes: (String text, Integer truncate_to, String? omission) -> String
   # `untyped`, and this one was learned the hard way: it said
   # `Array[untyped]` for a day, on the reasoning that the only receiver
   # is a channel's `streams`, a plain Array. It is — an
@@ -69,6 +168,7 @@ module ActiveSupport
   def self.months_ago: (Time t, ?Integer n) -> Time
   def self.years_since: (Time t, ?Integer n) -> Time
   def self.years_ago: (Time t, ?Integer n) -> Time
+  def self.change_time_usec: (Time time, Integer usec) -> Time
   def self.beginning_of_minute: (Time t) -> Time
   def self.end_of_minute: (Time t) -> Time
   def self.beginning_of_hour: (Time t) -> Time
@@ -78,6 +178,10 @@ module ActiveSupport
   def self.noon: (Time t) -> Time
   def self.beginning_of_week: (Time t, ?Integer start) -> Time
   def self.end_of_week: (Time t, ?Integer start) -> Time
+  def self.loose_decimal_text: (String text) -> String
+  def self.loose_digits: (String text, Integer at) -> String
+  def self.loose_digits_end: (String text, Integer at) -> Integer
+  def self.loose_to_d: (String | Integer | Float | BigDecimal | Roundhouse::ParamValue | nil value) -> BigDecimal
   def self.float_decimal_text: (Float f) -> String
   def self.next_week: (Time t) -> Time
   def self.prev_week: (Time t) -> Time
@@ -109,6 +213,7 @@ module ActiveSupport
   def self.formatted_offset: (Time t) -> String
   def self.seconds_to_utc_offset: (Integer seconds) -> String
   class TimeZone
+    MAPPING: Hash[String, String]
     def name: () -> String
     def initialize: (String name, TimeZoneData data) -> void
     def self.lookup: (String? name) -> TimeZone?
@@ -118,12 +223,22 @@ module ActiveSupport
     def formatted_offset: () -> String
     def to_s: () -> String
     def now: () -> Time
+    def tzinfo: () -> TimeZoneInfo
   end
+  class TimeZoneInfo
+    def name: () -> String
+    def initialize: (String name) -> void
+    def identifier: () -> String
+  end
+  def self.current_tzinfo: () -> TimeZoneInfo
   def self.parse_tz_rule: (String spec) -> Array[Integer]
   def self.posix_seconds: (String text) -> Integer
+  DEFAULT_ZONE: Array[TimeZoneData]
+  def self.set_default_zone: (String name) -> nil
   def self.current_zone: () -> TimeZoneData?
   def self.use_zone: (String? zone) { () -> untyped } -> untyped
   def self.present: (Time t) -> Time
+  def self.present_in_zone: (Time t, TimeZoneData zone) -> Time
   def self.present_db: (Time? t) -> Time?
   def self.in_time_zone: (Time t, String? zone) -> Time
   def self.zone_name: (TimeZone? zone) -> String?

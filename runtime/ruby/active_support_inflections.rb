@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Pure string ActiveSupport helpers for the Ruby/Spinel scaffold.
 # `active_support_ext.rb` keeps blank?/present?/… (`is_a?` dispatch
 # that AOT targets cannot host) and requires this file so scaffold
@@ -34,10 +35,38 @@ module ActiveSupport
     text.to_s.split(pattern.to_s).join("")
   end
 
+  # `String#strip_heredoc`: Rails removes `scan(/^[ \t]*(?=\S)/).min` from each line's start,
+  # the least indentation by String order, not by length, of the lines that are not blank.
+  def self.strip_heredoc(text)
+    lines = text.split("\n", -1)
+    least = ""
+    found = false
+    lines.each do |line|
+      i = 0
+      while i < line.length && (line[i] == " " || line[i] == "\t")
+        i = i + 1
+      end
+      next if i >= line.length
+      c = line[i]
+      next if c == "\r" || c == "\f" || c == "\v"
+      lead = line[0, i].to_s
+      if !found || lead < least
+        least = lead
+        found = true
+      end
+    end
+    out = least.empty? ? text.dup : lines.map { |line| line.start_with?(least) ? line[least.length, line.length - least.length].to_s : line }.join("\n")
+    out.freeze if text.frozen?
+    out
+  end
+
   def self.demodulize(text)
     s = text.to_s
     idx = s.rindex("::")
-    idx ? s[(idx + 2)..-1].to_s : s
+    # Not `s[(idx + 2)..-1]` or `if idx`: a strict target slices by start and length, and does not narrow a found index once tested
+    return s if idx.nil?
+    at = idx.to_i
+    s[at + 2, s.length - at - 2].to_s
   end
 
   # Regular-suffix singularize only. Analyze folds `String#singularize`
@@ -76,15 +105,116 @@ module ActiveSupport
     end
     out
   end
+
+  # The String methods over the Inflector bodies below. A nil receiver
+  # raises, as Rails' String methods do, naming the method the caller
+  # wrote (an alias included); otherwise the Inflector body answers.
+  def self.camelize(text)
+    raise NoMethodError, "undefined method 'camelize' for nil" if text.nil?
+    ActiveSupport::Inflector.camelize(text.to_s)
+  end
+
+  def self.camelcase(text)
+    raise NoMethodError, "undefined method 'camelcase' for nil" if text.nil?
+    ActiveSupport::Inflector.camelize(text.to_s)
+  end
+
+  def self.titlecase(text)
+    raise NoMethodError, "undefined method 'titlecase' for nil" if text.nil?
+    titleize(text)
+  end
+
+  def self.classify(text)
+    raise NoMethodError, "undefined method 'classify' for nil" if text.nil?
+    ActiveSupport::Inflector.classify(text.to_s)
+  end
+
+  def self.dasherize(text)
+    raise NoMethodError, "undefined method 'dasherize' for nil" if text.nil?
+    ActiveSupport::Inflector.dasherize(text.to_s)
+  end
+
+  def self.deconstantize(text)
+    raise NoMethodError, "undefined method 'deconstantize' for nil" if text.nil?
+    ActiveSupport::Inflector.deconstantize(text.to_s)
+  end
+
+  def self.foreign_key(text)
+    raise NoMethodError, "undefined method 'foreign_key' for nil" if text.nil?
+    ActiveSupport::Inflector.foreign_key(text.to_s)
+  end
 end
 
 # Rails 8.1.4 Inflector methods that do not depend on pluralization,
 # transliteration, constant lookup, or locale-specific rule catalogs. String
 # methods match default ASCII identifier behavior; configured acronym tables
-# are intentionally not modeled. `classify`/`tableize`, locale mutation,
+# are intentionally not modeled. `classify` is the one exception: it takes
+# its singular from the regular-suffix `ActiveSupport.singularize` above, the
+# rules `String#singularize` already grounds to. `tableize`, locale mutation,
 # constantization, transliteration, and parameterization remain unexposed.
 module ActiveSupport
   module Inflector
+    # Rails' `Inflector.pluralize(word)` and `singularize(word)` under the default rules (view_component names a
+    # slot's methods with them); the String forms' own ports answer.
+    def self.pluralize(word)
+      ::Inflector.pluralize_word(word.to_s, 2)
+    end
+
+    # Rails 8.1's default singular rules, latest defined first, after its uncountables and irregulars (the
+    # regular-suffix `ActiveSupport.singularize` the String form uses would give "movy" and "mice").
+    def self.singularize(word)
+      s = word.to_s
+      d = s.downcase
+      n = s.length
+      return s if s.empty? || ::Inflector.pluralize_uncountable?(d)
+      return ::Inflector.pluralize_cased(s, 6, "erson") if d.end_with?("people") || d.end_with?("person")
+      return ::Inflector.pluralize_cased(s, 8, "hild") if d.end_with?("children")
+      return ::Inflector.pluralize_cased(s, 5, "hild") if d.end_with?("child")
+      return ::Inflector.pluralize_cased(s, 3, "an") if d.end_with?("men") || d.end_with?("man")
+      return ::Inflector.pluralize_cased(s, 5, "ex") if d.end_with?("sexes")
+      return ::Inflector.pluralize_cased(s, 5, "ove") if d.end_with?("moves")
+      return ::Inflector.pluralize_cased(s, 7, "ombie") if d.end_with?("zombies")
+      return singular_tail(s, 1, "") if d.end_with?("databases")
+      return singular_tail(s, 3, "") if d.end_with?("quizzes")
+      return singular_tail(s, 4, "ix") if d.end_with?("matrices")
+      return singular_tail(s, 4, "ex") if d.end_with?("vertices") || d.end_with?("indices")
+      return s[0, 2].to_s + s[4, n - 4].to_s if d.start_with?("oxen")
+      return singular_tail(s, 2, "") if d.end_with?("aliases") || d.end_with?("statuses")
+      return s if d.end_with?("alias") || d.end_with?("status")
+      return singular_tail(s, 1, "us") if d.end_with?("octopi") || d.end_with?("viri")
+      return s if d.end_with?("octopus") || d.end_with?("virus")
+      return s[0, 1].to_s + "xis" if d == "axes" || d == "axis"
+      return singular_tail(s, 2, "is") if d.end_with?("crises") || d.end_with?("crisis") || d.end_with?("testes") || d.end_with?("testis")
+      return singular_tail(s, 1, "") if d.end_with?("shoes")
+      return singular_tail(s, 2, "") if d.end_with?("oes")
+      return singular_tail(s, 2, "") if d.end_with?("buses")
+      return s if d.end_with?("bus")
+      return s[0, 1].to_s + "ouse" if d == "mice" || d == "lice"
+      return singular_tail(s, 2, "") if d.end_with?("xes") || d.end_with?("ches") || d.end_with?("sses") || d.end_with?("shes")
+      return singular_tail(s, 1, "") if d.end_with?("movies")
+      return s if d.end_with?("series")
+      return singular_tail(s, 3, "y") if d.end_with?("ies") && n >= 4 && (!"aeiouy".include?(d[n - 4].to_s) || (n >= 5 && d[n - 5, 2] == "qu"))
+      return singular_tail(s, 3, "f") if d.end_with?("lves") || d.end_with?("rves")
+      return singular_tail(s, 1, "") if d.end_with?("tives") || d.end_with?("hives")
+      return singular_tail(s, 3, "fe") if d.end_with?("ves") && n >= 4 && d[n - 4] != "f"
+      return s[0, 5].to_s + "sis" if d == "analyses" || d == "analysis"
+      if d.end_with?("ses") || d.end_with?("sis")
+        stem = d[0, n - 3].to_s
+        if stem.end_with?("analy") || stem.end_with?("ba") || stem.end_with?("diagno") || stem.end_with?("parenthe") ||
+            stem.end_with?("progno") || stem.end_with?("synop") || stem.end_with?("the")
+          return singular_tail(s, 3, "sis")
+        end
+      end
+      return singular_tail(s, 1, "um") if d.end_with?("ta") || d.end_with?("ia")
+      return s if d.end_with?("news") || d.end_with?("ss")
+      return singular_tail(s, 1, "") if d.end_with?("s")
+      s
+    end
+
+    def self.singular_tail(s, drop, rest)
+      s[0, s.length - drop].to_s + rest
+    end
+
     # Rails' camelize with the default (upper camel case) and lower-camel
     # option. A slash separates namespaces; an underscore starts a new word.
     def self.camelize(text, uppercase_first_letter = true)
@@ -130,11 +260,32 @@ module ActiveSupport
       out
     end
 
+    def self.underscore(text)
+      ActiveSupport.underscore(text)
+    end
+
+    # Rails' dasherize: every underscore becomes a dash.
+    def self.dasherize(text)
+      text.to_s.tr("_", "-")
+    end
+
+    # Rails' classify: drop a leading schema name ("shop.gear_boxes"),
+    # singularize, camelize. An irregular plural ("people") keeps the
+    # answer `ActiveSupport.singularize` gives it.
+    def self.classify(table_name)
+      s = table_name.to_s
+      idx = s.rindex(".")
+      # Not `s[(idx + 1)..-1]` or `idx ? … : s`: a strict target slices by start and length, and does not narrow a found index once tested
+      base = idx.nil? ? s : s[idx.to_i + 1, s.length - idx.to_i - 1].to_s
+      camelize(ActiveSupport.singularize(base))
+    end
+
     # Rails' String-based namespace removal; this does not resolve constants.
     def self.deconstantize(text)
       s = text.to_s
       idx = s.rindex("::")
-      idx ? s[0, idx].to_s : ""
+      # Not `idx ? s[0, idx] : ""`: a strict target does not narrow a found index once tested
+      idx.nil? ? "" : s[0, idx.to_i].to_s
     end
 
     # Rails assumes a top-level class name and removes its namespace before

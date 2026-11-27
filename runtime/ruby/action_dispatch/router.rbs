@@ -15,8 +15,16 @@ module ActionDispatch
       # The pattern split on "/" once at construction, so a `Router.match`
       # table walk never re-splits it per request.
       def pattern_parts: () -> Array[String]
+      # Precomputed for `Router.admits`: the segment count, whether a
+      # segment is a `*glob`, and the first segment when it is a
+      # plain literal ("" when it is dynamic).
+      def part_count: () -> Integer
+      def globbed: () -> bool
+      def lead: () -> String
+      def guard: () -> Integer
+      def defaults: () -> Integer
 
-      def initialize: (String verb, String pattern, Symbol controller, Symbol action, ?Symbol? req_format, ?String int_params, ?String seg_constraints) -> void
+      def initialize: (String verb, String pattern, Symbol controller, Symbol action, ?Symbol? req_format, ?String int_params, ?String seg_constraints, ?Integer guard, ?Integer defaults) -> void
     end
 
     # Successful match result: the resolved controller + action symbols
@@ -26,8 +34,11 @@ module ActionDispatch
       def action: () -> Symbol
       def path_params: () -> Hash[String, String]
       def req_format: () -> Symbol?
+      def index: () -> Integer
+      def guard: () -> Integer
+      def defaults: () -> Integer
 
-      def initialize: (Symbol controller, Symbol action, Hash[String, String] path_params, ?Symbol? req_format) -> void
+      def initialize: (Symbol controller, Symbol action, Hash[String, String] path_params, ?Symbol? req_format, ?Integer index, ?Integer guard, ?Integer defaults) -> void
     end
 
     # Match a request against the route table. Returns a MatchResult
@@ -44,15 +55,36 @@ module ActionDispatch
       Array[::ActionDispatch::Router::Route] table
     ) -> ::ActionDispatch::Router::MatchResult?
 
+    # `match` over the routes from `start` on.
+    def self.match_from: (
+      String method,
+      String path,
+      Array[::ActionDispatch::Router::Route] table,
+      Integer start
+    ) -> ::ActionDispatch::Router::MatchResult?
+
     # One table scan for a literal path, with the format extension the
     # request carried (`.turbo_stream` stripped off the last segment by
     # `match`) — the empty string when the path carried none. A match
-    # puts it in `path_params["format"]`.
+    # puts it in `path_params["format"]`. `unpeeled` is the literal-path
+    # retry after a registered extension matched nothing stripped.
     def self.match_path: (
       String method,
       String path,
       Array[::ActionDispatch::Router::Route] table,
-      String format
+      String format,
+      bool unpeeled,
+      Integer start
+    ) -> ::ActionDispatch::Router::MatchResult?
+
+    # `scan_routes`, retried once with the root read as one empty segment.
+    def self.scan_root_aware: (
+      String method_upcase,
+      Array[String] path_parts,
+      Array[::ActionDispatch::Router::Route] table,
+      String format,
+      bool unpeeled,
+      Integer start
     ) -> ::ActionDispatch::Router::MatchResult?
 
     # One pass of the table for one (already upcased) verb over the
@@ -61,8 +93,19 @@ module ActionDispatch
       String method_upcase,
       Array[String] path_parts,
       Array[::ActionDispatch::Router::Route] table,
-      String format
+      String format,
+      bool unpeeled,
+      Integer start
     ) -> ::ActionDispatch::Router::MatchResult?
+
+    # Does `route` hold its `(.:format)` to a requirement and end in a
+    # param segment (which the `unpeeled` retry would bind the dot into)?
+    def self.format_held_param_tail: (::ActionDispatch::Router::Route route) -> bool
+
+    # Whether a path of `count` segments whose first segment is `lead` can
+    # match `route` at all (segment count, `*glob` tail, leading literal);
+    # `match_parts` decides the rest.
+    def self.admits: (::ActionDispatch::Router::Route route, Integer count, String lead) -> bool
 
     # Is `ext` one of Rails' registered format extensions?
     def self.format_extension: (String ext) -> bool
@@ -82,8 +125,9 @@ module ActionDispatch
     # The same segment loop over already-split parts — what `Router.match`
     # calls with the route's precomputed `pattern_parts`, so a table walk
     # allocates no segment arrays per candidate.
-    def self.literals_match: (Array[String] pattern_parts, Array[String] path_parts) -> bool
-    def self.glob_rest: (Array[String] path_parts, Integer from) -> String
+    def self.literals_match: (Array[String] pattern_parts, Array[String] path_parts, Integer glob, Integer extra) -> bool
+    def self.glob_rest: (Array[String] path_parts, Integer from, Integer stop) -> String
+    def self.glob_index: (Array[String] pattern_parts) -> Integer
     def self.param_prefix_length: (String segment) -> Integer
     def self.match_parts: (
       Array[String] pattern_parts,
@@ -127,6 +171,8 @@ module ActionDispatch
     def self.segment_pattern_class_match: (String quant, String neg, String any, String set, String value, Integer start) -> Integer
     def self.segment_pattern_item_match: (String tag, String quant, String neg, String any, String text, String value, Integer start) -> Integer
     def self.segment_pattern_match: (String pattern, String value) -> bool
+    def self.segment_pattern_alt_match: (String pattern, String value) -> bool
+    def self.segment_pattern_seq_match: (String pattern, String value) -> bool
 
     # A decoded capture path-escaped again, as Rails fills a routing
     # redirect's `%{name}`; see the .rb. Byte-oriented after UTF-8 decode.

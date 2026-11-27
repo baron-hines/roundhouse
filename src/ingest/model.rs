@@ -23,204 +23,20 @@ use super::util::{
 };
 use super::{IngestError, IngestResult};
 
-/// Namespace module → the `table_name_prefix` it declares. Rails walks a
-/// model's `module_parents` looking for this and prepends what it finds,
-/// which is the ONLY thing that puts a namespace into a table name (the
-/// name itself is demodulized — see `naming::rails_table_name`).
-///
-/// campfire's `app/models/push.rb` is four lines and exists solely for
-/// this: without it `Push::Subscription` reads `subscriptions`, and its
-/// table is `push_subscriptions`.
-pub type TablePrefixes = std::collections::HashMap<String, String>;
-
+use crate::ingest::prism_api::PrismLocation;
 mod enum_constants;
 pub(in crate::ingest) use enum_constants::EnumConstants;
 
-/// Scan one file for `module <Ns>; def self.table_name_prefix; "<p>"; end`,
-/// or the same def inside the module's `class << self`.
-/// Deliberately narrow: only a module-level singleton def whose body is a
-/// single string literal. A computed prefix would have to run to be known,
-/// and nothing in the corpus writes one.
-pub fn ingest_table_name_prefixes(source: &[u8], file: &str) -> TablePrefixes {
-    fn literal_prefix(def: &ruby_prism::DefNode<'_>) -> Option<String> {
-        if constant_id_str(&def.name()) != "table_name_prefix" {
-            return None;
-        }
-        let stmts = flatten_statements(def.body()?);
-        if stmts.len() != 1 {
-            return None;
-        }
-        string_value(&stmts[0])
-    }
-    let result = super::prism::parse(source, file);
-    let root = result.node();
-    let mut out = TablePrefixes::new();
-    for (scope, module) in super::util::find_all_modules_with_scope(&root) {
-        let Some(name_path) = super::util::module_name_path(&module) else {
-            continue;
-        };
-        let mut full = scope;
-        full.extend(name_path);
-        let Some(body) = module.body() else { continue };
-        let stmts = flatten_statements(body);
-        // `extend self` makes every instance method a singleton one too, so a
-        // nested module can override an outer `ledger_` with a plain
-        // `def table_name_prefix = ""`.
-        let extends_self = stmts.iter().any(|s| {
-            s.as_call_node().is_some_and(|c| {
-                c.receiver().is_none()
-                    && constant_id_str(&c.name()) == "extend"
-                    && c.arguments().is_some_and(|a| {
-                        let args: Vec<_> = a.arguments().iter().collect();
-                        args.len() == 1 && args[0].as_self_node().is_some()
-                    })
-            })
-        });
-        for stmt in stmts {
-            if let Some(def) = stmt.as_def_node() {
-                let singleton = match def.receiver() {
-                    Some(r) => r.as_self_node().is_some(),
-                    None => extends_self,
-                };
-                if !singleton {
-                    continue;
-                }
-                if let Some(prefix) = literal_prefix(&def) {
-                    out.insert(full.join("::"), prefix);
-                }
-            } else if let Some(sclass) = stmt.as_singleton_class_node() {
-                if sclass.expression().as_self_node().is_none() {
-                    continue;
-                }
-                let Some(sbody) = sclass.body() else { continue };
-                for inner in flatten_statements(sbody) {
-                    let Some(def) = inner.as_def_node() else { continue };
-                    if def.receiver().is_some() {
-                        continue;
-                    }
-                    if let Some(prefix) = literal_prefix(&def) {
-                        out.insert(full.join("::"), prefix);
-                    }
-                }
-            }
-        }
-    }
-    out
-}
+mod table_prefix;
+pub use table_prefix::{
+    ingest_class_table_prefixes, ingest_isolated_namespace_prefixes, ingest_table_name_prefixes,
+    inherited_table_prefixes, TablePrefixes,
+};
 
-/// `isolate_namespace Billing` in an engine body: Rails defines
-/// `Billing.table_name_prefix` as the engine name and `_`
-/// (`billing_`), unless the module already declares one. A
-/// `Billing::Rate` with no `table_name` read `rates` without the
-/// prefix, a table no schema has, and every column read on it was
-/// `no known method`. The written module is the enclosing one it names
-/// (`module Billing; class Engine`), else the name as written.
-pub fn ingest_isolated_namespace_prefixes(source: &[u8], file: &str) -> TablePrefixes {
-    let result = super::prism::parse(source, file);
-    let root = result.node();
-    let mut out = TablePrefixes::default();
-    for (scope, class) in super::util::find_all_classes_with_scope(&root) {
-        let Some(body) = class.body() else { continue };
-        let mut nesting = scope;
-        nesting.extend(class_name_path(&class).unwrap_or_default());
-        for stmt in flatten_statements(body) {
-            let Some(call) = stmt.as_call_node() else { continue };
-            if call.receiver().is_some() || constant_id_str(&call.name()) != "isolate_namespace" {
-                continue;
-            }
-            let Some(arg) = call.arguments().and_then(|args| args.arguments().iter().next()) else { continue };
-            let Some(written) = constant_path_of(&arg) else { continue };
-            let rooted = arg.as_constant_path_node().is_some_and(|p| super::util::constant_path_is_rooted(&p));
-            let enclosing = (!rooted)
-                .then(|| nesting[..nesting.len().saturating_sub(1)].iter().rposition(|s| *s == written[0]))
-                .flatten();
-            let full = match enclosing {
-                Some(at) => nesting[..at].iter().chain(&written).cloned().collect::<Vec<_>>().join("::"),
-                None => written.join("::"),
-            };
-            let prefix = format!("{}_", crate::naming::underscore(&full).replace('/', "_"));
-            out.insert(full, prefix);
-        }
-    }
-    out
-}
-
-/// Each class one file declares with its own `self.table_name_prefix =
-/// "…"`, by full name. Rails keeps the prefix in a class attribute, so a
-/// model inherits it from its abstract base: an abstract
-/// `PrefixedRecord` that sets `legacy_` gives its
-/// models (`Line`, …) that name no table `legacy_lines`.
-pub fn ingest_class_table_prefixes(source: &[u8], file: &str) -> TablePrefixes {
-    let result = super::prism::parse(source, file);
-    let root = result.node();
-    let mut out = TablePrefixes::default();
-    for (mut scope, class) in super::util::find_all_classes_with_scope(&root) {
-        let Some(prefix) = class.body().and_then(explicit_table_prefix) else { continue };
-        let Some(path) = class_name_path(&class) else { continue };
-        scope.extend(path);
-        out.insert(scope.join("::"), prefix);
-    }
-    out
-}
-
-/// The prefix each abstract base passes down: its own, else its parent's.
-/// `pairs` are the pre-pass's `(abstract class, parent)` pairs; a bare
-/// parent is found the way Ruby finds it, the child's enclosing scopes first.
-pub fn inherited_table_prefixes(own: &TablePrefixes, pairs: &[(String, String)]) -> TablePrefixes {
-    let parents: std::collections::HashMap<&str, &str> = pairs.iter().map(|(c, p)| (c.as_str(), p.as_str())).collect();
-    let known = |name: &str| own.contains_key(name) || parents.contains_key(name);
-    let resolve = |child: &str, parent: &str| -> String {
-        let mut segments: Vec<&str> = child.split("::").collect();
-        segments.pop();
-        while !segments.is_empty() {
-            let candidate = format!("{}::{parent}", segments.join("::"));
-            if known(&candidate) {
-                return candidate;
-            }
-            segments.pop();
-        }
-        parent.to_string()
-    };
-    let mut out = TablePrefixes::default();
-    for (child, _) in pairs {
-        let mut at = child.clone();
-        // A cycle guard: the walk follows `parent` links, so a cyclic
-        // hierarchy must end somewhere.
-        for _ in 0..16 {
-            if let Some(prefix) = own.get(&at) {
-                out.insert(child.clone(), prefix.clone());
-                break;
-            }
-            let Some(parent) = parents.get(at.as_str()) else { break };
-            at = resolve(&at, parent);
-        }
-    }
-    out
-}
-
-/// `self.table_name_prefix = "three_d_secure_"` in a model body: the
-/// class's own prefix, which wins over any namespace module's.
-fn explicit_table_prefix(body: ruby_prism::Node<'_>) -> Option<String> {
-    explicit_class_setting(body, "table_name_prefix=")
-}
-
-fn explicit_class_setting(body: ruby_prism::Node<'_>, setter: &str) -> Option<String> {
-    for stmt in flatten_statements(body) {
-        let Some(call) = stmt.as_call_node() else { continue };
-        if constant_id_str(&call.name()) != setter {
-            continue;
-        }
-        if call.receiver().and_then(|r| r.as_self_node()).is_none() {
-            continue;
-        }
-        let args = call.arguments()?;
-        let first = args.arguments().iter().next()?;
-        if let Some(name) = string_value(&first).or_else(|| symbol_value(&first)) {
-            return Some(name);
-        }
-    }
-    None
-}
+mod validations;
+pub(in crate::ingest) mod with_options;
+use validations::{and_guard, context_guard, parse_validates_call, validation_items, ParsedValidates, ValidatesKind};
+pub(super) use validations::dropped_rule_note;
 
 /// Parse a single model file. The first class definition is treated as the
 /// model; any schema-derived attributes are filled in from `schema`.
@@ -255,9 +71,9 @@ pub(super) fn ingest_model_with_enum_constants(
     // must ingest as `Admin::Report` (the compound `class Admin::Report`
     // spelling already carries its path). Falls back to the scopeless
     // finder for shapes the scoped walk doesn't cover.
-    let (scope, class) = match super::util::primary_class_with_scope(&root) {
-        Some((s, c)) => (s, Some(c)),
-        None => (Vec::new(), find_first_class(&root)),
+    let (scope, nesting, class) = match super::util::primary_class_with_nesting(&root) {
+        Some((s, n, c)) => (s, n, Some(c)),
+        None => (Vec::new(), Vec::new(), find_first_class(&root)),
     };
     let Some(class) = class else {
         return Ok(None);
@@ -279,12 +95,35 @@ pub(super) fn ingest_model_with_enum_constants(
     // prefix comes from the nearest module parent that declares one,
     // searched innermost-out the way `module_parents` walks.
     let table_decl = class.body().map(|body| parse_table_name_decl(body, file)).transpose()?.flatten();
-    let table_name = if let Some((name, _)) = &table_decl {
+    let table_name = if let Some((name, _)) = &table_decl
+        && !name.starts_with(TABLE_PREFIX_MARK)
+    {
         name.clone()
+    } else if let Some((name, _)) = &table_decl {
+        if class.body().is_some_and(|b| table_prefix::table_prefix_definitions(b) > 1) {
+            return Err(IngestError::Unsupported {
+                file: file.into(),
+                message: "`table_name_prefix + …` in a class that sets its prefix more than once reads the one before it, which is not modeled".into(),
+            });
+        }
+        // The class attribute as Rails reads it: the class body's own `table_name_prefix =`, else the base's.
+        let prefix = class.body().and_then(table_prefix::explicit_table_prefix)
+            .or_else(|| model_bases.resolve_class_superclass(&scope, &nesting, &class).and_then(|parent| base_prefixes.get(&parent).cloned()))
+            .unwrap_or_default();
+        // Not checked before the prefix is known: `"archive_" + "2026"` is a table name, `"2026"` alone is not.
+        let table = format!("{prefix}{}", name.trim_start_matches(TABLE_PREFIX_MARK));
+        if !bare_table_identifier(&table) {
+            return Err(IngestError::Unsupported {
+                file: file.into(),
+                message: "table_name binding requires one direct self.table_name assignment to a literal string or symbol naming a safe bare SQL identifier".into(),
+            });
+        }
+        table
     } else {
+        let mut return_table: Option<String> = None;
         let mut segments: Vec<&str> = class_name.as_str().split("::").collect();
         segments.pop();
-        let mut prefix = class.body().and_then(explicit_table_prefix).unwrap_or_default();
+        let mut prefix = class.body().and_then(table_prefix::explicit_table_prefix).unwrap_or_default();
         let mut from_module = false;
         while prefix.is_empty() && !segments.is_empty() {
             if let Some(p) = prefixes.get(&segments.join("::")) {
@@ -298,12 +137,23 @@ pub(super) fn ingest_model_with_enum_constants(
         // class attribute its abstract base set.
         if prefix.is_empty()
             && !from_module
-            && let Some(parent) = class.superclass().and_then(|n| constant_path_of(&n))
-            && let Some(inherited) = base_prefixes.get(&model_bases.resolve_superclass(&scope, &parent))
+            && let Some(parent) = model_bases.resolve_class_superclass(&scope, &nesting, &class)
+            && let Some(inherited) = base_prefixes.get(&parent)
         {
             prefix = inherited.clone();
         }
-        format!("{prefix}{}", crate::naming::rails_table_name(class_name.as_str()))
+        // A subclass of a gem's concrete model (maybe's `Setting < RailsSettings::Base`) is on its parent's table, as
+        // Rails' single-table inheritance keeps it.
+        if let Some(parent) = model_bases.resolve_class_superclass(&scope, &nesting, &class)
+            && model_bases.is_gem_concrete_model(&parent)
+            && let Some(Some(table)) = model_bases.concrete_model_table(&parent)
+        {
+            return_table = Some(table.to_string());
+        }
+        // Rails' `compute_table_name`: a class nested in a concrete model takes that model's singular table first
+        // (`Rule::Condition` is `rule_conditions`; under `self.table_name = "entries"`, `entry_notes`). Not where the
+        // schema lacks the nested table: the bare name is what the tree held before.
+        return_table.unwrap_or_else(|| nested_table(class_name.as_str(), &prefix, schema, model_bases).unwrap_or_else(|| format!("{prefix}{}", crate::naming::rails_table_name(class_name.as_str()))))
     };
 
     let attributes = if let Some(table) = schema.tables.get(&Symbol::from(table_name.as_str())) {
@@ -320,30 +170,161 @@ pub(super) fn ingest_model_with_enum_constants(
     // naturally attach to the first body item below.
     drain_comments_before(&mut comments, class.location().start_offset());
     let mut body: Vec<ModelBodyItem> = Vec::new();
+    // A nested `JSON` class or value class shadows bare `JSON` for `serialize`.
+    let mut body_json_shadow = false;
     let mut enums: IndexMap<Symbol, Vec<(String, Literal)>> = IndexMap::new();
     let mut enum_defaults: IndexMap<Symbol, Literal> = IndexMap::new();
     let mut class_attr_defaults: IndexMap<Symbol, Expr> = IndexMap::new();
     let mut primary_key: Option<Symbol> = None;
-    let visibility = Visibility::resolve(class.body().as_ref(), file, None)?;
+    // A model body's load-time conditional definitions are not carried
+    // (the model lowering writes no conditional), so the model stays
+    // refused for one, as before the library walk admitted them. One whose
+    // branches only load (`include` / `require`) defines nothing: it is
+    // settled here, or refused by name (`settle_load_only_conditional`).
+    let mut settled_loads: crate::det::HashMap<usize, Option<Node<'_>>> = crate::det::HashMap::default();
+    if let Some(body) = class.body() {
+        let lexical: Vec<String> = std::iter::once(class_name.to_string()).chain(enum_owners.iter().cloned()).collect();
+        for stmt in flatten_statements(body) {
+            if super::visibility::conditional_definition(&stmt).is_none() {
+                continue;
+            }
+            let at = stmt.location().start_offset();
+            match settle_load_only_conditional(stmt, &lexical, enum_constants, &root, file) {
+                Some(settled) => {
+                    settled_loads.insert(at, settled?);
+                }
+                None => {
+                    return Err(IngestError::Unsupported {
+                        file: file.into(),
+                        message: "conditional or dynamic visibility declarations are not modeled".into(),
+                    });
+                }
+            }
+        }
+    }
+    let visibility = Visibility::resolve_carrying_inherited(class.body().as_ref(), file, None)?;
+    let mut carried_markers: crate::det::HashSet<usize> = crate::det::HashSet::default();
     if let Some(class_body) = class.body() {
         let mut prev_end: Option<usize> = None;
         // Constants the class body assigns, for `enum :x, CONST` and for
         // labels spelled with a constant (`NAME => NAME`).
         let stmts = flatten_statements(class_body);
-        let class_consts = ClassConsts::collect(&stmts, file);
+        let mut class_consts = ClassConsts::collect(&stmts, file);
+        class_consts.set_lexical_scope(
+            name_path.len() == 1,
+            enum_constants.ancestor_names(class_name.as_str()),
+            enum_constants.top_level_names(),
+        );
+        class_consts.import(&stmts, enum_constants, &enum_owners);
         let resolve_constant = |node: &Node<'_>| enum_constants.resolve(node, &enum_owners);
-        for statement in stmts {
+        // A spliced hook statement looks constants up from its initializer's
+        // top level, as a block's lexical scope does under `class_eval`: none
+        // of the class body's own (folded, or keyed by offsets in its file).
+        let hook_consts = ClassConsts::default();
+        let resolve_hook_constant = |node: &Node<'_>| enum_constants.resolve(node, &[]);
+        // As the library walk does: a `define_method` loop over a literal list unrolls into the `def`s it makes.
+        let _loop_constants = super::define_method_loop::Scope::enter(super::define_method_loop::ConstTable::of(&owner, &stmts));
+        let loop_visibility = super::define_method_loop::named_visibility(&stmts);
+        let declared_attributes: Vec<Symbol> = stmts
+            .iter()
+            .filter_map(|st| st.as_call_node())
+            .filter(|c| c.receiver().is_none() && c.name().as_slice() == b"attribute")
+            .filter_map(|c| c.arguments()?.arguments().iter().next().and_then(|a| super::util::symbol_value(&a)))
+            .map(|n| Symbol::from(n.as_str()))
+            .collect();
+        // The walk's statements: the body's own, and, at each
+        // `ActiveSupport.run_load_hooks(:name, self)` that fires one, the whole
+        // block of every `ActiveSupport.on_load(:name)` an initializer
+        // registered — Rails runs it as `base.class_eval(&block)` right there,
+        // so its statements are the class body's at that point. The blocks are
+        // parsed from their own initializer files, so the items they become
+        // carry spans into the file they were written in.
+        let splices = super::load_hooks::splices(&stmts);
+        let mut hook_files: Vec<&super::load_hooks::Splice> = Vec::new();
+        for (_, splice) in &splices {
+            if !hook_files.iter().any(|kept| kept.file == splice.file) {
+                hook_files.push(splice);
+            }
+        }
+        let mut hook_parses: Vec<ruby_prism::ParseResult<'_>> = Vec::with_capacity(hook_files.len());
+        for splice in &hook_files {
+            hook_parses.push(super::load_hooks::parse_hook_file(&splice.file, &splice.text));
+        }
+        let mut walk: Vec<WalkStmt<'_>> = Vec::with_capacity(stmts.len());
+        for (at, statement) in stmts.into_iter().enumerate() {
+            // A settled load-only conditional: the include its branch is, or nothing.
+            if let Some(settled) = settled_loads.remove(&statement.location().start_offset()) {
+                if let Some(include) = settled {
+                    walk.push(WalkStmt { node: include, file, source, hook: None });
+                }
+                continue;
+            }
+            let fired = super::load_hooks::fired_by(&statement).is_some();
+            walk.push(WalkStmt { node: statement, file, source, hook: None });
+            if !fired {
+                continue;
+            }
+            for (_, splice) in splices.iter().filter(|(from, _)| *from == at) {
+                if let Some(reason) = &splice.refusal {
+                    super::prism::push(crate::diagnostic::Diagnostic::unsupported(
+                        splice.span,
+                        None,
+                        super::load_hooks::ON_LOAD,
+                        super::load_hooks::refusal_message(&splice.hook, class_name.as_str(), reason),
+                    ));
+                    continue;
+                }
+                let Some(index) = hook_files.iter().position(|kept| kept.file == splice.file) else { continue };
+                super::load_hooks::mark_spliced(splice, class_name.as_str());
+                for node in super::load_hooks::block_statements(hook_parses[index].node(), splice.span.start as usize) {
+                    walk.push(WalkStmt { node, file: &splice.file, source: &splice.text, hook: Some(&splice.hook) });
+                }
+            }
+        }
+        for item in walk {
+            // The statement's own file: the model's, or the initializer a
+            // spliced hook block was written in.
+            let WalkStmt { node: statement, file, source, hook } = item;
+            let spliced = hook.is_some();
+            // A spliced statement's loops see its initializer's constants, not
+            // the class body's, and a declaration the ingest would drop with a
+            // warning is refused, so it is reported as the hook's.
+            let _hook_scope = spliced.then(|| {
+                (super::define_method_loop::Scope::enter(super::define_method_loop::ConstTable::barrier()), super::load_hooks::InHook::enter())
+            });
+            // `ActiveSupport.run_load_hooks(:name, self)` itself lowers to
+            // nothing: what it runs is in the walk, here.
+            if hook.is_none() && super::load_hooks::fired_by(&statement).is_some() {
+                note_end(&mut prev_end, spliced, &statement);
+                continue;
+            }
             let definition = visibility::definition(&statement).map(|d| d.as_node());
+            // `Visibility` and the table-name declaration know the model's
+            // statements by their offsets in the model's file, which a spliced
+            // statement's offsets (into its initializer) can equal. A spliced
+            // statement never asks them, and a visibility marker or `private
+            // def` in a hook block, which it would need, is reported.
+            if spliced && statement.as_call_node().is_some_and(|c| visibility::marker(&c)) {
+                let err = IngestError::Unsupported { file: file.into(), message: "visibility in a load hook block is not carried".into() };
+                report_hook_statement(hook, file, &statement, class_name.as_str(), &err);
+                continue;
+            }
             let stmt = definition.as_ref().unwrap_or(&statement);
             if stmt.as_def_node().is_none() && statement.as_call_node().is_some_and(|c| visibility::marker(&c)) {
-                prev_end = Some(statement.location().end_offset());
+                note_end(&mut prev_end, spliced, &statement);
+                if visibility.names_inherited(&statement) {
+                    carried_markers.insert(statement.location().start_offset());
+                    let mut expr = ingest_expr(&statement, file)?;
+                    expr.decisions |= crate::expr::INHERITED_VISIBILITY;
+                    body.push(ModelBodyItem::Unknown { expr, leading_comments: Vec::new(), leading_blank_line: false });
+                }
                 continue;
             }
             // Explicit names override convention before schema binding.
             // Like primary_key, the setter is consumed: lowering already
             // synthesizes table_name from Model::table for every target.
-            if table_decl.as_ref().is_some_and(|(_, offset)| *offset == stmt.location().start_offset()) {
-                prev_end = Some(stmt.location().end_offset());
+            if !spliced && table_decl.as_ref().is_some_and(|(_, offset)| *offset == stmt.location().start_offset()) {
+                note_end(&mut prev_end, spliced, stmt);
                 continue;
             }
             // `self.primary_key = "key"` is recognized into
@@ -354,29 +335,42 @@ pub(super) fn ingest_model_with_enum_constants(
             // next statement.
             if let Some(pk) = parse_primary_key_decl(&stmt) {
                 primary_key = Some(pk);
-                prev_end = Some(stmt.location().end_offset());
+                note_end(&mut prev_end, spliced, stmt);
                 continue;
             }
             let stmt_start = stmt.location().start_offset();
-            let leading_area_start =
-                comments.first().map(|(off, _)| *off).filter(|off| *off < stmt_start)
-                    .unwrap_or(stmt_start);
-            let leading = drain_comments_before(&mut comments, stmt_start);
-            let leading_blank = prev_end
-                .map(|pe| source_has_blank_line(source, pe, leading_area_start))
-                .unwrap_or(false);
+            // A spliced hook statement's comments are the initializer's, not
+            // this body's, and its offsets index that file: it carries none of
+            // the body's leading comments and no blank line of its own.
+            let (leading, leading_blank) = if spliced {
+                (Vec::new(), false)
+            } else {
+                let leading_area_start =
+                    comments.first().map(|(off, _)| *off).filter(|off| *off < stmt_start)
+                        .unwrap_or(stmt_start);
+                let leading = drain_comments_before(&mut comments, stmt_start);
+                let leading_blank = prev_end
+                    .map(|pe| source_has_blank_line(source, pe, leading_area_start))
+                    .unwrap_or(false);
+                (leading, leading_blank)
+            };
             // `enum :status, %i[…]` — one statement standing for a
             // scope + predicate + bang writer per label, so it expands
             // in the walk loop for the same reason `class << self` does.
             if let Some(call) = stmt.as_call_node() {
-                match expand_class_body_dsl(&call, file, &leading, &class_consts, &resolve_constant) {
+                let expanded = if spliced {
+                    expand_class_body_dsl(&call, file, &leading, &hook_consts, &resolve_hook_constant)
+                } else {
+                    expand_class_body_dsl(&call, file, &leading, &class_consts, &resolve_constant)
+                };
+                match expanded {
                     Ok(Some(ClassBodyExpansion::DelegatedType(expanded))) => {
                         let mut blank = leading_blank;
                         for mut item in expanded {
                             item.set_leading_blank_line(std::mem::take(&mut blank));
                             body.push(item);
                         }
-                        prev_end = Some(stmt.location().end_offset());
+                        note_end(&mut prev_end, spliced, stmt);
                         continue;
                     }
                     Ok(Some(ClassBodyExpansion::Enum(expanded))) => {
@@ -384,6 +378,15 @@ pub(super) fn ingest_model_with_enum_constants(
                             enum_defaults.insert(expanded.column.clone(), d);
                         }
                         if let Some(mapping) = expanded.mapping {
+                            if mapping
+                                .iter()
+                                .all(|(label, stored)| matches!(stored, Literal::Str { value } if value == label))
+                            {
+                                class_consts.note_enum_labels(
+                                    expanded.column.as_str(),
+                                    mapping.iter().map(|(label, _)| label.clone()).collect(),
+                                );
+                            }
                             enums.insert(expanded.column, mapping);
                         }
                         let mut blank = leading_blank;
@@ -391,13 +394,20 @@ pub(super) fn ingest_model_with_enum_constants(
                             item.set_leading_blank_line(std::mem::take(&mut blank));
                             body.push(item);
                         }
-                        prev_end = Some(stmt.location().end_offset());
+                        note_end(&mut prev_end, spliced, stmt);
                         continue;
                     }
                     Ok(None) => {}
+                    Err(err) if spliced => {
+                        // A spliced hook statement the model ingest refuses: Rails
+                        // runs the block, so this one is reported, not dropped.
+                        report_hook_statement(hook, file, stmt, class_name.as_str(), &err);
+                        note_end(&mut prev_end, spliced, stmt);
+                        continue;
+                    }
                     Err(err) if super::survey::is_active() => {
                         super::survey::record(&err);
-                        prev_end = Some(stmt.location().end_offset());
+                        note_end(&mut prev_end, spliced, stmt);
                         continue;
                     }
                     Err(err) => return Err(err),
@@ -418,48 +428,81 @@ pub(super) fn ingest_model_with_enum_constants(
             // Ruby's alias reaches the original name's super method and a
             // renamed copy would reach its own. Anything else stays an
             // unknown item.
+            if let Some(methods) = super::define_method_loop::unroll(
+                stmt,
+                &owner,
+                file,
+                crate::dialect::MethodReceiver::Instance,
+                &loop_visibility,
+                true,
+            ) {
+                let mut leading = Some((leading, leading_blank));
+                for mut method in methods {
+                    if !spliced {
+                        visibility.apply(&statement, &mut method);
+                    }
+                    let (comments, blank) = leading.take().unwrap_or_default();
+                    body.push(ModelBodyItem::Method { method, leading_comments: comments, leading_blank_line: blank });
+                }
+                note_end(&mut prev_end, spliced, stmt);
+                continue;
+            }
             if let Some(mut copy) = stmt.as_call_node().and_then(|call| model_alias_method_copy(&call, &body)) {
-                visibility.apply(&statement, &mut copy);
+                if !spliced {
+                    visibility.apply(&statement, &mut copy);
+                }
                 body.push(ModelBodyItem::Method {
                     method: copy,
                     leading_comments: leading,
                     leading_blank_line: leading_blank,
                 });
-                prev_end = Some(stmt.location().end_offset());
+                note_end(&mut prev_end, spliced, stmt);
                 continue;
             }
+            // `alias new old` (keyword form). Columns, associations,
+            // `attr_accessor` and `attribute` are synthesized later, in
+            // `lower::model_to_library` — this walk only sees
+            // hand-written `def`s and enum-generated methods, so
+            // resolving here would wrongly refuse an alias naming any
+            // of those (#481: an enum alias failed even though the
+            // model itself emitted fine). Record it as a typed body
+            // item, in order, and let `lower_model_to_library_class`
+            // resolve it after synthesis, with snapshot semantics.
             if let Some(alias) = stmt.as_alias_method_node() {
                 let to = super::library_class::alias_keyword_name(&alias.new_name());
                 let from = super::library_class::alias_keyword_name(&alias.old_name());
-                let copied = to.zip(from).and_then(|(to, from)| {
-                    body.iter().rev().find_map(|item| match item {
-                        ModelBodyItem::Method { method, .. }
-                            if method.name.as_str() == from
-                                && method.receiver == crate::dialect::MethodReceiver::Instance =>
-                        {
-                            let mut copy = method.clone();
-                            copy.name = crate::ident::Symbol::from(to.as_str());
-                            Some(copy)
-                        }
-                        _ => None,
-                    })
-                });
-                if let Some(method) = copied {
-                    body.push(ModelBodyItem::Method {
-                        method,
+                if let Some((to, from)) = to.zip(from) {
+                    let span = Span {
+                        file: super::sources::file_id(file),
+                        start: stmt.location().start_offset() as u32,
+                        end: stmt.location().end_offset() as u32,
+                    };
+                    body.push(ModelBodyItem::Alias {
+                        new: crate::ident::Symbol::from(to.as_str()),
+                        old: crate::ident::Symbol::from(from.as_str()),
                         leading_comments: leading,
                         leading_blank_line: leading_blank,
+                        span,
                     });
-                    prev_end = Some(stmt.location().end_offset());
+                    note_end(&mut prev_end, spliced, stmt);
                     continue;
                 }
+                // Neither side is a plain name (e.g. a global variable
+                // alias, `alias $a $b`) — not a method alias at all.
                 return Err(IngestError::Unsupported {
                     file: file.into(),
                     message: "alias names a method this body has not defined".into(),
                 });
             }
             if let Some(sc) = stmt.as_singleton_class_node() {
-                match ingest_singleton_class_body(&sc, &owner, file, &visibility) {
+                // A hook's `class << self` is outside what the model's `Visibility` read.
+                if spliced && sc.body().is_some_and(|b| flatten_statements(b).iter().any(|s| s.as_call_node().is_some_and(|c| visibility::marker(&c)))) {
+                    let err = IngestError::Unsupported { file: file.into(), message: "visibility in a load hook block is not carried".into() };
+                    report_hook_statement(hook, file, stmt, class_name.as_str(), &err);
+                    note_end(&mut prev_end, spliced, stmt);
+                    continue;
+                }
+                match ingest_singleton_class_body(&sc, &owner, file, (!spliced).then_some(&visibility)) {
                     Ok(singleton) => {
                         let mut leading = leading;
                         let mut blank = leading_blank;
@@ -471,7 +514,11 @@ pub(super) fn ingest_model_with_enum_constants(
                                 leading_comments: Vec::new(),
                                 leading_blank_line: false,
                             })
-                            .chain(singleton.class_body.into_iter().map(|expr| {
+                            .chain(singleton.class_body.into_iter().map(|mut expr| {
+                                // Its constants live on the singleton class, where the Ruby trees read them (`expr::SINGLETON_BODY`).
+                                if let crate::expr::ExprNode::Assign { target: crate::expr::LValue::Const { .. }, value } = &mut *expr.node {
+                                    value.decisions |= crate::expr::SINGLETON_BODY;
+                                }
                                 ModelBodyItem::Unknown {
                                     expr,
                                     leading_comments: Vec::new(),
@@ -483,12 +530,17 @@ pub(super) fn ingest_model_with_enum_constants(
                             item.set_leading_blank_line(std::mem::take(&mut blank));
                             body.push(item);
                         }
-                        prev_end = Some(stmt.location().end_offset());
+                        note_end(&mut prev_end, spliced, stmt);
+                        continue;
+                    }
+                    Err(err) if spliced => {
+                        report_hook_statement(hook, file, stmt, class_name.as_str(), &err);
+                        note_end(&mut prev_end, spliced, stmt);
                         continue;
                     }
                     Err(err) if super::survey::is_active() => {
                         super::survey::record(&err);
-                        prev_end = Some(stmt.location().end_offset());
+                        note_end(&mut prev_end, spliced, stmt);
                         continue;
                     }
                     Err(err) => return Err(err),
@@ -509,9 +561,17 @@ pub(super) fn ingest_model_with_enum_constants(
             // with it aborted the whole file.
             //
             // Exception: a nested `class JSON` / `module JSON` shadows
-            // bare `JSON` for `serialize …, coder: JSON` — leave a
-            // synthetic Const-assign marker so lower::serialize can see
-            // the shadow without treating the namespace as a body item.
+            // bare `JSON` for `serialize …, coder: JSON` — recorded in
+            // `lexical_json_shadow` so lower::serialize can see the
+            // shadow without treating the namespace as a body item.
+            // In a hook block, the declaration is a constant the library pass
+            // over the model's file never sees: reported, not skipped.
+            if spliced && (stmt.as_class_node().is_some() || stmt.as_module_node().is_some()) {
+                let err = IngestError::Unsupported { file: file.into(), message: "a class or module declared in a load hook block is not carried".into() };
+                report_hook_statement(hook, file, stmt, class_name.as_str(), &err);
+                note_end(&mut prev_end, spliced, stmt);
+                continue;
+            }
             if let Some(path) = stmt
                 .as_class_node()
                 .and_then(|c| constant_path_of(&c.constant_path()))
@@ -521,43 +581,40 @@ pub(super) fn ingest_model_with_enum_constants(
                 })
             {
                 let path_syms: Vec<Symbol> = path.iter().map(|s| Symbol::from(s.as_str())).collect();
-                if crate::lower::serialize::const_path_shadows_bare_json(
-                    &path_syms,
-                    owner.0.as_str(),
-                ) {
-                    body.push(ModelBodyItem::Unknown {
-                        expr: Expr::new(
-                            Span::synthetic(),
-                            ExprNode::Assign {
-                                target: crate::expr::LValue::Const {
-                                    path: vec![Symbol::from("JSON")],
-                                },
-                                value: Expr::new(
-                                    Span::synthetic(),
-                                    ExprNode::Lit {
-                                        value: crate::expr::Literal::Nil,
-                                    },
-                                ),
-                            },
-                        ),
-                        leading_comments: Vec::new(),
-                        leading_blank_line: false,
-                    });
-                }
-                prev_end = Some(stmt.location().end_offset());
+                // Recorded on the model, not as a body item: a constant
+                // write in the body would be emitted (`JSON = nil`) and
+                // collide with the nested class when it loads.
+                body_json_shadow |= crate::lower::serialize::const_path_shadows_bare_json(&path_syms, owner.0.as_str());
+                note_end(&mut prev_end, spliced, stmt);
                 continue;
             }
-            let items = match ingest_model_body_items(
-                &stmt,
-                &owner,
-                file,
-                leading,
-                Some(&mut class_attr_defaults),
-            ) {
+            // `X = Data.define(:a) do … end` and its `Struct.new` twin
+            // declare a class, which the same library pass registers. A
+            // `JSON` one shadows bare `JSON`, as a nested `class JSON` does.
+            if !spliced && super::library_class::model_value_class(stmt, &owner, file) {
+                let name = stmt.as_constant_write_node().map(|w| Symbol::from(constant_id_str(&w.name())));
+                body_json_shadow |=
+                    name.is_some_and(|name| crate::lower::serialize::const_path_shadows_bare_json(&[name], owner.0.as_str()));
+                note_end(&mut prev_end, spliced, stmt);
+                continue;
+            }
+            let classified = {
+                let was = CLASSIFYING_MODEL_BODY.with(|c| c.replace(true));
+                let consts = if spliced { &hook_consts } else { &class_consts };
+                let items = ingest_model_body_items(&stmt, &owner, file, leading, Some(&mut class_attr_defaults), consts);
+                CLASSIFYING_MODEL_BODY.with(|c| c.set(was));
+                items
+            };
+            let items = match classified {
                 Ok(items) => items,
+                Err(err) if spliced => {
+                    report_hook_statement(hook, file, stmt, class_name.as_str(), &err);
+                    note_end(&mut prev_end, spliced, stmt);
+                    continue;
+                }
                 Err(err) if super::survey::is_active() => {
                     super::survey::record(&err);
-                    prev_end = Some(stmt.location().end_offset());
+                    note_end(&mut prev_end, spliced, stmt);
                     continue;
                 }
                 Err(err) => return Err(err),
@@ -566,9 +623,24 @@ pub(super) fn ingest_model_with_enum_constants(
             // attribute; only the first carries the blank line that
             // separated the declaration from what came before it.
             for (i, mut item) in items.into_iter().enumerate() {
-                if let ModelBodyItem::Method { method, .. } = &mut item {
+                if spliced {
+                    // Public, as a hook block without visibility markers defines it.
+                } else if let ModelBodyItem::Method { method, .. } = &mut item {
                     visibility.apply(&statement, method);
-                } else if let ModelBodyItem::Unknown { .. } = &item {
+                } else if let ModelBodyItem::Unknown { expr, .. } = &item {
+                    if let Some(mut methods) = visibility.restricted_at(&statement).then(|| restricted_attr_methods(expr, &owner, &attributes, &declared_attributes)).flatten() {
+                        for method in &mut methods {
+                            visibility.apply(&statement, method);
+                        }
+                        for (j, method) in methods.into_iter().enumerate() {
+                            body.push(ModelBodyItem::Method {
+                                method,
+                                leading_comments: Vec::new(),
+                                leading_blank_line: leading_blank && i == 0 && j == 0,
+                            });
+                        }
+                        continue;
+                    }
                     if let Err(err) = visibility.check_model_item(&statement, file) {
                         super::survey::continue_or_fail(err)?;
                         continue;
@@ -577,20 +649,18 @@ pub(super) fn ingest_model_with_enum_constants(
                 item.set_leading_blank_line(leading_blank && i == 0);
                 body.push(item);
             }
-            prev_end = Some(stmt.location().end_offset());
+            note_end(&mut prev_end, spliced, stmt);
         }
     }
+    visibility.uncarried_inherited(&carried_markers, file)?;
 
     let parent_span = class
         .superclass()
         .map(|n| super::util::node_span(&n, file))
         .unwrap_or_default();
-    let parent = class.superclass().and_then(|n| {
-        constant_path_of(&n).map(|p| {
-            let resolved = model_bases.resolve_superclass(&scope, &p);
-            ClassId(Symbol::from(model_bases.emit_superclass(&resolved)))
-        })
-    });
+    let parent = model_bases
+        .resolve_class_superclass(&scope, &nesting, &class)
+        .map(|resolved| ClassId(Symbol::from(model_bases.emit_superclass(&resolved))));
 
     let class_loc = class.location();
     Ok(Some(Model {
@@ -598,6 +668,8 @@ pub(super) fn ingest_model_with_enum_constants(
         parent,
         parent_span,
         sti_subclass_names: Vec::new(),
+        mixin_sends: Vec::new(),
+        select_aliases: Vec::new(),
         i18n: Default::default(),
         table: TableRef(Symbol::from(table_name)),
         primary_key,
@@ -606,13 +678,149 @@ pub(super) fn ingest_model_with_enum_constants(
         enums,
         enum_defaults,
         class_attr_defaults,
-        lexical_json_shadow: enum_constants.shadows_bare_json(&enum_owners),
+        lexical_json_shadow: enum_constants.shadows_bare_json(&enum_owners) || body_json_shadow,
         span: Span {
             file: super::sources::file_id(file),
             start: class_loc.start_offset() as u32,
             end: class_loc.end_offset() as u32,
         },
     }))
+}
+
+/// One statement the class-body walk reads: the body's own, or one of an
+/// `ActiveSupport.on_load` block spliced in where the body fires it.
+struct WalkStmt<'a> {
+    node: Node<'a>,
+    /// The file its spans name: the model's, or the initializer the hook block
+    /// was written in.
+    file: &'a str,
+    /// That file's text.
+    source: &'a [u8],
+    /// The hook the statement came from, when it was spliced.
+    hook: Option<&'a str>,
+}
+
+/// A model body's load-time conditional whose branches only load
+/// (`visibility::load_only_conditional`), as Ruby runs it, or `None` for any
+/// other conditional (#2282). `if defined?(Const)`, with at most an empty
+/// `else`, settles when the recorded sources answer the guard: when nothing
+/// could define `Const` the branch never runs (`Ok(None)`); when one of
+/// `owners`' (the model class first) spellings of it is defined and the branch is `include Const`
+/// alone, the branch is that include. Every other one is refused by what
+/// it is: a constant Ruby, the framework or an ancestor may define, one the
+/// model's own file declares (`file_root`: whether that runs before the
+/// guard is not what the recorded constants say), a branch doing more than
+/// include the guarded module, or another guard.
+// Not the modifier form (`include M if defined?(M)`): no `end`, so not a
+// conditional definition, and left as it was.
+fn settle_load_only_conditional<'pr>(
+    node: Node<'pr>,
+    owners: &[String],
+    enum_constants: &EnumConstants,
+    file_root: &Node<'_>,
+    file: &str,
+) -> Option<IngestResult<Option<Node<'pr>>>> {
+    let (negated, arms) = visibility::load_only_conditional(&node)?;
+    let refuse = |why: String| {
+        Some(Err(IngestError::Unsupported {
+            file: file.into(),
+            message: format!("a load-time conditional `include` or `require` in a model body is not modeled: {why}"),
+        }))
+    };
+    let mut arms = arms.into_iter();
+    let Some((Some(predicate), stmts)) = arms.next() else { return refuse("its condition is not `defined?` of a constant".into()) };
+    if negated || !arms.all(|(condition, rest)| condition.is_none() && rest.is_empty()) {
+        return refuse("its condition is not `defined?` of a constant".into());
+    }
+    let Some(written) = predicate.as_defined_node().and_then(|d| EnumConstants::path(&d.value())) else {
+        return refuse("its condition is not `defined?` of a constant".into());
+    };
+    let segments: Vec<&str> = written.trim_start_matches("::").split("::").collect();
+    let root = segments[0];
+    // Defined by Ruby or the framework, which no recorded source declares.
+    let runtime = super::app::FRAMEWORK_ROOTS.contains(&root)
+        || crate::gems::is_stdlib_namespace(root)
+        || crate::gems::is_core_constant(&segments)
+        || crate::gems::preloaded_constant(root);
+    let declared_here = declares_constant_named(file_root, segments[segments.len() - 1]);
+    match (!runtime && !declared_here).then(|| enum_constants.guarded_constant(&written, owners, &owners[0])).flatten() {
+        Some(false) => Some(Ok(None)),
+        Some(true) => {
+            let includes_guarded = |stmt: &Node<'_>| {
+                stmt.as_call_node().is_some_and(|call| {
+                    constant_id_str(&call.name()) == "include"
+                        && call.arguments().and_then(|a| a.arguments().iter().next()).and_then(|a| EnumConstants::path(&a)).as_deref() == Some(written.as_str())
+                })
+            };
+            match <[Node<'pr>; 1]>::try_from(stmts) {
+                Ok([only]) if includes_guarded(&only) => Some(Ok(Some(only))),
+                _ => refuse(format!("`{written}` is defined, and the branch does more than include it")),
+            }
+        }
+        None => refuse(format!("whether `{written}` is defined where the model loads is not known here")),
+    }
+}
+
+/// Whether the file declares a class, module or constant whose own name is
+/// `name`, at any depth (`module Auditable`, `Tracking::Auditable = …`).
+fn declares_constant_named(root: &Node<'_>, name: &str) -> bool {
+    struct Declares<'a> {
+        name: &'a str,
+        found: bool,
+    }
+    impl Declares<'_> {
+        fn path(&mut self, path: &Node<'_>) {
+            let own = if let Some(read) = path.as_constant_read_node() {
+                Some(read.name())
+            } else {
+                path.as_constant_path_node().and_then(|p| p.name())
+            };
+            self.found |= own.is_some_and(|n| constant_id_str(&n) == self.name);
+        }
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Declares<'_> {
+        fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+            self.path(&node.constant_path());
+            ruby_prism::visit_class_node(self, node);
+        }
+        fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
+            self.path(&node.constant_path());
+            ruby_prism::visit_module_node(self, node);
+        }
+        fn visit_constant_write_node(&mut self, node: &ruby_prism::ConstantWriteNode<'pr>) {
+            self.found |= constant_id_str(&node.name()) == self.name;
+            ruby_prism::visit_constant_write_node(self, node);
+        }
+        fn visit_constant_path_write_node(&mut self, node: &ruby_prism::ConstantPathWriteNode<'pr>) {
+            self.found |= node.target().name().is_some_and(|n| constant_id_str(&n) == self.name);
+            ruby_prism::visit_constant_path_write_node(self, node);
+        }
+    }
+    let mut declares = Declares { name, found: false };
+    ruby_prism::Visit::visit(&mut declares, root);
+    declares.found
+}
+
+/// Where the previous statement ended, for the blank line before the next one.
+/// A spliced hook statement lives in another file, so it leaves the body's own
+/// end where it was.
+fn note_end(prev_end: &mut Option<usize>, spliced: bool, node: &Node<'_>) {
+    if !spliced {
+        *prev_end = Some(node.location().end_offset());
+    }
+}
+
+/// A statement of a spliced `ActiveSupport.on_load` block the model ingest
+/// refuses: Rails runs it as part of the class body, so the compiled app would
+/// lose it — an error naming the hook and the model, never a silent drop.
+fn report_hook_statement(hook: Option<&str>, file: &str, node: &Node<'_>, model: &str, err: &IngestError) {
+    let Some(hook) = hook else { return };
+    super::prism::push(crate::diagnostic::Diagnostic::unsupported(
+        super::util::node_span(node, file),
+        None,
+        super::load_hooks::ON_LOAD_STATEMENT,
+        super::load_hooks::statement_message(hook, model, super::load_hooks::error_detail(err)),
+    ));
 }
 
 /// `alias_method :to, :from` (literal names) of the last instance def of
@@ -641,9 +849,7 @@ fn model_alias_method_copy(call: &ruby_prism::CallNode<'_>, body: &[ModelBodyIte
     if calls_super(&source.body) {
         return None;
     }
-    let mut copy = source.clone();
-    copy.name = Symbol::from(to.as_str());
-    Some(copy)
+    Some(super::library_class::copy_aliased_method(source, to.as_str()))
 }
 
 /// Classify one class-body statement into its `ModelBodyItem` variant.
@@ -659,16 +865,45 @@ fn model_alias_method_copy(call: &ruby_prism::CallNode<'_>, body: &[ModelBodyIte
 /// The `validates_*_of` family is the same declaration in Rails' older
 /// spelling — `validates_presence_of :a` IS `validates :a, presence:
 /// true` — so it lands here rather than growing a second rule table.
-/// BARE SYMBOLS ONLY: an options hash (`allow_nil:`, `if:`, `on:`)
-/// narrows or reshapes the check, and the call falls through to the
-/// unsupported-DSL ledger rather than being flattened into an
-/// unconditional one.
+/// Presence and absence stay BARE SYMBOLS ONLY: an options hash
+/// (`allow_nil:`, `if:`, `on:`) narrows the check, and that call falls
+/// through to the unsupported-DSL ledger rather than being flattened
+/// into an unconditional one. Numericality, inclusion, and format use
+/// the same option parse as `validates`.
+thread_local! {
+    /// Set while a model's own class body is classified, not a concern's `included do` or a macro expansion.
+    static CLASSIFYING_MODEL_BODY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// A model's own state-machine block, by its call's offset: its recorded gap is withdrawn if the class body replays it.
+    static DEFERRED_STATE_MACHINES: std::cell::RefCell<Vec<(crate::span::FileId, u32, String, IngestError)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Forget what an earlier ingest attempt on this thread left queued.
+pub(super) fn reset_deferred_state_machines() {
+    DEFERRED_STATE_MACHINES.with(|d| d.borrow_mut().clear());
+}
+
+/// Withdraw the gap of each model state-machine block the class body replays (`app_extension_calls`): the gem's
+/// class method runs it as Ruby does.
+pub(super) fn report_unreplayed_state_machines(app: &crate::App) {
+    let deferred = DEFERRED_STATE_MACHINES.with(|d| std::mem::take(&mut *d.borrow_mut()));
+    for (file, start, method, gap) in deferred {
+        let replayed = app.models.iter().flat_map(|m| m.body.iter()).any(|item| matches!(item,
+            ModelBodyItem::Unknown { expr, .. } if expr.span.file == file && expr.span.start == start
+                && expr.decisions & crate::expr::REPLAYED_CLASS_BODY != 0
+                && matches!(&*expr.node, crate::expr::ExprNode::Send { method: m, .. } if m.as_str() == method)));
+        if replayed {
+            super::survey::forget(&gap);
+        }
+    }
+}
+
 pub(super) fn ingest_model_body_items(
     stmt: &Node<'_>,
     owner: &ClassId,
     file: &str,
     leading_comments: Vec<Comment>,
     class_attr_defaults: Option<&mut IndexMap<Symbol, Expr>>,
+    class_consts: &ClassConsts,
 ) -> IngestResult<Vec<ModelBodyItem>> {
     use crate::dialect::{Validation, ValidationRule};
     let span = Span {
@@ -676,17 +911,122 @@ pub(super) fn ingest_model_body_items(
         start: stmt.location().start_offset() as u32,
         end: stmt.location().end_offset() as u32,
     };
+    // `alias new old` in an `included do` block, as the model body walk records it.
+    if let Some(alias) = stmt.as_alias_method_node()
+        && let Some((to, from)) = super::library_class::alias_keyword_name(&alias.new_name()).zip(super::library_class::alias_keyword_name(&alias.old_name()))
+    {
+        return Ok(vec![ModelBodyItem::Alias {
+            new: crate::ident::Symbol::from(to.as_str()),
+            old: crate::ident::Symbol::from(from.as_str()),
+            leading_comments,
+            leading_blank_line: false,
+            span,
+        }]);
+    }
+    // Only `serialize` and `scope` beside the `define_method`s: the other macros are read from the statement, not from a rewritten Expr.
+    enum Unrolled {
+        Serialize(Expr),
+        Scope(crate::dialect::Scope),
+    }
+    let mut macros = Vec::new();
+    if let Some(methods) = super::define_method_loop::unroll_with_macros(stmt, owner, file, &mut macros)
+        && let Some(unrolled) = macros
+            .into_iter()
+            .map(|expr| match &*expr.node {
+                ExprNode::Send { recv: None, method, .. } if method.as_str() == "serialize" => Some(Unrolled::Serialize(expr)),
+                ExprNode::Send { recv: None, method, .. } if method.as_str() == "scope" => unrolled_scope(&expr).map(Unrolled::Scope),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
+    {
+        let mut leading = Some(leading_comments);
+        let mut items: Vec<ModelBodyItem> = Vec::new();
+        for item in unrolled {
+            let leading_comments = leading.take().unwrap_or_default();
+            items.push(match item {
+                Unrolled::Serialize(expr) => ModelBodyItem::Unknown { expr, leading_comments, leading_blank_line: false },
+                Unrolled::Scope(scope) => ModelBodyItem::Scope { scope, leading_comments, leading_blank_line: false },
+            });
+        }
+        for method in methods {
+            items.push(ModelBodyItem::Method { method, leading_comments: leading.take().unwrap_or_default(), leading_blank_line: false });
+        }
+        return Ok(items);
+    }
     if let Some(call) = stmt.as_call_node() {
+        if with_options::is_with_options(&call) {
+            return match with_options::expand(&call, &[], owner, file, class_consts) {
+                Ok(items) => Ok(items),
+                // In a spliced load hook, the hook reports it as an error.
+                Err(err @ IngestError::Unsupported { .. }) if super::load_hooks::in_hook() => Err(err),
+                // Declined: reported with what blocked it, and dropped like
+                // any unlowered model DSL (none of its calls is kept).
+                Err(IngestError::Unsupported { message, .. }) => {
+                    let mut diagnostic =
+                        crate::diagnostic::Diagnostic::unsupported(span, None, "with_options", message.clone());
+                    diagnostic.severity = crate::diagnostic::Severity::Warning;
+                    super::prism::push(diagnostic);
+                    super::survey::record(&IngestError::Unsupported { file: file.into(), message });
+                    Ok(Vec::new())
+                }
+                Err(err) => Err(err),
+            };
+        }
+        if call.receiver().is_none()
+            && let Some(source) = validations::validates_of_as_validates(&call, file)
+        {
+            let parsed = super::prism::parse_silent(source.as_bytes());
+            let program = parsed.node();
+            if parsed.errors().next().is_none()
+                && let Some(stmt) = program.as_program_node().and_then(|p| p.statements().body().iter().next())
+            {
+                let mut items = ingest_model_body_items(&stmt, owner, file, leading_comments, class_attr_defaults, class_consts)?;
+                for item in &mut items {
+                    if let ModelBodyItem::Validation { span: at, .. } = item {
+                        *at = span;
+                    }
+                }
+                return Ok(items);
+            }
+        }
         if call.receiver().is_none() {
             let name = constant_id_str(&call.name()).to_string();
+            let of_kind = match name.as_str() {
+                "validates_numericality_of" => Some(ValidatesKind::Numericality),
+                "validates_inclusion_of" => Some(ValidatesKind::Inclusion),
+                "validates_exclusion_of" => Some(ValidatesKind::Exclusion),
+                "validates_format_of" => Some(ValidatesKind::Format),
+                _ => None,
+            };
+            if name == "validates" || of_kind.is_some() {
+                let kind = of_kind.unwrap_or(ValidatesKind::Map);
+                match parse_validates_call(&call, file, kind, class_consts) {
+                    ParsedValidates::Gap => return Ok(Vec::new()),
+                    ParsedValidates::Modeled(parsed) if !parsed.is_empty() => {
+                        return Ok(validation_items(parsed, leading_comments, span));
+                    }
+                    // The lowered rules, and the call itself for its custom
+                    // keys (`ingest::each_validator` lowers or reports them).
+                    ParsedValidates::Custom(parsed, keys, kept) => {
+                        if !kept.is_empty() {
+                            return validations::split_custom_call(&call, owner, file, leading_comments, class_consts, &keys, &kept);
+                        }
+                        let mut items = validation_items(parsed, leading_comments, span);
+                        let expr = ingest_expr(stmt, file)?;
+                        let text = String::from_utf8_lossy(call.location().as_slice()).into_owned();
+                        super::each_validator::note(expr.span, text, keys, kept);
+                        items.push(ModelBodyItem::Unknown { expr, leading_comments: Vec::new(), leading_blank_line: false });
+                        return Ok(items);
+                    }
+                    ParsedValidates::Decline | ParsedValidates::Modeled(_) => {}
+                }
+            }
             let rule = match name.as_str() {
                 "validates_presence_of" => Some(ValidationRule::Presence),
                 "validates_absence_of" => Some(ValidationRule::Absence),
                 _ => None,
             };
-            let parsed: Vec<Validation> = if name == "validates" {
-                parse_validates(&call)
-            } else if let Some(rule) = rule.clone() {
+            let parsed: Vec<Validation> = if let Some(rule) = rule.clone() {
                 let args: Vec<Node<'_>> = call
                     .arguments()
                     .map(|a| a.arguments().iter().collect())
@@ -698,7 +1038,14 @@ pub(super) fn ingest_model_body_items(
                 if attrs.len() == args.len() && !attrs.is_empty() {
                     attrs
                         .into_iter()
-                        .map(|attribute| Validation { attribute, rules: vec![rule.clone()] })
+                        .map(|attribute| Validation {
+                            prepend: false,
+                            attribute,
+                            rules: vec![rule.clone()],
+                            if_cond: None,
+                            unless_cond: None,
+                            message: None,
+                        })
                         .collect()
                 } else {
                     Vec::new()
@@ -707,22 +1054,7 @@ pub(super) fn ingest_model_body_items(
                 Vec::new()
             };
             if parsed.len() > 1 || (rule.is_some() && !parsed.is_empty()) {
-                return Ok(parsed
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, validation)| ModelBodyItem::Validation {
-                        validation,
-                        // The declaration's comments belong to the
-                        // first of the items it expands to.
-                        leading_comments: if i == 0 {
-                            leading_comments.clone()
-                        } else {
-                            Vec::new()
-                        },
-                        leading_blank_line: false,
-                        span,
-                    })
-                    .collect());
+                return Ok(validation_items(parsed, leading_comments, span));
             }
             // `cattr_*` / `mattr_*` — same class-attr expansion library
             // ingest applies. Plain `attr_*` stays Unknown: concern
@@ -751,13 +1083,53 @@ pub(super) fn ingest_model_body_items(
             }
         }
     }
-    Ok(vec![ingest_model_body_item(stmt, owner, file, leading_comments)?])
+    let mut items = vec![ingest_model_body_item(stmt, owner, file, leading_comments, class_consts)?];
+    crate::dialect::replace_validation_callbacks(&mut items);
+    Ok(items)
+}
+
+/// What a `cattr_*` / `mattr_*` declaration's default does to a class
+/// variable a seed may already hold. Rails' answer is `class_variable_set(sym,
+/// default) unless default.nil? && class_variable_defined?(sym)`: the
+/// VALUE decides, not whether an argument was written.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Seed {
+    /// No default (`cattr_writer :cap`; the synthetic nil placeholder the
+    /// collectors store): sets the variable only where nothing has.
+    Absent,
+    /// A literal `nil`: never replaces a variable something defined.
+    Nil,
+    /// A value that cannot be nil (a non-nil literal, a collection
+    /// literal, a lambda): always replaces.
+    Fixed,
+    /// A constant, a call…: it may evaluate to nil, so whether
+    /// it replaces an earlier seed is only known when nothing is seeded.
+    Computed,
+}
+
+impl Seed {
+    pub(super) fn of(value: &Expr) -> Self {
+        if value.span.is_synthetic() {
+            return Seed::Absent;
+        }
+        match &*value.node {
+            ExprNode::Lit { value: Literal::Nil } => Seed::Nil,
+            // A literal of any other kind, and a literal collection, are
+            // values that cannot be nil.
+            ExprNode::Lit { .. } | ExprNode::Array { .. } | ExprNode::Hash { .. } | ExprNode::Lambda { .. } => Seed::Fixed,
+            _ => Seed::Computed,
+        }
+    }
 }
 
 /// `mattr_*` / `cattr_*` with documented Rails defaults: `default:` and a
 /// parameterless block. Other kwargs (`instance_reader:`, splats, …) stay
 /// unexpanded so a partial reader cannot drop the initializer.
-fn expand_mattr_cattr(
+///
+/// Shared with the concern collector: `included do cattr_accessor :cap,
+/// default: 3 end` runs on each includer exactly as a model's own
+/// declaration does, and needs the seed carried beside the accessors.
+pub(super) fn expand_mattr_cattr(
     call: &ruby_prism::CallNode<'_>,
     owner: &ClassId,
     file: &str,
@@ -848,18 +1220,63 @@ fn expand_mattr_cattr(
         return Ok(None);
     }
     if let Some(defaults) = class_attr_defaults {
-        // Rails `class_variable_set`: nil when no default, else the value.
-        // `@@` storage requires an explicit seed (unlike `@ivar`).
-        let expr = default.unwrap_or_else(|| {
-            Expr::new(
-                Span::synthetic(),
-                ExprNode::Lit {
-                    value: Literal::Nil,
-                },
-            )
-        });
-        for attr in &names {
-            defaults.insert(attr.clone(), expr.clone());
+        // Rails `cattr_*` (`mattr_reader`'s twin) decides a declaration by
+        // the VALUE of its default (`class_variable_set(...) unless
+        // sym_default_value.nil? && class_variable_defined?`): a non-nil
+        // default always sets, while no default — and an explicit
+        // `default: nil` — sets only a variable nothing has defined yet
+        // (`cattr_reader :cap, default: 3; cattr_writer :cap` stays 3).
+        // Two declarations that both set it are decided by which runs
+        // last; a default this cannot evaluate (a constant, a call)
+        // might be nil, so it must not be guessed. `@@` storage
+        // still needs a seed for its first read (unlike `@ivar`), so an
+        // absent default seeds nil where nothing has.
+        match default {
+            Some(default) => {
+                let seed = Seed::of(&default);
+                for attr in &names {
+                    let Some(existing) = defaults.get(attr) else {
+                        defaults.insert(attr.clone(), default.clone());
+                        continue;
+                    };
+                    if seed == Seed::Nil {
+                        // `nil` never replaces a defined class variable.
+                        continue;
+                    }
+                    if matches!(Seed::of(existing), Seed::Absent | Seed::Nil) {
+                        // Nothing has set the variable yet, so this does.
+                        defaults.insert(attr.clone(), default.clone());
+                        continue;
+                    }
+                    if seed == Seed::Computed {
+                        super::prism::push(crate::diagnostic::Diagnostic::unsupported(
+                            super::util::node_span(&call.as_node(), file),
+                            None,
+                            "cattr_accessor",
+                            format!(
+                                "`{}` is declared again with a default this cannot evaluate, so whether it replaces the earlier seed cannot be established here",
+                                attr.as_str(),
+                            ),
+                        ));
+                        continue;
+                    }
+                    // Both set the variable: the later declaration, which
+                    // is this one, wins.
+                    defaults.insert(attr.clone(), default.clone());
+                }
+            }
+            None => {
+                for attr in &names {
+                    defaults.entry(attr.clone()).or_insert_with(|| {
+                        Expr::new(
+                            Span::synthetic(),
+                            ExprNode::Lit {
+                                value: Literal::Nil,
+                            },
+                        )
+                    });
+                }
+            }
         }
     }
     let want_reader = name.ends_with("_reader") || name.ends_with("_accessor");
@@ -909,6 +1326,26 @@ fn expand_mattr_cattr(
     } else {
         Ok(Some(out))
     }
+}
+
+/// `private` then `attr_reader :queue_adapter` (MissionControl::Jobs::RecurringTask): the
+/// readers as methods, each to carry its own visibility, which a class-body `attr_*`
+/// statement has nowhere to hold.
+fn restricted_attr_methods(expr: &Expr, owner: &ClassId, columns: &Row, attributes: &[Symbol]) -> Option<Vec<crate::dialect::MethodDef>> {
+    let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node else { return None };
+    // Not a writer: mass assignment refuses a private writer's key in Rails, which the model lowering does not model, so `check_model_item` still refuses one.
+    if method.as_str() != "attr_reader" {
+        return None;
+    }
+    args.iter()
+        .map(|arg| match &*arg.node {
+            // Not over a column or an `attribute`: Rails' reader then reads an ivar the record never sets, which the attribute reader the lowering keeps would not.
+            ExprNode::Lit { value: crate::expr::Literal::Sym { value } } if !columns.fields.contains_key(value) && !attributes.contains(value) => {
+                Some(super::library_class::synth_attr_reader(owner, value, crate::dialect::MethodReceiver::Instance))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 fn synth_mattr_instance_reader(owner: &ClassId, name: &Symbol) -> crate::dialect::MethodDef {
@@ -1004,6 +1441,7 @@ pub(super) fn ingest_model_body_item(
     owner: &ClassId,
     file: &str,
     leading_comments: Vec<Comment>,
+    class_consts: &ClassConsts,
 ) -> IngestResult<ModelBodyItem> {
     // Span of the whole statement — the typed variants (Association /
     // Validation / Callback) drop the source Expr during recognition,
@@ -1053,11 +1491,19 @@ pub(super) fn ingest_model_body_item(
                 .arguments()
                 .map(|args| args.arguments().iter().count())
                 .unwrap_or(0);
-            // `if: :pred` / `unless: :pred` (Symbol conditions only) ride
-            // along on the rule; any other option — `on:`, a lambda —
-            // keeps the call out, as before.
+            // `if: :pred` / `unless: :pred` ride along on the rule; a
+            // zero-arity lambda/proc condition is the guard expression
+            // `callback_condition` builds, carried on the Validation the
+            // way `validates` carries one, and `on: :create`/`:update`
+            // joins `if:` as the `persisted?` test `validates` uses. Any
+            // other option — `on: :custom`, a lambda that takes the
+            // record — keeps the call out.
             let mut if_method: Option<Symbol> = None;
             let mut unless_method: Option<Symbol> = None;
+            let mut if_cond: Option<Expr> = None;
+            let mut unless_cond: Option<Expr> = None;
+            let mut on_guard: Option<Expr> = None;
+            let mut prepend = false;
             let mut options_ok = true;
             let mut option_args = 0usize;
             if let Some(args) = call.arguments() {
@@ -1072,8 +1518,33 @@ pub(super) fn ingest_model_body_item(
                         let key = symbol_value(&assoc.key());
                         let value = symbol_value(&assoc.value()).map(|v| Symbol::from(v.as_str()));
                         match (key.as_deref(), value) {
+                            (Some("prepend"), _) => match class_consts.truthiness(&assoc.value()) {
+                                Some(flag) => prepend = flag,
+                                None => super::prism::push(crate::diagnostic::Diagnostic {
+                                    span,
+                                    kind: crate::diagnostic::DiagnosticKind::IgnoredValidatorOption {
+                                        validator: Symbol::from("validate"),
+                                        option: Symbol::from("prepend"),
+                                        hint: None,
+                                    },
+                                    severity: crate::diagnostic::Severity::Warning,
+                                    message: "prepend value cannot be resolved; validation is kept in ordinary registration order".into(),
+                                }),
+                            },
                             (Some("if"), Some(v)) => if_method = Some(v),
                             (Some("unless"), Some(v)) => unless_method = Some(v),
+                            (Some("if"), None) => match callback_condition(&assoc.value(), file) {
+                                Some(c) => if_cond = Some(c),
+                                None => options_ok = false,
+                            },
+                            (Some("unless"), None) => match callback_condition(&assoc.value(), file) {
+                                Some(c) => unless_cond = Some(c),
+                                None => options_ok = false,
+                            },
+                            (Some("on"), _) => match context_guard(&assoc.value()) {
+                                Some(g) => on_guard = g,
+                                None => options_ok = false,
+                            },
                             _ => options_ok = false,
                         }
                     }
@@ -1090,6 +1561,7 @@ pub(super) fn ingest_model_body_item(
                 let attribute = symbols[0].clone();
                 return Ok(ModelBodyItem::Validation {
                     validation: crate::dialect::Validation {
+                        prepend,
                         attribute,
                         rules: symbols
                             .into_iter()
@@ -1099,49 +1571,15 @@ pub(super) fn ingest_model_body_item(
                                 unless_method: unless_method.clone(),
                             })
                             .collect(),
+                        if_cond: and_guard(on_guard, if_cond),
+                        unless_cond,
+                        message: None,
                     },
                     leading_comments,
                     leading_blank_line: false,
                     span,
                 });
             }
-        }
-        if method == "validates" {
-            let mut parsed = parse_validates(&call);
-            if let Some(first) = parsed.first().cloned() {
-                // `validates :attr` with multiple rules is one call; we
-                // only see one Validation per call today. If the call
-                // expanded to multiple (the multi-attribute form), they
-                // share leading comments only on the first.
-                let mut items = Vec::with_capacity(parsed.len());
-                items.push(ModelBodyItem::Validation {
-                    validation: first,
-                    leading_comments,
-                    leading_blank_line: false,
-                    span,
-                });
-                for v in parsed.drain(1..) {
-                    items.push(ModelBodyItem::Validation {
-                        validation: v,
-                        leading_comments: Vec::new(),
-                        leading_blank_line: false,
-                        span,
-                    });
-                }
-                // Degenerate: the caller expects ONE item. If parse_validates
-                // returned multiple, merge-ingest is a bit lossy — return
-                // the first and drop the tail (no real fixture triggers
-                // this yet; multi-attr validates is usually
-                // `validates :a, :b, rule: ...` and our current shape is
-                // one-Validation-per-attribute).
-                return Ok(items.into_iter().next().unwrap());
-            }
-            // No validation extracted — treat as Unknown so we don't lose it.
-            return Ok(ModelBodyItem::Unknown {
-                expr: ingest_expr(stmt, file)?,
-                leading_comments,
-                leading_blank_line: false,
-            });
         }
         if method == "scope" {
             if let Some(scope) = parse_scope(&call, file)? {
@@ -1154,14 +1592,20 @@ pub(super) fn ingest_model_body_item(
         // The same classifier sees model declarations and a concern's
         // `included do`. Record before the latter drops the Unknown,
         // and before ingesting a block that may contain further gaps.
-        // Name the DSL shape, not unverified gem ownership.
+        // Name the DSL shape, not unverified gem ownership. A model's own
+        // call is judged once the class-body replay is decided
+        // (`app::report_unreplayed_state_machines`).
         if matches!(method.as_str(), "aasm" | "state_machine")
             && call.block().and_then(|b| b.as_block_node()).is_some()
         {
-            super::survey::record(&IngestError::Unsupported {
+            let gap = IngestError::Unsupported {
                 file: file.into(),
                 message: format!("state-machine DSL block `{method}` is not modeled"),
-            });
+            };
+            super::survey::record(&gap);
+            if CLASSIFYING_MODEL_BODY.with(|c| c.get()) {
+                DEFERRED_STATE_MACHINES.with(|d| d.borrow_mut().push((super::sources::file_id(file), call.location().start_offset() as u32, method.to_string(), gap)));
+            }
         }
         return Ok(ModelBodyItem::Unknown {
             expr: ingest_expr(stmt, file)?,
@@ -1344,6 +1788,63 @@ fn enum_mapping_error(file: &str, column: &str) -> IngestError {
     }
 }
 
+/// Re-ingesting models would duplicate diagnostics, so read their retained
+/// source when consumed method overrides may invalidate a folded set.
+fn folded_enum_validation_lists(
+    model: &Model,
+    source: &crate::span::SourceFile,
+    constants: &EnumConstants,
+) -> crate::det::HashMap<Span, Vec<Literal>> {
+    let validations: Vec<_> = model.body.iter().filter_map(|item| match item {
+        ModelBodyItem::Validation { span, .. } if !span.is_synthetic() => Some((span.start as usize, span.end as usize)),
+        _ => None,
+    }).collect();
+    let mut uses = crate::det::HashMap::default();
+    if validations.is_empty() { return uses; }
+    let result = super::prism::parse_silent(source.text.as_bytes());
+    let root = result.node();
+    let Some((_, class)) = super::util::find_all_classes_with_scope(&root).into_iter()
+        .find(|(_, class)| class.location().start_offset() == model.span.start as usize)
+        else { return uses };
+    let Some(body) = class.body() else { return uses };
+    let stmts = flatten_statements(body);
+    let owners = constants.nesting.get(&(source.path.clone(), model.span.start as usize)).cloned().unwrap_or_default();
+    let mut table = ClassConsts::collect(&stmts, &source.path);
+    table.import(&stmts, constants, &owners);
+    struct Reads<'a> {
+        table: &'a ClassConsts,
+        validations: &'a [(usize, usize)],
+        file: crate::span::FileId,
+        inside: bool,
+        uses: &'a mut crate::det::HashMap<Span, Vec<Literal>>,
+    }
+    impl Reads<'_> {
+        fn record(&mut self, node: &Node<'_>) {
+            if self.inside && let Some(values) = self.table.derived_enum_list(node) {
+                self.uses.insert(Span { file: self.file, start: node.location().start_offset() as u32, end: node.location().end_offset() as u32 }, values);
+            }
+        }
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Reads<'_> {
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            let before = self.inside;
+            self.inside |= self.validations.iter().any(|(start, end)| node.location().start_offset() <= *start && node.location().end_offset() >= *end);
+            self.record(&node.as_node());
+            ruby_prism::visit_call_node(self, node);
+            self.inside = before;
+        }
+        fn visit_constant_read_node(&mut self, node: &ruby_prism::ConstantReadNode<'pr>) {
+            self.record(&node.as_node());
+        }
+        fn visit_constant_path_node(&mut self, node: &ruby_prism::ConstantPathNode<'pr>) {
+            self.record(&node.as_node());
+        }
+    }
+    let mut reads = Reads { table: &table, validations: &validations, file: model.span.file, inside: false, uses: &mut uses };
+    for stmt in &stmts { ruby_prism::Visit::visit(&mut reads, stmt); }
+    uses
+}
+
 fn validate_sorbet_enum_mappings(
     model: &Model,
     source: &crate::span::SourceFile,
@@ -1351,7 +1852,7 @@ fn validate_sorbet_enum_mappings(
 ) -> IngestResult<()> {
     // This source was already parsed by ingest. Do not duplicate parse or
     // unrelated model diagnostics, or rebuild the model to check one mapping.
-    let result = ruby_prism::parse(source.text.as_bytes());
+    let result = super::prism::parse_silent(source.text.as_bytes());
     let root = result.node();
     let Some((_, class)) = super::util::find_all_classes_with_scope(&root).into_iter()
         .find(|(_, class)| class.location().start_offset() == model.span.start as usize)
@@ -1368,6 +1869,10 @@ fn validate_sorbet_enum_mappings(
                     &source.path, &declaration.column,
                 )))?;
             }
+        } else if model.enums.contains_key(&Symbol::from(declaration.column.as_str()))
+            && constants.enum_method_read_refused(&declaration.mapping, &owners)
+        {
+            super::survey::unwrap_or_record::<()>(Err(enum_mapping_error(&source.path, &declaration.column)))?;
         }
     }
     Ok(())
@@ -1646,6 +2151,502 @@ enum EnumStored {
     Expr(Expr),
 }
 
+/// Methods a class body may call on a folded constant without changing
+/// it. Any other call (`<<`, `push`, `concat`, `replace`, `[]=`, a
+/// bang method, or one this list doesn't know) counts as a mutation.
+const READ_ONLY_CONST_METHODS: &[&str] = &[
+    "freeze", "frozen?", "include?", "member?", "key?", "has_key?", "value?", "cover?", "each", "each_with_index",
+    "each_with_object", "map", "collect", "flat_map", "select", "filter", "reject", "find", "detect", "find_index",
+    "index", "any?", "all?", "none?", "one?", "empty?", "size", "length", "count", "first", "last", "min", "max",
+    "sum", "sort", "sort_by", "to_a", "to_h", "to_s", "to_sym", "to_set", "inspect", "dup", "keys", "values",
+    "fetch", "dig", "[]", "join", "entries", "zip", "index_by", "index_with", "group_by", "partition", "tally",
+    "filter_map", "each_slice", "each_key", "each_value", "each_pair", "values_at", "slice", "except", "take",
+    "drop", "uniq", "compact", "reverse", "flatten", "invert", "transform_values", "transform_keys", "minmax",
+    "intersection", "union", "difference", "excluding", "including", "&", "|", "+", "-", "*", "**", "-@", "source", "options",
+    "match", "match?", "=~", "===", "==", "!=", "eql?", "hash", "is_a?", "nil?", "present?", "blank?",
+];
+
+/// The names a class body writes, or may mutate, anywhere other than
+/// one plain top-level `NAME = …` (see [`ClassConsts::collect`]).
+struct ConstTaint {
+    proven_reads: crate::det::HashSet<(usize, usize)>,
+    top_level: crate::det::HashSet<usize>,
+    top_writes: crate::det::HashMap<String, usize>,
+    tainted: crate::det::HashSet<String>,
+    /// `ALIAS = MODES` / `ALIAS = MODES.freeze` (any constant the
+    /// right-hand side reads): the two may be one object, so a mutation
+    /// through either taints both.
+    aliases: Vec<(String, String)>,
+    snapshot_aliases: Vec<(String, String)>,
+    /// The constants a [`REFLECTION_METHODS`] call's receiver chain is
+    /// rooted at (`Rule.const_set`): owners whose constants it may replace.
+    reflected: crate::det::HashSet<String>,
+    /// The constant a `const_set(:NAME, …)` / `remove_const(:NAME)` call
+    /// names, whatever its receiver.
+    named_writes: crate::det::HashSet<String>,
+    /// For a boot source: the qualified classes and modules the inputs
+    /// define. A call on one, or a variable holding one, is not a change
+    /// to a constant (`Gadget.count`); see [`ConstTaint::names_boot_namespace`].
+    boot_namespaces: Option<crate::det::HashSet<String>>,
+}
+
+/// Calls on an owner that can write or remove its constants, run code in
+/// its scope that does, or hand out a constant to mutate where this pass
+/// cannot follow it (`Kinds.const_get(:ALL) << "c"`). On `Object` (or
+/// receiverless outside any body) they can reach every owner.
+const REFLECTION_METHODS: &[&str] = &[
+    "const_set", "remove_const", "const_get", "send", "__send__", "public_send", "class_eval", "module_eval",
+    "class_exec", "module_exec", "instance_eval", "instance_exec",
+];
+
+/// Methods whose result is a new object, never the receiver or one of its
+/// elements: a mutation of the result cannot reach the constant, so a
+/// receiver chain through one of them is no longer rooted at it
+/// (`(LIMIT - used).times`, `MODES.map(&:upcase) << "x"`). A method not
+/// listed may return the receiver itself (`to_a`, `tap`) or an element
+/// (`first`, `fetch`), and keeps the chain.
+const FRESH_RESULT_METHODS: &[&str] = &[
+    "+", "-", "*", "/", "%", "**", "<=>", "==", "!=", "<", "<=", ">", ">=", "&", "|", "^", "<<<", "~", "-@", "+@",
+    "map", "collect", "flat_map", "select", "filter", "reject", "filter_map", "sort", "sort_by", "uniq", "compact",
+    "reverse", "flatten", "dup", "clone", "size", "length", "count", "sum", "keys", "values", "join", "to_s",
+    "to_sym", "to_i", "to_f", "inspect", "index_by", "index_with", "group_by", "partition", "tally", "zip",
+    "include?", "member?", "key?", "any?", "all?", "none?", "empty?", "nil?", "frozen?", "is_a?",
+];
+
+/// The constant a `const_set(:Name, …)` / `remove_const(:Name)` names with a
+/// literal, which is all it can write.
+fn named_constant_write(call: &ruby_prism::CallNode<'_>) -> Option<String> {
+    if !matches!(constant_id_str(&call.name()).as_ref(), "const_set" | "remove_const") {
+        return None;
+    }
+    let first = call.arguments()?.arguments().iter().next()?;
+    symbol_value(&first).or_else(|| string_value(&first))
+}
+
+/// The constant a receiver chain is rooted at: `MODES`, `MODES.to_a`,
+/// `Widget::MODES.first` (the last segment of a path), unless the chain
+/// passes through a [`FRESH_RESULT_METHODS`] call.
+fn chain_root(node: &Node<'_>) -> Option<String> {
+    if let Some(paren) = node.as_parentheses_node() {
+        return chain_root(&paren.body()?);
+    }
+    if let Some(stmts) = node.as_statements_node() {
+        let body: Vec<Node<'_>> = stmts.body().iter().collect();
+        let [only] = body.as_slice() else { return None };
+        return chain_root(only);
+    }
+    if let Some(call) = node.as_call_node() {
+        if FRESH_RESULT_METHODS.contains(&constant_id_str(&call.name()).as_ref()) {
+            return None;
+        }
+        return chain_root(&call.receiver()?);
+    }
+    if let Some(cr) = node.as_constant_read_node() {
+        return Some(constant_id_str(&cr.name()).to_string());
+    }
+    node.as_constant_path_node()?.name().map(|n| constant_id_str(&n).to_string())
+}
+
+/// [`chain_root`]'s constant as written: `Gadget`, `Vendor::Gadget`,
+/// `::Catalog::KINDS`.
+fn chain_root_path(node: &Node<'_>) -> Option<String> {
+    fn path(node: &Node<'_>) -> Option<String> {
+        if let Some(cr) = node.as_constant_read_node() {
+            return Some(constant_id_str(&cr.name()).to_string());
+        }
+        let cp = node.as_constant_path_node()?;
+        let name = constant_id_str(&cp.name()?).to_string();
+        match cp.parent() {
+            Some(parent) => Some(format!("{}::{name}", path(&parent)?)),
+            None => Some(format!("::{name}")),
+        }
+    }
+    if let Some(paren) = node.as_parentheses_node() {
+        return chain_root_path(&paren.body()?);
+    }
+    if let Some(stmts) = node.as_statements_node() {
+        let body: Vec<Node<'_>> = stmts.body().iter().collect();
+        let [only] = body.as_slice() else { return None };
+        return chain_root_path(only);
+    }
+    if let Some(call) = node.as_call_node() {
+        if FRESH_RESULT_METHODS.contains(&constant_id_str(&call.name()).as_ref()) {
+            return None;
+        }
+        return chain_root_path(&call.receiver()?);
+    }
+    path(node)
+}
+
+/// `send(:const_set, :NAME, …)` / `public_send(:remove_const, :NAME)`:
+/// the constant a literal dispatch to a named write names.
+fn dispatched_named_constant_write(call: &ruby_prism::CallNode<'_>) -> Option<String> {
+    if !matches!(constant_id_str(&call.name()).as_ref(), "send" | "__send__" | "public_send") {
+        return None;
+    }
+    let arguments: Vec<Node<'_>> = call.arguments()?.arguments().iter().collect();
+    let [method, name, ..] = arguments.as_slice() else { return None };
+    if !matches!(symbol_value(method).as_deref(), Some("const_set" | "remove_const")) {
+        return None;
+    }
+    symbol_value(name).or_else(|| string_value(name))
+}
+
+/// Every constant a node reads, at any depth.
+fn constant_reads(node: &Node<'_>) -> Vec<String> {
+    struct Reads(Vec<String>);
+    impl<'pr> ruby_prism::Visit<'pr> for Reads {
+        fn visit_constant_read_node(&mut self, node: &ruby_prism::ConstantReadNode<'pr>) {
+            self.0.push(constant_id_str(&node.name()).to_string());
+        }
+        fn visit_constant_path_node(&mut self, node: &ruby_prism::ConstantPathNode<'pr>) {
+            if let Some(name) = node.name() {
+                self.0.push(constant_id_str(&name).to_string());
+            }
+            ruby_prism::visit_constant_path_node(self, node);
+        }
+    }
+    let mut reads = Reads(Vec::new());
+    ruby_prism::Visit::visit(&mut reads, node);
+    reads.0
+}
+
+impl ConstTaint {
+    fn scan(stmts: &[Node<'_>]) -> crate::det::HashSet<String> {
+        Self::scan_with_proven_reads(stmts, Default::default())
+    }
+
+    fn scan_with_proven_reads(stmts: &[Node<'_>], proven_reads: crate::det::HashSet<(usize, usize)>) -> crate::det::HashSet<String> {
+        let mut scan = ConstTaint {
+            proven_reads,
+            top_level: stmts
+                .iter()
+                .filter(|s| s.as_constant_write_node().is_some())
+                .map(|s| s.location().start_offset())
+                .collect(),
+            top_writes: Default::default(),
+            tainted: Default::default(),
+            aliases: Vec::new(),
+            snapshot_aliases: Vec::new(),
+            reflected: Default::default(),
+            named_writes: Default::default(),
+            boot_namespaces: None,
+        };
+        for stmt in stmts {
+            ruby_prism::Visit::visit(&mut scan, stmt);
+        }
+        let ConstTaint { top_writes, mut tainted, aliases, .. } = scan;
+        tainted.extend(top_writes.into_iter().filter(|(_, n)| *n > 1).map(|(name, _)| name));
+        Self::alias_closure(&mut tainted, &aliases);
+        tainted
+    }
+
+    /// A whole file, for constants other bodies read: every write but the
+    /// plain top-level ones at `direct_writes` taints its name, as do the
+    /// mutations and escapes [`ConstTaint::scan`] finds. A name written
+    /// once in each of two owners is two constants, so no write count
+    /// here: an owner declared twice is refused by its table instead.
+    /// Returns the tainted names and the [`REFLECTION_METHODS`] receivers.
+    fn scan_tree(
+        root: &Node<'_>,
+        direct_writes: crate::det::HashSet<usize>,
+    ) -> (crate::det::HashSet<String>, crate::det::HashSet<String>, crate::det::HashSet<String>, Vec<(String, String)>) {
+        let mut scan = ConstTaint {
+            proven_reads: Default::default(),
+            top_level: direct_writes,
+            top_writes: Default::default(),
+            tainted: Default::default(),
+            aliases: Vec::new(),
+            snapshot_aliases: Vec::new(),
+            reflected: Default::default(),
+            named_writes: Default::default(),
+            boot_namespaces: None,
+        };
+        ruby_prism::Visit::visit(&mut scan, root);
+        let ConstTaint { mut tainted, aliases, snapshot_aliases, reflected, named_writes, .. } = scan;
+        let mut snapshot_taint = tainted.clone();
+        snapshot_taint.extend(named_writes);
+        Self::alias_closure(&mut tainted, &aliases);
+        (tainted, reflected, snapshot_taint, snapshot_aliases)
+    }
+
+    /// The names a source that runs at boot may leave with another value:
+    /// the constants it writes outside `direct_writes`, mutates or lets a
+    /// variable hold, and each constant a `const_set` / `remove_const`
+    /// names; with its alias edges (`ALIAS = KINDS`), left unclosed. A call on an owner (`Gadget.count`, `Vendor::Gadget.class_eval`)
+    /// is not a write to one of its constants: a mutation inside the
+    /// block is scanned on its own.
+    pub(super) fn scan_boot(
+        root: &Node<'_>,
+        direct_writes: crate::det::HashSet<usize>,
+        namespaces: crate::det::HashSet<String>,
+    ) -> (crate::det::HashSet<String>, Vec<(String, String)>) {
+        let mut scan = ConstTaint {
+            proven_reads: Default::default(),
+            top_level: direct_writes,
+            top_writes: Default::default(),
+            tainted: Default::default(),
+            aliases: Vec::new(),
+            snapshot_aliases: Vec::new(),
+            reflected: Default::default(),
+            named_writes: Default::default(),
+            boot_namespaces: Some(namespaces),
+        };
+        ruby_prism::Visit::visit(&mut scan, root);
+        let ConstTaint { mut tainted, aliases, named_writes, .. } = scan;
+        tainted.extend(named_writes);
+        // Unclosed: an alias one boot source writes and another mutates
+        // through is one object, so the caller closes over every boot
+        // source's edges together (`EnumConstants::finish`).
+        (tainted, aliases)
+    }
+
+    /// [`Self::alias_closure`] for a caller that collects taints and alias
+    /// edges from several sources before closing them.
+    pub(super) fn close_aliases(tainted: &mut crate::det::HashSet<String>, aliases: &[(String, String)]) {
+        Self::alias_closure(tainted, aliases);
+    }
+
+    /// Whether a boot source's receiver chain (`Gadget.count`,
+    /// `Vendor::Gadget.class_eval`) is rooted at a class or module rather
+    /// than at a constant it could change: a bare name an input namespace
+    /// has, a path an input defines as a namespace, or a path rooted
+    /// outside the inputs (a library class). `Catalog::KINDS` is rooted in
+    /// an input namespace and is not one, so it is a constant, whatever
+    /// else is named `KINDS`.
+    fn names_boot_namespace(&self, node: &Node<'_>) -> bool {
+        let Some(namespaces) = &self.boot_namespaces else { return false };
+        let Some(path) = chain_root_path(node) else { return false };
+        let path = path.trim_start_matches("::");
+        match path.split_once("::") {
+            None => namespaces.iter().any(|ns| ns.rsplit("::").next() == Some(path)),
+            Some((first, _)) => {
+                namespaces.contains(path) || !namespaces.iter().any(|ns| ns.split("::").next() == Some(first))
+            }
+        }
+    }
+
+    fn alias_closure(tainted: &mut crate::det::HashSet<String>, aliases: &[(String, String)]) {
+        // Across alias edges, both ways, until nothing changes.
+        loop {
+            let before = tainted.len();
+            for (a, b) in aliases {
+                if tainted.contains(a) || tainted.contains(b) {
+                    tainted.insert(a.clone());
+                    tainted.insert(b.clone());
+                }
+            }
+            if tainted.len() == before {
+                break;
+            }
+        }
+    }
+
+    /// `x = MODES` (or `@x`, `@@x`, `$x`, or `MODES.to_a`): the variable
+    /// may mutate the constant later, out of this pass's sight.
+    fn escape(&mut self, value: &Node<'_>) {
+        if self.names_boot_namespace(value) {
+            return;
+        }
+        if let Some(root) = chain_root(value) {
+            self.tainted.insert(root);
+        }
+    }
+
+    fn taint(&mut self, name: Option<ruby_prism::ConstantId<'_>>) {
+        if let Some(name) = name {
+            self.tainted.insert(constant_id_str(&name).to_string());
+        }
+    }
+}
+
+impl<'pr> ruby_prism::Visit<'pr> for ConstTaint {
+    fn visit_constant_write_node(&mut self, node: &ruby_prism::ConstantWriteNode<'pr>) {
+        let name = constant_id_str(&node.name()).to_string();
+        if self.top_level.contains(&node.location().start_offset()) {
+            for read in constant_reads(&node.value()) {
+                self.aliases.push((name.clone(), read));
+            }
+            // The keys array does not alias the enum's namespace, so namespace
+            // mutation must not taint a snapshot through that alias.
+            fn fresh_keys(node: &Node<'_>) -> bool {
+                if let Some(inner) = single_parenthesized(node) { return fresh_keys(&inner); }
+                let Some(call) = node.as_call_node() else { return false };
+                if call.arguments().is_some() || call.block().is_some() { return false; }
+                match constant_id_str(&call.name()).as_ref() {
+                    "keys" => true,
+                    "freeze" | "dup" => call.receiver().is_some_and(|receiver| fresh_keys(&receiver)),
+                    _ => false,
+                }
+            }
+            if !fresh_keys(&node.value()) {
+                self.snapshot_aliases.extend(constant_reads(&node.value()).into_iter().map(|read| (name.clone(), read)));
+            }
+            *self.top_writes.entry(name).or_default() += 1;
+        } else {
+            self.tainted.insert(name);
+        }
+        ruby_prism::visit_constant_write_node(self, node);
+    }
+    fn visit_constant_operator_write_node(&mut self, node: &ruby_prism::ConstantOperatorWriteNode<'pr>) {
+        self.taint(Some(node.name()));
+        ruby_prism::visit_constant_operator_write_node(self, node);
+    }
+    fn visit_constant_or_write_node(&mut self, node: &ruby_prism::ConstantOrWriteNode<'pr>) {
+        self.taint(Some(node.name()));
+        ruby_prism::visit_constant_or_write_node(self, node);
+    }
+    fn visit_constant_and_write_node(&mut self, node: &ruby_prism::ConstantAndWriteNode<'pr>) {
+        self.taint(Some(node.name()));
+        ruby_prism::visit_constant_and_write_node(self, node);
+    }
+    // `A, B = …` and `rescue => A` write through a target node.
+    fn visit_constant_target_node(&mut self, node: &ruby_prism::ConstantTargetNode<'pr>) {
+        self.taint(Some(node.name()));
+    }
+    // `self::NAME = …`, `Widget::NAME << …` and the like: tainted by
+    // their last segment, whatever the scope names.
+    fn visit_constant_path_write_node(&mut self, node: &ruby_prism::ConstantPathWriteNode<'pr>) {
+        self.taint(node.target().name());
+        ruby_prism::visit_constant_path_write_node(self, node);
+    }
+    fn visit_constant_path_operator_write_node(&mut self, node: &ruby_prism::ConstantPathOperatorWriteNode<'pr>) {
+        self.taint(node.target().name());
+        ruby_prism::visit_constant_path_operator_write_node(self, node);
+    }
+    fn visit_constant_path_or_write_node(&mut self, node: &ruby_prism::ConstantPathOrWriteNode<'pr>) {
+        self.taint(node.target().name());
+        ruby_prism::visit_constant_path_or_write_node(self, node);
+    }
+    fn visit_constant_path_and_write_node(&mut self, node: &ruby_prism::ConstantPathAndWriteNode<'pr>) {
+        self.taint(node.target().name());
+        ruby_prism::visit_constant_path_and_write_node(self, node);
+    }
+    fn visit_constant_path_target_node(&mut self, node: &ruby_prism::ConstantPathTargetNode<'pr>) {
+        self.taint(node.name());
+        ruby_prism::visit_constant_path_target_node(self, node);
+    }
+    // A call outside the read-only set taints the constant its receiver
+    // chain is rooted at: `MODES << "c"`, and `MODES.to_a << "c"` or
+    // `MODES.first << "x"`, whose receivers may be the constant itself
+    // or one of its elements.
+    fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        // Proven enum reads cannot mutate the source namespace; treating them
+        // as arbitrary calls would taint an independent keys snapshot.
+        if self.proven_reads.contains(&(node.location().start_offset(), node.location().end_offset())) {
+            return;
+        }
+        // `Catalog.const_set(:KINDS, …)`, or a receiverless one in the
+        // owner's body: either replaces that name.
+        if let Some(name) = named_constant_write(node).or_else(|| dispatched_named_constant_write(node)) {
+            self.named_writes.insert(name);
+        }
+        if let Some(recv) = node.receiver() {
+            let method = constant_id_str(&node.name());
+            if !READ_ONLY_CONST_METHODS.contains(&method.as_ref()) && !self.names_boot_namespace(&recv) {
+                if let Some(root) = chain_root(&recv) {
+                    self.tainted.insert(root);
+                }
+            }
+            if REFLECTION_METHODS.contains(&method.as_ref()) {
+                if let Some(root) = chain_root(&recv) {
+                    // `Object.const_set(:Name, …)` defines or replaces the
+                    // one top-level `Name`, not every owner.
+                    match named_constant_write(node) {
+                        Some(name) if root == "Object" => self.reflected.insert(name),
+                        _ => self.reflected.insert(root),
+                    };
+                }
+            }
+            // `"Kinds".constantize` is the owner itself. A computed name
+            // (`model_name.constantize`) is not followed.
+            if matches!(method.as_ref(), "constantize" | "safe_constantize")
+                && let Some(name) = string_value(&recv)
+            {
+                self.reflected.extend(name.trim_start_matches("::").split("::").map(str::to_string));
+            }
+        }
+        ruby_prism::visit_call_node(self, node);
+    }
+    fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
+        self.escape(&node.value());
+        ruby_prism::visit_local_variable_write_node(self, node);
+    }
+    fn visit_local_variable_or_write_node(&mut self, node: &ruby_prism::LocalVariableOrWriteNode<'pr>) {
+        self.escape(&node.value());
+        ruby_prism::visit_local_variable_or_write_node(self, node);
+    }
+    fn visit_instance_variable_write_node(&mut self, node: &ruby_prism::InstanceVariableWriteNode<'pr>) {
+        self.escape(&node.value());
+        ruby_prism::visit_instance_variable_write_node(self, node);
+    }
+    fn visit_instance_variable_or_write_node(&mut self, node: &ruby_prism::InstanceVariableOrWriteNode<'pr>) {
+        self.escape(&node.value());
+        ruby_prism::visit_instance_variable_or_write_node(self, node);
+    }
+    fn visit_class_variable_write_node(&mut self, node: &ruby_prism::ClassVariableWriteNode<'pr>) {
+        self.escape(&node.value());
+        ruby_prism::visit_class_variable_write_node(self, node);
+    }
+    fn visit_global_variable_write_node(&mut self, node: &ruby_prism::GlobalVariableWriteNode<'pr>) {
+        self.escape(&node.value());
+        ruby_prism::visit_global_variable_write_node(self, node);
+    }
+    // `a, b = MODES, OTHER`: each right-hand element escapes.
+    fn visit_multi_write_node(&mut self, node: &ruby_prism::MultiWriteNode<'pr>) {
+        let value = node.value();
+        match value.as_array_node() {
+            Some(array) => array.elements().iter().for_each(|el| self.escape(&el)),
+            None => self.escape(&value),
+        }
+        ruby_prism::visit_multi_write_node(self, node);
+    }
+}
+
+/// The one expression inside `( … )`: `inclusion: (Kinds::ALL)` reads
+/// what `inclusion: Kinds::ALL` does. `None` for anything else, including
+/// `(a; b)`.
+pub(super) fn single_parenthesized<'pr>(node: &Node<'pr>) -> Option<Node<'pr>> {
+    let body = node.as_parentheses_node()?.body()?;
+    let mut stmts = flatten_statements(body);
+    (stmts.len() == 1).then(|| stmts.pop().unwrap())
+}
+
+/// The key a constant read is folded under: its name, or for a path
+/// (`Rule::LIMIT`, `::Rule::LIMIT`) the path as written, which
+/// [`ClassConsts::import`] fills from the owner's table.
+fn const_key(node: &Node<'_>) -> Option<String> {
+    if let Some(cr) = node.as_constant_read_node() {
+        return Some(constant_id_str(&cr.name()).to_string());
+    }
+    node.as_constant_path_node()?;
+    enum_constants::EnumConstants::path(node)
+}
+
+/// `Regexp.escape` for the pattern `Regexp.union` builds: a backslash
+/// before each character a pattern reads as an operator, and the escape
+/// sequence for a control character. Ruby also escapes a space, `#` and
+/// `-`, which mean themselves outside a character class and without the
+/// `x` flag, so they are left as they are.
+fn regexp_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\\' | '.' | '^' | '$' | '|' | '?' | '*' | '+' | '(' | ')' | '[' | ']' | '{' | '}' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            '\u{c}' => out.push_str("\\f"),
+            '\u{b}' => out.push_str("\\v"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Constants a class body assigns that an `enum` declaration below them
 /// may name: the mapping itself (`enum :status, STATUSES`), a label
 /// (`NAME => NAME`, `"#{PENDING}": 1`) or a stored value
@@ -1653,43 +2654,588 @@ enum EnumStored {
 /// (`ROLE_B = ROLE_A`) resolves through the constant it names.
 #[derive(Default)]
 pub(super) struct ClassConsts {
+    /// Literal Ruby truth values used by callback scheduling, including aliases.
+    truth_values: crate::det::HashMap<String, bool>,
     /// `NAME = "x"`, `NAME = :x`, `NAME = 3`, `NAME = OTHER`.
-    scalars: std::collections::HashMap<String, Literal>,
+    scalars: crate::det::HashMap<String, Literal>,
     /// `NAME = %i[…]` / `{ … }`, as the mapping an enum would build.
-    mappings: std::collections::HashMap<String, Vec<(String, EnumStored)>>,
+    mappings: crate::det::HashMap<String, Vec<(String, EnumStored)>>,
     /// `NAME = %i[…]` / `%w[…]` — the bare labels, for the idioms that
     /// derive a mapping from them (`NAME.index_by(&:to_s)`).
-    labels: std::collections::HashMap<String, Vec<String>>,
+    labels: crate::det::HashMap<String, Vec<String>>,
+    /// `NAME = /pattern/flags`, `.freeze`d, aliased, or an interpolation
+    /// of one other folded regex constant — `(pattern, flags)`. Used to
+    /// resolve `validates …, format: { with: NAME }` (#985 follow-up).
+    regexes: crate::det::HashMap<String, (String, String)>,
+    /// `NAME = %w[…]` / `%i[…]` / `[…]` of literals, `.freeze`d or an
+    /// alias of another folded list: the literals with their kind kept
+    /// (a Symbol is not a String), for `inclusion: { in: NAME }`.
+    lists: crate::det::HashMap<String, Vec<Literal>>,
+    /// Every constant, module, or class name the body itself defines,
+    /// folded or not — anything an unqualified constant path's first
+    /// segment could resolve to before Ruby reaches the top level.
+    defined_names: crate::det::HashSet<String>,
+    /// The class sits directly at the top level (`class User`, not
+    /// `module Admin; class User` nor `class Admin::User`), so its
+    /// lexical scope is only its own body. Set by `ingest_model`;
+    /// `false` everywhere else, which is the conservative answer.
+    top_level: bool,
+    /// Names any app source defines below the top level
+    /// (`EnumConstants::nested_names`): what an ancestor of the class
+    /// (its superclass chain, an included module) could define.
+    app_nested_names: std::rc::Rc<crate::det::HashSet<String>>,
+    /// First segments of every name the app defines or reopens
+    /// (`EnumConstants::top_level_names`): a top-level namespace the app
+    /// touches, whose standard-library contents it may have replaced.
+    app_top_level_names: std::rc::Rc<crate::det::HashSet<String>>,
+    /// `NAME = 3`, `NAME = (2**31) - 1`, `NAME = 4 * (OTHER + 1)`: every
+    /// Integer the class body folds, at the width Ruby computes it (an
+    /// `i128`, so `2**63` is kept exactly; `scalars` holds the ones that
+    /// fit an `i64`).
+    integers: crate::det::HashMap<String, i128>,
+    /// The `regexes` built with `Regexp.union` (directly, or reading one
+    /// that was), which only hold while `Regexp` is Ruby's own.
+    from_union: crate::det::HashSet<String>,
+    /// The app defines a constant named `Regexp` somewhere, which a
+    /// body's `Regexp.union` may resolve to: no union folds. Set by
+    /// [`ClassConsts::import`].
+    regexp_shadowed: bool,
+    /// `NAME = { "a" => …, b: … }`, `.freeze`d or an alias of another:
+    /// the keys, each a literal kept with its kind, in order. The values
+    /// are never read. For `inclusion: { in: NAME.keys }` and
+    /// `inclusion: { in: NAME }` (`Hash#include?` is `key?`).
+    hash_keys: crate::det::HashMap<String, Vec<Literal>>,
+    /// An enum the class body declared so far, by the class method Rails
+    /// names after it (`enum :status` → `statuses`): its labels, which
+    /// `statuses.keys` answers. Only an enum whose every label is also the
+    /// String it stores (`{ password: "password" }`): a lowered check
+    /// reads the stored value, and only there do the two agree.
+    enum_labels: crate::det::HashMap<String, Vec<String>>,
+    enum_key_lists: crate::det::HashMap<(usize, usize), Vec<Literal>>,
+    enum_key_constants: crate::det::HashSet<String>,
 }
+
+/// The operators [`ClassConsts::int_expr`] folds.
+const INTEGER_OPERATORS: &[&str] = &["+", "-", "*", "**", "-@"];
 
 impl ClassConsts {
     pub(super) fn collect(stmts: &[Node<'_>], file: &str) -> Self {
         let mut out = ClassConsts::default();
+        // A constant folds only when its one write is a plain top-level
+        // `NAME = …` and nothing else in the body, at any depth (method
+        // bodies included), writes it or calls a method on it that may
+        // mutate it. Rails reads the constant as it stands when the macro
+        // naming it runs, and this pass folds the whole body before any
+        // macro is read, so a second write, a write under `if`, or an
+        // `NAME << x` leaves no value it could trust. Refusing beats a
+        // wrong one: the validation stays the reported gap.
+        let tainted = ConstTaint::scan(stmts);
         for stmt in stmts {
+            let defined = if let Some(m) = stmt.as_module_node() {
+                Some(m.constant_path())
+            } else {
+                stmt.as_class_node().map(|c| c.constant_path())
+            };
+            if let Some(path) = defined
+                && let Some(first) = constant_path_of(&path).and_then(|p| p.into_iter().next())
+            {
+                out.defined_names.insert(first);
+            }
             let Some(cw) = stmt.as_constant_write_node() else { continue };
+            out.defined_names.insert(constant_id_str(&cw.name()).to_string());
             let name = constant_id_str(&cw.name()).to_string();
-            let value = cw.value();
-            if let Some(lit) = out.scalar(&value) {
-                out.scalars.insert(name, lit);
+            if tainted.contains(&name) {
                 continue;
             }
-            if let Some(labels) = label_list(&value) {
-                out.labels.insert(name.clone(), labels);
+            let value = cw.value();
+            if let Some(truth) = out.truthiness(&value) {
+                out.truth_values.insert(name.clone(), truth);
             }
+            // The right-hand side reads the constants as they stand
+            // before this write (Ruby evaluates it first). A tainted one
+            // is in no map, so nothing derived from it folds either.
+            let regex = out.regex(&value);
+            let list = out.list(&value);
+            let keys = out.hash_keys_of(&value);
+            let scalar = out.scalar(&value);
+            let integer = out.int_expr(&value);
+            let labels = if scalar.is_none() { label_list(&value) } else { None };
             // A failure to ingest a value is not this pass's to report:
             // the constant is simply not usable as a mapping, and the
             // enum that names it says so.
-            if let Ok(Some(mapping)) = enum_label_values(&value, file, &out, &|_| None) {
+            let mapping = if scalar.is_none() {
+                enum_label_values(&value, file, &out, &|_| None).ok().flatten()
+            } else {
+                None
+            };
+            if let Some(n) = integer {
+                out.integers.insert(name.clone(), n);
+            }
+            if let Some(re) = regex {
+                if out.reads_union(&value) {
+                    out.from_union.insert(name.clone());
+                }
+                out.regexes.insert(name.clone(), re);
+            }
+            if let Some(list) = list {
+                out.lists.insert(name.clone(), list);
+            }
+            if let Some(keys) = keys {
+                out.hash_keys.insert(name.clone(), keys);
+            }
+            if let Some(lit) = scalar {
+                out.scalars.insert(name.clone(), lit);
+            }
+            if let Some(labels) = labels {
+                out.labels.insert(name.clone(), labels);
+            }
+            if let Some(mapping) = mapping {
                 out.mappings.insert(name, mapping);
             }
         }
         out
     }
 
+    /// A list of literals the class body can fold: an array literal
+    /// (`%w[…]`, `%i[…]`, `[…]`) whose every element is a String, Symbol,
+    /// Integer, Float, `true`/`false` or `nil` literal, or a Duration
+    /// literal (`1.week.seconds`, folded to its Integer seconds), `.freeze`d
+    /// or not, or another folded list constant.
+    pub(super) fn list(&self, node: &Node<'_>) -> Option<Vec<Literal>> {
+        if let Some(list) = self.enum_key_lists.get(&(node.location().start_offset(), node.location().end_offset())) {
+            return Some(list.clone());
+        }
+        if let Some(inner) = single_parenthesized(node) {
+            return self.list(&inner);
+        }
+        if let Some(call) = node.as_call_node() {
+            if constant_id_str(&call.name()) == "freeze" && call.arguments().is_none() {
+                return self.list(&call.receiver()?);
+            }
+            // `NAME.keys` of a folded Hash constant.
+            if constant_id_str(&call.name()) == "keys" && call.arguments().is_none() && call.block().is_none() {
+                return self.hash_keys_of(&call.receiver()?);
+            }
+            return None;
+        }
+        if let Some(key) = const_key(node) {
+            return self.lists.get(&key).cloned();
+        }
+        node.as_array_node()?
+            .elements()
+            .iter()
+            .map(|el| {
+                list_atom(&el).or_else(|| super::util::duration_seconds(&el).map(|value| Literal::Int { value }))
+            })
+            .collect()
+    }
+
+    /// The keys of a Hash the class body can fold: a Hash literal whose
+    /// every key is a literal [`list_atom`] (no `**splat`), `.freeze`d or
+    /// not, or another folded Hash constant. Each key keeps its kind, in
+    /// the order `Hash#keys` gives (a repeated key keeps its first
+    /// place).
+    /// Record an enum the class body declares, for `<plural>.keys` below.
+    pub(super) fn note_enum_labels(&mut self, column: &str, labels: Vec<String>) {
+        self.enum_labels.insert(crate::naming::pluralize_snake(column), labels);
+    }
+
+    pub(super) fn hash_keys_of(&self, node: &Node<'_>) -> Option<Vec<Literal>> {
+        if let Some(inner) = single_parenthesized(node) {
+            return self.hash_keys_of(&inner);
+        }
+        if let Some(call) = node.as_call_node() {
+            if constant_id_str(&call.name()) == "freeze" && call.arguments().is_none() && call.block().is_none() {
+                return self.hash_keys_of(&call.receiver()?);
+            }
+            // `statuses` (or `self.statuses`): an enum this body declared
+            // above, whose mapping's keys are its labels as Strings.
+            if call.arguments().is_none()
+                && call.block().is_none()
+                && call.receiver().is_none_or(|r| r.as_self_node().is_some())
+            {
+                let labels = self.enum_labels.get(constant_id_str(&call.name()))?;
+                return Some(labels.iter().map(|l| Literal::Str { value: l.clone() }).collect());
+            }
+            return None;
+        }
+        if let Some(key) = const_key(node) {
+            return self.hash_keys.get(&key).cloned();
+        }
+        let mut keys: Vec<Literal> = Vec::new();
+        for element in node.as_hash_node()?.elements().iter() {
+            let key = list_atom(&element.as_assoc_node()?.key())?;
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        Some(keys)
+    }
+
+    /// Record whether the class sits directly at the top level, the
+    /// names the app defines below the top level anywhere, and the
+    /// top-level namespaces the app defines or reopens.
+    pub(super) fn set_lexical_scope(
+        &mut self,
+        top_level: bool,
+        app_nested_names: std::rc::Rc<crate::det::HashSet<String>>,
+        app_top_level_names: std::rc::Rc<crate::det::HashSet<String>>,
+    ) {
+        self.top_level = top_level;
+        self.app_nested_names = app_nested_names;
+        self.app_top_level_names = app_top_level_names;
+    }
+
+    /// Whether the app itself defines or reopens the top-level constant
+    /// `first` (`URI = …`, `module URI`, `URI::MailTo::X = …`), so a
+    /// standard-library constant under it, rooted or not, may not hold
+    /// its standard value.
+    pub(super) fn app_defines_top_level(&self, first: &str) -> bool {
+        self.app_top_level_names.contains(first)
+    }
+
+    /// Whether an unrooted constant path starting with `first` (the
+    /// `URI` of `URI::MailTo::EMAIL_REGEXP`) can only mean the top-level
+    /// constant. Ruby searches the lexical scope, then the class's
+    /// ancestors, then `Object`. So: the class is not nested in a module
+    /// or class, its own body defines nothing by that name, and no app
+    /// class or module defines it either (which covers every app
+    /// superclass and included module, however deep).
+    pub(super) fn resolves_at_top_level(&self, first: &str) -> bool {
+        self.top_level && !self.defined_names.contains(first) && !self.app_nested_names.contains(first)
+    }
+
+    /// A regex literal the class body can fold: a bare `/pattern/flags`
+    /// literal (`.freeze`d or not), a reference to another folded regex
+    /// constant (`OTHER_RE = NAME_RE`), or an interpolation of exactly
+    /// one other folded regex constant whose flags agree with the
+    /// outer literal's. Ruby embeds a nested `Regexp` in an
+    /// interpolated one as `(?flags-off:…)`; that group is only
+    /// equivalent to a plain substitution when the inner and outer
+    /// flags are identical, so a mismatch (or any other interpolated
+    /// shape) resolves to `None` rather than a wrong pattern.
+    pub(super) fn regex(&self, node: &Node<'_>) -> Option<(String, String)> {
+        if let Some(inner) = single_parenthesized(node) {
+            return self.regex(&inner);
+        }
+        if let Some(call) = node.as_call_node() {
+            if constant_id_str(&call.name()) == "freeze" && call.arguments().is_none() {
+                return self.regex(&call.receiver()?);
+            }
+            return self.regexp_union(&call).map(|pattern| (pattern, String::new()));
+        }
+        if let Some(key) = const_key(node) {
+            return self.regexes.get(&key).cloned();
+        }
+        if node.as_regular_expression_node().is_some() {
+            return super::util::regexp_literal_flags(node);
+        }
+        self.interpolated_regex(node)
+    }
+
+    /// `Regexp.union("a", "b")`, `Regexp.union(LIST)` or `Regexp.union(%w[…])`
+    /// of Strings: the alternation of each String escaped, as Ruby builds
+    /// it. No String at all (`Regexp.union`, `Regexp.union([])`) is Ruby's
+    /// `/(?!)/`, which matches nothing; it is spelled `[^\s\S]` here, which
+    /// also matches nothing and which every target's engine compiles (go's
+    /// RE2 and Rust's regex crate reject a lookahead). A Regexp or Symbol argument, or one
+    /// this table cannot fold, leaves the call unresolved.
+    fn regexp_union(&self, call: &ruby_prism::CallNode<'_>) -> Option<String> {
+        if constant_id_str(&call.name()) != "union" || call.block().is_some() || self.regexp_shadowed {
+            return None;
+        }
+        let receiver = call.receiver()?;
+        if !matches!(enum_constants::EnumConstants::path(&receiver).as_deref(), Some("Regexp" | "::Regexp")) {
+            return None;
+        }
+        let args: Vec<Node<'_>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        let strings: Vec<String> = match args.as_slice() {
+            [only] if only.as_string_node().is_none() && only.as_interpolated_string_node().is_none() => self
+                .list(only)?
+                .into_iter()
+                .map(|lit| match lit {
+                    Literal::Str { value } => Some(value),
+                    _ => None,
+                })
+                .collect::<Option<_>>()?,
+            _ => args.iter().map(|arg| self.text(arg)).collect::<Option<_>>()?,
+        };
+        if strings.is_empty() {
+            return Some(r"[^\s\S]".to_string());
+        }
+        Some(strings.iter().map(|s| regexp_escape(s)).collect::<Vec<_>>().join("|"))
+    }
+
+    /// Whether a constant's value calls `Regexp.union` or reads a constant
+    /// whose regex did.
+    fn reads_union(&self, value: &Node<'_>) -> bool {
+        struct Union<'a>(&'a ClassConsts, bool);
+        impl<'pr> ruby_prism::Visit<'pr> for Union<'_> {
+            fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+                self.1 |= constant_id_str(&node.name()) == "union";
+                ruby_prism::visit_call_node(self, node);
+            }
+            fn visit_constant_read_node(&mut self, node: &ruby_prism::ConstantReadNode<'pr>) {
+                self.1 |= self.0.from_union.contains::<str>(constant_id_str(&node.name()).as_ref());
+            }
+        }
+        let mut union = Union(self, false);
+        ruby_prism::Visit::visit(&mut union, value);
+        union.1
+    }
+
+    /// Another body of the same owner (a reopened class or module): its
+    /// folded constants join this table's. A name both bodies write is
+    /// refused by [`enum_constants::EnumConstants::owner_constant`]'s
+    /// write count, whichever value this keeps.
+    pub(super) fn merge(&mut self, other: ClassConsts) {
+        self.truth_values.extend(other.truth_values);
+        self.scalars.extend(other.scalars);
+        self.mappings.extend(other.mappings);
+        self.labels.extend(other.labels);
+        self.regexes.extend(other.regexes);
+        self.lists.extend(other.lists);
+        self.hash_keys.extend(other.hash_keys);
+        self.integers.extend(other.integers);
+        self.from_union.extend(other.from_union);
+    }
+
+    /// Copy into this table the folded values of the constants the body
+    /// reads through another owner (`Rule::TEXT_SIZE_LIMIT`, or a bare
+    /// name Ruby finds in an enclosing module), keyed as the body spells
+    /// them, so every lookup above finds them like its own.
+    /// [`enum_constants::EnumConstants::owner_constant`] decides what
+    /// may fold. A name the body itself writes resolves to the body's own
+    /// owner, which this skips: its own table already answers.
+    pub(super) fn import(&mut self, stmts: &[Node<'_>], constants: &enum_constants::EnumConstants, owners: &[String]) {
+        struct Reads(Vec<String>);
+        impl<'pr> ruby_prism::Visit<'pr> for Reads {
+            fn visit_constant_read_node(&mut self, node: &ruby_prism::ConstantReadNode<'pr>) {
+                self.0.push(constant_id_str(&node.name()).to_string());
+            }
+            fn visit_constant_path_node(&mut self, node: &ruby_prism::ConstantPathNode<'pr>) {
+                // The whole path is the read; its parent is only a scope.
+                if let Some(path) = enum_constants::EnumConstants::path(&node.as_node()) {
+                    self.0.push(path);
+                }
+            }
+        }
+        if constants.defines_name("Regexp") {
+            self.regexp_shadowed = true;
+            for key in std::mem::take(&mut self.from_union) {
+                self.regexes.remove(&key);
+            }
+        }
+        let mut reads = Reads(Vec::new());
+        for stmt in stmts {
+            ruby_prism::Visit::visit(&mut reads, stmt);
+        }
+        let own = owners.first().map(String::as_str);
+        for key in reads.0 {
+            if self.scalars.contains_key(&key)
+                || self.lists.contains_key(&key)
+                || self.hash_keys.contains_key(&key)
+                || self.regexes.contains_key(&key)
+                || self.integers.contains_key(&key)
+            {
+                continue;
+            }
+            let Some((owner, member, table)) = constants.owner_constant(&key, owners) else { continue };
+            if Some(owner.as_str()) == own {
+                continue;
+            }
+            if let Some(value) = table.scalars.get(&member) {
+                self.scalars.insert(key.clone(), value.clone());
+            }
+            if let Some(value) = table.truth_values.get(&member) {
+                self.truth_values.insert(key.clone(), *value);
+            }
+            if let Some(value) = table.lists.get(&member) {
+                self.lists.insert(key.clone(), value.clone());
+            }
+            if let Some(value) = table.hash_keys.get(&member) {
+                self.hash_keys.insert(key.clone(), value.clone());
+            }
+            if let Some(value) = table.integers.get(&member) {
+                self.integers.insert(key.clone(), *value);
+            }
+            if let Some(value) = table.regexes.get(&member)
+                && !(self.regexp_shadowed && table.from_union.contains(&member))
+            {
+                self.regexes.insert(key.clone(), value.clone());
+            }
+        }
+        self.import_enum_key_lists(stmts, constants, owners);
+    }
+
+    fn import_enum_key_lists(&mut self, stmts: &[Node<'_>], constants: &enum_constants::EnumConstants, owners: &[String]) {
+        struct Lists<'a> {
+            constants: &'a enum_constants::EnumConstants,
+            owners: &'a [String],
+            lists: &'a mut crate::det::HashMap<(usize, usize), Vec<Literal>>,
+        }
+        impl<'pr> ruby_prism::Visit<'pr> for Lists<'_> {
+            fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+                if let Some(list) = self.constants.enum_key_list(&node.as_node(), self.owners) {
+                    self.lists.insert((node.location().start_offset(), node.location().end_offset()), list);
+                }
+                ruby_prism::visit_call_node(self, node);
+            }
+        }
+        let mut lists = Lists { constants, owners, lists: &mut self.enum_key_lists };
+        for stmt in stmts {
+            ruby_prism::Visit::visit(&mut lists, stmt);
+        }
+        let tainted = ConstTaint::scan_with_proven_reads(stmts, self.enum_key_lists.keys().copied().collect());
+        for stmt in stmts {
+            let Some(write) = stmt.as_constant_write_node() else { continue };
+            let name = constant_id_str(&write.name()).to_string();
+            if !tainted.contains(&name)
+                && let Some(list) = self.derived_enum_list(&write.value())
+                && constants.snapshot_constant_is_stable(&name, owners)
+            {
+                self.lists.insert(name.clone(), list);
+                self.enum_key_constants.insert(name);
+            }
+        }
+    }
+
+    fn derived_enum_list(&self, node: &Node<'_>) -> Option<Vec<Literal>> {
+        if let Some(inner) = single_parenthesized(node) {
+            return self.derived_enum_list(&inner);
+        }
+        if let Some(call) = node.as_call_node()
+            && matches!(constant_id_str(&call.name()).as_ref(), "freeze" | "dup")
+            && call.arguments().is_none() && call.block().is_none()
+        {
+            return self.derived_enum_list(&call.receiver()?);
+        }
+        if let Some(key) = const_key(node)
+            && self.enum_key_constants.contains(&key)
+        {
+            return self.lists.get(&key).cloned();
+        }
+        self.enum_key_lists.get(&(node.location().start_offset(), node.location().end_offset())).cloned()
+    }
+
+    /// `/pattern#{CONST}pattern/flags` — folds when the embedded part
+    /// is itself a single expression this table can resolve to a regex
+    /// whose flags match the outer literal's, wrapping its source in a
+    /// non-capturing group (`(?:…)`), which is then exactly equivalent
+    /// on every target this build emits to. Any other embedded shape
+    /// (a different flag set, a non-regex constant, a method call)
+    /// leaves the whole constant unresolved.
+    fn interpolated_regex(&self, node: &Node<'_>) -> Option<(String, String)> {
+        let ir = node.as_interpolated_regular_expression_node()?;
+        // Not refused for `/o`: every part below folds to a constant, which evaluating once or each time reads the same
+        if ir.is_euc_jp()
+            || ir.is_windows_31j()
+            || ir.is_utf_8()
+            || ir.is_ascii_8bit()
+        {
+            return None;
+        }
+        let mut flags = String::new();
+        if ir.is_ignore_case() {
+            flags.push('i');
+        }
+        if ir.is_multi_line() {
+            flags.push('m');
+        }
+        if ir.is_extended() {
+            flags.push('x');
+        }
+        let mut pattern = String::new();
+        for part in ir.parts().iter() {
+            if let Some(sn) = part.as_string_node() {
+                pattern.push_str(&String::from_utf8_lossy(sn.unescaped()));
+                continue;
+            }
+            let es = part.as_embedded_statements_node()?;
+            let stmts = es.statements()?;
+            let body: Vec<Node<'_>> = stmts.body().iter().collect();
+            let [only] = body.as_slice() else { return None };
+            // A folded String (or Integer) constant is spliced in as raw
+            // pattern source, as Ruby does (`/\A#{FRAGMENT}\z/.source ==
+            // "\\A" + FRAGMENT + "\\z"`), under the outer literal's flags.
+            if let Some(text) = self.text(only) {
+                pattern.push_str(&text);
+                continue;
+            }
+            let (inner_pattern, inner_flags) = self.regex(only)?;
+            if inner_flags != flags {
+                return None;
+            }
+            pattern.push_str("(?:");
+            pattern.push_str(&inner_pattern);
+            pattern.push(')');
+        }
+        Some((pattern, flags))
+    }
+
+    /// The text an interpolated String or Integer piece contributes: a
+    /// folded String scalar as it is, an Integer as its digits (Ruby's
+    /// `to_s`). A Symbol constant folds as a String scalar too, and
+    /// interpolates as its name, as in Ruby.
+    fn text(&self, node: &Node<'_>) -> Option<String> {
+        if node.as_regular_expression_node().is_some() || node.as_interpolated_regular_expression_node().is_some() {
+            return None;
+        }
+        match self.scalar(node)? {
+            Literal::Str { value } => Some(value),
+            Literal::Int { value } => Some(value.to_string()),
+            _ => None,
+        }
+    }
+
+    /// Only nil and false are falsey in Ruby; unknown expressions stay unknown.
+    pub(super) fn truthiness(&self, node: &Node<'_>) -> Option<bool> {
+        if let Some(inner) = single_parenthesized(node) {
+            return self.truthiness(&inner);
+        }
+        if let Some(key) = const_key(node) {
+            return self.truth_values.get(&key).copied();
+        }
+        if let Some(value) = list_atom(node) {
+            return Some(!matches!(value, Literal::Nil | Literal::Bool { value: false }));
+        }
+        if node.as_integer_node().is_some() {
+            return Some(true);
+        }
+        if let Some(hash) = node.as_hash_node() {
+            return hash.elements().iter().all(|el| el.as_assoc_node().is_some_and(|a|
+                list_atom(&a.key()).is_some() && self.truthiness(&a.value()).is_some())).then_some(true);
+        }
+        if (node.as_array_node().is_some() && self.list(node).is_some()) || node.as_regular_expression_node().is_some() {
+            return Some(true);
+        }
+        None
+    }
+
     /// A scalar the class body can fold: a string, a symbol (stored as
     /// its string, which is what a string column holds), an integer,
-    /// or a constant already folded. `.freeze` is transparent.
+    /// a constant already folded, or a double-quoted interpolation whose
+    /// every piece is literal text or one of those (`"x[#{SEPARATORS}]"`).
+    /// `.freeze` is transparent.
     fn scalar(&self, node: &Node<'_>) -> Option<Literal> {
+        if let Some(interp) = node.as_interpolated_string_node() {
+            let mut value = String::new();
+            for part in interp.parts().iter() {
+                if let Some(sn) = part.as_string_node() {
+                    value.push_str(&String::from_utf8_lossy(sn.unescaped()));
+                    continue;
+                }
+                let es = part.as_embedded_statements_node()?;
+                let stmts = es.statements()?;
+                let body: Vec<Node<'_>> = stmts.body().iter().collect();
+                let [only] = body.as_slice() else { return None };
+                value.push_str(&self.text(only)?);
+            }
+            return Some(Literal::Str { value });
+        }
+        if node.as_parentheses_node().is_some() || node.as_call_node().is_some_and(|c| INTEGER_OPERATORS.contains(&constant_id_str(&c.name()).as_ref())) {
+            return i64::try_from(self.int_expr(node)?).ok().map(|value| Literal::Int { value });
+        }
         if let Some(call) = node.as_call_node() {
             if constant_id_str(&call.name()) == "freeze" && call.arguments().is_none() {
                 return self.scalar(&call.receiver()?);
@@ -1702,10 +3248,57 @@ impl ClassConsts {
         if let Some(i) = node.as_integer_node() {
             return Some(Literal::Int { value: super::util::integer_i64(&i.value())? });
         }
-        if let Some(cr) = node.as_constant_read_node() {
-            return self.scalars.get(constant_id_str(&cr.name())).cloned();
+        if let Some(key) = const_key(node) {
+            return self.scalars.get(&key).cloned();
         }
         None
+    }
+
+
+    /// Integer arithmetic the class body can fold, as Ruby computes it:
+    /// an Integer literal, a folded Integer constant, a parenthesized
+    /// expression, unary minus, or `+`, `-`, `*`, `**` of two of those.
+    /// Overflow past `i128` (or a negative or huge exponent) does not
+    /// fold, nor does any other operator or call (`/` truncates in
+    /// Ruby, and a method's result is not this pass's to compute).
+    pub(super) fn int_expr(&self, node: &Node<'_>) -> Option<i128> {
+        if let Some(paren) = node.as_parentheses_node() {
+            let body = paren.body()?;
+            let stmts = body.as_statements_node()?;
+            let parts: Vec<Node<'_>> = stmts.body().iter().collect();
+            let [only] = parts.as_slice() else { return None };
+            return self.int_expr(only);
+        }
+        if node.as_integer_node().is_some() {
+            return super::util::integer_value(node).map(i128::from);
+        }
+        if let Some(key) = const_key(node) {
+            return self.integers.get(&key).copied();
+        }
+        let call = node.as_call_node()?;
+        if call.block().is_some() {
+            return None;
+        }
+        let lhs = self.int_expr(&call.receiver()?)?;
+        let args: Vec<Node<'_>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        match (constant_id_str(&call.name()).as_ref(), args.as_slice()) {
+            ("-@", []) => lhs.checked_neg(),
+            ("+", [rhs]) => lhs.checked_add(self.int_expr(rhs)?),
+            ("-", [rhs]) => lhs.checked_sub(self.int_expr(rhs)?),
+            ("*", [rhs]) => lhs.checked_mul(self.int_expr(rhs)?),
+            ("**", [rhs]) => lhs.checked_pow(u32::try_from(self.int_expr(rhs)?).ok().filter(|e| *e <= 127)?),
+            _ => None,
+        }
+    }
+
+    /// An integer the class body can fold: a literal, `.freeze`d or not,
+    /// or one of the class's own integer constants (`maximum:
+    /// NAME_LIMIT`), whose value Rails reads when the class body runs.
+    pub(super) fn integer(&self, node: &Node<'_>) -> Option<i64> {
+        match self.scalar(node)? {
+            Literal::Int { value } => Some(value),
+            _ => None,
+        }
     }
 
     /// A label spelled as a symbol, a string, a folded constant, or an
@@ -1742,6 +3335,29 @@ impl ClassConsts {
 }
 
 /// The bare labels of a `%i[…]` / `%w[…]` array (optionally `.freeze`d).
+/// One literal element of a folded list, kind kept.
+fn list_atom(node: &Node<'_>) -> Option<Literal> {
+    if let Some(text) = string_value(node) {
+        return Some(Literal::Str { value: text });
+    }
+    if let Some(text) = symbol_value(node) {
+        return Some(Literal::Sym { value: Symbol::from(text.as_str()) });
+    }
+    if let Some(i) = node.as_integer_node() {
+        return Some(Literal::Int { value: super::util::integer_i64(&i.value())? });
+    }
+    if let Some(f) = node.as_float_node() {
+        return Some(Literal::Float { value: f.value() });
+    }
+    if node.as_true_node().is_some() {
+        return Some(Literal::Bool { value: true });
+    }
+    if node.as_false_node().is_some() {
+        return Some(Literal::Bool { value: false });
+    }
+    node.as_nil_node().is_some().then_some(Literal::Nil)
+}
+
 fn label_list(node: &Node<'_>) -> Option<Vec<String>> {
     if let Some(call) = node.as_call_node() {
         if constant_id_str(&call.name()) == "freeze" && call.arguments().is_none() {
@@ -1771,7 +3387,7 @@ fn enum_label_values(
     consts: &ClassConsts,
     resolve_constant: &impl Fn(&Node<'_>) -> Option<Vec<(String, Literal)>>,
 ) -> IngestResult<Option<Vec<(String, EnumStored)>>> {
-    if node.as_constant_path_node().is_some() {
+    if node.as_constant_path_node().is_some() || node.as_parentheses_node().is_some() {
         return Ok(resolve_constant(node).map(|pairs| pairs.into_iter().map(|(label, value)| (label, EnumStored::Lit(value))).collect()));
     }
 
@@ -1841,7 +3457,8 @@ fn enum_label_values(
             };
             Ok(labels.map(identity))
         }
-        _ => Ok(None),
+        // Another owner's mapping: `Gadget.statuses`, `.keys`, `.merge`.
+        _ => Ok(resolve_constant(node).map(|pairs| pairs.into_iter().map(|(label, value)| (label, EnumStored::Lit(value))).collect())),
     }
 }
 
@@ -1974,6 +3591,8 @@ fn enum_label_pairs<'a>(
             },
             None => match consts.scalar(&value) {
                 Some(lit) => EnumStored::Lit(lit),
+                // `unknown: nil` names a NULL column: a literal too.
+                None if value.as_nil_node().is_some() => EnumStored::Lit(Literal::Nil),
                 None => EnumStored::Expr(ingest_expr(&value, file)?),
             },
         };
@@ -2084,13 +3703,15 @@ fn ingest_singleton_class_body(
     sc: &ruby_prism::SingletonClassNode<'_>,
     owner: &ClassId,
     file: &str,
-    visibility: &Visibility,
+    visibility: Option<&Visibility>,
 ) -> IngestResult<super::singleton_class::SingletonBody> {
     super::singleton_class::ingest_singleton_body(sc, owner, file, &|def| {
         let mut method = ingest_method(def, file)?;
-        visibility.apply(&def.as_node(), &mut method);
+        if let Some(visibility) = visibility {
+            visibility.apply(&def.as_node(), &mut method);
+        }
         Ok(method)
-    })
+    }, true)
 }
 
 pub(super) fn ingest_method(
@@ -2229,13 +3850,16 @@ pub(super) fn ingest_method(
     // body that passes it on (`each(&blk)`) still binds the name.
     // Ruby 3.4's anonymous `&` gets the same synthesized name the
     // library-class path gives it, so bare-`&` forwarding binds.
-    let block_param = def.parameters().and_then(|pn| pn.block()).map(|block| {
-        let name = block
-            .name()
-            .and_then(|loc| std::str::from_utf8(loc.as_slice()).ok())
-            .unwrap_or("__blk");
-        crate::dialect::Param::positional(Symbol::from(name))
-    });
+    let block_param = def
+        .parameters()
+        .and_then(|pn| super::prism_api::block_parameter(&pn))
+        .map(|block| {
+            let name = block
+                .name()
+                .and_then(|loc| std::str::from_utf8(loc.as_slice()).ok())
+                .unwrap_or("__blk");
+            crate::dialect::Param::positional(Symbol::from(name))
+        });
 
     // Only full `...` or nameless `**` enters this canonical seam.
     // Named rest/keyword-rest above and the separate block slot stay
@@ -2243,7 +3867,7 @@ pub(super) fn ingest_method(
     params.extend(formals.anonymous.map(super::forwarding::AnonymousFormal::into_param));
 
     let body = match def.body() {
-        Some(b) => ingest_expr(&b, file)?,
+        Some(b) => super::expr::with_block_param(super::expr::def_block_param(block_param.as_ref().map(|p| p.name.clone()), Some(&b)), || ingest_expr(&b, file))?,
         None => Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] }),
     };
 
@@ -2305,6 +3929,9 @@ fn parse_callback(
         "after_destroy_commit" => CallbackHook::AfterCommit,
         "after_save_commit" => CallbackHook::AfterSaveCommit,
         "after_rollback" => CallbackHook::AfterRollback,
+        // Only the block form was recognized; the symbol form fell
+        // through to a "not lowered" Unknown and the method never ran.
+        "after_initialize" => CallbackHook::AfterInitialize,
         _ => return None,
     };
     // The lifecycle the sugar spelling pins, which `push_symbol_callback`
@@ -2329,6 +3956,15 @@ fn parse_callback(
                 let assoc = el.as_assoc_node()?;
                 let key = symbol_value(&assoc.key())?;
                 match key.as_str() {
+                    // Every lifecycle listed (rails-settings-cached's `on: %i[create update destroy]`) is no `on:`
+                    // at all; a subset of them is not modeled, so it rejects.
+                    // Not a validation hook's: there `on:` is the validation context, which a plain `valid?` lacks.
+                    "on" if matches!(hook, CallbackHook::AfterCommit) && assoc.value().as_array_node().is_some_and(|list| {
+                        let mut named: Vec<String> = list.elements().iter().filter_map(|e| symbol_value(&e)).collect();
+                        named.sort();
+                        named.dedup();
+                        list.elements().iter().count() >= 3 && named == ["create", "destroy", "update"]
+                    }) => {}
                     "on" => {
                         on = Some(match symbol_value(&assoc.value())?.as_str() {
                             "create" => CallbackOn::Create,
@@ -2405,7 +4041,16 @@ fn parse_callback(
 /// record. Anything else (a lambda with parameters, an array of
 /// conditions) is unmodeled and declines.
 fn callback_condition(value: &ruby_prism::Node<'_>, file: &str) -> Option<Expr> {
+    // `if: (:a?)`: the parentheses only group.
+    if let Some(inner) = single_parenthesized(value) {
+        return callback_condition(&inner, file);
+    }
     if let Some(lambda) = value.as_lambda_node() {
+        // Rails calls a one-parameter condition with the record, which the spliced guard reads as `self`
+        if let Some(record) = record_parameter(lambda.parameters()) {
+            let body = simple_condition_body_with(None, lambda.body(), Some(&record))?;
+            return record_as_self(ingest_expr(&body, file).ok()?, &record);
+        }
         let body = simple_condition_body(lambda.parameters(), lambda.body())?;
         return ingest_expr(&body, file).ok();
     }
@@ -2419,7 +4064,11 @@ fn callback_condition(value: &ruby_prism::Node<'_>, file: &str) -> Option<Expr> 
             }
         }
     }
-    let sym = symbol_value(value)?;
+    // `if: :a? || :b?` / `if: :a? && :b?`: Ruby evaluates the operator
+    // before the macro runs, and a Symbol is truthy, so the option is
+    // `:a?` and `:b?` respectively. Rails stores that one Symbol and
+    // calls only that predicate.
+    let sym = symbol_operator_value(value)?;
     Some(Expr::new(
         Span::synthetic(),
         ExprNode::Send {
@@ -2432,6 +4081,26 @@ fn callback_condition(value: &ruby_prism::Node<'_>, file: &str) -> Option<Expr> 
     ))
 }
 
+/// The name of the Symbol a Symbol literal, or an `||` / `&&` chain of
+/// them, evaluates to in Ruby: a Symbol is truthy, so `a || b` is `a`
+/// and `a && b` is `b` once `a` is known to be a Symbol
+/// (`:a? || :b? || :c?` is `:a?`, `:a? && :b? && :c?` is `:c?`). `None`
+/// when an operand Ruby would evaluate is not itself such a Symbol.
+fn symbol_operator_value(node: &ruby_prism::Node<'_>) -> Option<String> {
+    if let Some(name) = symbol_value(node) {
+        return Some(name);
+    }
+    if let Some(inner) = single_parenthesized(node) {
+        return symbol_operator_value(&inner);
+    }
+    if let Some(or) = node.as_or_node() {
+        return symbol_operator_value(&or.left());
+    }
+    let and = node.as_and_node()?;
+    symbol_operator_value(&and.left())?;
+    symbol_operator_value(&and.right())
+}
+
 /// The one expression a lambda/proc callback condition may splice into the
 /// hook as its guard. The guard runs inline in the callback, with `self`
 /// as the record and no frame of its own, so only a body that is the same
@@ -2442,16 +4111,71 @@ fn callback_condition(value: &ruby_prism::Node<'_>, file: &str) -> Option<Expr> 
 ///   `it` are parameters too);
 /// * exactly one statement, with no `return`/`next`/`break`/`redo`/
 ///   `retry` — inside the hook a `return` exits the whole callback chain;
-/// * no local writes — they would leak into the hook's scope. That
-///   includes a local bound through a target: a multi-write
-///   `(a, b = …)`, a `=> t` match-write, a `rescue => e`; and any
-///   multi-write declines, its targets being locals or not.
+/// * no local reads or writes of a name bound outside the expression.
+///   A read of a local captured from the class body
+///   (`flag = true; if: -> { flag }`) becomes a bare name inside
+///   `def validate` / the hook and raises `NameError`. A name bound by
+///   a nested block or lambda (`tags.any? { |tag| tag.blank? }`,
+///   `{ _1 }`, `{ it }`) stays: that binding is still in the spliced
+///   expression. A block local (`{ |; tmp| tmp }`) is not — the
+///   lowered block drops that declaration, so the read would be a
+///   bare name. A write would leak into the
+///   hook's scope. That includes a local bound through a target: a
+///   multi-write `(a, b = …)`, a `=> t` match-write, a `rescue => e`;
+///   and any multi-write declines, its targets being locals or not.
 ///
 /// Anything else declines (`None`), and the callback falls back to the
 /// unsupported-DSL warning, as it did before conditions were modelled.
 fn simple_condition_body<'pr>(
     params: Option<ruby_prism::Node<'pr>>,
     body: Option<ruby_prism::Node<'pr>>,
+) -> Option<ruby_prism::Node<'pr>> {
+    simple_condition_body_with(params, body, None)
+}
+
+/// `->(record) { … }`: the lambda's one required parameter, when it has
+/// no other.
+fn record_parameter(params: Option<ruby_prism::Node<'_>>) -> Option<String> {
+    let bp = params?.as_block_parameters_node()?;
+    if bp.locals().iter().next().is_some() {
+        return None;
+    }
+    let pn = bp.parameters()?;
+    let requireds: Vec<_> = pn.requireds().iter().collect();
+    let [only] = requireds.as_slice() else { return None };
+    if pn.optionals().iter().next().is_some()
+        || pn.rest().is_some()
+        || pn.posts().iter().next().is_some()
+        || pn.keywords().iter().next().is_some()
+        || pn.keyword_rest().is_some()
+        || pn.block().is_some()
+    {
+        return None;
+    }
+    Some(constant_id_str(&only.as_required_parameter_node()?.name()).to_string())
+}
+
+/// The guard with each read of the record parameter as `self`; `None`
+/// when a nested block or lambda binds that name again.
+fn record_as_self(mut expr: Expr, record: &str) -> Option<Expr> {
+    fn swap(e: &mut Expr, record: &str) {
+        if matches!(&*e.node, ExprNode::Var { name, .. } if name.as_str() == record) {
+            *e.node = ExprNode::SelfRef;
+            return;
+        }
+        e.node.for_each_child_mut(&mut |c| swap(c, record));
+    }
+    if crate::lower::rebinds_local(&expr, record) {
+        return None;
+    }
+    swap(&mut expr, record);
+    Some(expr)
+}
+
+fn simple_condition_body_with<'pr>(
+    params: Option<ruby_prism::Node<'pr>>,
+    body: Option<ruby_prism::Node<'pr>>,
+    record: Option<&str>,
 ) -> Option<ruby_prism::Node<'pr>> {
     if let Some(p) = params {
         let bp = p.as_block_parameters_node()?;
@@ -2466,38 +4190,124 @@ fn simple_condition_body<'pr>(
         return None;
     }
 
-    struct Escapes(bool);
+    struct Escapes {
+        bad: bool,
+        /// Names bound by nested blocks and lambdas still in scope.
+        bound: Vec<String>,
+    }
+    impl<'pr> Escapes {
+        fn push_binding(&mut self, name: &str) {
+            self.bound.push(name.to_string());
+        }
+
+        fn bind_parameters(&mut self, params: Option<ruby_prism::Node<'pr>>) {
+            let Some(params) = params else { return };
+            if params.as_it_parameters_node().is_some() {
+                self.push_binding("it");
+                return;
+            }
+            if let Some(numbered) = params.as_numbered_parameters_node() {
+                for n in 1..=numbered.maximum() {
+                    self.push_binding(&format!("_{n}"));
+                }
+                return;
+            }
+            let Some(block_params) = params.as_block_parameters_node() else { return };
+            // `|; tmp|` declares a local the lowered block does not
+            // keep. A read of that name would emit as a bare `tmp`.
+            let Some(pn) = block_params.parameters() else { return };
+            let bind_list = |this: &mut Self, list: ruby_prism::NodeList<'pr>| {
+                for node in list.iter() {
+                    this.bind_parameter(&node);
+                }
+            };
+            bind_list(self, pn.requireds());
+            bind_list(self, pn.optionals());
+            bind_list(self, pn.posts());
+            bind_list(self, pn.keywords());
+            if let Some(rest) = pn.rest() {
+                self.bind_parameter(&rest);
+            }
+            if let Some(rest) = pn.keyword_rest() {
+                self.bind_parameter(&rest);
+            }
+            if let Some(block) = super::prism_api::block_parameter(&pn) {
+                if let Some(name) = block.name() {
+                    self.push_binding(&constant_id_str(&name));
+                }
+            }
+        }
+
+        fn bind_parameter(&mut self, node: &ruby_prism::Node<'pr>) {
+            let name = if let Some(param) = node.as_required_parameter_node() {
+                Some(constant_id_str(&param.name()))
+            } else if let Some(param) = node.as_optional_parameter_node() {
+                Some(constant_id_str(&param.name()))
+            } else if let Some(param) = node.as_rest_parameter_node() {
+                param.name().as_ref().map(constant_id_str)
+            } else if let Some(param) = node.as_required_keyword_parameter_node() {
+                Some(constant_id_str(&param.name()))
+            } else if let Some(param) = node.as_optional_keyword_parameter_node() {
+                Some(constant_id_str(&param.name()))
+            } else if let Some(param) = node.as_keyword_rest_parameter_node() {
+                param.name().as_ref().map(constant_id_str)
+            } else {
+                None
+            };
+            if let Some(name) = name {
+                self.push_binding(&name);
+            }
+        }
+    }
     impl<'pr> ruby_prism::Visit<'pr> for Escapes {
-        fn visit_return_node(&mut self, _: &ruby_prism::ReturnNode<'pr>) { self.0 = true; }
-        fn visit_next_node(&mut self, _: &ruby_prism::NextNode<'pr>) { self.0 = true; }
-        fn visit_break_node(&mut self, _: &ruby_prism::BreakNode<'pr>) { self.0 = true; }
-        fn visit_redo_node(&mut self, _: &ruby_prism::RedoNode<'pr>) { self.0 = true; }
-        fn visit_retry_node(&mut self, _: &ruby_prism::RetryNode<'pr>) { self.0 = true; }
+        fn visit_block_node(&mut self, node: &ruby_prism::BlockNode<'pr>) {
+            let mark = self.bound.len();
+            self.bind_parameters(node.parameters());
+            ruby_prism::visit_block_node(self, node);
+            self.bound.truncate(mark);
+        }
+        fn visit_lambda_node(&mut self, node: &ruby_prism::LambdaNode<'pr>) {
+            let mark = self.bound.len();
+            self.bind_parameters(node.parameters());
+            ruby_prism::visit_lambda_node(self, node);
+            self.bound.truncate(mark);
+        }
+        fn visit_local_variable_read_node(&mut self, node: &ruby_prism::LocalVariableReadNode<'pr>) {
+            let name = constant_id_str(&node.name());
+            if !self.bound.iter().any(|bound| bound == name) {
+                self.bad = true;
+            }
+        }
+        fn visit_return_node(&mut self, _: &ruby_prism::ReturnNode<'pr>) { self.bad = true; }
+        fn visit_next_node(&mut self, _: &ruby_prism::NextNode<'pr>) { self.bad = true; }
+        fn visit_break_node(&mut self, _: &ruby_prism::BreakNode<'pr>) { self.bad = true; }
+        fn visit_redo_node(&mut self, _: &ruby_prism::RedoNode<'pr>) { self.bad = true; }
+        fn visit_retry_node(&mut self, _: &ruby_prism::RetryNode<'pr>) { self.bad = true; }
         fn visit_local_variable_write_node(&mut self, _: &ruby_prism::LocalVariableWriteNode<'pr>) {
-            self.0 = true;
+            self.bad = true;
         }
         fn visit_local_variable_operator_write_node(
             &mut self,
             _: &ruby_prism::LocalVariableOperatorWriteNode<'pr>,
         ) {
-            self.0 = true;
+            self.bad = true;
         }
         fn visit_local_variable_or_write_node(&mut self, _: &ruby_prism::LocalVariableOrWriteNode<'pr>) {
-            self.0 = true;
+            self.bad = true;
         }
         fn visit_local_variable_and_write_node(&mut self, _: &ruby_prism::LocalVariableAndWriteNode<'pr>) {
-            self.0 = true;
+            self.bad = true;
         }
         fn visit_local_variable_target_node(&mut self, _: &ruby_prism::LocalVariableTargetNode<'pr>) {
-            self.0 = true;
+            self.bad = true;
         }
         fn visit_multi_write_node(&mut self, _: &ruby_prism::MultiWriteNode<'pr>) {
-            self.0 = true;
+            self.bad = true;
         }
     }
-    let mut v = Escapes(false);
+    let mut v = Escapes { bad: false, bound: record.map(|r| vec![r.to_string()]).unwrap_or_default() };
     ruby_prism::Visit::visit(&mut v, &only);
-    if v.0 { None } else { Some(only) }
+    if v.bad { None } else { Some(only) }
 }
 
 fn negate_condition(cond: Expr) -> Expr {
@@ -2523,6 +4333,25 @@ fn and_condition(left: Expr, right: Expr) -> Expr {
             right,
         },
     )
+}
+
+/// One element's `scope` from a loop `define_method_loop` unrolled, the
+/// key in place: `scope "small", -> { where(size: "small") }`. Its lambda
+/// takes plain required parameters only (`define_method_loop::scope_ok`).
+fn unrolled_scope(expr: &Expr) -> Option<crate::dialect::Scope> {
+    let ExprNode::Send { args, block: None, .. } = &*expr.node else { return None };
+    let [name, lambda] = args.as_slice() else { return None };
+    let name = match &*name.node {
+        ExprNode::Lit { value: Literal::Str { value } } => Symbol::from(value.as_str()),
+        ExprNode::Lit { value: Literal::Sym { value } } => value.clone(),
+        _ => return None,
+    };
+    let ExprNode::Lambda { params, rest_param: None, extra_params, block_param: None, body, .. } = &*lambda.node else { return None };
+    if !extra_params.is_empty() {
+        return None;
+    }
+    let params = params.iter().map(|p| crate::dialect::Param::positional(p.clone())).collect();
+    Some(crate::dialect::Scope { name, params, body: body.clone() })
 }
 
 fn parse_scope(
@@ -2590,6 +4419,20 @@ fn parse_scope(
                     default,
                 ));
             }
+        }
+        // A required parameter after the optional ones (`->(col = "price",
+        // op = ">=", amount)`, Prism's `posts`) binds the LAST argument.
+        // The class method this scope becomes has no slot for it (the
+        // relation parameter follows the optionals), and dropping it left
+        // the body reading an unbound name while the caller's last
+        // argument landed in an optional. Refuse rather than mis-bind.
+        if pn.posts().iter().next().is_some() {
+            return Err(IngestError::Unsupported {
+                file: file.into(),
+                message: format!(
+                    "scope :{name}: a required parameter after optional ones is not supported"
+                ),
+            });
         }
         for kw in pn.keywords().iter() {
             if let Some(okw) = kw.as_optional_keyword_parameter_node() {
@@ -2705,111 +4548,13 @@ fn spelled_lambda_parts<'a>(
     Some((block.parameters(), block.body()))
 }
 
-fn parse_validates(call: &ruby_prism::CallNode<'_>) -> Vec<crate::dialect::Validation> {
-    use crate::dialect::{Validation, ValidationRule};
-    let Some(args) = call.arguments() else { return vec![] };
-    let all_args = args.arguments();
-
-    let mut attrs: Vec<Symbol> = Vec::new();
-    let mut rules: Vec<ValidationRule> = Vec::new();
-    let mut allow_blank = false;
-
-    for arg in all_args.iter() {
-        if let Some(sym) = symbol_value(&arg) {
-            attrs.push(Symbol::from(sym.as_str()));
-        } else if let Some(kh) = arg.as_keyword_hash_node() {
-            for el in kh.elements().iter() {
-                let Some(assoc) = el.as_assoc_node() else { continue };
-                let Some(key) = symbol_value(&assoc.key()) else { continue };
-                let value = assoc.value();
-                if key.as_str() == "allow_blank" {
-                    allow_blank = super::util::bool_value(&value).unwrap_or(false);
-                } else if let Some(rule) = validation_rule_from_kv(&key, &value) {
-                    rules.push(rule);
-                }
-            }
-        }
-    }
-
-    // `presence: true, allow_blank: true` is a dead check: presence
-    // fails only when the value is blank, and allow_blank skips every
-    // validator on blank values — so it can never fire (Rails runs
-    // validations BEFORE before_save, so e.g. lobsters' `validates
-    // :session_token, allow_blank: true, presence: true` relies on
-    // this: the token is generated in a before_save). Dropping it here
-    // fixes both lowering paths at once. The remaining parsed rule
-    // kinds are blank-safe as emitted (MaxLength trivially passes on
-    // blank; Absence wants blank); when MinLength/Format/Uniqueness
-    // gain allow_blank fixtures they'll need a skip-when-blank guard
-    // on the check instead of a drop.
-    if allow_blank {
-        rules.retain(|r| !matches!(r, ValidationRule::Presence));
-    }
-
-    let mut out = Vec::new();
-    for attr in attrs {
-        out.push(Validation { attribute: attr, rules: rules.clone() });
-    }
-    out
-}
-
-fn validation_rule_from_kv(
-    key: &str,
-    value: &ruby_prism::Node<'_>,
-) -> Option<crate::dialect::ValidationRule> {
-    use super::util::bool_value;
-    use crate::dialect::ValidationRule;
-    match key {
-        "presence" => bool_value(value).filter(|b| *b).map(|_| ValidationRule::Presence),
-        "absence" => bool_value(value).filter(|b| *b).map(|_| ValidationRule::Absence),
-        "length" => parse_length_rule(value),
-        _ => None,
-    }
-}
-
-/// `length: { minimum: N, maximum: M }`. Either bound may be absent;
-/// the hash-value shape is the only one we accept today. The shorthand
-/// `length: 5` (exact length) isn't in any fixture yet and drops.
-fn parse_length_rule(value: &ruby_prism::Node<'_>) -> Option<crate::dialect::ValidationRule> {
-    use super::util::integer_value;
-    use crate::dialect::ValidationRule;
-    let hash = value.as_hash_node().or_else(|| {
-        // Rails idiomatically uses `{ ... }`, but a bare keyword-args
-        // shape (`length: { … }` parses as HashNode inside the kwargs,
-        // not KeywordHashNode). Keep KeywordHashNode as a fallback for
-        // defensive parsing.
-        None
-    });
-    let elements = if let Some(h) = hash {
-        h.elements()
-    } else if let Some(kh) = value.as_keyword_hash_node() {
-        kh.elements()
-    } else {
-        return None;
-    };
-
-    let mut min: Option<u32> = None;
-    let mut max: Option<u32> = None;
-    for el in elements.iter() {
-        let Some(assoc) = el.as_assoc_node() else { continue };
-        let Some(key) = symbol_value(&assoc.key()) else { continue };
-        let Some(n) = integer_value(&assoc.value()) else { continue };
-        if n < 0 {
-            continue;
-        }
-        match key.as_str() {
-            "minimum" => min = Some(n as u32),
-            "maximum" => max = Some(n as u32),
-            // `is:` (exact), `in:` (range), `within:` land when a
-            // fixture demands them.
-            _ => {}
-        }
-    }
-
-    if min.is_none() && max.is_none() {
-        None
-    } else {
-        Some(ValidationRule::Length { min, max, message: None })
+/// `where(…).order(…)`: sends down to one with no receiver, the shape an
+/// association reader grafts onto its query.
+fn is_implicit_call_chain(e: &crate::expr::Expr) -> bool {
+    match &*e.node {
+        crate::expr::ExprNode::Send { recv: None, .. } => true,
+        crate::expr::ExprNode::Send { recv: Some(inner), .. } => is_implicit_call_chain(inner),
+        _ => false,
     }
 }
 
@@ -2844,23 +4589,57 @@ fn parse_association(
     let mut belongs_to_default: Option<crate::expr::Expr> = None;
     let mut touch: Option<crate::dialect::Touch> = None;
     let mut autosave: Option<bool> = None;
+    let mut validate: Option<bool> = None;
+    let mut inverse_of: Option<String> = None;
 
     for arg in iter {
         // Positional lambda between name and kwargs — the association
         // scope (`has_many :x, -> { where(...) }, through: :y`).
         // Recorded as its raw body Expr; the reader synthesis grafts it
-        // onto the relation seed. Param-taking lambdas (rare
-        // owner-dependent scopes) are skipped — they need the owner
-        // threaded and no exercised corpus does this yet.
+        // onto the relation seed. A lambda that takes the owner, through a
+        // parameter of any kind (`->(owner)`, `->(owner = nil)`, `-> { it }`),
+        // is skipped, and reported: the owner isn't threaded, so its
+        // body would read an unbound name.
+        //
+        // The readers graft the body onto their query as a chain of calls
+        // on the implicit receiver (`where(…).order(…)`). Any other body
+        // (`-> { where(active: true) if flag }`, two statements) is dropped
+        // there, so it is reported here.
         if let Some(lambda) = arg.as_lambda_node() {
+            // Every macro passes through here (`scope :x, ->(k) { … }`
+            // too); only an association's lambda is its scope.
+            let association =
+                matches!(method, "belongs_to" | "has_one" | "has_many" | "has_and_belongs_to_many");
             if scope.is_none() {
-                let param_free = lambda
-                    .parameters()
-                    .and_then(|p| p.as_block_parameters_node().and_then(|b| b.parameters()))
-                    .map(|pn| pn.requireds().iter().next().is_none())
-                    .unwrap_or(true);
+                let param_free = match lambda.parameters() {
+                    None => true,
+                    Some(p) => p.as_block_parameters_node().is_some_and(|b| b.parameters().is_none()),
+                };
+                let unapplied = |shape: String, reason: &str| {
+                    let mut diagnostic = crate::diagnostic::Diagnostic::unsupported(
+                        super::util::node_span(&arg, file),
+                        None,
+                        shape,
+                        reason,
+                    );
+                    diagnostic.severity = crate::diagnostic::Severity::Warning;
+                    super::prism::push(diagnostic);
+                };
                 if param_free {
                     scope = lambda.body().and_then(|b| ingest_expr(&b, file).ok());
+                    if association && scope.as_ref().is_some_and(|body| !is_implicit_call_chain(body)) {
+                        // The body stays, so the analyzer still checks it
+                        // (an unsupported construct in it is an error).
+                        unapplied(
+                            format!("{method} :{name_str}, -> {{ ... }}"),
+                            "an association scope that isn't a chain of query calls is not applied, so its reads skip the scope's conditions",
+                        );
+                    }
+                } else if association {
+                    unapplied(
+                        format!("{method} :{name_str}, ->(owner) {{ ... }}"),
+                        "an association scope that takes the owner is not applied, so its reads skip the scope's conditions",
+                    );
                 }
             }
             continue;
@@ -2871,8 +4650,21 @@ fn parse_association(
             let Some(key) = symbol_value(&assoc.key()) else { continue };
             let value = assoc.value();
             match key.as_str() {
-                // `"::Portal"` names the top-level class `Portal`; kept as written it is a class no one defines.
-                "class_name" => class_name = string_value(&value).map(|s| s.trim_start_matches("::").to_string()),
+                // `"::Portal"` keeps its root until `resolve_namespaced_targets`, which looks nowhere else for it.
+                "class_name" => {
+                    class_name = string_value(&value);
+                    // `class_name: Doorkeeper.config.access_token_class.to_s`: what the initializers leave it naming, once known.
+                    if class_name.is_none()
+                        && let Ok(expr) = ingest_expr(&value, file)
+                    {
+                        let span = Span {
+                            file: super::sources::file_id(file),
+                            start: call.location().start_offset() as u32,
+                            end: call.location().end_offset() as u32,
+                        };
+                        super::configured_superclass::defer_class_name(span, expr);
+                    }
+                }
                 "foreign_key" => {
                     foreign_key = string_value(&value).or_else(|| symbol_value(&value))
                 }
@@ -2880,12 +4672,21 @@ fn parse_association(
                     primary_key = string_value(&value).or_else(|| symbol_value(&value))
                 }
                 "through" => through = symbol_value(&value),
+                // A name only: `inverse_of: false` (or `nil`) derives nothing.
+                "inverse_of" => inverse_of = symbol_value(&value).or_else(|| string_value(&value)),
                 "source" => source = symbol_value(&value),
                 "source_type" => source_type = string_value(&value).map(|s| s.trim_start_matches("::").to_string()),
                 "dependent" => {
                     dependent = symbol_value(&value).and_then(|s| dependent_from_sym(&s))
                 }
-                "optional" => optional = bool_value(&value),
+                // Rails reads `optional:` for its truth: a lambda or a
+                // Symbol is optional, whatever it would return. Only a
+                // `false` or `nil` literal, parenthesized or not, keeps
+                // the association required.
+                "optional" => {
+                    let value = single_parenthesized(&value).unwrap_or(value);
+                    optional = Some(bool_value(&value).unwrap_or_else(|| value.as_nil_node().is_none()))
+                }
                 // `touch: true` / `touch: :last_message_at`. A `false`
                 // is Rails' explicit opt-out and reads as no touch,
                 // which is what `None` already means.
@@ -2901,6 +4702,9 @@ fn parse_association(
                 "polymorphic" => polymorphic = bool_value(&value),
                 "as" => as_interface = symbol_value(&value),
                 "autosave" => autosave = bool_value(&value),
+                // A has_one's `validate: true` (`HasOne::validate`); any
+                // other association's `validate:` stays reported below.
+                "validate" if method == "has_one" && bool_value(&value).is_some() => validate = bool_value(&value),
                 // `default: -> { Current.user }` — the lambda BODY, not
                 // the lambda. Rails calls it with `instance_exec`, so
                 // the body is already written against the record; a
@@ -2917,6 +4721,24 @@ fn parse_association(
                         })
                         .and_then(|l| l.body())
                         .and_then(|b| ingest_expr(&b, file).ok());
+                }
+                // Options that change what Rails does and that nothing here
+                // models: reported rather than dropped silently.
+                "index_errors" | "counter_cache" | "validate" | "required" | "before_add" | "after_add"
+                | "before_remove" | "after_remove" | "ensuring_owner_was" => {
+                    let span = Span {
+                        file: super::sources::file_id(file),
+                        start: el.location().start_offset() as u32,
+                        end: el.location().end_offset() as u32,
+                    };
+                    let mut diagnostic = crate::diagnostic::Diagnostic::unsupported(
+                        span,
+                        None,
+                        format!("{method} :{name_str}, {key}:"),
+                        "this association option is not modelled and is ignored",
+                    );
+                    diagnostic.severity = crate::diagnostic::Severity::Warning;
+                    super::prism::push(diagnostic);
                 }
                 _ => {}
             }
@@ -2947,6 +4769,13 @@ fn parse_association(
         })
         .unwrap_or_default();
 
+    // Rails takes the class of a `through:` association from its source
+    // association when no `class_name:` or `source_type:` names it.
+    // Ingest reads one model at a time, so app assembly does the
+    // lookup (`resolve_through_targets`).
+    let class_explicit = class_name.is_some() || source_type.is_some();
+    let source_name = source.as_deref().map(Symbol::from);
+
     match method {
         "has_many" => Some(Association::HasMany {
             name: name.clone(),
@@ -2976,6 +4805,12 @@ fn parse_association(
             // would otherwise be the polymorphic association name
             // ("Reference") — a phantom class. Already CamelCase, so no
             // transform.
+            //
+            // The camelized name is only a first guess for a `through:`
+            // association: `resolve_through_targets` replaces it with
+            // the class of the source association once every model is
+            // ingested (`source: :remarks` on `has_many :remarks,
+            // class_name: "Comment"` → Comment, not Remark).
             target: class_name
                 .map(|s| ClassId(Symbol::from(s.as_str())))
                 .or_else(|| source_type.map(|s| ClassId(Symbol::from(s.as_str()))))
@@ -2991,15 +4826,22 @@ fn parse_association(
                 }),
             foreign_key_explicit,
             through: through.map(|s| Symbol::from(s.as_str())),
+            source: source_name,
+            class_explicit,
             dependent: dependent.unwrap_or_default(),
             as_interface: as_interface.as_deref().map(Symbol::from),
             scope,
             primary_key: primary_key.as_deref().map(Symbol::from),
+            inverse_of: inverse_of.as_deref().map(Symbol::from),
         }),
         "has_one" => Some(Association::HasOne {
             name: name.clone(),
+            // As for has_many: a `through:` one's class comes from its
+            // source association (`resolve_through_targets`).
             target: class_name
                 .map(|s| ClassId(Symbol::from(s.as_str())))
+                .or_else(|| source_type.map(|s| ClassId(Symbol::from(s.as_str()))))
+                .or_else(|| source.map(|s| ClassId(Symbol::from(camelize(s.as_str())))))
                 .unwrap_or_else(|| ClassId(Symbol::from(camelize(name_str.as_str())))),
             foreign_key: foreign_key
                 .map(|s| Symbol::from(s.as_str()))
@@ -3010,10 +4852,14 @@ fn parse_association(
             foreign_key_explicit,
             dependent: dependent.unwrap_or_default(),
             through: through.map(|s| Symbol::from(s.as_str())),
+            source: source_name,
+            class_explicit,
             as_interface: as_interface.as_deref().map(Symbol::from),
             scope,
             autosave: autosave.unwrap_or(false),
+            validate: validate.unwrap_or(false),
             primary_key: primary_key.as_deref().map(Symbol::from),
+            inverse_of: inverse_of.as_deref().map(Symbol::from),
         }),
         "belongs_to" => Some(Association::BelongsTo {
             name: name.clone(),
@@ -3023,6 +4869,7 @@ fn parse_association(
             foreign_key: foreign_key
                 .map(|s| Symbol::from(s.as_str()))
                 .unwrap_or_else(|| Symbol::from(format!("{name_str}_id"))),
+            foreign_key_explicit,
             optional: optional.unwrap_or(false),
             polymorphic: polymorphic.unwrap_or(false),
             // Filled by `resolve_polymorphic_targets` once every
@@ -3032,6 +4879,7 @@ fn parse_association(
             touch,
             foreign_type: None,
             primary_key: primary_key.as_deref().map(Symbol::from),
+            scope,
         }),
         "has_and_belongs_to_many" => Some(Association::HasAndBelongsToMany {
             name: name.clone(),
@@ -3067,6 +4915,53 @@ fn parse_primary_key_decl(stmt: &Node<'_>) -> Option<Symbol> {
 /// or subsequent write must not leave a plausible but incorrect row bound.
 /// Method and nested namespace bodies are separate scopes; their headers
 /// still execute in the enclosing scope and must not hide table writes.
+/// `name`'s table as Rails' `compute_table_name` gives a class nested in a concrete model, its parent's effective
+/// table singular in front (`Rule::Condition::Note` is `rule_condition_notes`), or `None` for the bare default.
+fn nested_table(name: &str, prefix: &str, schema: &Schema, bases: &super::library_class::ModelBases) -> Option<String> {
+    let (parent, _) = name.rsplit_once("::")?;
+    let parent_table = match bases.concrete_model_table(parent)? {
+        Some(declared) => declared.to_string(),
+        None => nested_table(parent, prefix, schema, bases).unwrap_or_else(|| format!("{prefix}{}", crate::naming::rails_table_name(parent))),
+    };
+    let parent_table = parent_table.strip_prefix(prefix).unwrap_or(&parent_table);
+    let table = format!("{prefix}{}_{}", crate::naming::singularize(parent_table), crate::naming::rails_table_name(name));
+    schema.tables.contains_key(&Symbol::from(table.as_str())).then_some(table)
+}
+
+/// `table_name_prefix + "settings"` (rails-settings-cached's `RailsSettings::Base`): the class's own prefix, which the
+/// caller knows, in front of the literal, marked to be filled in.
+const TABLE_PREFIX_MARK: char = '\u{1}';
+
+fn prefixed_table(arg: &Node<'_>) -> Option<String> {
+    let call = arg.as_call_node()?;
+    if constant_id_str(&call.name()) != "+" {
+        return None;
+    }
+    let reader = call.receiver()?.as_call_node()?;
+    if constant_id_str(&reader.name()) != "table_name_prefix" || reader.arguments().is_some()
+        || reader.receiver().is_some_and(|r| r.as_self_node().is_none())
+    {
+        return None;
+    }
+    let args = call.arguments()?;
+    let rest: Vec<_> = args.arguments().iter().collect();
+    let [rest] = rest.as_slice() else { return None };
+    Some(format!("{TABLE_PREFIX_MARK}{}", string_value(rest)?))
+}
+
+/// The table a class body declares (`self.table_name = "entries"`), read leniently for the model prepass.
+pub(super) fn table_name_decl(class: &ruby_prism::ClassNode<'_>, file: &str) -> Option<String> {
+    let name = parse_table_name_decl(class.body()?, file).ok().flatten().map(|(name, _)| name)?;
+    if name.starts_with(TABLE_PREFIX_MARK) && class.body().is_some_and(|b| table_prefix::table_prefix_definitions(b) > 1) {
+        return None;
+    }
+    // Not the marked name: the prepass reads it as a table, so the prefix the class body sets (else none) goes in front.
+    Some(match name.strip_prefix(TABLE_PREFIX_MARK) {
+        Some(rest) => format!("{}{rest}", class.body().and_then(table_prefix::explicit_table_prefix).unwrap_or_default()),
+        None => name,
+    })
+}
+
 fn parse_table_name_decl(body: Node<'_>, file: &str) -> IngestResult<Option<(String, usize)>> {
     struct Collector {
         direct: Vec<(usize, usize)>,
@@ -3083,8 +4978,10 @@ fn parse_table_name_decl(body: Node<'_>, file: &str) -> IngestResult<Option<(Str
                 let name = valid.then_some(())
                     .and_then(|_| call.arguments())
                     .filter(|args| args.arguments().len() == 1)
-                    .and_then(|args| symbol_or_string_value(&args.arguments().iter().next()?))
-                    .filter(|name| bare_table_identifier(name));
+                    .and_then(|args| {
+                        let arg = args.arguments().iter().next()?;
+                        symbol_or_string_value(&arg).filter(|name| bare_table_identifier(name)).or_else(|| prefixed_table(&arg))
+                    });
                 self.writes.push(name.map(|name| (name, offset)));
             } else {
                 let name = node.as_call_and_write_node().map(|w| w.write_name())
@@ -3220,7 +5117,7 @@ pub(crate) fn row_from_table(table: &Table) -> Row {
     for col in &table.columns {
         fields.insert(col.name.clone(), ty_of_column_slot(col));
     }
-    Row { fields, rest: None }
+    Row { fields: fields.into(), rest: None }
 }
 
 /// The attributes-row type for a column: `ty_of_column` widened with
@@ -3229,11 +5126,19 @@ pub(crate) fn row_from_table(table: &Table) -> Row {
 /// — validations and analysis both need to see that. The primary key
 /// is excluded (the INSERT assigns it and every hydration path treats
 /// it as present). Twin of `lower::model_to_library::ty_of_column_slot`;
-/// keep them in sync, same as the `ty_of_column` pair below.
-fn ty_of_column_slot(col: &crate::schema::Column) -> Ty {
-    let base = ty_of_column(&col.col_type);
+/// keep them in sync, same as the `ty_of_column` pair below. A
+/// PostgreSQL array column (`array: true`) is typed `Array[<element>]`
+/// only where the target stores the Array (`Column::array_stored`, set by
+/// `lower::array_columns`). Elsewhere it stays its element: the analysis
+/// feeds the lowered targets' method dispatch, and their storage holds one
+/// element (`project::report_array_columns`).
+pub(crate) fn ty_of_column_slot(col: &crate::schema::Column) -> Ty {
+    let mut base = ty_of_column(&col.col_type);
+    if col.array_stored {
+        base = Ty::Array { elem: base.into() };
+    }
     if col.nullable && !col.primary_key {
-        Ty::Union { variants: vec![base, Ty::Nil] }
+        Ty::Union { variants: vec![base, Ty::Nil].into() }
     } else {
         base
     }
@@ -3261,11 +5166,17 @@ fn ty_of_column(t: &ColumnType) -> Ty {
         // Array, Hash, scalar, or nil, so neither String nor one fixed
         // container type is honest. The emitted model keeps serialized
         // text in its DB slot and decodes/encodes at the public accessor
-        // boundary (`JsonColumn`); analysis uses the deliberate gradual
+        // boundary (`RoundhouseJsonColumn`); analysis uses the deliberate gradual
         // type. A `has_json` declaration adds its stronger per-key schema
         // separately in `lower::has_json`.
         ColumnType::Json | ColumnType::Jsonb => Ty::Untyped,
         ColumnType::Uuid => Ty::Str,
+        // Rails casts a PostgreSQL interval to ActiveSupport::Duration.
+        // Storage stays text (`lower::model_to_library::ty_of_column`).
+        ColumnType::Interval => Ty::Class {
+            id: crate::ident::ClassId(crate::ident::Symbol::from("ActiveSupport::Duration")),
+            args: vec![].into(),
+        },
         ColumnType::Reference { .. } => Ty::Int,
     }
 }

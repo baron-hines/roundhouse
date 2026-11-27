@@ -5,7 +5,7 @@ use crate::dialect::{LibraryClass, MethodDef, Model, ModelBodyItem};
 use crate::expr::Expr;
 use crate::ident::ClassId;
 use crate::ingest::delegate::{expand_delegates, is_delegate_declaration};
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 #[derive(Clone, Default)]
 struct MethodSurface {
@@ -28,6 +28,7 @@ pub(crate) fn lower_model_delegates(app: &mut crate::App) {
         return;
     }
 
+    let body_names = crate::lower::model_to_library::schema::share_model_body_names(&app.models, &Default::default());
     let mut params_specs =
         crate::lower::controller_to_library::params::collect_specs(&app.controllers);
     params_specs.mark_file_fields(&app.models);
@@ -78,7 +79,7 @@ pub(crate) fn lower_model_delegates(app: &mut crate::App) {
                 .collect::<Vec<_>>()
         })
         .collect();
-    let mut method_cache = HashMap::new();
+    let mut method_cache = HashMap::default();
     let available_methods: HashMap<_, _> = association_targets
         .iter()
         .filter_map(|target| {
@@ -98,6 +99,7 @@ pub(crate) fn lower_model_delegates(app: &mut crate::App) {
         })
         .collect();
 
+    drop(body_names);
     for model in &mut app.models {
         let mut unknown_calls: Vec<_> = model
             .body
@@ -119,6 +121,8 @@ pub(crate) fn lower_model_delegates(app: &mut crate::App) {
         let blocked = blocked_names
             .get(&model.name)
             .expect("delegate model surface");
+        let mut method_targets = own_reader_targets(model);
+        method_targets.extend(included_concern_reader_targets(model, &concern_methods));
         let generated = expand_delegates(
             &model.name,
             &methods,
@@ -126,7 +130,10 @@ pub(crate) fn lower_model_delegates(app: &mut crate::App) {
             &additional_methods,
             blocked,
             Some(&supported_target_methods),
+            &method_targets,
             &app.sources,
+            &[],
+            false,
         );
         let mut unexpanded_spans: Vec<_> = unknown_calls
             .iter()
@@ -154,13 +161,71 @@ pub(crate) fn lower_model_delegates(app: &mut crate::App) {
     }
 }
 
+/// The model's own argument-less instance methods that are not
+/// associations: forem's `def authorizer` behind `delegate …, to:
+/// :authorizer`. The forwarder calls it as Rails' does, and analysis
+/// types what it answers, so a delegated name its class lacks is an
+/// error at the forwarder rather than at every caller.
+fn own_reader_targets(model: &Model) -> HashSet<String> {
+    let associations: HashSet<_> = model.associations().map(|a| a.name().as_str().to_string()).collect();
+    model
+        .methods()
+        .filter(|m| {
+            m.receiver == crate::dialect::MethodReceiver::Instance
+                && exact_positional_arity(m) == Some(0)
+                && !uses_implicit_block(&m.body)
+        })
+        .map(|m| m.name.as_str().to_string())
+        .filter(|name| !associations.contains(name))
+        .collect()
+}
+
+/// The zero-argument instance methods the model's concerns give it
+/// (`job_class` from `SolidQueue::Job::ConcurrencyControls`): Ruby calls
+/// them on the model as its own, so a `delegate … to:` one forwards there.
+fn included_concern_reader_targets(
+    model: &Model,
+    concern_methods: &HashMap<ClassId, (&[MethodDef], &[ClassId])>,
+) -> HashSet<String> {
+    let associations: HashSet<_> = model.associations().map(|a| a.name().as_str().to_string()).collect();
+    // Not one the model defines itself: Ruby dispatch selects the model's, whatever its arity (`own_reader_targets` judges it).
+    let own: HashSet<String> = model
+        .methods()
+        .filter(|m| m.receiver == crate::dialect::MethodReceiver::Instance)
+        .map(|m| m.name.as_str().to_string())
+        .collect();
+    let mut pending = crate::analyze::model_includes(model);
+    let mut names = HashSet::default();
+    let mut seen = HashSet::default();
+    while let Some(concern) = pending.pop() {
+        if !seen.insert(concern.clone()) {
+            continue;
+        }
+        if let Some((included_methods, includes)) = concern_methods.get(&concern) {
+            names.extend(
+                included_methods
+                    .iter()
+                    .filter(|m| {
+                        m.receiver == crate::dialect::MethodReceiver::Instance
+                            && exact_positional_arity(m) == Some(0)
+                            && !uses_implicit_block(&m.body)
+                    })
+                    .map(|m| m.name.as_str().to_string())
+                    .filter(|name| !associations.contains(name) && !own.contains(name)),
+            );
+            pending.extend(includes.iter().cloned());
+        }
+    }
+    names
+}
+
 fn included_concern_method_bodies(
     model: &Model,
     concern_methods: &HashMap<ClassId, (&[MethodDef], &[ClassId])>,
 ) -> Vec<Expr> {
     let mut pending = crate::analyze::model_includes(model);
     let mut methods = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     while let Some(concern) = pending.pop() {
         if !seen.insert(concern.clone()) {
             continue;
@@ -207,6 +272,12 @@ fn model_zero_argument_surface(
         return surface.clone();
     }
 
+    // Ingest does not produce a model whose parents loop: classes that only
+    // inherit from each other are not models. Should that ever change, this
+    // walk must end rather than abort `check`, so the model in progress
+    // answers empty to anything that reaches it again.
+    cache.insert(model.name.clone(), MethodSurface::default());
+
     let mut surface = MethodSurface::default();
     if let Some(parent) = &model.parent {
         if let Some(parent_model) = models.get(parent) {
@@ -229,7 +300,7 @@ fn model_zero_argument_surface(
         crate::lower::model_to_library::build_methods(model, all_models, schema, params_specs);
     add_method_definitions(model_methods.iter(), &mut surface);
 
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     // Surface insertion is last-definition-wins, and Ruby gives the last
     // included concern lookup precedence. Preserve source order here.
     for include in crate::analyze::model_includes(model) {
@@ -274,7 +345,7 @@ fn add_method_definitions<'a>(
                 .map(|arity| [arity].into_iter().collect())
                 .unwrap_or_default()
         } else {
-            HashSet::new()
+            HashSet::default()
         };
         surface.methods.insert(name, arities);
     }
@@ -317,7 +388,7 @@ fn supported_association_delegates(
     model: &Model,
     available_methods: &HashMap<ClassId, MethodSurface>,
 ) -> HashSet<(String, String, usize)> {
-    let mut supported = HashSet::new();
+    let mut supported = HashSet::default();
     for association in model.associations() {
         if !matches!(
             association,
@@ -353,4 +424,47 @@ fn supported_association_delegates(
         }
     }
     supported
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ident::Symbol;
+    use std::path::PathBuf;
+
+    /// No source reaches this today, so the loop is built by hand.
+    #[test]
+    fn a_parent_cycle_ends_the_surface_walk_with_what_the_classes_define() {
+        let files = [
+            ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n"),
+            ("app/models/a.rb", "class A < ApplicationRecord\n  def from_a\n    'a'\n  end\nend\n"),
+            ("app/models/b.rb", "class B < ApplicationRecord\n  def from_b\n    'b'\n  end\nend\n"),
+        ];
+        let mut app = crate::ingest::ingest_app_from_tree(
+            files
+                .iter()
+                .map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec()))
+                .collect(),
+        )
+        .expect("ingest");
+        for (name, parent) in [("A", "B"), ("B", "A")] {
+            let model = app.models.iter_mut().find(|m| m.name.0.as_str() == name).expect(name);
+            model.parent = Some(ClassId(Symbol::from(parent)));
+        }
+
+        let models: HashMap<_, _> = app.models.iter().map(|m| (m.name.clone(), m)).collect();
+        let classes: HashMap<_, _> = app.library_classes.iter().map(|c| (c.name.clone(), c)).collect();
+        let specs = crate::lower::controller_to_library::params::collect_specs(&app.controllers);
+        let surface = model_zero_argument_surface(
+            models[&ClassId(Symbol::from("B"))],
+            &app.models,
+            &models,
+            &classes,
+            &app.schema,
+            &specs,
+            &mut HashMap::default(),
+        );
+        assert!(surface.methods.contains_key("from_a"));
+        assert!(surface.methods.contains_key("from_b"));
+    }
 }

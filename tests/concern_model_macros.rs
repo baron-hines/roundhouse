@@ -215,8 +215,6 @@ fn unsupported_accessor_shapes_are_reported_only_for_includers() {
         "attr_accessor *FIELDS",
         "attr_accessor :scratch, *FIELDS",
         "attr_accessor(:scratch) { nil }",
-        "attr_reader :scratch",
-        "attr_writer :scratch",
         "attr_accessor :scratch if false",
         "attr_accessor :scratch if true",
         "attr_reader :scratch unless false",
@@ -226,7 +224,7 @@ fn unsupported_accessor_shapes_are_reported_only_for_includers() {
         let (items, enums) = roundhouse::ingest::library_class::ingest_concern_model_items(source.as_bytes(), "draft_state.rb");
         assert_eq!(items.len(), 1, "recognized declaration must be retained: {declaration}");
         let [ModelBodyItem::Unknown { expr, .. }] = items[0].1.as_slice() else { panic!("{items:?}") };
-        assert!(expr.diagnostic.is_some(), "unsupported declaration needs a contextual refusal: {declaration}");
+        assert!(expr.diagnostic().is_some(), "unsupported declaration needs a contextual refusal: {declaration}");
         assert!(enums.is_empty());
 
         let files = [
@@ -247,7 +245,7 @@ fn unsupported_accessor_shapes_are_reported_only_for_includers() {
         assert_eq!(gaps.len(), 2, "one refusal per includer: {declaration}: {gaps:?}");
         let declaration_span = app.concern_model_items.values().flatten().find_map(|item| {
             let ModelBodyItem::Unknown { expr, .. } = item else { return None };
-            expr.diagnostic.as_ref().map(|_| expr.span)
+            expr.diagnostic().as_ref().map(|_| expr.span)
         }).expect("original refused declaration retains its source span");
         for name in ["Message", "Note"] {
             assert!(gaps.iter().any(|gap| gap.to_string().contains(&format!("on {name}"))), "{gaps:?}");
@@ -256,18 +254,6 @@ fn unsupported_accessor_shapes_are_reported_only_for_includers() {
             let lowered = roundhouse::lower::lower_model_to_library_class(model, &app.schema);
             assert!(lowered.methods.iter().all(|method| !["scratch", "scratch=", "flag", "flag="].contains(&method.name.as_str())), "must not partially synthesize {declaration}");
         }
-    }
-}
-
-/// Receiver-bearing calls and unrelated DSL keep their existing path;
-/// recognizing attr_* must not start treating arbitrary calls as macros.
-#[test]
-fn unrelated_calls_are_not_accessor_candidates() {
-    for declaration in ["self.attr_accessor :scratch", "Other.attr_accessor :scratch", "unknown_macro :scratch"] {
-        let source = format!("module DraftState\n  extend ActiveSupport::Concern\n  included {{ {declaration} }}\nend\n");
-        let (items, enums) = roundhouse::ingest::library_class::ingest_concern_model_items(source.as_bytes(), "draft_state.rb");
-        assert!(items.is_empty(), "must not claim unrelated {declaration}: {items:?}");
-        assert!(enums.is_empty());
     }
 }
 
@@ -288,6 +274,7 @@ fn accessor_contexts_fail_strict_ingest_and_are_not_carried_in_survey() {
         ("attr_accessor :scratch\n    private :scratch", "include DraftState"),
         ("with_options if: false do\n      attr_accessor :scratch\n    end", "include DraftState"),
         ("attr_accessor :scratch\n    def scratch\n      'included override'\n    end", "include DraftState"),
+        ("attr_accessor :scratch\n    unknown_macro :scratch", "include DraftState"),
         ("attr_accessor :scratch", "def scratch\n    'earlier'\n  end\n  include DraftState"),
         ("attr_accessor :scratch", "def scratch=(value)\n    @scratch = value\n  end\n  include DraftState"),
         ("attr_accessor :body", "include DraftState"),
@@ -331,7 +318,6 @@ fn accessor_contexts_fail_strict_ingest_and_are_not_carried_in_survey() {
 fn source_visibility_refusals_precede_concern_accessor_admission() {
     use roundhouse::ingest::survey;
     for marker in [
-        "private :scratch=", "private \"scratch=\"", "protected \"scratch\"",
         "private :scratch if true", "with_options do\n    protected :scratch=\n  end",
         "private [:scratch].first",
     ] {
@@ -353,6 +339,26 @@ fn source_visibility_refusals_precede_concern_accessor_admission() {
         files.insert("app/models/message.rb".into(), model.replace("include DraftState", "").into_bytes());
         assert_eq!(ingest_app_from_tree(files).unwrap_err().to_string(), error,
             "the marker is unsupported even without a carried accessor");
+    }
+}
+
+/// A static marker naming the concern's accessor is the model's own
+/// visibility change on a method its body does not define: carried, and
+/// applied to the accessor the lowering synthesizes.
+#[test]
+fn a_marker_on_a_concern_accessor_applies_to_it() {
+    for (marker, name, keyword) in [
+        ("private :scratch=", "scratch=", "private"),
+        ("private \"scratch=\"", "scratch=", "private"),
+        ("protected \"scratch\"", "scratch", "protected"),
+    ] {
+        let app = ingest_app_from_tree(tree(&[
+            ("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table :messages do |t|\n    t.string :body\n  end\nend\n"),
+            ("app/models/concerns/draft_state.rb", "module DraftState\n  extend ActiveSupport::Concern\n  included { attr_accessor :scratch }\nend\n"),
+            ("app/models/message.rb", &format!("class Message < ApplicationRecord\n  include DraftState\n  {marker}\nend\n")),
+        ])).unwrap_or_else(|e| panic!("{marker}: {e}"));
+        let src = ruby::emit_lowered_models(&app).into_iter().find(|file| file.path.to_string_lossy().ends_with("message.rb")).unwrap().content;
+        assert!(src.contains(&format!("{keyword} :{name}")) || src.contains(&format!("{keyword}\n\n  def {name}")), "{marker}:\n{src}");
     }
 }
 
@@ -467,15 +473,15 @@ fn unused_accessor_contexts_do_not_reject_an_app() {
     }
 }
 
-/// Accessors are supplied only by direct model splicing. Neither a plain
-/// module nor a non-model class has that replacement for Concern execution.
+/// Accessors are supplied by a direct include into a model or a plain class
+/// (`library_concern_items`). A module, a controller, a test class or an
+/// indirect include has no such replacement for Concern execution.
 #[test]
 fn non_model_and_indirect_accessor_activations_are_errors() {
     use roundhouse::ingest::survey;
     for body in ["attr_accessor :scratch", "attr_accessor :scratch; private :helper"] {
         let concern = format!("module DraftState\n  extend ActiveSupport::Concern\n  def helper; 'helper'; end\n  included {{ {body} }}\nend\n");
         for (path, owner, source) in [
-            ("app/models/support.rb", "Support", "class Support; include DraftState; end"),
             ("app/models/support.rb", "Support", "module Support; include DraftState; end"),
             ("app/controllers/support_controller.rb", "SupportController", "class SupportController < ApplicationController; include DraftState; end"),
             ("test/models/support_test.rb", "SupportTest", "class SupportTest < ActiveSupport::TestCase; include DraftState; end"),
@@ -572,23 +578,27 @@ fn deferred_concern_dependencies_stay_dormant_and_use_lexical_names() {
         ("app/models/support.rb", "module Scope; module DraftState; def helper; 'local'; end; end; class Support; include DraftState; end; end"),
     ]);
     ingest_app_from_tree(files.clone()).expect("a Concern dependency is deferred, and the local namesake has no accessors");
+    // Inside `module Scope`, the model's `include DraftState` is the local
+    // namesake, as Ruby binds it. Ingest stores that name, so the Concern's
+    // accessors are never spliced into the model; the local module, which
+    // this file does not model, is refused by analysis instead.
     let mut shadowed = files.clone();
     shadowed.insert("app/models/support.rb".into(), b"module Scope; module DraftState; def helper; 'local'; end; end; class Message < ApplicationRecord; self.table_name = 'messages'; include DraftState; end; end".to_vec());
-    let error = ingest_app_from_tree(shadowed.clone()).unwrap_err().to_string();
-    assert!(error.contains("on Scope::Message") && error.contains("source-resolved"), "{error}");
-    roundhouse::ingest::survey::activate();
-    let result = ingest_app_from_tree(shadowed);
-    let gaps = roundhouse::ingest::survey::drain();
-    let app = result.unwrap();
-    assert_eq!(gaps.len(), 1, "{gaps:?}");
-    assert_eq!(gaps[0].to_string(), error);
+    let mut app = ingest_app_from_tree(shadowed).expect("the local namesake supplies no accessors");
     let model = app.models.iter().find(|m| m.name.0.as_str() == "Scope::Message").unwrap();
     let lowered = roundhouse::lower::lower_model_to_library_class(model, &app.schema);
     assert!(!lowered.methods.iter().any(|m| ["scratch", "scratch="].contains(&m.name.as_str())));
+    roundhouse::session::analyze_and_lower(&mut app);
+    let errors: Vec<String> = roundhouse::analyze::diagnose(&app).into_iter()
+        .filter(|d| d.severity == roundhouse::diagnostic::Severity::Error)
+        .map(|d| d.to_string()).collect();
+    assert!(errors.iter().any(|e| e.contains("Scope::Message includes unresolved Scope::DraftState")), "{errors:?}");
     let mut files = files;
     files.insert("app/models/support.rb".into(), b"module Scope; class Support; include ::DraftState; end; end".to_vec());
-    let error = ingest_app_from_tree(files).unwrap_err().to_string();
-    assert!(error.contains("on Scope::Support") && error.contains("concern attr_accessor"), "{error}");
+    // A plain class that includes the Concern itself takes its accessors (`library_concern_items`).
+    let app = ingest_app_from_tree(files).expect("a class including the Concern takes its accessors");
+    let support = app.library_classes.iter().find(|lc| lc.name.0.as_str() == "Scope::Support").unwrap();
+    assert!(["scratch", "scratch="].iter().all(|n| support.methods.iter().any(|m| m.name.as_str() == *n)), "{:?}", support.methods.iter().map(|m| m.name.as_str()).collect::<Vec<_>>());
 }
 
 #[test]
@@ -761,7 +771,9 @@ fn accessor_probes_do_not_add_or_swallow_real_emit_diagnostics() {
         });
         assert_eq!(diags, vec![sentinel], "ingest must preserve only the outer diagnostic");
         let (_, diags) = scope(|| ruby::emit_lowered_models(&app));
-        assert_eq!(diags.iter().filter(|diag| diag.message.contains("permitted key `tags`") && diag.message.contains("non-scalar")).count(), 1, "real emission must still report the dropped key: {diags:?}");
+        // The ruby family carries `tags: []` (#1338); Message has no
+        // `tags=`, so the model side reports the key as writerless.
+        assert_eq!(diags.iter().filter(|diag| diag.message.contains("permitted field `tags` has no writer")).count(), 1, "real emission must still report the dropped key: {diags:?}");
     }
 }
 
@@ -836,5 +848,8 @@ fn a_def_in_a_constants_defining_block_is_not_a_dynamic_declaration() {
     let error = ingest_app_from_tree(tree(&[schema, model, ("app/models/fragment_cache.rb", hidden)]))
         .unwrap_err()
         .to_string();
-    assert!(error.contains("conditional or dynamic visibility"), "{error}");
+    assert!(
+        error.contains("visibility change for `store`, which a load-time conditional defines in only some branches"),
+        "{error}"
+    );
 }

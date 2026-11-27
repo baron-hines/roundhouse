@@ -22,7 +22,7 @@
 //! written class names against the classes it actually knows (see
 //! `analyze::registry::gem_boundary`).
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 use std::path::{Path, PathBuf};
 
 use ruby_prism::Node;
@@ -31,7 +31,7 @@ use crate::effect::EffectSet;
 use crate::gem_boundary::{GemBoundary, GemClass};
 use crate::gems::{fate_of, GemFate, Lockfile};
 use crate::ident::{ClassId, Symbol};
-use crate::ty::{Param, ParamKind, Ty};
+use crate::ty::{FnTy, Param, ParamKind, Ty};
 use crate::vfs::Vfs;
 
 use super::sorbet_sig::{
@@ -57,24 +57,38 @@ fn rbi_dir<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> Option<PathBuf> {
 
 /// Read the RBIs of the locked gems the analyzer has no model for.
 ///
-/// Rails' own components, the stdlib gems and the tooling gems are
-/// skipped: the first two are already the analyzer's catalog (a second,
-/// partial, description of them would only disagree), and the last never
-/// enters the analysis at all.
-pub fn load_gem_boundary<V: Vfs + ?Sized>(vfs: &V, dir: &Path, lock: &Lockfile) -> GemBoundary {
-    let mut boundary = GemBoundary::default();
+/// Catalogued gems keep their existing surface. Extension-declared native
+/// gems and refused gems are also read, regardless of their census fate:
+/// their RBIs supply precise ownership as well as method signatures.
+pub fn load_gem_boundary<V: Vfs + ?Sized>(
+    vfs: &V,
+    dir: &Path,
+    lock: &Lockfile,
+    extensions: &crate::extensions::Extensions,
+) -> GemBoundary {
+    let loaded = extensions.lock_gated_requires.iter()
+        .filter(|row| lock.has(&row.gem) && !lock.is_in_repo(&row.gem))
+        .map(|row| row.gem.clone())
+        .collect();
+    let mut boundary = GemBoundary { loaded, ..GemBoundary::default() };
     let Some(root) = rbi_dir(vfs, dir) else { return boundary };
     let Ok(entries) = vfs.read_dir(&root) else { return boundary };
 
     // gem name -> the RBI file to read. A gem locked at one version can
     // have RBIs for several (a stale one left behind); the locked
     // version's wins, otherwise the highest-sorting one.
-    let mut chosen: HashMap<String, (bool, PathBuf)> = HashMap::new();
+    let mut chosen: HashMap<String, (bool, PathBuf)> = HashMap::default();
     for path in entries {
         let Some(file) = path.file_name().and_then(|f| f.to_str()) else { continue };
         let Some(stem) = file.strip_suffix(".rbi") else { continue };
         let Some((name, version)) = stem.split_once('@') else { continue };
-        if lock.is_in_repo(name) || !matches!(fate_of(name), GemFate::Unknown | GemFate::Modeled) {
+        let extension_gem = extensions.runtime_gems.iter().any(|row| row.gem == name)
+            || extensions.lock_gated_requires.iter().any(|row| row.gem == name)
+            || extensions.is_rails_dependent(name);
+        if lock.is_in_repo(name)
+            || lock.is_source(name)
+            || (!extension_gem && !matches!(fate_of(name), GemFate::Unknown | GemFate::Modeled))
+        {
             continue;
         }
         let Some(locked) = lock.version_of(name) else { continue };
@@ -118,11 +132,11 @@ pub fn load_gem_boundary<V: Vfs + ?Sized>(vfs: &V, dir: &Path, lock: &Lockfile) 
 /// across files (or twice in one) accumulates: the first parent wins,
 /// methods and ancestry union.
 pub fn read_rbi(source: &[u8], gem: &str, out: &mut GemBoundary) {
-    let result = ruby_prism::parse(source);
+    let result = super::prism::parse_silent(source);
     let node = result.node();
     let Some(program) = node.as_program_node() else { return };
     let statements = program.statements().body().iter().collect::<Vec<_>>();
-    let aliases = collect_type_aliases(&statements, &HashMap::new());
+    let aliases = collect_type_aliases(&statements, &HashMap::default());
     let mut reader = Reader { gem, out };
     reader.walk(&statements, None, false, &aliases);
 }
@@ -354,25 +368,25 @@ impl Reader<'_> {
 }
 
 fn untyped_fn() -> Ty {
-    Ty::Fn {
-        params: vec![Param { name: Symbol::new("args"), ty: Ty::Untyped, kind: ParamKind::Rest }],
+    Ty::Fn(Box::new(FnTy {
+        params: vec![Param { name: Symbol::new("args"), ty: Ty::Untyped.into(), kind: ParamKind::Rest }].into(),
         block: None,
-        ret: Box::new(Ty::Untyped),
+        ret: std::sync::Arc::new(Ty::Untyped),
         effects: EffectSet::pure(),
-    }
+    }))
 }
 
 fn reader_fn(ret: Ty) -> Ty {
-    Ty::Fn { params: Vec::new(), block: None, ret: Box::new(ret), effects: EffectSet::pure() }
+    Ty::Fn(Box::new(FnTy { params: Vec::new().into(), block: None, ret: std::sync::Arc::new(ret), effects: EffectSet::pure() }))
 }
 
 fn writer_fn(ty: Ty) -> Ty {
-    Ty::Fn {
-        params: vec![Param { name: Symbol::new("value"), ty: ty.clone(), kind: ParamKind::Required }],
+    Ty::Fn(Box::new(FnTy {
+        params: vec![Param { name: Symbol::new("value"), ty: ty.clone().into(), kind: ParamKind::Required }].into(),
         block: None,
-        ret: Box::new(ty),
+        ret: std::sync::Arc::new(ty),
         effects: EffectSet::pure(),
-    }
+    }))
 }
 
 /// The links of a `sig { ... }` chain, outermost first.
@@ -413,7 +427,7 @@ fn lenient_signature(
     self_is_instance: bool,
     aliases: &HashMap<String, Ty>,
 ) -> Ty {
-    let mut declared: HashMap<String, Ty> = HashMap::new();
+    let mut declared: HashMap<String, Ty> = HashMap::default();
     let mut ret = Ty::Untyped;
     if let Some(sig) = sig {
         for call in sig_chain(sig) {
@@ -453,12 +467,12 @@ fn lenient_signature(
             .into_iter()
             .map(|(name, kind)| {
                 let ty = declared.remove(&name).unwrap_or(Ty::Untyped);
-                Param { name: Symbol::new(&name), ty, kind }
+                Param { name: Symbol::new(&name), ty: ty.into(), kind }
             })
             .collect(),
         // A parameter list this reader does not take apart: accept
         // anything rather than assert an arity.
-        None => vec![Param { name: Symbol::new("args"), ty: Ty::Untyped, kind: ParamKind::Rest }],
+        None => vec![Param { name: Symbol::new("args"), ty: Ty::Untyped.into(), kind: ParamKind::Rest }],
     };
-    Ty::Fn { params, block: None, ret: Box::new(ret), effects: EffectSet::pure() }
+    Ty::Fn(Box::new(FnTy { params: params.into(), block: None, ret: std::sync::Arc::new(ret), effects: EffectSet::pure() }))
 }

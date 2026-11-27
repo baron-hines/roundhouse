@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 module ActionDispatch
   # Per-app session store. Real-blog uses no session keys, so the
   # struct is empty (no typed fields). It still exposes HWIA-shape
@@ -54,6 +55,12 @@ module ActionDispatch
 
     def delete(key)
       @data.delete(key.to_s)
+    end
+
+    # Not `@data.clear`: the strict targets' emitters have no zero-argument Hash#clear, and the Session object is what is kept.
+    def clear
+      @data = {}
+      self
     end
 
     def length

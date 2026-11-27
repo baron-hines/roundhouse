@@ -31,7 +31,7 @@ use std::path::PathBuf;
 use super::EmittedFile;
 use crate::App;
 use crate::dialect::MethodDef;
-use crate::ty::Ty;
+use crate::ty::{FnTy, Ty};
 
 mod expr;
 mod importmap;
@@ -62,9 +62,10 @@ pub fn emit_method(m: &MethodDef) -> String {
         .signature
         .as_ref()
         .expect("emit_method requires a signature");
-    let Ty::Fn { params: sig_params, ret, .. } = sig else {
+    let Ty::Fn(fn_ty) = sig else {
         panic!("signature is not Ty::Fn");
     };
+    let FnTy { params: sig_params, ret, .. } = &**fn_ty;
     assert_eq!(
         sig_params.len(),
         m.params.len(),
@@ -103,6 +104,7 @@ const PARAMS_SOURCE: &str = include_str!("../../runtime/python/params.py");
 /// Ships as `app/rh_datetime.py`; imported by models.py when a temporal
 /// column's reader `@property` references `Roundhouse.RhDateTime`.
 const RH_DATETIME_SOURCE: &str = include_str!("../../runtime/python/rh_datetime.py");
+const I18N_HOST_SOURCE: &str = include_str!("../../runtime/python/i18n_host.py");
 /// Python HTTP runtime — the `ActionResponse` value type
 /// `app/v2/dispatch.handle` returns and the server/TestClient glue
 /// consumes. Copied verbatim into generated projects as
@@ -145,6 +147,8 @@ const LIVE_FRAMEWORK: &[&str] = &[
     "app/session.py",
     "app/action_controller_base.py",
     "app/router.py",
+    "app/active_support_inflections.py",
+    "app/i18n_locale.py",
 ];
 
 /// Emit the switched-over framework leaf files (see `LIVE_FRAMEWORK`).
@@ -177,6 +181,10 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
         files.push(EmittedFile {
             path: PathBuf::from("app/rh_datetime.py"),
             content: RH_DATETIME_SOURCE.to_string(),
+        });
+        files.push(EmittedFile {
+            path: PathBuf::from("app/i18n_host.py"),
+            content: I18N_HOST_SOURCE.to_string(),
         });
         files.push(schema_sql::emit_schema_sql(app));
         files.push(EmittedFile {

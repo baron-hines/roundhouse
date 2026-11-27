@@ -40,7 +40,7 @@
 //! `@bots = Current.account.bots` in the app for no reader that needs
 //! it.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::app::App;
 use crate::dialect::ControllerBodyItem;
@@ -50,7 +50,7 @@ use crate::ty::Ty;
 
 pub fn apply_relation_ivar_materialize(app: &mut App) {
     for controller in &mut app.controllers {
-        let mut ivars: HashMap<Symbol, Ty> = HashMap::new();
+        let mut ivars: HashMap<Symbol, Ty> = HashMap::default();
         for item in &controller.body {
             if let ControllerBodyItem::Action { action, .. } = item {
                 crate::analyze::extract_ivar_assignments(&action.body, &mut ivars);
@@ -87,7 +87,7 @@ fn rewrite(expr: &mut Expr, mixed: &[Symbol]) {
             return;
         }
         let Some(Ty::Relation { of }) = value.ty.as_ref() else { return };
-        let elem = Ty::Class { id: of.clone(), args: vec![] };
+        let elem = Ty::Class { id: of.clone(), args: vec![].into() };
         let inner = std::mem::replace(value, Expr::new(span, ExprNode::Lit { value: Literal::Nil }));
         let mut materialised = Expr::new(
             span,
@@ -99,9 +99,32 @@ fn rewrite(expr: &mut Expr, mixed: &[Symbol]) {
                 parenthesized: false,
             },
         );
-        materialised.ty = Some(Ty::Array { elem: Box::new(elem) });
+        materialised.ty = Some(Ty::Array { elem: std::sync::Arc::new(elem) });
         *value = materialised;
         // The assignment's own type follows its value.
         expr.ty = value.ty.clone();
     }
+}
+
+/// `@report.collections - selected_collections` (mastodon): the relation operand of an Array `-` is loaded, so every
+/// target computes the difference of two Arrays, as Ruby's `Array#-` does through `Relation#to_ary`.
+pub fn apply_relation_difference_materialize(app: &mut App) {
+    fn walk(e: &mut crate::expr::Expr) {
+        e.node.for_each_child_mut(&mut |c| walk(c));
+        let crate::expr::ExprNode::Send { recv: Some(lhs), method, args, block: None, .. } = &mut *e.node else { return };
+        if method.as_str() != "-" || !matches!(lhs.ty, Some(Ty::Array { .. })) {
+            return;
+        }
+        let [rhs] = args.as_mut_slice() else { return };
+        let Some(Ty::Relation { of }) = rhs.ty.clone() else { return };
+        let span = rhs.span;
+        let inner = std::mem::replace(rhs, crate::expr::Expr::new(span, crate::expr::ExprNode::Lit { value: crate::expr::Literal::Nil }));
+        let mut loaded = crate::expr::Expr::new(
+            span,
+            crate::expr::ExprNode::Send { recv: Some(inner), method: Symbol::from("to_a"), args: vec![], block: None, parenthesized: false },
+        );
+        loaded.ty = Some(Ty::Array { elem: std::sync::Arc::new(Ty::Class { id: of, args: vec![].into() }) });
+        *rhs = loaded;
+    }
+    super::for_each_emit_body(app, &mut walk);
 }

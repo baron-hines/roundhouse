@@ -12,22 +12,36 @@
 //! Requires a Swift toolchain (6+) on PATH and, on Linux, the
 //! `libsqlite3-dev` package (the CSQLite systemLibrary's header + link
 //! target — see docs/archive/swift-migration-plan.md decision 3). CI provides
-//! both via `swift-actions/setup-swift` + apt; locally, the Xcode CLT
+//! both via `scripts/ci-swift-install` + apt; locally, the Xcode CLT
 //! (macOS) or a swiftly/mise toolchain suffices.
 //!
 //! Marked `#[ignore]` so the default `cargo test` run stays fast. Run:
 //!
 //!     cargo test --test swift_toolchain -- --ignored --nocapture
 
+#[path = "support/scratch.rs"]
+mod scratch;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use roundhouse::analyze::Analyzer;
+#[path = "support/emit_and_run.rs"]
+#[allow(dead_code)]
+mod emit_and_run;
+#[path = "support/i18n_locales_app.rs"]
+#[allow(dead_code)]
+mod i18n_locales_app;
+#[path = "support/record_slice_app.rs"]
+#[allow(dead_code)]
+mod record_slice_app;
+#[path = "support/ts_controller_ivars.rs"]
+#[allow(dead_code)]
+mod ts_controller_ivars;
+
 use roundhouse::emit::swift;
 use roundhouse::ingest::ingest_app;
 
 fn scratch_dir(fixture: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("roundhouse-swift-check-{fixture}"))
+    scratch::dir(&format!("roundhouse-swift-check-{fixture}"))
 }
 
 fn generate_project(fixture_path: &Path, out: &Path) {
@@ -52,7 +66,8 @@ fn generate_project(fixture_path: &Path, out: &Path) {
     std::fs::create_dir_all(out).expect("create scratch");
 
     let mut app = ingest_app(fixture_path).expect("ingest");
-    Analyzer::new(&app).analyze(&mut app);
+    // Emit from the post-analyze lowered IR, as `roundhouse --target swift` does
+    roundhouse::session::analyze_and_lower(&mut app);
     let files = swift::emit(&app);
 
     for file in &files {
@@ -151,4 +166,154 @@ fn parse_executed_count(s: &str) -> Option<usize> {
     let rest = &s[idx + "Executed ".len()..];
     let end = rest.find(' ')?;
     rest[..end].parse::<usize>().ok()
+}
+
+#[test]
+#[ignore]
+fn real_blog_i18n_locales_run() {
+    // The answers `emit_and_run::i18n_locales` checks on CRuby, but for a String
+    // locale named in an error: Swift has no Symbol apart from String, so `"de"` shows as `:de`.
+    let (emitted, errors) = i18n_locales_app::probe_app()
+        .edit("app/models/article.rb", i18n_locales_app::IN_LOCALE, "")
+        .emit(roundhouse::project::BuildTarget::Swift);
+    assert!(errors.is_empty(), "{errors:?}");
+    std::fs::write(emitted.join("Tests/AppTests/I18nProbeTests.swift"), r#"import XCTest
+@testable import App
+
+final class I18nProbeTests: XCTestCase {
+    func testLocalesAnswerAsRails() throws {
+        XCTAssertEqual(try Article.lookups(), ["Hello", "Hi <x>", "1 item", "2 items", "Translation missing: en.probe.nope", "Cześć", "fallback 3", "en"])
+        XCTAssertEqual(try Article.polish(), ["1 rzecz", "5 rzeczy", "English only", "Cześć", "Translation missing: pl.probe.nope", "Cześć", "Hi Ola", "pl"])
+        XCTAssertEqual(I18n.locale(), "en")
+        XCTAssertEqual([try Article.named("pl"), try Article.named("en"), try Article.named(nil)], ["Cześć", "Hello", "Hello"])
+        XCTAssertEqual([try Article.probeKey("greet"), try Article.onlyKey("xx")], ["Hello", "Translation missing: en.probe.only_xx"])
+        XCTAssertThrowsError(try Article.named("de")) { error in
+            XCTAssertEqual((error as? InvalidLocale)?.message, ":de is not a valid locale")
+        }
+    }
+}
+"#).expect("write probe test");
+    let output = Command::new("swift")
+        .args(["test", "--filter", "I18nProbeTests"])
+        .current_dir(&emitted)
+        .output()
+        .expect("run swift test");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore]
+fn real_blog_record_slice_runs() {
+    // The answers `emit_and_run::record_slice` checks on CRuby.
+    let (emitted, errors) = record_slice_app::probe_app().emit(roundhouse::project::BuildTarget::Swift);
+    assert!(errors.is_empty(), "{errors:?}");
+    std::fs::write(emitted.join("Tests/AppTests/RecordSliceProbeTests.swift"), r#"import XCTest
+@testable import App
+
+final class RecordSliceProbeTests: XCTestCase {
+    func testSliceAnswersAsRails() throws {
+        XCTAssertEqual(try Article.sliced(), ["2", "Sliced", "7", "1", "Other", "3", "Bound", "5", "4", "A comment body."])
+    }
+}
+"#).expect("write probe test");
+    let output = Command::new("swift")
+        .args(["test", "--filter", "RecordSliceProbeTests"])
+        .current_dir(&emitted)
+        .output()
+        .expect("run swift test");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore]
+fn real_blog_rescue_modifier_runs() {
+    // A raise that throws is what `expr rescue fallback` catches; a nil answered without one is kept, as CRuby keeps it.
+    let (emitted, errors) = emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "  validates :title, presence: true\n",
+            "  validates :title, presence: true\n\n  def self.checked(s)\n    raise ArgumentError, \"empty\" if s.to_s.empty?\n    s.to_s\n  end\n\n  def self.safe(s)\n    checked(s) rescue \"none\"\n  end\n\n  def self.lookup(s)\n    raise ArgumentError, \"empty\" if s.to_s.empty?\n    s.to_s == \"gone\" ? nil : s.to_s\n  end\n\n  def self.safe_lookup(s)\n    lookup(s) rescue \"fallback\"\n  end\n\n  def self.strict(s)\n    checked(s) rescue raise(TypeError, \"bad\")\n  end\n",
+        )
+        .emit(roundhouse::project::BuildTarget::Swift);
+    assert!(errors.is_empty(), "{errors:?}");
+    std::fs::write(emitted.join("Tests/AppTests/RescueModifierTests.swift"), r#"import XCTest
+@testable import App
+
+final class RescueModifierTests: XCTestCase {
+    func testTheFallbackAnswersARaise() throws {
+        XCTAssertEqual(Article.safe("a") as? String, "a")
+        XCTAssertEqual(Article.safe("") as? String, "none")
+        XCTAssertNil(Article.safeLookup("gone"))
+        XCTAssertEqual(Article.safeLookup("") as? String, "fallback")
+        XCTAssertEqual(Article.safeLookup("a") as? String, "a")
+        XCTAssertEqual(try Article.strict("a") as? String, "a")
+        XCTAssertThrowsError(try Article.strict("")) { error in XCTAssertEqual((error as? TypeError)?.message, "bad") }
+    }
+}
+"#).expect("write test");
+    let output = Command::new("swift")
+        .args(["test", "--filter", "RescueModifierTests"])
+        .current_dir(&emitted)
+        .output()
+        .expect("run swift test");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore]
+fn controller_ivars_named_like_base_state_build() {
+    // An app controller's `@status`, `@location` and `@headers` (its own,
+    // ApplicationController's and a concern's) build next to the runtime
+    // base's members of those names (#1625).
+    let (emitted, errors) = ts_controller_ivars::overlay().emit(roundhouse::project::BuildTarget::Swift);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_swift_builds("an app controller with ivars named like the base's state", &emitted);
+}
+
+const PROBES_TEST: &str = "require \"test_helper\"\n\nclass ProbesControllerTest < ActionDispatch::IntegrationTest\n  test \"show renders\" do\n    get \"/show\"\n    assert_response :success\n  end\nend\n";
+
+#[test]
+#[ignore]
+fn controller_ivars_named_like_base_state_render() {
+    // The three names render on the page, and the response is as Rails
+    // leaves it: 200, no Location (#1625).
+    // A test file, so the emit writes the test sources the probe joins.
+    let (emitted, errors) = ts_controller_ivars::overlay()
+        .write("test/controllers/probes_controller_test.rb", PROBES_TEST)
+        .emit(roundhouse::project::BuildTarget::Swift);
+    assert!(errors.is_empty(), "{errors:?}");
+    let body = serde_json::to_string(ts_controller_ivars::BODY).unwrap();
+    std::fs::write(
+        emitted.join("Tests/AppTests/ControllerIvarsProbeTests.swift"),
+        format!(
+            "import XCTest\n@testable import App\n\nfinal class ControllerIvarsProbeTests: XCTestCase {{\n    func testRendersAsRails() throws {{\n        let c = ProbesController()\n        c.requestMethod = \"GET\"\n        try c.processAction(\"show\")\n        XCTAssertEqual(c.status, 200)\n        XCTAssertNil(c.location)\n        XCTAssertEqual(c.body, {body})\n    }}\n}}\n"
+        ),
+    )
+    .expect("write probe test");
+    let output = Command::new("swift")
+        .args(["test", "--filter", "ControllerIvarsProbeTests"])
+        .current_dir(&emitted)
+        .output()
+        .expect("run swift test");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

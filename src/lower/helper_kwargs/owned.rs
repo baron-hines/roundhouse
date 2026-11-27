@@ -35,7 +35,7 @@
 //! slot layout that moves the keywords differently, no one positional
 //! spelling is right for every receiver, so the call is refused.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::app::App;
 use crate::dialect::MethodReceiver;
@@ -56,6 +56,10 @@ pub(super) struct OwnerIndex {
     /// Every method a library class defines, flattened or not, with its
     /// slots when it is flattened (`None` when it cannot be respelled).
     defined: HashMap<(String, Side, Symbol), Option<Vec<Slot>>>,
+    /// Classes and modules whose body `prepend`s a module. A prepended
+    /// module sits ahead of the class itself in Ruby's lookup and is not
+    /// one of `includes`, so a lookup through such a class is not resolved.
+    prepending: HashSet<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -77,12 +81,20 @@ impl OwnerIndex {
     pub(super) fn new(app: &App) -> Self {
         let names: HashSet<String> =
             app.library_classes.iter().map(|c| c.name.0.as_str().to_string()).collect();
-        let mut parents = HashMap::new();
-        let mut includes: HashMap<String, Vec<String>> = HashMap::new();
-        let mut children: HashMap<String, Vec<String>> = HashMap::new();
-        let mut defined = HashMap::new();
+        let mut parents = HashMap::default();
+        let mut includes: HashMap<String, Vec<String>> = HashMap::default();
+        let mut children: HashMap<String, Vec<String>> = HashMap::default();
+        let mut defined = HashMap::default();
+        let mut prepending = HashSet::default();
         for lc in &app.library_classes {
             let name = lc.name.0.as_str().to_string();
+            if lc.unknown_calls.iter().any(|e| matches!(&*e.node,
+                ExprNode::Send { recv, method, .. }
+                    if method.as_str() == "prepend"
+                        && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))))
+            {
+                prepending.insert(name.clone());
+            }
             if let Some(parent) = &lc.parent
                 && let Some(parent) = resolve_const(&names, &name, parent.0.as_str())
             {
@@ -104,13 +116,13 @@ impl OwnerIndex {
                 );
             }
         }
-        let mut includers: HashMap<String, Vec<String>> = HashMap::new();
+        let mut includers: HashMap<String, Vec<String>> = HashMap::default();
         for (includer, modules) in &includes {
             for m in modules {
                 includers.entry(m.clone()).or_default().push(includer.clone());
             }
         }
-        Self { parents, includes, children, includers, defined }
+        Self { parents, includes, children, includers, defined, prepending }
     }
 
     /// `class`'s ancestors on `side`, in Ruby's method lookup order: the
@@ -142,7 +154,7 @@ impl OwnerIndex {
         }
         let mut out = Vec::new();
         let mut current = Some(class.to_string());
-        let mut chain = HashSet::new();
+        let mut chain = HashSet::default();
         while let Some(c) = current {
             if !chain.insert(c.clone()) {
                 return Err(());
@@ -159,17 +171,33 @@ impl OwnerIndex {
             return Resolved::Ambiguous;
         };
         let key = |c: &String| (c.clone(), side, method.clone());
-        let Some(first) = ancestors.iter().position(|c| self.defined.contains_key(&key(c))) else {
+        let first = ancestors.iter().position(|c| self.defined.contains_key(&key(c)));
+        // A prepended module sits right ahead of the class that prepends
+        // it (`Base` prepending `Loud`: `[Child, Loud, Base]`), so it can
+        // take the call only from a class at or before the first definer;
+        // one prepended further up is never reached. With no definer known,
+        // any prepended module might define the name.
+        if side == Side::Instance
+            && ancestors[..first.map_or(ancestors.len(), |f| f + 1)]
+                .iter()
+                .any(|c| self.prepending.contains(c))
+        {
+            return Resolved::Ambiguous;
+        }
+        let Some(first) = first else {
             return Resolved::Missing;
         };
         // A module reachable at two positions in the chain: Ruby keeps
-        // one, and which one decides the binding when it defines the name.
-        let mut seen = HashSet::new();
-        if ancestors
-            .iter()
-            .filter(|c| !seen.insert(*c))
-            .any(|c| self.defined.contains_key(&key(c)))
-        {
+        // one (a class and its superclass both including `Helper` have it
+        // once, at the superclass's place), and which one can decide the
+        // binding when it defines the name. Dropping copies never moves
+        // an entry that occurs once, so the first definer is the answer
+        // when it occurs once, or when every definer is that same module.
+        // Two different definers ordered by the kept copy stay ambiguous.
+        let definers: Vec<&String> = ancestors.iter().filter(|c| self.defined.contains_key(&key(c))).collect();
+        let first_name = &ancestors[first];
+        let occurs_once = ancestors.iter().filter(|c| *c == first_name).count() == 1;
+        if !occurs_once && definers.iter().any(|c| *c != first_name) {
             return Resolved::Ambiguous;
         }
         match self.defined.get(&key(&ancestors[first])) {
@@ -189,6 +217,24 @@ impl OwnerIndex {
         }
     }
 
+    /// Whether and how `class.side` defines `method`, distinguishing
+    /// "does not define this at all" (any dispatch to it raises
+    /// `NoMethodError` regardless of what a caller rewrites) from
+    /// "defines it, but not with a flattened keyword ABI a caller can
+    /// safely respell against" (a real keyword, `rest`, forwarding
+    /// parameter, or no keywords at all — already binds correctly as
+    /// written). Callers outside the owner-relative walk that need this
+    /// distinction (a typed-receiver nilable union, `Gadget | Nil`) use
+    /// this instead of `lookup`, which collapses both into `Ok(None)`.
+    pub(super) fn defines(&self, class: &str, side: Side, method: &Symbol) -> Defined<'_> {
+        match self.resolve(class, side, method) {
+            Resolved::Flattened(slots) => Defined::Flattened(slots),
+            Resolved::Unflattened => Defined::Unflattened,
+            Resolved::Missing => Defined::Missing,
+            Resolved::Ambiguous => Defined::Ambiguous,
+        }
+    }
+
     /// The definition `method` resolves to on every class or module that
     /// can be `self` in `class`'s body: its subclasses and its includers,
     /// and theirs, transitively, each resolved through its own full
@@ -203,7 +249,7 @@ impl OwnerIndex {
         };
         let mut out = Vec::new();
         let mut stack: Vec<String> = below(class);
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         while let Some(c) = stack.pop() {
             if !seen.insert(c.clone()) {
                 continue;
@@ -220,6 +266,19 @@ impl OwnerIndex {
 }
 
 enum Resolved<'a> {
+    Flattened(&'a Vec<Slot>),
+    Unflattened,
+    Missing,
+    Ambiguous,
+}
+
+/// `OwnerIndex::defines`'s result: see its doc comment. `Flattened`
+/// carries the slots so a caller that only reaches this definition
+/// through an ancestor or included module — not keyed directly in its
+/// own `params.slots`-style map, which only ever holds each class's OWN
+/// direct definitions — can still use its shape instead of wrongly
+/// treating "defined, only inherited" as "cannot be resolved".
+pub(super) enum Defined<'a> {
     Flattened(&'a Vec<Slot>),
     Unflattened,
     Missing,
@@ -333,7 +392,7 @@ pub(super) fn rewrite_library_classes(
 
 const SEND_METHODS: &[&str] = &["send", "public_send", "__send__"];
 
-const AMBIGUOUS: &str = "the method this call reaches cannot be resolved statically (an include cycle, or a module reachable twice that defines it), so its keyword slots are not known";
+const AMBIGUOUS: &str = "the method this call reaches cannot be resolved statically (an include cycle, a prepended module, or two modules whose order depends on which copy of one Ruby keeps), so its keyword slots are not known";
 
 fn rewrite(
     e: &mut Expr,

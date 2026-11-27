@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Per-request state, per THREAD.
 #
 # Four modules in the shared runtime keep per-request state at module
@@ -93,20 +94,32 @@ module ActionView
       return "" if Thread.current[:view_broadcast_rendering] == true
       return "" if ActionController.forgery_switched_off
       return "" if token_fields_omitted?
-      %(<input type="hidden" name="authenticity_token" value="#{form_authenticity_token}">)
+      %(<input type="hidden" name="authenticity_token" value="#{form_authenticity_token}"#{hidden_autocomplete_attr}>)
     end
 
     def self.token_fields_omitted?
       Rails.application.token_fields_omitted
     end
 
+    # A broadcast renders as Rails' `ApplicationController.renderer`
+    # does: through a controller of its own, not the request that
+    # triggered it, so `controller.perform_caching` and the fragment
+    # store answer for a render with no request snapshot behind it —
+    # the detached controller, which caches nothing
+    # (runtime/action_controller_fragment_caching.rb). The request's
+    # controller is put back when the render is done. Like the flag, a
+    # raise inside the render leaves the swap for the rest of that one
+    # request only; the next dispatch assigns its own controller.
     def self.begin_broadcast_render
       Thread.current[:view_broadcast_rendering] = true
+      Thread.current[:view_broadcast_request_controller] = ActionController::Current.controller
+      ActionController::Current.controller = ActionView::ViewHelpers.broadcast_controller
       ""
     end
 
     def self.broadcast_render(_armed, html)
       Thread.current[:view_broadcast_rendering] = false
+      ActionController::Current.controller = Thread.current[:view_broadcast_request_controller]
       html
     end
   end
@@ -207,11 +220,32 @@ module ActiveJob
   # never holds the queue against the requests still enqueueing.
   QUEUE_LOCK = Mutex.new
 
-  def self.enqueue(work)
+  def self.enqueue_on(queue, work)
     QUEUE_LOCK.synchronize do
+      PENDING_QUEUES << queue
       PENDING << work
     end
     nil
+  end
+
+  def self.clear_queue(queue)
+    removed = 0
+    QUEUE_LOCK.synchronize do
+      n = PENDING.length
+      i = 0
+      while i < n
+        work = PENDING.shift
+        name = PENDING_QUEUES.shift
+        if name == queue
+          removed += 1
+        elsif !work.nil?
+          PENDING << work
+          PENDING_QUEUES << name.to_s
+        end
+        i += 1
+      end
+    end
+    removed
   end
 
   def self.pending_count
@@ -227,9 +261,17 @@ module ActiveJob
     while true
       work = nil
       QUEUE_LOCK.synchronize do
-        work = PENDING.shift if PENDING.length > 0
+        if PENDING.length > 0
+          work = PENDING.shift
+          PENDING_QUEUES.shift
+        end
       end
       break if work.nil?
+      # A job gets its own broadcast log, as `dispatch` gives a request.
+      # The drain thread is never a request, so nothing else clears its
+      # log: every message a job broadcast stayed on it, rendered HTML
+      # and all (~9 KB a campfire POST, 3 GB over a bench's POST cells).
+      Broadcasts.reset_log!
       begin
         work.call
         ran = ran + 1

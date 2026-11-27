@@ -50,7 +50,7 @@
 //! corpus site (`:username`, `"is_moderator"`). A computed method name
 //! is left as a plain `try` send for the analyzer to report.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::app::App;
 use crate::dialect::MethodReceiver;
@@ -160,7 +160,22 @@ pub(crate) fn rewrite_node(
     );
     call.ty = try_ty.clone();
 
-    let arms = if bang { None } else { narrowing(&name, definers, parents) };
+    // Not narrowed to the definers this pass can see when Ruby's own classes define the name too: lobsters' `current_vote.try(:[], :vote)` holds `{vote: 1}` or a `Vote` (whose `[]` is the runtime's), and `is_a?(CommentVoteHydrator)` answered nil for both.
+    let core_receiver = super::core_method_names::defined_by_every_object(name.as_str())
+        || (!super::core_method_names::core_value_definers(name.as_str()).is_empty()
+            && recv.ty.as_ref().is_none_or(may_hold_a_core_value));
+    let arms = if bang || core_receiver { None } else { narrowing(&name, definers, parents) };
+    // Not the app's definers alone where the receiver's class is not known: a runtime object answers the name too
+    // (Devise's `Rails.application.config.try(:relative_url_root)`), which `is_a?(Devise::FailureApp)` answered nil for.
+    let arms = match arms {
+        Some(mut arms) if !arms.is_empty() && recv.ty.as_ref().is_none_or(|t| matches!(t, Ty::Untyped | Ty::Var { .. })) => {
+            let mut runtime: Vec<Symbol> = runtime_definers(name.as_str()).into_iter().filter(|c| !arms.contains(c)).collect();
+            runtime.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+            arms.extend(runtime);
+            (arms.len() <= MAX_ARMS).then_some(arms)
+        }
+        other => other,
+    };
     let mut replaced = match arms {
         // Nothing in the tree defines it and it is not `try!`: the only
         // answer `try` can give is nil. Folding rather than emitting a
@@ -171,7 +186,7 @@ pub(crate) fn rewrite_node(
             // Under a one-class test the call's receiver IS that class:
             // the narrowing is the guard that makes the call resolve.
             if let ([klass], ExprNode::Send { recv: Some(r), .. }) = (arms.as_slice(), &mut *call.node) {
-                r.ty = Some(Ty::Class { id: crate::ident::ClassId(klass.clone()), args: Vec::new() });
+                r.ty = Some(Ty::Class { id: crate::ident::ClassId(klass.clone()), args: Vec::new().into() });
             }
             let test = arms
                 .into_iter()
@@ -215,6 +230,41 @@ pub(crate) fn rewrite_node(
         replaced.ty = try_ty;
     }
     *expr = replaced;
+}
+
+/// The runtime classes (`runtime/ruby`, which every target carries) whose instances answer `name`.
+fn runtime_definers(name: &str) -> Vec<Symbol> {
+    static TABLE: std::sync::OnceLock<HashMap<Symbol, Vec<Symbol>>> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let mut files = Vec::new();
+        let _ = crate::runtime_files::walk_into("runtime/ruby", "", &mut files);
+        let mut out: HashMap<Symbol, Vec<Symbol>> = HashMap::default();
+        for (_, source) in files.iter().filter(|(p, _)| p.ends_with(".rbs")) {
+            let Ok(classes) = crate::rbs::parse_instance_method_names(source) else { continue };
+            for (class, names) in classes {
+                for method in names {
+                    let owners = out.entry(method).or_default();
+                    if !owners.contains(&class.0) {
+                        owners.push(class.0.clone());
+                    }
+                }
+            }
+        }
+        out
+    });
+    table.get(&Symbol::from(name)).cloned().unwrap_or_default()
+}
+
+fn may_hold_a_core_value(ty: &Ty) -> bool {
+    match ty {
+        Ty::Nil | Ty::SelfInstance | Ty::Relation { .. } | Ty::Date | Ty::Time => false,
+        Ty::Class { id, .. } => matches!(
+            id.0.as_str(),
+            "Object" | "BasicObject" | "Hash" | "Array" | "String" | "Symbol" | "Integer" | "Float" | "Numeric"
+        ),
+        Ty::Union { variants } => variants.iter().any(may_hold_a_core_value),
+        _ => true,
+    }
 }
 
 /// The classes to test with `is_a?`, or None to keep the nil guard.
@@ -306,7 +356,7 @@ fn ancestry(name: &Symbol, parents: &HashMap<Symbol, Symbol>) -> Vec<Symbol> {
     let mut out = vec![name.clone()];
     let mut cur = name.clone();
     // A malformed tree with a parent cycle must not hang the compiler.
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     while let Some(p) = parents.get(&cur) {
         if !seen.insert(p.clone()) {
             break;
@@ -361,7 +411,7 @@ const SYNTHESIZED_ON_EVERY_MODEL: [&str; 1] = ["to_gid_param"];
 /// that spelled the name as a method (`ModNote`, through a `delegate`),
 /// so a logged-in `User` rendered `data-username=''`.
 pub(crate) fn collect_definers(app: &App) -> HashMap<Symbol, HashSet<Symbol>> {
-    let mut out: HashMap<Symbol, HashSet<Symbol>> = HashMap::new();
+    let mut out: HashMap<Symbol, HashSet<Symbol>> = HashMap::default();
     for m in &app.models {
         let owner = m.name.0.clone();
         let mut define = |name: &Symbol| {
@@ -403,7 +453,7 @@ pub(crate) fn collect_definers(app: &App) -> HashMap<Symbol, HashSet<Symbol>> {
 
 /// class -> superclass, over models and library classes both.
 pub(crate) fn collect_parents(app: &App) -> HashMap<Symbol, Symbol> {
-    let mut out = HashMap::new();
+    let mut out = HashMap::default();
     for m in &app.models {
         if let Some(p) = &m.parent {
             out.insert(m.name.0.clone(), p.0.clone());

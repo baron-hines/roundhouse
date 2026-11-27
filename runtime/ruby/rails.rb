@@ -15,6 +15,9 @@
 # backend is wired.
 
 require_relative "active_support_reporters"
+require_relative "active_support_isolated_execution_state"
+require_relative "active_support_notifications"
+require_relative "active_support_configuration_file"
 
 module Rails
   class << self
@@ -66,8 +69,34 @@ module Rails
     AppPath.new("public")
   end
 
+  # Empty, not ported: a gem's command (mission_control-jobs' `Authentication`) only needs its superclass to load.
+  module Command
+    class Base
+    end
+  end
+
   # Plain value object, no Pathname subclassing (the runtime stays
   # statically resolvable).
+  # Not ActiveSupport's gem-path rewriting: a silenced frame never shows it, and only a `:noise` reading would.
+  class BacktraceCleaner
+    APP_DIRS_PATTERN = /\A(?:\.\/)?(?:app|config|lib|test|\(\w+(?:-\w+)*\))/
+    RENDER_TEMPLATE_PATTERN = /:in [`'].*_\w+_{2,3}\d+_\d+'/
+
+    def clean(backtrace, kind = :silent)
+      return backtrace if ENV["BACKTRACE"]
+      root = "#{Dir.pwd}/"
+      filtered = backtrace.map do |line|
+        relative = line.start_with?(root) ? line[root.size, line.size - root.size] : line
+        relative.sub(RENDER_TEMPLATE_PATTERN, "")
+      end
+      case kind
+      when :silent then filtered.select { |line| APP_DIRS_PATTERN.match?(line) }
+      when :noise then filtered.reject { |line| APP_DIRS_PATTERN.match?(line) }
+      else filtered
+      end
+    end
+  end
+
   class AppPath
     def initialize(base)
       @base = base
@@ -75,12 +104,24 @@ module Rails
 
     # Pathname#join takes any number of parts
     # (`Rails.root.join("source", "posts")`), and with none it answers
-    # the path itself.
+    # the path itself. As in Pathname, an absolute part starts the path
+    # over and a separator is not doubled: `Rails.root.join("/var/", "x")`
+    # is `/var/x`.
     def join(*parts)
       if parts.empty?
         self
       else
-        AppPath.new(@base + "/" + parts.join("/"))
+        base = @base
+        parts.each do |part|
+          text = part.to_s
+          if text.start_with?("/")
+            base = text
+          else
+            base = base.chomp("/") while base.end_with?("/")
+            base = base + "/" + text
+          end
+        end
+        AppPath.new(base)
       end
     end
 
@@ -120,6 +161,39 @@ module Rails
     def exist?
       File.exist?(@base)
     end
+
+    # Pathname#expand_path: the absolute path. Here the root is the
+    # directory the app serves from, which `File.expand_path` reads. Rails.root
+    # is absolute, so a directory argument never moves the path, but it is
+    # still converted as File.expand_path converts it (an Integer raises TypeError).
+    def expand_path(dir = nil)
+      path = File.expand_path(@base)
+      AppPath.new(dir.nil? ? path : File.expand_path(path, dir))
+    end
+
+    # Pathname#mkpath (`mkdir -p`): makes each missing directory, leaves an
+    # existing one, raises Errno::EEXIST through a file, answers the path.
+    def mkpath
+      parts = @base.split("/")
+      built = @base.start_with?("/") ? "/" : ""
+      i = 0
+      while i < parts.length
+        part = parts[i]
+        unless part.empty? || part == "."
+          built = built.empty? || built == "/" ? built + part : built + "/" + part
+          unless Dir.exist?(built)
+            begin
+              Dir.mkdir(built)
+            rescue SystemCallError
+              # Another process made it first: fine, as in FileUtils.mkdir_p; a file there still raises.
+              raise unless Dir.exist?(built)
+            end
+          end
+        end
+        i += 1
+      end
+      self
+    end
   end
 
   # One store per process. A fresh `Cache.new` per call would make every
@@ -156,6 +230,11 @@ module Rails
 
   def self.application
     Application.new
+  end
+
+  # Rails' `Rails.configuration`, the application's config.
+  def self.configuration
+    Rails.application.config
   end
 
   # `Rails.env.production?` etc. — a plain object answering the known
@@ -335,6 +414,15 @@ module Rails
       value
     end
 
+    # Rails' `increment(name, amount = 1, expires_in:)`, the call
+    # `rate_limit` makes on the controller's `cache_store` — under that
+    # name, so a test stubbing the store's `increment` is heard. The
+    # counting is `increment_str`'s, which each store behind
+    # `Rails.cache` shards and locks its own way.
+    def increment(key, amount = 1, expires_in: 0)
+      increment_str(key.to_s, amount, expires_in.to_i)
+    end
+
     # A counter in the typed store: the value is the count as decimal
     # text, so the store stays `String → String` on every target. The
     # first increment in a window starts the window — the entry is
@@ -342,14 +430,14 @@ module Rails
     # is what `rate_limit`'s `within:` means (MemoryStore#increment does
     # the same). A whole-store flush at the cap resets every window;
     # that is the bound's shape, not a cost anything pays today.
-    def increment_str(key, ttl)
+    def increment_str(key, amount, ttl)
       k = key.to_s
       hit = read_str(k)
       if hit.nil?
-        write_str(k, "1", ttl)
-        1
+        write_str(k, amount.to_s, ttl)
+        amount
       else
-        n = hit.to_i + 1
+        n = hit.to_i + amount
         @entries[k] = n.to_s
         n
       end
@@ -374,11 +462,16 @@ module Rails
       nil
     end
 
-    def read(key)
+    # `opts` is Rails' entry-options Hash (`expires_in:`, `raw:`,
+    # `namespace:` ...) on every entry call, as on `fetch`. This store
+    # keeps nothing, so there is nothing to read them against; taking
+    # them is what keeps `write(k, v, expires_in: 30.minutes)` from
+    # raising on arity.
+    def read(key, opts = {})
       nil
     end
 
-    def write(key, value)
+    def write(key, value, opts = {})
       value
     end
 
@@ -386,11 +479,11 @@ module Rails
     # `user:<id>:unread_replies` on write paths, and a stale fragment
     # surviving its explicit delete would be a behaviour change, not a
     # missing optimization.
-    def delete(key)
+    def delete(key, opts = {})
       forget(key.to_s)
     end
 
-    def exist?(key)
+    def exist?(key, opts = {})
       false
     end
   end
@@ -420,22 +513,23 @@ module Rails
   # corpus is `Rails.logger.error "..."` (campfire: 7 sites, all
   # rescue-path reports); the lazy block form has no caller and an
   # optional block is its own hazard on the strict targets.
+  # Not a required message: Ruby's Logger takes none (lobsters' seeds write a bare `Rails.logger.debug`).
   class Logger
-    def info(message)
+    def info(message = nil)
       Rails.log_line("[rails] INFO " + message.to_s)
     end
 
-    def error(message)
+    def error(message = nil)
       Rails.log_line("[rails] ERROR " + message.to_s)
     end
 
-    def warn(message)
+    def warn(message = nil)
       Rails.log_line("[rails] WARN " + message.to_s)
     end
 
-    def debug(message); end
+    def debug(message = nil); end
 
-    def fatal(message)
+    def fatal(message = nil)
       Rails.log_line("[rails] FATAL " + message.to_s)
     end
   end
@@ -448,9 +542,8 @@ module Rails
     # DEFAULT, not a stub for un-ingested app config: Rails always has a
     # session cookie name (it derives one from the app name when the app
     # declares none), and the dispatch has to know it before any app code
-    # runs. `config/initializers/session_store.rb`'s
-    # `config.session_store :cookie_store, key: "..."` is lifted at
-    # ingest into a `session_cookie_key` def on the app's
+    # runs. The application class name and `config.session_store`
+    # declarations are lifted at ingest into a `session_cookie_key` def on the app's
     # `Rails::Application` reopen, which is required right after this
     # file and so overrides this default.
     #
@@ -460,6 +553,15 @@ module Rails
     # disagreement clears the session on every request.
     def session_cookie_key
       "_session"
+    end
+
+    # Rails' default with no `config.eager_load`; the app's environments override it on the reopen.
+    def eager_load
+      false
+    end
+
+    def propshaft_asset_path(source)
+      "/assets/#{source}"
     end
 
     # `config.action_controller.forgery_protection_verification_strategy`,
@@ -472,6 +574,70 @@ module Rails
       "header_or_legacy_token"
     end
 
+    # `config.public_file_server.headers`: what the static file server
+    # adds to every `public/` (and `/assets/`) response — the
+    # `Cache-Control` a browser, or a cache in front of the app, keeps a
+    # stylesheet by. Rails' default sends nothing extra; ingest lifts an
+    # app's own Hash into an override on the reopen
+    # (src/ingest/public_file_server_config.rs).
+    def public_file_server_headers
+      {}
+    end
+
+    # The standalone shell for partial trees follows Rails 8.1. An actual
+    # application.rb reopens these with Rails' legacy class defaults when
+    # it has neither load_defaults nor an explicit setting.
+    def action_controller_escape_json_responses
+      false
+    end
+
+    def active_support_escape_js_separators_in_json
+      false
+    end
+
+    def active_support_escape_html_entities_in_json
+      true
+    end
+
+    # `config.action_controller.perform_caching` (AbstractController::
+    # Caching's default) and actionpack-page_caching's
+    # `page_cache_directory` (its Railtie's `||=` with the app's
+    # `public/`). Ingest replays an app's assignments, per environment,
+    # into overrides on the reopen (`ingest::action_controller_caching_config`).
+    def action_controller_perform_caching
+      true
+    end
+
+    def active_job_queue_adapter
+      "async"
+    end
+
+    def action_controller_page_cache_directory
+      Rails.public_path.to_s
+    end
+
+    # Action Cable's three origin settings, as the `/cable` handshake
+    # check reads them (runtime/spinel/request_forgery_protection.rb):
+    # Rails' defaults. Ingest lifts an app's `config.action_cable.*`
+    # assignments, per environment, into overrides on the app's reopen
+    # (`ingest::action_cable_config`), the same shape as
+    # `forgery_protection_verification_strategy`.
+    #
+    # `allowed_request_origins` is unset outside development; in
+    # development Action Cable's engine sets it to
+    # `/https?:\/\/localhost:\d+/`, matched with `===`, so unanchored.
+    def action_cable_origin_listed?(origin)
+      Rails.env.development? && /https?:\/\/localhost:\d+/ === origin
+    end
+
+    def action_cable_allow_same_origin_as_host
+      true
+    end
+
+    def action_cable_disable_request_forgery_protection
+      false
+    end
+
     # Whether forms carry no authenticity token field at all: an app
     # helper overriding ActionView's `token_tag` to answer "" (the shape
     # header-only forgery protection uses) makes it true; ingest
@@ -482,10 +648,11 @@ module Rails
 
     # `GlobalID.app` — the first segment of every `gid://<app>/<Model>/
     # <id>` URI this runtime mints. Rails derives it from the
-    # application's railtie name (`campfire_application` minus the
-    # suffix); ingest reads the module wrapping `class Application <
-    # Rails::Application` in config/application.rb and synthesizes an
-    # override here, exactly as it does for `session_cookie_key`.
+    # application's railtie name minus the `_application` suffix,
+    # dasherized (`my_app_application` -> "my-app"); ingest reads the
+    # class inheriting `Rails::Application` in config/application.rb
+    # and synthesizes an override here, exactly as it does for
+    # `session_cookie_key`.
     #
     # The default is deliberately generic: an app whose config/
     # application.rb ingest could not read still mints well-formed gids,
@@ -551,7 +718,7 @@ module Rails
     # unset, drops the meta tag — the same page Rails renders without
     # credentials configured.
     def credentials
-      {}
+      Credentials.new
     end
 
     # The Rack env defaults every request starts from
@@ -575,10 +742,22 @@ module Rails
     # strict target can call it without a `respond_to?` guard.
     #
     # The value is a Rails zone NAME ("Central Time (US & Canada)"), not
-    # an IANA identifier; `ActiveSupport::RAILS_TZ_TO_IANA` translates,
-    # and main.rb pins ENV["TZ"] from the result before any render.
+    # an IANA identifier; `ActiveSupport::ZONE_NAMES` translates, and the
+    # boot makes it the runtime's default zone before any render.
     def config_time_zone
       "UTC"
+    end
+
+    # `config.filter_parameters`: the keys `request.filtered_parameters`
+    # masks (Rails' `rails new` initializer lists `:passw`, `:token`,
+    # ...). Same framework-default shape as `config_time_zone` above:
+    # Rails' default list is empty, and ingest lifts an app's Symbol and
+    # String filters, each as its String, and its Regexp literals as
+    # written, into an override on the reopen. The signature names
+    # Regexp too: Spinel compiles to the declared element type, and a
+    # Regexp filter typed as a String is silently never applied.
+    def config_filter_parameters
+      []
     end
 
     # `config.active_storage.variable_content_types -= %w[…]` — the
@@ -629,6 +808,211 @@ module Rails
     # none.
     def default_per_page
       25
+    end
+
+    # `Rails.application.config.assets.prefix`. A fresh object each
+    # call is enough: the prefix is a constant, and
+    # `Rails.application` itself is a fresh object per call.
+    def config
+      FrameworkConfig.new
+    end
+
+    # No policy unless an initializer says so. Ingest overrides this
+    # on the app's reopen when `config.content_security_policy` is set.
+    def content_security_policy
+      nil
+    end
+
+    # `config.content_security_policy_nonce_generator`: none unless an initializer sets one, when ingest overrides
+    # these on the app's reopen with the lambda's body.
+    def content_security_policy_nonce_generator?
+      false
+    end
+
+    def content_security_policy_nonce_generated(request)
+      ""
+    end
+
+    # The request's nonce for the view helpers, which have no request of their own: nil outside one, or without a
+    # generator, as Rails' `request&.content_security_policy_nonce` is.
+    def content_security_policy_nonce_current
+      # Not the request first: a tree that serves no request (a helper unit) loads no `ActionController::Current`.
+      return nil unless content_security_policy_nonce_generator?
+      req = ActionController::Current.request
+      req.nil? ? nil : req.content_security_policy_nonce
+    end
+
+    # Rails' DEFAULT_NONCE_DIRECTIVES, where the app names none.
+    def content_security_policy_nonce_directives
+      ["script-src", "style-src"]
+    end
+
+    # `Rails.application.importmap`. Paths are already `/assets/…`
+    # from ingest; `to_json` ignores the resolver. The string is the
+    # pretty script body the layout embeds, because a CSP hash of a
+    # compact encoding does not match the page.
+    def importmap
+      ImportmapMap.new
+    end
+
+    # Override on the app reopen when `config/importmap.rb` has pins.
+    # That override is the pretty script body. This default is only
+    # the empty map an app with no pins would hash, and no page embeds it.
+    def importmap_json
+      "{\"imports\":{}}"
+    end
+  end
+
+  # `Rails.application.credentials` with nothing configured: Rails' `EncryptedConfiguration`, whose every key reads
+  # nil (`credentials.secret_key_base`, `credentials[:vapid]`, `credentials.dig(:vapid, :public_key)`), and whose
+  # `fetch` of a key it does not hold answers its block, else its default, else raises, as a Hash's does.
+  class Credentials
+    def secret_key_base
+      nil
+    end
+
+    def [](key)
+      nil
+    end
+
+    def dig(*keys)
+      nil
+    end
+
+    def fetch(key, *default, &block)
+      return block.call(key) unless block.nil?
+      raise KeyError, "key not found: #{key.inspect}" if default.empty?
+      default[0]
+    end
+
+    def key?(key)
+      false
+    end
+
+    def has_key?(key)
+      false
+    end
+
+    def include?(key)
+      false
+    end
+
+    def keys
+      []
+    end
+
+    def values
+      []
+    end
+
+    def to_h
+      {}
+    end
+
+    def config
+      {}
+    end
+
+    def merge(other)
+      other
+    end
+
+    def each
+      self
+    end
+
+    def empty?
+      true
+    end
+
+    def any?
+      false
+    end
+
+    def present?
+      false
+    end
+
+    def blank?
+      true
+    end
+
+    def nil?
+      false
+    end
+  end
+
+  class AssetConfig
+    def prefix
+      "/assets"
+    end
+  end
+
+  class FrameworkConfig
+    def initialize
+      @assets = AssetConfig.new
+      @action_controller = ActionControllerOptions.new
+    end
+
+    def assets
+      @assets
+    end
+
+    def relative_url_root
+      ENV["RAILS_RELATIVE_URL_ROOT"]
+    end
+
+    # `config.eager_load`, per environment from config/environments (`ingest::action_controller_caching_config`).
+    def eager_load
+      Rails.application.eager_load
+    end
+
+    def action_controller
+      @action_controller
+    end
+
+    def action_dispatch
+      ActionDispatchOptions.new
+    end
+
+    # `config.session_options`, what `config.session_store` was given: the cookie's name alone, as ingest lifts no
+    # other option (`path:`, `domain:`, `secure:` are not read, and a cookie a gem scopes by them takes none).
+    def session_options
+      { key: Rails.application.session_cookie_key }
+    end
+
+    # `Rails.application.config.filter_parameters` read at run time. The
+    # list is the one ingest lifts from the app's `config.filter_parameters`.
+    def filter_parameters
+      Rails.application.config_filter_parameters
+    end
+  end
+
+  # The salts are Rails' defaults: the cookie jars derive with these, whatever an app assigns to them.
+  class ActionDispatchOptions
+    def cookies_rotations
+      ActiveSupport::Messages::RotationConfiguration.shared
+    end
+
+    def signed_cookie_salt
+      ActionController::MessageVerifier::SIGNED_COOKIE_SALT
+    end
+
+    def authenticated_encrypted_cookie_salt
+      ActionController::MessageEncryptor::SALT
+    end
+  end
+
+  # Not ActionController::ControllerConfig: that one is the Ruby family's alone, and this config is every target's.
+  class ActionControllerOptions
+    def relative_url_root
+      Rails.application.config.relative_url_root
+    end
+  end
+
+  class ImportmapMap
+    def to_json(resolver: nil)
+      Rails.application.importmap_json
     end
   end
 end

@@ -21,8 +21,26 @@ use crate::ty::Ty;
 /// The source reference names a modeled class or module. The Ruby emitter
 /// uses its resolved `Ty::Class` when it changes lexical nesting.
 pub const RESOLVED_CLASS_REF: u64 = 1 << 2;
+/// An empty `{}` / `[]` seed whose type a later write in its body refined and stamped back: the next analysis of
+/// the body starts it from that stamp less its unknown arms, which an earlier round's untyped ivars left there.
+pub const REFINED_EMPTY_SEED: u64 = 1 << 45;
+/// A receiverless call the source wrote with empty parentheses (`h()`): the Ruby emit keeps them, as bare the name
+/// reads a local of the same name. A synthesized call's `parenthesized` is a default and says nothing.
+pub const WRITTEN_EMPTY_PARENS: u64 = 1 << 46;
+/// An `include M` written in a Concern's `class_methods do … end`: Ruby's ClassMethods includes M, so M's methods are
+/// the includer's class methods (`ingest::app::class_methods_includes` copies them onto the Concern's class side).
+pub const CLASS_METHODS_INCLUDE: u64 = 1 << 47;
 /// The value is a proven class/module object, rather than a nominal instance.
 pub const CLASS_OBJECT_VALUE: u64 = 1 << 5;
+/// The receiver of `base.extend(M)` in a module's `extended(base)` hook: the class Ruby hands the hook, so the
+/// `extend` is that class's, not `Object#extend` (`lower::object_extend`).
+pub const MIXIN_HOOK_BASE: u64 = 1 << 41;
+/// Positive instance provenance for generated model-indexer key lowering.
+/// A nominal `Ty::Class` alone is not instance evidence.
+pub const INDEXER_INSTANCE_VALUE: u64 = 1 << 39;
+/// A class-valued query, possibly an unknown subclass. Unlike
+/// `CLASS_OBJECT_VALUE`, this does not establish exact class identity.
+pub const INDEXER_CLASS_QUERY_VALUE: u64 = 1 << 38;
 /// This receiver's operator call is backed by a registered method definition.
 pub const RESOLVED_OPERATOR_RECEIVER: u64 = 1 << 6;
 /// The cast's type was declared by source, rather than synthesized by lowering.
@@ -81,6 +99,166 @@ pub const SELF_BINDING_CLASS_OBJECT: u64 = 1 << 15;
 
 /// The `defaults.merge(hash)` ingest wrote for `hash.reverse_merge(defaults)`.
 pub const REVERSE_MERGE: u64 = 1 << 16;
+
+/// A `t` in a controller's copy of an `app/helpers` method no controller
+/// calls: it only ever runs in the view, so it is ActionView's `t`.
+pub const HELPER_COPY_TRANSLATE: u64 = 1 << 17;
+
+/// A `t` in an `app/helpers` module's own body (or a parameter default),
+/// which the analyzer types with an includer as `self`: ActionView's `t`
+/// all the same.
+pub const HELPER_BODY_TRANSLATE: u64 = 1 << 18;
+
+/// A model's class-body `extend AppModule`, or a call after it to that
+/// module's own method (`load_settings(…)`): app code the Ruby family
+/// replays where the source has it (`ingest::app_extension_calls`).
+pub const REPLAYED_CLASS_BODY: u64 = 1 << 19;
+
+/// A model's class-body `prepend Concern`, whose `prepended do` items the
+/// concern splice carried into the body and whose line the Ruby family
+/// writes back (the module's instance methods then sit ahead of the
+/// class's own, reaching them through `super`).
+pub const CONCERN_PREPEND: u64 = 1 << 60;
+
+/// A value-only inherited call: non-Ruby targets retain their previous warning.
+pub const INHERITED_CLASS_BODY: u64 = 1 << 52;
+
+/// A model's `private :has_role?` naming a method its body does not
+/// define (generated, a superclass's or a gem's): kept as a statement for
+/// the lowering to apply and the analyzer to enforce.
+pub const INHERITED_VISIBILITY: u64 = 1 << 20;
+
+/// `time_calendar` renamed a zero-arg `iso8601` to `to_rfc3339`. Later
+/// re-analysis can widen the receiver (`minimum(:col) || Time.utc`), so
+/// emitters cannot rediscover the rename from the type alone. Ruby prints
+/// `iso8601`; the other targets keep their time-format mapping.
+pub const GROUNDED_TIME_FORMAT: u64 = 1 << 21;
+
+/// `written_names` has applied Rubydex to this mixin path. The stored
+/// spelling is the answer, including when Rubydex left a short name
+/// because the reference is top-level. Absent on a per-file ingest,
+/// which never ran that pass.
+pub const RESOLVED_MIXIN: u64 = 1 << 22;
+
+/// Analysis admitted this send as a read-only Module query (`const_defined?`,
+/// `include?`, …) on a class object, which only the ruby family and spinel
+/// can ask; `project::report_unsupported_bundled_constants` reports it elsewhere.
+pub const MODULE_QUERY: u64 = 1 << 23;
+
+/// A runtime Class/Module factory or implicit singleton-class access.
+/// The Ruby and JRuby targets retain these runtime class objects.
+pub const RUNTIME_CLASS_OBJECT: u64 = 1 << 31;
+
+/// The call an `alias new builtin` delegates to (`ingest::library_class::
+/// OBJECT_BUILTINS`): a method every Ruby object answers, which only the
+/// ruby family has; `project::report_builtin_aliases` refuses it elsewhere.
+pub const BUILTIN_ALIAS: u64 = 1 << 26;
+
+/// The owner read an association build captures into its temp
+/// (`rh_build_owner_N = @article`): it stands in for the receiver of the
+/// `@article.x` the build replaced, which read the owner unconditionally.
+pub const BUILD_OWNER: u64 = 1 << 24;
+
+/// A constant path whose parent is a value (`self.class::KINDS`), ingested
+/// as the analysis' `const_get(:KINDS)`. The ruby family writes it back as
+/// the path: `const_get` also finds a top-level constant, which `::` does
+/// not (`Base::String` raises).
+pub const CONST_PATH: u64 = 1 << 25;
+
+/// A library class or module body statement only Ruby itself answers:
+/// a loop that `class_eval`s or `define_method`s, a call to a core
+/// `Module` method (`freeze`), a write through a class-side writer the
+/// class or an ancestor defines (`ingest::body_statements`). The Ruby
+/// and JRuby trees write it back where the source has it, among the
+/// class's methods; every other target drops it and reports it.
+pub const BODY_STATEMENT: u64 = 1 << 27;
+
+/// A library class or module body statement that calls a method on a
+/// constant the same body assigns (`SWATCHES.push(Swatch.new("teal"))`),
+/// making only calls the app answers (`ingest::body_statements`). Plain
+/// Ruby every Ruby-family tree runs, Spinel's too, so each writes it back
+/// where the source has it, among the constants it reads and writes.
+pub const CONSTANT_STATEMENT: u64 = 1 << 40;
+
+/// On a body statement or a constant's value: the source wrote it inside
+/// the class's own `class << self`, where Ruby runs it with the singleton
+/// class as `self` and puts a constant on the singleton class
+/// (`X.singleton_class.constants`, not `X.constants`). The Ruby and JRuby
+/// trees write it back inside a `class << self`; other targets keep the
+/// constant on the class.
+pub const SINGLETON_BODY: u64 = 1 << 28;
+
+/// On a `Const` the analyzer qualified to a constant of `X`'s
+/// `class << self` (Rubydex's `X::<X>::NAME`): the Ruby and JRuby trees
+/// read it as `X.singleton_class::NAME`, where it lives.
+pub const SINGLETON_CONSTANT_REF: u64 = 1 << 29;
+
+/// Analysis admitted this receiverless send as Kernel's `Rational(...)`,
+/// `Pathname(...)` or `URI(...)`: its own class, on its own side, defines
+/// no method of that name. Only the ruby family and spinel have the
+/// libraries, so `project::report_ruby_only_sends` refuses it elsewhere.
+/// The mark stays when lowering spells `Pathname(x)` as `Pathname.new(x)`.
+pub const KERNEL_CONVERSION: u64 = 1 << 30;
+
+/// Analysis dispatched this receiverless Kernel-named send (`puts`, `load`, …)
+/// to its own class's method on that side: no target maps it to a builtin.
+pub const APP_KERNEL_NAME: u64 = 1 << 59;
+
+/// On the body of a method `ingest::inherited_alias::resolve` copied
+/// from an ancestor for an `alias` of it: the Ruby family writes the
+/// captured `alias_method` back instead, and drops the copy.
+pub const INHERITED_ALIAS_COPY: u64 = 1 << 36;
+
+/// A source-resolved library call whose native keyword ABI is preserved.
+pub const NATIVE_KEYWORD_ARGUMENTS: u64 = 1 << 35;
+/// A retained finder dispatch: subclass arms are explicit, or hook ownership
+/// is unknown. Later registries must not relicense a framework rewrite.
+/// Bits 36–39 belong to inherited aliases, format variants and indexer
+/// decisions. Bits 40–47 are reserved for future decision groups, so finder
+/// decisions start at 48.
+pub const FINDER_DISPATCH_FALLBACK: u64 = 1 << 48;
+/// Ingest qualified a bare model finder; a runtime relation keeps its late-bound self.
+pub const IMPLICIT_MODEL_FINDER_RECEIVER: u64 = 1 << 49;
+/// Unknown-hook dynamic dispatch has no established emitted implementation.
+pub const FINDER_IMPLEMENTATION_UNKNOWN: u64 = 1 << 50;
+/// A bare constant read in a `class << self` body: Ruby looks it up from the singleton class, not the class.
+pub const SINGLETON_CREF_CONST_REF: u64 = 1 << 51;
+/// A `raise NameError` standing for such a read Ruby itself cannot resolve.
+pub const SINGLETON_NAME_ERROR: u64 = 1 << 53;
+/// A constant read the code expects may be absent: under a rescue of
+/// StandardError, or after a `return … unless defined?(…)` of its root.
+pub const ABSENCE_GUARDED: u64 = 1 << 54;
+/// A `raise NameError` standing for such a read of a constant nothing defines.
+pub const GUARDED_NAME_ERROR: u64 = 1 << 55;
+/// A nested `def` in a method no call reaches: its load-time calls were expanded in place.
+pub const UNCALLED_DEFINER: u64 = 1 << 56;
+/// An integer literal wider than 64 bits, built from 32-bit limbs: the ruby family's Integer holds it, a fixed-width one does not.
+pub const WIDE_INTEGER_LITERAL: u64 = 1 << 57;
+/// The body ingest read an `ActiveRecord::Base.connected_to(role: :writing)` block as, the call dropped. An app that
+/// switches roles gets the call back (`ingest::database_ownership`): inside a reading block it is what lifts the guard.
+pub const ERASED_WRITING_SCOPE: u64 = 1 << 61;
+/// On an argument analyze typed as the relation a has_many read is (`analyze::relation_params`): the read the lowering seeds.
+pub const RELATION_ARGUMENT: u64 = 1 << 42;
+/// On an operator's receiver whose non-nil arm defines the operator (`Money? * 2`): Ruby raises only for nil.
+pub const NILABLE_OPERATOR_RECEIVER: u64 = 1 << 43;
+/// On a number operator's operand whose class defines `coerce` and the operator (`2.5 * money`): Ruby asks the
+/// operand to coerce, and its own operator answers.
+pub const COERCED_OPERAND: u64 = 1 << 44;
+/// On `x ||= v` where analyze typed the local `x` as never nil nor false: Ruby never assigns, so `v` is dead.
+pub const DEAD_OR_ASSIGN: u64 = 1 << 58;
+/// A class-body `include M` / `prepend M` standing for a file's top-level `X.include(M)` / `X.prepend(M)`: the
+/// opening of `X` it sits in waits for `X`'s declaration to give it its kind (`ingest::top_level_mixins`).
+pub const TOP_LEVEL_MIXIN: u64 = 1 << 62;
+/// A read of a platform's own constant (`Socket::SOL_TCP`) in a load-time branch its `Socket.const_defined?` guards:
+/// it runs only where the platform defines it (`ingest::platform_guards`).
+pub const PLATFORM_GUARDED_CONST: u64 = 1 << 63;
+
+/// On a route-helper call `lower::route_format_suffix` renamed for its
+/// literal `format:` (`widget_url(w, format: :json)` to
+/// `widget_json_url(w)`): the only calls `routes_to_library` builds a
+/// format variant for. A `<route>_<word>_url` written in the source is
+/// not a Rails helper, whatever it splits into.
+pub const FORMAT_VARIANT_CALL: u64 = 1 << 37;
 
 /// Whether `expr` is a [`SELF_BINDING`] cast.
 pub fn is_self_binding(expr: &Expr) -> bool {
@@ -161,6 +339,32 @@ pub struct Expr {
     /// at ingest time.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub leading_blank_line: bool,
+    /// Rarely-set annotations (`diagnostic`, `hint`), boxed so a node
+    /// that has none of them pays one pointer. Read them through
+    /// [`Expr::diagnostic`] and [`Expr::hint`]; write them through
+    /// [`Expr::set_diagnostic`] and [`Expr::set_hint`], which drop the box
+    /// again once both are `None`. Flattened, so the serialized shape is
+    /// unchanged.
+    #[serde(flatten, default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_cold")]
+    pub cold: Option<Box<ExprCold>>,
+    /// Bit-packed source facts and target decisions. Bits 0–31 are
+    /// cross-target (`NEEDS_PARENS`, `LAST_USE`, source-resolution facts);
+    /// the analyzer sets source facts and the decide passes set the rest.
+    /// Bits 32–63 are per-target-local (e.g. rust's `OWNED`,
+    /// `CLONE_AT`). See `src/emit/rust/decide/bits.rs` for the
+    /// rust bit allocation. Default `0` = "no decisions" — emitters
+    /// that don't run a decide pass see no behavioral change.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub decisions: u64,
+}
+
+/// The annotations most nodes never carry, stored behind
+/// [`Expr::cold`]. Inline, `diagnostic` alone made up over half of every
+/// `Expr`, and each node pays for `Expr` about four times over: once in
+/// its parent and three times inside its boxed `ExprNode`, whose largest
+/// variants hold three `Expr`s.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ExprCold {
     /// Analyzer-set diagnostic annotation — present when the body-
     /// typer detected a user error (Incompatible `+`, etc.) at this
     /// site. Emitters read this first on the expr: if set, they
@@ -176,16 +380,98 @@ pub struct Expr {
     /// nothing tagged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<IrHint>,
-    /// Bit-packed source facts and target decisions. Bits 0–31 are
-    /// cross-target (`NEEDS_PARENS`, `LAST_USE`, source-resolution facts);
-    /// the analyzer sets source facts and the decide passes set the rest.
-    /// Bits 32–63 are per-target-local (e.g. rust's `OWNED`,
-    /// `CLONE_AT`). See `src/emit/rust/decide/bits.rs` for the
-    /// rust bit allocation. Default `0` = "no decisions" — emitters
-    /// that don't run a decide pass see no behavioral change.
-    #[serde(default, skip_serializing_if = "is_zero_u64")]
-    pub decisions: u64,
+    /// The method `ingest` parsed for a `def` at expression position.
+    /// The node stays the nil that carries the nested-def diagnostic;
+    /// this is that same parse, so a hoist does not read the source again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nested_def: Option<crate::dialect::MethodDef>,
 }
+
+static EMPTY_COLD: ExprCold = ExprCold {
+    diagnostic: None,
+    hint: None,
+    nested_def: None,
+};
+
+impl ExprCold {
+    fn is_empty(&self) -> bool {
+        self.diagnostic.is_none() && self.hint.is_none() && self.nested_def.is_none()
+    }
+
+    /// Apply `f` to the annotations in `slot` (an [`Expr::cold`] field),
+    /// allocating the box only when `f` leaves something set and
+    /// dropping it when nothing is. Takes the field rather than the
+    /// `Expr` so callers holding a borrow of `node` can still write.
+    pub fn update(slot: &mut Option<Box<ExprCold>>, f: impl FnOnce(&mut ExprCold)) {
+        match slot {
+            Some(cold) => {
+                f(cold);
+                if cold.is_empty() {
+                    *slot = None;
+                }
+            }
+            None => {
+                let mut cold = ExprCold::default();
+                f(&mut cold);
+                if !cold.is_empty() {
+                    *slot = Some(Box::new(cold));
+                }
+            }
+        }
+    }
+
+    /// The annotations in `slot`; all `None` when it is empty.
+    pub fn of(slot: &Option<Box<ExprCold>>) -> &ExprCold {
+        slot.as_deref().unwrap_or(&EMPTY_COLD)
+    }
+
+    /// Field-level forms of [`Expr::diagnostic`] / [`Expr::set_diagnostic`]
+    /// and the hint equivalents, for callers that hold a borrow of the
+    /// node while reading or writing an annotation.
+    pub fn diagnostic(slot: &Option<Box<ExprCold>>) -> &Option<DiagnosticKind> {
+        &Self::of(slot).diagnostic
+    }
+
+    pub fn set_diagnostic(slot: &mut Option<Box<ExprCold>>, diagnostic: Option<DiagnosticKind>) {
+        Self::update(slot, |c| c.diagnostic = diagnostic);
+    }
+
+    /// Field-level form of [`Expr::diagnostic_mut`]; allocates the box.
+    pub fn diagnostic_mut(slot: &mut Option<Box<ExprCold>>) -> &mut Option<DiagnosticKind> {
+        &mut slot.get_or_insert_with(Default::default).diagnostic
+    }
+
+    pub fn hint(slot: &Option<Box<ExprCold>>) -> &Option<IrHint> {
+        &Self::of(slot).hint
+    }
+
+    pub fn set_hint(slot: &mut Option<Box<ExprCold>>, hint: Option<IrHint>) {
+        Self::update(slot, |c| c.hint = hint);
+    }
+}
+
+/// A flattened `Option` deserializes as `Some` even when none of its
+/// fields are present, which would give every node read back an empty
+/// box. Read an empty one as `None`.
+fn deserialize_cold<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Box<ExprCold>>, D::Error> {
+    let cold = ExprCold::deserialize(d)?;
+    Ok(if cold.is_empty() { None } else { Some(Box::new(cold)) })
+}
+
+// A field that grows `Expr` grows every tree about fourfold (see
+// `ExprCold`). Put rare data in `ExprCold` instead of raising these.
+// Every node is one `ExprNode` allocation, and the allocator (mimalloc)
+// rounds it up to a size class: 248 bytes take the 256 class, past 256 a
+// node takes 320 (296 took 320, 392 took 448). The largest variants are
+// `If` (three `Expr`s) and `OpAssign`; rare large payloads are boxed
+// (`Ty::Fn`, `BeginRescue`'s `else_branch` and `ensure`). `Ty` sits
+// inline in `Expr::ty`.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<Expr>() <= 80);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<ExprNode>() <= 256);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<crate::ty::Ty>() <= 32);
 
 fn is_zero_u64(v: &u64) -> bool {
     *v == 0
@@ -201,8 +487,7 @@ impl PartialEq for Expr {
             && self.ty == other.ty
             && self.effects == other.effects
             && self.leading_blank_line == other.leading_blank_line
-            && self.diagnostic == other.diagnostic
-            && self.hint == other.hint
+            && self.cold() == other.cold()
             && self.decisions == other.decisions
     }
 }
@@ -215,10 +500,70 @@ impl Expr {
             ty: None,
             effects: EffectSet::pure(),
             leading_blank_line: false,
-            diagnostic: None,
-            hint: None,
+            cold: None,
             decisions: 0,
         }
+    }
+
+    /// The rarely-set annotations; all `None` when the node has none.
+    pub fn cold(&self) -> &ExprCold {
+        ExprCold::of(&self.cold)
+    }
+
+    /// The analyzer's diagnostic annotation, if any.
+    pub fn diagnostic(&self) -> &Option<DiagnosticKind> {
+        &self.cold().diagnostic
+    }
+
+    /// Set or clear the diagnostic annotation.
+    pub fn set_diagnostic(&mut self, diagnostic: Option<DiagnosticKind>) {
+        ExprCold::set_diagnostic(&mut self.cold, diagnostic);
+    }
+
+    /// Mutable access to the diagnostic annotation. Allocates the cold
+    /// box, so prefer [`Expr::set_diagnostic`] when only writing.
+    pub fn diagnostic_mut(&mut self) -> &mut Option<DiagnosticKind> {
+        ExprCold::diagnostic_mut(&mut self.cold)
+    }
+
+    /// Remove and return the diagnostic annotation.
+    pub fn take_diagnostic(&mut self) -> Option<DiagnosticKind> {
+        let mut taken = None;
+        ExprCold::update(&mut self.cold, |c| taken = c.diagnostic.take());
+        taken
+    }
+
+    /// The cross-target intent annotation, if any.
+    pub fn hint(&self) -> &Option<IrHint> {
+        &self.cold().hint
+    }
+
+    /// Set or clear the cross-target intent annotation.
+    pub fn set_hint(&mut self, hint: Option<IrHint>) {
+        ExprCold::set_hint(&mut self.cold, hint);
+    }
+
+    /// Mutable access to the hint annotation. Allocates the cold box,
+    /// so prefer [`Expr::set_hint`] when only writing.
+    pub fn hint_mut(&mut self) -> &mut Option<IrHint> {
+        &mut self.cold.get_or_insert_with(Default::default).hint
+    }
+
+    /// Remove and return the hint annotation.
+    pub fn take_hint(&mut self) -> Option<IrHint> {
+        let mut taken = None;
+        ExprCold::update(&mut self.cold, |c| taken = c.hint.take());
+        taken
+    }
+
+    /// The method parsed at a nested `def`, when ingest kept one.
+    pub fn nested_def(&self) -> Option<&crate::dialect::MethodDef> {
+        self.cold().nested_def.as_ref()
+    }
+
+    /// Remember the method ingest parsed for this nested `def`.
+    pub fn set_nested_def(&mut self, method: crate::dialect::MethodDef) {
+        ExprCold::update(&mut self.cold, |c| c.nested_def = Some(method));
     }
 
     /// Provenance backfill for lowerer-synthesized subtrees: every node
@@ -569,11 +914,15 @@ pub enum ExprNode {
     /// `RescueModifier` instead. An `implicit` begin arises when a
     /// `def` body contains trailing `rescue` clauses — same shape, no
     /// surface `begin` keyword.
+    ///
+    /// `else_branch` and `ensure` are boxed: inline they made this rare
+    /// variant (0.35% of nodes) the largest, and so the size of every
+    /// `ExprNode`.
     BeginRescue {
         body: Expr,
         rescues: Vec<RescueClause>,
-        else_branch: Option<Expr>,
-        ensure: Option<Expr>,
+        else_branch: Option<Box<Expr>>,
+        ensure: Option<Box<Expr>>,
         #[serde(default)]
         implicit: bool,
     },
@@ -1636,5 +1985,59 @@ mod tests {
         let mut e = var("x", Span::synthetic());
         e.inherit_span(Span::synthetic());
         assert!(e.span.is_synthetic());
+    }
+}
+
+#[cfg(test)]
+mod cold_tests {
+    use super::{Expr, ExprNode, IrHint, Literal};
+    use crate::diagnostic::DiagnosticKind;
+    use crate::span::Span;
+
+    fn nil() -> Expr {
+        Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil })
+    }
+
+    /// A node with no rare annotations carries no cold box, writes
+    /// none of their keys, and reads back without allocating one.
+    #[test]
+    fn absent_annotations_round_trip_without_a_box() {
+        let e = nil();
+        assert!(e.cold.is_none());
+        let json = serde_json::to_value(&e).unwrap();
+        assert!(json.get("diagnostic").is_none() && json.get("hint").is_none());
+        let back: Expr = serde_json::from_value(json.clone()).unwrap();
+        assert!(back.cold.is_none());
+        assert_eq!(serde_json::to_value(&back).unwrap(), json);
+    }
+
+    /// Set annotations serialize flat, beside `node`, and survive a
+    /// round trip.
+    #[test]
+    fn present_annotations_round_trip_flat() {
+        let mut e = nil();
+        e.set_diagnostic(Some(DiagnosticKind::Parse { message: "m".into() }));
+        e.set_hint(Some(IrHint::MutableStringLiteral));
+        let json = serde_json::to_value(&e).unwrap();
+        assert!(json.get("diagnostic").is_some() && json.get("hint").is_some());
+        assert!(json.get("cold").is_none());
+        let back: Expr = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(back.diagnostic(), e.diagnostic());
+        assert_eq!(back.hint(), &Some(IrHint::MutableStringLiteral));
+        assert_eq!(serde_json::to_value(&back).unwrap(), json);
+    }
+
+    /// Clearing the last annotation drops the box.
+    #[test]
+    fn cold_box_dropped_when_emptied() {
+        let mut e = nil();
+        e.set_hint(Some(IrHint::MutableStringLiteral));
+        e.set_diagnostic(Some(DiagnosticKind::Parse { message: "m".into() }));
+        e.set_hint(None);
+        assert!(e.cold.is_some());
+        assert!(e.take_diagnostic().is_some());
+        assert!(e.cold.is_none());
+        e.set_diagnostic(None);
+        assert!(e.cold.is_none());
     }
 }

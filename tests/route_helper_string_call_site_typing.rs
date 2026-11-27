@@ -25,7 +25,7 @@
 
 use roundhouse::ingest::ingest_app_from_tree;
 use roundhouse::lower::lower_routes_to_library_functions;
-use roundhouse::ty::Ty;
+use roundhouse::ty::{FnTy, Ty};
 
 const SCHEMA: &str = "ActiveRecord::Schema.define(version: 1) do\n  \
     create_table :articles do |t|\n    t.string :title\n  end\nend\n";
@@ -70,8 +70,9 @@ fn helper_params(name: &str) -> Vec<roundhouse::ty::Param> {
         .unwrap_or_else(|| panic!("helper {name} not generated"))
         .signature
         .expect("helper signature");
-    let Ty::Fn { params, .. } = sig else { panic!("helper signature is not Ty::Fn") };
-    params
+    let Ty::Fn(fn_ty) = sig else { panic!("helper signature is not Ty::Fn") };
+    let FnTy { params, .. } = *fn_ty;
+    params.to_vec()
 }
 
 #[test]
@@ -79,7 +80,7 @@ fn string_call_site_retypes_an_id_segment() {
     let params = helper_params("qr_code_path");
     assert_eq!(params[0].name.as_str(), "id");
     assert!(
-        matches!(params[0].ty, Ty::Str),
+        matches!(*params[0].ty, Ty::Str),
         "an `id` segment a call site fills with a String must type Str, got {:?}",
         params[0].ty
     );
@@ -90,7 +91,7 @@ fn an_id_call_site_keeps_the_integer_default() {
     let params = helper_params("article_path");
     assert_eq!(params[0].name.as_str(), "id");
     assert!(
-        matches!(params[0].ty, Ty::Int),
+        matches!(*params[0].ty, Ty::Int),
         "a model-backed `id` segment must stay Int, got {:?}",
         params[0].ty
     );
@@ -172,10 +173,11 @@ end
         .expect("transfer_path not generated")
         .signature
         .expect("helper signature");
-    let Ty::Fn { params, .. } = sig else { panic!("not Ty::Fn") };
+    let Ty::Fn(fn_ty) = sig else { panic!("not Ty::Fn") };
+    let FnTy { params, .. } = *fn_ty;
     assert_eq!(params[0].name.as_str(), "id");
     assert!(
-        matches!(params[0].ty, Ty::Str),
+        matches!(*params[0].ty, Ty::Str),
         "a segment filled by a concern's signed id must type Str, got {:?}",
         params[0].ty
     );
@@ -213,7 +215,7 @@ fn a_direct_helpers_route_for_is_a_call_site() {
     );
     assert_eq!(params[0].name.as_str(), "user_id");
     assert!(
-        matches!(params[0].ty, Ty::Str),
+        matches!(*params[0].ty, Ty::Str),
         "a segment a `direct` block fills with a signed id must type Str, got {:?}",
         params[0].ty
     );
@@ -248,7 +250,7 @@ fn an_untyped_call_site_does_not_poison_the_direct_seed() {
            end\nend\n",
     );
     assert!(
-        matches!(params[0].ty, Ty::Str),
+        matches!(*params[0].ty, Ty::Str),
         "an untyped caller must not outvote the typed ones, got {:?}",
         params[0].ty
     );
@@ -301,6 +303,7 @@ end
         .expect("user_avatar_path not generated")
         .signature
         .expect("helper signature");
-    let Ty::Fn { params, .. } = sig else { panic!("not Ty::Fn") };
-    params
+    let Ty::Fn(fn_ty) = sig else { panic!("not Ty::Fn") };
+    let FnTy { params, .. } = *fn_ty;
+    params.to_vec()
 }

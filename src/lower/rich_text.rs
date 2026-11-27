@@ -147,10 +147,11 @@ pub fn synthesize_record_model(app: &mut App) {
     // `belongs_to :record, polymorphic: true` is declared (rather than
     // written out) because the has_one side is what needed the scope.
     //
-    // `polymorphic_targets` stays empty on purpose: it is filled by
-    // `resolve_polymorphic_targets` from the inverse `as:` declarations,
-    // and no model declares `has_one … as: :record` in source — the
-    // owner side is this file's own expansion. With an empty implementor
+    // `polymorphic_targets` stays empty on purpose: this record is
+    // synthesized after `resolve_polymorphic_targets` has filled every
+    // app model's sets (from inverse `as:` declarations, else any
+    // model), and no model declares `has_one … as: :record` in source —
+    // the owner side is this file's own expansion. With an empty implementor
     // set, association lowering skips both the type-switched reader and
     // the monomorphic `Record.find_by` fallback (which would NameError),
     // so `rich_text.record` stays un-synthesized and typed gradual —
@@ -161,6 +162,7 @@ pub fn synthesize_record_model(app: &mut App) {
             name: Symbol::from("record"),
             target: ClassId(Symbol::from("Record")),
             foreign_key: Symbol::from("record_id"),
+            foreign_key_explicit: false,
             optional: false,
             polymorphic: true,
             polymorphic_targets: Vec::new(),
@@ -168,6 +170,7 @@ pub fn synthesize_record_model(app: &mut App) {
             touch: None,
             foreign_type: None,
             primary_key: None,
+            scope: None,
         },
         leading_comments: Vec::new(),
         leading_blank_line: false,
@@ -210,6 +213,8 @@ pub fn synthesize_record_model(app: &mut App) {
     }
     app.models.push(Model {
         sti_subclass_names: Vec::new(),
+        mixin_sends: Vec::new(),
+        select_aliases: Vec::new(),
         i18n: Default::default(),
         name: class,
         parent: Some(ClassId(Symbol::from("ApplicationRecord"))),
@@ -283,7 +288,7 @@ pub(crate) fn push_rich_text_methods(methods: &mut Vec<MethodDef>, model: &Model
 /// asks for plain text.
 fn push_record_methods(methods: &mut Vec<MethodDef>, model: &Model) {
     let body_col = Symbol::from("body");
-    let content_ty = Ty::Class { id: content_class(), args: vec![] };
+    let content_ty = Ty::Class { id: content_class(), args: vec![].into() };
 
     // def _sync_embeds
     //   embeds._sync_blob_ids(body.attachable_ids("ActiveStorage::Blob")) unless @body.to_s.strip.empty?
@@ -513,8 +518,8 @@ fn push_owner_methods(methods: &mut Vec<MethodDef>, model: &Model, attr: &Symbol
     let builder = Symbol::from(format!("build_rich_text_{}", attr.as_str()));
     let cache = Symbol::from(format!("__rich_text_{}", attr.as_str()));
     let loaded = Symbol::from(format!("__rich_text_{}_loaded", attr.as_str()));
-    let record_ty = Ty::Class { id: record_class(), args: vec![] };
-    let maybe_record = Ty::Union { variants: vec![record_ty.clone(), Ty::Nil] };
+    let record_ty = Ty::Class { id: record_class(), args: vec![].into() };
+    let maybe_record = Ty::Union { variants: vec![record_ty.clone(), Ty::Nil].into() };
     let push = super::model_to_library::push_synth_instance_method;
 
     // The association reader, with Rails' load-once semantics. The

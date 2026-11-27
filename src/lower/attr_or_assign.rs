@@ -82,9 +82,13 @@ pub(crate) fn rewrite_node(expr: &mut Expr) {
     );
     write.ty = value.ty.clone();
     let ty = expr.ty.clone();
+    // Where a class body runs the statement stays where the rewrite runs it.
+    let placement = expr.decisions
+        & (crate::expr::REPLAYED_CLASS_BODY | crate::expr::BODY_STATEMENT | crate::expr::SINGLETON_BODY);
     *expr = Expr::new(
         span,
         ExprNode::BoolOp { op: kind, surface: BoolOpSurface::Symbol, left: read, right: write },
     );
     expr.ty = ty;
+    expr.decisions |= placement;
 }

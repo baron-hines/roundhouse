@@ -1,0 +1,8 @@
+# post a top-level comment and a reply, then read the story and the comment feed
+GET {story_path}
+POST /comments story_id={story}&comment=Hello+from+the+replay
+GET {story_path}
+POST /comments story_id={story}&parent_comment_short_id={comment}&comment=A+reply+from+the+replay
+GET {story_path}
+GET /comments
+GET /threads

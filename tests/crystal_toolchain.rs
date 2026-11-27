@@ -12,25 +12,82 @@
 //!
 //!     cargo test --test crystal_toolchain -- --ignored --nocapture
 
+#[path = "support/scratch.rs"]
+mod scratch;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use roundhouse::analyze::Analyzer;
+#[path = "support/emit_and_run.rs"]
+#[allow(dead_code)]
+mod emit_and_run;
+#[path = "support/i18n_locales_app.rs"]
+#[allow(dead_code)]
+mod i18n_locales_app;
+#[path = "support/record_slice_app.rs"]
+#[allow(dead_code)]
+mod record_slice_app;
+#[path = "support/ts_controller_ivars.rs"]
+#[allow(dead_code)]
+mod ts_controller_ivars;
+#[path = "support/content_tag_options.rs"]
+#[allow(dead_code)]
+mod content_tag_options;
+#[path = "support/link_to_if_eval_order.rs"]
+#[allow(dead_code)]
+mod link_to_if_eval_order;
+#[path = "support/simple_format.rs"]
+mod simple_format;
+#[path = "support/link_to_computed_url.rs"]
+mod link_to_computed_url;
+#[path = "support/nested_route_helper_record.rs"]
+#[allow(dead_code)]
+mod nested_route_helper_record;
+#[path = "support/ivar_named_local.rs"]
+#[allow(dead_code)]
+mod ivar_named_local;
+#[path = "support/record_if_condition.rs"]
+#[allow(dead_code)]
+mod record_if_condition;
+#[path = "support/link_to_template_local.rs"]
+#[allow(dead_code)]
+mod link_to_template_local;
+#[path = "support/each_no_param.rs"]
+#[allow(dead_code)]
+mod each_no_param;
+#[path = "support/view_unless_no_else.rs"]
+#[allow(dead_code)]
+mod view_unless_no_else;
+#[path = "support/nilable_string_view.rs"]
+#[allow(dead_code)]
+mod nilable_string_view;
+#[path = "support/each_receiver_once.rs"]
+#[allow(dead_code)]
+mod each_receiver_once;
+#[path = "support/join_nil.rs"]
+#[allow(dead_code)]
+mod join_nil;
+#[path = "support/link_to_if_escape.rs"]
+#[allow(dead_code)]
+mod link_to_if_escape;
+#[path = "support/block_control_flow.rs"]
+#[allow(dead_code)]
+mod block_control_flow;
+#[path = "support/pluralize_escape.rs"]
+#[allow(dead_code)]
+mod pluralize_escape;
+
 use roundhouse::emit::crystal;
 use roundhouse::ingest::ingest_app;
 
 fn scratch_dir(fixture: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("roundhouse-crystal-check-{fixture}"))
+    scratch::dir(&format!("roundhouse-crystal-check-{fixture}"))
 }
 
 fn generate_project(fixture_path: &Path, out: &Path) {
-    if out.exists() {
-        std::fs::remove_dir_all(out).expect("clean scratch");
-    }
     std::fs::create_dir_all(out).expect("create scratch");
 
     let mut app = ingest_app(fixture_path).expect("ingest");
-    Analyzer::new(&app).analyze(&mut app);
+    roundhouse::session::analyze_and_lower(&mut app);
     let files = crystal::emit(&app);
 
     for file in &files {
@@ -137,4 +194,503 @@ fn real_blog_crystal_spec_passes() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
+}
+
+#[test]
+#[ignore]
+fn real_blog_i18n_locales_run() {
+    // The answers `emit_and_run::i18n_locales` checks on CRuby.
+    let (emitted, errors) = i18n_locales_app::probe_app()
+        .edit("app/models/article.rb", i18n_locales_app::IN_LOCALE, "")
+        .emit(roundhouse::project::BuildTarget::Crystal);
+    assert!(errors.is_empty(), "{errors:?}");
+    shards_install(&emitted);
+    std::fs::write(
+        emitted.join("probe.cr"),
+        r##"require "./src/app"
+def expect(what, got, want)
+  raise "#{what}: #{got.inspect}" unless got == want
+end
+expect("lookups", Article.lookups, ["Hello", "Hi <x>", "1 item", "2 items", "Translation missing: en.probe.nope", "Cześć", "fallback 3", "en"])
+expect("polish", Article.polish, ["1 rzecz", "5 rzeczy", "English only", "Cześć", "Translation missing: pl.probe.nope", "Cześć", "Hi Ola", "pl"])
+expect("restored", I18n.locale.to_s, "en")
+expect("named", [Article.named("pl"), Article.named(:en), Article.named(nil)], ["Cześć", "Hello", "Hello"])
+expect("dynamic", [Article.probe_key("greet"), Article.only_key("xx")], ["Hello", "Translation missing: en.probe.only_xx"])
+begin
+  Article.named("de")
+  raise "no raise"
+rescue e : I18n::InvalidLocale
+  expect("named de", e.message, "\"de\" is not a valid locale")
+end
+puts "locales passed"
+"##,
+    )
+    .unwrap();
+    let run = Command::new("crystal")
+        .args(["run", "probe.cr"])
+        .current_dir(&emitted)
+        .env("CRYSTAL_CACHE_DIR", emitted.join(".crystal-cache"))
+        .output()
+        .expect("run crystal");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(run.status.success() && stdout.contains("locales passed"), "{stdout}\n{}", String::from_utf8_lossy(&run.stderr));
+}
+
+#[test]
+#[ignore]
+fn real_blog_record_slice_runs() {
+    // The answers `emit_and_run::record_slice` checks on CRuby.
+    let (emitted, errors) = record_slice_app::probe_app().emit(roundhouse::project::BuildTarget::Crystal);
+    assert!(errors.is_empty(), "{errors:?}");
+    shards_install(&emitted);
+    std::fs::write(
+        emitted.join("probe.cr"),
+        r##"require "./src/app"
+def expect(what, got, want)
+  raise "#{what}: #{got.inspect}" unless got == want
+end
+expect("sliced", Article.sliced, ["2", "Sliced", "7", "1", "Other", "3", "Bound", "5", "4", "A comment body."])
+puts "slice passed"
+"##,
+    )
+    .unwrap();
+    let run = Command::new("crystal")
+        .args(["run", "probe.cr"])
+        .current_dir(&emitted)
+        .env("CRYSTAL_CACHE_DIR", emitted.join(".crystal-cache"))
+        .output()
+        .expect("run crystal");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(run.status.success() && stdout.contains("slice passed"), "{stdout}\n{}", String::from_utf8_lossy(&run.stderr));
+}
+
+#[test]
+#[ignore]
+fn controller_ivars_named_like_base_state_compile() {
+    // An app controller's `@status`, `@location` and `@headers` (its own,
+    // ApplicationController's and a concern's) compile next to the runtime
+    // base's members of those names (#1625).
+    let (emitted, errors) = ts_controller_ivars::overlay().emit(roundhouse::project::BuildTarget::Crystal);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_crystal_passes("an app controller with ivars named like the base's state", &emitted);
+}
+
+#[test]
+#[ignore]
+fn controller_ivars_named_like_base_state_render() {
+    // The same three names, all set by the controller that renders, show
+    // on the page, and the response is as Rails leaves it: 200, no
+    // Location (#1625). Set in ApplicationController instead, `@location`
+    // reaches the view call unnarrowed, whatever its name.
+    let (emitted, errors) = ts_controller_ivars::overlay()
+        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n")
+        .edit("app/controllers/probes_controller.rb", "@status = \"app status\"", "@status = \"app status\"\n    @location = \"app location\"")
+        .emit(roundhouse::project::BuildTarget::Crystal);
+    assert!(errors.is_empty(), "{errors:?}");
+    shards_install(&emitted);
+    std::fs::write(
+        emitted.join("probe.cr"),
+        "require \"./src/app\"\nc = ProbesController.new\nc.request_method = \"GET\"\nc.process_action(:show)\nputs [c.status, c.location, c.body].inspect\n",
+    )
+    .unwrap();
+    let run = Command::new("crystal")
+        .args(["run", "probe.cr"])
+        .current_dir(&emitted)
+        .env("CRYSTAL_CACHE_DIR", emitted.join(".crystal-cache"))
+        .output()
+        .expect("run crystal");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let want = format!("[200, nil, {}]", serde_json::to_string(ts_controller_ivars::BODY).unwrap());
+    assert!(run.status.success() && stdout.trim() == want, "{stdout}\n{}", String::from_utf8_lossy(&run.stderr));
+}
+
+#[test]
+#[ignore]
+fn controller_ivars_named_like_base_state_compile_without_application_controller() {
+    // No app ApplicationController: the emit synthesizes one under
+    // ActionController::Base, and the controller's `@status`/`@headers`
+    // still compile next to the base's members (#1625).
+    let (emitted, errors) = ts_controller_ivars::overlay()
+        .remove("app/controllers/application_controller.rb")
+        .write("app/views/probes/show.html.erb", &ts_controller_ivars::SHOW.replace("<p><%= @location %></p>\n", ""))
+        .emit(roundhouse::project::BuildTarget::Crystal);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_crystal_passes("an app with no ApplicationController and ivars named like the base's state", &emitted);
+}
+
+#[test]
+#[ignore]
+fn content_tag_blocks_render() {
+    // `content_tag … do … end` with options: they reach
+    // `content_tag_html` as its trailing Hash (Crystal takes no
+    // keyword into a positional `opts`), and a literal `class:` Array is
+    // space-joined, as Rails 8.1.4 renders it (#1771).
+    let (emitted, errors) = emit_and_run::real_blog()
+        .write("app/controllers/probes_controller.rb", "class ProbesController < ApplicationController\n  def show\n  end\nend\n")
+        .write(
+            "app/views/probes/show.html.erb",
+            concat!(
+                "<%= content_tag :section, class: \"boxed\" do %>inside<% end %>\n",
+                "<%= content_tag :div, class: [\"btn\", \"primary\"] do %>blk<% end %>\n",
+            ),
+        )
+        .edit("config/routes.rb", "  root \"articles#index\"\n", "  root \"articles#index\"\n  get \"/probe\", to: \"probes#show\"\n")
+        .emit(roundhouse::project::BuildTarget::Crystal);
+    assert!(errors.is_empty(), "{errors:?}");
+    shards_install(&emitted);
+    std::fs::write(
+        emitted.join("probe.cr"),
+        "require \"./src/app\"\nc = ProbesController.new\nc.request_method = \"GET\"\nc.process_action(:show)\nputs c.body\n",
+    )
+    .unwrap();
+    let run = Command::new("crystal")
+        .args(["run", "probe.cr"])
+        .current_dir(&emitted)
+        .env("CRYSTAL_CACHE_DIR", emitted.join(".crystal-cache"))
+        .output()
+        .expect("run crystal");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success(), "{stdout}\n{stderr}");
+    for want in [r#"<section class="boxed">inside</section>"#, r#"<div class="btn primary">blk</div>"#] {
+        assert!(stdout.contains(want), "expected {want} in\n{stdout}");
+    }
+}
+
+/// `GET /probe` rendered by `crystal run`: whether it ran, and its
+/// stdout and stderr.
+fn render_probe(app: emit_and_run::Overlay) -> (bool, String, String) {
+    let (emitted, errors) = app.emit(roundhouse::project::BuildTarget::Crystal);
+    assert!(errors.is_empty(), "{errors:?}");
+    shards_install(&emitted);
+    std::fs::write(
+        emitted.join("probe.cr"),
+        "require \"./src/app\"\nc = ProbesController.new\nc.request_method = \"GET\"\nc.process_action(:show)\nputs c.body\n",
+    )
+    .unwrap();
+    let run = Command::new("crystal")
+        .args(["run", "probe.cr"])
+        .current_dir(&emitted)
+        .env("CRYSTAL_CACHE_DIR", emitted.join(".crystal-cache"))
+        .output()
+        .expect("run crystal");
+    (run.status.success(), String::from_utf8_lossy(&run.stdout).into_owned(), String::from_utf8_lossy(&run.stderr).into_owned())
+}
+
+/// A non-block `content_tag` with options reaches the runtime's
+/// `content_tag`, which escapes the content and the attribute values and
+/// names, as Rails 8.1.4 renders them (#1780).
+#[test]
+#[ignore]
+fn content_tag_with_options_renders() {
+    let (ok, stdout, stderr) = render_probe(content_tag_options::app(content_tag_options::VIEW));
+    assert!(ok, "{stdout}\n{stderr}");
+    for want in content_tag_options::RENDERS {
+        assert!(stdout.contains(want), "expected {want} in\n{stdout}");
+    }
+}
+
+/// A name that is no HTML5 tag name is refused by the runtime's
+/// `content_tag_name`, as Rails raises `Invalid HTML5 tag name`.
+#[test]
+#[ignore]
+fn content_tag_with_a_bad_dynamic_name_raises() {
+    let view = "<% n = \"p onclick=x\" %><%= content_tag n, \"y\" %>\n";
+    let (ok, stdout, stderr) = render_probe(content_tag_options::app(view));
+    assert!(!ok && stderr.contains("Invalid HTML5 tag name"), "{stdout}\n{stderr}");
+    assert!(!stdout.contains("onclick"), "{stdout}");
+}
+
+/// `link_to_if`'s label is escaped in both branches, as Rails 8.1.4
+/// renders it.
+#[test]
+#[ignore]
+fn link_to_if_escapes_its_label() {
+    let (emitted, errors) = link_to_if_escape::app_with_truncate().emit(roundhouse::project::BuildTarget::Crystal);
+    assert!(errors.is_empty(), "{errors:?}");
+    shards_install(&emitted);
+    std::fs::write(
+        emitted.join("probe.cr"),
+        "require \"./src/app\"\nc = ProbesController.new\nc.request_method = \"GET\"\nc.process_action(:show)\nputs c.body\n",
+    )
+    .unwrap();
+    let run = Command::new("crystal")
+        .args(["run", "probe.cr"])
+        .current_dir(&emitted)
+        .env("CRYSTAL_CACHE_DIR", emitted.join(".crystal-cache"))
+        .output()
+        .expect("run crystal");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(run.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&run.stderr));
+    for want in link_to_if_escape::RENDERS.iter().chain([&link_to_if_escape::TRUNCATE_RENDERS]) {
+        assert!(stdout.contains(want), "expected {want} in\n{stdout}");
+    }
+    for absent in link_to_if_escape::ABSENT.iter().chain([&link_to_if_escape::TRUNCATE_ABSENT]) {
+        assert!(!stdout.contains(absent), "unexpected {absent} in\n{stdout}");
+    }
+}
+
+/// #1774: a block helper whose template body starts with control flow
+/// renders its markup, as Rails 8.1.4 does.
+#[test]
+#[ignore]
+fn a_block_starting_with_control_flow_renders() {
+    let (emitted, errors) = block_control_flow::app().emit(roundhouse::project::BuildTarget::Crystal);
+    assert!(errors.is_empty(), "{errors:?}");
+    shards_install(&emitted);
+    std::fs::write(
+        emitted.join("probe.cr"),
+        "require \"./src/app\"\nc = ProbesController.new\nc.request_method = \"GET\"\nc.process_action(:show)\nputs c.body\n",
+    )
+    .unwrap();
+    let run = Command::new("crystal")
+        .args(["run", "probe.cr"])
+        .current_dir(&emitted)
+        .env("CRYSTAL_CACHE_DIR", emitted.join(".crystal-cache"))
+        .output()
+        .expect("run crystal");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(run.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&run.stderr));
+    for want in block_control_flow::RENDERS {
+        assert!(stdout.contains(want), "expected {want} in\n{stdout}");
+    }
+}
+
+/// `pluralize`'s String is escaped in a template, as Rails 8.1.4 escapes
+/// it, and a `link_to` or `button_to` label made of one is escaped once.
+#[test]
+#[ignore]
+fn pluralize_in_a_template_is_escaped() {
+    let (emitted, errors) = pluralize_escape::app().emit(roundhouse::project::BuildTarget::Crystal);
+    assert!(errors.is_empty(), "{errors:?}");
+    shards_install(&emitted);
+    std::fs::write(
+        emitted.join("probe.cr"),
+        "require \"./src/app\"\nc = ProbesController.new\nc.request_method = \"GET\"\nc.process_action(:show)\nputs c.body\n",
+    )
+    .unwrap();
+    let run = Command::new("crystal")
+        .args(["run", "probe.cr"])
+        .current_dir(&emitted)
+        .env("CRYSTAL_CACHE_DIR", emitted.join(".crystal-cache"))
+        .output()
+        .expect("run crystal");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(run.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&run.stderr));
+    for want in pluralize_escape::RENDERS {
+        assert!(stdout.contains(want), "expected {want} in\n{stdout}");
+    }
+    for absent in pluralize_escape::ABSENT {
+        assert!(!stdout.contains(absent), "unexpected {absent} in\n{stdout}");
+    }
+}
+
+/// #1862: `link_to_if` / `link_to_unless` evaluate the url when no link
+/// is made, and the generated view still builds and renders as Rails
+/// (`link_to_if_eval_order::STRICT_VIEW`): the page rendered by the built app.
+#[test]
+#[ignore]
+fn link_to_if_evaluates_its_url_and_renders() {
+    let (ok, stdout, stderr) = render_probe(content_tag_options::app_rendering(link_to_if_eval_order::STRICT_VIEW, link_to_if_eval_order::STRICT_RENDERS));
+    assert!(ok, "{stdout}\n{stderr}");
+    for want in link_to_if_eval_order::STRICT_RENDERS {
+        assert!(stdout.contains(want), "expected {want:?} in\n{stdout}");
+    }
+}
+
+/// #1861: `simple_format` with `sanitize: false` renders as Rails 8.1.4
+/// does, multibyte texts included (`simple_format::VIEW`): the page rendered by the built app.
+#[test]
+#[ignore]
+fn simple_format_renders() {
+    let (ok, stdout, stderr) = render_probe(content_tag_options::app_rendering(simple_format::VIEW, simple_format::RENDERS));
+    assert!(ok, "{stdout}\n{stderr}");
+    for want in simple_format::RENDERS {
+        assert!(stdout.contains(want), "expected {want:?} in\n{stdout}");
+    }
+}
+
+/// #1865: `link_to` with a url the template computes renders as Rails
+/// 8.1.4 does (`link_to_computed_url::VIEW`).
+#[test]
+#[ignore]
+fn link_to_computed_url_renders() {
+    let (ok, stdout, stderr) = render_probe(content_tag_options::app_rendering(link_to_computed_url::VIEW, link_to_computed_url::RENDERS));
+    assert!(ok, "{stdout}\n{stderr}");
+    for want in link_to_computed_url::RENDERS {
+        assert!(stdout.contains(want), "expected {want:?} in\n{stdout}");
+    }
+}
+
+/// #1890: a record handed to a route helper inside an output
+/// expression renders as Rails 8.1.4 does
+/// (`nested_route_helper_record::VIEW`).
+#[test]
+#[ignore]
+fn nested_route_helper_record_renders() {
+    let (app, renders) = nested_route_helper_record::strict_app();
+    let (ok, stdout, stderr) = render_probe(app);
+    assert!(ok, "{stdout}\n{stderr}");
+    for want in &renders {
+        assert!(stdout.contains(want), "expected {want:?} in\n{stdout}");
+    }
+}
+
+/// A template local assigned from the ivar of its own name renders as
+/// Rails 8.1.4 does (`ivar_named_local::VIEW`).
+#[test]
+#[ignore]
+fn ivar_named_local_renders() {
+    let (app, renders) = (ivar_named_local::strict_app(), ivar_named_local::RENDERS.to_vec());
+    let (ok, stdout, stderr) = render_probe(app);
+    assert!(ok, "{stdout}\n{stderr}");
+    for want in &renders {
+        assert!(stdout.contains(want), "expected {want:?} in\n{stdout}");
+    }
+}
+
+/// #1909: a record as an `if` condition renders as Rails 8.1.4 does
+/// (`record_if_condition::VIEW`).
+#[test]
+#[ignore]
+fn record_if_condition_renders() {
+    let (app, renders) = (record_if_condition::strict_app(), record_if_condition::RENDERS.to_vec());
+    let (ok, stdout, stderr) = render_probe(app);
+    assert!(ok, "{stdout}\n{stderr}");
+    for want in &renders {
+        assert!(stdout.contains(want), "expected {want:?} in\n{stdout}");
+    }
+}
+
+/// #1898: a record in a local the template assigns, handed to
+/// `link_to`'s url helper, renders as Rails 8.1.4 does
+/// (`link_to_template_local::VIEW`).
+#[test]
+#[ignore]
+fn link_to_template_local_renders() {
+    let (app, renders) = (link_to_template_local::strict_app(), link_to_template_local::RENDERS.to_vec());
+    let (ok, stdout, stderr) = render_probe(app);
+    assert!(ok, "{stdout}\n{stderr}");
+    for want in &renders {
+        assert!(stdout.contains(want), "expected {want:?} in\n{stdout}");
+    }
+}
+
+/// #1910: a block with no parameter renders as Rails 8.1.4 does
+/// (`each_no_param::VIEW`).
+#[test]
+#[ignore]
+fn each_no_param_renders() {
+    let (app, renders) = (each_no_param::strict_app(), each_no_param::RENDERS.to_vec());
+    let (ok, stdout, stderr) = render_probe(app);
+    assert!(ok, "{stdout}\n{stderr}");
+    for want in &renders {
+        assert!(stdout.contains(want), "expected {want:?} in\n{stdout}");
+    }
+}
+
+/// An empty `map` block maps each element to nil, as Rails 8.1.4
+/// does (`each_no_param::EMPTY_MAP_VIEW`).
+#[test]
+#[ignore]
+fn each_no_param_empty_map_renders() {
+    let (app, renders) = (each_no_param::strict_empty_map_app(), each_no_param::EMPTY_MAP_RENDERS.to_vec());
+    let (ok, stdout, stderr) = render_probe(app);
+    assert!(ok, "{stdout}\n{stderr}");
+    for want in &renders {
+        assert!(stdout.contains(want), "expected {want:?} in\n{stdout}");
+    }
+}
+
+/// #1921: an `unless` with no `else` in a view renders as Rails 8.1.4
+/// does (`view_unless_no_else::VIEW`).
+#[test]
+#[ignore]
+fn view_unless_no_else_renders() {
+    let (app, renders) = (view_unless_no_else::strict_app(), view_unless_no_else::RENDERS.to_vec());
+    let (ok, stdout, stderr) = render_probe(app);
+    assert!(ok, "{stdout}\n{stderr}");
+    for want in &renders {
+        assert!(stdout.contains(want), "expected {want:?} in\n{stdout}");
+    }
+}
+
+/// #1937: a view reading a nullable string column with `==`, `!=`,
+/// `empty?` and `length` renders as Rails 8.1.4 does
+/// (`nilable_string_view::VIEW`).
+#[test]
+#[ignore]
+fn nilable_string_view_renders() {
+    let (app, renders) = (nilable_string_view::strict_app(), nilable_string_view::RENDERS.to_vec());
+    let (ok, stdout, stderr) = render_probe(app);
+    assert!(ok, "{stdout}\n{stderr}");
+    for want in &renders {
+        assert!(stdout.contains(want), "expected {want:?} in\n{stdout}");
+    }
+}
+
+/// #1937: `==` and `!=` on a nullable string column evaluate each
+/// operand once, left then right, as Rails 8.1.4 does
+/// (`nilable_string_view::EFFECT_VIEW`, title present).
+#[test]
+#[ignore]
+fn nilable_string_view_effect_renders() {
+    let (app, renders) = (nilable_string_view::strict_effect_app(), nilable_string_view::EFFECT_RENDERS.to_vec());
+    let (ok, stdout, stderr) = render_probe(app);
+    assert!(ok, "{stdout}\n{stderr}");
+    for want in &renders {
+        assert!(stdout.contains(want), "expected {want:?} in\n{stdout}");
+    }
+}
+
+/// #1937: with the column nil, `==` and `!=` render as Rails 8.1.4
+/// does (`nilable_string_view::NIL_VIEW`).
+#[test]
+#[ignore]
+fn nilable_string_view_nil_renders() {
+    let (app, renders) = (nilable_string_view::strict_nil_app(), nilable_string_view::NIL_RENDERS.to_vec());
+    let (ok, stdout, stderr) = render_probe(app);
+    assert!(ok, "{stdout}\n{stderr}");
+    for want in &renders {
+        assert!(stdout.contains(want), "expected {want:?} in\n{stdout}");
+    }
+}
+
+/// #1937: the same operands with a nil title: the right operand still
+/// runs, as in Rails 8.1.4 (`nilable_string_view::EFFECT_VIEW`).
+#[test]
+#[ignore]
+fn nilable_string_view_nil_effect_renders() {
+    let (app, renders) = (nilable_string_view::strict_nil_effect_app(), nilable_string_view::NIL_EFFECT_RENDERS.to_vec());
+    let (ok, stdout, stderr) = render_probe(app);
+    assert!(ok, "{stdout}\n{stderr}");
+    for want in &renders {
+        assert!(stdout.contains(want), "expected {want:?} in\n{stdout}");
+    }
+}
+
+/// #1946: `each` runs a receiver with an effect once, as Rails 8.1.4
+/// does (`each_receiver_once::VIEW`).
+#[test]
+#[ignore]
+fn each_receiver_once_renders() {
+    let (app, renders) = (each_receiver_once::strict_app(), each_receiver_once::RENDERS.to_vec());
+    let (ok, stdout, stderr) = render_probe(app);
+    assert!(ok, "{stdout}\n{stderr}");
+    for want in &renders {
+        assert!(stdout.contains(want), "expected {want:?} in\n{stdout}");
+    }
+}
+
+/// #1949: `join` reads a nil element as an empty string, as Rails 8.1.4
+/// does (`join_nil::VIEW`).
+#[test]
+#[ignore]
+fn join_nil_renders() {
+    let (app, renders) = (join_nil::strict_app(), join_nil::RENDERS.to_vec());
+    let (ok, stdout, stderr) = render_probe(app);
+    assert!(ok, "{stdout}\n{stderr}");
+    for want in &renders {
+        assert!(stdout.contains(want), "expected {want:?} in\n{stdout}");
+    }
 }

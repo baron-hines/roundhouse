@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # ActionController::ParameterMissing — raised by `Params.require_key`
 # when a required parameter is absent or blank, and RESCUED by app code
 # as a normal path (a controller turns it into a 400 rather than letting
@@ -48,6 +49,19 @@ module ActionController
   class UnknownFormat < StandardError
   end
 
+  # responders' `ActionController::Responder` raises it for a format no renderer answers.
+  class MissingRenderer < LoadError
+    def initialize(format)
+      super("No renderer defined for format: #{format}")
+    end
+  end
+
+  # The renderers Rails registers itself (`add :json`, `add :js`, `add :xml`); a gem's `Renderers.add`
+  # (turbo-rails' `:turbo_stream`) is not modeled.
+  module Renderers
+    RENDERERS = Set.new([:json, :js, :xml])
+  end
+
   # Raised by app code to answer 404 for a path that a route matches
   # but the app rejects (for example, a page number out of bounds).
   # Rails maps it to 404 in `ActionDispatch::ExceptionWrapper`, and the
@@ -64,6 +78,26 @@ module ActionController
 
     def failures
       @failures
+    end
+  end
+
+  # Raised by a generated path helper when a required segment is nil or
+  # empty, where Rails' router raises it (roundhouse#1475). The message is
+  # Rails': every key the route has, sorted, a given value as its
+  # `to_param`, then the missing keys. The helper passes each value as a
+  # String, or nil.
+  class UrlGenerationError < StandardError
+    def self.missing_segments(controller, action, names, values)
+      pairs = [["action", action.inspect], ["controller", controller.inspect]]
+      missing = []
+      names.each_with_index do |name, i|
+        value = values[i]
+        missing << ":#{name}" if value.to_s.empty?
+        pairs << [name, value.nil? ? "nil" : value.inspect]
+      end
+      shown = pairs.sort_by { |pair| pair[0] }.map { |pair| "#{pair[0]}: #{pair[1]}" }.join(", ")
+      error = new("No route matches {#{shown}}, missing required keys: [#{missing.sort.join(", ")}]")
+      error
     end
   end
 end

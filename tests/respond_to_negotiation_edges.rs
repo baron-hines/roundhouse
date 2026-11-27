@@ -92,7 +92,7 @@ fn replay(prefixes: &[&str]) {
     );
     let run = overlay(ACTIONS).run_ruby(&script);
     eprintln!("emit errors: {:?}", run.errors);
-    assert!(run.success, "ruby failed:\n{}\n{}", run.stdout, run.stderr);
+    run.assert_passes();
     assert!(run.stdout.contains(", 0 differ"), "differs from Rails:\n{}", run.stdout);
     assert!(run.stdout.contains("SLOW: []"), "a request took over five seconds:\n{}", run.stdout);
 }

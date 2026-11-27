@@ -30,7 +30,7 @@ fn lower_and_emit(source: &str) -> (String, Vec<Diagnostic>) {
 }
 
 #[test]
-fn string_present_grounds_to_not_empty() {
+fn string_present_uses_the_shared_runtime_predicate() {
     let (out, diags) = lower_and_emit(
         r#"
 class Util
@@ -42,8 +42,8 @@ class Util
 end
 "#,
     );
-    assert!(!out.contains("present?"), "site should be grounded:\n{out}");
-    assert!(out.contains("empty?"), "expected empty?-based form:\n{out}");
+    assert!(out.contains("ActiveSupport.present?(s)"), "site should be grounded:\n{out}");
+    assert!(!out.contains("strip.empty?"), "{out}");
     assert!(
         diags.is_empty(),
         "typed receiver should not produce residue: {diags:?}"
@@ -64,17 +64,22 @@ end
 "#,
     );
     assert!(!out.contains("blank?"), "site should be grounded:\n{out}");
-    // The ruby-family emitter's nil-safety pass may wrap the receiver
-    // (`(a || "").empty?`); either surface is the grounded form.
+    // A collection is `empty?`, not the string form. The nil guard lives
+    // on the string arm only; wrapping an array as `(a || "")` was the
+    // old Ruby-only `empty?` rewrite.
     assert!(
         out.contains(".empty?"),
         "expected empty?-based form:\n{out}"
+    );
+    assert!(
+        !out.contains("strip"),
+        "arrays are not whitespace-blank:\n{out}"
     );
     assert!(diags.is_empty(), "{diags:?}");
 }
 
 #[test]
-fn nilable_string_present_gets_nil_guard() {
+fn nilable_string_present_uses_the_same_runtime_predicate() {
     let (out, diags) = lower_and_emit(
         r#"
 class Util
@@ -86,12 +91,7 @@ class Util
 end
 "#,
     );
-    assert!(!out.contains("present?"), "site should be grounded:\n{out}");
-    assert!(
-        out.contains("nil?"),
-        "nilable receiver needs the nil guard:\n{out}"
-    );
-    assert!(out.contains("empty?"), "{out}");
+    assert!(out.contains("ActiveSupport.present?(s)"), "runtime predicate handles nil:\n{out}");
     assert!(diags.is_empty(), "{diags:?}");
 }
 
@@ -116,8 +116,35 @@ end
     assert!(diags.is_empty(), "{diags:?}");
 }
 
+/// An ivar read keeps its nil guard even when its stamp is non-nil:
+/// an unassigned ivar reads nil, and campfire's detached
+/// `ApplicationController.new.perform_caching` raised on
+/// `!@response_cache_version.empty?`.
 #[test]
-fn string_presence_becomes_conditional() {
+fn ivar_present_keeps_the_nil_guard_under_a_non_nil_stamp() {
+    let (out, diags) = lower_and_emit(
+        r#"
+class Util
+  def initialize
+    @parts = [1, 2]
+    @count = 3
+  end
+
+  def check
+    return "yes" if @parts.present? && @count.present?
+    "no"
+  end
+end
+"#,
+    );
+    assert!(!out.contains("present?"), "site should be grounded:\n{out}");
+    assert!(out.contains("@parts.nil?"), "collection ivar needs the nil guard:\n{out}");
+    assert!(out.contains("@count.nil?"), "scalar ivar must not fold to true:\n{out}");
+    assert!(diags.is_empty(), "{diags:?}");
+}
+
+#[test]
+fn string_presence_uses_the_shared_runtime_predicate() {
     let (out, diags) = lower_and_emit(
         r#"
 class Util
@@ -129,10 +156,10 @@ end
 "#,
     );
     assert!(
-        !out.contains("presence"),
+        out.contains("ActiveSupport.presence(s)"),
         "presence should be grounded:\n{out}"
     );
-    assert!(out.contains("empty?"), "{out}");
+    assert!(!out.contains("strip.empty?"), "{out}");
     assert!(diags.is_empty(), "{diags:?}");
 }
 
@@ -209,6 +236,38 @@ end
     assert_eq!(diags[0].code(), "blank_unlowered");
 }
 
+/// `def label(name = nil)` called only with an untyped argument has no
+/// call-site evidence (the argument's own type is still an inference
+/// var, filtered out before it reaches `param_ty_with_default`), so the
+/// `nil` default alone must not pin the parameter to `Ty::Nil` — that
+/// would fold `name.presence` away to a bare `nil` silently, as if the
+/// caller's value could never matter.
+#[test]
+fn nil_default_with_no_call_site_evidence_keeps_the_runtime_predicate() {
+    let (out, diags) = lower_and_emit(
+        r#"
+class Util
+  def label(name = nil)
+    name.presence || "none"
+  end
+
+  def call(thing)
+    label(thing)
+  end
+end
+"#,
+    );
+    assert!(
+        out.contains("ActiveSupport.presence(name)"),
+        "a nil default with no call-site evidence must not fold to a bare nil:\n{out}"
+    );
+    assert!(
+        !out.contains("nil || \"none\""),
+        "presence must not be grounded to nil:\n{out}"
+    );
+    assert!(diags.is_empty(), "{diags:?}");
+}
+
 #[test]
 fn own_predicate_class_keeps_dispatch() {
     let (out, diags) = lower_and_emit(
@@ -252,7 +311,7 @@ end
 "#,
     );
     assert!(
-        !out.contains("present?"),
+        out.contains("ActiveSupport.present?(h[\"a\"])"),
         "hash-value read should ground:\n{out}"
     );
     assert!(diags.is_empty(), "{diags:?}");
@@ -371,4 +430,209 @@ end
         "expected a reject through the runtime predicate:\n{out}"
     );
     assert!(diags.is_empty(), "{diags:?}");
+}
+
+/// The nil guard is in the lowered IR, before any emitter. `emit_expr`
+/// prints that IR and does not run a Ruby pre-emit rewrite, so these
+/// tests fail while `(r || "")` still lives only in an emitter.
+fn is_string_blank_test(expr: &roundhouse::Expr) -> bool {
+    if let roundhouse::ExprNode::Send { recv: Some(recv), method, args, .. } = &*expr.node {
+        if method.as_str() == "blank?" && args.len() == 1
+            && matches!(&*recv.node, roundhouse::ExprNode::Const { path }
+                if path.len() == 1 && path[0].as_str() == "ActiveSupport") {
+            return true;
+        }
+    }
+    let roundhouse::ExprNode::Send { recv: Some(strip_recv), method, args, .. } = &*expr.node
+    else {
+        return false;
+    };
+    if method.as_str() != "empty?" || !args.is_empty() {
+        return false;
+    }
+    let roundhouse::ExprNode::Send { recv: Some(guard), method, args, .. } = &*strip_recv.node
+    else {
+        return false;
+    };
+    if method.as_str() != "strip" || !args.is_empty() {
+        return false;
+    }
+    let roundhouse::ExprNode::BoolOp {
+        op: roundhouse::expr::BoolOpKind::Or,
+        right,
+        ..
+    } = &*guard.node
+    else {
+        return false;
+    };
+    matches!(
+        &*right.node,
+        roundhouse::ExprNode::Lit { value: roundhouse::Literal::Str { value } } if value.is_empty()
+    )
+}
+
+fn count_string_blank_tests(expr: &roundhouse::Expr) -> usize {
+    let mut n = 0;
+    fn rec(e: &roundhouse::Expr, n: &mut usize) {
+        if is_string_blank_test(e) {
+            *n += 1;
+        }
+        e.node.for_each_child(&mut |c| rec(c, n));
+    }
+    rec(expr, &mut n);
+    n
+}
+
+fn lowered_method(source: &str, method: &str) -> roundhouse::Expr {
+    let classes = ingest_library_classes(source.as_bytes(), "test.rb").expect("ingest test source");
+    let mut app = App::new();
+    for lc in classes {
+        app.library_classes.push(lc);
+    }
+    Analyzer::new(&app).analyze(&mut app);
+    apply_blank_lowering(&mut app);
+    app.library_classes
+        .iter()
+        .flat_map(|lc| lc.methods.iter())
+        .find(|m| m.name.as_str() == method)
+        .unwrap_or_else(|| panic!("missing {method}"))
+        .body
+        .clone()
+}
+
+#[test]
+fn whitespace_string_blank_uses_the_shared_runtime_predicate_in_ir() {
+    let body = lowered_method(
+        r#"
+class Util
+  def check
+    s = "   "
+    s.blank?
+  end
+end
+"#,
+        "check",
+    );
+    let printed = roundhouse::emit::ruby::emit_expr(&body);
+    assert_eq!(
+        count_string_blank_tests(&body),
+        1,
+        "typed String blank? must use the shared runtime predicate:\n{printed}"
+    );
+    assert!(printed.contains("ActiveSupport.blank?(s)"), "{printed}");
+    assert!(!printed.contains(".strip.empty?"), "{printed}");
+}
+
+#[test]
+fn nil_string_blank_uses_the_same_runtime_predicate_in_ir() {
+    let body = lowered_method(
+        r#"
+class Util
+  def check(flag)
+    s = flag ? "value" : nil
+    s.blank?
+  end
+end
+"#,
+        "check",
+    );
+    let printed = roundhouse::emit::ruby::emit_expr(&body);
+    assert_eq!(
+        count_string_blank_tests(&body),
+        1,
+        "a nilable string must use the same runtime predicate:\n{printed}"
+    );
+    assert!(printed.contains("ActiveSupport.blank?(s)"), "runtime predicate handles nil:\n{printed}");
+}
+
+#[test]
+fn string_blank_runtime_is_limited_to_the_ruby_family() {
+    use roundhouse::project::BuildTarget;
+    for target in BuildTarget::TRANSPILE.iter().copied().filter(|target| {
+        !matches!(target, BuildTarget::Roda | BuildTarget::Futamura)
+    }) {
+        let classes = ingest_library_classes(
+            b"class Util\n  def check\n    s = \"text\"\n    s.blank?\n  end\nend\n",
+            "test.rb",
+        ).unwrap();
+        let mut app = App::new();
+        app.library_classes = classes;
+        roundhouse::session::analyze_and_lower_for(&mut app, target);
+        let body = &app.library_classes.iter().find(|class| class.name.0.as_str() == "Util")
+            .unwrap().methods.iter().find(|method| method.name.as_str() == "check").unwrap().body;
+        let printed = roundhouse::emit::ruby::emit_expr(body);
+        if matches!(target, BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Spinel) {
+            assert!(printed.contains("ActiveSupport.blank?(s)"), "{target:?}: {printed}");
+        } else {
+            assert!(printed.contains(".strip.empty?"), "{target:?}: {printed}");
+            assert!(!printed.contains("ActiveSupport.blank?"), "{target:?}: {printed}");
+        }
+    }
+}
+
+fn is_nil_guarded_empty(expr: &roundhouse::Expr) -> bool {
+    let roundhouse::ExprNode::Send { recv: Some(guard), method, args, .. } = &*expr.node else {
+        return false;
+    };
+    if method.as_str() != "empty?" || !args.is_empty() {
+        return false;
+    }
+    let roundhouse::ExprNode::BoolOp {
+        op: roundhouse::expr::BoolOpKind::Or,
+        right,
+        ..
+    } = &*guard.node
+    else {
+        return false;
+    };
+    matches!(
+        &*right.node,
+        roundhouse::ExprNode::Lit { value: roundhouse::Literal::Str { value } } if value.is_empty()
+    )
+}
+
+fn count_nil_guarded_empties(expr: &roundhouse::Expr) -> usize {
+    let mut n = 0;
+    fn rec(e: &roundhouse::Expr, n: &mut usize) {
+        if is_nil_guarded_empty(e) {
+            *n += 1;
+        }
+        e.node.for_each_child(&mut |c| rec(c, n));
+    }
+    rec(expr, &mut n);
+    n
+}
+
+#[test]
+fn view_blank_and_present_guard_nil_without_strip() {
+    let mut tree = std::collections::HashMap::new();
+    tree.insert(
+        std::path::PathBuf::from("app/views/articles/index.html.erb"),
+        b"<% if notice.blank? %>blank<% end %>\n<% if notice.present? %>here<% end %>\n<% if @posts.blank? %>none<% end %>\n<% if @articles.any? %>rows<% end %>\n"
+            .to_vec(),
+    );
+    let app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest view");
+    let view = app.views.first().expect("view");
+    let lc = roundhouse::lower::lower_view_to_library_class(view, &app);
+    let body = &lc.methods.first().expect("view method").body;
+    let printed = roundhouse::emit::ruby::emit_expr(body);
+    assert_eq!(
+        count_nil_guarded_empties(body),
+        3,
+        "notice blank?, notice present?, and @posts.blank? each carry (recv || \"\").empty? in the IR:\n{printed}"
+    );
+    assert_eq!(
+        count_string_blank_tests(body),
+        0,
+        "an untyped view receiver must not strip; an array has no strip:\n{printed}"
+    );
+    assert!(
+        printed.contains("(notice || \"\").empty?") && printed.contains("(posts || \"\").empty?"),
+        "view blank?/present? print the IR guard:\n{printed}"
+    );
+    assert!(!printed.contains("notice.blank?") && !printed.contains("notice.present?"), "{printed}");
+    assert!(
+        printed.contains("articles.empty?") && !printed.contains("(articles ||"),
+        "any? stays a collection empty? with no nil-guard wrap:\n{printed}"
+    );
 }

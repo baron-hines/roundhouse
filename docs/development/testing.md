@@ -42,31 +42,249 @@ The generated trees are ignored by Git; a fresh clone has neither. Accessors in
 Missing Ruby, gems, or SDKs can cause a harness to skip or fail; read the
 executed test output rather than assuming exit zero means coverage.
 
+## Skips and early exits
+
+A test that skips passes, and Nextest does not show a passing test's
+output, so a skip printed with `eprintln!` never reaches a CI log. A test
+whose prerequisite (a gem for a native Rails control, Ruby on `PATH`, a
+native compiler) is missing calls `prerequisite::missing(what)` from
+[`tests/support/prerequisite.rs`](../../tests/support/prerequisite.rs) and
+returns. `ROUNDHOUSE_SKIP_LOG=<file>` appends each skip to that file.
+`ROUNDHOUSE_REQUIRE_PREREQUISITES=1` fails such a test as well, for a run
+that provides everything. The CI unit job sets both: it installs every gem
+its tests probe for, so a skip there fails the job and its summary names
+the test and what was missing. A test that needs Spinel belongs in
+`tests/spinel_toolchain/`, `#[ignore]`d, where the Spinel lane runs it;
+the unit job has no Spinel. PostgreSQL
+keeps its own pair, `ROUNDHOUSE_PG_TEST_URL` and `ROUNDHOUSE_PG_TEST_REQUIRED`.
+
+A `run_ruby` or `run_spinel*` script reports a failed check by raising, so
+exit status 0 alone would pass a script that stopped before its checks.
+The [emit-and-run harness](../../tests/support/emit_and_run.rs) adds a
+completion line after the script and counts the run a success only if that
+line was printed. Do not end a passing script with `exit`; let it reach
+its last line.
+
+A run that ran clean has still not passed if analysis or emit reported an
+error (Invariant 6). `run.assert_passes()` checks both halves and says
+which one failed; `run.passed()` is the same check as a value, for an
+assertion with its own message. `run.program_succeeded()` reads only the
+program's half: use it only next to an assertion on `run.errors`, for
+example in a test that expects a refusal, or a control whose wrong
+expectation must fail.
+
+## Scratch directories
+
+Tests write their apps and emitted trees under the system temp directory
+with `scratch::dir(prefix)` from
+[`tests/support/scratch.rs`](../../tests/support/scratch.rs). Each tree
+is removed when its test binary exits (on Unix), whether its tests passed
+or failed; an emit-and-run `Run` or emitted tree goes as soon as the test
+drops it. Left behind, a full suite runs `/tmp` out of inodes.
+`ROUNDHOUSE_KEEP_EMITTED=1` keeps every tree, so a failure's message names
+a path you can still open:
+
+```sh
+ROUNDHOUSE_KEEP_EMITTED=1 cargo test --test emit_and_run -- some_test
+```
+
+A process that is killed, by a timeout or `SIGKILL`, cannot clean up, so
+its trees stay. New helpers that need a temporary directory use
+`scratch::dir` rather than `std::env::temp_dir()` directly.
+
+## Native probes
+
+A Spinel test that checks one construct rather than the app can compile the
+probe alone: `run_spinel_slim(&["runtime/active_support_ext"], script)` in
+[`emit_and_run.rs`](../../tests/support/emit_and_run.rs) builds only the
+files the overlay `write`s and the runtime entries named, which takes seconds
+where `run_spinel`'s whole-blog `boot` takes minutes. Name too few entries
+and spinel refuses or the run raises; it does not pass. The probe no longer
+shares whole-program inference with the app, so scheduled Full validation
+sets `ROUNDHOUSE_SPINEL_SLIM=0` and compiles the same tests inside `boot`.
+Keep `run_spinel` for tests whose subject is the app, its models or its HTTP
+surface.
+
+The `spinel-framework` lane runs `spinel` at `-O0`: these suites judge
+behavior, and `cc` at `-O2` was over a third of their CPU. `spin build`,
+`spinel-smoke`, `spinel-compare` and the Campfire lanes keep `-O2`. Locally,
+`CI_SPINEL_OPT=` keeps the default for
+[`scripts/ci-spinel-framework.sh`](../../scripts/ci-spinel-framework.sh), and
+`CI_SPINEL_FRAMEWORK_BUDGET` sets the seconds after which it stops a shard's
+suites and names them.
+
+## Native controls
+
+A test that claims emitted behavior matches Rails runs the same program under
+CRuby with real Rails and compares. [`rails_oracle.rb`](../../tests/support/rails_oracle.rb)
+picks that Rails in one place: by default the installed release the suite
+pins, `RH_RAILS_ORACLE=<version>` for another release, or
+`RH_RAILS_ORACLE=<path>` for a Rails checkout. Call
+`RailsOracle.activate("activerecord", sqlite3: ">= 2.9")` before requiring
+Rails; other gems take a requirement, not one exact build. When
+`RailsOracle.available?` (same arguments) is false, skip with a reason
+rather than fail. Some older controls still pin `8.1.4` inline and ignore
+`RH_RAILS_ORACLE`.
+
+## Fork specs
+
+Some suites were ported from the Shopify/roundhouse-1 fork's tests to
+serve as specs for behavior the fork's compiler has and this one does not
+yet. A test the compiler does not pass is ignored with the group of
+behavior it waits on, `#[ignore = "fork spec: <group>"]` (load order,
+autoload, conditional declarations, class-body loops and hooks, gem
+closures, rails_dependent_by_name, postgresql). Run a group's tests with `--ignored`
+to see what remains; a change that makes one pass removes its `ignore`.
+Where a spec also asserts the fork's emitted layout (a file path, a
+generated line), the change that makes it pass rewrites that assertion
+for this tree's layout and keeps its comparison with native Ruby.
+
+The PostgreSQL specs compare the emitted program with native Rails on the
+same server (tests/support/pg_probe.rs). They need ROUNDHOUSE_PG_TEST_URL
+and the pg gem, and skip without them unless ROUNDHOUSE_PG_TEST_REQUIRED
+is set. Two of their groups are not yet compiler work: `postgresql native
+control`, whose native side fails on the Rails release the oracle loads,
+and `postgresql layout`, which still asserts the fork's emitted files.
+
+The `association targets` and `preload` groups are emit_and_run probes
+(`tests/emit_and_run/`) written for behaviors the fork found, each run
+unchanged on ActiveRecord 8.1.4 first: what a has_many or has_one holds,
+the inverses it seats, its add and remove callbacks, and what a preload
+hands each owner. The `ruby semantics` and `record queries` groups are
+probes of the same kind: how Ruby runs class and module bodies, method
+lookup and dispatch (an Array's `as_json`, `&.` on `false`,
+refinements, load hooks), and what a query answers (sums, plucks through
+joins, query constraints, custom inheritance columns). The `relation
+queries` group covers what a relation writes and reads (`rewhere`,
+selects of hashes, Strings and Arel attributes, plucks of Strings and
+enums, eager loads beside joins, a connection's `to_sql` of an Arel node), and the
+`persistence` group how a record is built, copied and saved (`toggle`,
+`save(touch: false)`, `dup`, `clone` and `reload`, a model's own
+`update`). The `controller tests` group runs a test file in the real-blog
+fixture against what Rails' controllers and their tests answer
+(`action_methods`, OPTIONS requests, `response.body=`, `request.variant`,
+an app's own json renderer, uploads and `deep_munge`), and the `views
+helpers` group what a view's helpers resolve to (without `helper :all`,
+modules a controller declares, `url_for` of a Hash, `capture` arguments,
+TagHelper, NumberHelper and TranslationHelper includes); their Spinel
+variants run the same file with `spin test`. The `test framework` group
+runs a test file against what Minitest and `ActiveSupport::TestCase` do
+with it (lifecycle hooks, assertion counts, `assert_difference`'s value,
+a fresh execution context per test, setup blocks and tests a support
+module's Concern declares, a test file's own classes and statements,
+`enqueued_jobs_with` and the deprecation assertions), and the `routes`
+group what a route helper and the router answer (positional and keyword
+path params, `default_url_options`, a trailing options Hash, scope
+requirements named by a constant, `recognized_request_for`). The
+`validations` group covers how a model's validators are built, listed
+and run (`validators` and `validators_on`, `validates_with`'s `class:`,
+an STI subclass's own validators, a reader a validation reads, `on:`
+named by a constant, custom contexts, a message proc's `self`); the
+`nested attributes` group what a nested-attributes or autosave owner
+validates (a built child's own errors, a built child once, a has_one
+under `autosave: true`); and the `attribute types`
+group what an attribute's type answers around a write (the value before
+its cast, changes in place, the value after a save, `update_columns`).
+`Overlay::run_tests` loads several emitted test files into one process,
+as a suite run does; a probe that needs that has no Spinel variant,
+since Spinel builds each test file as a program of its own. Each probe's
+`_on_spinel` variant carries the same ignore; once it passes, its reason
+goes back to `requires the Spinel toolchain`.
+
+## Complete local verification
+
+1. Install [cargo-nextest](https://nexte.st/docs/running/) once:
+
+   ```sh
+   cargo install cargo-nextest --locked
+   ```
+
+2. Run the complete default suite:
+
+   ```sh
+   bin/rh verify --all
+   ```
+
+This command runs library and binary tests plus every integration suite with
+Nextest. It then runs `cargo test --locked --doc`, because Nextest does not run
+documentation tests. Ignored tests remain ignored. It does not use a result
+cache, and it bypasses Nextest's default filter to prevent omitted tests.
+
+The full run compiles integration sources into one executable. `build.rs`
+discovers every `tests/*.rs` suite; no second list needs maintenance.
+Only full verification enables this target. Normal Cargo commands and
+`bin/rh verify --test NAME` keep the individual targets.
+
+Rust tests that start their own executable use the
+[`name!` helper](../../tests/support/test_subprocess.rs) for `--exact` selection.
+It preserves the test name in both layouts.
+[`tests/test_subprocess.rs`](../../tests/test_subprocess.rs) checks that the
+child executes its test body, not just that the child exits successfully.
+
+`--all` cannot be combined with `--test`, `--toolchain`, `--ignored`, `--lib`, or `--contract`.
+`NEXTEST_TEST_THREADS` controls test processes; `--jobs` controls Cargo workers.
+Full verification defaults incremental compilation on and preserves an explicit
+`CARGO_INCREMENTAL` value. `--all --plan` remains read-only.
+
+An ARM64 macOS run produced these measurements with the optimized test profile:
+
+| Measurement | Separate integration targets | Combined integration target |
+|---|---:|---:|
+| Test executables | 867 | 9 |
+| Nextest-reported test execution | 382.188 s | 262.323 s |
+
+The complete combined command took 265.837 s with a warm build, including
+discovery and documentation checks. The first combined build in this work took
+188.84 s. That build cost is not included in the warm-run time.
+Switching between full and focused modes can rebuild the library and test target.
+The final run passed 5,985 tests. All 6,334 existing test identities and their
+ignored status matched the separate targets; one new regression test checks
+child selection. The same 350 tests remained ignored.
+
+The macOS verification used `TMPDIR=/private/tmp`. The default `/var/...`
+temporary path caused existing assertions against canonical `/private/var/...`
+paths to fail.
+
 ## Focused verification
 
-`bin/rh verify` runs library tests, then only the integration suites you select,
-sequentially and fail-fast. It is a foreground developer loop, **not** a hosted
-CI emulator or merge approval.
+Without `--all`, `bin/rh verify` runs the integration suites you select,
+sequentially and fail-fast. The library suite runs only with `--lib`, after
+those suites. `--contract` runs `ingests_without_errors` and
+`type_analysis_coverage` in `tests/real_blog.rs`, then
+`every_runtime_method_body_is_fully_typed` in
+`tests/runtime_src_integration.rs`, and does not build the other integration
+binaries. A `--contract` `--exact` filter that matches no test fails that check. Neither mode is a hosted CI emulator or merge approval. A green
+focused run does not replace the commit bar below.
 
 ```sh
 bin/rh verify --plan --base main --test ingest
 bin/rh verify --test ingest --test real_blog
+bin/rh verify --contract
+bin/rh verify --lib --test ingest
 bin/rh verify --test framework_tests_ruby --ignored
 bin/rh verify --toolchain ruby --json > /tmp/verification.json
 ```
 
 - Repeat `--test` or `--toolchain` to select more suites. Default `--test`
   excludes ignored tests; an ignored-only suite otherwise executes nothing.
-  `--ignored` runs only ignored tests in selected integration suites, not library
-  tests. `--toolchain` already selects ignored tests in `<target>_toolchain`.
+  `--ignored` runs only ignored tests in selected `--test` suites, not the
+  library suite or the contract filters. `--toolchain` already selects
+  ignored tests in `<target>_toolchain`.
 - `--plan` is read-only: no Cargo, installs, tests, or verification lock.
+  With no `--test`, `--toolchain`, `--contract`, or `--lib`, it is only a
+  hosted-coverage preview and reports no local checks. A run without
+  `--plan`, `--all`, or one of those selectors exits with an error.
 - `--base REF` compares the current working tree with that exact commit
   (default `HEAD`), including non-ignored untracked files. It neither fetches
   nor finds a merge base. The hosted selection preview is informational,
   not GitHub's actual PR merge-tree/draft/label context.
-- Execution uses locked Cargo commands and one test thread; Cargo workers
-  default to at most four unless configured. `--jobs` overrides workers.
-  Explicit Cargo environment settings are preserved; incremental defaults off.
+- Execution uses locked Cargo commands. Every suite this loop launches keeps
+  `--test-threads=1`, because suites share SQLite or the process-global
+  `ingest::survey`. Cargo workers default to `CARGO_BUILD_JOBS` or the
+  machine's processor count. `--jobs` overrides workers. Explicit Cargo
+  environment settings are preserved. Verify does not set `CARGO_INCREMENTAL`;
+  Cargo's own dev/test default applies, and a caller-supplied value is passed
+  through. Hosted unit shards do not use this script.
 - The worktree lock coordinates verifier callers only. Do not run unrelated
   Cargo builds/tests concurrently in that checkout.
 - `--json` separates executed, failed, and not-run checks; child output goes to
@@ -98,9 +316,30 @@ Focused checks do not replace the default-suite commit bar. Native toolchain
 and framework integrations are generally ignored so local default tests do not
 require every SDK. They are not all separate GitHub jobs; see [CI](../ci/README.md).
 
-Keep repository debug profiles intact for readable backtraces. For debugger
-locals, opt into `CARGO_PROFILE_TEST_DEBUG=2`; suites that assert file/line
-backtraces need symbols. Neither the verifier nor a passing subset cleans old
-build artifacts. If space is exhausted, stop builds and inspect the dedicated
-target directory before removing disposable outputs; never strip live programs
-or clean a cache shared with another checkout.
+The local test profile uses `opt-level = 1` to reduce compiler pipeline costs across
+the integration suites. It keeps debug assertions, overflow checks, and
+file/line backtraces. No test selection or ignored-test rule changes.
+The first build costs more; later runs reuse the optimized artifacts.
+
+Unit CI overrides optimization only for the `roundhouse` package.
+It uses `opt-level=0` for archive and documentation builds while dependencies
+stay optimized. See the [CI execution guide](../ci/README.md#unit-test-execution).
+
+On an ARM64 macOS checkout, three runs of each built test binary gave these
+median times. These measurements exclude compilation:
+
+| Suite | Unoptimized | Test profile |
+|---|---:|---:|
+| `ingest` | 0.394 s | 0.142 s |
+| `analyze` | 4.015 s | 1.330 s |
+| `real_blog` | 0.872 s | 0.499 s |
+| `runtime_src_integration` | 0.702 s | 0.394 s |
+| `emit_and_run` | 127.186 s | 88.074 s |
+
+For debugger locals, use `CARGO_PROFILE_TEST_DEBUG=2`. To step through
+unoptimized test code, also use `CARGO_PROFILE_TEST_OPT_LEVEL=0`.
+Suites that assert file/line backtraces need symbols.
+Neither the verifier nor a passing subset cleans old build artifacts.
+If space is exhausted, stop builds and inspect the dedicated target directory
+before removing disposable outputs. Never strip live programs or clean a cache
+shared with another checkout.

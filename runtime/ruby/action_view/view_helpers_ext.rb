@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Ruby-family-only ViewHelpers extensions — a reopen, same pattern as
 # active_record/connection.rb: NOT listed in runtime_loader's strict-
 # target tables (the scaffold dir-walk ships it to spinel/CRuby/JRuby
@@ -10,14 +11,38 @@ require_relative "../action_view_number_helper"
 
 module ActionView
   module ViewHelpers
-    # `content_security_policy_nonce` — the per-request CSP script
-    # nonce Rails interpolates into `<script nonce=…>`. The CSP HEADER
-    # pipeline isn't modeled (no Content-Security-Policy response
-    # header is emitted), so the nonce is inert to browsers; a stable
-    # token keeps the layout's interpolation rendering without pulling
-    # a randomness primitive into every target runtime.
+    # `content_security_policy_nonce`: the request's nonce, nil without a generator (lobsters' layout writes it into
+    # `<script nonce=…>`, and the header carries the same value).
     def self.content_security_policy_nonce
-      "roundhouse-nonce"
+      Rails.application.content_security_policy_nonce_current
+    end
+
+    # Rails' `csp_meta_tag`: a `<meta name="csp-nonce">` when a policy
+    # is configured, nothing when it is not. The content attribute is
+    # the nonce, and Rails' tag helper omits a nil one — campfire
+    # configures no generator, so the tag is the name alone. ` />` is
+    # `tag("meta")`'s void spelling; the compare canonicalizer drops
+    # the slash.
+    #
+    # The signal is `Rails.application.content_security_policy`, the
+    # object the request duplicates. This unit's require list does not
+    # load `ActionController::Current`, and a strict target's helper
+    # has no request, so the universal body stays "". `@csp_policy_for_test`
+    # is the stand-in a unit test sets: spinel cannot reopen
+    # `Application`, and `Rails.application` is a fresh instance per
+    # call. Production leaves the flag false.
+    @csp_policy_for_test = false
+
+    def self.csp_policy_for_test=(present)
+      @csp_policy_for_test = present
+    end
+
+    def self.csp_meta_tag
+      return "<meta name=\"csp-nonce\" />" if @csp_policy_for_test
+      return "" if Rails.application.content_security_policy.nil?
+      nonce = Rails.application.content_security_policy_nonce_current
+      return "<meta name=\"csp-nonce\" />" if nonce.nil?
+      "<meta name=\"csp-nonce\" content=\"" + nonce + "\" />"
     end
 
     # The ruby family's `url_for_path` (see the universal body in
@@ -50,26 +75,101 @@ module ActionView
       )
     end
 
+    # Rails' `url_for(:back)`: the request's referrer, or a step back in the history where it has none or names a
+    # `javascript:` URL.
+    def self.back_url
+      request = ActionController::Current.request
+      referrer = request.nil? ? nil : request.referrer
+      return "javascript:history.back()" if referrer.nil? || referrer.empty? || referrer.start_with?("javascript:")
+      referrer
+    end
+
+    # Not url_for_path's host: a class that defines `default_url_options` names the host its `_url` helpers answer on, as Rails' url_for merges them
+    def self.url_for_options(path, options)
+      host = options[:host]
+      return url_for_path(path) if host.nil?
+      hostport = host.to_s
+      port = ActionController.url_port_of(hostport)
+      if options.key?(:port)
+        given = options[:port]
+        port = given.nil? ? "" : given.to_s
+      end
+      protocol = options[:protocol]
+      ActionController.build_host_url(protocol.nil? ? "http://" : protocol.to_s, hostport, port, path)
+    end
+
+    # The ruby family's `asset_url` and `image_url` (see the universal
+    # bodies in view_helpers.rb): the asset's path on the request's origin,
+    # as Rails' `url_to_asset` answers it with no `asset_host`
+    # (`compute_asset_host`'s `request.base_url`, for an absolute path
+    # too). A full URL, a protocol-relative one and a `data:` or `cid:`
+    # source pass as given, and a blank one answers blank. The origin is
+    # the request's `base_url`, not the app's canonical domain that route
+    # URLs use. Outside a request Rails has no host to add,
+    # and neither does this. With `skip_pipeline:`, a relative source is
+    # under its public directory (`public_compute_asset_path`): `/icon.png`,
+    # and `/images/icon.png` for an image.
+    def self.asset_url(source, skip_pipeline: false)
+      return source if source.empty? || asset_url?(source)
+      path = if source.start_with?("/")
+        source
+      elsif skip_pipeline
+        "/" + source
+      else
+        asset_path(source)
+      end
+      request_asset_url(path)
+    end
+
+    def self.image_url(source, skip_pipeline: false)
+      return source if source.empty? || asset_url?(source)
+      path = if source.start_with?("/")
+        source
+      elsif skip_pipeline
+        "/images/" + source
+      else
+        image_path(source)
+      end
+      request_asset_url(path)
+    end
+
+    def self.request_asset_url(path)
+      request = ActionController::Current.request
+      return path if request.nil?
+      request.base_url + path
+    end
+
+    def self.digested_asset_path(source)
+      cut = source.length
+      query = source.index("?")
+      cut = query if !query.nil? && query < cut
+      fragment = source.index("#")
+      cut = fragment if !fragment.nil? && fragment < cut
+      logical = source[0, cut].to_s
+      suffix = source[cut, source.length - cut].to_s
+      Rails.application.propshaft_asset_path(logical) + suffix
+    end
+
     # Rails `class_names` (alias of `token_list`): strings/arrays add
     # their tokens, hash entries contribute their key when the value is
-    # truthy (`class_names("nav", current_page: cur == path)`), nil and
-    # blank tokens drop. Joined with single spaces.
+    # truthy (`class_names("nav", current_page: cur == path)`), nested
+    # arrays recurse, and nil, false and blank tokens drop. Each value is
+    # split on whitespace and a token repeated is kept once, as Rails'
+    # `.split(/\s+/)` and `.uniq` do; joined with single spaces.
     def self.class_names(*args)
       tokens = []
       args.each do |arg|
         if arg.is_a?(Hash)
-          arg.each { |k, v| tokens << k.to_s if v }
-        elsif arg.is_a?(Array)
-          arg.each do |a|
-            s = a.to_s
-            tokens << s unless s.strip.empty?
+          arg.each do |k, v|
+            k.to_s.split(" ").each { |t| tokens << t } if v
           end
-        elsif !arg.nil?
-          s = arg.to_s
-          tokens << s unless s.strip.empty?
+        elsif arg.is_a?(Array)
+          class_names(*arg).split(" ").each { |t| tokens << t }
+        elsif arg
+          arg.to_s.split(" ").each { |t| tokens << t }
         end
       end
-      tokens.join(" ")
+      tokens.uniq.join(" ")
     end
 
     def self.number_helper_for_template(method, value, options = {})
@@ -140,6 +240,7 @@ module ActionView
       opts.to_h.each do |k, v|
         attrs[k] = v
       end
+      attrs[:autocomplete] = "off" unless hidden_autocomplete_attr.empty? || attrs.key?(:autocomplete) || attrs.key?("autocomplete")
       "<input#{render_attrs(attrs)} />"
     end
 
@@ -468,6 +569,17 @@ module ActionView
       sanitize_engine(html.to_s, tags, attributes)
     end
 
+    # `sanitize(html, tags:, attributes:)` written in a view or helper —
+    # the caller's allow-lists, as `sanitize_allowing`, but the VIEW
+    # form: the CRuby overlay answers a safe buffer here, as it does for
+    # `sanitize`, where `sanitize_allowing` (a content filter's) stays a
+    # plain String. The keyword call is rewritten to this one at emit
+    # (emit/ruby/library.rs), since `sanitize`'s arity is fixed. campfire's
+    # `MessagesHelper#auto_link_text` is the caller.
+    def self.sanitize_with(html, tags, attributes)
+      sanitize_engine(html.to_s, tags, attributes)
+    end
+
     # ── the safe-list engine and its rule tables ─────────────────────
     #
     # Every table below is PORTED from the gems named above, not
@@ -651,6 +763,18 @@ module ActionView
                 i = after
               else
                 name = sanitize_tag_name(raw)
+                # The parser drops ONE newline (LF, CR, or CRLF) right
+                # after a <pre> or <listing> start tag, kept or stripped,
+                # so the gem's output has lost it — measured:
+                # "<pre>\n\nx</pre>" sanitizes to "<pre>\nx</pre>".
+                # campfire's auto_link_text test pins it.
+                if name == "pre" || name == "listing"
+                  if s[after, 2] == "\r\n"
+                    after = after + 2
+                  elsif s[after, 1] == "\n" || s[after, 1] == "\r"
+                    after = after + 1
+                  end
+                end
                 if name == "svg" || name == "math"
                   # Foreign content is PRUNED whole — children, text and
                   # all — matching the gem's namespace rule. A

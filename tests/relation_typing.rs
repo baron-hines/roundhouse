@@ -77,9 +77,13 @@ end
   include Pagination
   has_many :comments
   scope :recent, -> { order(score: :desc).limit(10) }
+  scope :banged, -> { where!(score: 1).order!(:score) }
+  scope :bare_reload, -> { reload }
+  scope :reloaded, -> { where(score: 1).reload }
   scope :top, -> { recent.where("score > 0") }
   scope :titles_only, -> { pluck(:title) }
-  scope :filtered, ->(uid) { uid ? where(user_id: uid) : all }
+  scope :filtered, ->(uid) { case uid when Integer then where(user_id: uid) end }
+  scope :either, ->(uid) { uid ? where(user_id: uid) : all }
 
   def self.for_user(user_id)
     where(user_id: user_id)
@@ -96,6 +100,9 @@ end
             r#"class StoriesController < ApplicationController
   def index
     @relation = Story.recent
+    @banged = Story.banged
+    @bare_reload = Story.bare_reload
+    @reloaded = Story.reloaded
     @chained = Story.recent.where(user_id: 1)
     @delegated = Story.recent.for_user(1)
     @first = Story.recent.first
@@ -109,6 +116,7 @@ end
     @scope_on_scope = Story.top
     @terminal_scope = Story.titles_only
     @mixed = Story.filtered(1).recent
+    @either = Story.either(1).recent
     @last_page = Story.recent.last_page
     @page_before = Story.recent.page_before(Story.first)
     @page_around = Story.page_around(Story.first)
@@ -179,6 +187,28 @@ fn scope_call_types_as_relation() {
 }
 
 #[test]
+fn bang_builder_alias_scope_types_as_relation() {
+    // `where!` / `order!` are catalog aliases of builders. The scope
+    // seed has to read the same names the chain lowerer does, or a
+    // body that lowers onto `__rel` is still declared `Array[Story]`.
+    let app = analyzed_app();
+    assert_eq!(ivar_ty(&app, "banged"), relation_of_story());
+}
+
+#[test]
+fn relation_reload_continues_a_builder_chain() {
+    // `reload` is a Relation builder and an Instance read. A bare
+    // `reload` is the instance method. `where(…).reload` is the
+    // relation hop and keeps the relation type.
+    let app = analyzed_app();
+    let stories = Ty::Array {
+        elem: std::sync::Arc::new(Ty::Class { id: story(), args: vec![].into() }),
+    };
+    assert_eq!(ivar_ty(&app, "bare_reload"), stories);
+    assert_eq!(ivar_ty(&app, "reloaded"), relation_of_story());
+}
+
+#[test]
 fn builder_chain_preserves_relation() {
     let app = analyzed_app();
     assert_eq!(ivar_ty(&app, "chained"), relation_of_story());
@@ -200,13 +230,13 @@ fn relation_terminals_produce_array_representation_types() {
     assert_eq!(
         ivar_ty(&app, "first"),
         Ty::Union {
-            variants: vec![Ty::Class { id: story(), args: vec![] }, Ty::Nil]
+            variants: vec![Ty::Class { id: story(), args: vec![].into() }, Ty::Nil].into()
         },
     );
     assert_eq!(ivar_ty(&app, "count"), Ty::Int);
     assert_eq!(
         ivar_ty(&app, "list"),
-        Ty::Array { elem: Box::new(Ty::Class { id: story(), args: vec![] }) },
+        Ty::Array { elem: std::sync::Arc::new(Ty::Class { id: story(), args: vec![].into() }) },
     );
 }
 
@@ -218,7 +248,7 @@ fn counted_first_and_last_type_as_arrays() {
     // .last(100)` was typed as one `Message?` and the controller ivar
     // then disagreed with the `Array[Message]` the view declares.
     let app = analyzed_app();
-    let stories = Ty::Array { elem: Box::new(Ty::Class { id: story(), args: vec![] }) };
+    let stories = Ty::Array { elem: std::sync::Arc::new(Ty::Class { id: story(), args: vec![].into() }) };
     assert_eq!(ivar_ty(&app, "first_n"), stories);
     assert_eq!(ivar_ty(&app, "last_n"), stories);
     assert_eq!(ivar_ty(&app, "class_last_n"), stories);
@@ -236,7 +266,7 @@ fn counted_last_with_a_constant_count_types_as_array_through_a_scope() {
     // local, N+1 chains through it opaque, and the room page's own
     // partial unreachable to the dead-view walk.
     let app = analyzed_app();
-    let stories = Ty::Array { elem: Box::new(Ty::Class { id: story(), args: vec![] }) };
+    let stories = Ty::Array { elem: std::sync::Arc::new(Ty::Class { id: story(), args: vec![].into() }) };
     assert_eq!(ivar_ty(&app, "last_page"), stories);
     assert_eq!(ivar_ty(&app, "page_before"), stories);
     assert_eq!(ivar_ty(&app, "page_around"), stories);
@@ -263,22 +293,29 @@ fn relation_typed_scope_delegates_on_array_representation_receiver() {
     // Mixed-representation chain. C1 converged class-side chain
     // starts (`Story.where(...)`) onto the Relation representation,
     // so this pins the seam that C1 did NOT close: a scope whose
-    // body the seed classifier can't read (`filtered`'s ternary)
+    // body the seed classifier can't read (`filtered`'s case/when
+    // without else, whose value can be nil)
     // still falls back to `Array<Story>`, and `.recent` — a scope
     // whose seed carries the Relation representation — must still
     // delegate on it, preserving the RECEIVER's representation:
     // `Array<Story>`, not Var. This is exactly the Mastodon
     // `Account.with_username(u).with_domain(d)` regression (CI
-    // browser-smoke-ide) in its original shape: the unflipped
-    // ternary-body scope keeps the chain on the Array
-    // representation, and the flipped scope's hop poisoned it to
+    // browser-smoke-ide): the unflipped scope keeps the chain on the
+    // Array representation, and the flipped scope's hop poisoned it to
     // Var → Untyped. Retire this test only when the scope-seed
     // fallback itself converges.
     let app = analyzed_app();
     assert_eq!(
         ivar_ty(&app, "mixed"),
-        Ty::Array { elem: Box::new(Ty::Class { id: story(), args: vec![] }) },
+        Ty::Array { elem: std::sync::Arc::new(Ty::Class { id: story(), args: vec![].into() }) },
     );
+}
+
+#[test]
+fn scope_with_a_relation_on_each_branch_types_as_relation() {
+    // `scope :either, ->(uid) { uid ? where(user_id: uid) : all }`.
+    let app = analyzed_app();
+    assert_eq!(ivar_ty(&app, "either"), relation_of_story());
 }
 
 #[test]
@@ -289,7 +326,7 @@ fn terminal_tailed_scope_keeps_legacy_array_seed() {
     let app = analyzed_app();
     assert_eq!(
         ivar_ty(&app, "terminal_scope"),
-        Ty::Array { elem: Box::new(Ty::Class { id: story(), args: vec![] }) },
+        Ty::Array { elem: std::sync::Arc::new(Ty::Class { id: story(), args: vec![].into() }) },
     );
 }
 
@@ -297,10 +334,11 @@ fn terminal_tailed_scope_keeps_legacy_array_seed() {
 fn assoc_collection_build_rewrites_to_fk_preset_constructor() {
     // Ruby-lane lowering (relation-type-plan R5): `story.comments
     // .build` on a TYPED owner rewrites to the target constructor
-    // with the association FK preset — `Comment.new(story_id:
-    // story.id)` — instead of calling `build` on the folded Array
-    // reader. Owner typing is what disambiguates assoc names
-    // declared on several models.
+    // with the association preset — `Comment.new(story: story)`, the
+    // owner handed to the automatic inverse `belongs_to :story` as
+    // Rails sets it (its writer presets the FK) — instead of calling
+    // `build` on the folded Array reader. Owner typing is what
+    // disambiguates assoc names declared on several models.
     let app = analyzed_app();
     let controllers = roundhouse::emit::ruby::emit_lowered_controllers(&app);
     let src: String = controllers
@@ -309,7 +347,7 @@ fn assoc_collection_build_rewrites_to_fk_preset_constructor() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        src.contains("Comment.new(story_id: story.id)"),
+        src.contains("Comment.new(story: story)"),
         "expected FK-preset constructor rewrite in emitted controller:\n{src}",
     );
 }
@@ -348,9 +386,9 @@ fn view_iteration_over_materialized_list_still_types_element() {
 #[test]
 fn find_result_depends_on_the_id_container() {
     let app = analyzed_app();
-    let record = Ty::Class { id: story(), args: vec![] };
+    let record = Ty::Class { id: story(), args: vec![].into() };
     assert_eq!(ivar_ty(&app, "found_one"), record);
-    let records = Ty::Array { elem: Box::new(record) };
+    let records = Ty::Array { elem: std::sync::Arc::new(record) };
     assert_eq!(ivar_ty(&app, "found_many"), records);
     assert_eq!(ivar_ty(&app, "found_normalized"), records);
     assert_eq!(ivar_ty(&app, "found_array_repr"), records);

@@ -24,7 +24,7 @@ use crate::ident::{ClassId, Symbol, VarId};
 use crate::lower::routes::{flatten_routes, flatten_routes_for_helpers, FlatRoute};
 use crate::lower::typing::{fn_sig, lit_str, lit_sym, with_ty};
 use crate::span::Span;
-use crate::ty::Ty;
+use crate::ty::{FnTy, Ty};
 
 /// Build the `Routes` dispatch module — `RouteTable.table -> Array<Route>`
 /// (one `Route` instance per concrete `(verb, pattern, controller,
@@ -42,25 +42,226 @@ use crate::ty::Ty;
 /// consumers: helpers are called from view + controller bodies,
 /// dispatch is read at startup by the HTTP router.
 pub fn lower_routes_to_dispatch_functions(app: &App) -> Vec<LibraryFunction> {
-    let flat = flatten_routes(app);
-    if flat.is_empty() {
+    dispatch_functions(app, flatten_routes(app).into_iter().map(|r| (r, None)).collect(), false)
+}
+
+/// `lower_routes_to_dispatch_functions` for the Ruby-family router, which asks a guarded route's
+/// request constraints once its path matches: each route carries the index of its constraints in
+/// `RouteTable.guard_allows`, which the dispatcher calls before taking it.
+pub fn lower_routes_to_guarded_dispatch_functions(app: &App) -> Vec<LibraryFunction> {
+    let mut chains: Vec<Vec<usize>> = Vec::new();
+    let routes = crate::lower::routes::flatten_routes_asking_guards(app)
+        .into_iter()
+        .map(|(route, guards)| {
+            if guards.is_empty() {
+                return (route, None);
+            }
+            let at = chains.iter().position(|c| *c == guards).unwrap_or_else(|| {
+                chains.push(guards);
+                chains.len() - 1
+            });
+            (route, Some(at))
+        })
+        .collect();
+    let mut out = dispatch_functions(app, routes, true);
+    out.push(guard_allows_function(&chains));
+    out.push(match_asking_function());
+    out
+}
+
+/// `RouteTable.match_asking(verb, path, table, request)`: `Router.match`, past every route whose
+/// constraints refuse the request, as Rails' router goes on to the next route.
+///
+/// ```ruby
+/// matched = ActionDispatch::Router.match_from(verb, path, table, 0)
+/// while !matched.nil? && matched.guard >= 0 && !RouteTable.guard_allows(matched.guard, request)
+///   matched = ActionDispatch::Router.match_from(verb, path, table, matched.index + 1)
+/// end
+/// matched
+/// ```
+fn match_asking_function() -> LibraryFunction {
+    let syn = |node: ExprNode, ty: Ty| with_ty(Expr::new(Span::synthetic(), node), ty);
+    let string = Ty::Str;
+    let route_ty = Ty::Class { id: ClassId(Symbol::from("ActionDispatch::Router::Route")), args: vec![].into() };
+    let table_ty = Ty::Array { elem: std::sync::Arc::new(route_ty) };
+    let request_ty = Ty::Class { id: ClassId(Symbol::from("ActionDispatch::Request")), args: vec![].into() };
+    let result_ty = Ty::Class { id: ClassId(Symbol::from("ActionDispatch::Router::MatchResult")), args: vec![].into() };
+    let maybe_result = Ty::Union { variants: vec![result_ty, Ty::Nil].into() };
+    let var = |name: &str, ty: &Ty| syn(ExprNode::Var { id: VarId(0), name: Symbol::from(name) }, ty.clone());
+    let send = |recv: Option<Expr>, method: &str, args: Vec<Expr>, ty: Ty| {
+        syn(ExprNode::Send { recv, method: Symbol::from(method), args, block: None, parenthesized: true }, ty)
+    };
+    let int = |value: i64| syn(ExprNode::Lit { value: Literal::Int { value } }, Ty::Int);
+    let matched = || var("matched", &maybe_result);
+    let match_from = |start: Expr| {
+        send(
+            Some(Expr::new(Span::synthetic(), ExprNode::Const { path: vec![Symbol::from("ActionDispatch"), Symbol::from("Router")] })),
+            "match_from",
+            vec![var("verb", &string), var("path", &string), var("table", &table_ty), start],
+            maybe_result.clone(),
+        )
+    };
+    let assign = |value: Expr| syn(ExprNode::Assign { target: crate::expr::LValue::Var { id: VarId(0), name: Symbol::from("matched") }, value }, maybe_result.clone());
+    let and = |left: Expr, right: Expr| syn(ExprNode::BoolOp { op: crate::expr::BoolOpKind::And, surface: crate::expr::BoolOpSurface::Symbol, left, right }, Ty::Bool);
+    let not = |e: Expr| send(Some(e), "!", vec![], Ty::Bool);
+    let guard = || send(Some(matched()), "guard", vec![], Ty::Int);
+    let cond = and(
+        and(not(send(Some(matched()), "nil?", vec![], Ty::Bool)), send(Some(guard()), ">=", vec![int(0)], Ty::Bool)),
+        not(send(
+            Some(Expr::new(Span::synthetic(), ExprNode::Const { path: vec![Symbol::from("RouteTable")] })),
+            "guard_allows",
+            vec![guard(), var("request", &request_ty)],
+            Ty::Bool,
+        )),
+    );
+    let next = assign(match_from(send(Some(send(Some(matched()), "index", vec![], Ty::Int)), "+", vec![int(1)], Ty::Int)));
+    let body = syn(
+        ExprNode::Seq {
+            exprs: vec![
+                assign(match_from(int(0))),
+                syn(ExprNode::While { cond, body: next, until_form: false }, Ty::Nil),
+                matched(),
+            ],
+        },
+        maybe_result.clone(),
+    );
+    LibraryFunction {
+        module_path: vec![Symbol::from("RouteTable")],
+        name: Symbol::from("match_asking"),
+        params: ["verb", "path", "table", "request"].into_iter().map(|n| Param::positional(Symbol::from(n))).collect(),
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        body,
+        signature: Some(fn_sig(
+            vec![
+                (Symbol::from("verb"), string.clone()),
+                (Symbol::from("path"), string),
+                (Symbol::from("table"), table_ty),
+                (Symbol::from("request"), request_ty),
+            ],
+            maybe_result,
+        )),
+        effects: EffectSet::default(),
+        is_async: false,
+    }
+}
+
+/// `RouteTable.guard_allows(chain, request)`: whether every constraint of a route's chain admits the request.
+fn guard_allows_function(chains: &[Vec<usize>]) -> LibraryFunction {
+    let request_ty = Ty::Class { id: ClassId(Symbol::from("ActionDispatch::Request")), args: vec![].into() };
+    let var = |name: &str, ty: Ty| with_ty(Expr::new(Span::synthetic(), ExprNode::Var { id: VarId(0), name: Symbol::from(name) }), ty);
+    let lit_bool = |value: bool| with_ty(Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Bool { value } }), Ty::Bool);
+    let ask = |index: usize| {
+        with_ty(
+            Expr::new(
+                Span::synthetic(),
+                ExprNode::Send {
+                    recv: Some(Expr::new(Span::synthetic(), ExprNode::Const { path: vec![Symbol::from(crate::lower::route_guards::GUARD_CLASS)] })),
+                    method: Symbol::from(format!("guard_{index}")),
+                    args: vec![var("request", request_ty.clone())],
+                    block: None,
+                    parenthesized: true,
+                },
+            ),
+            Ty::Bool,
+        )
+    };
+    // Each chain's test in turn, `true` past the last: a route with no chain never asks.
+    let body = chains.iter().enumerate().rev().fold(lit_bool(true), |rest, (at, chain)| {
+        let all = chain.iter().map(|&i| ask(i)).reduce(|left, right| {
+            with_ty(
+                Expr::new(Span::synthetic(), ExprNode::BoolOp { op: crate::expr::BoolOpKind::And, surface: crate::expr::BoolOpSurface::Symbol, left, right }),
+                Ty::Bool,
+            )
+        }).expect("a chain names one constraint at least");
+        let cond = with_ty(
+            Expr::new(
+                Span::synthetic(),
+                ExprNode::Send {
+                    recv: Some(var("chain", Ty::Int)),
+                    method: Symbol::from("=="),
+                    args: vec![with_ty(Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Int { value: at as i64 } }), Ty::Int)],
+                    block: None,
+                    parenthesized: false,
+                },
+            ),
+            Ty::Bool,
+        );
+        with_ty(Expr::new(Span::synthetic(), ExprNode::If { cond, then_branch: all, else_branch: rest }), Ty::Bool)
+    });
+    LibraryFunction {
+        module_path: vec![Symbol::from("RouteTable")],
+        name: Symbol::from("guard_allows"),
+        params: vec![Param::positional(Symbol::from("chain")), Param::positional(Symbol::from("request"))],
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        body,
+        signature: Some(fn_sig(vec![(Symbol::from("chain"), Ty::Int), (Symbol::from("request"), request_ty)], Ty::Bool)),
+        effects: EffectSet::default(),
+        is_async: false,
+    }
+}
+
+/// Apply typed request defaults after body/query/captures have been merged. Captures always win.
+fn route_defaults_function(defaults: &[Vec<(String, Literal)>]) -> LibraryFunction {
+    let expr = |node| Expr::new(Span::synthetic(), node);
+    let var = |name: &str| expr(ExprNode::Var { id: VarId(0), name: Symbol::from(name) });
+    let nil = || with_ty(expr(ExprNode::Lit { value: Literal::Nil }), Ty::Nil);
+    let send = |recv, method: &str, args| with_ty(expr(ExprNode::Send { recv: Some(recv), method: Symbol::from(method), args, block: None, parenthesized: true }), Ty::Bool);
+    let body = defaults.iter().enumerate().rev().fold(nil(), |rest, (index, values)| {
+        let mut assignments: Vec<_> = values.iter().map(|(key, value)| {
+            let captured = send(var("captures"), "key?", vec![lit_str(key.clone())]);
+            let assign = expr(ExprNode::Assign { target: crate::expr::LValue::Index { recv: var("params"), index: lit_str(key.clone()) }, value: expr(ExprNode::Lit { value: value.clone() }) });
+            expr(ExprNode::If { cond: captured, then_branch: nil(), else_branch: assign })
+        }).collect();
+        assignments.push(nil());
+        let cond = send(var("n"), "==", vec![crate::lower::typing::lit_int(index as i64)]);
+        expr(ExprNode::If { cond, then_branch: expr(ExprNode::Seq { exprs: assignments }), else_branch: rest })
+    });
+    let hash = |value| Ty::Hash { key: std::sync::Arc::new(Ty::Str), value: std::sync::Arc::new(value) };
+    LibraryFunction {
+        module_path: vec![Symbol::from("RouteTable")], name: Symbol::from("route_defaults"),
+        params: ["n", "params", "captures"].into_iter().map(|name| Param::positional(Symbol::from(name))).collect(),
+        unsupported_formals: None, has_anonymous_block: false, body,
+        signature: Some(fn_sig(vec![(Symbol::from("n"), Ty::Int), (Symbol::from("params"), hash(Ty::Untyped)), (Symbol::from("captures"), hash(Ty::Str))], Ty::Nil)),
+        effects: EffectSet::default(), is_async: false,
+    }
+}
+
+fn dispatch_functions(app: &App, flat: Vec<(FlatRoute, Option<usize>)>, asks_guards: bool) -> Vec<LibraryFunction> {
+    let mounts = super::rack_mounts::mounts(app);
+    // Not for the Ruby-family router: its main.rb and test helper call `table` and `route_defaults` with no route too.
+    if flat.is_empty() && mounts.is_empty() && !asks_guards {
         return Vec::new();
     }
+    let mut defaults = Vec::new();
+    if asks_guards {
+        for (route, _) in &flat {
+            let values: Vec<_> = route.request_defaults.iter().map(|(k, v, _)| (k.clone(), v.clone())).collect();
+            if !values.is_empty() && !defaults.contains(&values) { defaults.push(values); }
+        }
+    }
     let module_path = vec![Symbol::from("RouteTable")];
-    // Same partition the per-target Spinel emit used: path "/" goes
-    // to `RouteTable.root`, everything else to `RouteTable.table`. Callers
-    // typically combine them at use site (`[RouteTable.root] +
-    // RouteTable.table`).
-    let (root_routes, table_routes): (Vec<&FlatRoute>, Vec<&FlatRoute>) =
-        flat.iter().partition(|r| r.path == "/");
+    // The first route on path "/" (the `root`, when the app has one)
+    // goes to `RouteTable.root`, every other route to `RouteTable.table`.
+    // Callers combine them at use site (`[RouteTable.root] +
+    // RouteTable.table`). Only the first: Rails matches on verb AND
+    // path, so a `match "/", via: %i[post delete]` beside a `root` (or
+    // the second verb of that `match`) is a route of its own, and it
+    // stays in the table in declaration order.
+    let root_index = flat.iter().position(|(r, _)| r.path == "/");
+    let root_routes: Vec<&(FlatRoute, Option<usize>)> = root_index.map(|i| &flat[i]).into_iter().collect();
+    let table_routes: Vec<&(FlatRoute, Option<usize>)> =
+        flat.iter().enumerate().filter(|(i, _)| Some(*i) != root_index).map(|(_, r)| r).collect();
 
     let route_class_id = ClassId(Symbol::from("ActionDispatch::Router::Route"));
     let route_ty = Ty::Class {
         id: route_class_id.clone(),
-        args: vec![],
+        args: vec![].into(),
     };
 
     let mut out: Vec<LibraryFunction> = Vec::new();
+    if asks_guards { out.push(route_defaults_function(&defaults)); }
 
     let table_body = with_ty(
         Expr::new(
@@ -68,12 +269,12 @@ pub fn lower_routes_to_dispatch_functions(app: &App) -> Vec<LibraryFunction> {
             ExprNode::Array {
                 elements: table_routes
                     .iter()
-                    .map(|r| build_route_new(r, &route_class_id, &route_ty))
+                    .map(|(r, chain)| build_route_new(r, *chain, asks_guards, &defaults, &route_class_id, &route_ty))
                     .collect(),
                 style: ArrayStyle::Brackets,
             },
         ),
-        Ty::Array { elem: Box::new(route_ty.clone()) },
+        Ty::Array { elem: std::sync::Arc::new(route_ty.clone()) },
     );
     out.push(LibraryFunction {
         module_path: module_path.clone(),
@@ -84,28 +285,73 @@ pub fn lower_routes_to_dispatch_functions(app: &App) -> Vec<LibraryFunction> {
         body: table_body,
         signature: Some(fn_sig(
             vec![],
-            Ty::Array { elem: Box::new(route_ty.clone()) },
+            Ty::Array { elem: std::sync::Arc::new(route_ty.clone()) },
         )),
         effects: EffectSet::default(),
         is_async: false,
     });
 
-    if let Some(r) = root_routes.first() {
-        let root_body = build_route_new(r, &route_class_id, &route_ty);
+    if let Some((r, chain)) = root_routes.first() {
+        let root_body = build_route_new(r, *chain, asks_guards, &defaults, &route_class_id, &route_ty);
+        // Where the root was declared among the table's routes: route
+        // generation (the test helper's `assert_generates`) breaks a
+        // tie by declaration order, so `root "articles#index"` declared
+        // first generates "/" for articles#index, as in Rails.
+        let position = root_index.unwrap_or(table_routes.len()) as i64;
         out.push(LibraryFunction {
-            module_path,
+            module_path: module_path.clone(),
+            name: Symbol::from("root_position"),
+            params: Vec::new(),
+            unsupported_formals: None,
+            has_anonymous_block: false,
+            body: with_ty(Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Int { value: position } }), Ty::Int),
+            signature: Some(fn_sig(vec![], Ty::Int)),
+            effects: EffectSet::default(),
+            is_async: false,
+        });
+        out.push(LibraryFunction {
+            module_path: module_path.clone(),
             name: Symbol::from("root"),
             params: Vec::new(),
             unsupported_formals: None,
             has_anonymous_block: false,
             body: root_body,
-            signature: Some(fn_sig(vec![], route_ty)),
+            signature: Some(fn_sig(vec![], route_ty.clone())),
             effects: EffectSet::default(),
             is_async: false,
         });
     }
 
+    if !mounts.is_empty() {
+        for (index, mount) in mounts.iter().enumerate() {
+            out.push(rack_route_array(
+                &format!("rack_routes_before_{index}"), mount.preceding.iter(),
+                &route_class_id, &route_ty, &defaults,
+            ));
+        }
+        out.push(rack_route_array(
+            "rack_head_routes", flat.iter().map(|(route, _)| route).filter(|route| route.method == HttpMethod::Head),
+            &route_class_id, &route_ty, &defaults,
+        ));
+    }
     out
+}
+
+/// Reuse the controller route constructor, including all its requirements.
+fn rack_route_array<'a>(
+    name: &str, routes: impl Iterator<Item = &'a FlatRoute>,
+    class: &ClassId, route_ty: &Ty, defaults: &[Vec<(String, Literal)>],
+) -> LibraryFunction {
+    let ty = Ty::Array { elem: std::sync::Arc::new(route_ty.clone()) };
+    LibraryFunction {
+        module_path: vec![Symbol::from("RouteTable")], name: Symbol::from(name),
+        params: Vec::new(), unsupported_formals: None, has_anonymous_block: false,
+        body: with_ty(Expr::new(Span::synthetic(), ExprNode::Array {
+            elements: routes.map(|route| build_route_new(route, None, false, defaults, class, route_ty)).collect(),
+            style: ArrayStyle::Brackets,
+        }), ty.clone()),
+        signature: Some(fn_sig(vec![], ty)), effects: EffectSet::default(), is_async: false,
+    }
 }
 
 /// Build `ActionDispatch::Router::Route.new("GET", "/x", :articles,
@@ -116,7 +362,7 @@ pub fn lower_routes_to_dispatch_functions(app: &App) -> Vec<LibraryFunction> {
 /// args — per-target emitters convert kwarg-style def to positional
 /// pub fn but don't unpack kwarg-style call sites; matches the
 /// positional `initialize` signature.
-fn build_route_new(r: &FlatRoute, class_id: &ClassId, route_ty: &Ty) -> Expr {
+fn build_route_new(r: &FlatRoute, chain: Option<usize>, asks_guards: bool, defaults: &[Vec<(String, Literal)>], class_id: &ClassId, route_ty: &Ty) -> Expr {
     let verb_str = match r.method {
         HttpMethod::Get => "GET",
         HttpMethod::Post => "POST",
@@ -130,7 +376,7 @@ fn build_route_new(r: &FlatRoute, class_id: &ClassId, route_ty: &Ty) -> Expr {
     let controller_sym = controller_symbol(r.controller.0.as_str());
     let mut args = vec![
         lit_str(verb_str.to_string()),
-        lit_str(r.path.clone()),
+        lit_str(crate::lower::segment_pattern::dispatch_path(&r.path, &r.seg_patterns)),
         lit_sym(Symbol::from(controller_sym)),
         lit_sym(r.action.clone()),
     ];
@@ -170,6 +416,28 @@ fn build_route_new(r: &FlatRoute, class_id: &ClassId, route_ty: &Ty) -> Expr {
     if !seg_constraints.is_empty() {
         args.push(lit_str(seg_constraints));
     }
+    // A guarded route's chain rides the optional 8th positional (`RouteTable.guard_allows`).
+    if let Some(chain) = chain.filter(|_| asks_guards) {
+        let nil = || {
+            let mut nil = Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil });
+            nil.ty = Some(Ty::Nil);
+            nil
+        };
+        match args.len() {
+            4 => args.extend([nil(), lit_str(String::new()), lit_str(String::new())]),
+            5 => args.extend([lit_str(String::new()), lit_str(String::new())]),
+            6 => args.push(lit_str(String::new())),
+            _ => {}
+        }
+        args.push(with_ty(Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Int { value: chain as i64 } }), Ty::Int));
+    }
+    let values: Vec<_> = r.request_defaults.iter().map(|(k, v, _)| (k.clone(), v.clone())).collect();
+    if let Some(index) = defaults.iter().position(|set| *set == values) {
+        if args.len() == 4 { args.push(with_ty(Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }), Ty::Nil)); }
+        while args.len() < 7 { args.push(lit_str(String::new())); }
+        if args.len() == 7 { args.push(crate::lower::typing::lit_int(-1)); }
+        args.push(crate::lower::typing::lit_int(index as i64));
+    }
     let class_path: Vec<Symbol> = class_id
         .0
         .as_str()
@@ -197,19 +465,32 @@ fn build_route_new(r: &FlatRoute, class_id: &ClassId, route_ty: &Ty) -> Expr {
 
 /// `ArticlesController` → `articles` (the controller-symbol form
 /// the spinel router uses). Mirrors the existing per-target convention.
-/// Namespaced controllers flatten with underscores
-/// (`Mod::ActivitiesController` → `mod_activities`) — a plain-ident
+/// Namespaced controllers flatten with a double underscore
+/// (`Mod::ActivitiesController` → `mod__activities`) — a plain-ident
 /// symbol every target's symbol literal can carry (`:mod::activities`
 /// parses as scope resolution, not a symbol, under Ruby).
+// Not a single underscore: lobsters' `Mod::MailsController` and top-level `ModMailsController` both flattened to `mod_mails`, and /mod/mails/* dispatched to the wrong one.
 pub(crate) fn controller_symbol(class_name: &str) -> String {
     let base = class_name.strip_suffix("Controller").unwrap_or(class_name);
-    crate::naming::underscore(base).replace('/', "_")
+    crate::naming::underscore(base).replace('/', "__")
 }
 
 /// Build the `RouteHelpers` module from `app.routes` as a list of
 /// `LibraryFunction`s, one per named route. Empty when the app has
 /// no routes.
 pub fn lower_routes_to_library_functions(app: &App) -> Vec<LibraryFunction> {
+    lower_route_helpers(app, true)
+}
+
+/// The same helpers with a Hash query option kept a scalar, for the
+/// TypeScript emit: its helper takes the option as `any`, and the Hash
+/// rendering's `keys` throws on the object it is passed, where the
+/// scalar form renders.
+pub fn lower_routes_to_library_functions_without_hash_query(app: &App) -> Vec<LibraryFunction> {
+    lower_route_helpers(app, false)
+}
+
+fn lower_route_helpers(app: &App, hash_query: bool) -> Vec<LibraryFunction> {
     let flat = flatten_routes_for_helpers(app);
     if flat.is_empty() {
         return Vec::new();
@@ -219,7 +500,7 @@ pub fn lower_routes_to_library_functions(app: &App) -> Vec<LibraryFunction> {
     // single helper (`articles` for both index/create — same URL).
     // First-occurrence wins; the as_name + path are identical so the
     // function body is the same.
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen: crate::det::HashSet<String> = crate::det::HashSet::default();
     let mut funcs: Vec<LibraryFunction> = Vec::new();
     // Helper name -> (every segment name it can take, how many
     // positionals the GENERATED helper requires). The query survey
@@ -234,7 +515,7 @@ pub fn lower_routes_to_library_functions(app: &App) -> Vec<LibraryFunction> {
     // Taking the last one's segments instead made `period` look like a
     // query param and emitted `mod_notes_path(period = nil, period:
     // nil)` — a duplicate parameter name.
-    let mut helper_shape: std::collections::HashMap<String, (Vec<String>, usize)> =
+    let mut helper_shape: crate::det::HashMap<String, (Vec<String>, usize)> =
         Default::default();
     for r in flat.iter().filter(|r| r.named) {
         // Both spellings: `_url` is the same helper with the host in
@@ -263,7 +544,7 @@ pub fn lower_routes_to_library_functions(app: &App) -> Vec<LibraryFunction> {
     // generated without them (`unknown keyword: :bot_key`). Registering
     // the variant under its own name collects them against the variant,
     // where they belong.
-    let declared: std::collections::HashSet<String> =
+    let declared: crate::det::HashSet<String> =
         flat.iter().filter(|r| r.named).map(|r| format!("{}_path", r.as_name)).collect();
     let variants = format_variant_demand(app, &declared);
     for (name, (as_name, _)) in &variants {
@@ -275,7 +556,10 @@ pub fn lower_routes_to_library_functions(app: &App) -> Vec<LibraryFunction> {
             }
         }
     }
-    let query_keys = query_param_demand(app, &helper_shape);
+    let mut query_keys = query_param_demand(app, &helper_shape);
+    if !hash_query {
+        query_keys.values_mut().flatten().for_each(|key| key.hash = false);
+    }
     let string_segments = string_segment_demand(app, &helper_shape);
     for route in &flat {
         // Unnamed dynamic routes (`get "/comments/page/:page"`, no `as:`)
@@ -323,10 +607,21 @@ pub fn lower_routes_to_library_functions(app: &App) -> Vec<LibraryFunction> {
     // target's call site: every emitter that wants route helpers wants
     // these too, and a per-target wiring is nine places to forget one.
     funcs.extend(lower_url_option_helpers(app));
+    funcs.extend(lower_dynamic_url_helper(app, &module_path, &flat));
     // `direct :name do … end` helpers — not routes, so they never reach
     // `flat`; they ride here because they live in the same module and
     // their `route_for` bodies need the flattened table to resolve.
-    funcs.extend(direct::lower_direct_helpers(&module_path, app, &flat));
+    // A `route_for` argument meets its target's signature the way any
+    // other call site does, so the generated helpers' parameter types go
+    // with it.
+    let helper_params: crate::det::HashMap<String, Vec<Ty>> = funcs
+        .iter()
+        .filter_map(|f| match &f.signature {
+            Some(Ty::Fn(fn_ty)) => Some((f.name.as_str().to_string(), fn_ty.params.iter().map(|p| (*p.ty).clone()).collect())),
+            _ => None,
+        })
+        .collect();
+    funcs.extend(direct::lower_direct_helpers(&module_path, app, &flat, &helper_params));
     // The `**hash` half of the query string. `query_keys` above covers
     // every key a call site NAMES; a call site that splats a runtime
     // Hash names none, and there is nothing static to read them off —
@@ -343,8 +638,21 @@ pub fn lower_routes_to_library_functions(app: &App) -> Vec<LibraryFunction> {
     // parameter is a `Hash[Symbol, untyped]` — the one shape
     // `feedback_types_are_performance` says to keep out of a tree that
     // does not need it.
-    if app_splats_into_a_route_helper(app) || app_merges_into_url_options(app) {
+    if app_splats_into_a_route_helper(app) || app_merges_into_url_options(app) || (hash_query && !app.generated_route_helpers.is_empty()) {
         funcs.push(build_query_suffix_helper(&module_path));
+    }
+    for m in app.generated_route_helpers.iter().filter(|_| hash_query) {
+        funcs.push(LibraryFunction {
+            module_path: module_path.clone(),
+            name: m.name.clone(),
+            params: m.params.to_vec(),
+            unsupported_formals: None,
+            has_anonymous_block: false,
+            body: m.body.clone(),
+            signature: None,
+            effects: EffectSet::default(),
+            is_async: false,
+        });
     }
     // These bodies carry APP source (a `direct` block's expressions —
     // campfire's `v: Current.account&.updated_at&.to_fs(:number)`), but
@@ -357,6 +665,147 @@ pub fn lower_routes_to_library_functions(app: &App) -> Vec<LibraryFunction> {
         crate::lower::time_current::rewrite_time_current(&mut f.body, &app.time_formats);
     }
     funcs
+}
+
+/// Ruby family: each generated path helper raises
+/// `ActionController::UrlGenerationError` when a required segment is nil
+/// or empty, as Rails' router does, instead of building
+/// "/articles//comments" (roundhouse#1475). The guard is
+///
+/// ```ruby
+/// raise ActionController::UrlGenerationError.missing_segments(
+///   "comments", "create", ["article_id"], [article_id]) if article_id.to_s.empty?
+/// ```
+///
+/// with one `to_s.empty?` per required positional segment (`nil.to_s` is
+/// `""`). Optional segments keep their `nil` default. A format variant
+/// (`article_comments_json_path`) takes its base route's guard. The
+/// strict targets' helpers take typed segments, so a nil can't reach them.
+pub fn guard_required_segments(funcs: &mut [LibraryFunction], app: &App) {
+    let mut targets: crate::det::HashMap<String, (String, String)> = Default::default();
+    for route in flatten_routes_for_helpers(app).iter().filter(|r| r.named) {
+        let controller = route.controller.0.as_str();
+        let controller = crate::naming::underscore(controller.strip_suffix("Controller").unwrap_or(controller));
+        targets
+            .entry(format!("{}_path", route.as_name))
+            .or_insert_with(|| (controller, route.action.as_str().to_string()));
+    }
+    // A format variant is built from its base route, so it takes the same
+    // guard (CodeRabbit on #1491).
+    let declared: crate::det::HashSet<String> = targets.keys().cloned().collect();
+    for (name, (as_name, _)) in format_variant_demand(app, &declared) {
+        if let Some(target) = targets.get(&format!("{as_name}_path")).cloned() {
+            targets.entry(name).or_insert(target);
+        }
+    }
+    // A `direct` helper of the same name is the app's own, defined after
+    // the generated ones, so it's the one Ruby calls: never guarded.
+    for helper in &app.routes.direct_helpers {
+        for suffix in ["path", "url"] {
+            targets.remove(&format!("{}_{suffix}", helper.name.as_str()));
+        }
+    }
+    let span = Span::synthetic();
+    for f in funcs.iter_mut() {
+        if f.module_path.last().map(|s| s.as_str()) != Some("RouteHelpers") {
+            continue;
+        }
+        let Some((controller, action)) = targets.get(f.name.as_str()) else { continue };
+        let param_tys: Vec<Ty> = match &f.signature {
+            Some(Ty::Fn(fn_ty)) => fn_ty.params.iter().map(|p| (*p.ty).clone()).collect(),
+            _ => Vec::new(),
+        };
+        let required: Vec<(Symbol, Ty)> = f
+            .params
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.default.is_none() && !p.keyword && !p.rest)
+            .map(|(i, p)| (p.name.clone(), param_tys.get(i).cloned().unwrap_or(Ty::Untyped)))
+            .collect();
+        if required.is_empty() {
+            continue;
+        }
+        let read = |name: &Symbol, ty: &Ty| with_ty(Expr::new(span, ExprNode::Var { id: VarId(0), name: name.clone() }), ty.clone());
+        let send = |recv: Expr, method: &str, args: Vec<Expr>, ty: Ty| {
+            with_ty(
+                Expr::new(span, ExprNode::Send { recv: Some(recv), method: Symbol::from(method), args, block: None, parenthesized: true }),
+                ty,
+            )
+        };
+        let blank = |name: &Symbol, ty: &Ty| {
+            let text = send(read(name, ty), "to_s", vec![], Ty::Str);
+            send(text, "empty?", vec![], Ty::Bool)
+        };
+        let cond = required
+            .iter()
+            .map(|(n, t)| blank(n, t))
+            .reduce(|a, b| {
+                with_ty(
+                    Expr::new(
+                        span,
+                        ExprNode::BoolOp {
+                            op: crate::expr::BoolOpKind::Or,
+                            surface: crate::expr::BoolOpSurface::Symbol,
+                            left: a,
+                            right: b,
+                        },
+                    ),
+                    Ty::Bool,
+                )
+            })
+            .expect("a required segment");
+        let array = |elements: Vec<Expr>| Expr::new(span, ExprNode::Array { elements, style: ArrayStyle::Brackets });
+        let error_class = Expr::new(
+            span,
+            ExprNode::Const { path: vec![Symbol::from("ActionController"), Symbol::from("UrlGenerationError")] },
+        );
+        // Each value as a `String?` (`p.nil? ? nil : p.to_s`): Rails shows a
+        // given value as its `to_param` and a nil as `nil`, and the runtime
+        // takes them typed.
+        let opt_str = Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() };
+        let shown = |name: &Symbol, ty: &Ty| {
+            with_ty(
+                Expr::new(
+                    span,
+                    ExprNode::If {
+                        cond: send(read(name, ty), "nil?", vec![], Ty::Bool),
+                        then_branch: with_ty(Expr::new(span, ExprNode::Lit { value: Literal::Nil }), Ty::Nil),
+                        else_branch: send(read(name, ty), "to_s", vec![], Ty::Str),
+                    },
+                ),
+                opt_str.clone(),
+            )
+        };
+        let error = send(
+            error_class,
+            "missing_segments",
+            vec![
+                lit_str(controller.clone()),
+                lit_str(action.clone()),
+                array(required.iter().map(|(n, _)| lit_str(n.as_str().to_string())).collect()),
+                array(required.iter().map(|(n, t)| shown(n, t)).collect()),
+            ],
+            Ty::Untyped,
+        );
+        let raise = with_ty(
+            Expr::new(span, ExprNode::Send { recv: None, method: Symbol::from("raise"), args: vec![error], block: None, parenthesized: false }),
+            Ty::Nil,
+        );
+        let guard = with_ty(
+            Expr::new(
+                span,
+                ExprNode::If {
+                    cond,
+                    then_branch: raise,
+                    else_branch: with_ty(Expr::new(span, ExprNode::Lit { value: Literal::Nil }), Ty::Nil),
+                },
+            ),
+            Ty::Nil,
+        );
+        let ty = f.body.ty.clone();
+        let body = std::mem::replace(&mut f.body, Expr::new(span, ExprNode::Seq { exprs: vec![] }));
+        f.body = Expr { ty, ..Expr::new(span, ExprNode::Seq { exprs: vec![guard, body] }) };
+    }
 }
 
 /// `a && b`, for the resolver's arm conditions.
@@ -420,10 +869,125 @@ pub fn lower_url_option_helpers(app: &App) -> Vec<LibraryFunction> {
         .collect()
 }
 
+/// `RouteHelpers.path_for_params(controller, action, params, recall)`: a
+/// URL built from a Hash only known at run time (lobsters' moderation log
+/// pages through `link_to "Page 2", @moderation_params.merge(page: 2)`),
+/// as Rails' route generation answers it. The request's controller and
+/// action stand for the ones the Hash leaves out, but a Hash that names a
+/// controller, or a nil action, is the index (`action ||= "index"`).
+///
+/// Rails' Journey: a candidate is a GET route of that controller#action
+/// whose every segment the Hash or the request's path parameters supply;
+/// the one whose segments the Hash names most wins, the first written on
+/// a tie; the rest of the Hash is the query string, less the parts of
+/// the route as written (an optional segment it could not place is
+/// dropped, not moved to the query). Generated only for an app whose
+/// views build such a URL.
+fn lower_dynamic_url_helper(app: &App, module_path: &[Symbol], flat: &[FlatRoute]) -> Option<LibraryFunction> {
+    if !app.views.iter().any(|v| crate::lower::view_to_library::view_uses_dynamic_url_hash(&v.body)) {
+        return None;
+    }
+    // Every controller's, not only the linking views' own: a shared partial renders under any controller, and the Hash can name one.
+    let controllers: std::collections::BTreeSet<String> = flat
+        .iter()
+        .filter(|r| r.method == HttpMethod::Get)
+        .map(|r| controller_symbol(r.controller.0.as_str()))
+        .collect();
+    let mut arms = String::new();
+    for controller in &controllers {
+        let mut actions: Vec<&Symbol> = Vec::new();
+        for r in flat.iter().filter(|r| r.method == HttpMethod::Get && controller_symbol(r.controller.0.as_str()) == *controller) {
+            if !actions.contains(&&r.action) {
+                actions.push(&r.action);
+            }
+        }
+        for action in actions {
+            let _ = std::fmt::Write::write_fmt(&mut arms, format_args!("  if key == \"{controller}#{action}\"\n"));
+            for r in flat.iter().filter(|r| r.method == HttpMethod::Get && controller_symbol(r.controller.0.as_str()) == *controller && &r.action == action) {
+                // This variant's own segments (an expanded optional group carries its siblings' names too).
+                let names: Vec<String> = r
+                    .path
+                    .split('/')
+                    .filter_map(|seg| seg.strip_prefix(':').or_else(|| seg.strip_prefix('*')))
+                    .map(str::to_string)
+                    .collect();
+                let present: Vec<String> = names.iter().map(|p| format!("(given.key?(\"{p}\") || recall.key?(\"{p}\"))")).collect();
+                let cond = if present.is_empty() { "true".to_string() } else { present.join(" && ") };
+                let score: Vec<String> = names.iter().map(|p| format!("(given.key?(\"{p}\") ? 1 : 0)")).collect();
+                let score = if score.is_empty() { "0".to_string() } else { score.join(" + ") };
+                let path = r
+                    .path
+                    .split('/')
+                    .map(|seg| match seg.strip_prefix(':').or_else(|| seg.strip_prefix('*')) {
+                        Some(p) => format!("#{{given.key?(\"{p}\") ? given.fetch(\"{p}\", \"\").to_s : recall.fetch(\"{p}\", \"\")}}"),
+                        None => seg.to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("/");
+                let written: Vec<String> = r
+                    .source_path
+                    .split(|c: char| c == '/' || c == '(' || c == ')' || c == '.')
+                    .filter_map(|seg| seg.strip_prefix(':').or_else(|| seg.strip_prefix('*')))
+                    .map(|p| format!("\"{p}\""))
+                    .collect();
+                let _ = std::fmt::Write::write_fmt(
+                    &mut arms,
+                    format_args!(
+                        "    if {cond}\n      score = {score}\n      if score > best\n        best = score\n        path = \"{path}\"\n        parts = [{}]\n      end\n    end\n",
+                        written.join(", ")
+                    ),
+                );
+            }
+            arms.push_str("  end\n");
+        }
+    }
+    let source = format!(
+        "def self.path_for_params(controller, action, params, recall)\n\
+         \x20 given = {{}}\n\
+         \x20 params.each {{ |k, v| given[k.to_s] = v }}\n\
+         \x20 c = given.key?(\"controller\") ? given.fetch(\"controller\", \"\").to_s : controller\n\
+         \x20 named = given.fetch(\"action\", nil)\n\
+         \x20 a = named.nil? ? (given.key?(\"controller\") || given.key?(\"action\") ? \"index\" : action) : named.to_s\n\
+         \x20 key = c.gsub(\"::\", \"_\").gsub(\"/\", \"_\") + \"#\" + a\n\
+         \x20 best = -1\n\
+         \x20 path = \"\"\n\
+         \x20 parts = []\n\
+         {arms}\
+         \x20 raise \"no route matches \" + key if best < 0\n\
+         \x20 rest = {{}}\n\
+         \x20 given.each {{ |k, v| rest[k] = v unless k == \"controller\" || k == \"action\" || parts.include?(k) }}\n\
+         \x20 query = ActiveSupport.to_query(rest)\n\
+         \x20 query.empty? ? path : path + \"?\" + query\n\
+         end\n"
+    );
+    let method = crate::runtime_src::parse_methods(&source).ok()?.into_iter().next()?;
+    let params_ty = Ty::Hash { key: std::sync::Arc::new(Ty::Untyped), value: std::sync::Arc::new(Ty::Untyped) };
+    let recall_ty = Ty::Hash { key: std::sync::Arc::new(Ty::Str), value: std::sync::Arc::new(Ty::Str) };
+    Some(LibraryFunction {
+        module_path: module_path.to_vec(),
+        name: Symbol::from("path_for_params"),
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        params: method.params.clone(),
+        body: method.body,
+        signature: Some(fn_sig(
+            vec![
+                (Symbol::from("controller"), Ty::Str),
+                (Symbol::from("action"), Ty::Str),
+                (Symbol::from("params"), params_ty),
+                (Symbol::from("recall"), recall_ty),
+            ],
+            Ty::Str,
+        )),
+        effects: EffectSet::default(),
+        is_async: false,
+    })
+}
+
 /// Every url-options hash in a view: a Hash literal in the URL argument
 /// of `link_to`, `link_to_if` or `button_to`, whose keys are all Symbols
-/// and include both `controller` and `action`. Yields the remaining
-/// keys, sorted.
+/// and include `controller` (no `action` is the index). Yields the
+/// keys other than those two, sorted.
 ///
 /// The view lowerer resolves a url-options hash only in that URL
 /// argument (`emit_url_options_hash`), so this looks only there. A Hash
@@ -462,7 +1026,7 @@ fn collect_url_options_in_url(url: &Expr, out: &mut Vec<Vec<String>>) {
             collect_url_options_in_url(else_branch, out);
         }
         ExprNode::Send { recv: Some(base), method, args, block: None, .. }
-            if method.as_str() == "merge" && args.len() == 1 =>
+            if method.as_str() == "merge" && args.len() == 1 && url_hash_names_action(base) =>
         {
             collect_url_options_in_url(base, out);
         }
@@ -477,7 +1041,8 @@ fn collect_url_options_in_url(url: &Expr, out: &mut Vec<Vec<String>>) {
                 })
                 .collect();
             if let Some(keys) = keys {
-                if keys.iter().any(|k| k == "controller") && keys.iter().any(|k| k == "action") {
+                // No action is the controller's index (`emit_url_options_hash`).
+                if keys.iter().any(|k| k == "controller") {
                     let mut extras: Vec<String> = keys
                         .into_iter()
                         .filter(|k| k != "controller" && k != "action")
@@ -488,6 +1053,25 @@ fn collect_url_options_in_url(url: &Expr, out: &mut Vec<Vec<String>>) {
             }
         }
         _ => {}
+    }
+}
+
+/// A url-options Hash literal with an `action:` key that is not a literal
+/// `nil`. Under a `.merge` the merged keys could name the action, so only
+/// such a base resolves there (`emit_url_options_hash`); any other is
+/// left to `path_for_params`.
+pub(crate) fn url_hash_names_action(e: &Expr) -> bool {
+    match &*e.node {
+        ExprNode::Hash { entries, .. } => entries.iter().any(|(k, v)| {
+            matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "action")
+                && !matches!(&*v.node, ExprNode::Lit { value: Literal::Nil })
+        }),
+        ExprNode::Send { recv: Some(base), method, args, block: None, .. }
+            if method.as_str() == "merge" && args.len() == 1 =>
+        {
+            url_hash_names_action(base)
+        }
+        _ => false,
     }
 }
 
@@ -503,7 +1087,7 @@ fn build_url_options_function(
     extras: &[String],
     flat: &[FlatRoute],
 ) -> LibraryFunction {
-    let no_slugs = std::collections::HashSet::new();
+    let no_slugs = crate::det::HashSet::default();
     let key_expr = Expr::new(
         Span::synthetic(),
         ExprNode::StringInterp {
@@ -568,7 +1152,7 @@ fn build_url_options_function(
             })
             .collect();
         supers.sort_by_key(|r| std::cmp::Reverse(r.path_params.len()));
-        let mut seen_paths: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut seen_paths: crate::det::HashSet<&str> = crate::det::HashSet::default();
         for r in supers {
             if !seen_paths.insert(r.path.as_str()) {
                 continue;
@@ -619,7 +1203,7 @@ fn build_url_options_function(
                 Expr::new(Span::synthetic(), ExprNode::Seq { exprs: binds }),
             ));
         }
-        let family: std::collections::HashSet<&String> =
+        let family: crate::det::HashSet<&String> =
             routes.iter().flat_map(|r| r.path_params.iter()).collect();
         let drop = routes
             .iter()
@@ -684,7 +1268,7 @@ fn build_url_options_function(
         .chain(extras.iter().cloned())
         .collect();
     // The request's path parameters, last: what the RECALL arms read.
-    let recall_ty = Ty::Hash { key: Box::new(Ty::Str), value: Box::new(Ty::Str) };
+    let recall_ty = Ty::Hash { key: std::sync::Arc::new(Ty::Str), value: std::sync::Arc::new(Ty::Str) };
     LibraryFunction {
         module_path: module_path.to_vec(),
         name: Symbol::from(url_options_helper_name(extras)),
@@ -718,7 +1302,8 @@ fn build_url_options_function(
 /// `/domains/:id => home#for_domain, as: "domain"`), so the helper's
 /// own name is the fallback resource lookup (`domain_path` → Domain).
 fn model_overrides_to_param(controller: &str, helper_name: &str, app: &App) -> bool {
-    let from_controller = crate::naming::singularize(&controller_symbol(controller));
+    let base = controller.strip_suffix("Controller").unwrap_or(controller);
+    let from_controller = crate::naming::singularize(&crate::naming::underscore(base).replace('/', "_"));
     if named_model_overrides_to_param(&from_controller, app) {
         return true;
     }
@@ -734,14 +1319,17 @@ fn model_overrides_to_param(controller: &str, helper_name: &str, app: &App) -> b
 /// String (roundhouse#90).
 fn named_model_overrides_to_param(resource: &str, app: &App) -> bool {
     let model_name = crate::naming::camelize(resource);
-    app.models.iter().any(|m| {
-        m.name.0.as_str() == model_name
-            && (m.body.iter().any(|item| matches!(
-                item,
-                crate::dialect::ModelBodyItem::Method { method, .. }
-                    if method.name.as_str() == "to_param"
-            )) || model_key_is_string(m, app))
-    })
+    app.models.iter().any(|m| m.name.0.as_str() == model_name && model_renders_own_param(m, app))
+}
+
+/// [`named_model_overrides_to_param`] for a model in hand, so a
+/// namespaced one (`Admin::Topic`) is not lost to the name's round trip.
+fn model_renders_own_param(m: &crate::dialect::Model, app: &App) -> bool {
+    m.body.iter().any(|item| matches!(
+        item,
+        crate::dialect::ModelBodyItem::Method { method, .. }
+            if method.name.as_str() == "to_param"
+    )) || model_key_is_string(m, app)
 }
 
 fn model_key_is_string(model: &crate::dialect::Model, app: &App) -> bool {
@@ -762,12 +1350,25 @@ fn build_helper_function(
     // Segments a call site fills with a String — see
     // `string_segment_demand`. Overrides the name-based `id`-is-Integer
     // default for exactly those.
-    string_segments: Option<&std::collections::HashSet<String>>,
+    string_segments: Option<&crate::det::HashSet<String>>,
     // `Some("json")` builds the MONOMORPHIZED variant a call site's
     // `format: :json` asks for — see `format_variant_demand`. The
     // extension is a literal here, so it costs the base helper nothing.
     ext: Option<&str>,
 ) -> LibraryFunction {
+    // `scope format: true`: the helper takes the format as one more
+    // required, last segment param (`count.:format`).
+    let format_required;
+    let route = if route.format_required && route.required_path.is_none() {
+        let mut r = route.clone();
+        r.path.push_str(".:format");
+        r.path_params.push("format".to_string());
+        r.required_params = r.path_params.len();
+        format_required = r;
+        &format_required
+    } else {
+        route
+    };
     let slug_id = model_overrides_to_param(route.controller.0.as_str(), helper_name, app);
     // Slugness is PER PARAM: a nested parent's segment names its model
     // directly (`story_id` in `/stories/:story_id/suggestions` → Story,
@@ -789,7 +1390,7 @@ fn build_helper_function(
         }
         slug_id
     };
-    let slug_params: std::collections::HashSet<String> = route
+    let slug_params: crate::det::HashSet<String> = route
         .path_params
         .iter()
         .filter(|p| param_is_slug(p.as_str()))
@@ -803,6 +1404,8 @@ fn build_helper_function(
     // caller.
     let has_format = route.path.ends_with("(.:format)");
     let path = route.path.strip_suffix("(.:format)").unwrap_or(&route.path);
+    let mount_root = format!("{path}/");
+    let path = if route.mount_root { mount_root.as_str() } else { path };
     let seg_params: Vec<String> = route
         .path_params
         .iter()
@@ -841,7 +1444,7 @@ fn build_helper_function(
     // this means teaching the call-site padders to fill by position
     // from the left, not appending.
     let default_for = |p: &String| -> Option<&String> {
-        route.param_defaults.iter().find(|(n, _)| n == p).map(|(_, v)| v)
+        route.param_defaults.iter().find(|(n, _)| n == p).map(|(_, (v, _))| v)
     };
     let defaults_are_a_suffix = seg_params
         .iter()
@@ -910,11 +1513,15 @@ fn build_helper_function(
         .enumerate()
         .filter(|(_, p)| !keyworded(p))
         .map(|(i, p)| {
+            // Not `param_ty` for a defaulted segment: its default is the route table's text, so the type follows that `Str`, as the keyword half below does.
+            if seg_default(p).is_some() {
+                return (Symbol::from(p.clone()), Ty::Str);
+            }
             let base = param_ty(p, slug_params.contains(p.as_str()));
             let ty = if i < required {
                 base
             } else {
-                Ty::Union { variants: vec![base, Ty::Nil] }
+                Ty::Union { variants: vec![base, Ty::Nil].into() }
             };
             (Symbol::from(p.clone()), ty)
         })
@@ -942,15 +1549,32 @@ fn build_helper_function(
             // default apply failed the C build with an int-conversion.
             // One description, and the default is the one that is
             // always present.
-            ty: crate::ty::Ty::Str,
+            ty: crate::ty::Ty::Str.into(),
             kind: crate::ty::ParamKind::Keyword { required: false },
         });
     }
-    let mut body = if required < seg_params.len() {
-        build_optional_path_expr(path, &seg_params, required, &slug_params)
+    let mut body = if route.required_path.is_some() || required < seg_params.len() {
+        build_optional_path_expr(
+            path,
+            route.required_path.as_deref(),
+            &seg_params,
+            required,
+            &slug_params,
+        )
     } else {
         build_path_expr(path, &seg_params, &slug_params)
     };
+    // A single optional default is omitted only when no format follows it.
+    if let Some(p) = seg_params.get(required).filter(|_| seg_params.len() == required + 1 && ext.is_none_or(|ext| route.format.as_ref().is_some_and(|default| default.as_str() == ext)))
+        && let Some((_, value, _)) = route.request_defaults.iter().find(|(name, _, _)| name == p) {
+        let default = Expr::new(Span::synthetic(), ExprNode::Lit { value: value.clone() });
+        let cond = with_ty(send_method(send_method(var_ref(p), "to_s", vec![]), "==", vec![send_method(default, "to_s", vec![])]), Ty::Bool);
+        let omitted = build_path_expr(route.required_path.as_deref().unwrap_or("/"), &seg_params[..required], &slug_params);
+        let omitted = if has_format {
+            with_ty(Expr::new(Span::synthetic(), ExprNode::If { cond: with_ty(send_method(send_method(var_ref("format"), "to_s", vec![]), "==", vec![lit_str(String::new())]), Ty::Bool), then_branch: omitted, else_branch: body.clone() }), Ty::Str)
+        } else { omitted };
+        body = with_ty(Expr::new(Span::synthetic(), ExprNode::If { cond, then_branch: omitted, else_branch: body }), Ty::Str);
+    }
     // Rails' `(.:format)`: a route path spelled the `rails routes` way
     // ends in `(.:format)`, which gives the helper a trailing optional
     // positional — `comments_path(:rss)` → "/comments.rss".
@@ -970,7 +1594,7 @@ fn build_helper_function(
         ));
         sig_params.push((
             format_sym.clone(),
-            Ty::Union { variants: vec![Ty::Str, Ty::Nil] },
+            Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() },
         ));
         // <path> + (format.to_s == "" ? "" : ".#{format}")
         //
@@ -1054,7 +1678,9 @@ fn build_helper_function(
     // placement is the whole point of this variant — `x_path(room_id: 2)
     // + ".json"` at the call site put it after `?room_id=2`, so the
     // parameter VALUE became "2.json" and the lookup missed.
-    if let Some(ext) = ext {
+    if let Some(ext) = ext
+        && route.format.as_ref().is_none_or(|default| default.as_str() != ext)
+    {
         body = with_ty(
             Expr::new(
                 Span::synthetic(),
@@ -1108,7 +1734,10 @@ fn build_helper_function(
             // Some(false)` used to override to Integer and is what made
             // campfire's messages_controller_test never link.
             let value_ty = if key.array {
-                Ty::Array { elem: Box::new(param_ty(singular_key(&key.name), false)) }
+                Ty::Array { elem: std::sync::Arc::new(param_ty(singular_key(&key.name), false)) }
+            } else if key.hash {
+                // Each value goes through `to_s`, whatever its type.
+                Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Untyped) }
             } else if key.record_slug == Some(true) {
                 Ty::Str
             } else {
@@ -1116,10 +1745,11 @@ fn build_helper_function(
             };
             query_sig.push(crate::ty::Param {
                 name: sym,
-                ty: Ty::Union { variants: vec![value_ty, Ty::Nil] },
+                ty: Ty::Union { variants: vec![value_ty, Ty::Nil].into() }.into(),
                 kind: crate::ty::ParamKind::Keyword { required: false },
             });
         }
+        let plain_keys: Vec<_> = plain_keys.into_iter().filter(|key| !route.request_defaults.iter().any(|(name, _, _)| name == &key.name)).collect();
         body = append_query_string(body, &plain_keys);
         if let Some(anchor) = anchor_keys.first() {
             body = append_anchor(body, &anchor.name);
@@ -1134,14 +1764,15 @@ fn build_helper_function(
     // spinel#3977 was about. `optional_names` is the set the `def`
     // actually defaulted, defaults-from-`scope` and trailing
     // nil-optionals alike.
-    let optional_names: std::collections::HashSet<Symbol> = params
+    let optional_names: crate::det::HashSet<Symbol> = params
         .iter()
         .filter(|p| p.default.is_some())
         .map(|p| p.name.clone())
         .collect();
     let mark_optional = |t: Ty| -> Ty {
-        let Ty::Fn { params, block, ret, effects } = t else { return t };
-        Ty::Fn {
+        let Ty::Fn(fn_ty) = t else { return t };
+        let FnTy { params, block, ret, effects } = *fn_ty;
+        Ty::Fn(Box::new(FnTy {
             params: params
                 .into_iter()
                 .map(|mut tp| {
@@ -1154,16 +1785,16 @@ fn build_helper_function(
             block,
             ret,
             effects,
-        }
+        }))
     };
     // Segment keywords ride with the query keywords: both are keyword
     // params in the `def`, and `fn_sig` types every param Required, so
     // declaring one positionally is a call spinel cannot make.
     query_sig.splice(0..0, segment_keyword_sig);
     let signature = match mark_optional(fn_sig(sig_params, Ty::Str)) {
-        Ty::Fn { mut params, block, ret, effects } if !query_sig.is_empty() => {
-            params.extend(query_sig);
-            Ty::Fn { params, block, ret, effects }
+        Ty::Fn(mut fn_ty) if !query_sig.is_empty() => {
+            fn_ty.params.extend(query_sig);
+            Ty::Fn(fn_ty)
         }
         other => other,
     };
@@ -1224,6 +1855,10 @@ fn is_non_query_option(key: &str) -> bool {
 pub(crate) struct QueryKey {
     pub(crate) name: String,
     pub(crate) array: bool,
+    /// Every site passes a Hash literal of scalars (`domain_allow:
+    /// { domain: d }`), which Rails renders as one `k[sub]=v` pair per
+    /// entry, as `Hash#to_query` does.
+    pub(crate) hash: bool,
     /// Rails' `anchor:` — rendered `#tag` AFTER every query key, which
     /// is the order `path_for` applies them in (`add_params` then
     /// `add_anchor`). Derived from the name, not surveyed: `anchor` is
@@ -1272,14 +1907,22 @@ pub(crate) struct QueryKey {
 /// demoted, and a helper nobody calls keeps the name-based default.
 fn string_segment_demand(
     app: &App,
-    helpers: &std::collections::HashMap<String, (Vec<String>, usize)>,
-) -> std::collections::HashMap<String, std::collections::HashSet<String>> {
-    type Demand = std::collections::HashMap<String, std::collections::HashSet<String>>;
+    helpers: &crate::det::HashMap<String, (Vec<String>, usize)>,
+) -> crate::det::HashMap<String, crate::det::HashSet<String>> {
+    type Demand = crate::det::HashMap<String, crate::det::HashSet<String>>;
     let mut out: Demand = Default::default();
+    // A record whose model fills a segment with a String (its own `to_param`, a uuid key) is a String at that position too
+    let string_keyed: crate::det::HashSet<String> = app
+        .models
+        .iter()
+        .filter(|m| model_renders_own_param(m, app))
+        .map(|m| m.name.0.as_str().to_string())
+        .collect();
     let mut collect = |e: &Expr| {
         fn walk(
             e: &Expr,
-            helpers: &std::collections::HashMap<String, (Vec<String>, usize)>,
+            helpers: &crate::det::HashMap<String, (Vec<String>, usize)>,
+            string_keyed: &crate::det::HashSet<String>,
             out: &mut Demand,
         ) {
             if let ExprNode::Send { recv: None, method, args, .. } = &*e.node {
@@ -1297,15 +1940,20 @@ fn string_segment_demand(
                         .unwrap_or_else(|| method.as_str().to_string());
                     for (i, arg) in positional.iter().enumerate() {
                         let Some(seg) = segments.get(i) else { break };
-                        if matches!(arg.ty, Some(Ty::Str)) {
+                        // A String that can be nil (a nullable column read off a
+                        // record that can be nil, `note.route_param`) is the same
+                        // evidence: Rails writes either with `to_param`.
+                        let arg_ty = arg.ty.as_ref().map(Ty::peel_nilable);
+                        let string_record = matches!(arg_ty, Some(Ty::Class { id, .. }) if string_keyed.contains(id.0.as_str()));
+                        if matches!(arg_ty, Some(Ty::Str)) || string_record {
                             out.entry(helper.clone()).or_default().insert(seg.clone());
                         }
                     }
                 }
             }
-            e.node.for_each_child(&mut |c| walk(c, helpers, out));
+            e.node.for_each_child(&mut |c| walk(c, helpers, string_keyed, out));
         }
-        walk(e, helpers, &mut out);
+        walk(e, helpers, &string_keyed, &mut out);
     };
     for_each_route_call_site(app, &mut collect);
 
@@ -1332,51 +1980,74 @@ fn string_segment_demand(
     // helper's own call sites — without it every node here is `ty: None`
     // and this walk finds nothing.
     for helper in &app.routes.direct_helpers {
-        route_for_string_segments(&helper.body, helpers, &mut out);
+        route_for_string_segments(&helper.body, helper.params.last(), helpers, &string_keyed, &mut out);
     }
     out
 }
 
-/// Record the segments a `route_for :target, arg…` fills with a String.
-/// Mirrors `direct::rewrite_route_for`'s reading of the same node — the
-/// symbol names the target, the trailing kwargs hash is the query half
-/// and never a segment.
+/// Record the segments a `route_for :target, arg…` fills with a String
+/// (or a record whose `to_param` is one). Reads the node as
+/// `direct::rewrite_route_for` does: the symbol, or each route an
+/// interpolated name can spell with exactly that many segments, names
+/// the target; the trailing keyword hash or forwarded `options` is
+/// never a segment.
 fn route_for_string_segments(
     e: &Expr,
-    helpers: &std::collections::HashMap<String, (Vec<String>, usize)>,
-    out: &mut std::collections::HashMap<String, std::collections::HashSet<String>>,
+    options: Option<&Symbol>,
+    helpers: &crate::det::HashMap<String, (Vec<String>, usize)>,
+    string_keyed: &crate::det::HashSet<String>,
+    out: &mut crate::det::HashMap<String, crate::det::HashSet<String>>,
 ) {
     if let ExprNode::Send { recv: None, method, args, .. } = &*e.node {
         if method.as_str() == "route_for" && !args.is_empty() {
-            if let ExprNode::Lit { value: crate::expr::Literal::Sym { value: target } } =
-                &*args[0].node
-            {
-                let helper = format!("{}_path", target.as_str());
-                if let Some((segments, _)) = helpers.get(&helper) {
-                    for (i, arg) in args[1..]
-                        .iter()
-                        .filter(|a| !matches!(&*a.node, ExprNode::Hash { kwargs: true, .. }))
-                        .enumerate()
-                    {
-                        let Some(seg) = segments.get(i) else { break };
-                        if matches!(arg.ty, Some(Ty::Str)) {
-                            out.entry(helper.clone()).or_default().insert(seg.clone());
-                        }
+            let (positional, _, _) = direct::route_for_arguments(&args[1..], options);
+            let targets: Vec<String> = match &*args[0].node {
+                ExprNode::Lit { value: crate::expr::Literal::Sym { value: target } } => {
+                    vec![format!("{}_path", target.as_str())]
+                }
+                ExprNode::Lit { value: crate::expr::Literal::Str { value: target } } => vec![format!("{target}_path")],
+                ExprNode::StringInterp { parts } => helpers
+                    .iter()
+                    .filter(|(name, (segments, required))| {
+                        (*required..=segments.len()).contains(&positional.len())
+                            && name.strip_suffix("_path").is_some_and(|n| direct::spells(parts, n))
+                    })
+                    .map(|(name, _)| name.clone())
+                    .collect(),
+                _ => Vec::new(),
+            };
+            // A record (or a union of them) any of whose models renders a
+            // String `to_param`: the rewrite sends it `to_param`.
+            let string_record = |ty: Option<&Ty>| {
+                let keyed = |t: &Ty| matches!(t, Ty::Class { id, .. } if string_keyed.contains(id.0.as_str()));
+                match ty {
+                    Some(Ty::Union { variants }) => variants.iter().any(keyed),
+                    Some(t) => keyed(t),
+                    None => false,
+                }
+            };
+            for helper in targets {
+                let Some((segments, _)) = helpers.get(&helper) else { continue };
+                for (i, arg) in positional.iter().enumerate() {
+                    let Some(seg) = segments.get(i) else { break };
+                    if matches!(arg.ty.as_ref().map(Ty::peel_nilable), Some(Ty::Str)) || string_record(arg.ty.as_ref()) {
+                        out.entry(helper.clone()).or_default().insert(seg.clone());
                     }
                 }
             }
         }
     }
-    e.node.for_each_child(&mut |c| route_for_string_segments(c, helpers, out));
+    e.node.for_each_child(&mut |c| route_for_string_segments(c, options, helpers, string_keyed, out));
 }
 
 fn query_param_demand(
     app: &App,
-    helpers: &std::collections::HashMap<String, (Vec<String>, usize)>,
-) -> std::collections::HashMap<String, Vec<QueryKey>> {
-    type Demand = std::collections::HashMap<String, std::collections::BTreeMap<String, bool>>;
-    type Records = std::collections::HashMap<(String, String), bool>;
-    let models: std::collections::HashMap<String, bool> = app
+    helpers: &crate::det::HashMap<String, (Vec<String>, usize)>,
+) -> crate::det::HashMap<String, Vec<QueryKey>> {
+    // Per key: (every site passes an Array, every site passes a Hash).
+    type Demand = crate::det::HashMap<String, std::collections::BTreeMap<String, (bool, bool)>>;
+    type Records = crate::det::HashMap<(String, String), bool>;
+    let models: crate::det::HashMap<String, bool> = app
         .models
         .iter()
         .map(|m| {
@@ -1393,9 +2064,9 @@ fn query_param_demand(
     let mut collect = |e: &Expr| {
         fn walk(
             e: &Expr,
-            helpers: &std::collections::HashMap<String, (Vec<String>, usize)>,
+            helpers: &crate::det::HashMap<String, (Vec<String>, usize)>,
             out: &mut Demand,
-            models: &std::collections::HashMap<String, bool>,
+            models: &crate::det::HashMap<String, bool>,
             records: &mut Records,
         ) {
             if let ExprNode::Send { recv: None, method, args, .. } = &*e.node {
@@ -1432,6 +2103,15 @@ fn query_param_demand(
                                 // and a different rendering, not just a
                                 // different value.
                                 let is_array = matches!(&*v.node, ExprNode::Array { .. });
+                                // A Hash only one level deep: a nested Hash or
+                                // Array value would need `to_query`'s recursion,
+                                // whether written there or held in a variable.
+                                let is_hash = matches!(&*v.node, ExprNode::Hash { entries, kwargs: false }
+                                    if entries.iter().all(|(k, v)| {
+                                        matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { .. } })
+                                            && !matches!(&*v.node, ExprNode::Hash { .. } | ExprNode::Array { .. })
+                                            && !matches!(v.ty.as_ref().map(Ty::peel_nilable), Some(Ty::Hash { .. } | Ty::Array { .. }))
+                                    }));
                                 let helper = method
                                     .as_str()
                                     .strip_suffix("_url")
@@ -1442,10 +2122,10 @@ fn query_param_demand(
                                     .entry(helper)
                                     .or_default()
                                     .entry(key.to_string())
-                                    .or_insert(is_array);
+                                    .or_insert((is_array, is_hash));
                                 // Any scalar site demotes the key: see
                                 // `QueryKey`.
-                                *seen = *seen && is_array;
+                                *seen = (seen.0 && is_array, seen.1 && is_hash);
                                 if let Some(slug) = record_model_slug(v, models) {
                                     records.insert((helper_key.clone(), key.to_string()), slug);
                                 }
@@ -1464,11 +2144,12 @@ fn query_param_demand(
             (
                 helper.clone(),
                 keys.into_iter()
-                    .map(|(name, array)| QueryKey {
+                    .map(|(name, (array, hash))| QueryKey {
                         anchor: name == "anchor",
                         record_slug: records.get(&(helper.clone(), name.clone())).copied(),
                         name,
                         array,
+                        hash,
                     })
                     .collect(),
             )
@@ -1481,7 +2162,7 @@ fn query_param_demand(
 /// convention the call-site pass also reads (`@user`, `@showing_user`:
 /// the name, or its `_<model>` suffix, is a model's). Answers whether
 /// that model overrides `to_param`.
-fn record_model_slug(v: &Expr, models: &std::collections::HashMap<String, bool>) -> Option<bool> {
+fn record_model_slug(v: &Expr, models: &crate::det::HashMap<String, bool>) -> Option<bool> {
     if let Some(crate::ty::Ty::Class { id, .. }) = v.ty.as_ref().map(crate::ty::Ty::peel_nilable) {
         if let Some(slug) = models.get(id.0.as_str()) {
             return Some(*slug);
@@ -1514,7 +2195,7 @@ fn record_model_slug(v: &Expr, models: &std::collections::HashMap<String, bool>)
 /// costs nothing to the callers that never mention a format.
 fn format_variant_demand(
     app: &App,
-    declared: &std::collections::HashSet<String>,
+    declared: &crate::det::HashSet<String>,
 ) -> std::collections::BTreeMap<String, (String, String)> {
     let mut out: std::collections::BTreeMap<String, (String, String)> = Default::default();
     // `<as_name>` for every named route, longest first: `story_path` and
@@ -1530,10 +2211,15 @@ fn format_variant_demand(
         fn walk(
             e: &Expr,
             names: &[String],
-            declared: &std::collections::HashSet<String>,
+            declared: &crate::det::HashSet<String>,
             out: &mut std::collections::BTreeMap<String, (String, String)>,
         ) {
-            if let ExprNode::Send { recv: None, method, .. } = &*e.node {
+            // Only a call the `format:` lowering renamed. Any other
+            // `<route>_<word>_url` is the app's own method (`widget_from_url`
+            // in a class that defines it), or no helper at all in Rails.
+            if let ExprNode::Send { recv: None, method, .. } = &*e.node
+                && e.decisions & crate::expr::FORMAT_VARIANT_CALL != 0
+            {
                 let raw = method.as_str();
                 if let Some(stem) = raw.strip_suffix("_path").or_else(|| raw.strip_suffix("_url")) {
                     // A real helper of that name wins — never shadow a
@@ -1600,8 +2286,30 @@ fn for_each_route_call_site(app: &App, f: &mut impl FnMut(&Expr)) {
 fn append_query_string(path: Expr, keys: &[QueryKey]) -> Expr {
     let mut out = path;
     for (i, key) in keys.iter().enumerate() {
+        // Not `var_ref`'s own type: an omitted key is nil, and a `nil?` on a non-nilable receiver folds to `false` on Rust.
         let is_nil = |k: &str| -> Expr {
-            send_method(var_ref(k), "nil?", Vec::new())
+            let var = var_ref(k);
+            let ty = var.ty.clone().map(|t| Ty::Union { variants: vec![t, Ty::Nil].into() });
+            with_ty(send_method(Expr { ty, ..var }, "nil?", Vec::new()), Ty::Bool)
+        };
+        // Rails renders nothing for an empty Hash either.
+        let omitted = |k: &QueryKey| -> Expr {
+            if !k.hash {
+                return is_nil(&k.name);
+            }
+            let empty = with_ty(send_method(var_ref(&k.name), "empty?", Vec::new()), Ty::Bool);
+            with_ty(
+                Expr::new(
+                    Span::synthetic(),
+                    ExprNode::BoolOp {
+                        op: crate::expr::BoolOpKind::Or,
+                        surface: Default::default(),
+                        left: is_nil(&k.name),
+                        right: empty,
+                    },
+                ),
+                Ty::Bool,
+            )
         };
         let key_name = key.name.as_str();
         // `?` only while nothing earlier was rendered. The first key
@@ -1610,43 +2318,49 @@ fn append_query_string(path: Expr, keys: &[QueryKey]) -> Expr {
             None
         } else {
             Some({
-            let mut cond = is_nil(&keys[0].name);
-            for earlier in keys[1..i].iter().map(|k| k.name.as_str()) {
+            let mut cond = omitted(&keys[0]);
+            for earlier in &keys[1..i] {
                 cond = Expr::new(
                     Span::synthetic(),
                     ExprNode::BoolOp {
                         op: crate::expr::BoolOpKind::And,
                         surface: Default::default(),
                         left: cond,
-                        right: is_nil(earlier),
+                        right: omitted(earlier),
                     },
                 );
             }
-            Expr::new(
-                Span::synthetic(),
-                ExprNode::If {
-                    cond,
-                    then_branch: lit_str("?".to_string()),
-                    else_branch: lit_str("&".to_string()),
-                },
+            with_ty(
+                Expr::new(
+                    Span::synthetic(),
+                    ExprNode::If {
+                        cond,
+                        then_branch: lit_str("?".to_string()),
+                        else_branch: lit_str("&".to_string()),
+                    },
+                ),
+                Ty::Str,
             )
             })
         };
         let url_encode = |value: Expr| -> Expr {
-            Expr::new(
-                Span::synthetic(),
-                ExprNode::Send {
-                    recv: Some(Expr::new(
-                        Span::synthetic(),
-                        ExprNode::Const {
-                            path: vec![Symbol::from("ActionView"), Symbol::from("ViewHelpers")],
-                        },
-                    )),
-                    method: Symbol::from("url_encode"),
-                    args: vec![send_method(value, "to_s", Vec::new())],
-                    block: None,
-                    parenthesized: true,
-                },
+            with_ty(
+                Expr::new(
+                    Span::synthetic(),
+                    ExprNode::Send {
+                        recv: Some(Expr::new(
+                            Span::synthetic(),
+                            ExprNode::Const {
+                                path: vec![Symbol::from("ActionView"), Symbol::from("ViewHelpers")],
+                            },
+                        )),
+                        method: Symbol::from("url_encode"),
+                        args: vec![with_ty(send_method(value, "to_s", Vec::new()), Ty::Str)],
+                        block: None,
+                        parenthesized: true,
+                    },
+                ),
+                Ty::Str,
             )
         };
         // Rails renders an Array option as one `k[]=v` pair per
@@ -1690,7 +2404,59 @@ fn append_query_string(path: Expr, keys: &[QueryKey]) -> Expr {
                 Some(sep) => parts.push(InterpPart::Expr { expr: sep }),
             }
             parts.push(InterpPart::Expr { expr: joined });
-            Expr::new(Span::synthetic(), ExprNode::StringInterp { parts })
+            with_ty(Expr::new(Span::synthetic(), ExprNode::StringInterp { parts }), Ty::Str)
+        } else if key.hash {
+            // `Hash#to_query`: `k[sub]=v` per entry, a nil value as a
+            // bare `k[sub]`, and the pairs sorted. Over `keys`, with a
+            // one-parameter block like the Array form: a two-parameter
+            // `map` is refused by the Python emit.
+            let sub = Symbol::from("rh_query_key");
+            let var = |name: &Symbol| Expr::new(Span::synthetic(), ExprNode::Var { id: crate::ident::VarId(0), name: name.clone() });
+            let value = || send_method(var_ref(key_name), "[]", vec![var(&sub)]);
+            let assigned = with_ty(
+                Expr::new(
+                    Span::synthetic(),
+                    ExprNode::If {
+                        cond: with_ty(send_method(value(), "nil?", Vec::new()), Ty::Bool),
+                        then_branch: lit_str(String::new()),
+                        else_branch: with_ty(send_method(lit_str("=".to_string()), "+", vec![url_encode(value())]), Ty::Str),
+                    },
+                ),
+                Ty::Str,
+            );
+            let named = send_method(lit_str(format!("{key_name}%5B")), "+", vec![url_encode(var(&sub))]);
+            let named = send_method(named, "+", vec![lit_str("%5D".to_string())]);
+            let body = with_ty(send_method(named, "+", vec![assigned]), Ty::Str);
+            let mapped = Expr::new(
+                Span::synthetic(),
+                ExprNode::Send {
+                    recv: Some(send_method(var_ref(key_name), "keys", Vec::new())),
+                    method: Symbol::from("map"),
+                    args: Vec::new(),
+                    block: Some(Expr::new(
+                        Span::synthetic(),
+                        ExprNode::Lambda { extra_params: Vec::new(), rest_param: None,
+                            params: vec![sub],
+                            block_param: None,
+                            body,
+                            block_style: crate::expr::BlockStyle::Brace,
+                        },
+                    )),
+                    parenthesized: false,
+                },
+            );
+            // Typed, so each target maps `sort`/`join` as an Array's: Python's `list.sort()` answers None.
+            let pairs_ty = || Ty::Array { elem: std::sync::Arc::new(Ty::Str) };
+            let mapped = with_ty(mapped, pairs_ty());
+            let sorted = with_ty(send_method(mapped, "sort", Vec::new()), pairs_ty());
+            let joined = send_method(sorted, "join", vec![lit_str("&".to_string())]);
+            let mut parts: Vec<InterpPart> = Vec::new();
+            match separator {
+                None => parts.push(InterpPart::Text { value: "?".to_string() }),
+                Some(sep) => parts.push(InterpPart::Expr { expr: sep }),
+            }
+            parts.push(InterpPart::Expr { expr: joined });
+            with_ty(Expr::new(Span::synthetic(), ExprNode::StringInterp { parts }), Ty::Str)
         } else {
             let mut parts: Vec<InterpPart> = Vec::new();
             match separator {
@@ -1701,17 +2467,20 @@ fn append_query_string(path: Expr, keys: &[QueryKey]) -> Expr {
                 }
             }
             parts.push(InterpPart::Expr { expr: url_encode(var_ref(key_name)) });
-            Expr::new(Span::synthetic(), ExprNode::StringInterp { parts })
+            with_ty(Expr::new(Span::synthetic(), ExprNode::StringInterp { parts }), Ty::Str)
         };
-        let arm = Expr::new(
-            Span::synthetic(),
-            ExprNode::If {
-                cond: send_method(var_ref(key_name), "nil?", Vec::new()),
-                then_branch: lit_str(String::new()),
-                else_branch: pair,
-            },
+        let arm = with_ty(
+            Expr::new(
+                Span::synthetic(),
+                ExprNode::If {
+                    cond: omitted(key),
+                    then_branch: lit_str(String::new()),
+                    else_branch: pair,
+                },
+            ),
+            Ty::Str,
         );
-        out = send_method(out, "+", vec![arm]);
+        out = with_ty(send_method(out, "+", vec![arm]), Ty::Str);
     }
     out
 }
@@ -1802,7 +2571,7 @@ fn param_ty(name: &str, slug_id: bool) -> Ty {
 fn build_path_expr(
     path: &str,
     path_params: &[String],
-    slug_params: &std::collections::HashSet<String>,
+    slug_params: &crate::det::HashSet<String>,
 ) -> Expr {
     if path_params.is_empty() {
         return lit_str(path.to_string());
@@ -1811,7 +2580,8 @@ fn build_path_expr(
     let mut buf = String::new();
     let mut chars = path.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == ':' {
+        // `:name` is a segment, `*name` a glob (the rest of the path).
+        if c == ':' || c == '*' {
             // Read identifier
             let mut ident = String::new();
             while let Some(&nc) = chars.peek() {
@@ -1827,10 +2597,10 @@ fn build_path_expr(
                     parts.push(InterpPart::Text { value: std::mem::take(&mut buf) });
                 }
                 parts.push(InterpPart::Expr {
-                    expr: var_ref_slug(&ident, slug_params.contains(&ident)),
+                    expr: segment_value(var_ref_slug(&ident, slug_params.contains(&ident)), c == '*'),
                 });
             } else {
-                buf.push(':');
+                buf.push(c);
                 buf.push_str(&ident);
             }
         } else {
@@ -1846,124 +2616,230 @@ fn build_path_expr(
     )
 }
 
-/// Build a path expr for a route whose trailing params come from Rails
-/// optional groups: the required prefix always renders, each optional
-/// param's segment is appended only when the arg is non-nil.
-/// `/top(/:length(/page/:page))` (required=0) →
+/// Build a path expr for a route with Rails optional groups: the always
+/// present segments render unconditionally, and each optional segment
+/// renders only when its param is non-nil, wherever in the path the group
+/// sits. `/top(/:length(/page/:page))` →
 /// `"/top" + (length.nil? ? "" : "/#{length}")
-///        + (page.nil?   ? "" : "/page/#{page}")`.
-/// The leading `/` of an optional group stays with its chunk, so
-/// `top_path()` yields `"/top"`, not `"/top/"`.
+///        + (page.nil?   ? "" : "/page/#{page}")`;
+/// `(/:locale)/cart` → `(locale.nil? ? "" : "/#{locale}") + "/cart"`.
+///
+/// `shortest` is the path with every group dropped; a segment of `path`
+/// the shortest lacks is optional. Without it (a hand-built route), the
+/// params from `seg_params[required..]` mark the optional segments and a
+/// literal after one stays with its group. A group's literal segments
+/// stay with the param they precede, so `top_path()` is `"/top"`, not
+/// `"/top/"`.
 fn build_optional_path_expr(
     path: &str,
+    shortest: Option<&str>,
     seg_params: &[String],
     required: usize,
-    slug_params: &std::collections::HashSet<String>,
+    slug_params: &crate::det::HashSet<String>,
 ) -> Expr {
-    let optional: std::collections::HashSet<&str> =
-        seg_params[required..].iter().map(|s| s.as_str()).collect();
-    let mut base_parts: Vec<InterpPart> = Vec::new();
-    // (param-name, its conditionally-appended segment parts)
-    let mut chunks: Vec<(String, Vec<InterpPart>)> = Vec::new();
-    let mut buf = String::new();
-    let mut in_optional = false;
-    let mut chars = path.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != ':' {
-            buf.push(c);
-            continue;
-        }
-        let mut ident = String::new();
-        while let Some(&nc) = chars.peek() {
-            if nc.is_alphanumeric() || nc == '_' {
-                ident.push(nc);
-                chars.next();
-            } else {
-                break;
+    let optional: crate::det::HashSet<&str> =
+        seg_params[required.min(seg_params.len())..].iter().map(|s| s.as_str()).collect();
+    let segments: Vec<&str> = path.split('/').collect();
+    let kept: Vec<&str> = shortest.map(|s| s.split('/').collect()).unwrap_or_default();
+    // A segment's text as parts: literal text and the params it names.
+    let segment_parts = |segment: &str, slash: bool| -> (Vec<InterpPart>, Option<String>) {
+        let mut parts: Vec<InterpPart> =
+            vec![InterpPart::Text { value: if slash { "/" } else { "" }.to_string() }];
+        let mut first_optional = None;
+        let mut buf = String::new();
+        let mut chars = segment.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != ':' && c != '*' {
+                buf.push(c);
+                continue;
             }
-        }
-        if !seg_params.iter().any(|p| p == &ident) {
-            buf.push(':');
-            buf.push_str(&ident);
-            continue;
-        }
-        if optional.contains(ident.as_str()) {
-            let mut chunk: Vec<InterpPart> = Vec::new();
-            if !in_optional {
-                // First optional param: split pending text at its last `/`
-                // — that slash opens the optional group and belongs to the
-                // chunk; everything before it is the always-present base.
-                let split = buf.rfind('/').unwrap_or(0);
-                let (base_text, chunk_prefix) = buf.split_at(split);
-                if !base_text.is_empty() {
-                    base_parts.push(InterpPart::Text { value: base_text.to_string() });
+            let mut ident = String::new();
+            while let Some(&nc) = chars.peek() {
+                if nc.is_alphanumeric() || nc == '_' {
+                    ident.push(nc);
+                    chars.next();
+                } else {
+                    break;
                 }
-                if !chunk_prefix.is_empty() {
-                    chunk.push(InterpPart::Text { value: chunk_prefix.to_string() });
-                }
-                in_optional = true;
-            } else if !buf.is_empty() {
-                chunk.push(InterpPart::Text { value: buf.clone() });
             }
-            chunk.push(InterpPart::Expr { expr: var_ref_slug(&ident, slug_params.contains(&ident)) });
-            chunks.push((ident.clone(), chunk));
+            if !seg_params.iter().any(|p| p == &ident) {
+                buf.push(c);
+                buf.push_str(&ident);
+                continue;
+            }
+            match parts.last_mut() {
+                Some(InterpPart::Text { value }) => value.push_str(&buf),
+                _ if !buf.is_empty() => parts.push(InterpPart::Text { value: buf.clone() }),
+                _ => {}
+            }
             buf.clear();
-        } else {
-            // Required param — stays in the always-present base.
-            if !buf.is_empty() {
-                base_parts.push(InterpPart::Text { value: std::mem::take(&mut buf) });
+            if optional.contains(ident.as_str()) && first_optional.is_none() {
+                first_optional = Some(ident.clone());
             }
-            base_parts.push(InterpPart::Expr { expr: var_ref_slug(&ident, slug_params.contains(&ident)) });
+            parts.push(InterpPart::Expr { expr: segment_value(var_ref_slug(&ident, slug_params.contains(&ident)), c == '*') });
+        }
+        if !buf.is_empty() {
+            match parts.last_mut() {
+                Some(InterpPart::Text { value }) => value.push_str(&buf),
+                _ => parts.push(InterpPart::Text { value: buf }),
+            }
+        }
+        (parts, first_optional)
+    };
+    // The path as an ordered list: text that always renders, and the
+    // segments that render only when their param is present.
+    enum Piece {
+        Always(Vec<InterpPart>),
+        When(String, Vec<InterpPart>),
+    }
+    let mut pieces: Vec<Piece> = Vec::new();
+    let mut pending: Vec<InterpPart> = Vec::new();
+    let mut next_kept = 0usize;
+    for (i, segment) in segments.iter().enumerate() {
+        if i == 0 && segment.is_empty() {
+            // The path's leading slash; every segment brings its own.
+            next_kept = usize::from(!kept.is_empty());
+            continue;
+        }
+        // A group inside a segment (`web-pixel-:id@:v(~:glue)`): the
+        // shortest segment is the always-present head, the rest the group.
+        if let Some(head) = kept.get(next_kept).filter(|head| {
+            !head.is_empty() && head.len() < segment.len() && segment.starts_with(**head)
+        }) {
+            let (head_parts, _) = segment_parts(head, true);
+            let (tail_parts, tail_param) = segment_parts(&segment[head.len()..], false);
+            next_kept += 1;
+            match pieces.last_mut() {
+                Some(Piece::Always(before)) => {
+                    before.extend(head_parts);
+                    merge_adjacent_text(before);
+                }
+                _ => pieces.push(Piece::Always(head_parts)),
+            }
+            match tail_param {
+                Some(param) => pieces.push(Piece::When(param, tail_parts)),
+                None => pending.extend(tail_parts),
+            }
+            continue;
+        }
+        let (parts, first_optional) = segment_parts(segment, true);
+        let in_shortest = match shortest {
+            Some(_) => {
+                let hit = kept.get(next_kept) == Some(segment);
+                if hit {
+                    next_kept += 1;
+                }
+                hit
+            }
+            None => first_optional.is_none() && pending.is_empty() && !optional_ahead(&segments[i..], &optional),
+        };
+        if in_shortest {
+            match pieces.last_mut() {
+                Some(Piece::Always(before)) => {
+                    before.extend(parts);
+                    merge_adjacent_text(before);
+                }
+                _ => pieces.push(Piece::Always(parts)),
+            }
+            continue;
+        }
+        pending.extend(parts);
+        if let Some(param) = first_optional {
+            pieces.push(Piece::When(param, std::mem::take(&mut pending)));
         }
     }
-    if !buf.is_empty() {
-        match chunks.last_mut() {
-            Some((_, last)) => last.push(InterpPart::Text { value: buf }),
-            None => base_parts.push(InterpPart::Text { value: buf }),
+    // A literal tail of an optional group (`(/:id/edit)`) stays with
+    // the group's last param.
+    if !pending.is_empty() {
+        if let Some(Piece::When(_, chunk)) =
+            pieces.iter_mut().rev().find(|p| matches!(p, Piece::When(..)))
+        {
+            chunk.extend(pending);
         }
     }
-    let mut result = parts_to_expr(base_parts);
-    for (pname, chunk) in chunks {
-        // `<param>.nil? ? "" : "<segment>"`
-        let cond = with_ty(
-            Expr::new(
-                Span::synthetic(),
-                ExprNode::Send {
-                    recv: Some(var_ref(&pname)),
-                    method: Symbol::from("nil?"),
-                    args: vec![],
-                    block: None,
-                    parenthesized: false,
-                },
+    let rooted = !pieces.iter().any(|p| matches!(p, Piece::Always(_)));
+    let mut result: Option<Expr> = None;
+    let mut first_when = true;
+    for piece in pieces {
+        let expr = match piece {
+            Piece::Always(parts) => parts_to_expr(parts),
+            Piece::When(pname, chunk) => {
+                // `<param>.nil? ? "" : "<segment>"`
+                let cond = with_ty(
+                    Expr::new(
+                        Span::synthetic(),
+                        ExprNode::Send {
+                            recv: Some(var_ref(&pname)),
+                            method: Symbol::from("nil?"),
+                            args: vec![],
+                            block: None,
+                            parenthesized: false,
+                        },
+                    ),
+                    Ty::Bool,
+                );
+                // A path made only of optional groups is `/` with none
+                // of them present.
+                let absent = if rooted && first_when { "/" } else { "" };
+                first_when = false;
+                with_ty(
+                    Expr::new(
+                        Span::synthetic(),
+                        ExprNode::If {
+                            cond,
+                            then_branch: lit_str(absent.to_string()),
+                            else_branch: parts_to_expr(chunk),
+                        },
+                    ),
+                    Ty::Str,
+                )
+            }
+        };
+        result = Some(match result {
+            None => expr,
+            Some(left) => with_ty(
+                Expr::new(
+                    Span::synthetic(),
+                    ExprNode::Send {
+                        recv: Some(left),
+                        method: Symbol::from("+"),
+                        args: vec![expr],
+                        block: None,
+                        parenthesized: false,
+                    },
+                ),
+                Ty::Str,
             ),
-            Ty::Bool,
-        );
-        let ternary = with_ty(
-            Expr::new(
-                Span::synthetic(),
-                ExprNode::If {
-                    cond,
-                    then_branch: lit_str(String::new()),
-                    else_branch: parts_to_expr(chunk),
-                },
-            ),
-            Ty::Str,
-        );
-        result = with_ty(
-            Expr::new(
-                Span::synthetic(),
-                ExprNode::Send {
-                    recv: Some(result),
-                    method: Symbol::from("+"),
-                    args: vec![ternary],
-                    block: None,
-                    parenthesized: false,
-                },
-            ),
-            Ty::Str,
-        );
+        });
     }
-    result
+    result.unwrap_or_else(|| lit_str("/".to_string()))
+}
+
+/// Join neighbouring literal parts so `"/a" + "/b"` renders as `"/a/b"`.
+fn merge_adjacent_text(parts: &mut Vec<InterpPart>) {
+    let mut merged: Vec<InterpPart> = Vec::with_capacity(parts.len());
+    for part in parts.drain(..) {
+        match (merged.last_mut(), part) {
+            (Some(InterpPart::Text { value: before }), InterpPart::Text { value }) => {
+                before.push_str(&value);
+            }
+            (_, part) => merged.push(part),
+        }
+    }
+    *parts = merged;
+}
+
+/// Does any later segment of the path name an optional param? Without a
+/// shortest variant this is the only signal a literal belongs to an
+/// optional group: it sits before an optional param, in its run.
+fn optional_ahead(rest: &[&str], optional: &crate::det::HashSet<&str>) -> bool {
+    rest.iter().any(|seg| {
+        seg.split([':', '*']).skip(1).any(|tail| {
+            let ident: String =
+                tail.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+            optional.contains(ident.as_str())
+        })
+    })
 }
 
 /// Collapse `InterpPart`s to an expr: empty → `""`, a lone text →
@@ -2032,7 +2908,7 @@ fn app_merges_into_url_options(app: &App) -> bool {
 
 fn expr_splats_into_a_route_helper(
     e: &Expr,
-    shapes: &std::collections::HashMap<String, Vec<bool>>,
+    shapes: &crate::det::HashMap<String, Vec<bool>>,
 ) -> bool {
     if let ExprNode::Send { recv: None, method, args, .. } = &*e.node {
         if crate::lower::controller_to_library::rewrites::route_helper_query_splat_index(
@@ -2074,7 +2950,7 @@ fn build_query_suffix_helper(module_path: &[Symbol]) -> LibraryFunction {
             Span::synthetic(),
             ExprNode::Var { id: VarId(0), name: Symbol::from("params") },
         ),
-        Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(Ty::Untyped) },
+        Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Untyped) },
     );
     let call = |recv: Option<Expr>, m: &str, args: Vec<Expr>, ty: Ty| {
         with_ty(
@@ -2154,7 +3030,7 @@ fn build_query_suffix_helper(module_path: &[Symbol]) -> LibraryFunction {
         signature: Some(fn_sig(
             vec![(
                 Symbol::from("params"),
-                Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(Ty::Untyped) },
+                Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Untyped) },
             )],
             Ty::Str,
         )),
@@ -2165,6 +3041,38 @@ fn build_query_suffix_helper(module_path: &[Symbol]) -> LibraryFunction {
 
 fn var_ref(name: &str) -> Expr {
     var_ref_slug(name, false)
+}
+
+/// A path param's value as Rails writes it into the URL: through
+/// `Journey::Router::Utils.escape_segment`, so `"a/b"` is `a%2Fb` and a
+/// `?` or `#` stays inside the segment. A `*glob` param is the rest of
+/// the path, so Rails takes `escape_path` for it and its `/`s stay.
+/// An Integer id needs none.
+fn segment_value(var: Expr, glob: bool) -> Expr {
+    if matches!(var.ty, Some(Ty::Int)) {
+        return var;
+    }
+    let span = var.span;
+    let text = with_ty(
+        Expr::new(span, ExprNode::Send { recv: Some(var), method: Symbol::from("to_s"), args: vec![], block: None, parenthesized: false }),
+        Ty::Str,
+    );
+    let (owner, method) = if glob {
+        (vec![Symbol::from("ActionDispatch"), Symbol::from("Router")], "escape_path")
+    } else {
+        (vec![Symbol::from("ActionView"), Symbol::from("ViewHelpers")], "escape_segment")
+    };
+    let helpers = Expr::new(span, ExprNode::Const { path: owner });
+    with_ty(
+        Expr::new(span, ExprNode::Send {
+            recv: Some(helpers),
+            method: Symbol::from(method),
+            args: vec![text],
+            block: None,
+            parenthesized: true,
+        }),
+        Ty::Str,
+    )
 }
 
 fn var_ref_slug(name: &str, slug_id: bool) -> Expr {

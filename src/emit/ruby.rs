@@ -21,9 +21,18 @@ use crate::lower::controller::body::FormatBreadth;
 const SPINEL_TEST_HELPER: &str =
     include_str!("../../runtime/spinel/test/test_helper.rb");
 
+pub(crate) mod class_paths;
 pub(crate) mod expr;
+mod inverse_seating;
 mod library;
+mod par_render;
+pub(crate) use library::install_lookup_indexes;
+pub(crate) use library::app_presents_time_zoned;
 mod rbs;
+/// Host-only, like the `project` tree passes that run it and whose RBS
+/// declaration spans it shares; excluded from the wasm build.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod reopen;
 pub mod shake;
 mod shared;
 pub mod source_markers;
@@ -35,6 +44,16 @@ pub use rbs::ty_to_rbs;
 
 // External API: the historical surface kept for `tests/` and `bin/`.
 pub use expr::emit_expr;
+
+/// The `models/<stem>` anchor of the file a library class is emitted
+/// into: its outermost enclosing app class's (`library::file_owner`).
+pub(crate) fn library_file_owner(name: &str, app: &App) -> String {
+    library::file_owner(name, app, &app.library_classes)
+}
+
+pub(crate) fn library_file_anchor(name: &str, app: &App) -> String {
+    format!("models/{}", crate::naming::underscore(&library::file_owner(name, app, &app.library_classes)))
+}
 
 pub(crate) fn with_external_gem_namespaces<R>(
     namespaces: &std::collections::BTreeSet<String>,
@@ -101,14 +120,18 @@ pub fn emit_method(m: &MethodDef) -> String {
     }
     let body_text = emit_expr(&m.body);
     fn emit_default(default: &crate::expr::Expr) -> String {
-        let src = expr::emit_expr(default);
         // A command-call default (`raise "…"`, the dead_default
         // grounding) needs parens to close unambiguously inside the
         // parameter list.
         if matches!(&*default.node, crate::expr::ExprNode::Raise { .. }) {
-            format!("({src})")
+            format!("({})", expr::emit_expr(default))
+        } else if matches!(&*default.node, crate::expr::ExprNode::Seq { .. } | crate::expr::ExprNode::Assign { .. }) {
+            // `name = (marker = true; nil)`: the statements, or an
+            // assignment, stay one parenthesized expression.
+            let src = expr::emit_expr(default);
+            format!("({})", src.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("; "))
         } else {
-            src
+            expr::emit_arg(default)
         }
     }
     for line in body_text.lines() {
@@ -127,6 +150,8 @@ pub fn emit_method(m: &MethodDef) -> String {
 /// Complementary to `emit`; skips Rails-app artifacts (controllers,
 /// routes, views, fixtures, importmap, schema) and emits only one
 /// `.rb` file per `LibraryClass`. Mirrors `typescript::emit_library`.
+pub use library::record_rendered;
+
 pub fn emit_library(app: &App) -> Vec<EmittedFile> {
     library::emit_library_class_decls(app)
 }
@@ -181,9 +206,10 @@ pub fn emit_rails_application(app: &App) -> Option<EmittedFile> {
 fn relax_from_stmt_handle(lc: &mut LibraryClass) {
     for m in &mut lc.methods {
         if m.name.as_str() == "from_stmt" && m.receiver == MethodReceiver::Class {
-            if let Some(crate::ty::Ty::Fn { params, .. }) = m.signature.as_mut() {
+            if let Some(crate::ty::Ty::Fn(fn_ty)) = m.signature.as_mut() {
+                let crate::ty::FnTy { params, .. } = &mut **fn_ty;
                 if let Some(p) = params.first_mut() {
-                    p.ty = crate::ty::Ty::Untyped;
+                    p.ty = crate::ty::Ty::Untyped.into();
                 }
             }
         }
@@ -196,6 +222,18 @@ pub(crate) fn materialize_models(
     app: &App,
     materialization: crate::lower::model_to_library::Materialization<'_>,
 ) -> (Vec<LibraryClass>, crate::lower::controller_to_library::params::ParamsSpecs) {
+    materialize_models_with_param_binds(
+        app,
+        materialization,
+        crate::build_target::BuildTarget::Ruby.param_binds_enabled(None),
+    )
+}
+
+fn materialize_models_with_param_binds(
+    app: &App,
+    materialization: crate::lower::model_to_library::Materialization<'_>,
+    param_binds: bool,
+) -> (Vec<LibraryClass>, crate::lower::controller_to_library::params::ParamsSpecs) {
     // Collect controller `permit(...)` declarations so the model lowerer
     // can synthesize `from_params(p: <Resource>Params)` factories sized
     // to the permitted-fields list. See `controller_to_library/params.rs`.
@@ -204,6 +242,9 @@ pub(crate) fn materialize_models(
     // A permitted `has_one_attached` field is a FILE on the params
     // class; the model's `from_params` reads it as one.
     params_specs.mark_file_fields(&app.models);
+    // The ruby family carries non-scalar permitted keys; the controller
+    // side ledgers the ones it can't (`carry_nested`).
+    params_specs.carry_nested(true, false);
 
     // Bulk lower so per-resource synthesized siblings (`<Model>Row`)
     // ride alongside the model class. Each returned `LibraryClass`
@@ -221,7 +262,7 @@ pub(crate) fn materialize_models(
     let assoc_scopes = crate::lower::scope_chain::assoc_query_method_names(
         &crate::lower::scope_chain::survey_assoc_class_methods(
             app,
-            &crate::lower::scope_chain::build_assoc_registry(&app.models),
+            &crate::lower::scope_chain::build_assoc_registry_for_app(app),
             &crate::lower::scope_chain::build_scope_registry(&app.models),
         )
         .0,
@@ -235,6 +276,10 @@ pub(crate) fn materialize_models(
         materialization,
         crate::lower::model_to_library::FinderInputs::Request,
         true,
+        param_binds,
+        crate::lower::model_to_library::ErrorsReaders::CreatedOnFirstRead,
+        crate::lower::model_to_library::RuntimeRelation::Present,
+        &crate::lower::view_to_library::PartialStems::of(&app.views),
     ).0;
     (lcs, params_specs)
 }
@@ -244,14 +289,30 @@ pub fn emit_lowered_models(app: &App) -> Vec<EmittedFile> {
     emit_model_classes(&lcs, app, &params_specs)
 }
 
+fn emit_lowered_models_with_param_binds(app: &App, param_binds: bool) -> Vec<EmittedFile> {
+    let (lcs, params_specs) = lowered_model_lcs_with_param_binds(app, param_binds);
+    emit_model_classes(&lcs, app, &params_specs)
+}
+
 /// The model classes `emit_lowered_models` writes, before rendering.
 /// Shared with `emit::futamura::routes`, which walks what is emitted.
 pub(crate) fn lowered_model_lcs(
     app: &App,
 ) -> (Vec<LibraryClass>, crate::lower::controller_to_library::params::ParamsSpecs) {
-    let (mut lcs, params_specs) = materialize_models(
+    lowered_model_lcs_with_param_binds(
+        app,
+        crate::build_target::BuildTarget::Ruby.param_binds_enabled(None),
+    )
+}
+
+fn lowered_model_lcs_with_param_binds(
+    app: &App,
+    param_binds: bool,
+) -> (Vec<LibraryClass>, crate::lower::controller_to_library::params::ParamsSpecs) {
+    let (mut lcs, params_specs) = materialize_models_with_param_binds(
         app,
         crate::lower::model_to_library::Materialization::Emit,
+        param_binds,
     );
     library::preserve_record_receiver_returns(&mut lcs, app);
     // The sqlite statement handle `Db.prepare` returns is a per-target
@@ -283,7 +344,7 @@ pub(crate) fn apply_model_lowering(mut lcs: &mut [LibraryClass], app: &App) {
     // through-assoc resolves).
     library::apply_through_assoc_lowering(&mut lcs, app);
     // belongs_to autosave: an unsaved target assigned through the
-    // writer is saved at before_validation and its id taken (no-op for
+    // writer is saved before validation and its id taken (no-op for
     // models with no belongs_to). Ruby-family only — see the pass.
     library::apply_belongs_to_autosave(&mut lcs, app);
     // An STI row hydrates as its subclass (no-op for apps with no STI).
@@ -321,6 +382,10 @@ pub(crate) fn apply_model_lowering(mut lcs: &mut [LibraryClass], app: &App) {
     // Date/DateTime/Time column accessors coerce to/from real `Time`
     // (no-op for apps with no temporal columns).
     library::apply_datetime_lowering(&mut lcs, app);
+    library::apply_rich_text_content_memo(&mut lcs);
+    // `ActionText::RichText belongs_to :record, touch: true`: a saved
+    // rich text touches the record it was read through.
+    library::apply_rich_text_record_touch(&mut lcs, app);
     // has_secure_password (authenticate + plaintext accessors, bcrypt
     // contract) and typed_store virtual-attribute accessors are
     // synthesized by the shared model lowering
@@ -329,13 +394,15 @@ pub(crate) fn apply_model_lowering(mut lcs: &mut [LibraryClass], app: &App) {
     // Boolean-column readers/predicates cast SQLite's 0/1 Integers
     // (0 is truthy in Ruby).
     library::apply_boolean_lowering(&mut lcs, app);
+    // Typed-column writers cast what they are given (#1158).
+    library::apply_typed_writer_cast_lowering(&mut lcs, app);
+    library::parse_untyped_numericality_input(&mut lcs, app);
     // NULL fidelity: nullable columns hydrate to nil (not 0/"") and fk
     // 0-sentinel guards widen to accept nil (no-op for schemas with no
-    // nullable columns); synthesized `.empty?` predicate forms in
-    // model bodies tolerate the nil.
+    // nullable columns). A string `blank?` already carries `(r || "")`
+    // in the shared IR (`lower::blank`).
     library::apply_hydration_nil_lowering(&mut lcs, app);
-    library::apply_nilsafe_empty_lowering(&mut lcs);
-    library::apply_time_format_lowering(&mut lcs);
+    library::apply_time_format_lowering(&mut lcs, app);
     library::apply_dynamic_render_options_lowering(&mut lcs);
     // Runtime-Relation eager loading: per-model `preload_associations`
     // machinery + belongs_to reader cache guards, so `includes(...)`
@@ -343,24 +410,27 @@ pub(crate) fn apply_model_lowering(mut lcs: &mut [LibraryClass], app: &App) {
     // N+1 lazy reads. Runs last so nothing reprocesses the synthesized
     // bodies (no-op unless the app mentions includes).
     library::apply_preload_lowering(&mut lcs, app);
-    // A belongs_to reader memoizes, and writing the foreign key
-    // invalidates it (no-op for models with no belongs_to). AFTER the
+    // A belongs_to reader memoizes, and writing the foreign key or the
+    // association invalidates it (no-op for models with no belongs_to). AFTER the
     // preload pass, which is what puts the `return @<name>_cache if
     // @<name>_loaded` guard on the reader — this pass memoizes into
     // that same cache and would have nothing to prepend itself to if it
     // ran first.
     library::apply_belongs_to_memoization(&mut lcs, app);
-    // Every association reader waits on its record's pending preload
-    // (`lower::deferred_preload`): a Relation's includes run when a record
-    // first reads an association, not when the rows arrive. After the two
-    // passes above, which put the `@<name>_loaded` guard it looks for.
-    crate::lower::deferred_preload::apply(&mut lcs, app);
+    // An association's loaded records hold their owner through its
+    // inverse. AFTER the memoization above, whose cache the seat fills,
+    // and the preload pass, whose setters it extends.
+    inverse_seating::apply(&mut lcs, app);
+    // A partial `select`'s left-out column raises from its generated
+    // reader. After every pass that rewrites a reader body by its shape.
+    crate::lower::missing_attribute::apply(&mut lcs, app);
     // A has_many cache is made on first read rather than at construction,
     // and the constructor's `attrs = {}` default is one shared frozen Hash
     // (`lower::lazy_model_state`) — nine Arrays and a Hash per hydrated
     // User on campfire's room page, for records that only answer a name.
     // LAST, after every pass that reads or writes `@<assoc>_cache` by name.
     crate::lower::lazy_model_state::apply(&mut lcs, app);
+    crate::lower::rooted_constants::root_shadowed(lcs, app);
 }
 
 fn emit_model_classes(
@@ -378,20 +448,19 @@ fn emit_model_classes(
         .filter(|lc| lc.origin.is_some())
         .map(|lc| {
             let name = lc.name.0.as_str().to_string();
-            let stem = crate::naming::underscore(&name);
-            (name, format!("app/models/{stem}"))
+            let anchor = class_paths::class_anchor(&name);
+            (name, anchor)
         })
         .collect();
     for spec in params_specs.iter() {
         let name = spec.class_id.0.as_str().to_string();
-        let stem = crate::naming::underscore(&name);
-        synthesized.push((name, format!("app/models/{stem}")));
+        let anchor = class_paths::class_anchor(&name);
+        synthesized.push((name, anchor));
     }
 
     lcs.iter()
         .flat_map(|lc| {
-            let stem = crate::naming::underscore(lc.name.0.as_str());
-            let out_path = PathBuf::from(format!("app/models/{stem}.rb"));
+            let out_path = class_paths::class_rb(lc.name.0.as_str());
             library::emit_library_class_pair_with_synthesized(
                 lc,
                 app,
@@ -440,7 +509,7 @@ pub fn emit_lowered_schema_pair(app: &App) -> Vec<EmittedFile> {
 /// `main.rb`. The body itself (the data) flows through the
 /// universal walker.
 pub fn emit_lowered_routes(app: &App) -> EmittedFile {
-    let funcs = crate::lower::lower_routes_to_dispatch_functions(app);
+    let funcs = crate::lower::routes_to_library::lower_routes_to_guarded_dispatch_functions(app);
     let mut emitted = library::emit_module_file(
         &funcs,
         app,
@@ -450,7 +519,7 @@ pub fn emit_lowered_routes(app: &App) -> EmittedFile {
     // Prepend require_relative headers for application_controller and
     // each unique controller used by the route table — Spinel runtime
     // loads controllers via require chain rooted at config/routes.rb.
-    let flat = crate::lower::routes::flatten_routes(app);
+    let flat = crate::lower::routes::flatten_routes_reachable(app);
     let mut header = String::new();
     use std::fmt::Write;
     let mut seen: Vec<String> = vec!["application_controller".to_string()];
@@ -463,7 +532,7 @@ pub fn emit_lowered_routes(app: &App) -> EmittedFile {
     // LoadError at boot on the ruby lane and a build abort on spinel.
     // Skipping it keeps Rails' laziness: the route still dispatches,
     // and it fails where Rails fails it.
-    let defined: std::collections::HashSet<&str> =
+    let defined: crate::det::HashSet<&str> =
         app.controllers.iter().map(|c| c.name.0.as_str()).collect();
     // The same holds for the base: a model-only app (an engine or library
     // app with no controllers) has no application_controller to require.
@@ -500,13 +569,20 @@ pub fn emit_lowered_routes(app: &App) -> EmittedFile {
 /// `app/models/<name>.rb` because they're plain holders, not request
 /// handlers.
 pub fn emit_lowered_controllers(app: &App) -> Vec<EmittedFile> {
+    emit_lowered_controllers_with_param_binds(
+        app,
+        crate::build_target::BuildTarget::Ruby.param_binds_enabled(None),
+    )
+}
+
+fn emit_lowered_controllers_with_param_binds(app: &App, param_binds: bool) -> Vec<EmittedFile> {
     // RSS_ONLY: the spinel tree compiles these, so the inline-json arms
     // stay out — they reference the CRuby-overlay JsonRender and don't
     // type under the AOT compile (CI caught `render(JsonRender.encode
     // (...))` as sp_RbVal-vs-char* in articles_controller). The rss arm
     // reaches only the emitted `Views::<X>.rss` template and the shared
     // `Rails.cache.fetch_str`, both of which this tree already carries.
-    let mut lcs = lower_controllers_for_spinel(app, FormatBreadth::RSS_ONLY);
+    let mut lcs = lower_controllers_for_spinel(app, FormatBreadth::RSS_ONLY, param_binds);
     library::apply_scope_lowering(&mut lcs, app);
     library::apply_helper_lowering(&mut lcs, app);
     // A record handed to a path helper becomes its slug here, not
@@ -515,8 +591,7 @@ pub fn emit_lowered_controllers(app: &App) -> Vec<EmittedFile> {
     // A helper handed `raw(x)` retargets to a `_raw` clone in which
     // that argument's escaping comes off (no-op without such a site).
     library::apply_raw_helper_monomorphization(&mut lcs, app);
-    library::apply_nilsafe_empty_lowering(&mut lcs);
-    library::apply_time_format_lowering(&mut lcs);
+    library::apply_time_format_lowering(&mut lcs, app);
     library::apply_dynamic_render_options_lowering(&mut lcs);
     // Layout wrap at render call sites — the seam where the @ivars a
     // layout reads are in scope. Converged with the CRuby tree
@@ -526,6 +601,10 @@ pub fn emit_lowered_controllers(app: &App) -> Vec<EmittedFile> {
     // params) can only be called where those ivars live. No-op for
     // apps without an emitted Layouts/application view.
     library::apply_layout_lowering(&mut lcs, app);
+    // A compact `class Gadget::WidgetsController` is emitted nested
+    // (`module Gadget; class WidgetsController`), which would put
+    // `Gadget::Util` in a bare `Util`'s scope; Ruby reads `::Util`.
+    library::apply_constant_rooting(&mut lcs, app, library::RootingScope::AppAndRuntime);
     emit_lowered_controllers_from_lcs(&lcs, app)
 }
 
@@ -545,13 +624,27 @@ pub fn emit_lowered_controllers_with_layout(app: &App) -> Vec<EmittedFile> {
     emit_lowered_controllers_from_lcs(&lcs, app)
 }
 
+pub(crate) fn emit_lowered_controllers_with_layout_and_param_binds(
+    app: &App, param_binds: bool,
+) -> Vec<EmittedFile> {
+    let lcs = lowered_controller_lcs_with_layout_and_param_binds(app, param_binds);
+    emit_lowered_controllers_from_lcs(&lcs, app)
+}
+
 /// The controller classes `emit_lowered_controllers_with_layout`
 /// writes, before rendering. Shared with `emit::futamura::routes`.
 pub(crate) fn lowered_controller_lcs_with_layout(app: &App) -> Vec<LibraryClass> {
+    lowered_controller_lcs_with_layout_and_param_binds(
+        app,
+        crate::build_target::BuildTarget::Ruby.param_binds_enabled(None),
+    )
+}
+
+fn lowered_controller_lcs_with_layout_and_param_binds(app: &App, param_binds: bool) -> Vec<LibraryClass> {
     // FULL: the CRuby/JRuby trees ship the overlay (JsonRender) so the
     // widened respond_to arms all resolve; these files dedupe last-wins
     // over the spinel-shape ones.
-    let mut lcs = lower_controllers_for_spinel(app, FormatBreadth::FULL);
+    let mut lcs = lower_controllers_for_spinel(app, FormatBreadth::FULL, param_binds);
     library::apply_scope_lowering(&mut lcs, app);
     library::apply_helper_lowering(&mut lcs, app);
     // A record handed to a path helper becomes its slug here, not
@@ -560,10 +653,11 @@ pub(crate) fn lowered_controller_lcs_with_layout(app: &App) -> Vec<LibraryClass>
     // A helper handed `raw(x)` retargets to a `_raw` clone in which
     // that argument's escaping comes off (no-op without such a site).
     library::apply_raw_helper_monomorphization(&mut lcs, app);
-    library::apply_nilsafe_empty_lowering(&mut lcs);
-    library::apply_time_format_lowering(&mut lcs);
+    library::apply_time_format_lowering(&mut lcs, app);
     library::apply_dynamic_render_options_lowering(&mut lcs);
     library::apply_layout_lowering(&mut lcs, app);
+    // Same rooting as the spinel-shape controllers above.
+    library::apply_constant_rooting(&mut lcs, app, library::RootingScope::AppAndRuntime);
     lcs
 }
 
@@ -575,18 +669,18 @@ pub(crate) fn lowered_controller_lcs_with_layout(app: &App) -> Vec<LibraryClass>
 /// controller lowerer's registry as extras — the Arel pass needs
 /// them to resolve `Article.includes(...).order(...)` chain
 /// receivers to a TableRef.
-fn lower_controllers_for_spinel(app: &App, format_breadth: FormatBreadth) -> Vec<LibraryClass> {
+fn lower_controllers_for_spinel(app: &App, format_breadth: FormatBreadth, param_binds: bool) -> Vec<LibraryClass> {
+    let resolver = app.const_resolver.for_sources(&app.sources);
+    let finder_classes = crate::analyze::source_finder_classes(app, &resolver);
     // Use lower_models_with_registry (not lower_models_to_library_classes
     // + class_info_from_library_class) because the former returns
     // ClassInfo with `table` set — the Arel pass needs `info.table`
     // to map a Const recv to a TableRef when recognizing chains.
-    let (_, model_registry) = crate::lower::model_to_library::lower_models_with_request_finders(
-        &app.models,
-        &app.schema,
-        Vec::new(),
-    );
     let model_extras: Vec<(crate::ident::ClassId, crate::analyze::ClassInfo)> =
-        model_registry.into_iter().collect();
+        crate::lower::model_to_library::request_finder_registry(&app.models, &app.schema, true)
+            .iter()
+            .map(|(id, info)| (id.clone(), info.clone()))
+            .collect();
     // Association graph drives `includes(:assoc)` eager-load lowering
     // (issue #27) — without it the Arel pass drops includes and the
     // reader N+1s.
@@ -595,11 +689,11 @@ fn lower_controllers_for_spinel(app: &App, format_breadth: FormatBreadth) -> Vec
     // action (gets implicit render + process_action dispatch) only if a
     // route reaches it. Lets base-controller helper/filter methods keep
     // their return value instead of being clobbered by a synthesized render.
-    let mut routed: std::collections::HashMap<
+    let mut routed: crate::det::HashMap<
         crate::ident::ClassId,
-        std::collections::HashSet<crate::ident::Symbol>,
-    > = std::collections::HashMap::new();
-    for r in crate::lower::flatten_routes(app) {
+        crate::det::HashSet<crate::ident::Symbol>,
+    > = crate::det::HashMap::default();
+    for r in crate::lower::routes::flatten_routes_reachable(app) {
         routed.entry(r.controller).or_default().insert(r.action);
     }
     let route_ids = crate::lower::routes::helper_id_segments(app);
@@ -608,9 +702,12 @@ fn lower_controllers_for_spinel(app: &App, format_breadth: FormatBreadth) -> Vec
         model_extras,
         crate::lower::controller_to_library::LowerControllerOptions {
             ruby_read_values: true,
+            carry_nested_params: true,
+            param_binds,
             schema: Some(&app.schema),
             views: &app.views,
             library_classes: &app.library_classes,
+            finder_classes: Some(&finder_classes),
             assocs: &assocs,
             routed_by_controller: Some(&routed),
             format_breadth,
@@ -619,6 +716,10 @@ fn lower_controllers_for_spinel(app: &App, format_breadth: FormatBreadth) -> Vec
             models: &app.models,
             wrap_parameters_by_default: app.wrap_parameters_by_default,
             concern_spliced_actions: Some(&app.concern_spliced_actions),
+            // `require: false` (an empty require list) keeps Bundler from loading it, and its railtie with it.
+            jbuilder_loaded: app.gem_lock.as_ref().map(|lock| {
+                lock.has("jbuilder") && !lock.gemfile_requires.get("jbuilder").is_some_and(|features| features.is_empty())
+            }),
         },
     )
 }
@@ -635,8 +736,8 @@ fn emit_lowered_controllers_from_lcs(
         .filter(|lc| lc.origin.is_some())
         .map(|lc| {
             let name = lc.name.0.as_str().to_string();
-            let stem = crate::naming::underscore(&name);
-            (name, format!("app/models/{stem}"))
+            let anchor = class_paths::class_anchor(&name);
+            (name, anchor)
         })
         .collect();
 
@@ -644,7 +745,7 @@ fn emit_lowered_controllers_from_lcs(
         .flat_map(|lc| {
             let file_stem = crate::naming::underscore(lc.name.0.as_str());
             let out_path = if lc.origin.is_some() {
-                PathBuf::from(format!("app/models/{file_stem}.rb"))
+                class_paths::class_rb(lc.name.0.as_str())
             } else {
                 PathBuf::from(format!("app/controllers/{file_stem}.rb"))
             };
@@ -729,12 +830,24 @@ pub fn emit_lowered_views(app: &App) -> Vec<EmittedFile> {
 /// The html view classes `emit_lowered_views` writes, paired with their
 /// views, before rendering. Shared with `emit::futamura::routes`.
 pub(crate) fn lowered_view_lcs(app: &App) -> (Vec<&crate::dialect::View>, Vec<LibraryClass>) {
+    let (html_views, mut lcs) = lowered_view_lcs_pre_helper(app);
+    library::apply_helper_lowering(&mut lcs, app);
+    finish_lowered_view_lcs(&mut lcs, app);
+    (html_views, lcs)
+}
+
+/// The html-view half of `lowered_view_lcs`, up to (not including)
+/// `apply_helper_lowering`. Split out so `emit_lowered_views_and_jbuilder`
+/// can run that one pass ONCE over the html AND jbuilder `LibraryClass`es
+/// together (see its doc comment) while every other pass — before and
+/// after — stays exactly where it was, per format.
+fn lowered_view_lcs_pre_helper(app: &App) -> (Vec<&crate::dialect::View>, Vec<LibraryClass>) {
     // Lower every view through ONE per-app context, then run the
     // Ruby-family passes over the whole group at once — per-view pass
     // application rebuilt the scope/assoc/helper registries for every
     // template, which is quadratic in app size (the mastodon playground
     // transpile blew its budget on it).
-    let vctx = crate::lower::ViewLowerCtx::new(app);
+    let vctx = crate::lower::ViewLowerCtx::new(app).observe_form_with_entry();
     let html_views: Vec<&crate::dialect::View> = app
         .views
         .iter()
@@ -748,42 +861,42 @@ pub(crate) fn lowered_view_lcs(app: &App) -> (Vec<&crate::dialect::View>, Vec<Li
     // no-op for scope-free apps (the blog), and a view LC is never a
     // model, so only the call-site rewrite arm runs.
     library::apply_scope_lowering(&mut lcs, app);
-    library::apply_helper_lowering(&mut lcs, app);
+    (html_views, lcs)
+}
+
+/// The html-view half of `lowered_view_lcs` AFTER `apply_helper_lowering`.
+fn finish_lowered_view_lcs(lcs: &mut Vec<LibraryClass>, app: &App) {
     // Whatever `apply_helper_lowering` did not claim as an app helper
     // and the route table DOES answer is a route helper called outside
     // URL position — `rails_blob_path` in a `data:` hash. It gets the
     // same `RouteHelpers.` receiver `link_to`'s URL argument gets.
-    crate::lower::route_helper_receiver::qualify_lcs(&mut lcs, app);
+    crate::lower::route_helper_receiver::qualify_lcs(lcs, app);
     // A record handed to a path helper becomes its slug here, not
     // inside the helper (no-op unless a model overrides `to_param`).
-    library::apply_route_param_lowering(&mut lcs, app);
+    library::apply_route_param_lowering(lcs, app);
     // A helper handed `raw(x)` retargets to a `_raw` clone in which
     // that argument's escaping comes off (no-op without such a site).
-    library::apply_raw_helper_monomorphization(&mut lcs, app);
-    library::apply_time_current_lowering(&mut lcs, app);
-    library::apply_duration_lowering(&mut lcs, app);
-    // Nullable columns hydrate to nil on the Ruby tree — synthesized
-    // `.empty?` predicate forms in view bodies must tolerate it.
-    library::apply_nilsafe_empty_lowering(&mut lcs);
-    library::apply_time_format_lowering(&mut lcs);
-    library::apply_dynamic_render_options_lowering(&mut lcs);
+    library::apply_raw_helper_monomorphization(lcs, app);
+    library::apply_time_current_lowering(lcs, app);
+    library::apply_duration_lowering(lcs, app);
+    library::apply_time_format_lowering(lcs, app);
+    library::apply_dynamic_render_options_lowering(lcs);
     // A view whose own namespace shadows a top-level app class
     // (`Views::Stats` over `Stats`) must reference it absolutely, or
     // Ruby resolves the inner module first. No-op unless a view
     // directory shares a name with a class.
-    library::apply_constant_rooting(&mut lcs, app, library::RootingScope::AppAndRuntime);
+    library::apply_constant_rooting(lcs, app, library::RootingScope::AppAndRuntime);
     // Give each view a `<name>_into(io, …)` variant and point
     // view-to-view appends at it, so a nested fragment is written into
     // the caller's buffer instead of being materialised as a string
     // that the caller then appends. Ruby-family only: the construct
     // needs a mutable buffer a callee can write through.
-    crate::lower::view_buffer_passing::apply(&mut lcs);
+    crate::lower::view_buffer_passing::apply(lcs);
     // And the same for a block-taking tag helper: `io << Helper.tag(a)
     // do … end` becomes `Helper.tag_into(io, a) do … end`, the block
     // appending into the view's own buffer. The variants are added on
     // the helper side (`emit_library_class_decls`) from the same table.
-    crate::lower::tag_block_passing::apply_views(&mut lcs, &crate::lower::tag_block_passing::variants(app));
-    (html_views, lcs)
+    crate::lower::tag_block_passing::apply_views(lcs, &crate::lower::tag_block_passing::variants(app));
 }
 
 /// Lower each json-format `app.views` entry through `jbuilder_to_library`
@@ -792,15 +905,108 @@ pub(crate) fn lowered_view_lcs(app: &App) -> (Vec<&crate::dialect::View>, Vec<Li
 /// io-accumulator shape as html views; values flow through
 /// `JsonBuilder.encode_value`.
 pub fn emit_lowered_jbuilder_views(app: &App) -> Vec<EmittedFile> {
-    app.views
+    let (jbuilder_views, mut lcs) = jbuilder_view_lcs_pre_helper(app);
+    library::apply_helper_lowering(&mut lcs, app);
+    emit_jbuilder_view_files(&jbuilder_views, &lcs, app)
+}
+
+/// The jbuilder half of `emit_lowered_jbuilder_views`, up to (not
+/// including) `apply_helper_lowering`. Split out, like
+/// `lowered_view_lcs_pre_helper`, so `emit_lowered_views_and_jbuilder`
+/// can run that one pass once over BOTH formats' `LibraryClass`es.
+fn jbuilder_view_lcs_pre_helper(app: &App) -> (Vec<&crate::dialect::View>, Vec<LibraryClass>) {
+    let jbuilder_views: Vec<&crate::dialect::View> = app.views.iter().filter(|v| v.jbuilder).collect();
+    // A jbuilder view is a module function exactly like an ERB one
+    // (`Views::<X>.<template>_json`, no controller instance), but
+    // unlike ERB views this tree never ran `apply_helper_lowering` on
+    // it — `emit_library_class_decls` (the ERB/model/controller path)
+    // is the only caller. A bare `helper_method`-marked call (Devise's
+    // `current_user`, an app's own `helper_method :platform`) stayed
+    // unrewritten and raised `NameError`/`NoMethodError` at the first
+    // render that reached it. Invisible for most jbuilder views because
+    // nothing in them typically calls one, and invisible inside
+    // `json.cache! key do … end` before roundhouse 981ce8e30
+    // specifically because the pre-981ce8e3 transparent `cache!`
+    // handling dropped the key expression on the floor rather than
+    // lowering it — so a key like `[current_user, @widgets]` was never
+    // even reached. 981ce8e30's whole-template `cache!`
+    // (`walk_cached_template`) lowers the key for real, which is what
+    // exposed the gap.
+    let lcs: Vec<LibraryClass> = jbuilder_views
         .iter()
-        .filter(|v| v.jbuilder)
-        .flat_map(|v| {
-            let lc = crate::lower::lower_jbuilder_to_library_class(v, app);
+        .map(|v| {
+            let mut lc = crate::lower::lower_jbuilder_to_library_class(v, app);
+            library::apply_zoned_json_time_lowering(std::slice::from_mut(&mut lc), app);
+            lc
+        })
+        .collect();
+    (jbuilder_views, lcs)
+}
+
+fn emit_jbuilder_view_files(
+    jbuilder_views: &[&crate::dialect::View],
+    lcs: &[LibraryClass],
+    app: &App,
+) -> Vec<EmittedFile> {
+    jbuilder_views
+        .iter()
+        .zip(lcs.iter())
+        .flat_map(|(v, lc)| {
             let out_path = jbuilder_view_output_path(v.name.as_str());
-            library::emit_library_class_pair(&lc, app, out_path)
+            library::emit_library_class_pair(lc, app, out_path)
         })
         .collect()
+}
+
+/// `emit_lowered_views` and `emit_lowered_jbuilder_views` combined, for
+/// the real per-app pipeline (`emit_spinel_with_param_binds`), sharing
+/// ONE `apply_helper_lowering` call over BOTH formats' `LibraryClass`es
+/// instead of each format running it separately over its own slice.
+///
+/// Why this has to be one call (roundhouse #1034, CodeRabbit): an html
+/// view and a jbuilder view can reopen the SAME `Views::<Plural>`
+/// module (`app/views/widgets/index.html.erb` and
+/// `app/views/widgets/show.json.jbuilder` both land in `Views::Widgets`)
+/// and each call the same hoistable helper (`image_tag("boost.svg",
+/// alt: "…")`) with the same first string literal but a different
+/// `alt:`. `apply_helper_lowering`'s tail, `hoist_pure_helper_constants`,
+/// dedupes a hoisted constant's name against a `used` set built fresh
+/// FOR THE SLICE IT IS GIVEN (already fixed within a single format by
+/// `jbuilder_helper_hoist_cross_view.rs`'s regression, which gave every
+/// jbuilder view one shared call) — but `emit_lowered_views` and
+/// `emit_lowered_jbuilder_views` each build their OWN slice and call it
+/// separately, so the two formats never learned about each other's
+/// allocation: both mint the identical `HOISTED_IMAGE_TAG_BOOST_SVG`
+/// constant into the same Ruby module, and at load time the second
+/// file's top-level assignment silently overwrites the first's.
+///
+/// Combining the slices for this one pass (then splitting them back
+/// apart for each format's own remaining passes) gives the dedupe the
+/// cross-format visibility it needs, exactly as combining jbuilder's
+/// own per-view slices did for the jbuilder-jbuilder case.
+pub(crate) fn emit_lowered_views_and_jbuilder(app: &App) -> Vec<EmittedFile> {
+    let (html_views, mut html_lcs) = lowered_view_lcs_pre_helper(app);
+    // Not in `lowered_view_lcs_pre_helper`: the views-only entry points serve harnesses that load the views without ActiveSupport::Notifications, which only a whole tree ships.
+    crate::lower::view_instrumentation::apply(&html_views, &mut html_lcs, app);
+    let (jbuilder_views, jbuilder_lcs) = jbuilder_view_lcs_pre_helper(app);
+    let html_len = html_lcs.len();
+    let mut combined = html_lcs;
+    combined.extend(jbuilder_lcs);
+    library::apply_helper_lowering(&mut combined, app);
+    let jbuilder_lcs = combined.split_off(html_len);
+    let mut html_lcs = combined;
+    finish_lowered_view_lcs(&mut html_lcs, app);
+
+    let mut files: Vec<EmittedFile> = html_views
+        .iter()
+        .zip(html_lcs.iter())
+        .flat_map(|(v, lc)| {
+            let out_path = view_output_path(&crate::lower::view::view_output_stem(v));
+            library::emit_library_class_pair(lc, app, out_path)
+        })
+        .collect();
+    files.extend(emit_jbuilder_view_files(&jbuilder_views, &jbuilder_lcs, app));
+    files
 }
 
 /// Map a view name (`articles/index`, `articles/_article`,
@@ -835,12 +1041,21 @@ fn jbuilder_view_output_path(view_name: &str) -> PathBuf {
 /// which would have CRuby double-run every test if combined with the
 /// shim).
 pub fn emit_spinel(app: &App) -> Vec<EmittedFile> {
+    emit_spinel_with_param_binds(
+        app,
+        crate::build_target::BuildTarget::Spinel.param_binds_enabled(None),
+    )
+}
+
+/// Ruby-family emit with the build target's resolved bind policy.
+pub(crate) fn emit_spinel_with_param_binds(app: &App, param_binds: bool) -> Vec<EmittedFile> {
+    let _indexes = library::install_lookup_indexes(app);
     let mut files = Vec::new();
     files.extend(emit_lowered_schema_pair(app));
     // routes.rb gets a require-relative header prepended (see
     // emit_lowered_routes); emit the .rb via that path, then derive
     // the .rbs sidecar from the same funcs without the header.
-    let route_funcs = crate::lower::lower_routes_to_dispatch_functions(app);
+    let route_funcs = crate::lower::routes_to_library::lower_routes_to_guarded_dispatch_functions(app);
     files.push(emit_lowered_routes(app));
     files.extend(rbs_only_from_funcs(
         &route_funcs,
@@ -893,19 +1108,24 @@ pub fn emit_spinel(app: &App) -> Vec<EmittedFile> {
                 .to_string(),
         }),
     }
-    files.extend(emit_lowered_models(app));
+    files.extend(emit_lowered_models_with_param_binds(app, param_binds));
     if let Some(f) = library::emit_relation_scope_delegates(app) {
         files.push(f);
     }
-    files.extend(emit_lowered_controllers(app));
-    files.extend(emit_lowered_views(app));
-    files.extend(emit_lowered_jbuilder_views(app));
+    files.extend(emit_lowered_controllers_with_param_binds(app, param_binds));
+    // One combined call, not `emit_lowered_views` then
+    // `emit_lowered_jbuilder_views` separately (roundhouse #1034,
+    // CodeRabbit): see `emit_lowered_views_and_jbuilder`'s doc comment
+    // for why the two formats' hoisted helper constants must share one
+    // `apply_helper_lowering` pass when they land in the same app.
+    files.extend(emit_lowered_views_and_jbuilder(app));
 
     // RouteHelpers — `app/route_helpers.rb` with `def self.<x>_path(args)`
     // per named route. Generated from `app.routes`; supersedes the
     // hand-written `runtime/ruby/action_view/route_helpers.rb` (which
     // is being kept for backward compat until callers migrate).
-    let route_helper_funcs = crate::lower::lower_routes_to_library_functions(app);
+    let mut route_helper_funcs = crate::lower::lower_routes_to_library_functions(app);
+    crate::lower::routes_to_library::guard_required_segments(&mut route_helper_funcs, app);
     // The segment interpolations stay bare. `to_param` used to be
     // applied here, to every segment of every helper — which reads as
     // Rails-faithful but isn't, because our segments are declared
@@ -937,7 +1157,7 @@ pub fn emit_spinel(app: &App) -> Vec<EmittedFile> {
     // + `Object.const_get` scan, which violates the spinel subset).
     // Same `fixture_lcs` is reused below for the per-fixture file emit
     // and for `fixture_extras` synthesized siblings.
-    let mut fixture_lcs = crate::lower::lower_fixtures_to_library_classes(app);
+    let mut fixture_lcs = crate::lower::lower_fixtures_to_library_classes_keeping_keys(app);
     // Same vestige as the view pipeline above, for the same reason:
     // fixture classes are synthesized here, after the shared post-
     // analyze hooks have already run over the App, so an ERB tag's
@@ -980,7 +1200,7 @@ pub fn emit_spinel(app: &App) -> Vec<EmittedFile> {
     // `DELETE FROM` rather than a synthesized `_adapter_truncate`:
     // there is no model to synthesize it onto, and a virtual table has
     // no AUTOINCREMENT sequence to reset.
-    let modelled: std::collections::HashSet<&str> =
+    let modelled: crate::det::HashSet<&str> =
         app.models.iter().map(|m| m.table.0.as_str()).collect();
     for (name, _table) in &app.schema.tables {
         if !modelled.contains(name.as_str()) {
@@ -1040,27 +1260,29 @@ pub fn emit_spinel(app: &App) -> Vec<EmittedFile> {
         // its registry, and letting it report again duplicated 58
         // `unsupported` entries into campfire's ledger — the same gaps,
         // counted twice, which is worse than not knowing.
-        let (model_registry, _dup_diags) = crate::emit::diagnostics::scope(|| {
-            let (_, reg) =
-                crate::lower::model_to_library::lower_models_with_request_finders(&app.models, &app.schema, Vec::new());
-            reg
-        });
+        let model_registry = crate::lower::model_to_library::request_finder_registry(&app.models, &app.schema, false);
         let fixture_extras: Vec<(crate::ident::ClassId, crate::analyze::ClassInfo)> = fixture_lcs
             .iter()
             .map(|lc| (lc.name.clone(), crate::lower::class_info_from_library_class(lc)))
-            .chain(model_registry)
+            .chain(model_registry.iter().map(|(id, info)| (id.clone(), info.clone())))
             .collect();
         // A test body's `_url` answers absolute, on the session's host,
         // as the Ruby family's jbuilder `_url` does (see the pass).
         let test_modules =
             crate::lower::test_module_to_library::ruby_family_absolute_test_urls(&app.test_modules);
-        let mut test_lowered = crate::lower::lower_test_modules_with_inner(
+        let mut test_lowered = crate::lower::test_module_to_library::lower_test_modules_with_inner_opts(
             &test_modules,
             &app.fixtures,
             &app.models,
             fixture_extras,
             &crate::lower::routes::helper_id_segments(app),
+            &crate::lower::routes::direct_helper_names(app),
+            true,
         );
+        // The url-rewritten copy of every test module is lowering input
+        // only. It is as large as the lowered classes, so free it before
+        // the passes below rather than holding both to the end of emit.
+        drop(test_modules);
         // A test body writes the same relation chains an app body does —
         // `@room.messages.ordered`, `user.push_subscriptions.find_by(…)`,
         // `room.memberships.grant_to(users)`. The has_many reader hands
@@ -1082,18 +1304,30 @@ pub fn emit_spinel(app: &App) -> Vec<EmittedFile> {
         // half (scope-method synthesis, `push_scope_variants`) is inert
         // here and only the call-site rewrite runs.
         {
-            let mut test_lcs: Vec<crate::dialect::LibraryClass> = test_lowered
-                .iter()
-                .flat_map(|m| {
-                    std::iter::once(m.test_class.clone()).chain(m.inner_classes.iter().cloned())
-                })
-                .collect();
+            // Moved out, not cloned: a copy of every lowered test class
+            // doubled the heap's largest holding for these passes.
+            let inner_counts: Vec<usize> = test_lowered.iter().map(|m| m.inner_classes.len()).collect();
+            let mut constants = Vec::with_capacity(test_lowered.len());
+            let mut test_lcs: Vec<crate::dialect::LibraryClass> = Vec::new();
+            for m in test_lowered.drain(..) {
+                test_lcs.push(m.test_class);
+                test_lcs.extend(m.inner_classes);
+                constants.push(m.constants);
+            }
             // A record Array at a Relation-typed parameter, restated as
             // the Relation over those records — BEFORE the scope
             // lowering, which is what turns the `M.where` it writes
             // into a seeded Relation. See the module.
             crate::lower::records_to_relation_arg::rewrite_test_classes(&mut test_lcs, app);
             library::apply_scope_lowering(&mut test_lcs, app);
+            // A route-helper argument as the helper's SIGNATURE takes
+            // it, as app bodies get it: a String-typed segment (a slug,
+            // or one typed by its `scope defaults:` text) takes
+            // `id.to_s`, not the Integer `project_route_helper_ids`
+            // left. campfire's `user_profile_url(users(:jason))` reached
+            // `?String user_id` as an Integer, and Spinel refused the
+            // contradicted seed.
+            library::apply_route_param_lowering(&mut test_lcs, app);
             // `1.minute.ago` in a class a test file carries (campfire's
             // `PushServiceTestHelper.sign`), as library classes get it.
             library::apply_duration_lowering(&mut test_lcs, app);
@@ -1109,12 +1343,15 @@ pub fn emit_spinel(app: &App) -> Vec<EmittedFile> {
                 library::RootingScope::AppAndRuntime,
             );
             let mut it = test_lcs.into_iter();
-            for m in &mut test_lowered {
-                m.test_class = it.next().expect("one lowered class per test module");
-                for inner in &mut m.inner_classes {
-                    *inner = it.next().expect("one lowered class per inner class");
-                }
-            }
+            test_lowered = constants
+                .into_iter()
+                .zip(inner_counts)
+                .map(|(constants, inner_count)| crate::lower::test_module_to_library::LoweredTestModule {
+                    test_class: it.next().expect("one lowered class per test module"),
+                    inner_classes: it.by_ref().take(inner_count).collect(),
+                    constants,
+                })
+                .collect();
         }
         // Fixture classes (`ArticlesFixtures`, etc.) live at
         // `test/fixtures/<plural>.rb` — outside the model/controller
@@ -1147,10 +1384,10 @@ pub fn emit_spinel(app: &App) -> Vec<EmittedFile> {
         // silently replace the first. A namespaced class whose stem
         // is taken spells its `::` as `__` instead — decided from the
         // whole set, so the outcome does not depend on emit order.
-        let stem_counts: std::collections::HashMap<String, usize> = test_lowered
+        let stem_counts: crate::det::HashMap<String, usize> = test_lowered
             .iter()
             .map(|l| test_file_stem(l.test_class.name.0.as_str()))
-            .fold(std::collections::HashMap::new(), |mut m, s| {
+            .fold(crate::det::HashMap::default(), |mut m, s| {
                 *m.entry(s).or_insert(0) += 1;
                 m
             });
@@ -1171,11 +1408,11 @@ pub fn emit_spinel(app: &App) -> Vec<EmittedFile> {
         // A test class may subclass another the app defines (a base in
         // test_helper.rb: `class QueryHelperTest <
         // GemCompat::TestCase`). Its file has to be loaded first.
-        let test_paths: std::collections::HashMap<&str, PathBuf> = test_lowered
+        let test_paths: crate::det::HashMap<&str, PathBuf> = test_lowered
             .iter()
             .map(|l| (l.test_class.name.0.as_str(), out_path_of(&l.test_class)))
             .collect();
-        let test_parents: std::collections::HashSet<&str> = test_lowered
+        let test_parents: crate::det::HashSet<&str> = test_lowered
             .iter()
             .filter_map(|l| l.test_class.parent.as_ref().map(|p| p.0.as_str()))
             .collect();
@@ -1420,10 +1657,38 @@ fn render_autorun_shim(lc: &LibraryClass, reset_lines: &[String]) -> String {
         "\n# Spinel AOT autorun shim — see emit/ruby.rs::render_autorun_shim.\n",
     );
     // An Integer counter and per-failure `puts`, deliberately: no
-    // array accumulator and no block, so the shim leans on nothing
-    // beyond `begin/rescue`, `+`, `to_s` and string concatenation —
-    // the surface spinel-AOT already compiles in lowered test bodies
-    // (`assert_raises`) and `runtime/spinel`.
+    // array accumulator and no block in the runner, so that loop leans
+    // on nothing beyond `begin/rescue`, `+`, `to_s` and string
+    // concatenation. The fixture-transaction wrapper is a method: its
+    // block sits in a `def`, the shape spinel already compiles in
+    // lowered test bodies.
+    //
+    // Rails' `use_transactional_tests` (default true) runs the example
+    // inside a non-joinable transaction, so each `save`/`destroy` is a
+    // SAVEPOINT. `TestBase.use_transactional_tests` is that default; a
+    // class that sets the flag false overrides the class method.
+    //
+    // Only an app suite has fixture reset lines, and only that suite
+    // loads the helper that defines the method. Spinel rejects the call
+    // when no class in the program defines it; `respond_to?` does not
+    // make the reference optional. A framework file has nothing to reset
+    // and no such method, so it calls the example directly.
+    let transactional = !reset_lines.is_empty();
+    if transactional && !test_methods.is_empty() {
+        writeln!(s, "class {class_name}").unwrap();
+        for tm in &test_methods {
+            writeln!(s, "  def __txn_{tm}").unwrap();
+            writeln!(s, "    if self.class.use_transactional_tests").unwrap();
+            writeln!(s, "      ActiveRecord::Base.transaction(joinable: false) do").unwrap();
+            writeln!(s, "        {tm}").unwrap();
+            writeln!(s, "      end").unwrap();
+            writeln!(s, "    else").unwrap();
+            writeln!(s, "      {tm}").unwrap();
+            writeln!(s, "    end").unwrap();
+            writeln!(s, "  end").unwrap();
+        }
+        writeln!(s, "end").unwrap();
+    }
     writeln!(s, "__failed = 0").unwrap();
     writeln!(s, "__skipped = 0").unwrap();
     for tm in &test_methods {
@@ -1440,11 +1705,20 @@ fn render_autorun_shim(lc: &LibraryClass, reset_lines: &[String]) -> String {
         // that fails to load is a per-test error in Rails. Outside
         // the guard it would abort the file and hide every test
         // behind it — the exact failure mode this shim exists to end.
-        for line in reset_lines {
-            writeln!(s, "  {line}").unwrap();
+        // Rails' fixture setup: loaded with referential integrity off, then checked. Not around an empty list: a framework test has nothing to reset and loads neither Db nor the helper.
+        if !reset_lines.is_empty() {
+            writeln!(s, "  FixtureLoader.with_foreign_keys_deferred do").unwrap();
+            for line in reset_lines {
+                writeln!(s, "    {line}").unwrap();
+            }
+            writeln!(s, "  end").unwrap();
         }
         writeln!(s, "  __t.setup").unwrap();
-        writeln!(s, "  __t.{tm}").unwrap();
+        if transactional {
+            writeln!(s, "  __t.__txn_{tm}").unwrap();
+        } else {
+            writeln!(s, "  __t.{tm}").unwrap();
+        }
         // `rescue Exception`, not a bare rescue: a bare one catches
         // StandardError, and an assertion library may deliberately put
         // its failure OUTSIDE that. `Mocha::ExpectationError <
@@ -1464,14 +1738,21 @@ fn render_autorun_shim(lc: &LibraryClass, reset_lines: &[String]) -> String {
         // counting it passed claims a check that never ran. So it is
         // reported on its own line and taken out of BOTH sides of the
         // tally by `scripts/campfire-suite`.
-        writeln!(s, "rescue TestSkipped => __e").unwrap();
-        writeln!(s, "  __ok = false").unwrap();
-        writeln!(s, "  __skipped = __skipped + 1").unwrap();
-        writeln!(s, "  puts {:?} + __e.message", format!("SKIP {class_name}#{tm}: ")).unwrap();
+        // One `rescue Exception`. `TestSkipped < Exception`, and a
+        // framework file never loads the helper that defines that
+        // class — naming it in its own rescue arm raised
+        // `NameError` while handling an ordinary failure. The class
+        // name is the skip signal the helper's `skip` raises.
         writeln!(s, "rescue Exception => __e").unwrap();
-        writeln!(s, "  __ok = false").unwrap();
-        writeln!(s, "  __failed = __failed + 1").unwrap();
-        writeln!(s, "  puts {:?} + __e.message", format!("FAIL {class_name}#{tm}: ")).unwrap();
+        writeln!(s, "  if __e.class.name == \"TestSkipped\"").unwrap();
+        writeln!(s, "    __ok = false").unwrap();
+        writeln!(s, "    __skipped = __skipped + 1").unwrap();
+        writeln!(s, "    puts {:?} + __e.message", format!("SKIP {class_name}#{tm}: ")).unwrap();
+        writeln!(s, "  else").unwrap();
+        writeln!(s, "    __ok = false").unwrap();
+        writeln!(s, "    __failed = __failed + 1").unwrap();
+        writeln!(s, "    puts {:?} + __e.message", format!("FAIL {class_name}#{tm}: ")).unwrap();
+        writeln!(s, "  end").unwrap();
         writeln!(s, "end").unwrap();
         // Teardown gets a guard of its OWN, for the reason the comment
         // above gives for the reset lines: unguarded, a raise here
@@ -1681,8 +1962,8 @@ fn render_test_helper(fixture_lcs: &[LibraryClass], truncate_lines: &[String]) -
 
     // (2) Per-test isolation. `_adapter_truncate` exists only on models
     // with a backing schema table; the caller applies that gate.
-    const TRUNCATE_BLOCK: &str = "    Article._adapter_truncate if defined?(Article)
-    Comment._adapter_truncate if defined?(Comment)";
+    const TRUNCATE_BLOCK: &str = "      Article._adapter_truncate if defined?(Article)
+      Comment._adapter_truncate if defined?(Comment)";
 
     // (3) Fixture loading — spinel's AOT model has no runtime constant
     // table, so the scan is materialized at emit time.
@@ -1735,16 +2016,20 @@ fn render_test_helper(fixture_lcs: &[LibraryClass], truncate_lines: &[String]) -
          # `config.action_controller.allow_forgery_protection = false`.\n\
          # boot.rb loaded the ruby family's forgery check; a test posts\n\
          # without a token, as Rails' own integration tests do.\n\
-         ActionController::Base.allow_forgery_protection = false",
+         ActionController::Base.allow_forgery_protection = false\n\
+         # One call for the process. `load_rake_tasks!` returns immediately\n\
+         # once the graph exists, so a file-scope `load_tasks` in a test\n\
+         # is not copied into the emit.\n\
+         Rails.application.load_tasks",
     );
 
     // (2)
     let truncate = if truncate_lines.is_empty() {
-        String::from("    # no table-backed models")
+        String::from("      # no table-backed models")
     } else {
         truncate_lines
             .iter()
-            .map(|line| format!("    {line}"))
+            .map(|line| format!("      {line}"))
             .collect::<Vec<_>>()
             .join("\n")
     };
@@ -1830,6 +2115,12 @@ mod method_sig_tests {
     use crate::expr::{Expr, ExprNode, Literal};
     use crate::ident::Symbol;
     use crate::span::Span;
+
+    #[test]
+    fn unbound_param_binds_follow_the_target_policy() {
+        assert!(!crate::build_target::BuildTarget::Ruby.param_binds_enabled(None));
+        assert!(crate::build_target::BuildTarget::Spinel.param_binds_enabled(None));
+    }
 
     // `def get_from_cache(opts = {}, &block)` — an optional positional with
     // a default plus a captured block param must both round-trip into the

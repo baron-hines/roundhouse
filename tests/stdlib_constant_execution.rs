@@ -295,3 +295,385 @@ fn enumerable_constants_execute_in_native_spinel() {
     stdlib_app().write("app/services/enumerable_probe.rb", ENUMERABLE_SOURCE)
         .run_spinel(ENUMERABLE_SCRIPT).assert_passes();
 }
+
+const SYNCHRONIZATION_SOURCE: &str = r#"require "monitor"
+class SynchronizationProbe
+  def self.reentrant_count
+    lock = Monitor.new
+    count = 0
+    lock.synchronize { lock.synchronize { count += 1 } }
+    count
+  end
+  def self.handoff
+    mutex = Mutex.new
+    ready = ConditionVariable.new
+    value = 0
+    thread = Thread.new do
+      mutex.synchronize do
+        value = 42
+        ready.signal
+      end
+    end
+    mutex.synchronize { ready.wait(mutex) while value == 0 }
+    thread.join
+    value
+  end
+  def self.condition_variable_classes
+    [ConditionVariable, Thread::ConditionVariable]
+  end
+end
+"#;
+
+const SYNCHRONIZATION_SCRIPT: &str = r#"
+raise "Monitor reentrancy lost" unless SynchronizationProbe.reentrant_count == 1
+raise "ConditionVariable handoff lost" unless SynchronizationProbe.handoff == 42
+raise "ConditionVariable alias lost" unless SynchronizationProbe.condition_variable_classes.uniq.length == 1
+puts "Monitor and ConditionVariable execution passed"
+"#;
+
+#[test]
+fn monitor_and_condition_variable_constants_execute_after_emission() {
+    stdlib_app().write("app/models/synchronization_probe.rb", SYNCHRONIZATION_SOURCE)
+        .run_ruby(SYNCHRONIZATION_SCRIPT).assert_passes();
+}
+
+#[test]
+#[ignore = "requires the native Spinel compiler; set SPINEL"]
+fn monitor_and_condition_variable_constants_execute_in_native_spinel() {
+    stdlib_app().write("app/models/synchronization_probe.rb", SYNCHRONIZATION_SOURCE)
+        .run_spinel(SYNCHRONIZATION_SCRIPT).assert_passes();
+}
+
+const UNIX_SOCKET_SOURCE: &str = r#"require "socket"
+class UnixSocketProbe
+  def self.round_trip(path)
+    server = UNIXServer.new(path)
+    client = UNIXSocket.new(path)
+    peer = server.accept
+    client.write("ping\n")
+    line = peer.readpartial(5)
+    client.close
+    peer.close
+    server.close
+    line
+  end
+  def self.unix_socket?(value)
+    value.is_a?(UNIXSocket)
+  end
+end
+"#;
+
+const UNIX_SOCKET_SCRIPT: &str = r#"
+require "tmpdir"
+Dir.mktmpdir do |dir|
+  raise "UNIX socket round trip lost" unless UnixSocketProbe.round_trip(File.join(dir, "probe.sock")) == "ping\n"
+end
+raise "UNIXSocket class check changed" if UnixSocketProbe.unix_socket?("probe.sock")
+puts "UNIXServer and UNIXSocket execution passed"
+"#;
+
+#[test]
+fn unix_socket_constants_execute_after_emission() {
+    stdlib_app().write("app/models/unix_socket_probe.rb", UNIX_SOCKET_SOURCE)
+        .run_ruby(UNIX_SOCKET_SCRIPT).assert_passes();
+}
+
+/// The two socket classes name one library, and the emitted file requires it once.
+#[test]
+fn unix_socket_classes_share_one_require() {
+    let (emitted, errors) = stdlib_app().write("app/models/unix_socket_probe.rb", UNIX_SOCKET_SOURCE)
+        .emit(roundhouse::project::BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:?}");
+    let probe = std::fs::read_to_string(emitted.join("app/models/unix_socket_probe.rb")).expect("emitted probe");
+    assert_eq!(probe.matches("require \"socket\"").count(), 1, "{probe}");
+}
+
+#[test]
+#[ignore = "requires the native Spinel compiler; set SPINEL"]
+fn unix_socket_constants_execute_in_native_spinel() {
+    stdlib_app().write("app/models/unix_socket_probe.rb", UNIX_SOCKET_SOURCE)
+        .run_spinel(UNIX_SOCKET_SCRIPT).assert_passes();
+}
+
+const OPEN3_AND_FIND_SOURCE: &str = r#"require "open3"
+require "find"
+class ProcessAndTreeProbe
+  def self.echo(text)
+    stdout, _stderr, status = Open3.capture3("cat", stdin_data: text)
+    status.success? ? stdout : ""
+  end
+  def self.files(root)
+    found = []
+    Find.find(root) do |path|
+      Find.prune if File.basename(path) == "skip"
+      found << path if File.file?(path)
+    end
+    found.sort
+  end
+end
+"#;
+
+const OPEN3_AND_FIND_SCRIPT: &str = r#"
+require "tmpdir"
+raise "Open3.capture3 lost" unless ProcessAndTreeProbe.echo("hi") == "hi"
+Dir.mktmpdir do |dir|
+  Dir.mkdir(File.join(dir, "skip"))
+  File.write(File.join(dir, "skip", "hidden.txt"), "x")
+  File.write(File.join(dir, "kept.txt"), "x")
+  raise "Find.find or prune lost" unless ProcessAndTreeProbe.files(dir) == [File.join(dir, "kept.txt")]
+end
+puts "Open3 and Find execution passed"
+"#;
+
+#[test]
+fn open3_and_find_constants_execute_after_emission() {
+    stdlib_app().write("app/models/process_and_tree_probe.rb", OPEN3_AND_FIND_SOURCE)
+        .run_ruby(OPEN3_AND_FIND_SCRIPT).assert_passes();
+}
+
+/// Without a block `Find.find` answers an Enumerator, not nil.
+#[test]
+fn find_without_a_block_is_an_enumerator() {
+    stdlib_app()
+        .write("app/models/item.rb", "require \"find\"\nclass Item < ActiveRecord::Base\n  def self.files(root)\n    Find.find(root).select { |path| File.file?(path) }.length\n  end\nend\n")
+        .run_ruby("require \"tmpdir\"\nDir.mktmpdir do |dir|\n  File.write(File.join(dir, \"a.txt\"), \"x\")\n  raise \"Find.find enumerator lost\" unless Item.files(dir) == 1\nend\nputs \"Find enumerator passed\"\n")
+        .assert_passes();
+}
+
+#[test]
+#[ignore = "requires the native Spinel compiler; set SPINEL"]
+fn open3_and_find_constants_execute_in_native_spinel() {
+    stdlib_app().write("app/models/process_and_tree_probe.rb", OPEN3_AND_FIND_SOURCE)
+        .run_spinel(OPEN3_AND_FIND_SCRIPT).assert_passes();
+}
+
+const FLOAT_DOMAIN_SOURCE: &str = r#"class FloatDomainProbe
+  def self.round(value)
+    value.round
+  rescue FloatDomainError
+    "domain"
+  end
+end
+"#;
+
+const FLOAT_DOMAIN_SCRIPT: &str = r#"
+raise "FloatDomainError rescue lost" unless FloatDomainProbe.round(1.0 / 0) == "domain"
+raise "a finite Float still rounds" unless FloatDomainProbe.round(2.4) == 2
+raise "FloatDomainError hierarchy changed" unless FloatDomainError.superclass == RangeError
+puts "FloatDomainError execution passed"
+"#;
+
+#[test]
+fn float_domain_error_constant_executes_after_emission() {
+    stdlib_app().write("app/services/float_domain_probe.rb", FLOAT_DOMAIN_SOURCE)
+        .run_ruby(FLOAT_DOMAIN_SCRIPT).assert_passes();
+}
+
+const GZIP_SOURCE: &str = r#"require "openssl"
+require "zlib"
+require "stringio"
+class GzipProbe
+  def self.compress(text)
+    writer = Zlib::Deflate.new(Zlib::BEST_COMPRESSION, Zlib::MAX_WBITS + 16)
+    bytes = writer.deflate(text, Zlib::FINISH)
+    writer.close
+    bytes
+  end
+  def self.decompress(bytes)
+    reader = ::Zlib::GzipReader.new(StringIO.new(bytes))
+    reader.read
+  rescue Zlib::Error
+    "rejected"
+  end
+end
+"#;
+
+const GZIP_SCRIPT: &str = r#"
+bytes = GzipProbe.compress("sample")
+raise "gzip round trip" unless GzipProbe.decompress(bytes) == "sample"
+raise "malformed gzip accepted" unless GzipProbe.decompress("not gzip") == "rejected"
+puts "gzip: round trip and rejection checks passed"
+"#;
+
+#[test]
+fn whole_gzip_execute_after_emission() {
+    stdlib_app().write("app/models/gzip_probe.rb", GZIP_SOURCE)
+        .run_ruby(GZIP_SCRIPT).assert_passes();
+}
+
+#[test]
+#[ignore = "requires the native Spinel compiler; set SPINEL"]
+fn whole_gzip_execute_in_native_spinel() {
+    stdlib_app().write("app/models/gzip_probe.rb", GZIP_SOURCE)
+        .run_spinel(GZIP_SCRIPT).assert_passes();
+}
+
+#[test]
+fn gzip_and_digest_remain_unavailable_on_strict_targets() {
+    for constant in ["Zlib::Deflate", "Zlib::GzipReader", "Zlib::Error",
+                     "Zlib::BEST_COMPRESSION", "Zlib::MAX_WBITS", "Zlib::FINISH",
+                     "OpenSSL::Digest::SHA1", "OpenSSL::Digest::SHA256"] {
+        let source = format!("class ConstantProbe\n  def self.value\n    {constant}\n  end\nend\n");
+        let (_, errors) = stdlib_app().write("app/models/constant_probe.rb", &source)
+            .emit(roundhouse::project::BuildTarget::Rust);
+        assert!(errors.iter().any(|e| e.contains("bundled_constant") && e.contains(constant)),
+                "{constant}: {errors:?}");
+    }
+}
+
+
+const DIGEST_SOURCE: &str = r#"require "openssl"
+class DigestProbe
+  def self.sha1(text)
+    OpenSSL::Digest::SHA1.new(text).hexdigest
+  end
+  def self.sha256(text)
+    ::OpenSSL::Digest::SHA256.new(text).hexdigest
+  end
+  def self.sha1_class(text)
+    OpenSSL::Digest::SHA1.digest(text).unpack1("H*")
+  end
+  def self.sha256_class(text)
+    OpenSSL::Digest::SHA256.hexdigest(text)
+  end
+end
+"#;
+const DIGEST_SCRIPT: &str = r#"
+raise "SHA1" unless DigestProbe.sha1("abc") == "a9993e364706816aba3e25717850c26c9cd0d89d"
+raise "SHA256" unless DigestProbe.sha256("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+raise "SHA1 class method" unless DigestProbe.sha1_class("abc") == DigestProbe.sha1("abc")
+raise "SHA256 class method" unless DigestProbe.sha256_class("abc") == DigestProbe.sha256("abc")
+puts "SHA1 and SHA256 digest objects passed"
+"#;
+#[test]
+fn openssl_digest_subclasses_execute_after_emission() {
+    stdlib_app().write("app/models/digest_probe.rb", DIGEST_SOURCE)
+        .run_ruby(DIGEST_SCRIPT).assert_passes();
+}
+#[test]
+#[ignore = "requires the native Spinel compiler; set SPINEL"]
+fn openssl_digest_subclasses_execute_in_native_spinel() {
+    stdlib_app().write("app/models/digest_probe.rb", DIGEST_SOURCE)
+        .run_spinel(DIGEST_SCRIPT).assert_passes();
+}
+
+#[test]
+fn buffered_stdlib_calls_refuse_unqualified_intermediate_results() {
+    let mut admitted = Vec::new();
+    for expression in [
+        "Zlib::Deflate.new.deflate(\"sample\")",
+        "Zlib::Deflate.new.deflate(\"sample\", 0)",
+        "Zlib::Deflate.new.deflate(\"sample\", 2 + 2)",
+        "Zlib::Deflate.new.send(:deflate, \"sample\")",
+        "Zlib::Deflate.new.deflate(\"sample\", 4) { |part| part }",
+        "Zlib::Deflate.new.method(:deflate)",
+        "Zlib::GzipReader.new(StringIO.new(\"\")).read(0)",
+    ] {
+        let source = format!("class BufferProbe\n  def self.value\n    {expression}\n  end\nend\n");
+        for target in [roundhouse::project::BuildTarget::Ruby, roundhouse::project::BuildTarget::Spinel] {
+            let (_, errors) = stdlib_app().write("app/models/buffer_probe.rb", &source).emit(target);
+            let refused = errors.iter().any(|e| e.contains("buffered zlib result"));
+            if !refused { admitted.push(format!("{expression}, {target:?}: {errors:?}")); }
+        }
+    }
+    assert!(admitted.is_empty(), "unqualified calls admitted: {admitted:?}");
+}
+
+#[test]
+fn a_shadowed_finish_is_not_the_stdlib_finish() {
+    let (_, errors) = stdlib_app().write("app/models/buffer_probe.rb",
+        "module Zlib\n  FINISH = 0\nend\nclass BufferProbe\n  def self.value\n    Zlib::Deflate.new.deflate(\"sample\", Zlib::FINISH)\n  end\nend\n")
+        .emit(roundhouse::project::BuildTarget::Spinel);
+    assert!(errors.iter().any(|e| e.contains("buffered zlib result")), "{errors:?}");
+}
+
+#[test]
+fn a_source_deflate_override_keeps_its_contract() {
+    stdlib_app().write("app/models/buffer_probe.rb",
+        "require \"zlib\"\nmodule Zlib\n  class Deflate\n    def deflate(text)\n      text + \"!\"\n    end\n  end\nend\nclass BufferProbe\n  def self.value\n    Zlib::Deflate.new.deflate(\"sample\")\n  end\nend\n")
+        .run_ruby("raise \"override lost\" unless BufferProbe.value == \"sample!\"").assert_passes();
+}
+
+#[test]
+fn an_inherited_zlib_constructor_keeps_the_subclass_override() {
+    stdlib_app().write("app/models/buffer_probe.rb",
+        "require \"zlib\"\nclass ChildDeflate < Zlib::Deflate\n  def deflate(text)\n    text\n  end\nend\nclass BufferProbe\n  def self.value\n    ChildDeflate.new.deflate(\"sample\")\n  end\nend\n")
+        .run_ruby("raise \"subclass override lost\" unless BufferProbe.value == \"sample\"").assert_passes();
+}
+
+#[test]
+fn a_zlib_override_forwarding_to_super_is_not_qualified() {
+    let (_, errors) = stdlib_app().write("app/models/buffer_probe.rb",
+        "require \"zlib\"\nclass ChildDeflate < Zlib::Deflate\n  def deflate(text)\n    super(text)\n  end\nend\nclass BufferProbe\n  def self.value\n    ChildDeflate.new.deflate(\"sample\")\n  end\nend\n")
+        .emit(roundhouse::project::BuildTarget::Spinel);
+    assert!(errors.iter().any(|e| e.contains("buffered zlib result")), "{errors:?}");
+}
+
+/// message_bus's `Synchronizer`: a class that includes `MonitorMixin`,
+/// calls `super()` to set the monitor up, and answers what its
+/// `synchronize` block does (reentrantly, as Monitor is).
+const MONITOR_MIXIN_SOURCE: &str = r#"require "monitor"
+class MixinCounter
+  include MonitorMixin
+
+  def initialize
+    super()
+    @count = 0
+  end
+
+  def bump
+    synchronize { synchronize { @count += 1 } }
+  end
+
+  def count
+    @count
+  end
+end
+"#;
+
+const MONITOR_MIXIN_SCRIPT: &str = r#"
+c = MixinCounter.new
+got = [c.bump, c.bump]
+raise got.inspect unless got == [1, 2] && c.count == 2
+puts "MonitorMixin execution passed"
+"#;
+
+#[test]
+fn monitor_mixin_executes_after_emission() {
+    let app = || stdlib_app().write("app/services/mixin_counter.rb", MONITOR_MIXIN_SOURCE);
+    let errors = app().check_errors();
+    assert!(errors.is_empty(), "{errors:#?}");
+    app().run_ruby(MONITOR_MIXIN_SCRIPT).assert_passes();
+}
+
+#[test]
+#[ignore = "requires the native Spinel compiler; set SPINEL"]
+fn monitor_mixin_executes_in_native_spinel() {
+    stdlib_app().write("app/services/mixin_counter.rb", MONITOR_MIXIN_SOURCE)
+        .run_spinel(MONITOR_MIXIN_SCRIPT).assert_passes();
+}
+
+/// `ingest::ruby_conditions::CORE_PROBES`: each probe settled at ingest answers so on the tree's Ruby too.
+const CORE_PROBE_SOURCE: &str = r#"class CoreProbe
+  def self.answers
+    [String.method_defined?(:byteindex), IO.method_defined?(:wait_readable), IO.method_defined?(:wait_writable)]
+  end
+end
+"#;
+
+const CORE_PROBE_SCRIPT: &str = r#"
+got = CoreProbe.answers
+raise got.inspect unless got == [true, true, true]
+puts "core probes passed"
+"#;
+
+#[test]
+fn core_feature_probes_answer_as_settled() {
+    stdlib_app().write("app/services/core_probe.rb", CORE_PROBE_SOURCE).run_ruby(CORE_PROBE_SCRIPT).assert_passes();
+}
+
+#[test]
+#[ignore = "requires the native Spinel compiler; set SPINEL"]
+fn core_feature_probes_answer_as_settled_in_native_spinel() {
+    stdlib_app().write("app/services/core_probe.rb", CORE_PROBE_SOURCE).run_spinel(CORE_PROBE_SCRIPT).assert_passes();
+}

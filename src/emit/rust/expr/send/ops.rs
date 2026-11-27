@@ -10,7 +10,7 @@
 
 use crate::expr::{Expr, ExprNode};
 
-use super::super::util::peel_nil;
+use super::super::util::{is_option_ty, peel_nil};
 use super::super::{emit_expr, in_constructor, ivar_field_ty};
 use super::coerce::coerce_arg_for_field_ty;
 
@@ -57,7 +57,11 @@ pub(super) fn try_stdlib_class_method(
     if let ExprNode::Const { path } = &*r.node {
         let last = path.last().map(|s| s.as_str()).unwrap_or("");
         match (last, method, args.len()) {
-            ("Time", "now", 0) => return Some("chrono::Utc::now()".to_string()),
+            ("Time", "now" | "utc", 0)
+                if path.iter().rev().skip(1).all(|s| s.as_str().is_empty()) =>
+            {
+                return Some("chrono::Utc::now()".to_string());
+            }
             ("JSON", "generate" | "dump" | "fast_generate", 1) => {
                 return Some(format!("serde_json::to_string(&{}).unwrap()", emit_expr(&args[0])));
             }
@@ -79,6 +83,21 @@ pub(super) fn try_stdlib_class_method(
                     emit_expr(&args[0])
                 ));
             }
+            // The digest gem's BLAKE3 over the `blake3` crate (declared
+            // in Cargo.toml when a body calls it). The input is hashed
+            // as its UTF-8 bytes, as Ruby hashes a UTF-8 String; the raw
+            // `digest` is bytes, held one char per byte as
+            // `Db::column_binary` holds a `t.binary` value.
+            ("BLAKE3", "digest" | "hexdigest" | "base64digest", 1) if is_digest_blake3(path) => {
+                let hash = format!("blake3::hash(({}).as_bytes())", emit_expr(&args[0]));
+                return Some(match method {
+                    "digest" => format!("{hash}.as_bytes().iter().map(|&b| b as char).collect::<String>()"),
+                    "hexdigest" => format!("{hash}.to_hex().to_string()"),
+                    _ => format!(
+                        "{{ use base64::Engine; base64::engine::general_purpose::STANDARD.encode({hash}.as_bytes()) }}"
+                    ),
+                });
+            }
             _ => {}
         }
     }
@@ -93,7 +112,9 @@ pub(super) fn try_stdlib_class_method(
     if recv_is_time(r) {
         match (method, args.len()) {
             ("utc" | "to_time", 0) => return Some(emit_expr(r)),
-            ("iso8601" | "rfc3339", 0) => return Some(format!("{}.to_rfc3339()", emit_expr(r))),
+            ("rfc3339" | "to_rfc3339", 0) => {
+                return Some(format!("{}.to_rfc3339()", emit_expr(r)))
+            }
             ("rfc2822", 0) => return Some(format!("{}.to_rfc2822()", emit_expr(r))),
             ("strftime", 1) => {
                 return Some(format!(
@@ -106,6 +127,12 @@ pub(super) fn try_stdlib_class_method(
         }
     }
     None
+}
+
+/// `Digest::BLAKE3` or `::Digest::BLAKE3`.
+fn is_digest_blake3(path: &[crate::ident::Symbol]) -> bool {
+    let named: Vec<&str> = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect();
+    named == ["Digest", "BLAKE3"]
 }
 
 /// True when `e` is a Time-valued receiver for the `.utc`/`.iso8601`/…
@@ -124,7 +151,10 @@ fn recv_is_time(e: &Expr) -> bool {
     if let ExprNode::Send { recv: Some(r), method, args, .. } = &*e.node {
         if args.is_empty() {
             if let ExprNode::Const { path } = &*r.node {
-                if path.last().map(|s| s.as_str()) == Some("Time") && method.as_str() == "now" {
+                if path.last().map(|s| s.as_str()) == Some("Time")
+                    && path.iter().rev().skip(1).all(|s| s.as_str().is_empty())
+                    && matches!(method.as_str(), "now" | "utc")
+                {
                     return true;
                 }
             }
@@ -166,8 +196,8 @@ pub(super) fn try_binary_operator(
     }
     // `x == "lit"` where x is a nilable column read: Rust can't compare
     // `Option<String>` with `&str`. Ruby's comparison is against the
-    // value, and nil never equals a string literal, so
-    // `unwrap_or_default()` preserves the answer on both sides.
+    // value, and nil never equals a string literal, not even `""`, so
+    // both sides compare as `Option<&str>`.
     if matches!(method, "==" | "!=") {
         let is_str_lit = |e: &Expr| {
             matches!(&*e.node, ExprNode::Lit { value: crate::expr::Literal::Str { .. } })
@@ -183,16 +213,31 @@ pub(super) fn try_binary_operator(
         if is_nilable_str(r) && is_str_lit(&args[0]) {
             let lhs = super::super::wrap_if_needs_parens(r, emit_expr(r));
             return Some(format!(
-                "{lhs}.clone().unwrap_or_default() {method} {}",
+                "{lhs}.as_deref() {method} Some({})",
                 emit_expr(&args[0])
             ));
         }
         if is_str_lit(r) && is_nilable_str(&args[0]) {
+            let rhs = super::super::wrap_if_needs_parens(&args[0], emit_expr(&args[0]));
+            return Some(format!("Some({}) {method} {rhs}.as_deref()", emit_expr(r)));
+        }
+        // The same against any String value (`assert_equal digest,
+        // record.nullable_column`): borrowed, so neither side moves. The
+        // nilable side only as a reader call (`record.column`), which is
+        // `Option<String>` here; an element of a `String?` array is a
+        // bare `String` in this target.
+        let is_str = |e: &Expr| matches!(e.ty.as_ref(), Some(crate::ty::Ty::Str));
+        let is_nilable_reader = |e: &Expr| {
+            is_nilable_str(e)
+                && matches!(&*e.node, ExprNode::Send { recv: Some(_), args, block: None, .. } if args.is_empty())
+        };
+        if is_nilable_reader(r) && is_str(&args[0]) {
             let lhs = super::super::wrap_if_needs_parens(r, emit_expr(r));
-            return Some(format!(
-                "{lhs} {method} {}.clone().unwrap_or_default()",
-                emit_expr(&args[0])
-            ));
+            return Some(format!("{lhs}.as_deref() {method} Some(&*({}))", emit_expr(&args[0])));
+        }
+        if is_str(r) && is_nilable_reader(&args[0]) {
+            let rhs = super::super::wrap_if_needs_parens(&args[0], emit_expr(&args[0]));
+            return Some(format!("Some(&*({})) {method} {rhs}.as_deref()", emit_expr(r)));
         }
     }
     // Int / Int and Int % Int floor in Ruby; Rust's operators truncate.
@@ -259,9 +304,143 @@ pub(super) fn try_binary_operator(
         // turbofish (`i64<y, …>`). Decide pass stamps the bit;
         // `wrap_if_needs_parens` adds the paren only where needed.
         let lhs = super::super::wrap_if_needs_parens(r, emit_expr(r));
+        if let Some(cmp) = numeric_cmp(method, r, &lhs, &args[0]) {
+            return Some(cmp);
+        }
+        // Not the bare operands: Rust orders a String against a String or a &str against a &str, never one against the other
+        let stringish = |e: &Expr| e.ty.as_ref().is_some_and(|t| matches!(super::super::util::peel_nil(t), crate::ty::Ty::Str | crate::ty::Ty::Sym));
+        if matches!(method, "<" | ">" | "<=" | ">=") && stringish(r) && stringish(&args[0]) {
+            return Some(format!("(&*({lhs})) {method} (&*({}))", emit_expr(&args[0])));
+        }
         return Some(format!("{} {} {}", lhs, method, emit_expr(&args[0])));
     }
     None
+}
+
+/// Column slots are `Option<i64>` / `Option<f64>`. A bound literal is
+/// often the other numeric type (`@price <= 0.0`). Ordered comparisons
+/// unwrap so the check type-checks; the numericality `if` guards nil
+/// before those runs. Equality does not unwrap: `nil == n` is false.
+fn numeric_cmp(method: &str, lhs: &Expr, lhs_s: &str, rhs: &Expr) -> Option<String> {
+    if !matches!(method, "==" | "!=" | "<" | ">" | "<=" | ">=") {
+        return None;
+    }
+    let (lk, lo) = numeric_kind(lhs)?;
+    let (rk, ro) = numeric_kind(rhs)?;
+    // `Option<i64> == Option<i64>` already type-checks. Unwrap only
+    // when one side is a bare number or the numeric kinds differ.
+    if lk == rk && lo == ro {
+        return None;
+    }
+    let as_float = lk == NumKind::Float || rk == NumKind::Float;
+    let rhs_s = emit_expr(rhs);
+    // `nil == 5` is false and `nil != 5` is true. Unwrapping the
+    // Option panics on the absent column.
+    if matches!(method, "==" | "!=") {
+        return Some(numeric_equality(method, lhs_s, lk, lo, &rhs_s, rk, ro, as_float));
+    }
+    let side = |rendered: &str, kind: NumKind, optional: bool| {
+        let base = if optional {
+            format!("({rendered}).clone().unwrap()")
+        } else {
+            rendered.to_string()
+        };
+        promote(&base, kind, as_float)
+    };
+    Some(format!(
+        "{} {} {}",
+        side(lhs_s, lk, lo),
+        method,
+        side(&rhs_s, rk, ro)
+    ))
+}
+
+fn promote(rendered: &str, kind: NumKind, as_float: bool) -> String {
+    if as_float && kind == NumKind::Int {
+        format!("({rendered} as f64)")
+    } else {
+        rendered.to_string()
+    }
+}
+
+/// Equality against an `Option` column. `None` matches only `None`.
+fn numeric_equality(
+    method: &str,
+    lhs_s: &str,
+    lk: NumKind,
+    lo: bool,
+    rhs_s: &str,
+    rk: NumKind,
+    ro: bool,
+    as_float: bool,
+) -> String {
+    let on_none = if method == "==" { "false" } else { "true" };
+    match (lo, ro) {
+        (false, false) => format!(
+            "{} {} {}",
+            promote(lhs_s, lk, as_float),
+            method,
+            promote(rhs_s, rk, as_float)
+        ),
+        (true, false) => format!(
+            "{{ match ({lhs_s}).clone() {{ Some(__v) => {} {method} {}, None => {on_none} }} }}",
+            promote("__v", lk, as_float),
+            promote(rhs_s, rk, as_float)
+        ),
+        (false, true) => format!(
+            "{{ match ({rhs_s}).clone() {{ Some(__v) => {} {method} {}, None => {on_none} }} }}",
+            promote(lhs_s, lk, as_float),
+            promote("__v", rk, as_float)
+        ),
+        (true, true) => format!(
+            "{{ match (({lhs_s}).clone(), ({rhs_s}).clone()) {{ \
+             (Some(__a), Some(__b)) => {} {method} {}, \
+             (None, None) => {}, \
+             _ => {on_none} }} }}",
+            promote("__a", lk, as_float),
+            promote("__b", rk, as_float),
+            method == "=="
+        ),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum NumKind {
+    Int,
+    Float,
+}
+
+fn numeric_kind(expr: &Expr) -> Option<(NumKind, bool)> {
+    use crate::expr::Literal;
+    use crate::ty::Ty;
+    if let ExprNode::Lit { value } = &*expr.node {
+        return match value {
+            Literal::Int { .. } => Some((NumKind::Int, false)),
+            Literal::Float { .. } => Some((NumKind::Float, false)),
+            _ => None,
+        };
+    }
+    // Only a column slot is emitted as `Option<T>`. An index read is
+    // typed `T | nil` and rendered as `T`, so unwrapping it does not
+    // type-check.
+    if let ExprNode::Ivar { name } = &*expr.node {
+        let ty = ivar_field_ty(name.as_str())?;
+        let optional = is_option_ty(&ty);
+        return match peel_nil(&ty) {
+            Ty::Int => Some((NumKind::Int, optional)),
+            Ty::Float => Some((NumKind::Float, optional)),
+            _ => None,
+        };
+    }
+    let ty = expr.ty.clone()?;
+    if is_option_ty(&ty) {
+        return None;
+    }
+    match peel_nil(&ty) {
+        Ty::Int => Some((NumKind::Int, false)),
+        Ty::Float => Some((NumKind::Float, false)),
+        _ => None,
+    }
 }
 
 /// Unary `!` — `!cond` in Ruby lowers as `Send { recv: cond, method:

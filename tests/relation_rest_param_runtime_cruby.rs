@@ -9,6 +9,10 @@
 //! Skips when `ruby` with the sqlite3 gem is not on the machine; the CI
 //! core job has it.
 
+#[path = "support/prerequisite.rs"]
+mod prerequisite;
+#[path = "support/scratch.rs"]
+mod scratch;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -17,8 +21,7 @@ use roundhouse::ingest::ingest_app;
 use roundhouse::project::BuildTarget;
 
 fn tree() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("roundhouse-rel-rest-runtime-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = scratch::dir("roundhouse-rel-rest-runtime");
     for (path, body) in [
         (
             "db/schema.rb",
@@ -98,7 +101,7 @@ end
 #[test]
 fn direct_zero_arg_splat_and_chained_calls_answer_like_rails() {
     if !Command::new("ruby").args(["-rsqlite3", "-e", "1"]).status().is_ok_and(|s| s.success()) {
-        eprintln!("skipping: ruby with the sqlite3 gem not available");
+        prerequisite::missing("ruby with the sqlite3 gem not available");
         return;
     }
     let out = tree();

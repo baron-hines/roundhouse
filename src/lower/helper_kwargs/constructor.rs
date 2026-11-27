@@ -3,14 +3,16 @@
 //! This pass has stricter semantic constraints: moving keywords must preserve
 //! Ruby evaluation order and defaults must retain their lexical meaning.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::app::App;
 use crate::expr::{Expr, ExprNode, Literal};
 use crate::ident::Symbol;
 
 use super::{Slot, slot_of};
+use super::owned::{Defined, OwnerIndex, Side};
 
+use crate::ingest::prism_api::PrismLocation;
 pub(super) struct InstanceCallParams {
     pub(super) slots: HashMap<(String, Symbol), Vec<Slot>>,
     pub(super) custom_new_slots: HashMap<(String, Symbol), Vec<Slot>>,
@@ -20,6 +22,12 @@ pub(super) struct InstanceCallParams {
     unqualified_class_ids: HashMap<String, String>,
     ambiguous_names: HashSet<String>,
     model_names: HashSet<String>,
+    /// The owner-relative walk's ancestor/module-aware lookup, reused
+    /// here to tell "this union member doesn't define the method at
+    /// all" apart from "defines it, but not with flattened keyword
+    /// slots" when narrowing a nilable receiver's union — `params.slots`
+    /// alone cannot tell those apart (see `resolve_instance_receiver_class`).
+    owner_index: OwnerIndex,
 }
 
 impl InstanceCallParams {
@@ -31,7 +39,7 @@ impl InstanceCallParams {
         >,
         names: &super::super::forwarding::ConstructorNames,
     ) -> Self {
-        let mut slots: HashMap<(String, Symbol), Vec<Slot>> = HashMap::new();
+        let mut slots: HashMap<(String, Symbol), Vec<Slot>> = HashMap::default();
         for class in &app.library_classes {
             for method in &class.methods {
                 if method.receiver != crate::dialect::MethodReceiver::Instance {
@@ -59,7 +67,7 @@ impl InstanceCallParams {
         // receiver types as `Message`. With several includers the
         // receiver still names one, but which module's definition wins
         // is the includer's ancestry, so those are left alone.
-        let mut defined: HashSet<(String, Symbol)> = HashSet::new();
+        let mut defined: HashSet<(String, Symbol)> = HashSet::default();
         for model in &app.models {
             for method in model.methods() {
                 if method.receiver != crate::dialect::MethodReceiver::Instance {
@@ -91,9 +99,9 @@ impl InstanceCallParams {
             }
         }
 
-        let mut custom_new = HashSet::new();
-        let mut custom_new_slots = HashMap::new();
-        let mut unknown_new = HashSet::new();
+        let mut custom_new = HashSet::default();
+        let mut custom_new_slots = HashMap::default();
+        let mut unknown_new = HashSet::default();
         let unqualified_class_ids = names.unqualified_class_ids.clone();
         for (class_id, contract) in constructors {
             add_constructor_slots(
@@ -105,6 +113,12 @@ impl InstanceCallParams {
                 &mut unknown_new,
             );
         }
+        // Not a core container's subclass where the tree keeps keywords (the Ruby family): its `new` is the container's,
+        // which no lowering rewrites, so the call written as the source's reaches what Ruby looks up as it runs
+        // (OmniAuth's `AuthHash.new(:provider => name)`, a Hash subclass whose modules hook `included`).
+        if app.native_library_keywords {
+            unknown_new.retain(|class| !descends_from_core_container(app, class));
+        }
         Self {
             slots,
             custom_new_slots,
@@ -114,6 +128,7 @@ impl InstanceCallParams {
             unqualified_class_ids,
             ambiguous_names: names.ambiguous_names.clone(),
             model_names: names.model_names.clone(),
+            owner_index: OwnerIndex::new(app),
         }
     }
 }
@@ -230,7 +245,7 @@ pub(super) fn lexical_refinement_calls(app: &App) -> HashSet<crate::span::Span> 
         }
     }
 
-    let mut spans = HashSet::new();
+    let mut spans = HashSet::default();
     for class in &app.library_classes {
         let refinements = refinements_for(class.name.0.as_str(), &activations);
         if !refinements.is_empty() {
@@ -271,6 +286,32 @@ pub(super) fn lexical_refinement_calls(app: &App) -> HashSet<crate::span::Span> 
         }
     }
     spans
+}
+
+fn descends_from_core_container(app: &App, class: &str) -> bool {
+    let mut current = class.to_string();
+    for _ in 0..32 {
+        let Some(parent) = app.library_classes.iter().filter(|c| !c.is_module && c.name.0.as_str() == current).find_map(|c| c.parent.clone()) else {
+            return false;
+        };
+        let rooted = parent.0.as_str().starts_with("::");
+        let written = parent.0.as_str().trim_start_matches("::").to_string();
+        if rooted && matches!(written.as_str(), "Hash" | "Array" | "String") && !app.library_classes.iter().any(|c| c.name.0.as_str() == written) {
+            return true;
+        }
+        // The parent as Ruby's lexical lookup would find it from the class's namespace, else as written: an app's
+        // `A::Hash` before the core one.
+        let scope: Vec<&str> = current.split("::").collect();
+        let resolved = (0..scope.len())
+            .rev()
+            .map(|depth| if depth == 0 { written.clone() } else { format!("{}::{written}", scope[..depth].join("::")) })
+            .find(|candidate| *candidate != current && app.library_classes.iter().any(|c| !c.is_module && c.name.0.as_str() == candidate));
+        match resolved {
+            Some(next) => current = next,
+            None => return matches!(written.as_str(), "Hash" | "Array" | "String"),
+        }
+    }
+    false
 }
 
 fn add_constructor_slots(
@@ -346,9 +387,9 @@ pub(super) fn refuse_keyword_splats(
         .get(id.0.as_str())
         .map_or(id.0.as_str(), String::as_str);
     if let Some(reason) =
-        constructor_refusal_reason(params, expr.span, id.0.as_str(), class_name, args)
+        constructor_refusal_reason(params, expr.span, resolved_class_ref(recv), id.0.as_str(), class_name, args)
     {
-        refuse_constructor(expr.span, &mut expr.diagnostic, reason, diagnostics);
+        refuse_constructor(expr.span, crate::expr::ExprCold::diagnostic_mut(&mut expr.cold), reason, diagnostics);
     }
 }
 
@@ -360,13 +401,162 @@ pub(super) fn rewrite_instance_call_node(
     rewrite_instance_call(expr, params, diagnostics);
 }
 
+/// What `resolve_instance_receiver_class` found for a non-constructor
+/// instance call's receiver type.
+enum ClassResolution {
+    /// No candidate class defines this method with flattened keyword
+    /// slots (including an untyped/non-class remainder after dropping
+    /// `Nil`): nothing for this pass to rewrite.
+    None,
+    /// Exactly one class remains after dropping `Nil`, or several
+    /// remain whose flattened slots for this method are identical —
+    /// either way the keywords land in the same positions whichever
+    /// branch runs at runtime.
+    One(String),
+    /// Several classes remain that disagree about this method: either
+    /// their flattened slots differ, or one of them defines the method
+    /// without a flattened keyword ABI at all (real keywords, `rest`,
+    /// forwarding, or no keywords — already binding correctly as
+    /// written). No one respelling is right for every branch, so the
+    /// call is left exactly as written — the dynamic path, with no
+    /// diagnostic, the same as before this fix existed and the same as
+    /// the general untyped-receiver gap.
+    Mismatch,
+}
+
+/// Resolve the library class a non-constructor instance call's receiver
+/// may be, after dropping `Nil` from a nilable union. `Array#first`,
+/// `find_by`, and an `[]` read all type the receiver
+/// `Ty::Union { [Class, Nil] }` — the analyzer knows the class, the
+/// receiver just isn't pinned to it the way a plain `Ty::Class` is. A
+/// wider union of several classes is handled too, as long as they agree
+/// on this method's slot shape; anything else (an `Untyped`/`Var` arm,
+/// a non-class type) returns `None`, leaving that gap exactly as it was.
+///
+/// A union member with no entry in `params.slots` is NOT assumed to
+/// skip the method: `params.slots` only ever holds flattened keyword
+/// ABIs, so a class that defines the method with real keywords, `rest`,
+/// forwarding, or a plain positional parameter (`def deliver(opts)`,
+/// which already binds the caller's keyword Hash correctly as written)
+/// looks identical to a class that doesn't define the method at all.
+/// Respelling the call for another branch would silently change that
+/// one's binding. `OwnerIndex::defines` — the same ancestor/module-aware
+/// lookup the owner-relative walk uses — tells the two apart: truly
+/// missing is skipped (that branch's dispatch never reaches the method,
+/// so it raises `NoMethodError` regardless of this rewrite), while
+/// "defined but not flattened" is a `Mismatch` — left exactly as
+/// written, the dynamic path, with no diagnostic (see `ClassResolution`).
+fn resolve_instance_receiver_class(
+    ty: &crate::ty::Ty,
+    params: &InstanceCallParams,
+    method: &Symbol,
+) -> ClassResolution {
+    let stripped = ty.clone().strip_nil();
+    match &stripped {
+        // A single class is unambiguous — there is no other branch to
+        // agree or disagree with — so this is exactly the plain typed
+        // receiver case #814 already handled: a miss in `params.slots`
+        // means nothing to rewrite, not a refusal. The ancestor-aware
+        // `Mismatch` check below only makes sense across several
+        // candidates, so it does not apply here (it would otherwise
+        // turn every ordinary, non-keyword method call on a typed
+        // instance — an `attr_reader`, `b.add(...).rows` below — into a
+        // spurious refusal, since `OwnerIndex::defines` resolves nearly
+        // every real method name as "defined, not flattened").
+        crate::ty::Ty::Class { id, .. } => {
+            let class_id = id.0.as_str().to_string();
+            match params.slots.get(&(class_id.clone(), method.clone())) {
+                Some(_) => ClassResolution::One(class_id),
+                None => ClassResolution::None,
+            }
+        }
+        crate::ty::Ty::Union { variants } => {
+            let mut class_ids = Vec::with_capacity(variants.len());
+            for variant in variants.iter() {
+                let crate::ty::Ty::Class { id, .. } = variant else {
+                    return ClassResolution::None;
+                };
+                class_ids.push(id.0.as_str().to_string());
+            }
+            let mut representative: Option<(&str, &Vec<Slot>)> = None;
+            for class_id in &class_ids {
+                let slots = match params.slots.get(&(class_id.clone(), method.clone())) {
+                    Some(slots) => slots,
+                    // `params.slots` only keys each class's OWN direct
+                    // definitions; fall back to the ancestor/module-aware
+                    // lookup for one reached only through inheritance or
+                    // an included module (e.g. a subclass that doesn't
+                    // override the method at all).
+                    None => match params.owner_index.defines(class_id, Side::Instance, method) {
+                        Defined::Missing => {
+                            // This branch of the union doesn't define
+                            // the method at all: calling it raises
+                            // `NoMethodError` regardless of this
+                            // rewrite, so it doesn't constrain the
+                            // respelling.
+                            continue;
+                        }
+                        Defined::Flattened(slots) => slots,
+                        Defined::Unflattened | Defined::Ambiguous => {
+                            // Defined, but without a flattened keyword
+                            // ABI this call site could respell to (real
+                            // keywords, rest, forwarding, no keywords at
+                            // all — already binds correctly as written),
+                            // or the lookup itself is ambiguous.
+                            // Rewriting the call for another branch
+                            // would silently change this one's binding,
+                            // so this is a `Mismatch` — left dynamic,
+                            // not guessed at.
+                            return ClassResolution::Mismatch;
+                        }
+                    },
+                };
+                match representative {
+                    None => representative = Some((class_id.as_str(), slots)),
+                    Some((_, rep_slots)) if !slots_match_shape(rep_slots, slots) => {
+                        // Two members flatten this method differently:
+                        // same reasoning, same `Mismatch`.
+                        return ClassResolution::Mismatch;
+                    }
+                    Some(_) => {}
+                }
+            }
+            match representative {
+                Some((id, _)) => ClassResolution::One(id.to_string()),
+                None => ClassResolution::None,
+            }
+        }
+        _ => ClassResolution::None,
+    }
+}
+
+/// Whether two classes' flattened slots for the same method name agree
+/// on shape: same slot count, same names in the same order, the same
+/// keyword/kwrest origin per slot, and structurally equal defaults
+/// (defaults are spliced into gaps the caller left unnamed, so a
+/// mismatched default would change behavior depending on which branch
+/// actually runs).
+fn slots_match_shape(a: &[Slot], b: &[Slot]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b.iter()).all(|(x, y)| {
+            x.name == y.name
+                && x.from_keyword == y.from_keyword
+                && x.from_kwrest == y.from_kwrest
+                && match (&x.default, &y.default) {
+                    (None, None) => true,
+                    (Some(dx), Some(dy)) => dx.node == dy.node,
+                    _ => false,
+                }
+        })
+}
+
 fn rewrite_instance_call(
     expr: &mut Expr,
     params: &InstanceCallParams,
     diagnostics: &mut Vec<crate::diagnostic::Diagnostic>,
 ) {
     if matches!(
-        &expr.diagnostic,
+        &expr.diagnostic(),
         Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, .. })
             if construct.as_str() == crate::diagnostic::CONSTRUCTOR_KEYWORD_ARGUMENTS
     ) {
@@ -388,30 +578,55 @@ fn rewrite_instance_call(
     else {
         return;
     };
-    let Some(crate::ty::Ty::Class { id, .. }) = &recv.ty else {
-        return;
-    };
     let is_constructor = method.as_str() == "new" && matches!(&*recv.node, ExprNode::Const { .. });
-    let class_id = if is_constructor {
-        params
+    let owned_class_id: String;
+    let class_id: &str = if is_constructor {
+        let Some(crate::ty::Ty::Class { id, .. }) = &recv.ty else {
+            return;
+        };
+        let class_id = params
             .unqualified_class_ids
             .get(id.0.as_str())
-            .map_or(id.0.as_str(), String::as_str)
-    } else {
-        id.0.as_str()
-    };
-    if is_constructor
-        && let Some(reason) =
-            constructor_refusal_reason(params, expr.span, id.0.as_str(), class_id, args)
-    {
-        refuse_constructor(expr.span, &mut expr.diagnostic, reason, diagnostics);
-        return;
-    }
-    if is_constructor {
+            .map_or(id.0.as_str(), String::as_str);
+        if let Some(reason) =
+            constructor_refusal_reason(params, expr.span, resolved_class_ref(recv), id.0.as_str(), class_id, args)
+        {
+            refuse_constructor(expr.span, crate::expr::ExprCold::diagnostic_mut(&mut expr.cold), reason, diagnostics);
+            return;
+        }
         if params.custom_new.contains(class_id) {
             return;
         }
-    }
+        class_id
+    } else {
+        // A receiver whose type isn't a single `Ty::Class` is usually
+        // untyped (out of scope here), but `Array#first`, `find_by` and
+        // an `[]` read type it `Ty::Union { [Class, Nil] }`: the
+        // analyzer knows the class(es), the call just isn't pinned to
+        // one. Strip `Nil` and respell against what's left when that's
+        // unambiguous; a call on the dropped `nil` branch would raise
+        // `NoMethodError` either way, so narrowing it away doesn't
+        // change that call's behavior.
+        let Some(ty) = &recv.ty else { return };
+        match resolve_instance_receiver_class(ty, params, method) {
+            ClassResolution::None => return,
+            ClassResolution::One(id) => {
+                owned_class_id = id;
+                owned_class_id.as_str()
+            }
+            // Several classes disagree about this method (different
+            // flattened shapes, or one of them isn't flattened at all):
+            // no one respelling is right for every branch. Per #959's
+            // CodeRabbit review, this keeps the DYNAMIC path — the call
+            // is left exactly as written, with no diagnostic — the same
+            // as the general untyped-receiver gap and as every union
+            // receiver before this fix existed. A hard refusal here
+            // regressed `critic_corrections_preserve_class_objects_
+            // reflection_and_operators`, which passes on main precisely
+            // because its mismatched union fell through silently.
+            ClassResolution::Mismatch => return,
+        }
+    };
     if !is_constructor && super::SEND_METHODS.contains(&method.as_str()) {
         let class_id = class_id.to_string();
         super::owned::refuse_send(
@@ -434,7 +649,7 @@ fn rewrite_instance_call(
         if respell_constructor(args, slots).is_err() {
             refuse_constructor(
                 expr.span,
-                &mut expr.diagnostic,
+                crate::expr::ExprCold::diagnostic_mut(&mut expr.cold),
                 "cannot safely move these keywords into initialize's positional slots without changing Ruby argument binding or evaluation semantics",
                 diagnostics,
             );
@@ -477,7 +692,7 @@ pub(super) fn rewrite_custom_new_call(
     if respell_constructor(args, slots).is_err() {
         refuse_constructor(
             expr.span,
-            &mut expr.diagnostic,
+            crate::expr::ExprCold::diagnostic_mut(&mut expr.cold),
             "cannot safely move these keywords into custom `new` positional slots without changing Ruby argument binding or evaluation semantics",
             diagnostics,
         );
@@ -496,9 +711,20 @@ fn has_keyword_arguments(args: &[Expr]) -> bool {
     })
 }
 
+/// The analyzer's constant resolution answered this receiver: the
+/// reference resolved, by Ruby's lexical lookup, to the class its type
+/// names (`analyze::body`, `RESOLVED_CLASS_REF`). A type that only fell
+/// back to the written name carries no such answer. A root-qualified
+/// `::Name` needs none: Ruby looks it up at the top level only.
+fn resolved_class_ref(recv: &Expr) -> bool {
+    recv.decisions & crate::expr::RESOLVED_CLASS_REF != 0
+        || matches!(&*recv.node, ExprNode::Const { path } if path.len() > 1 && path[0].as_str().is_empty())
+}
+
 fn constructor_refusal_reason(
     params: &InstanceCallParams,
     span: crate::span::Span,
+    resolved: bool,
     unqualified_name: &str,
     class_name: &str,
     args: &[Expr],
@@ -506,7 +732,15 @@ fn constructor_refusal_reason(
     if !has_keyword_arguments(args) {
         return None;
     }
-    if params.ambiguous_names.contains(unqualified_name) && !params.model_names.contains(class_name)
+    // A leaf name two classes share (`Request`, `Fasp::Request`) is
+    // ambiguous as written. A reference the analyzer resolved is not: its
+    // type is the class Ruby's lexical lookup reaches, so a top-level
+    // `Request` outside `module Fasp` (including `class Fasp::Compact`,
+    // whose lexical scope is not `Fasp`) is the top-level class, and one
+    // inside it was already qualified to `Fasp::Request`.
+    if params.ambiguous_names.contains(unqualified_name)
+        && !resolved
+        && !params.model_names.contains(class_name)
     {
         return Some(
             "cannot verify constructor lookup because this unqualified class name is ambiguous",
@@ -589,7 +823,7 @@ fn respell_constructor(args: &mut Vec<Expr>, slots: &[Slot]) -> Result<(), ()> {
     }
 
     let mut supplied = Vec::with_capacity(entries.len());
-    let mut positions = HashSet::new();
+    let mut positions = HashSet::default();
     let mut previous_pos = None;
     for (key, value) in entries {
         let ExprNode::Lit {

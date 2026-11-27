@@ -43,7 +43,7 @@ pub(super) fn emit_form_builder_inline(
     ctx: &ViewCtx,
 ) -> Vec<Expr> {
     let (positional, opts) = split_args(args);
-    match kind {
+    let out = match kind {
         FormBuilderMethod::Label => emit_label(
             positional.first().copied(),
             positional.get(1).copied(),
@@ -143,7 +143,70 @@ pub(super) fn emit_form_builder_inline(
             binding,
             ctx,
         ),
+        FormBuilderMethod::NumberField
+        | FormBuilderMethod::RangeField
+        | FormBuilderMethod::SearchField
+        | FormBuilderMethod::TelephoneField => emit_typed_input_field(
+            match kind {
+                FormBuilderMethod::NumberField => "number",
+                FormBuilderMethod::RangeField => "range",
+                FormBuilderMethod::SearchField => "search",
+                _ => "tel",
+            },
+            positional.first().copied(),
+            opts.as_slice(),
+            binding,
+            ctx,
+        ),
+        FormBuilderMethod::ColorField => {
+            emit_color_field(positional.first().copied(), opts.as_slice(), binding, ctx)
+        }
+        FormBuilderMethod::DatetimeLocalField => {
+            emit_datetime_local_field(positional.first().copied(), opts.as_slice(), binding, ctx)
+        }
+    };
+    wrap_field_errors(out, kind, positional.first().copied(), binding, ctx)
+}
+
+/// Rails' default `field_error_proc`: a control whose field has errors
+/// renders inside `<div class="field_with_errors">`, decided per render.
+fn wrap_field_errors(
+    mut out: Vec<Expr>,
+    kind: FormBuilderMethod,
+    field: Option<&Expr>,
+    binding: &FormBuilderBinding,
+    ctx: &ViewCtx,
+) -> Vec<Expr> {
+    if !kind.wraps_field_errors() || !binding.metadata_class(ctx).is_some_and(|class| ctx.i18n.has_errors_for(class)) || ctx.i18n.field_error_proc().is_some() {
+        return out;
     }
+    let Some(field_sym) = field_symbol(field) else { return out };
+    // The check box's unchecked-value companion stays outside the wrapper, as Rails renders it
+    let first = usize::from(kind == FormBuilderMethod::CheckBox && out.len() > 1);
+    // Not a leading underscore: Elixir warns on reading such a variable, and its lanes treat warnings as errors
+    let flag = Symbol::from(format!("rh_{}_{}_errors", binding.form_param, field_sym.as_str()));
+    let record = Expr::new(Span::synthetic(), ExprNode::Var { id: VarId(0), name: binding.record_var.clone() });
+    let has_errors = Expr::new(
+        Span::synthetic(),
+        ExprNode::Assign {
+            target: crate::expr::LValue::Var { id: VarId(0), name: flag.clone() },
+            value: crate::lower::errors_index::has_errors_on(Some(record), field_sym.as_str(), Span::synthetic()),
+        },
+    );
+    let when_errors = |text: &str| {
+        Expr::new(
+            Span::synthetic(),
+            ExprNode::If {
+                cond: Expr::new(Span::synthetic(), ExprNode::Var { id: VarId(0), name: flag.clone() }),
+                then_branch: accumulator_append_call(lit_str(text.to_string()), ctx),
+                else_branch: super::nil_lit(),
+            },
+        )
+    };
+    out.insert(first, when_errors("<div class=\"field_with_errors\">"));
+    out.insert(first, has_errors);
+    out.push(when_errors("</div>"));
+    out
 }
 
 /// `<input name="user[f]" type="hidden" value="0" autocomplete="off">
@@ -162,15 +225,15 @@ fn emit_check_box(
     };
     let model_name = &binding.model_name;
     let field_str = field_sym.as_str();
+    // The unchecked-value companion carries no `autocomplete`
+    // attribute — Rails renders exactly
+    // `<input name="user[f]" type="hidden" value="0">`.
+    let autocomplete = if ctx.hidden_autocomplete { " autocomplete=\"off\"" } else { "" };
+    let hidden = lit_str(format!("<input name=\"{model_name}[{field_str}]\" type=\"hidden\" value=\"0\"{autocomplete}>"));
     let mut parts: Vec<InterpPart> = Vec::new();
     parts.push(InterpPart::Text {
         value: format!(
-            // The unchecked-value companion carries no `autocomplete`
-            // attribute — Rails renders exactly
-            // `<input name="user[f]" type="hidden" value="0">`.
-            "<input name=\"{mn}[{f}]\" type=\"hidden\" value=\"0\"><input type=\"checkbox\" value=\"1\"{nid}",
-            mn = model_name,
-            f = field_str,
+            "<input type=\"checkbox\" value=\"1\"{nid}",
             nid = name_id_attrs_for(binding, field_str, opts),
         ),
     });
@@ -189,7 +252,7 @@ fn emit_check_box(
     let checked = lit_str(" checked=\"checked\"".to_string());
     let is_bool_reader = ctx
         .bool_readers
-        .get(model_name.as_str())
+        .get(binding.metadata_class(ctx).unwrap_or(""))
         .is_some_and(|s| s.contains(field_str));
     let checked_expr = if is_bool_reader {
         let record_ref = Expr::new(
@@ -237,7 +300,7 @@ fn emit_check_box(
     parts.push(InterpPart::Expr { expr: checked_expr });
     append_attr_parts(&mut parts, opts);
     parts.push(InterpPart::Text { value: ">".to_string() });
-    vec![accumulator_append_call(string_interp(parts), ctx)]
+    vec![accumulator_append_call(hidden, ctx), accumulator_append_call(string_interp(parts), ctx)]
 }
 
 /// `<input type="radio" value="V"[ checked] name="user[f]" id="user_f_v">`
@@ -495,27 +558,22 @@ fn emit_select_options(
                 map_loop_options(&container, selected.as_ref(), multiple, field_str, blank, ctx)?;
             Some((setup, loop_var))
         }
+        // `collect`, its alias: the pairs as `map`'s. A block answering one
+        // value per element runs as written under the scalar loop below,
+        // whatever its parameters; pairs the map loop can't inline go to
+        // the general fallback.
+        ExprNode::Send { method, block: Some(block), .. } if method.as_str() == "collect" => {
+            if let Some(found) = map_loop_options(&container, selected.as_ref(), multiple, field_str, blank.clone(), ctx) {
+                return Some(found);
+            }
+            if block_answers_array(block) {
+                return None;
+            }
+            Some(scalar_select_loop(&container, selected.as_ref(), multiple, field_str, blank, ctx))
+        }
         // Any other container expr — flat scalar loop (the corpus:
         // `@moderators`, `Category.pluck(:category)` — plain strings).
-        _ => {
-            let el = Symbol::from("_choice");
-            let el_ref = Expr::new(
-                Span::synthetic(),
-                ExprNode::Var { id: VarId(0), name: el.clone() },
-            );
-            let mut option = Vec::new();
-            push_dynamic_option(
-                &mut option,
-                to_s(el_ref.clone()),
-                to_s(el_ref),
-                &[],
-                selected.as_ref(),
-                multiple,
-            );
-            let (setup, var) =
-                each_loop(&container, el, string_interp(option), field_str, blank, ctx);
-            Some((setup, var))
-        }
+        _ => Some(scalar_select_loop(&container, selected.as_ref(), multiple, field_str, blank, ctx)),
     }
 }
 
@@ -661,7 +719,48 @@ fn collection_options(
     Some((setup, var))
 }
 
-/// `<coll>.map { |x| [text, value] / [text, {attrs}, value] }` — loop
+/// Whether a block's last expression is an array literal (`[text, value]`).
+fn block_answers_array(block: &Expr) -> bool {
+    let ExprNode::Lambda { body, .. } = &*block.node else { return false };
+    let last = match &*body.node {
+        ExprNode::Seq { exprs } => exprs.last(),
+        _ => Some(body),
+    };
+    last.is_some_and(|e| matches!(&*e.node, ExprNode::Array { .. }))
+}
+
+/// Whether `e` holds a `next` or `break` for the block it sits in (nested
+/// blocks keep their own).
+fn exits_block(e: &Expr) -> bool {
+    match &*e.node {
+        ExprNode::Next { .. } | ExprNode::Break { .. } => true,
+        ExprNode::Lambda { .. } => false,
+        node => {
+            let mut found = false;
+            node.for_each_child(&mut |child| found |= exits_block(child));
+            found
+        }
+    }
+}
+
+/// One `<option>` per element of `container`, its `to_s` as text and value.
+fn scalar_select_loop(
+    container: &Expr,
+    selected: Option<&Expr>,
+    multiple: bool,
+    field_str: &str,
+    blank: Vec<InterpPart>,
+    ctx: &ViewCtx,
+) -> (Vec<Expr>, Expr) {
+    let el = Symbol::from("_choice");
+    let el_ref = Expr::new(Span::synthetic(), ExprNode::Var { id: VarId(0), name: el.clone() });
+    let mut option = Vec::new();
+    push_dynamic_option(&mut option, to_s(el_ref.clone()), to_s(el_ref), &[], selected, multiple);
+    each_loop(container, el, string_interp(option), field_str, blank, ctx)
+}
+
+/// `<coll>.map { |x| [text, value] / [text, {attrs}, value] }` (or
+/// `collect`) — loop
 /// over the map SOURCE with the lambda's element exprs inlined (the
 /// loop rebinds the lambda's own param name, so the exprs read it
 /// directly).
@@ -677,11 +776,17 @@ fn map_loop_options(
     else {
         return None;
     };
-    if method.as_str() != "map" {
+    if !matches!(method.as_str(), "map" | "collect") {
         return None;
     }
-    let ExprNode::Lambda { extra_params, params, body, .. } = &*block.node else { return None };
-    if !extra_params.is_empty() {
+    let ExprNode::Lambda { extra_params, params, rest_param, body, .. } = &*block.node else { return None };
+    // One element parameter: the loop binds only that one.
+    if !extra_params.is_empty() || rest_param.is_some() || params.len() != 1 {
+        return None;
+    }
+    // The loop appends one option per element, so a `next` or `break`
+    // answering the block's value would skip it instead.
+    if exits_block(body) {
         return None;
     }
     let el = params.first().cloned()?;
@@ -1137,11 +1242,11 @@ pub(super) fn emit_form_builder_block_inline(
             Some(out)
         }
         FormBuilderMethod::FieldsFor => {
-            emit_fields_for(binding, &positional, params, body, ctx)
+            emit_fields_for(binding, &positional, opts.as_slice(), params, body, ctx)
         }
         // Lexxy's editor takes a block — its children, campfire's
         // `<lexxy-prompt>` for mentions. Trix's helper takes none.
-        FormBuilderMethod::RichTextArea if ctx.lexxy => Some(emit_rich_text_area(
+        FormBuilderMethod::RichTextArea if ctx.lexxy && !binding.recordless => Some(emit_rich_text_area(
             positional.first().copied(),
             opts.as_slice(),
             binding,
@@ -1178,6 +1283,7 @@ pub(super) fn emit_form_builder_block_inline(
 fn emit_fields_for(
     binding: &FormBuilderBinding,
     positional: &[&Expr],
+    opts: &[(Expr, Expr)],
     params: &[Symbol],
     body: &Expr,
     ctx: &ViewCtx,
@@ -1206,24 +1312,291 @@ fn emit_fields_for(
         Span::synthetic(),
         ExprNode::Assign {
             target: super::LValue::Var { id: VarId(0), name: record_var.clone() },
-            value: record_expr,
+            value: record_expr.clone(),
         },
     )];
 
+    // Rails' `fields_for_with_nested_attributes` for a has_one/belongs_to the model accepts nested attributes for:
+    // `parent[assoc_attributes]`, nothing for a nil association, and the record's hidden id when it is persisted.
+    let nested_kind = binding
+        .metadata_class(ctx)
+        .and_then(|owner| ctx.nested_attributes.get(&(owner.to_owned(), nested.as_str().to_owned())).copied());
+    if nested_kind == Some(true) {
+        return emit_nested_collection_fields(binding, nested, &nested_param, positional, opts, body, ctx);
+    }
+    let nested_attributes = nested_kind == Some(false);
+    let model_name = if nested_attributes {
+        format!("{}[{}_attributes]", binding.model_name, nested.as_str())
+    } else {
+        format!("{}[{}]", binding.model_name, nested.as_str())
+    };
+    // Rails' `fields_for` builds the parent's `builder:` again: an override runs on that object, as the form's do, and a
+    // partial handed the nested builder gets it.
+    if let Some(assign) = nested_builder_object(binding, &nested_param, &model_name, &record_var, body) {
+        out.push(assign);
+    }
     let mut inner = ctx.with_locals([nested_param_str.clone()]);
     inner.form_records.push(FormBuilderBinding {
+        overridden: if binding.builder.is_some() { binding.overridden.clone() } else { Default::default() },
+        builder: binding.builder.clone(),
         form_param: nested_param_str.clone(),
-        model_name: format!("{}[{}]", binding.model_name, nested.as_str()),
+        model_name,
+        model_class: if positional.get(1).is_some() {
+            super::form_with::form_model_class(&record_expr, "", ctx)
+        } else {
+            binding.metadata_class(ctx).and_then(|owner| ctx.nested_record_classes
+                .get(&(owner.to_owned(), nested.as_str().to_owned())).cloned())
+        },
         record_var: record_var.clone(),
         // The parent's, unchanged: `form.submit`'s default text and the
         // `_method` override belong to the FORM, and `fields_for` opens
         // no form of its own.
         form_method_var: binding.form_method_var.clone(),
         id_prefix: binding.id_prefix.clone(),
+        recordless: binding.recordless && positional.get(1).is_none(),
+        child_counters: Default::default(),
     });
     let body = super::form_with::rewrite_form_object_reads(body, &nested_param_str, &record_var);
-    out.extend(walk_body(&body, &inner));
+    let mut fields = super::walk_counting(&body, &inner);
+    if !nested_attributes {
+        out.extend(fields);
+        return Some(out);
+    }
+    let record_ref = || Expr::new(Span::synthetic(), ExprNode::Var { id: VarId(0), name: record_var.clone() });
+    let include_id = !opts.iter().any(|(k, v)| {
+        matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "include_id")
+            && matches!(&*v.node, ExprNode::Lit { value: Literal::Bool { value: false } })
+    });
+    if include_id
+        && !calls_hidden_id(&body, &nested_param_str)
+        && let Some(nested_binding) = inner.form_records.last()
+    {
+        let id = lit_sym(Symbol::from("id"));
+        fields.push(Expr::new(
+            Span::synthetic(),
+            ExprNode::If {
+                cond: send(Some(record_ref()), "persisted?", Vec::new(), None, false),
+                then_branch: super::seq(emit_hidden_field(Some(&id), &[], nested_binding, &inner)),
+                else_branch: Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
+            },
+        ));
+    }
+    out.push(Expr::new(
+        Span::synthetic(),
+        ExprNode::If {
+            cond: send(Some(record_ref()), "nil?", Vec::new(), None, false),
+            then_branch: Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
+            else_branch: super::seq(fields),
+        },
+    ));
     Some(out)
+}
+
+/// The index a nested child's names carry while its fields are written (`parent[assoc_attributes][<here>][field]`),
+/// replaced by the child's index once they are: letters only, which `name` and the sanitized `id` both keep.
+const CHILD_INDEX_MARK: &str = "rhnestedchildindexmark";
+
+/// Rails' `fields_for_with_nested_attributes` for a has_many: each child of the association (or the one record or
+/// collection given) under `parent[assoc_attributes][i]`, `i` the explicit `child_index:` or the builder's count,
+/// with the persisted child's hidden id after its fields.
+fn emit_nested_collection_fields(
+    binding: &FormBuilderBinding,
+    nested: Symbol,
+    nested_param: &Symbol,
+    positional: &[&Expr],
+    opts: &[(Expr, Expr)],
+    body: &Expr,
+    ctx: &ViewCtx,
+) -> Option<Vec<Expr>> {
+    let var = |name: &str| Expr::new(Span::synthetic(), ExprNode::Var { id: VarId(0), name: Symbol::from(name) });
+    let param = nested_param.as_str();
+    let record_var = Symbol::from(format!("{param}_record"));
+    let children = match positional.get(1) {
+        // One record given is that child alone; a collection given is the children.
+        Some(given) if matches!(given.ty.as_ref().map(|t| t.peel_nilable()), Some(crate::ty::Ty::Class { .. })) => {
+            Expr::new(Span::synthetic(), ExprNode::Array { elements: vec![(*given).clone()], style: Default::default() })
+        }
+        Some(given) => (*given).clone(),
+        None => send(Some(var(binding.record_var.as_str())), nested.as_str(), Vec::new(), None, false),
+    };
+    let opt = |key: &str| opts.iter().find_map(|(k, v)| matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == key).then_some(v));
+    let include_id = !opt("include_id").is_some_and(|v| matches!(&*v.node, ExprNode::Lit { value: Literal::Bool { value: false } }));
+    // Not the block's own counter: Rails counts on the parent builder (its depth, as names repeat) per association.
+    let depth = ctx.form_records.iter().rposition(|b| b.form_param == binding.form_param).unwrap_or(ctx.form_records.len());
+    let counter = format!("rh_{}{depth}_{}_index", binding.form_param, nested.as_str());
+    let child_index = format!("rh_{param}_child_index");
+    let mut out = Vec::new();
+    let index_value = match opt("child_index") {
+        Some(explicit) => send(Some(explicit.clone()), "to_s", Vec::new(), None, false),
+        None => {
+            let mut counters = binding.child_counters.borrow_mut();
+            if !counters.contains(&counter) {
+                counters.push(counter.clone());
+            }
+            send(Some(var(&counter)), "to_s", Vec::new(), None, false)
+        }
+    };
+    let model_name = format!("{}[{}_attributes][{CHILD_INDEX_MARK}]", binding.model_name, nested.as_str());
+    let mut inner = ctx.with_locals([param.to_string(), record_var.as_str().to_string()]);
+    inner.form_records.push(FormBuilderBinding {
+        overridden: if binding.builder.is_some() { binding.overridden.clone() } else { Default::default() },
+        builder: binding.builder.clone(),
+        form_param: param.to_string(),
+        model_name,
+        model_class: binding.metadata_class(ctx).and_then(|owner| ctx.nested_record_classes.get(&(owner.to_owned(), nested.as_str().to_owned())).cloned()),
+        record_var: record_var.clone(),
+        form_method_var: binding.form_method_var.clone(),
+        id_prefix: binding.id_prefix.clone(),
+        recordless: false,
+        child_counters: Default::default(),
+    });
+    let body = super::form_with::rewrite_form_object_reads(body, param, &record_var);
+    let mut loop_body = Vec::new();
+    if opt("child_index").is_none() {
+        loop_body.push(Expr::new(Span::synthetic(), ExprNode::Assign {
+            target: super::LValue::Var { id: VarId(0), name: Symbol::from(counter.as_str()) },
+            value: send(Some(var(&counter)), "+", vec![Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Int { value: 1 } })], None, false),
+        }));
+    }
+    loop_body.push(Expr::new(Span::synthetic(), ExprNode::Assign {
+        target: super::LValue::Var { id: VarId(0), name: Symbol::from(child_index.as_str()) },
+        value: index_value,
+    }));
+    let model_name_for_object = format!("{}[{}_attributes][{CHILD_INDEX_MARK}]", binding.model_name, nested.as_str());
+    let builder_object = nested_builder_object(binding, nested_param, &model_name_for_object, &record_var, &body);
+    let mut fields = walk_body(&body, &inner);
+    if include_id
+        && !calls_hidden_id(&body, param)
+        && let Some(nested_binding) = inner.form_records.last()
+    {
+        let id = lit_sym(Symbol::from("id"));
+        fields.push(Expr::new(
+            Span::synthetic(),
+            ExprNode::If {
+                cond: send(Some(var(record_var.as_str())), "persisted?", Vec::new(), None, false),
+                then_branch: super::seq(emit_hidden_field(Some(&id), &[], nested_binding, &inner)),
+                else_branch: Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
+            },
+        ));
+    }
+    if let Some(object) = builder_object {
+        fields.insert(0, object);
+    }
+    for f in &mut fields {
+        mark_child_index(f, &var(&child_index));
+    }
+    loop_body.extend(fields);
+    let lambda = Expr::new(
+        Span::synthetic(),
+        ExprNode::Lambda {
+            extra_params: Vec::new(),
+            rest_param: None,
+            params: vec![record_var],
+            block_param: None,
+            body: super::seq(loop_body),
+            block_style: crate::expr::BlockStyle::Do,
+        },
+    );
+    out.push(send(Some(children), "each", Vec::new(), Some(lambda), false));
+    Some(out)
+}
+
+/// `<param> = <builder>.new("<name>", <record>, ActionView::Base.new, { namespace: … })` for a `fields_for` whose
+/// builder must be an object: the form's overriding `builder:`, or Rails' own when the body hands it to a partial.
+fn nested_builder_object(binding: &FormBuilderBinding, param: &Symbol, model_name: &str, record_var: &Symbol, body: &Expr) -> Option<Expr> {
+    let class = binding.builder.clone().or_else(|| {
+        hands_to_render(body, param.as_str()).then(|| {
+            Expr::new(Span::synthetic(), ExprNode::Const { path: vec![Symbol::from("ActionView"), Symbol::from("Helpers"), Symbol::from("FormBuilder")] })
+        })
+    })?;
+    let template = send(Some(Expr::new(Span::synthetic(), ExprNode::Const { path: vec![Symbol::from("ActionView"), Symbol::from("Base")] })), "new", Vec::new(), None, false);
+    let args = vec![
+        lit_str(model_name.to_string()),
+        Expr::new(Span::synthetic(), ExprNode::Var { id: VarId(0), name: record_var.clone() }),
+        template,
+        // Rails' `fields_for` hands the nested builder the form's `namespace:`.
+        Expr::new(Span::synthetic(), ExprNode::Hash {
+            entries: (!binding.id_prefix.is_empty())
+                .then(|| (lit_sym(Symbol::from("namespace")), lit_str(binding.id_prefix.clone())))
+                .into_iter()
+                .collect(),
+            kwargs: false,
+        }),
+    ];
+    Some(Expr::new(
+        Span::synthetic(),
+        ExprNode::Assign {
+            target: super::LValue::Var { id: VarId(0), name: param.clone() },
+            value: send(Some(class), "new", args, None, true),
+        },
+    ))
+}
+
+/// Whether a block hands its builder to a `render` (`render "poll_fields", f: poll_form`).
+fn hands_to_render(body: &Expr, param: &str) -> bool {
+    let mut found = false;
+    fn walk(e: &Expr, param: &str, found: &mut bool) {
+        let is_param = |v: &Expr| matches!(&*v.node, ExprNode::Var { name, .. } if name.as_str() == param);
+        if let ExprNode::Send { recv: None, method, args, .. } = &*e.node
+            && method.as_str() == "render"
+            && args.iter().any(|a| is_param(a) || matches!(&*a.node, ExprNode::Hash { entries, .. } if entries.iter().any(|(_, v)| is_param(v))))
+        {
+            *found = true;
+        }
+        e.node.for_each_child(&mut |c| walk(c, param, found));
+    }
+    walk(body, param, &mut found);
+    found
+}
+
+/// The child's index for [`CHILD_INDEX_MARK`] in every string its fields wrote.
+fn mark_child_index(e: &mut Expr, index: &Expr) {
+    e.node.for_each_child_mut(&mut |c| mark_child_index(c, index));
+    let split = |text: &str| -> Vec<InterpPart> {
+        let mut parts = Vec::new();
+        for (i, piece) in text.split(CHILD_INDEX_MARK).enumerate() {
+            if i > 0 {
+                parts.push(InterpPart::Expr { expr: index.clone() });
+            }
+            if !piece.is_empty() {
+                parts.push(InterpPart::Text { value: piece.to_string() });
+            }
+        }
+        parts
+    };
+    match &mut *e.node {
+        ExprNode::Lit { value: Literal::Str { value } } if value.contains(CHILD_INDEX_MARK) => {
+            let parts = split(value);
+            *e = Expr::new(e.span, ExprNode::StringInterp { parts });
+        }
+        ExprNode::StringInterp { parts } if parts.iter().any(|p| matches!(p, InterpPart::Text { value } if value.contains(CHILD_INDEX_MARK))) => {
+            let old = std::mem::take(parts);
+            for p in old {
+                match p {
+                    InterpPart::Text { value } if value.contains(CHILD_INDEX_MARK) => parts.extend(split(&value)),
+                    other => parts.push(other),
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether a `fields_for` body writes the record's id itself (`f.hidden_field :id`), which Rails then does not repeat.
+fn calls_hidden_id(body: &Expr, param: &str) -> bool {
+    let mut found = false;
+    fn walk(e: &Expr, param: &str, found: &mut bool) {
+        if let ExprNode::Send { recv: Some(r), method, args, .. } = &*e.node
+            && method.as_str() == "hidden_field"
+            && matches!(&*r.node, ExprNode::Var { name, .. } if name.as_str() == param)
+            && matches!(args.first().map(|a| &*a.node), Some(ExprNode::Lit { value: Literal::Sym { value } }) if value.as_str() == "id")
+        {
+            *found = true;
+        }
+        e.node.for_each_child(&mut |c| walk(c, param, found));
+    }
+    walk(body, param, &mut found);
+    found
 }
 
 fn emit_button(
@@ -1296,6 +1669,85 @@ fn emit_typed_input_field(
     vec![accumulator_append_call(string_interp(parts), ctx)]
 }
 
+/// `<input type="color" …>` — Rails' `Tags::ColorField`, which always
+/// writes a value: an explicit `value:` as given, else the record's
+/// value lowercased when it holds `#` and six hex digits, else
+/// `#000000` (`validate_color_string`). A `value:` that is nil at
+/// render falls back to the record (`options["value"] ||= …`).
+fn emit_color_field(
+    field: Option<&Expr>,
+    opts: &[(Expr, Expr)],
+    binding: &FormBuilderBinding,
+    ctx: &ViewCtx,
+) -> Vec<Expr> {
+    let Some(field_sym) = field_symbol(field) else {
+        return vec![accumulator_append_call(lit_str(String::new()), ctx)];
+    };
+    let field_str = field_sym.as_str();
+    let mut opts = opts.to_vec();
+    let mut parts: Vec<InterpPart> = Vec::new();
+    parts.push(InterpPart::Text {
+        value: format!("<input type=\"color\"{}", name_id_attrs_for(binding, field_str, &opts)),
+    });
+    // A String literal `value:` stays an ordinary attribute; any other is
+    // decided at render.
+    let literal = |v: &Expr| matches!(&*v.node, ExprNode::Lit { value: Literal::Str { .. } });
+    let value_pos = opts.iter().position(|(k, _)| {
+        matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "value")
+    });
+    if !value_pos.is_some_and(|i| literal(&opts[i].1)) {
+        let record = field_value_read(binding, field_sym.clone(), ctx);
+        let attr = match super::attr_parts::take_opt(&mut opts, "value") {
+            Some(v) if !matches!(&*v.node, ExprNode::Lit { value: Literal::Nil }) => {
+                view_helpers_call("color_field_value_attr", vec![v, record])
+            }
+            _ => view_helpers_call("color_value_attr", vec![record]),
+        };
+        parts.push(InterpPart::Expr { expr: attr });
+    }
+    append_attr_parts(&mut parts, &opts);
+    parts.push(InterpPart::Text { value: ">".to_string() });
+    vec![accumulator_append_call(string_interp(parts), ctx)]
+}
+
+/// `<input type="datetime-local" …>` — Rails' `Tags::DatetimeLocalField`.
+/// A String literal `value:` is written as given and `value: nil` writes
+/// none; with no `value:`, a datetime or date column's value is formatted
+/// `%Y-%m-%dT%T` (`datetime_local_value_attr`) and a string column's is
+/// written as given. Analyze refuses the rest (`datetime_local_refusal`).
+fn emit_datetime_local_field(
+    field: Option<&Expr>,
+    opts: &[(Expr, Expr)],
+    binding: &FormBuilderBinding,
+    ctx: &ViewCtx,
+) -> Vec<Expr> {
+    let Some(field_sym) = field_symbol(field) else {
+        return vec![accumulator_append_call(lit_str(String::new()), ctx)];
+    };
+    let field_str = field_sym.as_str();
+    let mut opts = opts.to_vec();
+    let mut parts: Vec<InterpPart> = Vec::new();
+    parts.push(InterpPart::Text {
+        value: format!("<input type=\"datetime-local\"{}", name_id_attrs_for(binding, field_str, &opts)),
+    });
+    match super::attr_parts::take_opt(&mut opts, "value") {
+        Some(v) if matches!(&*v.node, ExprNode::Lit { value: Literal::Nil }) => {}
+        Some(v) => opts.insert(0, (lit_sym(Symbol::from("value")), v)),
+        None => {
+            let is_time = ctx
+                .time_columns
+                .get(binding.metadata_class(ctx).unwrap_or(""))
+                .is_some_and(|names| names.contains(field_str));
+            let helper = if is_time { "datetime_local_value_attr" } else { "optional_value_attr" };
+            let read = field_value_read(binding, field_sym.clone(), ctx);
+            parts.push(InterpPart::Expr { expr: view_helpers_call(helper, vec![read]) });
+        }
+    }
+    append_attr_parts(&mut parts, &opts);
+    parts.push(InterpPart::Text { value: ">".to_string() });
+    vec![accumulator_append_call(string_interp(parts), ctx)]
+}
+
 /// `<expr>.to_s` — the coercion the escape helpers expect.
 fn to_s(e: Expr) -> Expr {
     Expr::new(
@@ -1357,7 +1809,8 @@ fn emit_hidden_field(
     let mut parts: Vec<InterpPart> = Vec::new();
     parts.push(InterpPart::Text {
         value: format!(
-            "<input type=\"hidden\"{}",
+            "<input type=\"hidden\"{}{}",
+            if ctx.hidden_autocomplete && !opts_have_key(opts, "autocomplete") { " autocomplete=\"off\"" } else { "" },
             name_id_attrs_for(binding, field_sym.as_str(), opts)
         ),
     });
@@ -1458,7 +1911,7 @@ fn label_for_attr(binding: &FormBuilderBinding, field: &str) -> String {
 /// `optional_value_attr(nil)` then omits the `value=` attr, matching Rails
 /// rendering an empty non-model field).
 fn field_value_read(binding: &FormBuilderBinding, field: Symbol, ctx: &ViewCtx) -> Expr {
-    if binding.model_name.is_empty() {
+    if binding.model_name.is_empty() || binding.recordless {
         Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil })
     } else {
         record_field_read(binding, field, ctx)
@@ -1467,6 +1920,10 @@ fn field_value_read(binding: &FormBuilderBinding, field: Symbol, ctx: &ViewCtx) 
 
 /// True when `opts` carries an explicit `value:` — a `hidden_field` with a
 /// caller-supplied value uses it instead of reading the record attribute.
+fn opts_have_key(opts: &[(Expr, Expr)], key: &str) -> bool {
+    opts.iter().any(|(k, _)| matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == key))
+}
+
 fn opts_have_value(opts: &[(Expr, Expr)]) -> bool {
     opts.iter().any(|(k, _)| {
         matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "value")
@@ -1509,7 +1966,7 @@ fn emit_label(
             }),
         },
         None => parts.push(InterpPart::Text {
-            value: html_escape_static(&ctx.i18n.label(&binding.model_name, field_sym.as_str())),
+            value: html_escape_static(&binding.metadata_class(ctx).map(|class| ctx.i18n.label_for(class, &binding.model_name, field_sym.as_str())).unwrap_or_else(|| ctx.i18n.label(&binding.model_name, field_sym.as_str()))),
         }),
     }
     parts.push(InterpPart::Text { value: "</label>".to_string() });
@@ -1749,7 +2206,7 @@ fn emit_rich_text_area(
 
     let mut parts: Vec<InterpPart> = Vec::new();
     parts.push(InterpPart::Text {
-        value: format!("<input type=\"hidden\" name=\"{name}\" id=\""),
+        value: format!("<input type=\"hidden\"{} name=\"{name}\" id=\"", if ctx.hidden_autocomplete { " autocomplete=\"off\"" } else { "" }),
     });
     parts.push(input_id_part());
     parts.push(InterpPart::Text { value: "\"".to_string() });
@@ -2066,8 +2523,8 @@ fn emit_submit_input(label_expr: Expr, opts: &[(Expr, Expr)], ctx: &ViewCtx) -> 
 /// node referencing the captured `form_method` local so per-record
 /// new/edit distinction renders correctly at runtime.
 fn default_submit_text(binding: &FormBuilderBinding, ctx: &ViewCtx) -> Expr {
-    let update_text = lit_str(ctx.i18n.submit(&binding.model_name, "update"));
-    let create_text = lit_str(ctx.i18n.submit(&binding.model_name, "create"));
+    let update_text = lit_str(binding.metadata_class(ctx).map(|class| ctx.i18n.submit_for(class, &binding.model_name, "update")).unwrap_or_else(|| ctx.i18n.submit(&binding.model_name, "update")));
+    let create_text = lit_str(binding.metadata_class(ctx).map(|class| ctx.i18n.submit_for(class, &binding.model_name, "create")).unwrap_or_else(|| ctx.i18n.submit(&binding.model_name, "create")));
     let method_var_read = Expr::new(
         Span::synthetic(),
         ExprNode::Var {
@@ -2237,7 +2694,7 @@ fn record_field_read(binding: &FormBuilderBinding, field: Symbol, ctx: &ViewCtx)
     // lives.
     let is_store_read = ctx
         .store_readers
-        .get(binding.model_name.as_str())
+        .get(binding.metadata_class(ctx).unwrap_or(""))
         .is_some_and(|names| names.contains(field.as_str()));
     if is_store_read {
         return send(Some(record_ref), field.as_str(), Vec::new(), None, false);
@@ -2290,48 +2747,74 @@ fn string_interp(parts: Vec<InterpPart>) -> Expr {
     )
 }
 
-/// `["base_string", {cond_class: pred, …}]` → `"base_string default_class"`,
-/// where `default_class` is the FIRST key of the conditional hash. The
-/// convention in real-blog is that the first hash entry is the
-/// no-errors variant; picking the first key gives byte-parity with
-/// Rails for the 5 default compare paths. A real if/else over
-/// `record.errors[:field].any?` would be strictly better and is
-/// tracked as a follow-on; this path matches the prior runtime
-/// behavior.
 fn simplify_class_array(v: &Expr) -> Expr {
-    let ExprNode::Array { elements, .. } = &*v.node else {
+    let ExprNode::Array { .. } = &*v.node else {
         return v.clone();
     };
-    let Some(first) = elements.first() else {
-        return v.clone();
-    };
-    let ExprNode::Lit { value: Literal::Str { value: base } } = &*first.node else {
-        return v.clone();
-    };
-    let mut composed = base.clone();
-    if let Some(second) = elements.get(1) {
-        if let ExprNode::Hash { entries, .. } = &*second.node {
-            if let Some((k, _)) = entries.first() {
-                let key_str = match &*k.node {
-                    ExprNode::Lit { value: Literal::Sym { value } } => {
-                        Some(value.as_str().to_string())
-                    }
-                    ExprNode::Lit { value: Literal::Str { value } } => Some(value.clone()),
-                    _ => None,
-                };
-                if let Some(s) = key_str {
-                    composed.push(' ');
-                    composed.push_str(&s);
+    let mut pieces = Vec::new();
+    flatten_class_pieces(v, &mut pieces);
+    // A token is its text, and the condition it renders under when that is only known at render time.
+    let mut tokens: Vec<(String, Option<Expr>)> = Vec::new();
+    for piece in &pieces {
+        match &*piece.node {
+            ExprNode::Lit { value: Literal::Str { value } } => {
+                if !value.trim().is_empty() {
+                    tokens.push((value.clone(), None));
                 }
             }
+            ExprNode::Lit { value: Literal::Bool { value: false } | Literal::Nil } => {}
+            ExprNode::Hash { entries, .. } => {
+                for (k, val) in entries {
+                    let key = match &*k.node {
+                        ExprNode::Lit { value: Literal::Sym { value } } => value.as_str().to_string(),
+                        ExprNode::Lit { value: Literal::Str { value } } => value.clone(),
+                        _ => return view_helpers_call("class_names", pieces),
+                    };
+                    if key.trim().is_empty() {
+                        continue;
+                    }
+                    match &*val.node {
+                        ExprNode::Lit { value: Literal::Bool { value: true } } => tokens.push((key, None)),
+                        ExprNode::Lit { value: Literal::Bool { value: false } | Literal::Nil } => {}
+                        _ => tokens.push((key, Some(val.clone()))),
+                    }
+                }
+            }
+            _ => return view_helpers_call("class_names", pieces),
         }
     }
-    Expr::new(
-        first.span,
-        ExprNode::Lit {
-            value: Literal::Str { value: composed },
-        },
-    )
+    if tokens.iter().all(|(_, cond)| cond.is_none()) {
+        let text = tokens.into_iter().map(|(t, _)| t).collect::<Vec<_>>().join(" ");
+        return Expr::new(v.span, ExprNode::Lit { value: Literal::Str { value: text } });
+    }
+    // Not `class_names` here: a conditional token's separator rides with it, which every target can render without a runtime helper
+    let Some((head, None)) = tokens.first().cloned() else {
+        return view_helpers_call("class_names", pieces);
+    };
+    let mut parts = vec![InterpPart::Text { value: head }];
+    for (text, cond) in tokens.into_iter().skip(1) {
+        match cond {
+            None => parts.push(InterpPart::Text { value: format!(" {text}") }),
+            Some(cond) => parts.push(InterpPart::Expr {
+                expr: Expr::new(
+                    Span::synthetic(),
+                    ExprNode::If { cond, then_branch: lit_str(format!(" {text}")), else_branch: lit_str(String::new()) },
+                ),
+            }),
+        }
+    }
+    string_interp(parts)
+}
+
+fn flatten_class_pieces(v: &Expr, out: &mut Vec<Expr>) {
+    match &*v.node {
+        ExprNode::Array { elements, .. } => {
+            for e in elements {
+                flatten_class_pieces(e, out);
+            }
+        }
+        _ => out.push(v.clone()),
+    }
 }
 
 #[cfg(test)]

@@ -10,25 +10,36 @@
 //!
 //!     cargo test --test csharp_toolchain -- --ignored --nocapture
 
+#[path = "support/scratch.rs"]
+mod scratch;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use roundhouse::analyze::Analyzer;
+#[path = "support/emit_and_run.rs"]
+#[allow(dead_code)]
+mod emit_and_run;
+#[path = "support/i18n_locales_app.rs"]
+#[allow(dead_code)]
+mod i18n_locales_app;
+#[path = "support/record_slice_app.rs"]
+#[allow(dead_code)]
+mod record_slice_app;
+#[path = "support/ts_controller_ivars.rs"]
+#[allow(dead_code)]
+mod ts_controller_ivars;
+
 use roundhouse::emit::csharp;
 use roundhouse::ingest::ingest_app;
 
 fn scratch_dir(fixture: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("roundhouse-csharp-check-{fixture}"))
+    scratch::dir(&format!("roundhouse-csharp-check-{fixture}"))
 }
 
 fn generate_project(fixture_path: &Path, out: &Path) {
-    if out.exists() {
-        std::fs::remove_dir_all(out).expect("clean scratch");
-    }
     std::fs::create_dir_all(out).expect("create scratch");
 
     let mut app = ingest_app(fixture_path).expect("ingest");
-    Analyzer::new(&app).analyze(&mut app);
+    roundhouse::session::analyze_and_lower(&mut app);
     let files = csharp::emit(&app);
 
     for file in &files {
@@ -176,4 +187,134 @@ fn parses_the_dotnet_test_summary() {
     assert_eq!(parse_passed_count(line), Some(21));
     // The `Passed!` banner alone (no counts) must NOT read as a count.
     assert_eq!(parse_passed_count("Build succeeded."), None);
+}
+
+#[test]
+#[ignore]
+fn real_blog_i18n_locales_run() {
+    // The answers `emit_and_run::i18n_locales` checks on CRuby, but for a String
+    // locale named in an error: C# has no Symbol apart from String, so `"de"` shows as `:de`.
+    let (emitted, errors) = i18n_locales_app::probe_app()
+        .edit("app/models/article.rb", i18n_locales_app::IN_LOCALE, "")
+        .emit(roundhouse::project::BuildTarget::CSharp);
+    assert!(errors.is_empty(), "{errors:?}");
+    std::fs::write(emitted.join("tests/I18nProbeTest.cs"), r#"using System;
+using System.Collections.Generic;
+using Xunit;
+
+namespace Roundhouse;
+
+public class I18nProbeTest
+{
+    private static void Expect(string what, object? got, object? want)
+    {
+        var g = System.Text.Json.JsonSerializer.Serialize(got);
+        var w = System.Text.Json.JsonSerializer.Serialize(want);
+        Assert.True(g == w, what + ": " + g);
+    }
+
+    [Fact]
+    public void LocalesAnswerAsRails()
+    {
+        Expect("lookups", Article.Lookups(), new List<object?> { "Hello", "Hi <x>", "1 item", "2 items", "Translation missing: en.probe.nope", "Cześć", "fallback 3", "en" });
+        Expect("polish", Article.Polish(), new List<object?> { "1 rzecz", "5 rzeczy", "English only", "Cześć", "Translation missing: pl.probe.nope", "Cześć", "Hi Ola", "pl" });
+        Expect("restored", I18n.Locale(), "en");
+        Expect("named", new List<object?> { Article.Named("pl"), Article.Named("en"), Article.Named(null) }, new List<object?> { "Cześć", "Hello", "Hello" });
+        Expect("dynamic", new List<object?> { Article.ProbeKey("greet"), Article.OnlyKey("xx") }, new List<object?> { "Hello", "Translation missing: en.probe.only_xx" });
+        var e = Assert.Throws<InvalidLocale>(() => Article.Named("de"));
+        Expect("named de", e.Message, ":de is not a valid locale");
+    }
+}
+"#).expect("write probe test");
+    let output = Command::new("dotnet")
+        .args(["test", "tests", "--nologo", "--filter", "I18nProbeTest"])
+        .current_dir(&emitted)
+        .output()
+        .expect("run dotnet test");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore]
+fn real_blog_record_slice_runs() {
+    // The answers `emit_and_run::record_slice` checks on CRuby.
+    let (emitted, errors) = record_slice_app::probe_app().emit(roundhouse::project::BuildTarget::CSharp);
+    assert!(errors.is_empty(), "{errors:?}");
+    std::fs::write(emitted.join("tests/RecordSliceProbeTest.cs"), r#"using System.Collections.Generic;
+using Xunit;
+
+namespace Roundhouse;
+
+public class RecordSliceProbeTest
+{
+    [Fact]
+    public void SliceAnswersAsRails()
+    {
+        var got = System.Text.Json.JsonSerializer.Serialize(Article.Sliced());
+        var want = System.Text.Json.JsonSerializer.Serialize(new List<object?> { "2", "Sliced", "7", "1", "Other", "3", "Bound", "5", "4", "A comment body." });
+        Assert.True(got == want, "sliced: " + got);
+    }
+}
+"#).expect("write probe test");
+    let output = Command::new("dotnet")
+        .args(["test", "tests", "--nologo", "--filter", "RecordSliceProbeTest"])
+        .current_dir(&emitted)
+        .output()
+        .expect("run dotnet test");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore]
+fn controller_ivars_named_like_base_state_build() {
+    // An app controller's `@status`, `@location` and `@headers` (its own,
+    // ApplicationController's and a concern's) build next to the runtime
+    // base's members of those names (#1625).
+    let (emitted, errors) = ts_controller_ivars::overlay().emit(roundhouse::project::BuildTarget::CSharp);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_dotnet_build_passes("an app controller with ivars named like the base's state", &emitted);
+}
+
+const PROBES_TEST: &str = "require \"test_helper\"\n\nclass ProbesControllerTest < ActionDispatch::IntegrationTest\n  test \"show renders\" do\n    get \"/show\"\n    assert_response :success\n  end\nend\n";
+
+#[test]
+#[ignore]
+fn controller_ivars_named_like_base_state_render() {
+    // The three names render on the page, and the response is as Rails
+    // leaves it: 200, no Location (#1625).
+    // A test file, so the emit writes the `tests/` project the probe joins.
+    let (emitted, errors) = ts_controller_ivars::overlay()
+        .write("test/controllers/probes_controller_test.rb", PROBES_TEST)
+        .emit(roundhouse::project::BuildTarget::CSharp);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert!(emitted.join("tests").is_dir(), "no tests/ project in the emit");
+    let body = serde_json::to_string(ts_controller_ivars::BODY).unwrap();
+    std::fs::write(
+        emitted.join("tests/ControllerIvarsProbeTest.cs"),
+        format!(
+            "using Xunit;\n\nnamespace Roundhouse;\n\npublic class ControllerIvarsProbeTest\n{{\n    [Fact]\n    public void RendersAsRails()\n    {{\n        var c = new ProbesController();\n        c.RequestMethod = \"GET\";\n        c.ProcessAction(\"show\");\n        Assert.Equal(200L, c.Status);\n        Assert.Null(c.Location);\n        Assert.Equal({body}, c.Body);\n    }}\n}}\n"
+        ),
+    )
+    .expect("write probe test");
+    let output = Command::new("dotnet")
+        .args(["test", "tests", "--nologo", "--filter", "ControllerIvarsProbeTest"])
+        .current_dir(&emitted)
+        .output()
+        .expect("run dotnet test");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

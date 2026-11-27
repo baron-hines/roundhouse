@@ -5,29 +5,163 @@ use crate::ident::Symbol;
 use crate::span::Span;
 use crate::ty::Ty;
 
-pub fn apply_indifferent_access_lowering(app: &mut App) {
+pub fn apply_indifferent_access_lowering(app: &mut App) -> Vec<crate::diagnostic::Diagnostic> {
+    let diags = test_handoffs(app);
+    for method in app.library_classes.iter_mut().flat_map(|c| c.methods.iter_mut()).chain(app.models.iter_mut().flat_map(|m| m.methods_mut())) {
+        keyed_like_indifferent(method);
+    }
+    let app_defines = app_defines_conversion(app);
+    let mut lower = |body: &mut Expr| lower(body, app_defines);
     super::for_each_hook_body(app, &mut lower);
     for view in &mut app.views {
         lower(&mut view.body);
     }
     super::for_each_test_body(app, &mut lower);
+    diags
 }
 
-fn lower(body: &mut Expr) {
-    rewrite(body);
+/// An indifferent Hash a test hands to an app method whose parameter no
+/// analyzed call gives one (`Sifter.new(given)` from a test alone): the
+/// method's reads stay Symbol-keyed, and the String-keyed Hash the
+/// indifferent one runs as answers nil to them. A test's calls are not
+/// among the evidence a parameter is typed from, so this is ledgered
+/// (a warning: the method may convert the Hash itself).
+fn test_handoffs(app: &mut App) -> Vec<crate::diagnostic::Diagnostic> {
+    // Each app method's positional parameters: whether the body reads it
+    // as an indifferent Hash.
+    let mut params: crate::det::HashMap<(String, String, bool), Vec<bool>> = Default::default();
+    let methods = app
+        .library_classes
+        .iter()
+        .flat_map(|c| c.methods.iter().map(move |m| (c.name.0.as_str(), m)))
+        .chain(app.models.iter().flat_map(|c| c.methods().map(move |m| (c.name.0.as_str(), m))));
+    for (class, m) in methods {
+        let read_indifferent = m
+            .params
+            .iter()
+            .filter(|p| !p.keyword && !p.rest)
+            .map(|p| first_read_ty(&m.body, &p.name).is_some_and(may_be_indifferent))
+            .collect();
+        let class_side = m.receiver == crate::dialect::MethodReceiver::Class;
+        params.insert((class.to_string(), m.name.as_str().to_string(), class_side), read_indifferent);
+    }
+    let mut diags = Vec::new();
+    super::for_each_test_body(app, &mut |body| report_handoffs(body, &params, &mut diags));
+    diags
+}
+
+fn report_handoffs(
+    expr: &mut Expr,
+    params: &crate::det::HashMap<(String, String, bool), Vec<bool>>,
+    diags: &mut Vec<crate::diagnostic::Diagnostic>,
+) {
+    expr.node.for_each_child_mut(&mut |c| report_handoffs(c, params, diags));
+    let ExprNode::Send { recv: Some(recv), method, args, .. } = &*expr.node else { return };
+    let callee = match (&*recv.node, &recv.ty) {
+        (ExprNode::Const { path }, _) => {
+            let class = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::");
+            match method.as_str() {
+                "new" => (class, "initialize".to_string(), false),
+                m => (class, m.to_string(), true),
+            }
+        }
+        (_, Some(Ty::Class { id, .. })) => (id.0.as_str().to_string(), method.as_str().to_string(), false),
+        _ => return,
+    };
+    let Some(read_indifferent) = params.get(&callee) else { return };
+    for (arg, indifferent) in args.iter().zip(read_indifferent) {
+        if !indifferent && arg.ty.as_ref().is_some_and(may_be_indifferent) {
+            diags.push(crate::lower::residue_diagnostic(
+                "indifferent_access",
+                "with_indifferent_access",
+                arg.span,
+                "handed from a test",
+                format!(
+                    "an indifferent Hash handed from a test to `{}{}{}`, whose parameter no analyzed call gives one: \
+                     its Symbol-key reads there may answer nil",
+                    callee.0,
+                    if callee.2 { "." } else { "#" },
+                    callee.1
+                ),
+            ));
+        }
+    }
+}
+
+/// The type of the first typed read of the local `name` in `body`.
+fn first_read_ty<'a>(body: &'a Expr, name: &Symbol) -> Option<&'a Ty> {
+    if let ExprNode::Var { name: read, .. } = &*body.node
+        && read == name
+        && body.ty.is_some()
+    {
+        return body.ty.as_ref();
+    }
+    let mut found = None;
+    body.node.for_each_child(&mut |c| {
+        if found.is_none() {
+            found = first_read_ty(c, name);
+        }
+    });
+    found
+}
+
+fn app_defines_conversion(app: &App) -> bool {
+    let conversion = |name: &str| name == "with_indifferent_access";
+    app.models.iter().any(|m| m.methods().any(|d| conversion(d.name.as_str())))
+        || app.library_classes.iter().any(|c| c.methods.iter().any(|d| conversion(d.name.as_str())))
+}
+
+fn lower(body: &mut Expr, app_defines: bool) {
+    rewrite(body, app_defines);
     // Not retyped during the rewrite: a parent call finds its indifferent receiver by the type its child still carries.
     retype(body);
 }
 
-fn rewrite(expr: &mut Expr) {
-    expr.node.for_each_child_mut(&mut rewrite);
+fn rewrite(expr: &mut Expr, app_defines: bool) {
+    expr.node.for_each_child_mut(&mut |c| rewrite(c, app_defines));
     if !expr.ty.as_ref().is_some_and(|t| !matches!(t, Ty::Var { .. })) {
+        // A receiver analysis could not type: a jbuilder partial's local
+        // is one, as no `render` call binds it. Only a Hash's conversion
+        // can be meant unless the app defines the name itself.
+        if !app_defines
+            && let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*expr.node
+            && method.as_str() == "with_indifferent_access"
+            && args.is_empty()
+            && recv.ty.as_ref().is_none_or(|t| matches!(t, Ty::Var { .. }))
+        {
+            let mut call = support_call(expr.span, "indifferent", vec![recv.clone()]);
+            call.ty = indifferent::from_gradual(&Ty::Untyped);
+            *expr = call;
+        }
+        return;
+    }
+    // An untyped receiver (a json column's reader, `extras || {}`) is the
+    // usual one in a Rails app, and no runtime defines the call itself:
+    // lower it as a Hash receiver's is. The result is typed indifferent,
+    // so the calls chained on it (`.merge!(key => value)`) take the
+    // modeled path instead of being half-converted.
+    if let ExprNode::Send { recv: Some(recv), method, args, .. } = &*expr.node
+        && let Some(ty) = untyped_receiver_conversion(method.as_str(), args, recv)
+    {
+        let mut call = support_call(expr.span, "indifferent", vec![recv.clone()]);
+        call.ty = Some(expr.ty.take().filter(indifferent::mentions).unwrap_or(ty));
+        *expr = call;
         return;
     }
     if let Some(mut replacement) = rewrite_node(expr.span, expr.decisions, &mut expr.node) {
         replacement.ty = expr.ty.take();
         *expr = replacement;
     }
+}
+
+// Not a receiver of any other class (an app's own `with_indifferent_access`,
+// one already indifferent, which the typed path copies): the gradual ones
+// analysis types the call for.
+fn untyped_receiver_conversion(method: &str, args: &[Expr], recv: &Expr) -> Option<Ty> {
+    if method != "with_indifferent_access" || !args.is_empty() {
+        return None;
+    }
+    indifferent::from_gradual(recv.ty.as_ref()?)
 }
 
 fn rewrite_node(span: Span, decisions: u64, node: &mut ExprNode) -> Option<Expr> {
@@ -56,7 +190,26 @@ fn rewrite_node(span: Span, decisions: u64, node: &mut ExprNode) -> Option<Expr>
     if !typed && !(maybe && converts_untyped(method.as_str())) {
         return None;
     }
-    match indifferent::shape(method.as_str(), args, block.is_some())? {
+    // A receiver that is a Symbol-keyed Hash on one path and an indifferent
+    // one on another (`@given = given || DEFAULTS`): the String key read
+    // below misses the Symbol-keyed one's, so a read converts it first, as
+    // a parameter both reach is converted (`keyed_like_indifferent`). Not a
+    // write, which would go to the copy; not a String key, which only the
+    // indifferent one answers in Ruby too; not a shape the keys below are
+    // left unconverted for.
+    let shape = indifferent::shape(method.as_str(), args, block.is_some())?;
+    let keys = match method.as_str() {
+        "[]" | "fetch" | "key?" | "has_key?" => &args[..1],
+        "dig" | "values_at" | "slice" | "except" => &args[..],
+        _ => &[],
+    };
+    if !typed && recv.ty.as_ref().is_some_and(symbol_keyed_on_a_path) && keys.iter().any(may_be_symbol_key) {
+        let mixed = recv.clone();
+        let mut converted = support_call(recv.span, "indifferent_param", vec![mixed]);
+        converted.ty = recv.ty.clone();
+        *recv = converted;
+    }
+    match shape {
         Shape::FirstKey => convert_key(&mut args[0]),
         Shape::AllKeys => {
             args.iter_mut().for_each(convert_key);
@@ -120,6 +273,10 @@ fn leaves(ty: &Ty) -> Vec<&Ty> {
         Ty::Union { variants } => variants.iter().flat_map(leaves).collect(),
         other => vec![other],
     }
+}
+
+fn symbol_keyed_on_a_path(ty: &Ty) -> bool {
+    leaves(ty).iter().any(|v| matches!(v, Ty::Hash { key, .. } if matches!(**key, Ty::Sym)))
 }
 
 fn may_be_indifferent(ty: &Ty) -> bool {
@@ -186,6 +343,17 @@ fn convert_key(key: &mut Expr) {
     }
 }
 
+fn may_be_symbol_key(key: &Expr) -> bool {
+    // A splat by its elements: `*[:mesh]` is Symbol keys.
+    if let ExprNode::Splat { value } = &*key.node {
+        return match value.ty.as_ref() {
+            Some(Ty::Array { elem }) => may_be_symbol(elem),
+            _ => true,
+        };
+    }
+    matches!(&*key.node, ExprNode::Lit { value: Literal::Sym { .. } }) || key.ty.as_ref().is_some_and(may_be_symbol)
+}
+
 fn may_be_symbol(ty: &Ty) -> bool {
     match ty {
         Ty::Sym | Ty::Untyped | Ty::Var { .. } => true,
@@ -232,4 +400,37 @@ fn retype(expr: &mut Expr) {
     if let Some(ty) = expr.ty.as_ref().filter(|t| indifferent::mentions(t)) {
         expr.ty = Some(indifferent::plain(ty));
     }
+}
+
+/// A parameter both a Symbol-keyed Hash and an indifferent one reach (Devise's `ParameterFilter#filter`, passed
+/// `{ confirmation_token: t }` and a request's params): the body's reads and writes are lowered to String keys, so a
+/// Symbol-keyed one is converted as the method is entered.
+// Not the arguments at each call: a call outside the analyzed bodies (a gem's, a test's) would pass its Hash unconverted.
+fn keyed_like_indifferent(method: &mut crate::dialect::MethodDef) {
+    let Some(Ty::Fn(fn_ty)) = &method.signature else { return };
+    let params = &fn_ty.params;
+    let mixed = |ty: &Ty| {
+        let leaves = leaves(ty);
+        leaves.iter().any(|v| matches!(v, Ty::Hash { key, .. } if matches!(**key, Ty::Sym)))
+            && leaves.iter().any(|v| indifferent::value_of(v).is_some())
+    };
+    let names: Vec<Symbol> = params
+        .iter()
+        .filter(|p| matches!(p.kind, crate::ty::ParamKind::Required | crate::ty::ParamKind::Optional) && mixed(&p.ty))
+        .map(|p| p.name.clone())
+        .collect();
+    if names.is_empty() {
+        return;
+    }
+    let span = method.body.span;
+    let mut exprs: Vec<Expr> = Vec::new();
+    for name in names {
+        let id = crate::ident::VarId(0);
+        let read = Expr::new(span, ExprNode::Var { id, name: name.clone() });
+        let converted = support_call(span, "indifferent_param", vec![read]);
+        exprs.push(Expr::new(span, ExprNode::Assign { target: crate::expr::LValue::Var { id, name }, value: converted }));
+    }
+    let body = std::mem::replace(&mut method.body, Expr::new(span, ExprNode::Seq { exprs: Vec::new() }));
+    exprs.push(body);
+    method.body = Expr::new(span, ExprNode::Seq { exprs });
 }

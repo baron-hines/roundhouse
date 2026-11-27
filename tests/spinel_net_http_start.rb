@@ -106,4 +106,81 @@ check "the session stays started after the failed block restart", nested_blk.sta
 nested_blk.finish
 check "finish still closes the session after a failed block restart", !nested_blk.started?
 
+# CRuby's positional form, `start(address, port, p_addr, opt)`: what a
+# `**options` splat beside keywords arrives as (campfire's
+# Opengraph::Fetch). The options Hash is read for TLS, the pinned address
+# and the timeouts; a fractional timeout is rounded up, never shortened.
+options = { ipaddr: nil, use_ssl: false }.merge({ open_timeout: 2, read_timeout: 1.5, write_timeout: 1, max_retries: 0 })
+timeouts = nil
+res = Net::HTTP.start("widgets.example", 80, nil, options) do |http|
+  timeouts = [ http.open_timeout, http.read_timeout ]
+  http.request(Net::HTTP::Get.new("/gadget"))
+end
+check "the positional form with an options Hash serves the request", res.body == "gadget body"
+check "the options Hash sets the timeouts", timeouts == [ 2, 2 ]
+
+proxied = ""
+begin
+  Net::HTTP.start("widgets.example", 80, "proxy.example", {}) { |http| http }
+rescue NotImplementedError => e
+  proxied = e.message
+end
+check "a proxy address is refused, not connected around", proxied.include?("proxy")
+
+# A `return` from the caller's block leaves the caller through the
+# session's ensure (Opengraph::Fetch#fetch_document returns this way out
+# of its redirect loop; see matz/spinel#9511).
+def first_body_through_start
+  3.times do
+    Net::HTTP.start("widgets.example", 80) { |http| return http.request(Net::HTTP::Get.new("/gadget")).body }
+  end
+  "the return was lost"
+end
+check "a block's return leaves the caller through Net::HTTP.start", first_body_through_start == "gadget body"
+
+HttpStub.stub("GET", "http://widgets.example/large", 200, "a" * 32769, { "content-length" => "32769" })
+chunks = []
+size = 0
+Net::HTTP.new("widgets.example", 80).request(Net::HTTP::Get.new("/large")) do |response|
+  response.read_body do |chunk|
+    chunks << chunk.bytesize
+    size += chunk.bytesize
+  end
+end
+check "stubbed streaming retains the body size", size == 32769
+check "stubbed streaming retains bounded chunks", chunks == [16384, 16384, 1]
+raised_request = ""
+http = Net::HTTP.new("widgets.example", 80)
+begin
+  http.request(Net::HTTP::Get.new("/gadget")) { |response| raise ArgumentError, "reader stopped" }
+rescue ArgumentError => e
+  raised_request = e.message
+end
+check "a request block error propagates", raised_request == "reader stopped"
+check "a request block error closes an implicit session", !http.started?
+response_buffer = String.new
+same_buffer = false
+Net::HTTP.new("widgets.example", 80).request(Net::HTTP::Get.new("/gadget")) do |response|
+  same_buffer = response.read_body(response_buffer).equal?(response_buffer)
+end
+check "read_body supports a destination", same_buffer && response_buffer == "gadget body"
+conflict = false
+Net::HTTP.new("widgets.example", 80).request(Net::HTTP::Get.new("/gadget")) do |response|
+  begin
+    response.read_body(String.new) { |chunk| chunk }
+  rescue ArgumentError
+    conflict = true
+  end
+end
+check "read_body refuses a destination together with a block", conflict
+read_twice = false
+Net::HTTP.new("widgets.example", 80).request(Net::HTTP::Get.new("/gadget")) do |response|
+  response.read_body { |chunk| chunk }
+  begin
+    response.read_body { |chunk| chunk }
+  rescue IOError
+    read_twice = true
+  end
+end
+check "read_body refuses a second streaming read", read_twice
 puts "done"
