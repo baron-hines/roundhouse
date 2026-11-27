@@ -96,4 +96,11 @@ class ProbesController < ApplicationController
       format.turbo_stream
     end
   end
+
+  def any_multi
+    respond_to do |format|
+      format.html { render html: "h" }
+      format.any(:json, :turbo_stream) { render plain: "multi" }
+    end
+  end
 end

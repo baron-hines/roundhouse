@@ -36,10 +36,11 @@ const ROUTES: &[(&str, &str)] = &[
     ("h_side", "probes"), ("h_side_json", "probes"), ("h_multi", "probes"), ("h_other", "probes"),
     ("h_redirect", "probes"), ("h_bare_noview", "probes"), ("any_bare", "probes"),
     ("mixed", "probes"), ("pin", "probes"), ("semi", "probes"), ("h_cond", "probes"),
+    ("any_multi", "probes"),
 ];
 
 const REFUSED_ROUTES: &[(&str, &str)] = &[
-    ("any_multi", "refused_probes"), ("force_json", "refused_probes"), ("force_turbo", "refused_probes"),
+    ("force_json", "refused_probes"), ("force_turbo", "refused_probes"),
     ("force_plain", "refused_probes"), ("cond_arm", "refused_probes"), ("helper_resp", "refused_probes"),
     ("assign_param", "refused_probes"),
 ];
@@ -160,11 +161,14 @@ fn conditional_arm_registration_is_an_error() {
     assert!(errors.iter().any(|e| e.contains("registered conditionally")), "{errors:?}");
 }
 
-/// `format.any(:json, :turbo_stream) { }` would answer formats it never named.
+/// `format.any(:json, :turbo_stream) { }` registers each named format with
+/// the block, beside the html arm; png is none of them (406).
 #[test]
-fn format_any_with_a_mime_list_is_an_error() {
-    let errors = refused_errors();
-    assert!(errors.iter().any(|e| e.contains("format.any") && e.contains("mime list")), "{errors:?}");
+fn format_any_with_a_mime_list_answers_each_named_format() {
+    replay(&[
+        "any_multi html", "any_multi turbo", "any_multi json", "any_multi star", "any_multi none",
+        "any_multi html_turbo", "any_multi png", "any_multi browser",
+    ]);
 }
 
 /// A bare `format.turbo_stream` in a private helper has no action whose
