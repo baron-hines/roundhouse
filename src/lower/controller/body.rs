@@ -1475,12 +1475,27 @@ fn mark_render_format(body: &Expr, fmt: &str) -> Expr {
                 if entries.iter().any(|(k, _)| matches!(&*k.node,
                     ExprNode::Lit { value: Literal::Sym { value } }
                         if matches!(value.as_str(), "action" | "template"))));
+            // `render plain:` in a negotiated arm: `respond_to` set the arm's type before the block ran.
+            let plain_untyped = matches!(&*args[0].node, ExprNode::Hash { entries, .. }
+                if entries.iter().any(|(k, _)| matches!(&*k.node,
+                    ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "plain"))
+                && !entries.iter().any(|(k, _)| matches!(&*k.node,
+                    ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "content_type")));
             if matches!(&*args[0].node, ExprNode::Lit { value: Literal::Sym { .. } }) || names_template {
                 let new_args = add_format_kwarg(args, fmt, body.span);
                 ExprNode::Send {
                     recv: None,
                     method: method.clone(),
                     args: new_args,
+                    block: block.clone(),
+                    parenthesized: *parenthesized,
+                }
+            } else if plain_untyped && matches!(fmt, "json" | "turbo_stream") {
+                let mime = format!("{}; charset=utf-8", mime_for_format(fmt));
+                ExprNode::Send {
+                    recv: None,
+                    method: method.clone(),
+                    args: add_content_type_kwarg(args, &mime, body.span),
                     block: block.clone(),
                     parenthesized: *parenthesized,
                 }
