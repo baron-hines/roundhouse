@@ -75,9 +75,13 @@ impl<'a> BodyTyper<'a> {
 
     fn defined_on_own(&self, id: &ClassId, method: &Symbol) -> bool {
         let Some(cls) = self.classes.get(id) else { return true };
+        // Not only the class body's own mixins: a file-level `K.extend(M)` (version_gem's `class_eval do extend … end`) and a hook's `base.extend` land in these.
+        let extended = |m: &ClassId| self.classes.get(m).is_none() || self.lookup_in_module(m, method).is_some();
         cls.class_methods.contains_key(method)
             || cls.instance_methods.contains_key(method)
             || cls.includes.iter().any(|m| self.lookup_in_module(m, method).is_some())
+            || cls.class_method_extensions.iter().any(extended)
+            || cls.hook_extensions.iter().any(extended)
     }
 
     /// Every subclass of `id` is closed and none defines `method`.
