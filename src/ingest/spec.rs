@@ -730,16 +730,14 @@ fn let_method(name: &str, body: Expr, span: Span, owner: &ClassId) -> MethodDef 
 /// class's `teardown do ... end` blocks.
 fn teardown_method(hooks: Vec<Expr>, owner: &ClassId) -> MethodDef {
     let syn = Span::synthetic();
-    let body = Expr::new(
-        syn,
-        ExprNode::BeginRescue {
-            body: Expr::new(syn, ExprNode::Seq { exprs: hooks }),
-            rescues: Vec::new(),
-            else_branch: None,
-            ensure: Some(Box::new(Expr::new(syn, ExprNode::Super { args: Some(Vec::new()) }))),
-            implicit: true,
-        },
-    );
+    // Each hook in its own `ensure`, not one around them all: RSpec runs every `after` hook when an earlier one raises.
+    let mut body = Expr::new(syn, ExprNode::Super { args: Some(Vec::new()) });
+    for hook in hooks.into_iter().rev() {
+        body = Expr::new(
+            syn,
+            ExprNode::BeginRescue { body: hook, rescues: Vec::new(), else_branch: None, ensure: Some(Box::new(body)), implicit: true },
+        );
+    }
     MethodDef {
         name_span: syn,
         name: Symbol::from("teardown"),
@@ -1090,15 +1088,25 @@ fn change_expectation(
     let mut by: Option<(String, Expr)> = None;
     let mut from: Option<Expr> = None;
     let mut to: Option<Expr> = None;
-    for (name, args) in qualifiers {
+    // Each argument as its call in the chain runs, in the chain's order (`.to(…).from(…)` reads `to`'s first).
+    let mut stmts = Vec::new();
+    for (qualifier, args) in qualifiers {
         let [arg] = args.as_slice() else {
-            return Err(format!("`change.{name}` without exactly one argument"));
+            return Err(format!("`change.{qualifier}` without exactly one argument"));
         };
-        match name.as_str() {
-            "by" | "by_at_least" | "by_at_most" if by.is_none() => by = Some((name.clone(), arg.clone())),
-            "from" if from.is_none() => from = Some(arg.clone()),
-            "to" if to.is_none() => to = Some(arg.clone()),
-            _ => return Err(format!("`change.{name}` here")),
+        let slot = match qualifier.as_str() {
+            "by" | "by_at_least" | "by_at_most" if by.is_none() => "by",
+            "from" if from.is_none() => "from",
+            "to" if to.is_none() => "to",
+            _ => return Err(format!("`change.{qualifier}` here")),
+        };
+        let bound = name(slot);
+        stmts.push(assign_var(&bound, arg.clone(), span));
+        let read = var(&bound, span);
+        match slot {
+            "by" => by = Some((qualifier.clone(), read)),
+            "from" => from = Some(read),
+            _ => to = Some(read),
         }
     }
     if by.is_some() && (from.is_some() || to.is_some()) {
@@ -1108,15 +1116,6 @@ fn change_expectation(
         return Err("`not_to change` with `by` or `to`".into());
     }
 
-    // RSpec builds the matcher, so evaluates these arguments, before it runs the block; each is read once.
-    let mut stmts = Vec::new();
-    let mut bind = |var_name: String, arg: Expr| {
-        stmts.push(assign_var(&var_name, arg, span));
-        var(&var_name, span)
-    };
-    let by = by.map(|(kind, n)| (kind, bind(name("by"), n)));
-    let from = from.map(|x| bind(name("from"), x));
-    let to = to.map(|y| bind(name("to"), y));
     // RSpec's ChangeDetails: the value is not copied; its `hash` before and after tells an in-place change apart.
     stmts.push(assign_var(&before, value.clone(), span));
     stmts.push(assign_var(&before_hash, send(Some(var(&before, span)), "hash", Vec::new(), span), span));
@@ -1464,16 +1463,17 @@ end
         let src = "describe Article do\n  after { outer_one }\n  after { outer_two }\n  context \"c\" do\n    after { inner }\n    it \"x\" do\n      expect(1).to eq(1)\n    end\n  end\nend\n";
         let tms = ingest(src);
         let teardown = helper(&tms[0], "teardown");
-        let ExprNode::BeginRescue { body, ensure: Some(ensure), .. } = &*teardown.body.node else { panic!() };
-        assert!(matches!(&*ensure.node, ExprNode::Super { .. }));
-        let ExprNode::Seq { exprs } = &*body.node else { panic!() };
-        let order: Vec<&str> = exprs
-            .iter()
-            .map(|e| match &*e.node {
+        // Each hook in its own `ensure`, `super` innermost: a raising hook still runs the ones after it.
+        let mut order: Vec<&str> = Vec::new();
+        let mut at = &teardown.body;
+        while let ExprNode::BeginRescue { body, ensure: Some(ensure), .. } = &*at.node {
+            order.push(match &*body.node {
                 ExprNode::Send { method, .. } => method.as_str(),
                 _ => "?",
-            })
-            .collect();
+            });
+            at = ensure;
+        }
+        assert!(matches!(&*at.node, ExprNode::Super { .. }));
         assert_eq!(order, ["inner", "outer_two", "outer_one"]);
     }
 
