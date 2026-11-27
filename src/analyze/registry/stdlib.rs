@@ -613,6 +613,14 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("readonly?", Ty::Bool),
         ("busy_timeout=", Ty::Int),
         ("busy_handler_timeout=", Ty::Int),
+        // A schema-owning app (a search index kept in SQLite): the
+        // batch answers its last statement's first row; `transaction`
+        // answers its block's value (true without one).
+        ("execute_batch", Ty::Union { variants: vec![Ty::Array { elem: std::sync::Arc::new(Ty::Untyped) }, Ty::Nil].into() }),
+        ("transaction", Ty::Untyped),
+        ("commit", Ty::Bool),
+        ("rollback", Ty::Bool),
+        ("transaction_active?", Ty::Bool),
     ]);
     // `ActionDispatch::Integration::Session`, a request the app answers in
     // process (runtime/spinel/integration_session.rb and its ruby-tree

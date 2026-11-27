@@ -580,6 +580,10 @@ mod concern_guarded_filter;
 mod before_action_return;
 #[path = "emit_and_run/sti_global_id.rs"]
 mod sti_global_id;
+#[path = "support/sqlite3_batch_transaction.rs"]
+mod sqlite3_batch_transaction_contract;
+#[path = "emit_and_run/sqlite3_batch_transaction.rs"]
+mod sqlite3_batch_transaction;
 #[path = "emit_and_run/global_id_app.rs"]
 mod global_id_app;
 #[path = "support/campfire_caches.rs"]
