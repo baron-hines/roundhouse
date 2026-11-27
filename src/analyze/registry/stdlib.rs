@@ -1400,6 +1400,16 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     register_stdlib_class(classes, "StringIO", &[], &[
         ("string", Ty::Str), ("<<", string_io),
     ]);
+    // `OpenStruct.new(hash)` as an app wraps a configuration hash. Members
+    // are read through `method_missing` (the OpenStruct arm in
+    // `body/send.rs`), untyped; `to_h` without a block has Symbol keys.
+    // Checked against CRuby and Spinel in tests/support/stdlib_rnp.rs.
+    let open_struct = Ty::Class { id: ClassId(Symbol::from("OpenStruct")), args: vec![].into() };
+    register_stdlib_class(classes, "OpenStruct", &[("new", open_struct)], &[
+        ("to_h", Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Untyped) }),
+    ]);
+    // Open, not `method_missing` listed: a listed one would be dispatched to by name, and a member read is not a call to it.
+    classes.entry(ClassId(Symbol::from("OpenStruct"))).or_default().open = true;
     // `StringScanner` (`require "strscan"`): the ruby family's own, spinel's
     // `packages/strscan`, whose native bindings these returns follow
     // (a pattern method answers nil on no match).

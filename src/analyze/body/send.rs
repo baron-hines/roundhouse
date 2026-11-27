@@ -2253,6 +2253,17 @@ impl<'a> BodyTyper<'a> {
                 if id.0.as_str() == "BigDecimal" {
                     return bigdecimal_method(method, call_args).unwrap_or_else(unknown);
                 }
+                // OpenStruct answers any name it does not define through
+                // `method_missing`: a member read (nil when unset) or write.
+                // An instance's member may be named like a class method (`OpenStruct.new(new: "x").new`).
+                if id.0.as_str() == "OpenStruct"
+                    && !self.classes().get(id).is_some_and(|c| {
+                        c.instance_methods.contains_key(method)
+                            || (!instance_receiver && c.class_methods.contains_key(method))
+                    })
+                {
+                    return Ty::Untyped;
+                }
                 if id.0.as_str() == crate::analyze::indifferent::CLASS {
                     // Not `instance_receiver`: the bare `HashWithIndifferentAccess` alias is not marked a resolved class reference.
                     let answer = if let Some(value) = args.first().cloned() {
