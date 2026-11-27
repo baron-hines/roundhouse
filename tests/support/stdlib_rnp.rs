@@ -55,6 +55,10 @@ class StdlibProbe
     OpenStruct.new(query_text: "flat").query_text
   end
 
+  def self.member_named_new
+    OpenStruct.new(new: "x").new
+  end
+
   def self.config_hash
     config.to_h
   end
@@ -117,6 +121,7 @@ raise "lazy hits #{StdlibProbe.lazy_hits}" unless StdlibProbe.lazy_hits == [40, 
 raise "chain?" unless StdlibProbe.chain?(StdlibProbe.chain) && !StdlibProbe.chain?([1].each)
 raise "ostruct #{StdlibProbe.config_members}" unless StdlibProbe.config_members == [["da", "en"], "dk", nil, "da"]
 raise "ostruct keyword" unless StdlibProbe.keyword_member == "flat"
+raise "ostruct member named new" unless StdlibProbe.member_named_new == "x"
 raise "ostruct to_h #{StdlibProbe.config_hash}" unless StdlibProbe.config_hash == { locales: ["da", "en"], country_code: "dk" }
 raise "ostruct?" unless StdlibProbe.config?
 raise "ostruct respond_to?" unless StdlibProbe.config_responds?

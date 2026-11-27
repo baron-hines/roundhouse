@@ -2255,9 +2255,11 @@ impl<'a> BodyTyper<'a> {
                 }
                 // OpenStruct answers any name it does not define through
                 // `method_missing`: a member read (nil when unset) or write.
+                // An instance's member may be named like a class method (`OpenStruct.new(new: "x").new`).
                 if id.0.as_str() == "OpenStruct"
                     && !self.classes().get(id).is_some_and(|c| {
-                        c.instance_methods.contains_key(method) || c.class_methods.contains_key(method)
+                        c.instance_methods.contains_key(method)
+                            || (!instance_receiver && c.class_methods.contains_key(method))
                     })
                 {
                     return Ty::Untyped;
