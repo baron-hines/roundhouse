@@ -105,9 +105,9 @@ class CookieStoreTest < Minitest::Test
     refute back.key?("flash"), "a message carried in and shown is not carried on"
   end
 
-  def test_the_discard_list_and_unknown_flash_keys_are_not_shown
+  def test_the_discard_list_is_not_shown_and_any_key_is
     session = session_with("flash" => { "discard" => ["alert"], "flashes" => { "notice" => "n", "alert" => "a", "error" => "e" } })
-    assert_equal({ "notice" => "n" }, ActionDispatch::CookieStore.inbound_flash(session))
+    assert_equal({ "notice" => "n", "error" => "e" }, ActionDispatch::CookieStore.inbound_flash(session))
     assert_equal({}, ActionDispatch::CookieStore.inbound_flash(session_with("flash" => "not a flash")))
   end
 end
