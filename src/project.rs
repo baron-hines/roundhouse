@@ -8739,7 +8739,11 @@ fn apply_database_paths(files: &mut [(String, String)], app: &App) {
         .collect();
     let mut body = String::from("    case env\n");
     for (env, path) in &paths {
-        body.push_str(&format!("    when {env:?} then {path:?}\n"));
+        body.push_str(&format!(
+            "    when {} then {}\n",
+            crate::emit::ruby::expr::ruby_str_literal(env),
+            crate::emit::ruby::expr::ruby_str_literal(path)
+        ));
     }
     body.push_str("    end\n");
     if paths.is_empty() {

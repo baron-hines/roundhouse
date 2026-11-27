@@ -205,7 +205,7 @@ if [[ "$LANE" == spinel ]]; then
     ( cd "$OUT" && BLOG_DB="$OUT/storage/development.sqlite3" PORT="$EMIT_PORT" \
         SECRET_KEY_BASE="$KEY" exec ./build/blog ) > "$LOGS/emit-server.log" 2>&1 &
 else
-    ( cd "$OUT" && RAILS_ENV=development BLOG_DB="$OUT/storage/development.sqlite3" SECRET_KEY_BASE="$KEY" \
+    ( cd "$OUT" && RAILS_ENV=development BLOG_DB=storage/development.sqlite3 SECRET_KEY_BASE="$KEY" \
         exec ruby -S puma -p "$EMIT_PORT" config.ru ) > "$LOGS/emit-server.log" 2>&1 &
 fi
 EMIT_PID=$!

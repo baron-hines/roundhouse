@@ -77,6 +77,13 @@ fn each_environment_names_its_main_database() {
     assert!(!boot.contains("production_cache"), "{boot}");
 }
 
+/// A literal `#{…}` in a file name is the file name, not Ruby interpolation.
+#[test]
+fn a_path_is_written_as_a_literal_ruby_string() {
+    let boot = boot_rb(Some("development:\n  adapter: sqlite3\n  database: 'storage/#{1 + 1}.sqlite3'\n"));
+    assert!(boot.contains(r#"when "development" then "storage/\#{1 + 1}.sqlite3""#), "{boot}");
+}
+
 #[test]
 fn a_computed_database_path_is_left_to_the_default() {
     let boot = boot_rb(Some(DATABASE_YML));
