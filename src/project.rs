@@ -8734,12 +8734,19 @@ fn apply_database_paths(files: &mut [(String, String)], app: &App) {
     if boot.contains(MARK) {
         return;
     }
+    // A computed (ERB) path and a server database have no file here; that environment keeps the default.
+    let paths: Vec<(&str, &str)> = app
+        .databases
+        .iter()
+        .filter(|d| d.primary && d.adapter == crate::database::DatabaseAdapter::Sqlite3)
+        .filter_map(|d| d.database.as_deref().map(|path| (d.env.as_str(), path)))
+        .collect();
     let mut body = String::from("    case env\n");
-    for (env, path) in &app.database_paths {
+    for (env, path) in &paths {
         body.push_str(&format!("    when {env:?} then {path:?}\n"));
     }
     body.push_str("    end\n");
-    if app.database_paths.is_empty() {
+    if paths.is_empty() {
         body = "    nil\n".to_string();
     }
     boot.push_str(&format!(

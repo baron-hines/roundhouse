@@ -41,7 +41,17 @@ module SqliteAdapter
     dir.split("/").each do |seg|
       next if seg.length == 0
       built = (built == "" || built == "/") ? built + seg : built + "/" + seg
-      Dir.mkdir(built) unless Dir.exist?(built)
+      mkdir_parent(built) unless Dir.exist?(built)
+    end
+    nil
+  end
+
+  # Another process may create the same directory between the check and the mkdir.
+  def self.mkdir_parent(path)
+    begin
+      Dir.mkdir(path)
+    rescue Errno::EEXIST
+      raise unless Dir.exist?(path)
     end
     nil
   end
