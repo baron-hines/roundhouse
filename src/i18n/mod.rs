@@ -811,6 +811,12 @@ impl Catalog {
         if ancestors.into_iter().any(|p| self.order.get(p).is_some_and(|children| children.iter().any(|c| c.contains('.')))) {
             return None;
         }
+        // The locale root too: a dotted root key (`"js.a"` beside `js: { a: }`) lands on `key` or above it.
+        if self.order.get("").is_some_and(|roots| {
+            roots.iter().any(|r| r.contains('.') && (r == key || key.starts_with(&format!("{r}."))))
+        }) {
+            return None;
+        }
         let mut out = String::new();
         node(self, key, separators, &mut out)?;
         Some(out)
@@ -1529,6 +1535,9 @@ mod tests {
         // And above the requested node: `js.a.b` is two mappings merged.
         let c = catalog(&[("config/locales/en.yml", "en:\n  js:\n    \"a.b\":\n      extra: \"flat\"\n    a:\n      b:\n        ok: \"nested\"\n")]);
         assert_eq!(c.subtree_json("js.a.b", false), None);
+        // And at the locale root.
+        let c = catalog(&[("config/locales/en.yml", "en:\n  \"js.a\":\n    extra: \"flat\"\n  js:\n    a:\n      ok: \"nested\"\n")]);
+        assert_eq!(c.subtree_json("js.a", false), None);
     }
 
     #[test]
