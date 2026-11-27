@@ -328,6 +328,7 @@ fn expand_nested(
                 parent_span: crate::span::Span::synthetic(),
                 includes: Vec::new(),
                 include_spans: Vec::new(),
+                include_statements: Vec::new(),
                 methods: Vec::new(),
                 nullable_columns: Vec::new(),
                 origin: None,

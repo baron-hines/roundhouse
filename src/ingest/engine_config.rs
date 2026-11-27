@@ -1401,6 +1401,7 @@ fn carry_boot_mixin(app: &mut App, statement: &Expr) -> bool {
     match app.library_classes.iter_mut().find(|lc| lc.name == name) {
         Some(lc) => {
             for m in mixins {
+                crate::dialect::include_statements::appended(&mut lc.include_statements, &lc.include_spans, lc.includes.len(), statement.span);
                 lc.includes.push(m);
                 lc.include_spans.push(statement.span);
             }
@@ -1417,6 +1418,7 @@ fn carry_boot_mixin(app: &mut App, statement: &Expr) -> bool {
                 parent_span: statement.span,
                 includes: mixins,
                 include_spans: vec![statement.span; count],
+                include_statements: Vec::new(),
                 methods: Vec::new(),
                 nullable_columns: Vec::new(),
                 origin: None,

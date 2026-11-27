@@ -5899,12 +5899,25 @@ fn spanned_include_statements(lc: &LibraryClass) -> Vec<(crate::span::Span, Vec<
     if lc.include_spans.len() != lc.includes.len() {
         return lc.includes.iter().map(|m| (crate::span::Span::synthetic(), vec![m.clone()])).collect();
     }
+    // A record of the statements, where spans alone don't tell them apart (a `class_eval` loop's, #2278); out of step,
+    // it's not read. In step with the spans but not with it, a mutation kept the one and not the other.
+    let ids = (lc.include_statements.len() == lc.includes.len()).then_some(&lc.include_statements);
+    debug_assert!(
+        lc.include_statements.is_empty() || ids.is_some(),
+        "{}: include_statements ({}) out of step with includes ({}) and include_spans",
+        lc.name.0,
+        lc.include_statements.len(),
+        lc.includes.len()
+    );
     let mut out: Vec<(crate::span::Span, Vec<crate::ident::ClassId>)> = Vec::new();
-    for (module, span) in lc.includes.iter().zip(&lc.include_spans) {
+    let mut last_id = None;
+    for (i, (module, span)) in lc.includes.iter().zip(&lc.include_spans).enumerate() {
+        let id = ids.map(|ids| ids[i]);
         match out.last_mut() {
-            Some((last, group)) if last == span && !span.is_synthetic() => group.push(module.clone()),
+            Some((last, group)) if last == span && !span.is_synthetic() && id == last_id => group.push(module.clone()),
             _ => out.push((*span, vec![module.clone()])),
         }
+        last_id = id;
     }
     out
 }

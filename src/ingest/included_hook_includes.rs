@@ -137,6 +137,7 @@ pub(super) fn carry(app: &mut App) {
         // The include's span is the statement that reached the hook; the
         // include is not written in this file, so a synthetic one keeps it
         // out of the source-ordered body.
+        crate::dialect::include_statements::appended(&mut lc.include_statements, &lc.include_spans, lc.includes.len(), crate::span::Span::synthetic());
         lc.includes.push(module);
         lc.include_spans.push(crate::span::Span::synthetic());
     }

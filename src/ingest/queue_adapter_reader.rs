@@ -32,6 +32,7 @@ pub(super) fn synthesize(app: &mut App) {
             crate::span::Span::synthetic(),
             ExprNode::Send { recv: None, method: Symbol::from("extend"), args: vec![module], block: None, parenthesized: false },
         ));
+        crate::dialect::include_statements::appended(&mut lc.include_statements, &lc.include_spans, lc.includes.len(), crate::span::Span::synthetic());
         lc.includes.push(enqueuing);
         lc.include_spans.push(crate::span::Span::synthetic());
     }

@@ -314,6 +314,7 @@ fn carry_receiver_mixins(body: Node<'_>, hook: &str, scope: &[String], file: &st
                     parent_span: span,
                     includes: Vec::new(),
                     include_spans: Vec::new(),
+                    include_statements: Vec::new(),
                     methods: Vec::new(),
                     nullable_columns: Vec::new(),
                     origin: None,

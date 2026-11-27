@@ -67,6 +67,7 @@ fn error_tables_class(data: &LabelData) -> crate::dialect::LibraryClass {
         parent_span: Default::default(),
         includes: Vec::new(),
         include_spans: Vec::new(),
+        include_statements: Vec::new(),
         methods: vec![table_method("names", &data.names), table_method("overrides", &data.overrides)],
         nullable_columns: Vec::new(),
         origin: None,

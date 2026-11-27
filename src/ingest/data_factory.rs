@@ -218,7 +218,7 @@ pub(super) fn collect(
             parent: Some(ClassId(Symbol::from("Data"))),
             parent_span: node_span(&call.receiver().unwrap(), file),
             includes,
-            include_spans,
+            include_spans, include_statements: Vec::new(),
             methods,
             class_ivar_initializers: Vec::new(),
             nullable_columns: Vec::new(),
