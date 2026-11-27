@@ -59,21 +59,19 @@ pub(in crate::analyze) fn mark(
     };
     // Boot and file-level code can define on a class from outside its body (`Box.define_singleton_method(:x=) { }`).
     let mut touched: HashSet<String> = HashSet::default();
-    let statements = app.boot_program.iter().chain(app.file_programs.iter().flat_map(|p| {
-        p.items.iter().filter_map(|i| match i {
-            crate::app::ProgramItem::Statement(e) => Some(e),
-            _ => None,
-        })
-    }));
-    for stmt in statements {
+    for stmt in &app.boot_program {
         metaprogrammed_constants(stmt, &mut touched);
     }
+    for program in &app.file_programs {
+        program_items_touch(&program.items, &mut touched);
+    }
     // An initializer statement the ingest does not carry is in neither, so config/ is read as text too.
-    let config_texts: Vec<&str> = app
+    // Whitespace dropped: Ruby takes `Box .define_singleton_method` and a call continued on the next line alike.
+    let config_texts: Vec<String> = app
         .sources
         .iter()
         .filter(|f| f.path.contains("config/"))
-        .map(|f| f.text.as_str())
+        .map(|f| f.text.split_whitespace().collect::<String>())
         .collect();
     let touched_from_outside = |id: &ClassId| {
         let name = id.0.as_str();
@@ -167,4 +165,19 @@ fn metaprogrammed_constants(expr: &Expr, out: &mut HashSet<String>) {
         }
     }
     expr.node.for_each_child(&mut |child| metaprogrammed_constants(child, out));
+}
+
+/// A file program's statements, a file-level `if`/`unless`'s condition and both its branches included.
+fn program_items_touch(items: &[crate::app::ProgramItem], out: &mut HashSet<String>) {
+    for item in items {
+        match item {
+            crate::app::ProgramItem::Statement(e) => metaprogrammed_constants(e, out),
+            crate::app::ProgramItem::Branch { condition, then_items, else_items, .. } => {
+                metaprogrammed_constants(condition, out);
+                program_items_touch(then_items, out);
+                program_items_touch(else_items, out);
+            }
+            _ => {}
+        }
+    }
 }
