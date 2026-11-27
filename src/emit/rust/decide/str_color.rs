@@ -1076,6 +1076,7 @@ mod tests {
             parent_span: Default::default(),
             includes: vec![],
             include_spans: Vec::new(),
+            include_statements: Vec::new(),
             methods,
             nullable_columns: Vec::new(),
             origin: None,

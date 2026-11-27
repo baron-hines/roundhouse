@@ -919,6 +919,7 @@ fn build_library_class(
         parent_span: Default::default(),
         includes: tm.includes.clone(),
         include_spans: Vec::new(),
+        include_statements: Vec::new(),
         methods,
         nullable_columns: Vec::new(),
         origin: None,

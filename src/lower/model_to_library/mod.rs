@@ -805,6 +805,7 @@ fn model_class(model: &Model, mut methods: Vec<MethodDef>, table: Option<&Table>
         // real span (`analyze/mod.rs`'s model loop uses it directly,
         // not this projection), so this envelope needs none.
         include_spans: Vec::new(),
+        include_statements: Vec::new(),
         methods,
         nullable_columns: nullable_column_names(table),
         origin: None,

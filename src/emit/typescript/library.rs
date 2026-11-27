@@ -219,6 +219,7 @@ fn synthesize_module_lc(
         parent_span: Default::default(),
         includes: Vec::new(),
         include_spans: Vec::new(),
+        include_statements: Vec::new(),
         methods,
         nullable_columns: Vec::new(),
         origin: None,
@@ -504,6 +505,7 @@ fn collect_imports_for_function(
         parent_span: Default::default(),
         includes: Vec::new(),
         include_spans: Vec::new(),
+        include_statements: Vec::new(),
         nullable_columns: Vec::new(),
         methods: vec![crate::dialect::MethodDef {
             visibility: crate::dialect::MethodVisibility::Public,

@@ -1345,6 +1345,7 @@ fn compile_components<V: crate::vfs::Vfs + ?Sized>(app: &mut App, vfs: &V) {
                     && let Some(lc) = app.library_classes.iter_mut().find(|c| &c.name == class)
                     && !lc.includes.iter().any(|i| i.0.as_str() == "RouteHelpers")
                 {
+                    crate::dialect::include_statements::added(&mut lc.include_statements, lc.includes.len(), 0);
                     lc.includes.insert(0, crate::ident::ClassId(crate::ident::Symbol::from("RouteHelpers")));
                     lc.include_spans.insert(0, crate::span::Span::synthetic());
                 }

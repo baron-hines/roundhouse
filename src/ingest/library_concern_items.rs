@@ -118,6 +118,7 @@ pub(super) fn splice(app: &mut App) {
         }
         let lc = &mut app.library_classes[i];
         for (id, span) in added {
+            crate::dialect::include_statements::appended(&mut lc.include_statements, &lc.include_spans, lc.includes.len(), span);
             lc.includes.push(id);
             lc.include_spans.push(span);
         }

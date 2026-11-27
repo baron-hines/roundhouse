@@ -516,7 +516,7 @@ pub(super) fn install_boot_stores(app: &mut crate::App, stores: Vec<InitializerS
             app.library_classes.push(LibraryClass {
                 name: crate::ident::ClassId(Symbol::from("Object")),
                 is_module: false, parent: None, parent_span: crate::span::Span::synthetic(),
-                includes: Vec::new(), include_spans: Vec::new(), methods: Vec::new(),
+                includes: Vec::new(), include_spans: Vec::new(), include_statements: Vec::new(), methods: Vec::new(),
                 nullable_columns: Vec::new(), origin: None, constants,
                 conditional_definitions: Vec::new(), unknown_calls: Vec::new(), class_ivar_initializers: Vec::new(),
             });

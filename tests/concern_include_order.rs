@@ -812,3 +812,97 @@ fn a_loops_alias_of_the_concerns_def_copies_no_empty_method() {
     let refused = roundhouse::ingest::ingest_app_from_tree(tree).map(|_| ()).expect_err("the keyword alias is refused");
     assert!(format!("{refused:?}").contains("alias names a method this body has not defined"), "{refused:?}");
 }
+
+/// The `label` of each module a class_eval loop test includes.
+fn labelled(file: &str, module: &str, label: &str) -> (String, String) {
+    (file.to_string(), format!("module {module}\n  def label\n    \"{label}\"\n  end\nend\n"))
+}
+
+/// A loop's elements run in order, each string's `include` after the
+/// previous one's: `[Single, LoopTwoHost, LoopTwoY, LoopTwoX]`, so `label`
+/// is LoopTwoY's (#2278).
+#[test]
+fn a_class_eval_loops_elements_include_in_order() {
+    let host = ("loop_two_host", "module LoopTwoHost\n  def loop_two_host_own\n    \"own\"\n  end\n\n  %w[LoopTwoX LoopTwoY].each { |m| class_eval \"include #{m}\" }\nend\n");
+    let x = labelled("loop_two_x", "LoopTwoX", "loop x");
+    let y = labelled("loop_two_y", "LoopTwoY", "loop y");
+    single_case(&[(x.0.as_str(), x.1.as_str()), (y.0.as_str(), y.1.as_str()), host], "  include LoopTwoHost\n", "label", "loop y");
+}
+
+/// One string's `include` statements, `;`-separated, run in order: the
+/// last, the host's nested `Leaf`, is nearest (#2278).
+#[test]
+fn a_class_eval_loop_strings_include_statements_run_in_order() {
+    let host = (
+        "loop_five_host",
+        "module LoopFiveHost\n  def loop_five_host_own\n    \"own\"\n  end\n\n  module Leaf\n    def label\n      \"five leaf\"\n    end\n  end\n\n  %w[x].each { |m| class_eval \"include LoopFiveA; include LoopFiveB; include LoopFiveC; include LoopFiveD; include Leaf\" }\nend\n",
+    );
+    let mods: Vec<(String, String)> = ["a", "b", "c", "d"]
+        .iter()
+        .map(|n| labelled(&format!("loop_five_{n}"), &format!("LoopFive{}", n.to_uppercase()), &format!("five {n}")))
+        .collect();
+    let mut files: Vec<(&str, &str)> = mods.iter().map(|(f, s)| (f.as_str(), s.as_str())).collect();
+    files.push(host);
+    single_case(&files, "  include LoopFiveHost\n", "label", "five leaf");
+}
+
+/// Two `include` lines in one element's string are two statements, run in
+/// order: LoopLinesB is nearest (#2278).
+#[test]
+fn a_class_eval_loop_strings_include_lines_are_two_statements() {
+    let host = ("loop_lines_host", "module LoopLinesHost\n  def loop_lines_host_own\n    \"own\"\n  end\n\n  %w[x].each { |m| class_eval \"include LoopLinesA\\ninclude LoopLinesB\" }\nend\n");
+    let a = labelled("loop_lines_a", "LoopLinesA", "lines a");
+    let b = labelled("loop_lines_b", "LoopLinesB", "lines b");
+    single_case(&[(a.0.as_str(), a.1.as_str()), (b.0.as_str(), b.1.as_str()), host], "  include LoopLinesHost\n", "label", "lines b");
+}
+
+/// `include A, B` in a loop's string stays one statement: Ruby includes
+/// its arguments last first, so LoopCommaA is nearest (#2278).
+#[test]
+fn a_class_eval_loop_strings_include_of_two_modules_stays_one_statement() {
+    let host = ("loop_comma_host", "module LoopCommaHost\n  def loop_comma_host_own\n    \"own\"\n  end\n\n  %w[x].each { |m| class_eval \"include LoopCommaA, LoopCommaB\" }\nend\n");
+    let a = labelled("loop_comma_a", "LoopCommaA", "comma a");
+    let b = labelled("loop_comma_b", "LoopCommaB", "comma b");
+    single_case(&[(a.0.as_str(), a.1.as_str()), (b.0.as_str(), b.1.as_str()), host], "  include LoopCommaHost\n", "label", "comma a");
+}
+
+/// The Ruby emit writes a loop's two `include` statements as two lines in
+/// the order they ran, not as one `include LoopTwoX, LoopTwoY`, which
+/// Ruby would run last first (#2278).
+#[test]
+fn the_ruby_emit_writes_a_loops_include_statements_as_two_lines() {
+    let host = ("loop_two_host", "module LoopTwoHost\n  def loop_two_host_own\n    \"own\"\n  end\n\n  %w[LoopTwoX LoopTwoY].each { |m| class_eval \"include #{m}\" }\nend\n");
+    let x = labelled("loop_two_x", "LoopTwoX", "loop x");
+    let y = labelled("loop_two_y", "LoopTwoY", "loop y");
+    let (emitted, errors) = single_app(&[(x.0.as_str(), x.1.as_str()), (y.0.as_str(), y.1.as_str()), host], "  include LoopTwoHost\n", "label").emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let path = emitted.join("app/models/loop_two_host.rb");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    assert!(text.contains("  include LoopTwoX\n  include LoopTwoY\n"), "{text}");
+}
+
+/// A loop host whose includes are filtered afterwards without their spans
+/// (`included_extend` drops the include of a hook that only extends its
+/// includer): the class reads its include statements as main does, one per
+/// module, not from a record out of step with them (#2278).
+#[test]
+fn a_loop_hosts_include_filtered_alone_falls_back_to_the_span_reading() {
+    let host = (
+        "loop_filter_host",
+        "module LoopFilterHost\n  def loop_filter_host_own\n    \"own\"\n  end\n\n  %w[LoopFilterHook LoopFilterX LoopFilterY].each { |m| class_eval \"include #{m}\" }\nend\n",
+    );
+    let hook = ("loop_filter_hook", "module LoopFilterHook\n  def self.included(base)\n    base.instance_eval { extend LoopFilterMethods }\n  end\nend\n");
+    let methods = ("loop_filter_methods", "module LoopFilterMethods\n  def greeting\n    \"hi\"\n  end\nend\n");
+    let x = labelled("loop_filter_x", "LoopFilterX", "filter x");
+    let y = labelled("loop_filter_y", "LoopFilterY", "filter y");
+    let files = [hook, methods, (x.0.as_str(), x.1.as_str()), (y.0.as_str(), y.1.as_str()), host];
+    let mut tree: std::collections::HashMap<std::path::PathBuf, Vec<u8>> = std::collections::HashMap::new();
+    for (file, source) in &files {
+        tree.insert(format!("app/controllers/concerns/{file}.rb").into(), source.as_bytes().to_vec());
+    }
+    let app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest");
+    let host_class = app.library_classes.iter().find(|c| c.name.0.as_str() == "LoopFilterHost").expect("LoopFilterHost");
+    let includes: Vec<&str> = host_class.includes.iter().map(|i| i.0.as_str()).collect();
+    assert_eq!(includes, ["LoopFilterX", "LoopFilterY"], "the hook's include is filtered out");
+    single_case(&files, "  include LoopFilterHost\n", "label", "filter y");
+}

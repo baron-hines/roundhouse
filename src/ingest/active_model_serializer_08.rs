@@ -569,6 +569,8 @@ pub(super) fn lower(app: &mut crate::App, sources: &[SourceFile]) -> IngestResul
         let spanned = lc.include_spans.len() == lc.includes.len();
         let mut at = 0;
         let spans = std::mem::take(&mut lc.include_spans);
+        let keep: Vec<bool> = lc.includes.iter().map(|i| i.0.as_str().trim_start_matches("::") != "ActiveModel::SerializerSupport").collect();
+        crate::dialect::include_statements::retained(&mut lc.include_statements, &keep);
         lc.includes.retain(|i| {
             let keep = i.0.as_str().trim_start_matches("::") != "ActiveModel::SerializerSupport";
             if spanned && keep {

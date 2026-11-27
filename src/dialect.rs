@@ -1206,6 +1206,13 @@ pub struct LibraryClass {
     /// vec, same as a missing `parent_span`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub include_spans: Vec<Span>,
+    /// The `include` statement each of `includes` came from, same length and order, where spans can't tell them
+    /// apart: every statement a `class_eval` loop's strings run is placed at the loop (#2278). Neighbouring includes
+    /// of one id and span are one statement (`include A, B`). Empty, or of another length, means none is recorded:
+    /// the include statements are read from the spans alone, as for a class without such a loop. See
+    /// `include_statements`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include_statements: Vec<u32>,
     /// All instance + class methods in the class. `attr_reader` /
     /// `attr_writer` / `attr_accessor` are lowered to synthetic
     /// `MethodDef`s at ingest time (not preserved as attr declarations
@@ -2836,5 +2843,90 @@ impl ConditionalDefinitions {
     /// one, defines `method`.
     pub fn contains(&self, method: &MethodDef) -> bool {
         self.arms.iter().any(|arm| arm.methods.iter().any(|m| m.is(method)) || arm.nested.iter().any(|n| n.contains(method)))
+    }
+}
+
+/// Keeping `LibraryClass::include_statements` (or a body's) in step with `includes` where an include is added,
+/// dropped or moved. A record out of step is never read (the spans alone are), so each helper either keeps it in
+/// step or clears it: a class falls back to the span-only reading, never to a wrong order.
+pub mod include_statements {
+    use crate::span::Span;
+
+    /// One id per include from its span alone: a new statement wherever the span changes or is synthetic.
+    pub fn of_spans(spans: &[Span]) -> Vec<u32> {
+        let mut ids = Vec::with_capacity(spans.len());
+        let mut id = 0u32;
+        for (i, span) in spans.iter().enumerate() {
+            if i > 0 && (span.is_synthetic() || *span != spans[i - 1]) {
+                id += 1;
+            }
+            ids.push(id);
+        }
+        ids
+    }
+
+    /// An id no include has yet.
+    pub fn fresh(ids: &[u32]) -> u32 {
+        ids.iter().max().map_or(0, |max| max + 1)
+    }
+
+    /// An include inserted at `at` among `len_before`, as a statement of its own.
+    pub fn added(ids: &mut Vec<u32>, len_before: usize, at: usize) {
+        if ids.is_empty() {
+            return;
+        }
+        if ids.len() != len_before || at > ids.len() {
+            ids.clear();
+            return;
+        }
+        let id = fresh(ids);
+        ids.insert(at, id);
+    }
+
+    /// An include appended with `span`, after `spans`: part of the last statement when it shares that statement's
+    /// (non-synthetic) span, as the span-only reading would take it, else a statement of its own.
+    pub fn appended(ids: &mut Vec<u32>, spans: &[Span], len_before: usize, span: Span) {
+        if ids.is_empty() {
+            return;
+        }
+        if ids.len() != len_before {
+            ids.clear();
+            return;
+        }
+        let id = match (ids.last(), spans.last()) {
+            (Some(&last), Some(prev)) if spans.len() == len_before && *prev == span && !span.is_synthetic() => last,
+            _ => fresh(ids),
+        };
+        ids.push(id);
+    }
+
+    /// The includes kept by `keep`, one flag per include before the filter.
+    pub fn retained(ids: &mut Vec<u32>, keep: &[bool]) {
+        if ids.is_empty() {
+            return;
+        }
+        if ids.len() != keep.len() {
+            ids.clear();
+            return;
+        }
+        let mut k = keep.iter();
+        ids.retain(|_| *k.next().unwrap());
+    }
+
+    /// `other`'s includes appended after `spans`' (both with their spans, in step with their includes): a record on
+    /// either side is kept, the other side's statements read from its spans; another body's ids never meet this one's.
+    pub fn extended(ids: &mut Vec<u32>, spans: &[Span], len: usize, other: Vec<u32>, other_spans: &[Span], other_len: usize) {
+        if ids.is_empty() && other.is_empty() {
+            return;
+        }
+        let mine = if ids.len() == len { std::mem::take(ids) } else if ids.is_empty() && spans.len() == len { of_spans(spans) } else { Vec::new() };
+        let theirs = if other.len() == other_len { other } else if other.is_empty() && other_spans.len() == other_len { of_spans(other_spans) } else { Vec::new() };
+        if mine.len() != len || theirs.len() != other_len {
+            ids.clear();
+            return;
+        }
+        let offset = fresh(&mine);
+        *ids = mine;
+        ids.extend(theirs.into_iter().map(|id| id + offset));
     }
 }

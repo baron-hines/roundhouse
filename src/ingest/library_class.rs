@@ -220,7 +220,7 @@ pub fn class_eval_openings(source: &[u8], file: &str) -> IngestResult<Vec<ClassE
         let owner = ClassId(Symbol::from(path.join("::")));
         let DeclBody {
             includes,
-            include_spans,
+            include_spans, include_statements,
             methods,
             constants,
             unknown_calls,
@@ -238,7 +238,7 @@ pub fn class_eval_openings(source: &[u8], file: &str) -> IngestResult<Vec<ClassE
             parent: None,
             parent_span: Span::synthetic(),
             includes,
-            include_spans,
+            include_spans, include_statements,
             methods,
             nullable_columns: Vec::new(),
             origin: None,
@@ -840,7 +840,7 @@ fn data_block_classes(
         let name = ClassId(Symbol::from(format!("{}::{}", owner.0.as_str(), constant_id_str(&cw.name()))));
         // Not a carried marker: a Data block's `private_class_method :new` names the constructor Data defines.
         let visibility = Visibility::resolve_library(block.body().as_ref(), file, None, Some(&name))?;
-        let DeclBody { includes, include_spans, methods, constants, unknown_calls, class_initializers, class_attributes: _, conditional_definitions } =
+        let DeclBody { includes, include_spans, include_statements, methods, constants, unknown_calls, class_initializers, class_attributes: _, conditional_definitions } =
             walk_decl_body_with_visibility(block.body(), &name, file, DeclBodyMode::Instance, &visibility)?;
         debug_assert!(includes.is_empty() && constants.is_empty() && unknown_calls.is_empty());
         out.push(LibraryClass {
@@ -849,7 +849,7 @@ fn data_block_classes(
             parent: None,
             parent_span: Span::synthetic(),
             includes,
-            include_spans,
+            include_spans, include_statements,
             methods,
             nullable_columns: Vec::new(),
             origin: None,
@@ -965,7 +965,7 @@ fn data_class(statement: &ruby_prism::Node<'_>, scope: Option<&ClassId>, file: &
         }
     }
     let visibility = Visibility::resolve_data(body().as_ref(), file, &owner)?;
-    let DeclBody { includes, include_spans, methods, constants, mut unknown_calls, mut class_initializers, class_attributes: _, conditional_definitions } =
+    let DeclBody { includes, include_spans, include_statements, methods, constants, mut unknown_calls, mut class_initializers, class_attributes: _, conditional_definitions } =
         walk_decl_body_with_visibility(body(), &owner, file, DeclBodyMode::Instance, &visibility)?;
     class_initializers.extend(take_class_ivar_initializers(&mut unknown_calls));
     for call in &mut unknown_calls {
@@ -980,7 +980,7 @@ fn data_class(statement: &ruby_prism::Node<'_>, scope: Option<&ClassId>, file: &
         parent: None,
         parent_span: Span::synthetic(),
         includes,
-        include_spans,
+        include_spans, include_statements,
         methods,
         nullable_columns: Vec::new(),
         origin: Some(crate::dialect::LibraryClassOrigin::DataDefine {
@@ -1436,7 +1436,7 @@ pub(super) fn library_class_and_struct_base(
 
     let DeclBody {
         mut includes,
-        mut include_spans,
+        mut include_spans, mut include_statements,
         mut methods,
         mut constants,
         mut unknown_calls,
@@ -1494,6 +1494,7 @@ pub(super) fn library_class_and_struct_base(
         includes.retain(|_| *k.next().unwrap());
         let mut k = keep.iter();
         include_spans.retain(|_| *k.next().unwrap());
+        crate::dialect::include_statements::retained(&mut include_statements, &keep);
         let mut synthesized = synth_sorbet_struct_methods(&owner, &members, comparable, true);
         synthesized.append(&mut methods);
         methods = synthesized;
@@ -1558,7 +1559,7 @@ pub(super) fn library_class_and_struct_base(
                 source_parent_span
             },
             includes,
-            include_spans,
+            include_spans, include_statements,
             methods,
             nullable_columns: Vec::new(),
             origin: None,
@@ -2518,6 +2519,7 @@ fn struct_library_class(base: ClassId, methods: Vec<MethodDef>, origin: crate::d
         parent_span: Span::synthetic(),
         includes: Vec::new(),
         include_spans: Vec::new(),
+        include_statements: Vec::new(),
         methods,
         nullable_columns: Vec::new(),
         origin: Some(origin),
@@ -2729,6 +2731,14 @@ fn struct_constant_class(owner: &ClassId, spec: StructConstant<'_>, file: &str) 
     if spec.body.is_some() {
         let body = walk_decl_body(spec.body, &id, file, DeclBodyMode::Instance)?;
         class.methods.extend(body.methods);
+        crate::dialect::include_statements::extended(
+            &mut class.include_statements,
+            &class.include_spans,
+            class.includes.len(),
+            body.include_statements,
+            &body.include_spans,
+            body.includes.len(),
+        );
         class.includes.extend(body.includes);
         class.include_spans.extend(body.include_spans);
         class.constants.extend(body.constants);
@@ -2760,7 +2770,7 @@ pub(super) fn library_class_from_module_node_with_scope(
     let visibility = Visibility::resolve_library(module.body().as_ref(), file, Some(&owner), None)?;
     let DeclBody {
         includes,
-        include_spans,
+        include_spans, include_statements,
         methods,
         constants,
         mut unknown_calls,
@@ -2776,7 +2786,7 @@ pub(super) fn library_class_from_module_node_with_scope(
         parent: None,
         parent_span: Span::synthetic(),
         includes,
-        include_spans,
+        include_spans, include_statements,
         methods,
         nullable_columns: Vec::new(),
         origin: None,
@@ -2925,6 +2935,8 @@ pub(super) struct DeclBody {
     /// Parallel to `includes`: the span of each `include` call, so an
     /// unresolved one can be pointed at.
     pub(super) include_spans: Vec<Span>,
+    /// `LibraryClass::include_statements`, for the same includes.
+    pub(super) include_statements: Vec<u32>,
     pub(super) methods: Vec<MethodDef>,
     pub(super) constants: Vec<(Symbol, Expr)>,
     pub(super) unknown_calls: Vec<Expr>,
@@ -2938,6 +2950,14 @@ pub(super) struct DeclBody {
 
 impl DeclBody {
     fn extend(&mut self, other: Self) {
+        crate::dialect::include_statements::extended(
+            &mut self.include_statements,
+            &self.include_spans,
+            self.includes.len(),
+            other.include_statements,
+            &other.include_spans,
+            other.includes.len(),
+        );
         self.includes.extend(other.includes);
         self.include_spans.extend(other.include_spans);
         self.methods.extend(other.methods);
@@ -4996,7 +5016,7 @@ fn walk_decl_body_hosted<'pr>(
         // concern's hook (#2278): the wrapper extends it as well, and its body is walked with this body's own `def`
         // names (`walk_decl_body_hosted`), so the hoist keeps a colliding hook def in the block, as it does for
         // this body's own `included do`. The wrapper's `extend` is not the string's.
-        let (includes, unknown_calls, methods) = match &concern_direct_defs {
+        let (includes, string_include_spans, unknown_calls, methods) = match &concern_direct_defs {
             Some(direct) => {
                 let prefix = "class RoundhouseClassEval\nextend ActiveSupport::Concern\n";
                 let wrapped = format!("{prefix}{source}\nend\n");
@@ -5014,14 +5034,14 @@ fn walk_decl_body_hosted<'pr>(
                 // As a class body's are: its `@x = …` statements are not class-body calls.
                 take_class_ivar_initializers(&mut walked.unknown_calls);
                 walked.unknown_calls.retain(|call| call.span.is_synthetic() || call.span.start >= prefix.len() as u32);
-                (walked.includes, walked.unknown_calls, walked.methods)
+                (walked.includes, walked.include_spans, walked.unknown_calls, walked.methods)
             }
             None => {
                 let wrapped = format!("class RoundhouseClassEval\n{source}\nend\n");
                 let (parsed, _) = super::prism::scope(|| super::ingest_library_classes(wrapped.as_bytes(), file));
                 let mut classes = parsed?;
                 let Some(class) = classes.pop() else { continue };
-                (class.includes, class.unknown_calls, class.methods)
+                (class.includes, class.include_spans, class.unknown_calls, class.methods)
             }
         };
         // The string's `included` blocks, at their offsets in it, and a span inside the loop's own for them and the
@@ -5049,15 +5069,33 @@ fn walk_decl_body_hosted<'pr>(
         } else {
             out.includes.len()
         };
-        for include in &includes {
+        // Every statement the strings run has the loop's span, so each `include` statement is told apart by its id
+        // (`include_statements`, #2278): one element's after the previous element's, `include A` then `include B`
+        // in one string, and `include A, B` as one statement, as the wrapped string's own spans group them. The
+        // body's includes written before get theirs from their spans, as the include statements reader would read
+        // them.
+        if spanned && out.include_statements.len() != out.includes.len() {
+            out.include_statements = crate::dialect::include_statements::of_spans(&out.include_spans);
+        }
+        let mut id = crate::dialect::include_statements::fresh(&out.include_statements);
+        let string_ids = (string_include_spans.len() == includes.len())
+            .then(|| crate::dialect::include_statements::of_spans(&string_include_spans));
+        for (i, include) in includes.iter().enumerate() {
+            if i > 0 && string_ids.as_ref().is_none_or(|ids| ids[i] != ids[i - 1]) {
+                id += 1;
+            }
             if spanned {
                 out.includes.insert(at, include.clone());
                 out.include_spans.insert(at, at_loop);
+                out.include_statements.insert(at, id);
                 at += 1;
             } else {
                 out.includes.push(include.clone());
                 out.include_spans.push(at_loop);
             }
+        }
+        if !spanned {
+            out.include_statements.clear();
         }
         // Not looked up at their own spans: those offsets are the wrapped string's, not the file's, so a constant is read as written.
         fn mark_constants(e: &mut crate::expr::Expr) {
@@ -9132,6 +9170,7 @@ fn file_constants_holder(file: &str, constants: &[(Symbol, Expr)]) -> LibraryCla
         parent_span: Default::default(),
         includes: Vec::new(),
         include_spans: Vec::new(),
+        include_statements: Vec::new(),
         methods: Vec::new(),
         nullable_columns: Vec::new(),
         origin: Some(crate::dialect::LibraryClassOrigin::FileConstants),

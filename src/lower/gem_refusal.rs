@@ -172,8 +172,11 @@ fn refuse_library_class(
     }
     let mut kept = Vec::new();
     let mut kept_spans = Vec::new();
+    let mut keep = Vec::with_capacity(lc.includes.len());
     for (i, id) in lc.includes.iter().enumerate() {
-        if class_id_under_root(Some(id), refusal.root) && !resolves_in_scope(lc.name.0.as_str(), id.0.as_str(), known) {
+        let refused = class_id_under_root(Some(id), refusal.root) && !resolves_in_scope(lc.name.0.as_str(), id.0.as_str(), known);
+        keep.push(!refused);
+        if refused {
             let span = lc.include_spans.get(i).copied().unwrap_or(Span::synthetic());
             report_decl(span, target, refusal, id.0.as_str());
         } else {
@@ -183,6 +186,7 @@ fn refuse_library_class(
             }
         }
     }
+    crate::dialect::include_statements::retained(&mut lc.include_statements, &keep);
     lc.includes = kept;
     if !lc.include_spans.is_empty() {
         lc.include_spans = kept_spans;

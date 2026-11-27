@@ -126,7 +126,7 @@ fn opening(name: String, includes: Vec<ClassId>, include_spans: Vec<Span>, const
         parent: None,
         parent_span: Span::synthetic(),
         includes,
-        include_spans,
+        include_spans, include_statements: Vec::new(),
         methods: Vec::new(),
         nullable_columns: Vec::new(),
         origin: None,

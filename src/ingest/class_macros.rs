@@ -3114,6 +3114,7 @@ fn made_class(owner: &ClassId, name: &Symbol, base: &[Symbol], body: bool, call:
         parent_span: Span::synthetic(),
         includes: Vec::new(),
         include_spans: Vec::new(),
+        include_statements: Vec::new(),
         methods: Vec::new(),
         nullable_columns: Vec::new(),
         origin: None,
@@ -3154,6 +3155,7 @@ fn made_class(owner: &ClassId, name: &Symbol, base: &[Symbol], body: bool, call:
     let decl = find.found.ok_or("its block is not found in its source")??;
     class.includes = decl.includes;
     class.include_spans = decl.include_spans;
+    class.include_statements = decl.include_statements;
     class.methods = decl.methods;
     class.constants = decl.constants;
     class.conditional_definitions = decl.conditional_definitions;
