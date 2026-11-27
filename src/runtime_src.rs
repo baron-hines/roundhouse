@@ -18,7 +18,7 @@ use crate::expr::{Expr, ExprNode, LValue};
 use crate::ident::{ClassId, Symbol};
 use crate::rbs::parse_signatures;
 use crate::span::Span;
-use crate::ty::Ty;
+use crate::ty::{FnTy, Ty};
 
 const VIRTUAL_FILE: &str = "<runtime>";
 
@@ -44,24 +44,31 @@ fn ingest_expr(node: &Node<'_>, file: &str) -> Result<Expr, crate::ingest::Inges
 ///   `CONST = { k: v, ... }.freeze`
 ///   `CONST = [a, b, ...]`
 ///   `CONST = [a, b, ...].freeze`
+///   `CONST = OTHER`, where `OTHER` is an earlier constant of the same
+///   source with one of these types, looked up in the enclosing
+///   module or class and then in each scope around it
 /// The returned map keys are the constant's last-segment name; values
 /// are the inferred Ty (Hash[K, V] / Array[T] / etc.). Used by the
 /// body-typer's `ExprNode::Const` arm so dispatch on a constant
 /// (`STATUS_CODES.fetch(...)`) lands in the right primitive method
 /// table.
-pub fn parse_module_constants(source: &str) -> Result<std::collections::HashMap<Symbol, Ty>, String> {
+pub fn parse_module_constants(source: &str) -> Result<crate::det::HashMap<Symbol, Ty>, String> {
     Ok(parse_module_constant_tables(source, false).0)
 }
 
-type ConstantTypes = std::collections::HashMap<Symbol, Ty>;
-type OwnedConstantTypes = std::collections::HashMap<ClassId, ConstantTypes>;
+type ConstantTypes = crate::det::HashMap<Symbol, Ty>;
+type OwnedConstantTypes = crate::det::HashMap<ClassId, ConstantTypes>;
 
 pub(crate) fn parse_module_constant_tables(source: &str, with_owners: bool) -> (ConstantTypes, OwnedConstantTypes) {
-    let mut global = ConstantTypes::new();
-    let mut by_owner = OwnedConstantTypes::new();
+    let mut global = ConstantTypes::default();
+    let mut by_owner = OwnedConstantTypes::default();
     let result = parse(source.as_bytes());
     if result.errors().count() == 0 {
-        walk_constants(&result.node(), "", &mut global, &mut by_owner, with_owners);
+        walk_constants(&result.node(), "", &mut global, &mut by_owner);
+    }
+    by_owner.remove(&ClassId(Symbol::from("")));
+    if !with_owners {
+        by_owner.clear();
     }
     (global, by_owner)
 }
@@ -269,15 +276,14 @@ fn walk_constants(
     owner: &str,
     global: &mut ConstantTypes,
     by_owner: &mut OwnedConstantTypes,
-    with_owners: bool,
 ) {
     if let Some(program) = node.as_program_node() {
         for stmt in program.statements().body().iter() {
-            collect_constant_from_stmt(&stmt, owner, global, by_owner, with_owners);
+            collect_constant_from_stmt(&stmt, owner, global, by_owner);
         }
     } else if let Some(stmts) = node.as_statements_node() {
         for stmt in stmts.body().iter() {
-            collect_constant_from_stmt(&stmt, owner, global, by_owner, with_owners);
+            collect_constant_from_stmt(&stmt, owner, global, by_owner);
         }
     }
 }
@@ -287,13 +293,12 @@ fn collect_constant_from_stmt(
     owner: &str,
     global: &mut ConstantTypes,
     by_owner: &mut OwnedConstantTypes,
-    with_owners: bool,
 ) {
     if let Some(module) = node.as_module_node() {
         let Ok(name) = std::str::from_utf8(module.name().as_slice()) else { return };
         if let Some(body) = module.body() {
             let nested = join_owner(owner, name);
-            walk_constants(&body, &nested, global, by_owner, with_owners);
+            walk_constants(&body, &nested, global, by_owner);
         }
         return;
     }
@@ -301,17 +306,29 @@ fn collect_constant_from_stmt(
         let Ok(name) = std::str::from_utf8(class.name().as_slice()) else { return };
         if let Some(body) = class.body() {
             let nested = join_owner(owner, name);
-            walk_constants(&body, &nested, global, by_owner, with_owners);
+            walk_constants(&body, &nested, global, by_owner);
         }
         return;
     }
     if let Some(write) = node.as_constant_write_node() {
         let Ok(name) = std::str::from_utf8(write.name().as_slice()) else { return };
-        if let Some(ty) = type_of_const_literal(&write.value()) {
-            let name = Symbol::from(name);
-            if with_owners && !owner.is_empty() {
-                by_owner.entry(ClassId(Symbol::from(owner))).or_default().insert(name.clone(), ty.clone());
+        let value = write.value();
+        let ty = type_of_const_literal(&value).or_else(|| {
+            let read = Symbol::from(std::str::from_utf8(value.as_constant_read_node()?.name().as_slice()).ok()?);
+            let mut scope = owner;
+            loop {
+                if let Some(ty) = by_owner.get(&ClassId(Symbol::from(scope))).and_then(|own| own.get(&read)) {
+                    return Some(ty.clone());
+                }
+                if scope.is_empty() {
+                    return None;
+                }
+                scope = scope.rsplit_once("::").map_or("", |(outer, _)| outer);
             }
+        });
+        if let Some(ty) = ty {
+            let name = Symbol::from(name);
+            by_owner.entry(ClassId(Symbol::from(owner))).or_default().insert(name.clone(), ty.clone());
             global.insert(name, ty);
         }
     }
@@ -461,7 +478,7 @@ pub fn parse_methods_with_rbs(
     parse_methods_with_rbs_in_ctx(
         ruby_src,
         rbs_src,
-        &std::collections::HashMap::new(),
+        &crate::det::HashMap::default(),
     )
 }
 
@@ -502,7 +519,7 @@ pub fn parse_library_with_rbs(
     // annotation; the flat parser does. Use the flat result purely as
     // an abstract-name filter so per-class orphan checks skip
     // contract-only methods (e.g. base.rb's `[]` / `[]=`).
-    let abstract_method_names: std::collections::HashSet<Symbol> =
+    let abstract_method_names: crate::det::HashSet<Symbol> =
         crate::rbs::parse_signatures(rbs_src)
             .map(|s| s.abstract_methods)
             .unwrap_or_default();
@@ -512,7 +529,7 @@ pub fn parse_library_with_rbs(
     // `ActiveRecord::Base`), so the lookup is direct. The prior
     // last-segment normalization was a workaround for the bare-name
     // collision between RBS and ingest; both sides have caught up.
-    let sigs_by_full_path: std::collections::HashMap<String, std::collections::HashMap<Symbol, Ty>> =
+    let sigs_by_full_path: crate::det::HashMap<String, crate::det::HashMap<Symbol, Ty>> =
         sigs_by_class
             .into_iter()
             .map(|(cid, m)| (cid.0.as_str().to_string(), m))
@@ -525,7 +542,7 @@ pub fn parse_library_with_rbs(
     let ruby_text = String::from_utf8_lossy(ruby_src);
     let (literal_constants, owned_constants) = parse_module_constant_tables(&ruby_text, true);
     let constants = crate::analyze::ConstScope::global(literal_constants);
-    let class_constants: std::collections::HashMap<_, _> = owned_constants
+    let class_constants: crate::det::HashMap<_, _> = owned_constants
         .into_iter()
         .map(|(owner, own)| (owner, constants.with_own(own)))
         .collect();
@@ -553,7 +570,8 @@ pub fn parse_library_with_rbs(
                     class_name, m.name
                 )
             })?;
-            if let Ty::Fn { params, .. } = &sig {
+            if let Ty::Fn(fn_ty) = &sig {
+                let FnTy { params, .. } = &**fn_ty;
                 let rbs_arity = params
                     .iter()
                     .filter(|p| !matches!(p.kind, crate::ty::ParamKind::Block))
@@ -609,10 +627,10 @@ pub fn parse_library_with_rbs(
     // body-typer dispatches `Send { recv: SelfRef, method: m }` against
     // self_ty's class entry, so without this registry self-method
     // calls resolve to `Ty::Untyped`.
-    let mut class_registry: std::collections::HashMap<
+    let mut class_registry: crate::det::HashMap<
         crate::ident::ClassId,
         crate::analyze::ClassInfo,
-    > = std::collections::HashMap::new();
+    > = crate::det::HashMap::default();
     // Use the shared `class_info_from_library_class` helper so kinds
     // (and the ivar-shadows-method reclassification — `def errors` paired
     // with `@errors = []` reads as a field, so its dispatch should not
@@ -650,11 +668,11 @@ pub fn parse_library_with_rbs(
     for lc in &mut library_classes {
         let scope_constants = class_constants.get(&lc.name).unwrap_or(&constants);
         let build_ctx = |m: &MethodDef,
-                         ivars: &std::collections::HashMap<Symbol, Ty>|
+                         ivars: &crate::det::HashMap<Symbol, Ty>|
          -> crate::analyze::Ctx {
             let mut ctx = crate::analyze::Ctx::default();
-            if let Some(Ty::Fn { params, .. }) = &m.signature {
-                for (param, p) in m.params.iter().zip(params.iter()) {
+            if let Some(Ty::Fn(fn_ty)) = &m.signature {
+                for (param, p) in m.params.iter().zip(fn_ty.params.iter()) {
                     ctx.local_bindings.insert(param.name.clone(), (*p.ty).clone());
                 }
             }
@@ -674,16 +692,16 @@ pub fn parse_library_with_rbs(
             ctx
         };
 
-        let empty_ivars: std::collections::HashMap<Symbol, Ty> =
-            std::collections::HashMap::new();
+        let empty_ivars: crate::det::HashMap<Symbol, Ty> =
+            crate::det::HashMap::default();
         for m in &mut lc.methods {
             stamp_sig_return_on_empty_tail(m);
             let ctx = build_ctx(m, &empty_ivars);
             typer.analyze_expr(&mut m.body, &ctx);
         }
 
-        let mut flow_ivars: std::collections::HashMap<Symbol, Ty> =
-            std::collections::HashMap::new();
+        let mut flow_ivars: crate::det::HashMap<Symbol, Ty> =
+            crate::det::HashMap::default();
         for m in &lc.methods {
             crate::analyze::extract_ivar_assignments(&m.body, &mut flow_ivars);
         }
@@ -696,7 +714,8 @@ pub fn parse_library_with_rbs(
         // initializer's inferred shape.
         if let Some(info) = class_registry.get(&lc.name) {
             for (m_name, sig) in &info.instance_methods {
-                if let Ty::Fn { params, ret, .. } = sig {
+                if let Ty::Fn(fn_ty) = sig {
+                    let FnTy { params, ret, .. } = &**fn_ty;
                     if params.is_empty() {
                         flow_ivars.insert(m_name.clone(), (**ret).clone());
                     }
@@ -714,7 +733,7 @@ pub fn parse_library_with_rbs(
             }
         }
         if !flow_ivars.is_empty() {
-            let reseeded: std::collections::HashMap<Symbol, Ty> = flow_ivars
+            let reseeded: crate::det::HashMap<Symbol, Ty> = flow_ivars
                 .into_iter()
                 .map(|(name, ty)| (name, Ty::Union { variants: vec![ty, Ty::Nil].into() }))
                 .collect();
@@ -722,6 +741,21 @@ pub fn parse_library_with_rbs(
                 stamp_sig_return_on_empty_tail(m);
                 let ctx = build_ctx(m, &reseeded);
                 typer.analyze_expr(&mut m.body, &ctx);
+            }
+        }
+        // Not the assigned local's own type: `@table = table` built from `{}` keeps an open key, and each emitter declares the ivar from what is assigned
+        if let Some(declared) = rbs_ivars_by_class.get(&lc.name) {
+            fn stamp(e: &mut Expr, declared: &crate::det::HashMap<Symbol, Ty>) {
+                if let ExprNode::Assign { target: crate::expr::LValue::Ivar { name }, value } = &mut *e.node
+                    && let Some(ty) = declared.get(name)
+                    && value.ty.as_ref().is_none_or(|t| t.mentions_unknown())
+                {
+                    value.ty = Some(ty.clone());
+                }
+                e.node.for_each_child_mut(&mut |c| stamp(c, declared));
+            }
+            for m in &mut lc.methods {
+                stamp(&mut m.body, declared);
             }
         }
     }
@@ -739,7 +773,7 @@ pub fn parse_library_with_rbs(
 /// truncate`) `runtime/ruby/active_record/base.rb` dispatches through
 /// `ActiveRecord.adapter`.
 fn seed_well_known_classes(
-    classes: &mut std::collections::HashMap<crate::ident::ClassId, crate::analyze::ClassInfo>,
+    classes: &mut crate::det::HashMap<crate::ident::ClassId, crate::analyze::ClassInfo>,
 ) {
     use crate::analyze::ClassInfo;
     use crate::ident::{ClassId, Symbol};
@@ -749,6 +783,16 @@ fn seed_well_known_classes(
     // (active_record/connection.rb) calls `Db.prepare`/`step?`/
     // `column_*` directly, so its bodies need the same typing here.
     crate::lower::view_to_library::insert_db_stub(classes);
+
+    // Not transpiled with the rest: each strict target writes I18nHost by hand, so only its signatures reach the files that call it.
+    let host = crate::rbs::parse_app_signatures(include_str!("../runtime/ruby/i18n_host.rbs"))
+        .expect("runtime/ruby/i18n_host.rbs must parse");
+    for (class_id, methods) in host {
+        let info = classes.entry(class_id).or_default();
+        for (name, ty) in methods {
+            info.class_methods.insert(name, ty);
+        }
+    }
 
     let row_ty = Ty::Hash {
         key: std::sync::Arc::new(Ty::Str),
@@ -791,6 +835,9 @@ fn seed_well_known_classes(
         .insert(Symbol::from("select_rows"), array_of_rows.clone());
     adapter_iface
         .instance_methods
+        .insert(Symbol::from("each_row"), Ty::Nil);
+    adapter_iface
+        .instance_methods
         .insert(Symbol::from("execute_ddl"), Ty::Nil);
     adapter_iface
         .instance_methods
@@ -815,9 +862,9 @@ fn seed_well_known_classes(
 /// sibling (`erb_url_encode` reading `erb_url_byte`) types unknown
 /// without it. Never mutates `classes`.
 fn typing_classes_with_local_block_contracts(
-    classes: &std::collections::HashMap<crate::ident::ClassId, crate::analyze::ClassInfo>,
+    classes: &crate::det::HashMap<crate::ident::ClassId, crate::analyze::ClassInfo>,
     methods: &[MethodDef],
-) -> std::collections::HashMap<crate::ident::ClassId, crate::analyze::ClassInfo> {
+) -> crate::det::HashMap<crate::ident::ClassId, crate::analyze::ClassInfo> {
     let mut typing_classes = classes.clone();
     for m in methods {
         let (Some(enclosing), Some(sig)) = (&m.enclosing_class, &m.signature) else {
@@ -830,7 +877,7 @@ fn typing_classes_with_local_block_contracts(
             MethodReceiver::Instance => &mut info.instance_methods,
             MethodReceiver::Class => &mut info.class_methods,
         };
-        if matches!(sig, Ty::Fn { block: Some(_), .. }) {
+        if matches!(sig, Ty::Fn(fn_ty) if fn_ty.block.is_some()) {
             table.insert(m.name.clone(), sig.clone());
         } else {
             table.entry(m.name.clone()).or_insert_with(|| sig.clone());
@@ -847,7 +894,7 @@ fn typing_classes_with_local_block_contracts(
 pub fn parse_methods_with_rbs_in_ctx(
     ruby_src: &str,
     rbs_src: &str,
-    classes: &std::collections::HashMap<crate::ident::ClassId, crate::analyze::ClassInfo>,
+    classes: &crate::det::HashMap<crate::ident::ClassId, crate::analyze::ClassInfo>,
 ) -> Result<Vec<MethodDef>, String> {
     let mut methods = parse_methods(ruby_src)?;
 
@@ -861,8 +908,8 @@ pub fn parse_methods_with_rbs_in_ctx(
     // class) we fall back to a name-keyed map built from
     // parse_signatures.
     let app_sigs = crate::rbs::parse_app_signatures(rbs_src)?;
-    let mut sig_by_class: std::collections::HashMap<String, std::collections::HashMap<Symbol, Ty>> =
-        std::collections::HashMap::new();
+    let mut sig_by_class: crate::det::HashMap<String, crate::det::HashMap<Symbol, Ty>> =
+        crate::det::HashMap::default();
     for (cid, sigs) in app_sigs {
         let raw = cid.0.as_str();
         let last = raw.rsplit("::").next().unwrap_or(raw).to_string();
@@ -873,9 +920,9 @@ pub fn parse_methods_with_rbs_in_ctx(
     }
 
     let flat_sigs = parse_signatures(rbs_src)?;
-    let abstract_methods: std::collections::HashSet<Symbol> =
+    let abstract_methods: crate::det::HashSet<Symbol> =
         flat_sigs.abstract_methods.iter().cloned().collect();
-    let mut flat_sig_map: std::collections::HashMap<Symbol, Ty> =
+    let mut flat_sig_map: crate::det::HashMap<Symbol, Ty> =
         flat_sigs.methods.into_iter().collect();
 
     // Names that satisfied a top-level (no enclosing class) Ruby def
@@ -883,8 +930,8 @@ pub fn parse_methods_with_rbs_in_ctx(
     // per-class orphan check — emit_method drops module wrappers, so
     // a round-trip test re-parses with `enclosing_class = None` but
     // the RBS sigs still live inside a `module M`.
-    let mut flat_matched_names: std::collections::HashSet<Symbol> =
-        std::collections::HashSet::new();
+    let mut flat_matched_names: crate::det::HashSet<Symbol> =
+        crate::det::HashSet::default();
 
     for m in &mut methods {
         let ty = if let Some(enclosing) = &m.enclosing_class {
@@ -909,7 +956,8 @@ pub fn parse_methods_with_rbs_in_ctx(
             ty
         };
 
-        if let Ty::Fn { params, .. } = &ty {
+        if let Ty::Fn(fn_ty) = &ty {
+            let FnTy { params, .. } = &**fn_ty;
             // RBS injects a synthetic Block-kind param into Ty::Fn
             // when the signature declares `{ ... } -> T`. Ruby's flat
             // param list collects an `&block` only when explicitly
@@ -990,18 +1038,18 @@ pub fn parse_methods_with_rbs_in_ctx(
     let constants = crate::analyze::ConstScope::global(parse_module_constants(ruby_src).unwrap_or_default());
 
     let build_ctx = |m: &MethodDef,
-                     ivars: &std::collections::HashMap<Symbol, Ty>|
+                     ivars: &crate::det::HashMap<Symbol, Ty>|
      -> crate::analyze::Ctx {
         let mut ctx = crate::analyze::Ctx::default();
         ctx.class_side = m.receiver == MethodReceiver::Class;
-        if let Some(Ty::Fn { params, .. }) = &m.signature {
-            for (param, p) in m.params.iter().zip(params.iter()) {
+        if let Some(Ty::Fn(fn_ty)) = &m.signature {
+            for (param, p) in m.params.iter().zip(fn_ty.params.iter()) {
                 ctx.local_bindings.insert(param.name.clone(), (*p.ty).clone());
             }
             // `def subscribe(subscriber, &block)`: the captured block is
             // the signature's block, which `m.params` does not carry.
             if let Some(block_param) = &m.block_param {
-                if let Some(p) = params.iter().find(|p| matches!(p.kind, crate::ty::ParamKind::Block)) {
+                if let Some(p) = fn_ty.params.iter().find(|p| matches!(p.kind, crate::ty::ParamKind::Block)) {
                     ctx.local_bindings.insert(block_param.name.clone(), (*p.ty).clone());
                 }
             }
@@ -1017,22 +1065,22 @@ pub fn parse_methods_with_rbs_in_ctx(
         ctx
     };
 
-    let empty_ivars: std::collections::HashMap<Symbol, Ty> =
-        std::collections::HashMap::new();
+    let empty_ivars: crate::det::HashMap<Symbol, Ty> =
+        crate::det::HashMap::default();
     for m in &mut methods {
         stamp_sig_return_on_empty_tail(m);
         let ctx = build_ctx(m, &empty_ivars);
         typer.analyze_expr(&mut m.body, &ctx);
     }
 
-    let mut flow_ivars: std::collections::HashMap<Symbol, Ty> =
-        std::collections::HashMap::new();
+    let mut flow_ivars: crate::det::HashMap<Symbol, Ty> =
+        crate::det::HashMap::default();
     for m in &methods {
         crate::analyze::extract_ivar_assignments(&m.body, &mut flow_ivars);
     }
 
     if !flow_ivars.is_empty() {
-        let reseeded: std::collections::HashMap<Symbol, Ty> = flow_ivars
+        let reseeded: crate::det::HashMap<Symbol, Ty> = flow_ivars
             .into_iter()
             .map(|(name, ty)| (name, Ty::Union { variants: vec![ty, Ty::Nil].into() }))
             .collect();
@@ -1050,7 +1098,8 @@ pub fn parse_methods_with_rbs_in_ctx(
 /// `{}` / `[]` tail before body-typing. See
 /// [`crate::analyze::stamp_expected_on_empty_return_tail`].
 fn stamp_sig_return_on_empty_tail(m: &mut MethodDef) {
-    if let Some(Ty::Fn { ret, .. }) = m.signature.as_ref() {
+    if let Some(Ty::Fn(fn_ty)) = m.signature.as_ref() {
+        let FnTy { ret, .. } = &**fn_ty;
         crate::analyze::stamp_expected_on_empty_return_tail(&mut m.body, ret);
     }
 }
@@ -1309,7 +1358,8 @@ fn reclassify_abstract_attributes(methods: &mut [MethodDef]) {
             if m.name == name {
                 let enclosing = m.enclosing_class.as_ref().map(|s| s.as_str().to_string());
                 let sig = m.signature.take();
-                if let Some(Ty::Fn { ret, .. }) = &sig {
+                if let Some(Ty::Fn(fn_ty)) = &sig {
+                    let FnTy { ret, .. } = &**fn_ty;
                     zero = zero_literal(ret);
                 }
                 *m = synthesize_reader(name.as_str(), enclosing.as_deref());
@@ -1659,6 +1709,16 @@ mod tests {
     }
 
     #[test]
+    fn a_constant_alias_reads_the_constant_its_scope_sees() {
+        let src = "module Outer\n  FLAGS = { \"a\" => 1 }.freeze\n  class Inner\n    FLAGS = [\"b\"].freeze\n  end\n  COPY = FLAGS\n  class Other\n    COPY = FLAGS\n  end\nend\n";
+        let (_, owners) = parse_module_constant_tables(src, true);
+        for owner in ["Outer", "Outer::Other"] {
+            let own = owners.get(&ClassId(Symbol::from(owner))).expect("owner constants");
+            assert!(matches!(own.get(&Symbol::from("COPY")), Some(Ty::Hash { .. })), "{owner}: {own:?}");
+        }
+    }
+
+    #[test]
     fn toplevel_def_is_found() {
         let src = "def pluralize(count, word)\n  count == 1 ? \"1 #{word}\" : \"#{count} #{word}s\"\nend\n";
         let m = parse_one(src);
@@ -1954,9 +2014,10 @@ mod tests {
         assert_eq!(m.name.as_str(), "pluralize");
 
         let sig = m.signature.as_ref().expect("signature attached");
-        let Ty::Fn { params, ret, .. } = sig else {
+        let Ty::Fn(fn_ty) = sig else {
             panic!("expected Ty::Fn, got {sig:?}");
         };
+        let FnTy { params, ret, .. } = &**fn_ty;
         assert_eq!(params.len(), 2);
         assert_eq!(params[0].ty, Ty::Int.into());
         assert_eq!(params[1].ty, Ty::Str.into());
@@ -2023,8 +2084,8 @@ mod tests {
         // And each has its own signature.
         let b_sig = methods[0].signature.as_ref().unwrap();
         let a_sig = methods[1].signature.as_ref().unwrap();
-        assert!(matches!(b_sig, Ty::Fn { ret, .. } if **ret == Ty::Int));
-        assert!(matches!(a_sig, Ty::Fn { ret, .. } if **ret == Ty::Str));
+        assert!(matches!(b_sig, Ty::Fn(fn_ty) if *fn_ty.ret == Ty::Int));
+        assert!(matches!(a_sig, Ty::Fn(fn_ty) if *fn_ty.ret == Ty::Str));
     }
 
     #[test]

@@ -86,6 +86,7 @@ module Cable
   # dispatch, cable branch included.
   def self.identify(req)
     conn = Cable.build_connection(ActionController::CookieJar.new(req.cookies))
+    conn.request = Cable.request_for(req)
     refused = false
     begin
       conn.connect
@@ -100,6 +101,31 @@ module Cable
       return nil
     end
     conn
+  end
+
+  def self.request_for(req)
+    request = ActionDispatch::Request.new
+    request.request_method = req.verb
+    request.path = req.path
+    request.query_string = req.raw_query
+    request.remote_ip = req.remote_host
+    request.host = req.req_headers.fetch("host", "localhost")
+    request.referer = req.req_headers.fetch("referer", "")
+    request.user_agent = req.req_headers.fetch("user-agent", "")
+    request.env["REQUEST_METHOD"] = req.verb
+    request.env["PATH_INFO"] = req.path
+    request.env["QUERY_STRING"] = req.raw_query
+    request.env["REMOTE_ADDR"] = req.remote_host
+    request.env["roundhouse.listener"] = req.listener_transport
+    req.req_headers.each do |name, value|
+      request.env[ActionDispatch::Http::Headers.env_name_from_header(name)] = value
+    end
+    query = ParamBuilder.from_query_string(req.raw_query)
+    unless query.nil?
+      request.query_parameters = query
+      query.each { |key, value| request.params[key] = value }
+    end
+    request
   end
 
   # THE CHANNEL A SUBSCRIBE FRAME NAMES — `ActionCable::Channel.build`,
@@ -135,7 +161,7 @@ module Cable
   # its subscription table on the identifier and retries a subscription
   # it never heard back about, so a dropped frame is a reconnect loop.
   def self.subscribe(ws, connection, identifier, holder)
-    name = ActionCable::Channel::Parameters.read(identifier, "channel")
+    name = ActionCable::Channel::Parameters.read(identifier, "channel").to_s
     if name.length == 0
       return Cable.reject(ws, identifier)
     end
@@ -172,7 +198,7 @@ module Cable
       Tep::APP.cable_lock.synchronize do
         Tep::APP.cable_identifiers[stream] = identifier
       end
-      Tep::Broadcast.subscribe_ws(stream, ws)
+      Tep::Broadcast.subscribe_ws(stream, ws, identifier)
     end
     # REMEMBERED, and only once the subscription is confirmed. The
     # unsubscribe callbacks are the other half of a connect storm —
@@ -285,6 +311,8 @@ module Cable
     if start
       Cable.spawn_heartbeat
     end
+    # This process's Redis subscription, when broadcasts go through Redis.
+    RedisCable.ensure_subscriber
     0
   end
 
@@ -659,7 +687,9 @@ module Cable
     drv.set_on_message(cb_msg)
     # `close(reason:)` closes this socket, and the heartbeat calls the
     # connection's `beat` (`Cable.app_beats`).
-    conn.transport = drv
+    sock = Cable::Socket.new
+    sock.ws = drv
+    conn.transport = sock
     Cable.beats.add(cb_msg)
 
     cb_close = Cable::WsClose.new
@@ -681,8 +711,8 @@ module Cable
   # `"message":"{\"roomId\":1}"`, valid JSON in the wrong shape, and
   # wrong in the silent way because only the browser notices.
   #
-  # Returns without publishing when no subscriber has named the stream,
-  # same as `Transport#broadcast`.
+  # `publish_local` returns without publishing when no subscriber here
+  # has named the stream; `Transport#broadcast` comes through it too.
   # The identifier JSON a subscriber sent for `stream`, or "" when none
   # has. Read under the map's lock: subscribes on other connections
   # write it concurrently.
@@ -694,7 +724,24 @@ module Cable
     id
   end
 
+  # Under config/cable.yml's `adapter: redis` (runtime/redis_cable.rb)
+  # every message goes through Redis, and comes back to this process's
+  # sockets, and every other process's, through `deliver_json`.
   def self.publish_raw(stream, message_json)
+    if RedisCable.enabled?
+      RedisCable.publish(stream, message_json)
+    else
+      Cable.publish_local(stream, message_json)
+    end
+    nil
+  end
+
+  # A message from Redis for this process's sockets.
+  def self.deliver_json(stream, message_json)
+    Cable.publish_local(stream, message_json)
+  end
+
+  def self.publish_local(stream, message_json)
     id = Cable.identifier_for(stream)
     if id.length == 0
       return nil
@@ -705,22 +752,47 @@ module Cable
     nil
   end
 
+  # Rails' connection `socket` over the driver, the two calls
+  # `ActionCable::Connection::Base` hands it: `close` tells the client
+  # why and whether to come back and closes (the client's close reply
+  # runs the driver's ordinary teardown), and `perform_work` runs inline
+  # under the heartbeat's database lease.
+  class Socket
+    attr_accessor :ws
+
+    def stop_streams(identifier)
+      Tep::Broadcast.unsubscribe_ws(@ws, identifier)
+      nil
+    end
+
+    def transmit(data)
+      @ws.text(ActionCable.payload_json(data))
+      nil
+    end
+
+    def close_with_reason(reason, reconnect)
+      drv = @ws
+      drv.text(ActionCable.disconnect_json(reason, reconnect))
+      drv.close(1000, "")
+      nil
+    end
+
+    def perform_work(receiver)
+      receiver.call
+      nil
+    end
+  end
+
   # Broadcasts transport: Broadcasts.record calls broadcast(stream,
   # fragment) on every after-commit hook. Wrap the fragment in the
   # Action Cable message envelope (echoing the subscriber's identifier)
   # and publish to every WS fd subscribed to the stream.
   class Transport
     def broadcast(stream, fragment)
-      id = Cable.identifier_for(stream)
-      if id.length == 0
-        return nil   # no subscriber has named this stream yet
-      end
       # The fragment as Rails writes it: ActiveSupport::JSON escapes `<`,
       # `>` and `&` inside strings (`\u003cturbo-stream ...`), which plain
       # JSON.generate does not. Same text as the overlay's `Registry.deliver`.
-      envelope = "{\"identifier\":" + JSON.generate(id) +
-                 ",\"message\":" + JsonBuilder.escape_html_entities(JSON.generate(fragment)) + "}"
-      Tep::Broadcast.publish(stream, envelope)
+      Cable.publish_raw(stream, JsonBuilder.escape_html_entities(JSON.generate(fragment)))
       nil
     end
   end

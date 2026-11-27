@@ -50,6 +50,10 @@ end
 }
 
 fn app_with_helper(call_tail: &str, helper: &str) -> App {
+    app_with_helper_target(call_tail, helper, None)
+}
+
+fn app_with_helper_target(call_tail: &str, helper: &str, target: Option<roundhouse::project::BuildTarget>) -> App {
     let template = format!(
         "<%= thing_form_with @thing{call_tail} do |form| %>\n  <p>hi</p>\n<% end %>\n"
     );
@@ -71,8 +75,70 @@ fn app_with_helper(call_tail: &str, helper: &str) -> App {
         ("app/views/things/show.html.erb", Box::leak(template.into_boxed_str())),
     ]))
     .expect("ingest wrapper app");
-    roundhouse::session::analyze_and_lower(&mut app);
+    if let Some(target) = target {
+        roundhouse::session::analyze_and_lower_for(&mut app, target);
+    } else {
+        roundhouse::session::analyze_and_lower(&mut app);
+    }
     app
+}
+
+#[test]
+fn a_native_keyword_rest_wrapper_splices_literal_keyword_packets() {
+    for tail in [", class: \"literal\"", ", **{ class: \"literal\" }"] {
+        let app = app_with_helper_target(
+            tail,
+            r#"module ThingsHelper
+  def thing_form_with(model, **params, &)
+    form_with model: @thing, url: thing_path(model), method: :patch, **params, &
+  end
+end
+"#,
+            Some(roundhouse::project::BuildTarget::Ruby),
+        );
+        let files = roundhouse::emit::ruby::emit_lowered_views(&app);
+        let source = &files.iter().find(|file| file.path.to_string_lossy().ends_with("things/show.rb")).unwrap().content;
+        assert!(source.contains("<form"), "{source}");
+        assert!(source.contains("literal"), "{source}");
+        assert!(!source.contains("thing_form_with"), "{source}");
+    }
+}
+
+#[test]
+fn a_native_keyword_rest_wrapper_does_not_splice_dynamic_options() {
+    let app = app_with_helper_target(
+        ", **options",
+        r#"module ThingsHelper
+  def thing_form_with(model, **params, &)
+    form_with model: @thing, url: thing_path(model), method: :patch, **params, &
+  end
+end
+"#,
+        Some(roundhouse::project::BuildTarget::Ruby),
+    );
+    let files = roundhouse::emit::ruby::emit_lowered_views(&app);
+    let source = &files.iter().find(|file| file.path.to_string_lossy().ends_with("things/show.rb")).unwrap().content;
+    assert!(source.contains("thing_form_with"), "{source}");
+    assert!(source.contains("**options"), "{source}");
+    assert!(!source.contains("<form"), "{source}");
+}
+
+#[test]
+fn a_native_keyword_rest_wrapper_does_not_splice_a_positional_hash() {
+    let app = app_with_helper_target(
+        ", { class: \"invalid\" }",
+        r#"module ThingsHelper
+  def thing_form_with(model, **params, &)
+    form_with model: @thing, url: thing_path(model), method: :patch, **params, &
+  end
+end
+"#,
+        Some(roundhouse::project::BuildTarget::Ruby),
+    );
+    let files = roundhouse::emit::ruby::emit_lowered_views(&app);
+    let source = &files.iter().find(|file| file.path.to_string_lossy().ends_with("things/show.rb")).unwrap().content;
+    assert!(source.contains("thing_form_with"), "{source}");
+    assert!(!source.contains("<form"), "{source}");
 }
 
 fn show_view(call_tail: &str) -> String {
@@ -88,6 +154,40 @@ fn show_view(call_tail: &str) -> String {
                 files.iter().map(|f| f.path.display().to_string()).collect::<Vec<_>>()
             )
         })
+}
+
+#[test]
+fn a_call_with_constant_option_keys_keeps_the_wrapper() {
+    for tail in [", **{ OPTION_KEY => \"x\" }", ", OPTION_KEY => \"x\""] {
+        let src = show_view(tail);
+        assert!(src.contains("thing_form_with"), "{tail}: {src}");
+        assert!(src.contains("OPTION_KEY"), "{tail}: {src}");
+        assert!(!src.contains("io << \"\""), "{tail}: {src}");
+    }
+}
+
+#[test]
+fn a_call_with_splatted_literal_option_keys_produces_a_form() {
+    for tail in [", **{ class: \"literal\" }", ", **{ \"class\" => \"literal\" }"] {
+        let src = show_view(tail);
+        assert!(src.contains("<form"), "{tail}: {src}");
+        assert!(!src.contains("thing_form_with"), "{tail}: {src}");
+    }
+}
+
+#[test]
+fn a_string_option_key_does_not_override_a_symbol_key() {
+    let src = show_view(", **{ \"method\" => :delete }");
+    assert!(src.contains("<form"), "{src}");
+    assert!(src.contains("form_method = :patch"), "{src}");
+    assert!(!src.contains("form_method = :delete"), "{src}");
+}
+
+#[test]
+fn a_splatted_symbol_option_key_overrides_a_symbol_key() {
+    let src = show_view(", **{ method: :delete }");
+    assert!(src.contains("<form"), "{src}");
+    assert!(src.contains("form_method = :delete"), "{src}");
 }
 
 /// Bare call — the options parameter binds its own `{}` default.
@@ -154,7 +254,7 @@ fn the_form_is_never_silently_dropped() {
 #[test]
 fn owner_bridges_keep_required_typed_parameters_and_source_spans() {
     use roundhouse::dialect::{MethodReceiver, MethodVisibility};
-    use roundhouse::ty::{ParamKind, Ty};
+    use roundhouse::ty::{FnTy, ParamKind, Ty};
     let mut app = app_with_helper("", r#"module ThingsHelper
   def thing_form_with(model, suffix = "!", &)
     form_with model: model, url: thing_path(model), data: { label: own_data(model, suffix), count: Thing.count }, &
@@ -173,7 +273,8 @@ end
     assert!(!bridge.has_anonymous_block, "the generated bridge is blockless");
     assert!(bridge.unsupported_formals.is_none());
     assert!(!bridge.body.span.is_synthetic());
-    let Some(Ty::Fn { params, block, ret, .. }) = &bridge.signature else { panic!("typed bridge") };
+    let Some(Ty::Fn(fn_ty)) = &bridge.signature else { panic!("typed bridge") };
+    let FnTy { params, block, ret, .. } = &**fn_ty;
     assert!(params.iter().all(|p| p.kind == ParamKind::Required));
     assert_eq!(params[1].ty, Ty::Str.into());
     assert_eq!(bridge.body.ty.as_ref(), Some(ret.as_ref()));

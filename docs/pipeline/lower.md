@@ -131,7 +131,19 @@ Each lowerer:
 
 - Expands DSL surface into method bodies (e.g. `validates :title,
   presence: true` becomes a `validate` method that pushes
-  `ValidationError`s).
+  `ValidationError`s). In `model_to_library`, a NOT NULL integer column
+  with no default that `presence:` checks is held in a nilable
+  `<col>_raw` slot behind a reader of the column's type
+  (`validations::hold_unset_presence_columns`), so the check sees nil
+  until the record assigns it, as Rails does; the DDL keeps NOT NULL.
+  Only a column nothing else on the model reads or writes is held (no
+  own reader or writer, enum, array, `normalizes` or `numericality`),
+  and on a shared table only when every model qualifies. Model bodies
+  then read it through the reader and write it through the writer
+  (`read_held_columns_through_readers`).
+  On a target with no runtime Relation, each `uniqueness:` rule becomes
+  a private `_rh_<attr>_taken_<n>?` that runs one fixed
+  `SELECT 1 … LIMIT 1` (`adapter_emit::uniqueness`).
 - Rewrites helpers and form builders into runtime calls (e.g.
   `link_to` → `Roundhouse::ViewHelpers.link_to(...)`).
 - Runs the body-typer over the rewritten bodies so emitters get
@@ -197,6 +209,27 @@ different runtime costs; see the struct's doc). The plain
 `unwrap_respond_to` — collapse to the HTML branch only — survives for
 per-target paths that can't emit the dispatch; its own doc comment
 calls that the legacy behavior.
+
+On the ruby-family trees (`FormatBreadth::negotiates`: spinel and
+CRuby) the dispatch is Rails' own selection rather than a
+`request_format` sniff. Each arm becomes `negotiate_format([<arms in
+source order>]) == "<fmt>"`, the runtime's `Base#negotiate_format`
+walks the request's formats (a URL-pinned format, else the parsed
+`Accept` list, else html) exactly as `Request#negotiate_mime` does, and
+what no arm answers is `raise ActionController::UnknownFormat` (the
+dispatchers answer 406). `format.turbo_stream` is carried on these
+trees: a bare arm renders `<action>.turbo_stream.erb`, a block may
+`render :sym`, `head`, or `render turbo_stream: turbo_stream.<action>(
+target, partial:, locals:)` (singly or as an Array), and a block that
+only has side effects falls to the implicit template. An arm the tree
+cannot run is an ERROR (`respond_to_negotiate`): a bare arm with no
+template, builders written by app code, `*_all` / attribute options,
+and formats the lowering does not model. The one deliberate exception
+is a json arm whose body needs an encoder the AOT tree lacks (`render
+json: record.errors`, every scaffold's failure arm): it stays a
+warning and answers its html arm, as before. The expected responses
+are measured from actionpack + turbo-rails by
+`tests/support/turbo_respond_to/oracle.rb`.
 
 ### `resolve_before_actions` + `inline_before_filters`
 

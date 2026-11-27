@@ -20,6 +20,9 @@ module ActionDispatch
     def alert_was: () -> String?
 
     def initialize: (?Hash[String, String]? other) -> void
+    def begin_carry: () -> nil
+    def carry_other: (String key, untyped value) -> nil
+    def carried: (String key) -> nil
 
     def now: () -> FlashNow
     def mark_shown: (String | Symbol key) -> void
@@ -38,6 +41,7 @@ module ActionDispatch
     def each: () { (String, String?) -> void } -> Flash
     def to_h: () -> Hash[String, String]
     def to_persisted: () -> Hash[String, String]
+    def to_session_value: () -> Hash[String, Array[String] | Hash[String, String]]?
     def merge: (Hash[String, String] other) -> Flash
   end
 

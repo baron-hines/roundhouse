@@ -9,7 +9,7 @@ use crate::dialect::MethodDef;
 use crate::expr::{Expr, ExprNode, Literal};
 use crate::ident::{ClassId, Symbol};
 use crate::span::Span;
-use crate::ty::{Param as TyParam, ParamKind, Ty};
+use crate::ty::{FnTy, Param as TyParam, ParamKind, Ty};
 
 /// Attach a known type to an Expr. Lowerers use this when the type is
 /// statically known by construction.
@@ -76,7 +76,7 @@ pub fn fn_sig_with_block(
     block: Option<Ty>,
     ret: Ty,
 ) -> Ty {
-    Ty::Fn {
+    Ty::Fn(Box::new(FnTy {
         params: params
             .into_iter()
             .map(|(name, ty)| TyParam {
@@ -88,7 +88,7 @@ pub fn fn_sig_with_block(
         block: block.map(std::sync::Arc::new),
         ret: std::sync::Arc::new(ret),
         effects: crate::effect::EffectSet::pure(),
-    }
+    }))
 }
 
 /// Run the body-typer over a method's body, seeded by the method's
@@ -97,13 +97,13 @@ pub fn fn_sig_with_block(
 /// fully typed.
 pub fn type_method_body(
     method: &mut MethodDef,
-    classes: &std::collections::HashMap<ClassId, crate::analyze::ClassInfo>,
-    ivar_bindings: &std::collections::HashMap<Symbol, Ty>,
+    classes: &crate::det::HashMap<ClassId, crate::analyze::ClassInfo>,
+    ivar_bindings: &crate::det::HashMap<Symbol, Ty>,
 ) {
     let typer = crate::analyze::BodyTyper::new(classes);
     let mut ctx = crate::analyze::Ctx::default();
-    if let Some(Ty::Fn { params, .. }) = &method.signature {
-        for (param, sig) in method.params.iter().zip(params.iter()) {
+    if let Some(Ty::Fn(fn_ty)) = &method.signature {
+        for (param, sig) in method.params.iter().zip(fn_ty.params.iter()) {
             ctx.local_bindings.insert(param.name.clone(), (*sig.ty).clone());
         }
     }
@@ -118,15 +118,15 @@ pub fn type_method_body(
     // is on record.
     if let Some(block_param) = &method.block_param {
         let declared_block = match &method.signature {
-            Some(Ty::Fn { block: Some(block_ty), .. }) => Some((**block_ty).clone()),
+            Some(Ty::Fn(fn_ty)) if let Some(block_ty) = &fn_ty.block => Some((**block_ty).clone()),
             _ => None,
         };
-        let block_ty = declared_block.unwrap_or_else(|| Ty::Fn {
+        let block_ty = declared_block.unwrap_or_else(|| Ty::Fn(Box::new(FnTy {
             params: vec![].into(),
             block: None,
             ret: std::sync::Arc::new(Ty::Untyped),
             effects: crate::effect::EffectSet::default(),
-        });
+        })));
         ctx.local_bindings.insert(block_param.name.clone(), block_ty);
     }
     if let Some(enclosing) = &method.enclosing_class {
@@ -215,8 +215,8 @@ mod tests {
     #[test]
     fn own_block_param_types_as_a_closed_fn_not_var() {
         let mut method = with_x_calling_its_own_block();
-        let classes = std::collections::HashMap::new();
-        let ivar_bindings = std::collections::HashMap::new();
+        let classes = crate::det::HashMap::default();
+        let ivar_bindings = crate::det::HashMap::default();
 
         type_method_body(&mut method, &classes, &ivar_bindings);
 
@@ -225,7 +225,7 @@ mod tests {
             other => panic!("expected the lowered body to still be a Send, got {other:?}"),
         };
         match recv_ty {
-            Some(Ty::Fn { params, .. }) => assert!(params.is_empty(), "expected a closed, no-arg Fn"),
+            Some(Ty::Fn(fn_ty)) => assert!(fn_ty.params.is_empty(), "expected a closed, no-arg Fn"),
             other => panic!(
                 "expected the block param to carry a closed Fn type, got {other:?} (Var(0)/Untyped means the seed is missing)"
             ),

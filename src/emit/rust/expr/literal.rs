@@ -74,8 +74,10 @@ pub(super) fn emit_hash(entries: &[(Expr, Expr)]) -> String {
             .iter()
             .map(|(k, v)| {
                 let k_s = emit_expr(k);
-                let v_s = emit_expr(v);
-                format!("(({k_s}).to_string(), serde_json::Value::from({v_s}))")
+                // A Value holds a time as its stored text.
+                let v_s = super::send::time_into_value(v)
+                    .unwrap_or_else(|| format!("serde_json::Value::from({})", emit_expr(v)));
+                format!("(({k_s}).to_string(), {v_s})")
             })
             .collect();
         return format!("std::collections::HashMap::from([{}])", pairs.join(", "));
@@ -235,10 +237,7 @@ pub(super) fn attach_block(base: &str, block: &Expr) -> String {
     let closure = match &*block.node {
         ExprNode::Lambda { params, body, .. } => emit_closure(params, body),
         ExprNode::Var { name, .. } => name.as_str().to_string(),
-        _ => format!(
-            "/* TODO rust2: non-Lambda/non-Var block: {:?} */",
-            std::mem::discriminant(&*block.node)
-        ),
+        _ => crate::emit::diagnostics::report_unsupported(block.span, "rust", block.node.kind_str(), "block argument"),
     };
     if let Some(stripped) = base.strip_suffix("()") {
         format!("{stripped}({closure})")

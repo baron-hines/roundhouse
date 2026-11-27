@@ -7,12 +7,12 @@
 //! Ruby family the app's own code defines the method when it runs, and
 //! the send answers untyped, the gradual escape. Only where that code
 //! runs in the emitted class: the class `extend`s the defining module
-//! and every class-body call that reaches the definition is one the
-//! Ruby family replays (`ingest::app_extension_calls`). The class is
+//! and every class-body call that reaches the definition is in a statement
+//! the Ruby family replays (`ingest::app_extension_calls`). The class is
 //! reported once, as a warning. A literal-named definition is not
 //! this: the class macro expansion turns it into a `def`.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::App;
 use crate::dialect::{MethodDef, MethodReceiver, ModelBodyItem};
@@ -38,13 +38,13 @@ impl OpenClasses {
             }
         }
         // A module's instance methods that (through its other instance methods) define a computed name on `self`.
-        let mut reaching: HashMap<&str, (HashSet<Symbol>, Span)> = HashMap::new();
+        let mut reaching: HashMap<&str, (HashSet<Symbol>, Span)> = HashMap::default();
         let mut reopenings: std::collections::BTreeMap<&str, HashMap<&Symbol, &MethodDef>> = Default::default();
         for lc in app.library_classes.iter().filter(|lc| lc.is_module && lc.origin.is_none()) {
             reopenings.entry(lc.name.0.as_str()).or_default().extend(lc.methods.iter().filter(|m| m.receiver == MethodReceiver::Instance).map(|m| (&m.name, m)));
         }
         for (module, methods) in reopenings {
-            let mut found: HashMap<Symbol, Span> = HashMap::new();
+            let mut found: HashMap<Symbol, Span> = HashMap::default();
             for (name, def) in &methods {
                 if let Some(span) = computed_definitions(&def.body).into_iter().find(|(singleton, _)| *singleton).map(|(_, s)| s) {
                     found.insert((*name).clone(), span);
@@ -92,17 +92,17 @@ impl OpenClasses {
                     }
                     continue;
                 }
+                if replayed {
+                    continue;
+                }
                 let reach: Vec<&HashSet<Symbol>> = extended.iter().map(|m| &reaching[m].0).collect();
-                let mut root = true;
                 visit(expr, &mut |e| {
                     if let ExprNode::Send { recv, method, .. } = &*e.node
                         && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
                         && reach.iter().any(|set| set.contains(method))
-                        && !(root && replayed)
                     {
                         covered = false;
                     }
-                    root = false;
                 });
             }
             if covered && let Some(m) = extended.first() {

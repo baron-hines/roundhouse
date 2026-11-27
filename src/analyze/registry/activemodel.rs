@@ -2,7 +2,7 @@
 //! `ActiveModel::Errors` collection + individual `ActiveModel::Error`
 //! classes. Extracted verbatim from `Analyzer::with_adapter`.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::analyze::ClassInfo;
 use crate::ident::{ClassId, Symbol};
@@ -69,6 +69,11 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("size", Ty::Int),
         ("any?", Ty::Bool),
         ("none?", Ty::Bool),
+        // Blockless, as Enumerable over the Errors (always truthy) and
+        // over the accumulator's messages alike: the count is one, and
+        // true.
+        ("one?", Ty::Bool),
+        ("all?", Ty::Bool),
         ("empty?", Ty::Bool),
         ("include?", Ty::Bool),
         ("key?", Ty::Bool),
@@ -77,7 +82,6 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("full_messages", str_arr()),
         // `errors[:title]` returns an Array<String> of messages for that attribute.
         ("[]", str_arr()),
-        ("messages_for", str_arr()),
         ("details", crate::lower::errors_index::details_ty()),
         ("messages", Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(str_arr()) }),
         ("to_hash", Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(str_arr()) }),

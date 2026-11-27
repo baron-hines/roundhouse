@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use roundhouse::analyze::Analyzer;
 use roundhouse::ingest::ingest_app_from_tree;
-use roundhouse::ty::Ty;
+use roundhouse::ty::{FnTy, Ty};
 
 fn params_of(files: &[(&str, &str)], class: &str, method: &str) -> Vec<Ty> {
     let mut tree: HashMap<PathBuf, Vec<u8>> =
@@ -19,8 +19,8 @@ fn params_of(files: &[(&str, &str)], class: &str, method: &str) -> Vec<Ty> {
         .iter()
         .find(|m| m.name.as_str() == method && m.receiver == roundhouse::dialect::MethodReceiver::Instance)
         .expect("method");
-    let Some(Ty::Fn { params, .. }) = &def.signature else { panic!("typed: {:?}", def.signature) };
-    params.iter().map(|p| (*p.ty).clone()).collect()
+    let Some(Ty::Fn(fn_ty)) = &def.signature else { panic!("typed: {:?}", def.signature) };
+    fn_ty.params.iter().map(|p| (*p.ty).clone()).collect()
 }
 
 fn params_of_get(client: &str) -> Vec<Ty> {
@@ -34,13 +34,9 @@ fn params_of_get(client: &str) -> Vec<Ty> {
     )
 }
 
-/// The caller's `{ a: 1 }` joined with the `{}` default: no `{ query: … }` arm.
+/// The caller's `{ a: 1 }`, not joined with the `{}` default no caller leaves it to: no `{ query: … }` arm.
 fn caller_options_hash() -> Ty {
-    let unknown = || Ty::Var { var: roundhouse::ident::TyVar(0) };
-    Ty::Hash {
-        key: std::sync::Arc::new(Ty::Union { variants: vec![Ty::Sym, unknown()].into() }),
-        value: std::sync::Arc::new(Ty::Union { variants: vec![Ty::Int, unknown()].into() }),
-    }
+    Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Int) }
 }
 
 /// HTTParty gives the class a `get(url, options)`; `self.class.get` inside

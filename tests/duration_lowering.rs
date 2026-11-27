@@ -105,7 +105,7 @@ end
         "after? must ground to `>`:\n{out}",
     );
     assert!(
-        out.contains("t - ActiveSupport::Duration.hour(1).to_i < ActiveSupport::Duration.days(30).ago"),
+        out.contains("t - ActiveSupport::Duration.hour(1).value < ActiveSupport::Duration.days(30).ago"),
         "before? must ground to `<`, and Time - Duration to its seconds \
          (`-` binds tighter than `<`, so the parens are redundant):\n{out}",
     );
@@ -150,13 +150,40 @@ end
 "#,
     );
     assert!(
-        out.contains("t - ActiveSupport::Duration.hour(1).to_i"),
+        out.contains("t - ActiveSupport::Duration.hour(1).value"),
         "Time - Duration must ground to seconds:\n{out}",
     );
     assert!(
         out.contains("ActiveSupport::Duration.days(2) - ActiveSupport::Duration.hour(1)"),
         "Duration - Duration must stay untouched:\n{out}",
     );
+}
+
+#[test]
+fn named_duration_receivers_keep_duration_arithmetic() {
+    let out = lower_and_emit(r#"
+class DurationMath
+  AGE = 1.day
+  def difference
+    AGE - AGE
+  end
+end
+"#);
+    assert!(!out.contains("AGE.to_f"), "{out}");
+    assert!(!out.contains("AGE.to_i"), "{out}");
+}
+
+#[test]
+fn numeric_constants_keep_numeric_time_arithmetic() {
+    let out = lower_and_emit(r#"
+class NumericShift
+  SHIFT = 2
+  def shifted
+    Time.now + SHIFT
+  end
+end
+"#);
+    assert!(!out.contains("SHIFT.to_i"), "{out}");
 }
 
 #[test]

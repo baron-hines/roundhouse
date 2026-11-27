@@ -141,8 +141,8 @@ module ActiveSupport
     FROZEN_AT << 0
   end
 
-  # Stop the clock at `seconds` (the harness's `freeze_time`).
-  def self.freeze(seconds)
+  # Stop the clock at `seconds` (the harness's `freeze_time`). Not `freeze`: that is Module#freeze, which a gem calls on any class value.
+  def self.freeze_clock(seconds)
     FROZEN_AT.clear
     FROZEN_AT << seconds
   end
@@ -173,17 +173,6 @@ module ActiveSupport
       "%04d-%02d-%02d %02d:%02d:%02d.%06d",
       t.year, t.month, t.day, t.hour, t.min, t.sec, t.usec
     )
-  end
-
-  # Stdlib is the authority here (this tree already requires "time"),
-  # so the overlay delegates rather than re-derives — the CRuby lane's
-  # feed bytes are exactly what they were before the call site was
-  # grounded to a module function. The spinel twin composes the same
-  # shape from strftime and pins the zone tail; see its comment for why
-  # the two differ.
-  def self.rfc2822(t)
-    return nil if t.nil?
-    t.rfc2822
   end
 
   # Normalize a temporal-writer value into the canonical storage form

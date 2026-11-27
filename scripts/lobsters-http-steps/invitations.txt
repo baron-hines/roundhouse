@@ -1,0 +1,8 @@
+# invite someone, then look at the invitation and sign-up pages
+GET /invitations
+# /invitations redirects a user who may not invite; the form's token comes from /settings
+GET /settings
+POST /invitations email=newcomer@example.com&memo=From+the+replay
+GET /invitations
+GET /signup
+GET /invitations/not-a-code

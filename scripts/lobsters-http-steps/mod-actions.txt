@@ -1,0 +1,11 @@
+# a moderator writes a note on a user, and removes then restores a comment
+#! login alice@example.com
+GET /mod/
+POST /mod/notes mod_note[username]=bob&mod_note[note]=A+note+from+the+replay
+GET /~bob
+GET {story_path}
+POST /comments/{comment}/delete reason=Off-topic
+GET {story_path}
+POST /comments/{comment}/undelete
+GET {story_path}
+GET /moderations

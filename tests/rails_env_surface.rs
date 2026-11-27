@@ -2,13 +2,33 @@
 //! it, against native Rails as the oracle: the environment inquirer
 //! (`ActiveSupport::EnvironmentInquirer`, a String) compared,
 //! interpolated and asked `local?`; `present?`/`blank?`/`presence`;
-//! `File.dirname`; `warn`. `RH_RAILS_ORACLE=<version>`
-//! pins the activesupport the native control loads.
+//! `File.dirname`; `warn`. The native control loads the Rails
+//! `tests/support/rails_oracle.rb` picks (`RH_RAILS_ORACLE`).
 
+#[path = "support/prerequisite.rs"]
+mod prerequisite;
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
 use std::process::Command;
+
+const ORACLE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/rails_oracle.rb");
+
+/// Whether the Rails oracle's activesupport is there; a run without it
+/// says so and passes, as `docs/development/testing.md` asks. A probe that
+/// cannot run (a broken oracle) fails rather than skips.
+fn oracle_available() -> bool {
+    let probe = Command::new("ruby")
+        .args(["-e", &format!("require {ORACLE:?}\nputs RailsOracle.available?(\"activesupport\")")])
+        .output()
+        .expect("ruby");
+    let answer = String::from_utf8_lossy(&probe.stdout).trim().to_string();
+    assert!(probe.status.success() && (answer == "true" || answer == "false"), "oracle probe failed: {answer}\n{}", String::from_utf8_lossy(&probe.stderr));
+    if answer == "false" {
+        prerequisite::missing("the Rails oracle's activesupport is not available");
+    }
+    answer == "true"
+}
 
 /// App code, written once and run both natively and emitted. `ENV_OF`
 /// builds the inquirer for a name: Rails' class natively, the
@@ -62,13 +82,13 @@ local: 'local' is a reserved environment name
 
 #[test]
 fn native_rails_answers() {
-    let pin = std::env::var("RH_RAILS_ORACLE")
-        .map(|version| format!("gem \"activesupport\", \"{version}\"\n"))
-        .unwrap_or_default();
+    if !oracle_available() {
+        return;
+    }
     let output = Command::new("ruby")
         .args(["-e"])
         .arg(format!(
-            "{pin}require \"active_support\"\nrequire \"active_support/environment_inquirer\"\nrequire \"active_support/core_ext/object/blank\"\n{SURFACE}\nENV_OF = ->(name) {{ ActiveSupport::EnvironmentInquirer.new(name) }}\n{REPORT}"
+            "require {ORACLE:?}\nRailsOracle.activate(\"activesupport\")\nrequire \"active_support\"\nrequire \"active_support/environment_inquirer\"\nrequire \"active_support/core_ext/object/blank\"\n{SURFACE}\nENV_OF = ->(name) {{ ActiveSupport::EnvironmentInquirer.new(name) }}\n{REPORT}"
         ))
         .output()
         .expect("native Ruby control");

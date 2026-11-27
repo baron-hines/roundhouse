@@ -723,7 +723,7 @@ fn association_touch_guards_generated_targets_and_preserves_ordinary_columns() {
 }
 
 #[test]
-fn polymorphic_association_touch_guards_resolved_and_unresolved_generated_targets() {
+fn polymorphic_association_touch_guards_generated_targets_with_and_without_an_inverse() {
     use roundhouse::dialect::Association;
     use roundhouse::project::BuildTarget;
 
@@ -773,9 +773,11 @@ fn polymorphic_association_touch_guards_resolved_and_unresolved_generated_target
     else {
         panic!("expected polymorphic belongs_to");
     };
+    // No inverse `as:` or type literal: the association reads any model,
+    // `Person` among them, so the resolved-target branch guards it too.
     assert!(
-        polymorphic_targets.is_empty(),
-        "no inverse or type literal should exercise the unresolved-target guard branch"
+        polymorphic_targets.iter().any(|target| target.0.as_str() == "Person"),
+        "no inverse or type literal should resolve to every model; got {polymorphic_targets:?}"
     );
     assert_association_touch_guard(&analyzed_app, &diagnostics, "touch: :display_name");
 

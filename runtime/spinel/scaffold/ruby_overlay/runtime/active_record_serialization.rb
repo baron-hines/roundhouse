@@ -24,7 +24,12 @@ module ActiveRecord
           self.class.schema_columns.map { |n| n.to_s }
         end
       h = {}
+      # A column a partial `select` left out is not among Rails'
+      # `attribute_names`, so it gets no key and its reader, which
+      # raises MissingAttributeError, is not called.
+      unloaded = @__unloaded_columns
       names.each do |n|
+        next if unloaded && unloaded.include?(n.to_sym)
         # Rails' serializable_hash reads COLUMN attributes only: a
         # requested name with no column storage behind it (a
         # typed_store accessor like lobsters' homepage, which lives
@@ -40,7 +45,8 @@ module ActiveRecord
           value = send(n)
           # Date-only JSON is YYYY-MM-DD. DateTime is a distinct
           # timestamp domain despite being a Ruby subclass of Date.
-          h[n] = value.instance_of?(Date) ? value.iso8601 : value
+          # Not the Time itself: Rails' as_json answers each value as JSON reads it, a Time as `xmlschema(3)`.
+          h[n] = value.instance_of?(Date) ? value.iso8601 : (value.is_a?(Time) ? ActiveSupport::JSON.time_json(value) : value)
         end
       end
       h

@@ -79,7 +79,7 @@ expect "[3, 5, a..b]", scores(klass.where(score: [3, 5, 6..9])), [3, 5, 7]
 
 # Range bounds bind like any other hash-condition value.
 sql = klass.where(score: 5...9).to_sql
-raise "exclusive range SQL: #{sql}" unless sql.include?("widgets.score >= 5") && sql.include?("widgets.score < 9")
+raise "exclusive range SQL: #{sql}" unless sql.include?(%(widgets."score" >= 5)) && sql.include?(%(widgets."score" < 9))
 "##,
     );
 }

@@ -1,11 +1,11 @@
 //! Exception owners are class/module values, not implementations of Rails'
 //! image-processing or cloud-service constructor contracts.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::expr::{Expr, ExprNode, Literal, Pattern};
 use crate::ident::{ClassId, Symbol};
-use crate::ty::Ty;
+use crate::ty::{FnTy, Ty};
 
 use super::{BodyTyper, Ctx};
 
@@ -315,7 +315,7 @@ impl BodyTyper<'_> {
             return false;
         };
         let mut current = Some(id);
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = crate::det::HashSet::default();
         while let Some(id) = current {
             if !seen.insert(id) {
                 break;
@@ -409,12 +409,12 @@ impl BodyTyper<'_> {
                 _ => return None,
             };
             let ret = self.derived_storage_class_value(Some(recv_ty), &name, &[])?;
-            return Some(Ty::Fn {
+            return Some(Ty::Fn(Box::new(FnTy {
                 params: vec![].into(),
                 block: None,
                 ret: std::sync::Arc::new(ret),
                 effects: crate::effect::EffectSet::default(),
-            });
+            })));
         }
         if !args.is_empty() {
             return None;
@@ -459,7 +459,7 @@ impl BodyTyper<'_> {
             return None;
         };
         let mut current = Some(id);
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = crate::det::HashSet::default();
         let mut lineage = Vec::new();
         let mut storage_owner = false;
         while let Some(id) = current {
@@ -489,7 +489,7 @@ impl BodyTyper<'_> {
             return None;
         };
         let mut current = Some(id);
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = crate::det::HashSet::default();
         let mut unsupported = None;
         while let Some(id) = current {
             if !seen.insert(id) {
@@ -504,7 +504,7 @@ impl BodyTyper<'_> {
                 return None;
             }
             if id.0.as_str() != "ActiveStorage::Transformers"
-                && self.source_storage_initializer(id, &mut std::collections::HashSet::new())
+                && self.source_storage_initializer(id, &mut crate::det::HashSet::default())
             {
                 return None;
             }
@@ -517,7 +517,7 @@ impl BodyTyper<'_> {
     fn source_storage_initializer<'a>(
         &'a self,
         id: &'a ClassId,
-        seen: &mut std::collections::HashSet<&'a ClassId>,
+        seen: &mut crate::det::HashSet<&'a ClassId>,
     ) -> bool {
         if !seen.insert(id) {
             return false;

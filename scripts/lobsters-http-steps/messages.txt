@@ -1,0 +1,5 @@
+# send a private message, read the inbox, the sent box and the message
+GET /messages
+POST /messages message[recipient_username]=alice&message[subject]=Hello+alice&message[body]=A+message+from+the+replay
+GET /messages
+GET /messages/sent

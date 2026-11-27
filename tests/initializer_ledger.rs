@@ -149,12 +149,24 @@ fn a_content_helper_allow_list_after_other_statements_is_read() {
 }
 
 #[test]
-fn an_after_initialize_hook_is_one_unconsumed_statement() {
-    let (_, ledger) = ingest(&[(
+fn an_after_initialize_hook_is_carried_unless_it_needs_its_surroundings() {
+    // The first runs at boot (ingest::after_initialize) and is consumed;
+    // `do |app|` takes the application Rails yields and the third reads the
+    // initializer's own local, which a carried body has neither of.
+    let (app, ledger) = ingest(&[(
         "config/initializers/hooks.rb",
-        "Rails.application.config.after_initialize do\n  Mailer.verify!\nend\n",
+        "limit = 5\n\
+         Rails.application.config.after_initialize do\n  Mailer.verify!\nend\n\
+         Rails.application.config.after_initialize do |app|\n  Mailer.verify!(app)\nend\n\
+         Rails.application.config.after_initialize do\n  Mailer.verify!(limit)\nend\n",
     )]);
-    assert_eq!(statements(&ledger), ["Rails.application.config.after_initialize"]);
+    let hooks: Vec<&str> = ledger
+        .iter()
+        .filter(|d| statement(d) == "Rails.application.config.after_initialize")
+        .map(location)
+        .collect();
+    assert_eq!(hooks, ["config/initializers/hooks.rb:5:1", "config/initializers/hooks.rb:8:1"]);
+    assert!(app.runs_after_initialize);
 }
 
 #[test]
@@ -221,11 +233,30 @@ fn every_recognizer_that_reads_an_initializer_keeps_its_statement_out_of_the_led
             "config/initializers/content.rb",
             "ActionText::ContentHelper.allowed_tags = ActionText::ContentHelper.allowed_tags | %w[mark]\n",
         ),
+        ("config/initializers/view_paths.rb", "ActionController::Base.prepend_view_path \"app/views/themes/next\"\n"),
+        (
+            "config/initializers/mail_views.rb",
+            "ActiveSupport.on_load(:action_mailer) do\n  append_view_path \"app/views/mail\"\nend\n",
+        ),
     ];
     for (path, source) in consumed {
         let (_, ledger) = ingest(&[(path, source)]);
         assert!(ledger.is_empty(), "{path}: ledger listed {:?}", statements(&ledger));
     }
+}
+
+#[test]
+fn a_view_path_the_build_cannot_read_is_an_error_not_a_ledger_line() {
+    let files = tree(&[
+        ("db/schema.rb", SCHEMA),
+        ("config/initializers/view_paths.rb", "ActionController::Base.prepend_view_path(ThemeResolver.new)\n"),
+    ]);
+    let (app, diags) = prism::scope(|| ingest_app_from_tree(files));
+    app.expect("ingest");
+    assert!(!diags.iter().any(|d| matches!(d.kind, DiagnosticKind::UnconsumedInitializer { .. })), "{diags:#?}");
+    let errors: Vec<&Diagnostic> = diags.iter().filter(|d| d.severity == Severity::Error).collect();
+    assert_eq!(errors.len(), 1, "{diags:#?}");
+    assert!(errors[0].message.contains("a view path that is not a string literal"), "{:?}", errors[0].message);
 }
 
 #[test]
@@ -321,9 +352,10 @@ fn application_rb_reports_config_statements_nothing_reads() {
     assert!(application.methods.iter().any(|m| m.name.as_str() == "config_time_zone"));
     assert!(application.methods.iter().any(|m| m.name.as_str() == "read_only?"));
     // ... load_defaults / time_zone are consumed, eager_load is inert, defs are methods.
-    assert_eq!(statements(&ledger), ["config.i18n.enforce_available_locales =", "config.after_initialize"]);
+    // `config.after_initialize` runs at boot (ingest::after_initialize), so it is consumed too.
+    assert_eq!(statements(&ledger), ["config.i18n.enforce_available_locales ="]);
     assert_eq!(owner(&ledger[0]), "host config/application.rb");
-    assert_eq!(location(&ledger[1]), "config/application.rb:10:5");
+    assert!(app.runs_after_initialize);
 }
 
 /// The tree of an in-tree PATH engine: its class body, initializers and
@@ -355,6 +387,62 @@ fn an_engine_class_body_reports_initializers_and_hooks_but_not_requires() {
     assert_eq!(location(&ledger[1]), "vendor/catalog/lib/catalog/engine.rb:6:5");
     // The span points at the statement itself.
     assert!(ledger.iter().all(|d| d.severity == Severity::Warning));
+}
+
+const SETTLED_ENGINE: &str = r##"module Catalog
+  mattr_accessor :label, default: "x"
+
+  class Engine < Rails::Engine
+    isolate_namespace Catalog
+
+    rake_tasks do
+      load "catalog/tasks.rb"
+    end
+
+    console do
+      puts "catalog"
+    end
+
+    config.catalog = ActiveSupport::OrderedOptions.new unless config.try(:catalog)
+
+    config.before_initialize do
+      config.catalog.each do |key, value|
+        Catalog.public_send("#{key}=", value)
+      end
+    end
+
+    initializer "catalog.extensions" do
+      ActiveSupport.on_load :active_job do
+        ActiveJob.extend Catalog::Lookup
+      end
+    end
+
+    initializer "catalog.middleware" do |app|
+      if app.config.api_only
+        config.middleware.use ActionDispatch::Flash
+      end
+    end
+  end
+end
+"##;
+
+/// An engine's statements the engine's own boot accounts for leave the
+/// ledger: blocks only a `rails` command runs, the config namespace it
+/// copies onto a module, the load-hook mixins the ingest carries, an
+/// initializer whose only branch the host's config never takes, and the
+/// `before_initialize` boot replays; the engine is then admitted, so its
+/// `isolate_namespace` is consumed too.
+#[test]
+fn an_engines_settled_boot_statements_leave_the_ledger() {
+    let (_, ledger) = ingest(&engine_tree(SETTLED_ENGINE, &[]));
+    assert!(statements(&ledger).is_empty(), "{:?}", statements(&ledger));
+}
+
+#[test]
+fn an_engine_initializer_whose_branch_the_host_takes_stays_on_the_ledger() {
+    let application = "module Shop\n  class Application < Rails::Application\n    config.api_only = true\n  end\nend\n";
+    let (_, ledger) = ingest(&engine_tree(SETTLED_ENGINE, &[("config/application.rb", application)]));
+    assert!(statements(&ledger).contains(&"initializer \"catalog.middleware\""), "{:?}", statements(&ledger));
 }
 
 #[test]
@@ -526,7 +614,7 @@ end
              Rack::Attack.throttle(\"req/ip\", limit: 300, period: 300) { |req| req.ip }
              OmniAuth.config.logger = Rails.logger
              Audit.record_boot
-             Rails.application.config.after_initialize { Audit.record_boot }
+             Rails.application.config.after_initialize { |app| Audit.record_boot }
              if ENV[\"SLOW\"]
   Rails.application.config.middleware.insert_before 0, Rack::Runtime
 end
@@ -541,11 +629,11 @@ end
             ("Rails.application.config.middleware.use", "rails"),
             ("Rails.application.config.assets.paths.<<", "rails-boot-only"),
             ("Rails.autoloaders.main.ignore", "rails-boot-only"),
-            ("config.password_length =", "gem:devise:modeled"),
+            ("config.password_length =", "gem:devise:unknown"),
             ("orm :active_record", "gem:doorkeeper:unknown"),
             ("Rack::Attack.throttle", "gem:rack-attack:unknown"),
             ("OmniAuth.config.logger =", "gem:omniauth:unknown"),
-            ("Audit.record_boot", "app"),
+            // Not listed: an app-owned top-level call is no longer dropped, it runs at boot (`ingest::boot_program`).
             ("Rails.application.config.after_initialize", "app"),
             ("if ENV[\"SLOW\"]", "rails"),
             ("Unheard::Of.start", "unknown"),
@@ -567,7 +655,7 @@ fn a_rooted_configure_block_and_an_in_repo_gem_keep_their_gems() {
         ),
     ]);
     let got: Vec<(&str, &str)> = ledger.iter().map(|d| (statement(d), holder(d))).collect();
-    assert_eq!(got, [("config.password_length =", "gem:devise:modeled"), ("c.size =", "gem:catalog:in-repo")]);
+    assert_eq!(got, [("config.password_length =", "gem:devise:unknown"), ("c.size =", "gem:catalog:in-repo")]);
 }
 
 #[test]
@@ -593,4 +681,157 @@ fn a_filter_parameters_operand_after_a_comment_or_blank_line_is_read() {
          Rails.application.config.filter_parameters += [\n  # secrets\n  :secret,\n]\n",
     )]);
     assert!(ledger.is_empty(), "{:?}", statements(&ledger));
+}
+
+#[test]
+fn a_constant_a_class_body_reads_stays_on_the_ledger_since_initializers_load_after_app() {
+    let (app, ledger) = ingest(&[
+        ("config/initializers/settings.rb", "SETTINGS = { default: 3 }.freeze\nGREETING = \"hi\"\n"),
+        ("app/models/widget.rb", "class Widget < ApplicationRecord\n  DEFAULT = SETTINGS[:default]\n  def greeting = GREETING\nend\n"),
+    ]);
+    assert!(statements(&ledger).iter().any(|s| s.starts_with("SETTINGS")), "{:?}", statements(&ledger));
+    assert!(!statements(&ledger).iter().any(|s| s.starts_with("GREETING")), "{:?}", statements(&ledger));
+    assert_eq!(app.boot_program.len(), 1);
+}
+
+#[test]
+fn a_condition_on_a_rooted_or_quoted_constant_stays_on_the_ledger() {
+    let (app, ledger) = ingest(&[(
+        "config/initializers/guards.rb",
+        "if ::Gizmo.ready?\n  READY = true\nend\nif \"'\" == \"x\" && Widgetry.on?\n  ON = true\nend\nif ENV[\"BOOT\"]\n  BOOTED = true\nend\n",
+    )]);
+    assert_eq!(statements(&ledger), ["if ::Gizmo.ready?", "if \"'\" == \"x\" && Widgetry.on?"]);
+    assert_eq!(app.boot_program.len(), 1);
+}
+
+#[test]
+fn a_constant_a_class_body_reads_stays_on_the_ledger_when_a_conditional_assigns_it() {
+    let (app, ledger) = ingest(&[
+        ("config/initializers/settings.rb", "if ENV[\"BOOT\"]\n  SETTINGS = {}\nend\n"),
+        ("app/models/widget.rb", "class Widget < ApplicationRecord\n  DEFAULT = SETTINGS\nend\n"),
+    ]);
+    assert_eq!(statements(&ledger), ["if ENV[\"BOOT\"]"]);
+    assert!(app.boot_program.is_empty());
+}
+
+#[test]
+fn a_constant_a_conditional_assigns_does_not_admit_a_later_mutation() {
+    let (app, ledger) = ingest(&[(
+        "config/initializers/flags.rb",
+        "if ENV[\"BOOT\"]\n  FLAGS = []\nend\nFLAGS << :late\n",
+    )]);
+    assert_eq!(statements(&ledger), ["FLAGS.<<"]);
+    assert_eq!(app.boot_program.len(), 1);
+}
+
+/// Rails registers a hook under `if defined?(Rails::Server)` under `rails
+/// server` only; it is carried as a server-only callback
+/// (`ingest::after_initialize`), so the ledger no longer reports it, and it
+/// is still no statement of the boot program.
+#[test]
+fn a_hook_under_the_server_guard_is_carried_off_the_ledger() {
+    let (app, ledger) = ingest(&[(
+        "config/initializers/recover_exports.rb",
+        "if defined?(Rails::Server)\n  Rails.application.config.after_initialize do\n    BootProbe.recover_pending!\n  end\nend\n",
+    )]);
+    assert!(ledger.is_empty(), "{:?}", statements(&ledger));
+    assert!(app.runs_after_initialize);
+    assert!(app.boot_program.is_empty(), "{:?}", app.boot_program);
+}
+
+/// The other spellings of that guard: rooted, as a modifier, and around
+/// two hooks. Each is carried, server-only, and nothing is ledgered.
+#[test]
+fn the_server_guard_is_carried_rooted_as_a_modifier_and_around_several_hooks() {
+    let hook = "Rails.application.config.after_initialize do\n  BootProbe.recover_pending!\nend\n";
+    for (name, source) in [
+        ("rooted", format!("if defined?(::Rails::Server)\n{hook}end\n")),
+        ("then", format!("if defined? Rails::Server then\n{hook}end\n")),
+        ("modifier", format!("Rails.application.config.after_initialize do\n  BootProbe.recover_pending!\nend if defined?(Rails::Server)\n")),
+        ("several", format!("if defined?(Rails::Server)\n{hook}{hook}end\n")),
+    ] {
+        let (app, ledger) = ingest(&[("config/initializers/server_hooks.rb", &source)]);
+        assert!(ledger.is_empty(), "{name}: {:?}", statements(&ledger));
+        assert!(app.runs_after_initialize, "{name}");
+        assert!(app.boot_program.is_empty(), "{name}: {:?}", app.boot_program);
+    }
+}
+
+/// Only that exact guard is carried. An `else` or `elsif`, `unless`,
+/// another predicate or constant, a mixed body, a hook inside `configure`,
+/// a hook whose block takes the app, and a hook with a static part (a
+/// reopen or a `require`, which would apply in every process) each stay on
+/// the ledger, and nothing runs.
+#[test]
+fn a_hook_under_any_other_guard_stays_on_the_ledger() {
+    let hook = "  Rails.application.config.after_initialize do\n    BootProbe.recover_pending!\n  end\n";
+    let guarded = |body: &str| format!("if defined?(Rails::Server)\n{body}end\n");
+    for (name, source) in [
+        ("else", format!("if defined?(Rails::Server)\n{hook}else\n  BOOTED = true\nend\n")),
+        ("elsif", format!("if defined?(Rails::Server)\n{hook}elsif ENV[\"SERVE\"]\n{hook}end\n")),
+        ("unless", format!("unless defined?(Rails::Server)\n{hook}end\n")),
+        ("console", format!("if defined?(Rails::Console)\n{hook}end\n")),
+        ("nested constant", format!("if defined?(Boot::Rails::Server)\n{hook}end\n")),
+        ("and", format!("if defined?(Rails::Server) && ENV[\"SERVE\"]\n{hook}end\n")),
+        ("mixed", guarded(&format!("{hook}  BootProbe.warm!\n"))),
+        ("configure", guarded("  Rails.application.configure do\n    config.after_initialize do\n      BootProbe.recover_pending!\n    end\n  end\n")),
+        ("block parameter", guarded("  Rails.application.config.after_initialize do |app|\n    BootProbe.recover_pending!(app)\n  end\n")),
+        ("reopen", guarded("  Rails.application.config.after_initialize do\n    BootProbe.module_eval do\n      def self.ready? = true\n    end\n  end\n")),
+        ("require", guarded("  Rails.application.config.after_initialize do\n    require \"ext/boot_patch\"\n  end\n")),
+    ] {
+        let (app, ledger) = ingest(&[("config/initializers/guarded.rb", &source)]);
+        assert_eq!(ledger.len(), 1, "{name}: {:?}", statements(&ledger));
+        assert!(!app.runs_after_initialize, "{name}");
+        assert!(app.boot_program.is_empty(), "{name}: {:?}", app.boot_program);
+    }
+}
+
+#[test]
+fn a_hook_name_outside_a_guard_branch_is_not_a_hook() {
+    let (app, _) = ingest(&[
+        (
+            "config/initializers/limits.rb",
+            "LIMITS = Limits.configure { |c| c }\n\ndef reconfigure_limits\n  Limits.configure { |c| c }\nend\n",
+        ),
+        ("app/models/limits.rb", "class Limits\n  def self.configure\n    yield 1\n  end\nend\n"),
+    ]);
+    assert_eq!(app.boot_program.len(), 1, "{:?}", app.boot_program);
+    assert!(
+        app.library_classes.iter().any(|lc| lc.name.0.as_str() == "RoundhouseInitializers"
+            && lc.methods.iter().any(|m| m.name.as_str() == "reconfigure_limits")),
+        "the def is still taken"
+    );
+}
+
+#[test]
+fn a_hook_in_a_case_branch_stays_on_the_ledger() {
+    let (app, ledger) = ingest(&[(
+        "config/initializers/by_env.rb",
+        "case ENV[\"MODE\"]\nwhen \"server\"\n  Rails.application.config.after_initialize do\n    BootProbe.recover_pending!\n  end\nend\n",
+    )]);
+    assert!(!ledger.is_empty(), "the hook is reported");
+    assert!(app.boot_program.is_empty(), "{:?}", app.boot_program);
+}
+
+/// The app's own `config.middleware.use` of a gem compiled from source is stacked, so it is no
+/// dropped statement; one of a class no source gem defines still is.
+#[test]
+fn a_stacked_application_middleware_use_is_not_dropped() {
+    let (app, ledger) = ingest(&[
+        ("Gemfile.lock", "GEM\n  remote: https://rubygems.org/\n  specs:\n    warden (1.2.9)\n\nDEPENDENCIES\n  warden\n"),
+        (".bundle/config", "---\nBUNDLE_PATH: \"vendor/bundle\"\n"),
+        (
+            "vendor/bundle/ruby/3.4.0/gems/warden-1.2.9/lib/warden.rb",
+            "module Warden\n  class Proxy\n    def initialize(env)\n      @env = env\n    end\n  end\n  class Manager\n    def initialize(app)\n      @app = app\n    end\n\n    def call(env)\n      env[\"warden\"] = Proxy.new(env)\n      @app.call(env)\n    end\n  end\nend\n",
+        ),
+        (
+            "config/application.rb",
+            "module Blog\n  class Application < Rails::Application\n    config.middleware.use Rack::Deflater\n    config.middleware.use Warden::Manager\n  end\nend\n",
+        ),
+    ]);
+    assert_eq!(app.gem_middlewares, ["Warden::Manager"]);
+    assert_eq!(app.rack_env_writes.get("warden").map(String::as_str), Some("Warden::Proxy"));
+    let got: Vec<&str> = ledger.iter().map(|d| statement(d)).collect();
+    assert_eq!(got, ["config.middleware.use"], "{ledger:#?}");
+    assert!(ledger[0].message.contains("config/application.rb:3"), "{}", ledger[0].message);
 }

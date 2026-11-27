@@ -1,7 +1,7 @@
-//! `X = Struct.new(…, keyword_init: true)` in a class or module body
-//! becomes the class `<owner>::X`. A shape the synthesis cannot write as
-//! plain Ruby stays the constant it was, so it keeps reporting instead
-//! of vanishing.
+//! `X = Struct.new(…)` in a class or module body becomes the class
+//! `<owner>::X`, positional or `keyword_init: true`. A shape the synthesis
+//! cannot write as plain Ruby stays the constant it was, so it keeps
+//! reporting instead of vanishing.
 
 use roundhouse::ingest::ingest_library_classes;
 
@@ -24,9 +24,12 @@ fn a_struct_constant_becomes_its_class_after_the_owner() {
 #[test]
 fn a_struct_the_synthesis_cannot_write_stays_a_constant() {
     let (names, constants) = names_and_constants(
-        "class Service\n  Asked = Struct.new(:success?, keyword_init: true)\n  Reserved = Struct.new(:end, keyword_init: true)\n  Splat = Struct.new(*FIELDS, keyword_init: true)\n  Loud = Struct.new(:a, keyword_init: true) do\n    attr_accessor :b\n  end\n  Strict = Struct.new(:a, keyword_init: false)\n  Either = Struct.new(:a, :b)\nend\n",
+        "class Service\n  Asked = Struct.new(:success?, keyword_init: true)\n  Reserved = Struct.new(:end, keyword_init: true)\n  Splat = Struct.new(*FIELDS, keyword_init: true)\n  Loud = Struct.new(:a, keyword_init: true) do\n    attr_accessor :a\n  end\n  Strict = Struct.new(:a, keyword_init: false)\n  Either = Struct.new(:a, :b)\n  Extra = Struct.new(:a) do\n    attr_accessor :b\n  end\n  Aliased = Struct.new(:a) do\n    alias_method :b, :a\n  end\nend\n",
     );
-    assert_eq!(names, ["Service"]);
-    // `Either` takes `Either.new(1, 2)` and, since Ruby 3.2, `Either.new(a: 1, b: 2)`: no one constructor answers both.
-    assert_eq!(constants, ["Asked", "Reserved", "Splat", "Loud", "Strict", "Either"]);
+    // The positional forms are classes: `Either.new(a: 1, b: 2)` (Ruby 3.2
+    // binds it by member name) is refused where it is called instead.
+    // An accessor of its own beside the members is the class's (`Extra`); one over a member is not (`Loud`).
+    // A predicate member (`Asked`) is held under a slot of its own (`struct_slot`), so it is a class too.
+    assert_eq!(names, ["Service", "Service::Asked", "Service::Strict", "Service::Either", "Service::Extra"]);
+    assert_eq!(constants, ["Reserved", "Splat", "Loud", "Aliased"]);
 }

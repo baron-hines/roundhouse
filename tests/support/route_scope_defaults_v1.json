@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "schema": {
+    "tables": {}
+  },
+  "models": [],
+  "controllers": [],
+  "routes": {
+    "entries": [
+      {
+        "kind": "scope",
+        "defaults": {
+          "user_id": "me",
+          "format": "json"
+        },
+        "entries": [
+          {
+            "kind": "explicit",
+            "method": "GET",
+            "path": "/users/:user_id",
+            "controller": "UsersController",
+            "action": "show"
+          },
+          {
+            "kind": "scope",
+            "defaults": {
+              "locale": "en"
+            },
+            "entries": [
+              {
+                "kind": "explicit",
+                "method": "GET",
+                "path": "/posts",
+                "controller": "PostsController",
+                "action": "index"
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "views": [],
+  "rbs_includes": {},
+  "source_index_required": false
+}

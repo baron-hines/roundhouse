@@ -7,6 +7,8 @@
 //! writer's key is dropped the same way and the writer isn't called,
 //! from `create` or `update`. A public hand-written writer still is.
 
+#[path = "../support/prerequisite.rs"]
+mod prerequisite;
 use super::emit_and_run;
 
 const WRITERS: &str = r##"
@@ -84,7 +86,7 @@ puts "private writers are not called"
 fn rails_refuses_a_private_writer_key() {
     let probe = r#"gem "activerecord", "8.1.4"; gem "actionpack", "8.1.4"; require "active_record"; require "action_controller"; require "sqlite3""#;
     if !std::process::Command::new("ruby").args(["-e", probe]).status().is_ok_and(|s| s.success()) {
-        eprintln!("skipping: ruby with activerecord/actionpack 8.1.4 and sqlite3 not available");
+        prerequisite::missing("ruby with activerecord/actionpack 8.1.4 and sqlite3 not available");
         return;
     }
     let script = format!(

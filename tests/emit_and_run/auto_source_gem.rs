@@ -1,0 +1,122 @@
+use roundhouse::build_target::BuildTarget;
+
+use super::auto_source_gem_contract as auto_source_gem;
+
+fn mentions(tree: &std::path::Path, needle: &str) -> bool {
+    walkdir(tree).iter().any(|p| std::fs::read_to_string(p).is_ok_and(|text| text.contains(needle)))
+}
+
+fn walkdir(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(walkdir(&path));
+        } else if path.extension().is_some_and(|e| e == "rb") {
+            out.push(path);
+        }
+    }
+    out
+}
+
+#[test]
+fn the_spinel_tree_compiles_the_installed_gem_and_its_dependency() {
+    let (emitted, errors) = auto_source_gem::overlay().emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+    assert!(mentions(&emitted, "module Greetings"), "greetings is not in the Spinel tree");
+    assert!(mentions(&emitted, "module Exclaim"), "exclaim is not in the Spinel tree");
+    // Spelled whole: runtime/multipart.rb has `def self.boundary`.
+    assert!(!mentions(&emitted, "class Bindings\n"), "an unreached gem class is in the Spinel tree");
+    assert!(!mentions(&emitted, "def self.bound(values)"), "an unreached gem method is in the Spinel tree");
+    assert!(mentions(&emitted, "@width = value.to_i * 2"), "a writer reached by a built name is not in the Spinel tree");
+}
+
+#[test]
+fn the_ruby_tree_loads_the_real_gem_instead() {
+    let (emitted, errors) = auto_source_gem::overlay().emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    assert!(!mentions(&emitted, "module Greetings"), "greetings is compiled into the Ruby tree");
+    assert!(!mentions(&emitted, "module Exclaim"), "exclaim is compiled into the Ruby tree");
+    let gemfile = std::fs::read_to_string(emitted.join("Gemfile")).expect("Gemfile");
+    assert!(gemfile.contains("gem \"greetings\""), "{gemfile}");
+}
+
+/// A direct dependency that depends on a gem compiled from source is Bundler's to require, and it
+/// extends that gem as it loads (devise_invitable's `Devise.add_module`): it is compiled with it, though
+/// the app names nothing of its own.
+#[test]
+fn a_gem_that_extends_a_compiled_gem_comes_with_it() {
+    let (emitted, errors) = auto_source_gem::overlay()
+        .edit("Gemfile.lock", "    greetings (1.0)\n      exclaim\n", "    greetings (1.0)\n      exclaim\n    greetings_loud (1.0)\n      greetings\n")
+        .edit("Gemfile.lock", "DEPENDENCIES\n", "DEPENDENCIES\n  greetings_loud\n")
+        .write(
+            "vendor/bundle/ruby/3.4.0/gems/greetings_loud-1.0/lib/greetings_loud.rb",
+            "module Greetings\n  class Formatter\n    def self.loud(text)\n      shout(text) + \"!!\"\n    end\n  end\nend\n",
+        )
+        .edit("app/models/article.rb", "  def shouted_title\n", "  def loud_title\n    Greetings::Formatter.loud(title)\n  end\n\n  def shouted_title\n")
+        .emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+    assert!(mentions(&emitted, "def self.loud(text)"), "the extending gem is not in the Spinel tree");
+}
+
+/// A gem's bare read of a constant it defines only in another class is the
+/// NameError Ruby raises there, not an unsupported constant.
+#[test]
+fn a_gem_s_bare_read_of_a_constant_nested_elsewhere_is_ruby_s_name_error() {
+    let (_emitted, errors) = auto_source_gem::misnamed_overlay().emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+}
+
+/// A gem's `const_set` of a name built with a literal prefix (aasm's `klass.const_set("STATE_#{name.upcase}", …)`,
+/// through a local) makes only names with that prefix, so the constants nothing defines stay Ruby's NameError; a name
+/// of no known shape may be any, and the read stays unsupported.
+#[test]
+fn a_gem_s_const_set_hides_only_the_names_it_may_make() {
+    let state_const_set = "module Greetings\n  module States\n    def self.define(klass, name)\n      const_name = name.nil? ? \"STATE_#{name}\" : \"STATE_#{name.upcase}\"\n      klass.const_set(const_name, name)\n    end\n  end\nend\n";
+    let with = |text: &str| {
+        auto_source_gem::misnamed_overlay()
+            .write("vendor/bundle/ruby/3.4.0/gems/greetings-1.0/lib/greetings/states.rb", text)
+            .edit("vendor/bundle/ruby/3.4.0/gems/greetings-1.0/lib/greetings.rb", "require \"greetings/codec\"\n", "require \"greetings/codec\"\nrequire \"greetings/states\"\n")
+            .emit(BuildTarget::Spinel)
+            .1
+    };
+    let errors = with(state_const_set);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let errors = with(&state_const_set.replace("klass.const_set(const_name, name)", "klass.const_set(name, name)"));
+    assert!(errors.iter().any(|e| e.ends_with("constant not supported (all targets): MustImplement")), "{errors:#?}");
+}
+
+/// A constant a gem assigns into another class (`MessageBus::BACKENDS = {}` at a file's top level, redis-client's
+/// `CommandError::ERRORS = { … }` in `class RedisClient`) is that class's, as Ruby defines it.
+#[test]
+fn a_gem_s_constant_write_into_another_class_is_that_class_s() {
+    let (_emitted, errors) = auto_source_gem::top_level_constant_overlay().emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+}
+
+/// A gem file's top-level `Klass.prepend(Mod)` is Module#prepend, run as the file loads.
+#[test]
+fn a_gem_file_s_top_level_prepend_is_module_s() {
+    let (_emitted, errors) = auto_source_gem::top_level_prepend_overlay().emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+}
+
+/// A platform constant read in the load-time branch that tests `Socket` for it runs only where it exists; read
+/// anywhere else it stays reported.
+#[test]
+fn a_gem_s_platform_constant_read_under_its_test_is_typed() {
+    let (_emitted, errors) = auto_source_gem::platform_constant_overlay().emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let errors = auto_source_gem::platform_constant_overlay()
+        .edit("vendor/bundle/ruby/3.4.0/gems/greetings-1.0/lib/greetings/keep_alive.rb", "[Socket::IPPROTO_TCP, Socket::TCP_KEEPINTVL]", "[Socket::SOL_TCP, Socket::TCP_KEEPINTVL]")
+        .check_errors();
+    assert!(errors.iter().any(|e| e.ends_with("constant not supported (all targets): Socket::SOL_TCP")), "{errors:#?}");
+}
+
+/// A rooted `::Absent` read in a gem class under a Rails framework's namespace is Ruby's NameError, which the gem
+/// rescues; the framework may define only a relative read there.
+#[test]
+fn a_gem_s_rooted_read_in_a_framework_namespace_is_ruby_s_name_error() {
+    let (_emitted, errors) = auto_source_gem::rooted_in_framework_overlay().emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+}

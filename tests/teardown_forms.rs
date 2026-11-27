@@ -1,7 +1,8 @@
-//! Only `teardown do … end` is modeled in a test class. Any other
-//! `teardown` call is refused by name at ingest, since it would otherwise
-//! fall to the unrecognized-statement drop and its cleanup would silently
-//! never run.
+//! `teardown do … end` and `teardown :method_name` are modeled in a test
+//! class (the named form runs end to end in tests/test_helper_concerns.rs).
+//! Any other `teardown` call is refused by name at ingest, since it would
+//! otherwise fall to the unrecognized-statement drop and its cleanup would
+//! silently never run.
 
 fn ingest(body: &str) -> Result<(), String> {
     let source = format!("require \"test_helper\"\n\nclass WidgetTest < ActiveSupport::TestCase\n{body}\nend\n");
@@ -16,8 +17,13 @@ fn a_teardown_block_is_modeled() {
 }
 
 #[test]
-fn a_teardown_symbol_is_refused_by_name() {
-    let err = ingest("  teardown :close_files\n\n  test \"a\" do\n    assert true\n  end").unwrap_err();
+fn a_teardown_symbol_is_modeled() {
+    ingest("  teardown :close_files\n\n  def close_files\n  end\n\n  test \"a\" do\n    assert true\n  end").unwrap();
+}
+
+#[test]
+fn a_teardown_with_options_is_refused_by_name() {
+    let err = ingest("  teardown :close_files, if: :open?\n\n  test \"a\" do\n    assert true\n  end").unwrap_err();
     assert!(err.contains("test teardown not modeled"), "{err}");
 }
 

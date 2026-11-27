@@ -19,7 +19,8 @@ module ActionController
       target = fallback
       req = ActionController::Current.request
       unless req.nil?
-        ref = req.referer
+        # Not the bare reader: the CRuby overlay's referer is nil when no Referer header came, whatever the RBS says.
+        ref = req.referer.to_s
         base = req.base_url
         if ref == base || ref.start_with?(base + "/")
           target = ref

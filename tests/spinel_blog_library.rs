@@ -37,13 +37,14 @@ fn errors_rb_ingests_and_emits_via_library_path() {
     // qualified — `ingest_library_classes` walks enclosing module
     // nesting and prepends the path to each class's syntactic name.
     let names: Vec<&str> = classes.iter().map(|c| c.name.0.as_str()).collect();
-    assert_eq!(classes.len(), 24, "names: {names:?}");
+    assert_eq!(classes.len(), 26, "names: {names:?}");
 
-    // Rails 8.1's hierarchy: ActiveRecordError under StandardError, and every other class under it.
+    // Rails 8.1's ActiveRecord hierarchy, plus ActiveModel's NoMethodError subclasses.
     for lc in &classes {
         assert!(!lc.is_module, "{} should be a class, not module", lc.name.0.as_str());
         let parent = lc.parent.as_ref().map(|p| p.0.as_str()).unwrap_or("(none)");
         let expected = match lc.name.0.as_str() {
+            "ActiveModel::UnknownAttributeError" | "ActiveModel::MissingAttributeError" => "NoMethodError",
             "ActiveRecord::ActiveRecordError" => "StandardError",
             "ActiveRecord::RecordNotFound" | "ActiveRecord::RecordInvalid" | "ActiveRecord::RecordNotSaved"
             | "ActiveRecord::RecordNotDestroyed"
@@ -83,7 +84,7 @@ fn errors_rb_ingests_and_emits_via_library_path() {
         .iter()
         .filter(|f| f.path.extension().and_then(|e| e.to_str()) == Some("rb"))
         .count();
-    assert_eq!(rb_count, 24, "one .rb file per LibraryClass");
+    assert_eq!(rb_count, 26, "one .rb file per LibraryClass");
 
     let invalid_file = files
         .iter()

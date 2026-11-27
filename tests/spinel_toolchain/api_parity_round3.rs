@@ -16,7 +16,6 @@
 //! so it is a full `spin build`, not a `SPINEL_TESTS` entry.
 
 use super::{emit_and_run, native_http};
-use roundhouse::project::BuildTarget;
 
 fn app() -> emit_and_run::Overlay {
     emit_and_run::empty_app()
@@ -63,6 +62,33 @@ end
     render plain: Widget.count.to_s
   end
 
+  def raw_role
+    widget = Widget.new(name: "raw", role: :admin)
+    assigned = widget.role_before_type_cast.to_s
+    widget.save!
+    render plain: assigned + "|" + widget.role_before_type_cast.to_s
+  end
+
+  def normalized_stage
+    Widget.create!(name: "stage", stage: "draft")
+    widget = Widget.new(name: "n")
+    widget.stage = "draft"
+    render plain: widget.stage.to_s + "|" + Widget.where(stage: "draft").count.to_s
+  end
+
+  def permit_rows
+    render json: { rows: params.require(:list).map { |item| item.permit(:name, :price) } }
+  end
+
+  def expect_rows
+    rows = params.require(:list).map { it.expect(:name); it.permit(:name, :tags => []) }
+    render json: { rows: rows }
+  end
+
+  def element_reads
+    render json: { rows: params.require(:list).map { |item| [item[:name], item["name"], item.key?(:name), item.fetch(:price) { 0 }] } }
+  end
+
   def show
     render json: { name: Widget.find(params[:id]).name }
   end
@@ -92,6 +118,8 @@ end
 "##)
         .write("app/models/widget.rb", r##"class Widget < ApplicationRecord
   enum :role, %i[member admin owner]
+  enum :stage, { draft: 0, live: 1 }
+  normalizes :stage, with: ->(v) { v == "draft" ? "live" : v }
 end
 "##)
         .write("app/views/gizmos/index.json.jbuilder", "json.ok true\n")
@@ -103,7 +131,12 @@ end
   get "/widgets/seed", to: "widgets#seed"
   get "/widgets/admins", to: "widgets#admins"
   get "/widgets/names", to: "widgets#names"
+  get "/widgets/raw_role", to: "widgets#raw_role"
+  get "/widgets/normalized_stage", to: "widgets#normalized_stage"
   get "/widgets/extra", to: "widgets#extra"
+  post "/widgets/permit_rows", to: "widgets#permit_rows"
+  post "/widgets/expect_rows", to: "widgets#expect_rows"
+  post "/widgets/element_reads", to: "widgets#element_reads"
   get "/widgets/counts", to: "widgets#counts"
   post "/widgets/wrap", to: "widgets#wrap"
   resources :widgets, only: %i[show]
@@ -114,6 +147,7 @@ end
   create_table "widgets", force: :cascade do |t|
     t.string "name"
     t.integer "role", default: 0, null: false
+    t.integer "stage"
     t.integer "price", default: 0
   end
 end
@@ -123,10 +157,7 @@ end
 #[test]
 #[ignore = "requires Spinel; run in its CI lane"]
 fn api_parity_round3_fixes_run_on_spinel() {
-    let (tree, errors) = app().emit(BuildTarget::Spinel);
-    assert!(errors.is_empty(), "analysis/emission errors:\n{}", errors.join("\n"));
-
-    native_http::build(&tree);
+    let tree = app().native_http_tree();
     let server = native_http::Server::start(&tree);
     let json = [("Accept", "application/json")];
 
@@ -159,6 +190,20 @@ fn api_parity_round3_fixes_run_on_spinel() {
     let wrap = server.request("POST", "/widgets/wrap", &[("Content-Type", "application/json")], "{}");
     assert_eq!((wrap.status, wrap.body.as_str()), (422, r#"{"error":"widget missing"}"#), "cause:\n{}", server.log());
 
+    // #1989: each element of `params.require(:list)` is params (Rails 8.1.4).
+    let json_ct = [("Content-Type", "application/json")];
+    let rows = r#"{"list":[{"name":"a","price":3,"admin":true,"tags":["x"]},{"name":"b"}]}"#;
+    let permit = server.request("POST", "/widgets/permit_rows", &json_ct, rows);
+    assert_eq!((permit.status, permit.body.as_str()), (200, r#"{"rows":[{"name":"a","price":3},{"name":"b"}]}"#), "element permit:\n{}", server.log());
+    let expected = server.request("POST", "/widgets/expect_rows", &json_ct, rows);
+    assert_eq!((expected.status, expected.body.as_str()), (200, r#"{"rows":[{"name":"a","tags":["x"]},{"name":"b"}]}"#), "element expect:\n{}", server.log());
+    let missing = server.request("POST", "/widgets/expect_rows", &json_ct, r#"{"list":[{"name":"a"},{"price":3}]}"#);
+    assert_eq!(missing.status, 400, "element expect, missing:\n{}", server.log());
+    let nested = server.request("POST", "/widgets/permit_rows", &json_ct, r#"{"list":[{"name":{"deep":1}}]}"#);
+    assert_eq!((nested.status, nested.body.as_str()), (200, r#"{"rows":[{}]}"#), "nested value:\n{}", server.log());
+    let reads = server.request("POST", "/widgets/element_reads", &json_ct, rows);
+    assert_eq!((reads.status, reads.body.as_str()), (200, r#"{"rows":[["a","a",true,3],["b","b",true,0]]}"#), "element reads:\n{}", server.log());
+
     let up = server.get("/up.json");
     assert!(
         up.status == 200 && up.body.starts_with(r#"{"status":"up","timestamp":""#),
@@ -179,4 +224,10 @@ fn api_parity_round3_fixes_run_on_spinel() {
 
     let counts = server.get("/widgets/counts");
     assert_eq!((counts.status, counts.body.as_str()), (200, r#"{"counts":3}"#), "concern action:\n{}", server.log());
+    // #1986: what was assigned, then the stored value (Rails 8.1.4). Last: it saves a row.
+    let raw_role = server.get("/widgets/raw_role");
+    assert_eq!(raw_role.body, "admin|1", "raw role:\n{}", server.log());
+    // #1993: the lambda gets the label, on a write and in a condition (Rails 8.1.4).
+    let stage = server.get("/widgets/normalized_stage");
+    assert_eq!(stage.body, "live|1", "normalized enum:\n{}", server.log());
 }

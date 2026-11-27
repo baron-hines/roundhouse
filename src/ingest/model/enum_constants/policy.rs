@@ -5,6 +5,7 @@ use super::{EnumConstant, EnumConstants, SourceFact, SurfaceUse, ValueContext};
 
 impl EnumConstants {
     pub(in crate::ingest) fn finish(&mut self) {
+        super::super::ConstTaint::close_aliases(&mut self.foreign_taint, &self.boot_aliases);
         let facts = std::mem::take(&mut self.facts);
         for fact in &facts {
             let SourceFact::Write(subject) = fact else {
@@ -73,7 +74,7 @@ impl EnumConstants {
                 .filter(|(_, v)| matches!(v, EnumConstant::Sorbet { .. }))
                 .map(|(name, _)| name.clone())
                 .collect();
-            let mut aliased = std::collections::HashSet::new();
+            let mut aliased = crate::det::HashSet::default();
             for fact in &facts {
                 let SourceFact::Use { subject, context } = fact else {
                     continue;

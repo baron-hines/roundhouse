@@ -165,6 +165,17 @@ fn assoc_create_rewrite(
         _ => return None,
     };
     let declared = declared_target(&parent_class, assoc_method.as_str());
+    // The name-derived fallback below guesses an undeclared association
+    // of a MODEL. A parent that is no model (a test class's own helper,
+    // `saved_search_class.create!(..)` with `saved_search_class`
+    // answering the model under test) has no association to guess: the
+    // call is the method's, and the guess named a class that does not
+    // exist (`::SavedSearchClass`). Only a caller that passes the models
+    // can tell: `rewrite_assoc_create` (the seeds) passes none and keeps
+    // the guess.
+    if declared.is_none() && !models.is_empty() && !models.iter().any(|m| m.name.0.as_str() == parent_class) {
+        return None;
+    }
     let inverse = if owner_objects {
         models.iter().find(|m| m.name.0.as_str() == parent_class).and_then(|owner| {
             owner

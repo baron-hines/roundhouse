@@ -105,6 +105,9 @@ module Db
   end
 end
 
+# boot.rb loads runtime/redis_cable.rb first; on a tree that keeps
+# broadcasts in process that is this no-op facade.
+load "#{root}/runtime/spinel/redis_cable.rb"
 load "#{root}/runtime/spinel/action_cable.rb"   # requires cable.rb
 
 puts "vendor ruby #{RUBY_VERSION}"
@@ -248,7 +251,9 @@ def socket_for(fd, conn)
   msg = Cable::WsMessage.new
   msg.ws = Tep::WebSocket::Driver.new(fd)
   msg.connection = conn
-  conn.transport = msg.ws
+  sock = Cable::Socket.new    # what `Cable.upgrade` does
+  sock.ws = msg.ws
+  conn.transport = sock
   Cable.beats.add(msg)
   Cable.register(msg.ws)    # what the socket's open handler does
   msg

@@ -25,7 +25,7 @@ c.article = nil
 raise "nil writer still reads #{c.article&.title.inspect}" unless c.article.nil?
 c.article = first
 raise "re-assigned owner reads #{c.article&.title.inspect}" unless c.article && c.article.title == "First"
-c.article_id = second.id
+raise "the key writer returns its value" unless c.send(:article_id=, second.id) == second.id
 raise "a direct key write reads #{c.article&.title.inspect}" unless c.article.title == "Second"
 fresh = Article.new(title: "Fresh", body: "A body long enough to be valid")
 c.article = fresh
@@ -75,6 +75,8 @@ c.post = nil
 raise "nil writer still reads #{c.post&.title.inspect}" unless c.post.nil?
 c.post = first
 raise "re-assigned owner reads #{c.post&.title.inspect}" unless c.post && c.post.title == "first"
+raise "the key writer returns its value" unless c.send(:post_id=, second.id) == second.id
+raise "a direct key write reads #{c.post&.title.inspect}" unless c.post.title == "second"
 puts "UUID OK"
 "#,
         )
