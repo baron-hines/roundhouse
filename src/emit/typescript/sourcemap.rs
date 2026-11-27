@@ -21,7 +21,7 @@
 use crate::det::HashMap;
 
 use super::printer::Mapping;
-use crate::span::SourceFile;
+use crate::span::{LineIndex, SourceFile};
 
 const BASE64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -75,7 +75,9 @@ pub(super) fn build_source_map(
     // emission order. The printer writes linearly so generated
     // positions are already non-decreasing.
     let mut src_index: HashMap<u32, usize> = HashMap::default();
-    let mut used: Vec<&SourceFile> = Vec::new();
+    // Each used file's line index, built once: one mapping per emitted
+    // node, and `line_col` alone rescans the file from its start.
+    let mut used: Vec<LineIndex<'_>> = Vec::new();
     let mut resolved: Vec<(u32, u32, usize, u32, u32)> = Vec::new();
     for m in mappings {
         let fid = m.span.file.0;
@@ -86,10 +88,10 @@ pub(super) fn build_source_map(
             continue;
         };
         let idx = *src_index.entry(fid).or_insert_with(|| {
-            used.push(sf);
+            used.push(sf.line_index());
             used.len() - 1
         });
-        let (line1, col1) = sf.line_col(m.span.start);
+        let (line1, col1) = used[idx].line_col(m.span.start);
         resolved.push((m.gen_line, m.gen_col, idx, line1 - 1, col1 - 1));
     }
     if resolved.is_empty() {
@@ -140,14 +142,15 @@ pub(super) fn build_source_map(
     let obj = serde_json::json!({
         "version": 3,
         "file": generated_file,
-        "sources": used.iter().map(|s| {
+        "sources": used.iter().map(|index| {
+            let s = index.file();
             let rel = s.path
                 .strip_prefix(root)
                 .map(|r| r.trim_start_matches('/'))
                 .unwrap_or(&s.path);
             format!("{source_prefix}{rel}")
         }).collect::<Vec<_>>(),
-        "sourcesContent": used.iter().map(|s| s.text.as_str()).collect::<Vec<_>>(),
+        "sourcesContent": used.iter().map(|index| index.file().text.as_str()).collect::<Vec<_>>(),
         "names": [],
         "mappings": mappings_str,
     });
@@ -237,5 +240,18 @@ mod tests {
         assert_eq!(v["sources"], serde_json::json!(["a.rb", "b.rb"]));
         // Line 0: [0,0,0,0]; line 1: [genCol 0, srcIdx +1, line 0, col 0].
         assert_eq!(v["mappings"], "AAAA;ACAA");
+    }
+
+    /// Each mapping's line and column come from its own file's lines:
+    /// the two files break lines at different offsets, and the mappings
+    /// alternate between them.
+    #[test]
+    fn each_file_answers_its_own_lines() {
+        let sources = vec![src("a.rb", "x\ny\n"), src("b.rb", "ab\ncd\n")];
+        // a.rb 0 is (0,0); b.rb 4 (`d`) is (1,1); a.rb 2 (`y`) is (1,0).
+        let maps = vec![mapping(0, 0, 1, 0), mapping(1, 0, 2, 4), mapping(2, 0, 1, 2)];
+        let json = build_source_map(&maps, "a.ts", &sources, "", "").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["mappings"], "AAAA;ACCC;ADAD");
     }
 }

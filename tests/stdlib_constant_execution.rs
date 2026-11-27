@@ -608,3 +608,72 @@ fn a_zlib_override_forwarding_to_super_is_not_qualified() {
         .emit(roundhouse::project::BuildTarget::Spinel);
     assert!(errors.iter().any(|e| e.contains("buffered zlib result")), "{errors:?}");
 }
+
+/// message_bus's `Synchronizer`: a class that includes `MonitorMixin`,
+/// calls `super()` to set the monitor up, and answers what its
+/// `synchronize` block does (reentrantly, as Monitor is).
+const MONITOR_MIXIN_SOURCE: &str = r#"require "monitor"
+class MixinCounter
+  include MonitorMixin
+
+  def initialize
+    super()
+    @count = 0
+  end
+
+  def bump
+    synchronize { synchronize { @count += 1 } }
+  end
+
+  def count
+    @count
+  end
+end
+"#;
+
+const MONITOR_MIXIN_SCRIPT: &str = r#"
+c = MixinCounter.new
+got = [c.bump, c.bump]
+raise got.inspect unless got == [1, 2] && c.count == 2
+puts "MonitorMixin execution passed"
+"#;
+
+#[test]
+fn monitor_mixin_executes_after_emission() {
+    let app = || stdlib_app().write("app/services/mixin_counter.rb", MONITOR_MIXIN_SOURCE);
+    let errors = app().check_errors();
+    assert!(errors.is_empty(), "{errors:#?}");
+    app().run_ruby(MONITOR_MIXIN_SCRIPT).assert_passes();
+}
+
+#[test]
+#[ignore = "requires the native Spinel compiler; set SPINEL"]
+fn monitor_mixin_executes_in_native_spinel() {
+    stdlib_app().write("app/services/mixin_counter.rb", MONITOR_MIXIN_SOURCE)
+        .run_spinel(MONITOR_MIXIN_SCRIPT).assert_passes();
+}
+
+/// `ingest::ruby_conditions::CORE_PROBES`: each probe settled at ingest answers so on the tree's Ruby too.
+const CORE_PROBE_SOURCE: &str = r#"class CoreProbe
+  def self.answers
+    [String.method_defined?(:byteindex), IO.method_defined?(:wait_readable), IO.method_defined?(:wait_writable)]
+  end
+end
+"#;
+
+const CORE_PROBE_SCRIPT: &str = r#"
+got = CoreProbe.answers
+raise got.inspect unless got == [true, true, true]
+puts "core probes passed"
+"#;
+
+#[test]
+fn core_feature_probes_answer_as_settled() {
+    stdlib_app().write("app/services/core_probe.rb", CORE_PROBE_SOURCE).run_ruby(CORE_PROBE_SCRIPT).assert_passes();
+}
+
+#[test]
+#[ignore = "requires the native Spinel compiler; set SPINEL"]
+fn core_feature_probes_answer_as_settled_in_native_spinel() {
+    stdlib_app().write("app/services/core_probe.rb", CORE_PROBE_SOURCE).run_spinel(CORE_PROBE_SCRIPT).assert_passes();
+}

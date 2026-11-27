@@ -49,6 +49,7 @@ require_relative "runtime/db"
 # the stdlib equivalents with semantically-identical implementations
 # for the surface framework Ruby actually uses.
 require_relative "runtime/base64"
+require_relative "runtime/securerandom_active_support"
 # stdlib Shellwords, including String#shellescape. The Spinel port is
 # runtime/shellwords_spinel.rb and must not be named shellwords.rb:
 # runtime/ is on $LOAD_PATH, so the library's own name would answer a
@@ -111,6 +112,7 @@ require_relative "runtime/type_toolkit"
 # `config_for`'s answer: a Hash subclass with `method_missing`, so it cannot
 # live in the shared runtime that reads it (CRuby overlay only).
 require_relative "runtime/active_support_ordered_options"
+require_relative "runtime/active_support_gzip"
 # Blank-predicate helper for receivers `src/lower/blank.rs` had no static
 # type to ground on. CRuby could serve those sites through the core_ext
 # reopen above; it now takes the same lowered call every other
@@ -129,6 +131,7 @@ require_relative "runtime/action_view_form_builder"
 require_relative "runtime/action_view_tags"
 require_relative "runtime/active_record"
 require_relative "runtime/active_record_bang"
+require_relative "runtime/active_record_runtime_macros"
 # `ActiveRecord::Base.connection_db_config`, `connection_pool` and
 # `transaction_open?` over the Db shim loaded above.
 require_relative "runtime/active_record_db_config"
@@ -159,9 +162,9 @@ require_relative "runtime/request_forgery_protection"
 # Rails' HTTP Token and Basic auth helpers — another reopen of
 # ActionController::Base, ruby-family only (see the file).
 require_relative "runtime/http_authentication"
-# The signatures on the session and flash cookies — the helpers the two
-# dispatchers restore and persist those cookies through (see the file).
-require_relative "runtime/signed_cookies"
+# Rails' encrypted session cookie, and the flash inside it: what the two
+# dispatchers restore and persist the session through (see the file).
+require_relative "runtime/cookie_store"
 # The mocha slot `lower::mocha` prepends to an app method a test stubs
 # (`User#reset_remote_connections`): the guard is in the APP's code, so it
 # runs in production too, where it asks the registry, finds nothing and

@@ -139,8 +139,12 @@ module Main
     # stripping here would make an explicit `/feed.json` route unreachable.
     request_format = :html
     request_path = request[:path]
+    # The format the URL PINS, for `negotiate_format` (see the spinel
+    # dispatcher): the `Accept` sniff below only seeds `request_format`.
+    explicit_format = ""
     if request_path.end_with?(".json")
       request_format = :json
+      explicit_format = "json"
     end
     # Turbo Stream is negotiated by the Accept header, not by a path
     # suffix — a Turbo-driven form POST asks for
@@ -183,6 +187,7 @@ module Main
     # formats one at a time — a Symbol materialized from a runtime
     # String is a shape the strict targets do not share.
     path_format = matched.path_params.fetch("format", "")
+    explicit_format = path_format unless path_format.empty?
     request_format = :json if path_format == "json"
     request_format = :turbo_stream if path_format == "turbo_stream"
     request_format = :rss if path_format == "rss"
@@ -197,6 +202,7 @@ module Main
     # route defaulting to json.
     if path_format.empty? && !matched.req_format.nil?
       request_format = matched.req_format
+      explicit_format = matched.req_format.to_s
       matched.path_params["format"] = matched.req_format.to_s
     end
 
@@ -209,6 +215,22 @@ module Main
     if !allowed.nil? && !allowed.include?("#{matched.controller}##{matched.action}")
       env["roundhouse.declined"] = true
       return [404, "", "text/html; charset=utf-8", nil, {}, {}, {}, {}, {}]
+    end
+
+    # The `?format=json` QUERY parameter: Rails reads `params[:format]`,
+    # route and path parameters over query ones, so it pins only when
+    # nothing above did. Same literal comparisons as above. A PRESENT but
+    # empty value still pins, to a format no template or arm answers
+    # (Rails reads `Mime[""]` as no format at all, so a `respond_to` is a
+    # 406); it is spelled "none" here since "" means unpinned.
+    query_format = request[:params].fetch("format", "").to_s
+    if explicit_format.empty? && request[:params].key?("format")
+      explicit_format = query_format.empty? ? "none" : query_format
+      request_format = :json if query_format == "json"
+      request_format = :turbo_stream if query_format == "turbo_stream"
+      request_format = :rss if query_format == "rss"
+      request_format = :xml if query_format == "xml"
+      request_format = :js if query_format == "js"
     end
 
     # A JSON body that does not parse: Rails' params parser raises
@@ -227,15 +249,12 @@ module Main
     controller.params  = merged
     controller.path_parameters = matched.path_params
 
-    # Decode inbound flash from cookies. Each flash key carries via
-    # its own cookie (`flash_notice`, `flash_alert`) so the cookie
-    # plumbing stays format-free.
     cookies = request[:cookies] || {}
     # Cookie-carried session: restore the whole session from the session
-    # cookie (url-encoded k=v pairs; empty when absent or garbled —
-    # "logged out", never a 500). The raw inbound value is kept so the
-    # persist step below can skip Set-Cookie when the action left the
-    # session untouched.
+    # cookie, Rails' encrypted JSON (runtime/cookie_store.rb; empty when
+    # absent or unreadable - "logged out", never a 500). Its plain JSON is
+    # kept so the persist step below can skip Set-Cookie when the action
+    # left the session untouched.
     #
     # The NAME comes from `Rails.application.session_cookie_key` (see the
     # spinel main.rb twin): apps set it with `config.session_store
@@ -260,19 +279,12 @@ module Main
     # Load inbound flash through the constructor (NOT `flash[:k]=`) so the
     # Flash snapshots these as carried-in; `to_persisted` then sweeps the
     # ones merely displayed (show-once). See ActionDispatch::Flash.
-    # SIGNED — see the spinel main.rb twin: a cookie that does not verify
-    # is no message (and is still cleared below, as a consumed one is).
+    # The messages ride in the session, as Rails keeps them - see the
+    # spinel main.rb twin.
     inbound_flash = {}
     host_flash = env["roundhouse.flash"]
     if host_flash.nil?
-      # Every `flash_<key>` cookie, not only notice/alert: lobsters' layout shows `flash[:error]` / `[:success]`.
-      cookies.each do |cname, cvalue|
-        name = cname.to_s
-        next unless name.start_with?("flash_")
-        ActionDispatch::Flash.cookie_flashes(cvalue.to_s, name).each do |key, value|
-          inbound_flash[key] = value
-        end
-      end
+      ActionDispatch::CookieStore.inbound_flash(restored).each { |key, value| inbound_flash[key] = value }
     else
       host_flash.each { |k, v| inbound_flash[k.to_s] = v }
     end
@@ -293,6 +305,10 @@ module Main
     # comma is read as html.
     accept = request.fetch(:accept, "").to_s
     controller.accepts_any_format = !accept.include?(",") && accept.split(";", 2)[0].to_s.strip == "*/*"
+    controller.accept_header = accept
+    controller.accepted_format_names = ActionDispatch::MimeNegotiation.accepted_formats(accept)
+    controller.explicit_format = explicit_format
+    controller.explicit_format_registered = explicit_format.empty? || !Mime[explicit_format].nil?
     # Rails' `Vary: Accept` on a render whose format came from the Accept
     # header (runtime/action_dispatch/mime_negotiation.rb), as the spinel
     # dispatcher decides it.
@@ -304,6 +320,7 @@ module Main
     # detaches a plain mutable Hash (callers write scratch keys the real
     # ENV would reject); params delegation gets the same merged hash the
     # controller sees.
+    env["RAW_POST_DATA"] = request.fetch(:raw_body, "")
     controller.request = ActionDispatch::Request.new(env.to_h, merged)
     # Not read back from the controller: Devise's FailureApp delegates `flash` to the request.
     controller.request.flash = flash
@@ -344,6 +361,11 @@ module Main
       raise if Kernel.instance_method(:is_a?).bind_call(error, FrameworkParseError) &&
                !Kernel.instance_method(:instance_of?).bind_call(error, FrameworkParseError)
       return [400, "<h1>400 Bad Request</h1>", "text/html; charset=utf-8", nil, {}, {}, {}, {}, {}]
+    rescue ActionController::UnknownFormat
+      # A `respond_to` none of whose arms answers the request's format:
+      # Rails' rescue_responses answer :not_acceptable, and
+      # PublicExceptions renders the status page in the requested format.
+      return [406, controller.unacceptable_body, controller.unacceptable_content_type, nil, {}, {}, {}, {}, {}]
     rescue ActiveRecord::RecordInvalid, ActiveRecord::RecordNotSaved, ActionController::InvalidAuthenticityToken
       # Not a 500: Rails' rescue_responses answer these with 422.
       return [422, "<h1>422 Unprocessable Content</h1>", "text/html; charset=utf-8", nil, {}, {}, {}, {}, {}]
@@ -357,28 +379,14 @@ module Main
     # "Redirecting…" body; render-with-`location:` (Rails' POST 201
     # idiom) keeps a 2xx status and ships the rendered body alongside
     # the Location header.
-    # Persist the swept flash as cookies for the next request. Flash owns
-    # the show-once sweep (`to_persisted` keeps only entries this request
-    # set); set those, and clear any inbound cookie that wasn't carried so
-    # a displayed notice doesn't repeat.
+    # Flash owns the show-once sweep (`to_persisted` keeps only entries
+    # this request set). Under the futamura bridge the host keeps the
+    # flash in its own session: hand back what survives this request
+    # (nothing, once displayed). Otherwise it goes into the session below.
     out_cookies = {}
-    persisted = controller.flash.to_persisted
-    if !host_flash.nil?
-      # The host keeps the flash in its own session; hand back what
-      # survives this request (nothing, once displayed).
-      env["roundhouse.flash.out"] = persisted
-    else
-      persisted.each do |kind, value|
-        name = "flash_#{kind}"
-        out_cookies[name.to_sym] = ActionDispatch::Flash.signed_cookie(value, name)
-      end
-      cookies.each_key do |cname|
-        name = cname.to_s
-        out_cookies[name.to_sym] = nil if name.start_with?("flash_") && !persisted.key?(name.delete_prefix("flash_"))
-      end
-    end
+    env["roundhouse.flash.out"] = controller.flash.to_persisted unless host_flash.nil?
     # Cookies the action wrote (`cookies[:k] = v` / `cookies.permanent`)
-    # ride out alongside the flash cookies. Flag maps stay off the
+    # ride out alongside the session cookie. Flag maps stay off the
     # value so `run_rack` can emit Secure / the requested SameSite.
     jar = controller.cookies
     secure_cookies = {}
@@ -399,14 +407,16 @@ module Main
     # Set-Cookie only on change. An emptied session (reset_session
     # logout with no token re-added) clears the cookie.
     # `request.session_options[:skip] = true` leaves it alone — see
-    # the spinel main.
-    session_out = controller.session.to_cookie
+    # the spinel main. The flash goes into the session first, as Rails'
+    # `commit_flash` puts it there.
+    ActionDispatch::CookieStore.commit_flash(controller.session, controller.flash) if host_flash.nil?
+    session_out = ActionDispatch::CookieStore.payload(controller.session)
     if !host_session.nil?
       env["roundhouse.session.out"] = controller.session.to_hash if session_out != session_in && !controller.request.session_skip?
     # Not here under `run_rack`: Rails commits above the gems' middleware (`Main.commit_session`).
     elsif session_out != session_in && !controller.request.session_skip? && !env["roundhouse.session.above"]
       out_cookies[session_cookie] =
-        session_out.empty? ? nil : ActionDispatch::Session.signed_cookie(session_out, session_cookie)
+        controller.session.to_hash.empty? ? nil : ActionDispatch::CookieStore.cookie_value(controller.session, session_cookie)
     end
     is_redirect = controller.status >= 300 && controller.status < 400 && !controller.head_response?
     # Compose `Cache-Control` from whatever `response.cache_control`
@@ -430,10 +440,13 @@ module Main
       extra_headers[controller.headers.key_at(hi)] = controller.headers.val_at(hi)
       hi += 1
     end
+    # Rails' `redirect_to` sets no type: a redirect keeps the one a
+    # filter assigned, and only an unset type is text/html, the
+    # controller's default. The spinel dispatcher does the same.
     if is_redirect
       [controller.status,
        %(<a href="#{ActionView::ViewHelpers.html_escape(controller.location.to_s)}">Redirecting</a>),
-       "text/html; charset=utf-8", controller.location, out_cookies, extra_headers, secure_cookies, samesite_cookies, httponly_cookies, expires_cookies]
+       controller.content_type, controller.location, out_cookies, extra_headers, secure_cookies, samesite_cookies, httponly_cookies, expires_cookies]
     else
       # The controller body IS the full page: the Ruby emit path's
       # `apply_layout_lowering` wraps each html action render in
@@ -525,12 +538,12 @@ module Main
     session_cookie = Rails.application.session_cookie_key
     host_session = env["roundhouse.session"]
     restored = if host_session.nil?
-      ActionDispatch::Session.from_signed_cookie(
-        cookies[session_cookie.to_sym].to_s, session_cookie)
+      ActionDispatch::CookieStore.restore(cookies[session_cookie.to_sym].to_s, session_cookie)
     else
       ActionDispatch::Session.new(host_session)
     end
-    env["roundhouse.session.in"] = restored.to_cookie
+    # The plain JSON, not the cookie: a fresh IV makes every encryption of the same session differ.
+    env["roundhouse.session.in"] = ActionDispatch::CookieStore.payload(restored)
     # Not left to the controller's request: it holds a copy of the env, and the commit above the stack reads this Hash.
     env["rack.session.options"] ||= {}
     env["rack.session"] = restored
@@ -539,14 +552,14 @@ module Main
   def self.commit_session(env, headers)
     session = env["rack.session"]
     return unless session.is_a?(ActionDispatch::Session)
-    out = session.to_cookie
+    out = ActionDispatch::CookieStore.payload(session)
     return if out == env["roundhouse.session.in"].to_s || env["rack.session.options"].to_h[:skip] == true
     name = Rails.application.session_cookie_key
     https = env["HTTPS"].to_s == "on" || env.fetch("HTTP_X_FORWARDED_PROTO", "").to_s.split(",").first.to_s.strip.downcase == "https"
-    line = if out.empty?
+    line = if session.to_hash.empty?
       "#{name}=; Path=/; Max-Age=0"
     else
-      "#{name}=#{CgiIo.url_encode(ActionDispatch::Session.signed_cookie(out, name))}; Path=/; HttpOnly; SameSite=Lax#{"; Secure" if https}"
+      "#{name}=#{CgiIo.url_encode(ActionDispatch::CookieStore.cookie_value(session, name))}; Path=/; HttpOnly; SameSite=Lax#{"; Secure" if https}"
     end
     key = headers.keys.find { |k| k.to_s.downcase == "set-cookie" } || "set-cookie"
     existing = headers[key]
@@ -583,7 +596,7 @@ module Main
         ss = (samesite_cookies && samesite_cookies[name]).to_s
         ss = "Lax" if ss.empty?
         line = "#{name}=#{CgiIo.url_encode(val.to_s)}; Path=/"
-        # Default HttpOnly. Session/flash cookies are not in the map.
+        # Default HttpOnly. The session cookie is not in the map.
         # An explicit httponly: false records false and is omitted.
         line = line + "; HttpOnly" unless httponly_cookies && httponly_cookies.key?(name) && !httponly_cookies[name]
         line = line + "; SameSite=#{ss}"
@@ -634,10 +647,19 @@ module Main
   # Tests configure `:memory:` explicitly through their own setup, so
   # this server default never reaches them (the `adapter.nil?` guard
   # also short-circuits when a test already configured the adapter).
+  def self.default_db_path
+    db_path = ENV["BLOG_DB"]
+    return db_path if !db_path.nil? && !db_path.empty?
+    # config/database.yml for RAILS_ENV, as Rails picks it (boot.rb's
+    # AppDatabase, generated from the file at transpile time).
+    env = ENV["RAILS_ENV"].to_s
+    configured = AppDatabase.path_for(env.empty? ? "development" : env)
+    configured.nil? ? "storage/development.sqlite3" : configured
+  end
+
   def self.configure_default_adapter!
     return unless ActiveRecord.adapter.nil?
-    db_path = ENV["BLOG_DB"]
-    path = (!db_path.nil? && !db_path.empty?) ? db_path : "storage/development.sqlite3"
+    path = Main.default_db_path
     # SqliteAdapter.configure delegates to Db.configure (single shared
     # connection); both the legacy AR-adapter dispatch path and the
     # Level-3 lowerer-emitted `_adapter_*` path read through one handle.

@@ -56,7 +56,7 @@ use crate::ident::{ClassId, Symbol, VarId};
 use crate::lower::typing::with_ty;
 use crate::naming::camelize;
 use crate::span::Span;
-use crate::ty::Ty;
+use crate::ty::{FnTy, Ty};
 
 use super::util::map_expr;
 
@@ -1371,7 +1371,8 @@ pub fn first_permit_in(body: &Expr) -> Option<(Symbol, Vec<Symbol>, Vec<String>)
 
 /// Push the permit list of each value `expr` can evaluate to, or answer
 /// false when one of them is not a permit. A local read resolves to the
-/// values `body` writes to that local.
+/// values `body` writes to that local; `except` and a `tap` block are
+/// seen through to their receiver.
 fn collect_returned_permits<'a>(
     expr: &'a Expr,
     body: &'a Expr,
@@ -1408,15 +1409,31 @@ fn collect_returned_permits<'a>(
             arms.iter().map(|arm| &arm.body).collect()
         }
         ExprNode::CaseMatch { arms, else_body, .. } => arms.iter().map(|arm| &arm.body).chain(else_body).collect(),
-        ExprNode::BeginRescue { body: begun, rescues, else_branch, .. } => std::iter::once(else_branch.as_ref().unwrap_or(begun))
+        ExprNode::BeginRescue { body: begun, rescues, else_branch, .. } => std::iter::once(else_branch.as_deref().unwrap_or(begun))
             .chain(rescues.iter().map(|rescue| &rescue.body))
             .collect(),
         ExprNode::Assign { value, .. } | ExprNode::OpAssign { value, .. } | ExprNode::Return { value } => vec![value],
         ExprNode::BoolOp { left, right, .. } | ExprNode::RescueModifier { expr: left, fallback: right } => vec![left, right],
         ExprNode::Send { recv: Some(recv), method, .. } if method.as_str() == "except" => vec![recv],
+        ExprNode::Send { recv: Some(recv), method, args, block: Some(block), .. }
+            if method.as_str() == "tap" && args.is_empty() && !block_can_leave(block) => vec![recv],
         _ => Vec::new(),
     };
     !sources.is_empty() && sources.into_iter().all(|source| collect_returned_permits(source, body, resolving, permits))
+}
+
+/// Whether `block` can leave with a value other than its call's result:
+/// `tap { |p| ... }` returns its receiver unless the block ends it with
+/// `break value`, or ends the whole method with `return value`. A `break`
+/// in a nested block ends that block's call and is skipped; one in a loop
+/// is counted, and so is a `return` at any depth, which can only leave a
+/// helper untyped. A forwarded block (`tap(&check)`) isn't read: it counts.
+fn block_can_leave(block: &Expr) -> bool {
+    let ExprNode::Lambda { body, .. } = &*block.node else { return true };
+    let mut leaves = false;
+    for_each_outside_lambdas(body, &mut |e| leaves |= matches!(&*e.node, ExprNode::Break { .. }));
+    walk_all(body, &mut |e| leaves |= matches!(&*e.node, ExprNode::Return { .. }));
+    leaves
 }
 
 fn for_each_outside_lambdas<'a>(expr: &'a Expr, f: &mut dyn FnMut(&'a Expr)) {
@@ -1487,6 +1504,19 @@ fn rewrite_tail(e: &Expr, spec: &ParamsSpec) -> Expr {
                 cond: cond.clone(),
                 then_branch: rewrite_tail(then_branch, spec),
                 else_branch: rewrite_tail(else_branch, spec),
+            }),
+            ..e.clone()
+        },
+        // `<value>.tap { … }` answers `<value>` (see `block_can_leave`),
+        // so the rewrite belongs on the receiver.
+        ExprNode::Send { recv: Some(recv), method, args, block: Some(b), parenthesized }
+            if method.as_str() == "tap" && args.is_empty() && !block_can_leave(b) => Expr {
+            node: Box::new(ExprNode::Send {
+                recv: Some(rewrite_tail(recv, spec)),
+                method: method.clone(),
+                args: args.clone(),
+                block: Some(b.clone()),
+                parenthesized: *parenthesized,
             }),
             ..e.clone()
         },
@@ -2104,6 +2134,7 @@ fn build_params_class(spec: &ParamsSpec) -> LibraryClass {
         parent_span: Default::default(),
         includes: Vec::new(),
         include_spans: Vec::new(),
+        include_statements: Vec::new(),
         methods,
         nullable_columns: Vec::new(),
         origin: Some(LibraryClassOrigin::ResourceParams {
@@ -2347,14 +2378,14 @@ fn synth_except(spec: &ParamsSpec) -> MethodDef {
         receiver: MethodReceiver::Instance,
         params: vec![Param::rest(keys.clone())],
         body,
-        signature: Some(Ty::Fn {
+        signature: Some(Ty::Fn(Box::new(FnTy {
             params: vec![crate::ty::Param {
                 name: keys, ty: keys_ty.into(), kind: crate::ty::ParamKind::Rest,
             }].into(),
             block: None,
             ret: owner_ty.into(),
             effects: EffectSet::pure(),
-        }),
+        }))),
         effects: EffectSet::default(),
         enclosing_class: Some(owner.0.clone()),
         kind: AccessorKind::Method,
@@ -3015,7 +3046,7 @@ fn synth_as_json(owner: &ClassId) -> MethodDef {
 }
 
 fn fn_sig(params: Vec<(Symbol, Ty)>, ret: Ty) -> Ty {
-    Ty::Fn {
+    Ty::Fn(Box::new(FnTy {
         params: params
             .into_iter()
             .map(|(name, ty)| crate::ty::Param {
@@ -3027,7 +3058,7 @@ fn fn_sig(params: Vec<(Symbol, Ty)>, ret: Ty) -> Ty {
         block: None,
         ret: std::sync::Arc::new(ret),
         effects: crate::effect::EffectSet::pure(),
-    }
+    }))
 }
 
 /// Build the `ClassInfo` registry entry for a synthesized Params class

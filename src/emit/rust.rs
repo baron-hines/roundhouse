@@ -287,6 +287,14 @@ use crate::session::Session;
 /// progress): adds per-file application code emit through the
 /// `lower_*_to_library_classes` lowerers + the shared
 /// `library::emit_library_class` consumer.
+/// The instance methods the model shim in [`emit`] writes into every
+/// Rust model (by their Ruby names), for `respond_to?` answered at emit
+/// time (`expr::send::model_respond_to`). Keep in step with the shim.
+pub(crate) const MODEL_SHIM_INSTANCE_METHODS: &[&str] = &[
+    "errors", "save", "save!", "destroy", "destroy!", "valid?", "persisted?", "reload", "saved_changes",
+    "id_previously_changed?", "attribute_previously_was",
+];
+
 pub fn emit(app: &App) -> Vec<EmittedFile> {
     // Wedge 2b: route-bearing apps get a real `src/main.rs` that
     // boots tokio + axum and calls `server::start(router::router(),
@@ -1290,6 +1298,7 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
                     parent_span: Default::default(),
                     includes: Vec::new(),
                     include_spans: Vec::new(),
+                    include_statements: Vec::new(),
                     methods: Vec::new(),
                     nullable_columns: Vec::new(),
                     origin: None,
@@ -2038,7 +2047,7 @@ fn render_route_helpers_bare_wrappers(lc: &crate::dialect::LibraryClass) -> Stri
             continue;
         }
         let sig_params: &[crate::ty::Param] = match m.signature.as_ref() {
-            Some(crate::ty::Ty::Fn { params, .. }) => params,
+            Some(crate::ty::Ty::Fn(fn_ty)) => &fn_ty.params,
             _ => &[],
         };
         let params: Vec<String> = m
@@ -2478,16 +2487,18 @@ fn collect_global_class_methods(
 ) -> EmitCtx {
     use crate::dialect::LibraryClass;
     use crate::ident::Symbol;
-    use crate::ty::{Param, ParamKind, Ty};
+    use crate::ty::{FnTy, Param, ParamKind, Ty};
 
     fn collect_one(
         lc: &LibraryClass,
         out: &mut GlobalMethodsMap,
         out_defaults: &mut GlobalDefaultsMap,
         out_mutating: &mut crate::det::HashSet<String>,
+        out_instance: &mut crate::det::HashMap<String, crate::det::HashSet<String>>,
     ) {
         let raw = lc.name.0.as_str();
         let class_name = raw.rsplit("::").next().unwrap_or(raw).to_string();
+        let instance_entry = out_instance.entry(class_name.clone()).or_default();
         let entry = out.entry(class_name.clone()).or_default();
         let defaults_entry = out_defaults.entry(class_name).or_default();
         // Collect ALL methods (Class + Instance), since constructor
@@ -2501,12 +2512,18 @@ fn collect_global_class_methods(
             if m.mutates_self {
                 out_mutating.insert(m.name.as_str().to_string());
             }
+            if matches!(m.receiver, crate::dialect::MethodReceiver::Instance) {
+                instance_entry.insert(m.name.as_str().to_string());
+            }
             let params: Vec<Param> = match m.signature.as_ref() {
-                Some(Ty::Fn { params, .. }) => params
-                    .iter()
-                    .filter(|p| !matches!(p.kind, ParamKind::Block | ParamKind::KeywordRest))
-                    .cloned()
-                    .collect(),
+                Some(Ty::Fn(fn_ty)) => {
+                    let FnTy { params, .. } = &**fn_ty;
+                    params
+                        .iter()
+                        .filter(|p| !matches!(p.kind, ParamKind::Block | ParamKind::KeywordRest))
+                        .cloned()
+                        .collect()
+                },
                 _ => m
                     .params
                     .iter()
@@ -2550,23 +2567,25 @@ fn collect_global_class_methods(
     let mut out: GlobalMethodsMap = crate::det::HashMap::default();
     let mut out_defaults: GlobalDefaultsMap = crate::det::HashMap::default();
     let mut out_mutating: crate::det::HashSet<String> = crate::det::HashSet::default();
+    let mut out_instance: crate::det::HashMap<String, crate::det::HashSet<String>> =
+        crate::det::HashMap::default();
     for lc in model_lcs {
-        collect_one(lc, &mut out, &mut out_defaults, &mut out_mutating);
+        collect_one(lc, &mut out, &mut out_defaults, &mut out_mutating, &mut out_instance);
     }
     if let Some(lc) = route_helpers_lc {
-        collect_one(lc, &mut out, &mut out_defaults, &mut out_mutating);
+        collect_one(lc, &mut out, &mut out_defaults, &mut out_mutating, &mut out_instance);
     }
     if let Some(lc) = importmap_lc {
-        collect_one(lc, &mut out, &mut out_defaults, &mut out_mutating);
+        collect_one(lc, &mut out, &mut out_defaults, &mut out_mutating, &mut out_instance);
     }
     for lc in view_lcs {
-        collect_one(lc, &mut out, &mut out_defaults, &mut out_mutating);
+        collect_one(lc, &mut out, &mut out_defaults, &mut out_mutating, &mut out_instance);
     }
     for lc in controller_lcs {
-        collect_one(lc, &mut out, &mut out_defaults, &mut out_mutating);
+        collect_one(lc, &mut out, &mut out_defaults, &mut out_mutating, &mut out_instance);
     }
     for lc in fixture_lcs {
-        collect_one(lc, &mut out, &mut out_defaults, &mut out_mutating);
+        collect_one(lc, &mut out, &mut out_defaults, &mut out_mutating, &mut out_instance);
     }
     // Framework runtime LCs (ViewHelpers, JsonBuilder, Inflector,
     // Router, ActiveRecord::Base, ActionController::Base) — parsed
@@ -2578,12 +2597,13 @@ fn collect_global_class_methods(
     // arity-only `Untyped` fallback) and the coerce_arg_for_param_ty
     // families fire.
     for lc in runtime_lcs {
-        collect_one(lc, &mut out, &mut out_defaults, &mut out_mutating);
+        collect_one(lc, &mut out, &mut out_defaults, &mut out_mutating, &mut out_instance);
     }
     EmitCtx {
         global_class_methods: out,
         global_class_method_defaults: out_defaults,
         global_mutating_methods: out_mutating,
+        global_instance_methods: out_instance,
         ..EmitCtx::default()
     }
 }

@@ -10,3 +10,11 @@ fn stdlib_constants_an_api_uses_execute_natively() {
     run.assert_passes();
     assert!(run.stdout.contains("stdlib constants OK"), "{}", run.stdout);
 }
+
+#[test]
+#[ignore = "requires the Spinel toolchain, run in its CI lane"]
+fn open_struct_members_execute_natively() {
+    let run = contract::ostruct_overlay().run_spinel(contract::OSTRUCT_ASSERTIONS);
+    run.assert_passes();
+    assert!(run.stdout.contains("ostruct OK"), "{}", run.stdout);
+}

@@ -148,6 +148,43 @@ module ActiveRecord
     end
   end
 
+  # PostgreSQL's uuid type as Rails casts a value bound to it
+  # (OID::Uuid#cast_value): the value's text when it matches
+  # ACCEPTABLE_UUID, `\A(\{)?([a-fA-F0-9]{4}-?){8}(?(1)\}|)\z`, in
+  # canonical form (lowercase 8-4-4-4-12), and nil otherwise, which
+  # Rails binds as NULL. Sent as written, PostgreSQL rejects a blank or
+  # malformed literal (`invalid input syntax for type uuid`). The answer
+  # is "" for no uuid, so it stays a String: a real one is never blank.
+  class UuidCast
+    def self.cast_text(value)
+      text = value.to_s
+      i = 0
+      stop = text.length
+      if text[0, 1].to_s == "{"
+        return "" unless stop >= 2 && text[stop - 1, 1].to_s == "}"
+        i = 1
+        stop -= 1
+      end
+      hex = +""
+      groups = 0
+      while groups < 8
+        return "" if i + 4 > stop
+        k = 0
+        while k < 4
+          char = text[i + k, 1].to_s.downcase
+          return "" unless "0123456789abcdef".include?(char)
+          hex << char
+          k += 1
+        end
+        i += 4
+        i += 1 if i < stop && text[i, 1].to_s == "-"
+        groups += 1
+      end
+      return "" unless i == stop
+      "#{hex[0, 8]}-#{hex[8, 4]}-#{hex[12, 4]}-#{hex[16, 4]}-#{hex[20, 12]}"
+    end
+  end
+
   # The edges of `Model.transaction`, for work that has to wait for the
   # COMMIT. No-ops here, so this file stays self-contained; the
   # Ruby-family job registry (runtime/job_registry.rb) redefines them to
@@ -260,18 +297,37 @@ module ActiveRecord
       columns = {}
       Connection.shared.select_rows("PRAGMA table_info(#{Connection.shared.quote(table.to_s)})").each do |row|
         name = row[1].to_s
-        columns[name] = Column.new(name, row[2].to_s)
+        columns[name] = Column.new(name, row[2].to_s, row[3].to_i == 0)
       end
       columns
     end
   end
 
   class Column
-    attr_reader :name, :sql_type
+    attr_reader :name, :sql_type, :null
 
-    def initialize(name, sql_type)
+    def initialize(name, sql_type, null = true)
       @name = name
       @sql_type = sql_type
+      @null = null
+    end
+
+    # Rails' `type`: the declared SQL type as the Symbol Rails' type map names it.
+    def type
+      declared = @sql_type.downcase
+      return :integer if declared.start_with?("int", "bigint", "smallint", "tinyint", "mediumint", "serial", "bigserial")
+      return :string if declared.start_with?("varchar", "character varying", "char")
+      return :boolean if declared.start_with?("bool")
+      return :float if declared.start_with?("real", "float", "double")
+      return :decimal if declared.start_with?("decimal", "numeric")
+      return :datetime if declared.start_with?("datetime", "timestamp")
+      return :date if declared.start_with?("date")
+      return :time if declared.start_with?("time")
+      return :binary if declared.start_with?("blob", "bytea")
+      return :jsonb if declared.start_with?("jsonb")
+      return :json if declared.start_with?("json")
+      return :uuid if declared.start_with?("uuid")
+      :text
     end
 
     # `varchar(255)` declares 255; a bare type (sqlite's `text`) none, as Rails reads it.
@@ -346,6 +402,26 @@ module ActiveRecord
       @shared ||= Connection.new
     end
 
+    # The pool slot this handle was taken on (-1 for the shared handle),
+    # and whether on ActiveRecord::Base: as in Rails, its pool and guard.
+    def initialize(slot = -1, base = false)
+      @slot = slot
+      @base = base
+    end
+
+    # `Base.with_connection`'s hold on the handle's slot for its block.
+    # Nothing to hold for the shared handle (-1) or one taken before the
+    # databases are open (-2): their statements stay as they were.
+    def _hold_slot
+      Db.hold_slot(@slot, @base) if @slot >= 0
+      nil
+    end
+
+    def _release_slot
+      Db.leave_slot if @slot >= 0
+      nil
+    end
+
     # This runtime's only backend. Lobsters branches on this to pick
     # its upsert dialect; the SQLite arm is the one we execute.
     def adapter_name
@@ -369,14 +445,24 @@ module ActiveRecord
     # simply produce zero rows. Delegates to the adapter's row loop
     # (which resolves column names once, not rows×cols times).
     def execute(sql)
-      Result.new(ActiveRecord.adapter.select_rows(sql))
+      Db.enter_slot(@slot, @base) if @slot != -1
+      begin
+        Result.new(ActiveRecord.adapter.select_rows(sql))
+      ensure
+        Db.leave_slot if @slot != -1
+      end
     end
 
     # `select_rows(sql)` — Rails' rows as Arrays of values, in column
     # order (campfire's tests read an `EXPLAIN QUERY PLAN`'s detail with
     # `select_rows(…).map(&:last)`).
     def select_rows(sql)
-      ActiveRecord.adapter.select_rows(sql).map { |row| row.values }
+      Db.enter_slot(@slot, @base) if @slot != -1
+      begin
+        ActiveRecord.adapter.select_rows(sql).map { |row| row.values }
+      ensure
+        Db.leave_slot if @slot != -1
+      end
     end
 
     # `select_value(sql)` — the first column of the first row, or nil
@@ -409,6 +495,7 @@ module ActiveRecord
     # `transaction(mode)` is reached: campfire repairs its counters in one
     # `BEGIN IMMEDIATE` write transaction.
     def raw_connection
+      raise NotImplementedError, "raw_connection is not carried in an app that routes by role and shard" if Db.connection_slot(false) >= 0
       RawConnection.new
     end
 
@@ -430,8 +517,13 @@ module ActiveRecord
     # vote save. The binds go through `sanitize_sql`, the escaping every
     # other raw-SQL entry here already uses; `name` is Rails' log label.
     def exec_update(sql, name = nil, binds = [])
-      ActiveRecord.adapter.execute_ddl(Base.sanitize_sql([sql] + binds))
-      ActiveRecord.adapter.changes
+      Db.enter_slot(@slot, @base) if @slot != -1
+      begin
+        ActiveRecord.adapter.execute_ddl(Base.sanitize_sql([sql] + binds))
+        ActiveRecord.adapter.changes
+      ensure
+        Db.leave_slot if @slot != -1
+      end
     end
 
     # lobsters' FullTextSearch drops an index row this way
@@ -478,7 +570,7 @@ module ActiveRecord
     def create_or_find_by(conditions)
       created = build(conditions)
       begin
-        ActiveRecord::Base.transaction(requires_new: true) { created.save }
+        model.transaction(requires_new: true) { created.save }
       rescue ActiveRecord::RecordNotUnique
         return find_by!(conditions)
       end
@@ -488,7 +580,7 @@ module ActiveRecord
     def create_or_find_by!(conditions)
       created = build(conditions)
       begin
-        ActiveRecord::Base.transaction(requires_new: true) { created.save! }
+        model.transaction(requires_new: true) { created.save! }
       rescue ActiveRecord::RecordNotUnique
         return find_by!(conditions)
       end
@@ -503,6 +595,24 @@ module ActiveRecord
 
     def self.column_names
       Connection.shared.select_rows("PRAGMA table_info(#{Connection.shared.quote(table_name)})").map { |row| row[1].to_s }
+    end
+
+    # Rails' `columns`: each of the table's columns, with whether it may be null (Doorkeeper's `secret_required?`).
+    def self.columns
+      SchemaCache.new.columns_hash(table_name).values
+    end
+
+    # Rails' `columns_hash`, by column name (aasm's `columns_hash[column_name].type`).
+    def self.columns_hash
+      SchemaCache.new.columns_hash(table_name)
+    end
+
+    # Rails' `attribute_names`: the record's attributes as Strings, its table's columns less those a partial `select` left out.
+    def attribute_names
+      unloaded = @__unloaded_columns
+      names = self.class.column_names
+      return names if unloaded.nil?
+      names.reject { |name| unloaded.include?(name.to_sym) }
     end
 
     # Rails' read-only records: one a `readonly` relation loaded, or one
@@ -539,8 +649,21 @@ module ActiveRecord
 
     # Ruby-family only, beside the other reopens here: strict targets have
     # no `Type::Value`, no untyped `self[name]` and no relation `all`.
+    # A column a partial `select` left out reads nil here, where `[]`
+    # raises: Rails' `[]` passes `read_attribute` the raising block and
+    # `read_attribute` alone has none (attribute_methods/read.rb).
+    # The key is normalized first: Rails keys `@attributes` by the
+    # canonical name, so `read_attribute("title")` and
+    # `read_attribute(:title)` read the same attribute. Compared as given,
+    # a String key matched no name in the unloaded list and fell through
+    # to the generated `[]`, whose column arm raises for a left-out column.
+    # Lowering turns a literal String key into a Symbol; this is for the
+    # key an app only holds at runtime (`read_attribute(key)`).
     def read_attribute(name)
-      self[name]
+      key = name.to_sym
+      unloaded = @__unloaded_columns
+      return nil unless unloaded.nil? || !unloaded.include?(key)
+      self[key]
     end
 
     def write_attribute(name, value)
@@ -594,6 +717,20 @@ module ActiveRecord
       {}
     end
 
+    # The byte width (4 or 8) each plain integer column range-checks a
+    # query value against, as Rails' integer type does
+    # (Relation#integer_query_limit). Schema-generated models list theirs.
+    def self.schema_integer_query_limits
+      {}
+    end
+
+    # The PostgreSQL uuid columns whose query values cast as Rails' uuid
+    # type does (Relation#uuid_query_column?). Schema-generated models on
+    # PostgreSQL list theirs.
+    def self.schema_uuid_query_columns
+      []
+    end
+
     def self.schema_json_coder_columns
       []
     end
@@ -616,7 +753,7 @@ module ActiveRecord
     # zero/empty-string key.
     def self.find(id)
       raise RecordNotFound.new("Couldn't find #{name} without an ID", name, primary_key, id) if id.nil?
-      result = _default_scope_where.empty? ? _find_primary_key_input(id) : _find_in_scope(id)
+      result = _read_through_relation? ? _find_in_scope(id) : _find_primary_key_input(id)
       raise RecordNotFound.new("Couldn't find #{name} with '#{primary_key}'=#{id.inspect}", name, primary_key, id) if result.nil?
       result
     end
@@ -640,7 +777,7 @@ module ActiveRecord
       _adapter_find_by_id(key)
     end
 
-    # `find` on a default-scoped model: the row only when the scope keeps it.
+    # `find` on a scoped model: the row only when the scope keeps it.
     def self._find_in_scope(id)
       key = _cast_primary_key(id)
       return nil if key.nil?
@@ -670,7 +807,7 @@ module ActiveRecord
       # Conditions, not a key (Rails' `exists?(name: "x")`): the Relation
       # answers them, through the default scope when the model has one.
       return all.exists?(id) if id.is_a?(Hash)
-      unless _default_scope_where.empty?
+      if _read_through_relation?
         key = _cast_primary_key(id)
         return false if key.nil?
         return all.where({ primary_key => key }).exists?
@@ -692,8 +829,38 @@ module ActiveRecord
     # stub through `connection_pool.with_connection`, which a fresh
     # instance per call would lose. Held on Connection, not on Base, so
     # `User.connection` and `ActiveRecord::Base.connection` agree.
+    # In a routed app, a handle on the pool the receiver's role and shard
+    # select now: Base's own, or the connection class's.
     def self.connection
-      ActiveRecord::Connection.shared
+      slot = Db.connection_slot(self == ActiveRecord::Base)
+      slot == -1 ? ActiveRecord::Connection.shared : ActiveRecord::Connection.new(slot, self == ActiveRecord::Base)
+    end
+
+    def self.lease_connection
+      connection
+    end
+
+    # Rails' `connection_handler`, for the call a request's end makes of it (message_bus's `close_db_connection!`).
+    def self.connection_handler
+      ActiveRecord::ConnectionAdapters::ConnectionHandler.shared
+    end
+
+    # Rails' `with_connection` holds one connection for its block: the
+    # handle's slot, leased once, so each statement through it is on that
+    # connection (a raw BEGIN carries to the next one). The block's value
+    # is bound before the slot is left, so the Spinel binary keeps it.
+    # `prevent_permanent_checkout:` is taken and not read: it keeps a connection a block leases from staying the
+    # thread's after it, and this runtime's handle holds one slot only for the block.
+    def self.with_connection(prevent_permanent_checkout: false)
+      handle = connection
+      handle._hold_slot
+      result = nil
+      begin
+        result = yield handle
+      ensure
+        handle._release_slot
+      end
+      result
     end
 
     # Rails' `Model.sanitize_sql(["insert … values (?, ?)", a, b])` —
@@ -932,6 +1099,9 @@ module ActiveRecord
     end
 
     def self.transaction(isolation: nil, requires_new: nil, joinable: true)
+      if self == ActiveRecord::Base && Db.connection_slot(true) != Db.connection_slot(false)
+        raise NotImplementedError, "ActiveRecord::Base.transaction opens its transaction on Base's own database, which the routed models are not on; open it on the model or its connection class"
+      end
       depth = Db._txn_depth
       if depth > 0
         parent_joinable = ActiveRecord::Base._txn_parent_joinable?(depth)
@@ -1116,12 +1286,61 @@ module ActiveRecord
       end
     end
 
+    # `#lock!` on the ruby family, where the database may be PostgreSQL
+    # (base.rb's `lock!` is the SQLite one every target shares). Rails
+    # reloads with `SELECT … FOR UPDATE`; on PostgreSQL that row lock is
+    # what makes a second `with_lock` on the same row wait for the first
+    # transaction to commit and then read its write. Without it, two
+    # concurrent read-check-write blocks both read the old row and both
+    # write. Here the lock is taken by its own `SELECT <key> … FOR
+    # UPDATE`, then `reload` reads the row: in the same transaction, and
+    # after the lock is held, so it reads what the holder committed.
+    # SQLite keeps base.rb's behaviour (`_lock_row` does nothing there).
+    def lock!(lock = nil)
+      _lock_row(lock)
+      reload
+    end
+
+    # The row lock `lock!` takes: Rails' `lock` argument, where `true`
+    # (and nil, this runtime's "not given") is `FOR UPDATE`, a String is
+    # the clause itself (`"FOR SHARE"`, `"FOR UPDATE NOWAIT"`), and
+    # `false` takes none. Only on PostgreSQL, and only for a persisted
+    # record: Rails' `lock!` reloads nothing for a new one. Outside a
+    # transaction the lock ends with the statement, as it does in Rails.
+    #
+    # `Db.exec_returning`, not a read through the statement cache: a
+    # locking read must reach the server every time (Rails never answers
+    # one from the query cache), and it also clears the lease's query
+    # cache, as Rails' `reload` does before it reads. Its rows are kept:
+    # a clause that skips (`FOR UPDATE SKIP LOCKED`) answers none for a
+    # row another transaction holds, and Rails' locked `find_by!` then
+    # raises RecordNotFound instead of going on without the lock.
+    def _lock_row(lock)
+      return nil unless Db.adapter_name == "postgresql"
+      return nil unless persisted?
+      return nil if lock == false
+      clause = lock.is_a?(String) ? lock : "FOR UPDATE"
+      key = ActiveRecord.adapter.quote_column_name(self.class.primary_key.to_s)
+      value = ActiveRecord.adapter.escape_value(_primary_key_value)
+      stmt = Db.exec_returning("SELECT #{key} FROM #{self.class._table_sql} WHERE #{key} = #{value} #{clause}")
+      found = false
+      begin
+        found = Db.step?(stmt)
+      ensure
+        Db.finalize(stmt)
+      end
+      unless found
+        raise RecordNotFound.new("Couldn't find #{self.class.name}", self.class.name, self.class.primary_key.to_s)
+      end
+      nil
+    end
+
     # `Model.delete_all` for a model without the lowerer-emitted
     # override: the rows the DELETE removed, read off the statement
     # rather than counted beforehand. Ruby-family-only because
     # `changes` is — see base.rb's default.
     def self.delete_all
-      return all.delete_all unless _default_scope_where.empty?
+      return all.delete_all if _read_through_relation?
       ActiveRecord.adapter.delete_all(table_name)
       ActiveRecord.adapter.changes
     end
@@ -1260,7 +1479,7 @@ module ActiveRecord
       now = _database_now_sql
       stamps = _bulk_stamps(cols, record_timestamps)
       tuples = keyed.map do |row|
-        values = cols.map { |c| ActiveRecord.adapter.escape_value(row[c]) }
+        values = cols.map { |c| _written_sql(c, row[c]) }
         "(" + (values + stamps.map { |_c| now }).join(", ") + ")"
       end
 
@@ -1336,7 +1555,7 @@ module ActiveRecord
       now = _database_now_sql
       stamps = _bulk_stamps(cols, record_timestamps)
       tuples = keyed.map do |row|
-        values = cols.map { |c| ActiveRecord.adapter.escape_value(row[c]) }
+        values = cols.map { |c| _written_sql(c, row[c]) }
         "(" + (values + stamps.map { |_c| now }).join(", ") + ")"
       end
 
@@ -1494,12 +1713,16 @@ module ActiveRecord
     # renders as ISO8601 with three fractional digits in the app's zone.
     # `schema_time_columns` is the emitted fact that says which those
     # are.
+    # A column a partial `select` left out is no attribute of the record,
+    # so it is not written either (Rails' `attribute_names`).
     def _as_json_only(only)
       h = {}
       columns = self.class.schema_columns
       time_columns = self.class.schema_time_columns
+      unloaded = @__unloaded_columns
       only.each do |k|
         next unless columns.include?(k)
+        next if !unloaded.nil? && unloaded.include?(k)
         h[k.to_s] = if time_columns.include?(k)
           ActiveSupport.json_time(self[k])
         else
@@ -1592,14 +1815,23 @@ module ActiveRecord
     # what Rails' UniquenessValidator queries (`finder_class.unscoped`).
     # With a block, Rails runs it with the model's default scope removed
     # from every relation built inside, and returns the block's value.
+    # Rails runs that block as `relation.scoping { … }`, so the bare
+    # relation is also the model's current scope: an outer `scoping` of
+    # the model does not reach in.
     def self.unscoped
       if block_given?
         tables = ActiveRecord::Relation.unscoped_tables
         tables << _table_sql
+        # The bare relation is the block's current scope, as Rails'
+        # `relation.scoping { yield }` makes it, so an outer scope does
+        # not reach in. Pushed here rather than through `scoping`, so the
+        # block's value comes straight from this `yield`.
+        scopes = Db._push_current_scope(ActiveRecord::Relation.new(self, false))
         value = nil
         begin
           value = yield
         ensure
+          scopes.pop
           tables.pop
         end
         return value
@@ -1613,22 +1845,29 @@ module ActiveRecord
       {}
     end
 
-    # A default-scoped model is read only through its Relation, which
-    # applies the scope (or not, inside `unscoped { }`): these class
+    # Whether a class-level read has to go through the Relation, the one
+    # place that applies a default scope (or not, inside `unscoped { }`)
+    # and a current scope (`rel.scoping { … }` of this model), as every
+    # Rails class-level query starts from `all`.
+    def self._read_through_relation?
+      !_default_scope_where.empty? || !ActiveRecord::Relation.current_scope_for(self).nil?
+    end
+
+    # A scoped model is read only through its Relation: these class
     # forms answer from it rather than from the model's whole-table
     # adapter primitives, which base.rb's defaults use.
     def self.count
-      return all.count unless _default_scope_where.empty?
+      return all.count if _read_through_relation?
       _adapter_count
     end
 
     def self.last
-      return all.last unless _default_scope_where.empty?
+      return all.last if _read_through_relation?
       _adapter_last
     end
 
     def self.destroy_all
-      return all.destroy_all unless _default_scope_where.empty?
+      return all.destroy_all if _read_through_relation?
       records = _adapter_all
       records.each { |r| r.destroy() }
       records
@@ -1730,6 +1969,38 @@ module ActiveRecord
       all.first!
     end
 
+    def self.second!
+      all.second!
+    end
+
+    def self.third!
+      all.third!
+    end
+
+    def self.fourth!
+      all.fourth!
+    end
+
+    def self.fifth!
+      all.fifth!
+    end
+
+    def self.second_to_last!
+      all.second_to_last!
+    end
+
+    def self.third_to_last!
+      all.third_to_last!
+    end
+
+    def self.reselect(*specs)
+      all.reselect(*specs)
+    end
+
+    def self.annotate(*comments)
+      all.annotate(*comments)
+    end
+
     def self.from(source)
       all.from(source)
     end
@@ -1798,12 +2069,12 @@ module ActiveRecord
       all.order(*parts)
     end
 
-    def self.pick(col)
-      all.pick(col)
+    def self.pick(*cols)
+      all.pick(*cols)
     end
 
-    def self.pluck(col)
-      all.pluck(col)
+    def self.pluck(*cols)
+      all.pluck(*cols)
     end
 
     def self.preload(*names)
@@ -1893,6 +2164,23 @@ module ActiveRecord
     # is what the row held.
     def self.decode_plucked(column, value)
       value
+    end
+
+    # The value a bulk write (`update_all`, `insert_all`, `upsert_all`)
+    # gives a column, as a record's save would store it. A model with a
+    # stored PostgreSQL array column overrides this to encode that
+    # column's Array (`ArrayColumn.dump`: JSON on SQLite, the array
+    # literal on PostgreSQL); every other value, an Array into a json
+    # column included, is written as given.
+    def self.encode_written(column, value)
+      value
+    end
+
+    # One value of a bulk write as SQL: an Array through `encode_written`
+    # first, every value through the adapter's quoting.
+    def self._written_sql(column, value)
+      value = encode_written(column, value) if value.is_a?(Array)
+      ActiveRecord.adapter.escape_value(value)
     end
 
     # Not in base.rb: a block here would put one on every strict target's runtime.
@@ -2076,6 +2364,7 @@ module ActiveRecord
       unless @__rollback_saved
         @__rollback_saved = true
         @__rollback_baseline = @__last_saved_attributes
+        @__rollback_unloaded_writes = @__unloaded_writes
       end
       _enlist_or_run(kind)
     end
@@ -2095,6 +2384,7 @@ module ActiveRecord
       unless @__rollback_saved
         @__rollback_saved = true
         @__rollback_baseline = @__last_saved_attributes
+        @__rollback_unloaded_writes = @__unloaded_writes
       end
       Db._txn_records << ActiveRecord::EnlistedRecord.new(self, 4)
       nil
@@ -2104,6 +2394,7 @@ module ActiveRecord
     def _forget_rollback_state
       @__rollback_saved = false
       @__rollback_baseline = nil
+      @__rollback_unloaded_writes = nil
       nil
     end
 
@@ -2173,6 +2464,7 @@ module ActiveRecord
         else
           @__last_saved_attributes = _attributes_snapshot
           @__touched_updated_at = nil
+          @__unloaded_writes = nil
         end
         after_touch
         _save_committed(false)
@@ -2369,6 +2661,8 @@ module ActiveRecord
       end
       if @__rollback_saved
         @__last_saved_attributes = @__rollback_baseline
+        # A partial row's assigned left-out columns are pending again too.
+        @__unloaded_writes = @__rollback_unloaded_writes
         _forget_rollback_state
       end
       nil
@@ -2394,6 +2688,7 @@ module ActiveRecord
       end
       @__last_saved_attributes = _attributes_snapshot
       @__touched_updated_at = nil
+      @__unloaded_writes = nil
       @saved_changes = changes
       @id_previously_changed = was_new
       nil
@@ -2436,6 +2731,7 @@ module ActiveRecord
     def _note_hydrated
       @__last_saved_attributes = _attributes_snapshot
       @__touched_updated_at = nil
+      @__unloaded_writes = nil
       nil
     end
 
@@ -2446,9 +2742,12 @@ module ActiveRecord
     # a `User.select(*attrs)` without `token` must not mint one. Nothing
     # is recorded when the row carries every column, so the common path
     # allocates nothing.
+    # The primary key is never noted: Rails keeps it among a partial row's
+    # attributes (`has_attribute?(:id)` true, `id` in `as_json`), reading nil.
     def _note_unloaded(row)
       missing = []
-      self.class.schema_columns.each { |c| missing << c unless row.key?(c.to_s) }
+      primary_key = self.class.primary_key
+      self.class.schema_columns.each { |c| missing << c unless row.key?(c.to_s) || c.to_s == primary_key }
       @__unloaded_columns = missing unless missing.empty?
       nil
     end
@@ -2457,6 +2756,45 @@ module ActiveRecord
       return false unless self.class.schema_columns.include?(name)
       unloaded = @__unloaded_columns
       unloaded.nil? || !unloaded.include?(name)
+    end
+
+    # Rails' generated reader raises for a column the row's `select` left
+    # out (attribute_methods/read.rb, `missing_attribute`); each generated
+    # reader calls this first when the row noted any (`lower::missing_attribute`).
+    def _missing_attribute(name)
+      unloaded = @__unloaded_columns
+      return nil if unloaded.nil? || !unloaded.include?(name)
+      raise ActiveModel::MissingAttributeError, "missing attribute '#{name}' for #{self.class.name}"
+    end
+
+    # Assigning a column the row's `select` left out loads it: Rails'
+    # writer replaces the uninitialized attribute with the assigned one
+    # (attribute_set.rb, `write_from_user`), so the column then reads,
+    # answers `has_attribute?` true and serializes. Each generated column
+    # writer calls this first when the row noted any
+    # (`lower::missing_attribute`).
+    # The assignment is also a write the next save owes the row, so the
+    # column is named in `@__unloaded_writes` until a save records it.
+    # Rails marks the attribute changed as it writes it
+    # (`@mutations_from_database`), so `changed` reports the assignment even
+    # when it is nil — and nil IS the unloaded column's baseline, so the
+    # diff in `changes_to_save` alone reads the assignment as no change and
+    # `_columns_to_write` dropped it: the row kept the value the partial
+    # `select` never showed the record.
+    def _note_loaded(name)
+      unloaded = @__unloaded_columns
+      return nil if unloaded.nil?
+      return nil unless unloaded.include?(name)
+      unloaded.delete(name)
+      @__unloaded_columns = nil if unloaded.empty?
+      wrote = @__unloaded_writes
+      key = name.to_s
+      if wrote.nil?
+        @__unloaded_writes = [key]
+      else
+        wrote.push(key) unless wrote.include?(key)
+      end
+      nil
     end
 
     # The pending diff: current attributes against the baseline the
@@ -2484,8 +2822,47 @@ module ActiveRecord
       changes
     end
 
+    # Rails' `merge_target_lists`: the rows an association query answered,
+    # with a record the association already held (one created or built
+    # through it) standing in for its row, and the held records the query
+    # did not answer and that are not persisted (unsaved or destroyed
+    # ones, as Rails' `memory.reject(&:persisted?)`) after them. The held
+    # object is kept —
+    # it is what the target answers — and takes the row's value of every
+    # attribute it has not changed, keeping the changes it has.
+    def _merge_target(rows, held)
+      return rows if held.nil? || held.empty?
+      merged = []
+      rows.each do |row|
+        found = nil
+        held.each { |h| found = h if !h.new_record? && h.id == row.id }
+        if found.nil?
+          merged << row
+        else
+          found._take_unchanged_attributes(row)
+          merged << found
+        end
+      end
+      held.each { |h| merged << h unless h.persisted? }
+      merged
+    end
+
+    # The attribute half of `_merge_target`: each attribute `row` carries
+    # that this record has not changed, written through the column
+    # indexer, as Rails' `_write_attribute(name, record[name])` writes it.
+    def _take_unchanged_attributes(row)
+      row.attributes.each do |name, value|
+        next if attribute_changed?(name)
+        self[name.to_sym] = value
+      end
+      self
+    end
+
     # The columns the emitted `_adapter_update` writes, as Rails' partial
-    # updates choose them: the ones with a pending change. A record with
+    # updates choose them: the ones with a pending change, among them a
+    # column the row's `select` left out that has been assigned since — a
+    # write the record owes the row even where the unloaded baseline makes
+    # the diff call it no change (see `_note_loaded`). A record with
     # no Dirty baseline (one this runtime didn't load or save) writes
     # every column, so nothing it holds is skipped; `update_columns`
     # names its own.
@@ -2493,7 +2870,11 @@ module ActiveRecord
       only = @__write_only
       return only unless only.nil?
       return attributes.keys if @__last_saved_attributes.nil?
-      changes_to_save.keys
+      columns = changes_to_save.keys
+      wrote = @__unloaded_writes
+      return columns if wrote.nil?
+      wrote.each { |name| columns.push(name) unless columns.include?(name) }
+      columns
     end
 
     # Rails' `<col>_was`: the value before the pending change, or the
@@ -2513,6 +2894,8 @@ module ActiveRecord
       baseline[name] = _attributes_snapshot[name]
       @__last_saved_attributes = baseline
       @__touched_updated_at = nil if name == "updated_at"
+      wrote = @__unloaded_writes
+      wrote.delete(name) unless wrote.nil?
       nil
     end
 
@@ -2524,6 +2907,30 @@ module ActiveRecord
         clear_attribute_change(name)
       end
       nil
+    end
+
+    # Rails' `restore_attributes`: every pending change written back, as
+    # `restore_attribute!` writes one, answering the names it restored. A
+    # write to a column the row's `select` left out is pending too, though
+    # the diff may not show it (nil over the unloaded nil): restoring it
+    # drops the write and leaves the column unloaded again, so a save
+    # leaves it as the row holds it and a later write is noted afresh.
+    def restore_attributes
+      names = changes_to_save.keys
+      names.each { |name| restore_attribute!(name) }
+      wrote = @__unloaded_writes
+      unless wrote.nil?
+        unloaded = @__unloaded_columns
+        unloaded = [] if unloaded.nil?
+        wrote.each do |name|
+          names.push(name) unless names.include?(name)
+          column = name.to_sym
+          unloaded.push(column) unless unloaded.include?(column)
+        end
+        @__unloaded_columns = unloaded
+        @__unloaded_writes = nil
+      end
+      names
     end
 
     # ---- cache_key / cache_version / cache_key_with_version ---------
@@ -2644,6 +3051,28 @@ module ActiveRecord
     def cache_key_with_version
       version = cache_version
       version.nil? ? cache_key : "#{cache_key}-#{version}"
+    end
+  end
+end
+
+module ActiveRecord
+  module ConnectionAdapters
+    # Rails' connection handler, with the one call a request's end makes of it. This runtime leases a connection only
+    # for a request or a `with_connection` block and gives it back itself, so there is none to return here; the query
+    # cache goes off for the rest of the request, as each pool's `disable_query_cache!` turns it off in Rails.
+    class ConnectionHandler
+      def self.shared
+        @shared ||= ConnectionHandler.new
+      end
+
+      # nil, not the pools Rails' `each` hands back: this runtime has no pool objects to answer with.
+      def clear_active_connections!(role = nil)
+        # Not before the databases open (`connection_slot` -2): the Spinel Db keeps its replay cache on a connection,
+        # which it has none of yet; the CRuby one keeps it on the fiber, which this turns off with or without a lease.
+        return nil if Db.connection_slot(true) == -2
+        Db.query_cache_end if Db.query_cache_enabled?
+        nil
+      end
     end
   end
 end

@@ -13,6 +13,11 @@
 //! name the key then spells (`public_send("#{status}_execution")`) names
 //! that literal.
 //!
+//! In a model's class body, `define_singleton_method(…)` (or
+//! `self.define_singleton_method`, `singleton_class.define_method`) in
+//! the loop makes a class method the same way; inside `class << self`, a
+//! plain `define_method` does (`singleton_class::ingest_singleton_body`).
+//!
 //! What the substitution cannot keep is left alone: a loop it does not
 //! recognize stays the statement it was. Refused shapes: a constant
 //! whose value is not a literal, a name the key does not decide, a
@@ -70,6 +75,9 @@ pub(super) struct ConstTable {
     owner: Vec<String>,
     map: HashMap<String, Entries>,
     named: HashSet<String>,
+    /// Lookup stops here: the statements read under it (a spliced load
+    /// hook's) see none of the enclosing bodies' constants.
+    barrier: bool,
 }
 
 impl ConstTable {
@@ -90,7 +98,13 @@ impl ConstTable {
             ruby_prism::Visit::visit(&mut mutated, stmt);
         }
         map.retain(|name, _| written.get(name) == Some(&1) && !mutated.names.contains(name));
-        ConstTable { owner: owner.0.as_str().split("::").map(str::to_string).collect(), map, named: named_visibility(statements) }
+        ConstTable { owner: owner.0.as_str().split("::").map(str::to_string).collect(), map, named: named_visibility(statements), barrier: false }
+    }
+
+    /// A table that hides the enclosing bodies' constants: a load hook
+    /// block spliced into a class body reads its initializer's, not the class's.
+    pub(super) fn barrier() -> Self {
+        ConstTable { barrier: true, ..Default::default() }
     }
 
     /// Only the visibility markers of a body whose constants another table already holds (an `included do` block).
@@ -141,13 +155,17 @@ impl Drop for Scope {
 /// The constant's qualified path and entries, innermost scope first.
 fn lookup(name: &str) -> Option<(Vec<String>, Entries)> {
     SCOPES.with(|s| {
-        s.borrow().iter().rev().find_map(|t| {
-            t.map.get(name).map(|e| {
+        for t in s.borrow().iter().rev() {
+            if let Some(e) = t.map.get(name) {
                 let mut path = t.owner.clone();
                 path.push(name.to_string());
-                (path, e.clone())
-            })
-        })
+                return Some((path, e.clone()));
+            }
+            if t.barrier {
+                return None;
+            }
+        }
+        None
     })
 }
 
@@ -205,13 +223,39 @@ struct Plan<'pr> {
     entries: Entries,
     key_param: String,
     value_param: Option<String>,
-    defines: Vec<CallNode<'pr>>,
+    /// Each `define_method` call, and whether it defines on the class
+    /// itself (`define_singleton_method`, `singleton_class.define_method`).
+    defines: Vec<(CallNode<'pr>, bool)>,
     /// Class macros the loop runs beside its `define_method`s
-    /// (`serialize "on_#{type}", coder: JSON`), each once per element.
+    /// (`serialize "on_#{type}", coder: JSON`, `scope kind, -> { … }`),
+    /// each once per element. A loop of `scope`s alone is one too.
     macros: Vec<CallNode<'pr>>,
 }
 
-fn plan<'pr>(stmt: &Node<'pr>, file: &str, named: &HashSet<String>, allow_macros: bool) -> Option<Plan<'pr>> {
+/// Whether `call` defines a method, and if so whether on the class itself:
+/// a receiverless `define_method` defines on the body's own side; with
+/// `singletons`, `define_singleton_method` (receiverless or on `self`) and
+/// `singleton_class.define_method` define class methods.
+fn defining_call(call: &CallNode<'_>, singletons: bool) -> Option<bool> {
+    let is_self = |n: &Node<'_>| n.as_self_node().is_some();
+    let name = constant_id_str(&call.name());
+    match call.receiver() {
+        None if name == "define_method" => Some(false),
+        None if singletons && name == "define_singleton_method" => Some(true),
+        Some(r) if singletons && name == "define_singleton_method" && is_self(&r) => Some(true),
+        Some(r) if singletons && name == "define_method" => {
+            let sc = r.as_call_node()?;
+            (constant_id_str(&sc.name()) == "singleton_class"
+                && sc.receiver().is_none_or(|r| is_self(&r))
+                && sc.arguments().is_none()
+                && sc.block().is_none())
+            .then_some(true)
+        }
+        _ => None,
+    }
+}
+
+fn plan<'pr>(stmt: &Node<'pr>, file: &str, named: &HashSet<String>, allow_macros: bool, singletons: bool) -> Option<Plan<'pr>> {
     let call = stmt.as_call_node()?;
     if constant_id_str(&call.name()) != "each" || call.arguments().is_some() {
         return None;
@@ -235,37 +279,72 @@ fn plan<'pr>(stmt: &Node<'pr>, file: &str, named: &HashSet<String>, allow_macros
         _ => return None,
     };
     let body = block.body()?;
-    let mut defines: Vec<CallNode<'pr>> = Vec::new();
+    let mut defines: Vec<(CallNode<'pr>, bool)> = Vec::new();
     let mut macros: Vec<CallNode<'pr>> = Vec::new();
     for s in flatten_statements(body) {
         let c = s.as_call_node()?;
-        if c.receiver().is_some() {
-            return None;
-        }
-        if constant_id_str(&c.name()) == "define_method" {
+        if let Some(on_class) = defining_call(&c, singletons) {
             if !(c.arguments().is_some_and(|a| a.arguments().iter().count() == 1)
                 && c.block().is_some_and(|b| b.as_block_node().is_some()))
             {
                 return None;
             }
-            defines.push(c);
+            defines.push((c, on_class));
+        } else if c.receiver().is_some() {
+            return None;
         } else if allow_macros && c.block().is_none() {
             macros.push(c);
         } else {
             return None;
         }
     }
-    if defines.is_empty() {
+    if defines.is_empty() && !macros.iter().any(is_scope) {
         return None;
     }
     let plan = Plan { constant, entries, key_param, value_param, defines, macros };
     let loop_params: Vec<&str> = std::iter::once(plan.key_param.as_str()).chain(plan.value_param.as_deref()).collect();
     let macros_ok = plan.macros.iter().all(|m| {
+        if is_scope(m) {
+            return scope_ok(m, &plan, &loop_params);
+        }
         let mut check = MacroCheck { loop_params: &loop_params, ok: true };
         ruby_prism::Visit::visit(&mut check, &m.as_node());
         check.ok
     });
-    (macros_ok && plan.defines.iter().all(|d| define_ok(d, &plan, named))).then_some(plan)
+    (macros_ok && plan.defines.iter().all(|(d, _)| define_ok(d, &plan, named))).then_some(plan)
+}
+
+fn is_scope(call: &CallNode<'_>) -> bool {
+    constant_id_str(&call.name()) == "scope"
+}
+
+/// `scope kind, -> { where(kind: kind) }` (or `"#{kind}_ones"`): a name
+/// the key decides, distinct per element, and a lambda of plain required
+/// parameters whose body reads the loop's parameters as a `define_method`
+/// body may, so each element's scope is the lambda with its key in place.
+fn scope_ok(call: &CallNode<'_>, plan: &Plan<'_>, loop_params: &[&str]) -> bool {
+    let Some(args) = call.arguments() else { return false };
+    let args: Vec<Node<'_>> = args.arguments().iter().collect();
+    let [name, body] = args.as_slice() else { return false };
+    let Some(lambda) = body.as_lambda_node() else { return false };
+    if lambda.locals().iter().any(|l| loop_params.contains(&constant_id_str(&l))) || required_params(lambda.parameters()).is_none() {
+        return false;
+    }
+    let keys = match &plan.entries {
+        Entries::Array(k) | Entries::Hash(k) => k,
+    };
+    let mut names: Vec<String> = Vec::new();
+    for key in keys {
+        match name_for(name, &plan.key_param, key.text()) {
+            Some(n) if !names.contains(&n) => names.push(n),
+            _ => return false,
+        }
+    }
+    let mut check = BodyCheck { depth: 0, loops: 0, loop_params, ok: true };
+    if let Some(body) = lambda.body() {
+        ruby_prism::Visit::visit(&mut check, &body);
+    }
+    check.ok
 }
 
 /// Plain required parameter names, or `None` for any other shape.
@@ -505,7 +584,7 @@ impl<'pr> ruby_prism::Visit<'pr> for BodyCheck<'_> {
 /// Whether `stmt` is a loop this unrolls, with the enclosing bodies' tables
 /// in scope.
 pub(super) fn unrollable(stmt: &Node<'_>, named: &HashSet<String>) -> bool {
-    plan(stmt, "", named, false).is_some()
+    plan(stmt, "", named, false, false).is_some()
 }
 
 /// The names `private :a, :b`-style markers in `statements` set the
@@ -520,14 +599,18 @@ pub(super) fn named_visibility(statements: &[Node<'_>]) -> HashSet<String> {
 }
 
 /// The `def`s the loop makes, or `None` when it is not one this unrolls.
+/// `receiver` is the side a receiverless `define_method` defines on; with
+/// `singletons` (a model's class body), the loop's class-method forms
+/// (`define_singleton_method`, `singleton_class.define_method`) unroll too.
 pub(super) fn unroll(
     stmt: &Node<'_>,
     owner: &ClassId,
     file: &str,
     receiver: MethodReceiver,
     named: &HashSet<String>,
+    singletons: bool,
 ) -> Option<Vec<MethodDef>> {
-    unroll_with(stmt, owner, file, receiver, named, None)
+    unroll_with(stmt, owner, file, receiver, named, None, singletons)
 }
 
 /// [`unroll`], also taking a loop that runs class macros beside its
@@ -540,7 +623,7 @@ pub(super) fn unroll_with_macros(
     macros: &mut Vec<Expr>,
 ) -> Option<Vec<MethodDef>> {
     let named: HashSet<String> = SCOPES.with(|s| s.borrow().iter().flat_map(|t| t.named.iter().cloned()).collect());
-    unroll_with(stmt, owner, file, MethodReceiver::Instance, &named, Some(macros))
+    unroll_with(stmt, owner, file, MethodReceiver::Instance, &named, Some(macros), true)
 }
 
 fn unroll_with(
@@ -550,8 +633,9 @@ fn unroll_with(
     receiver: MethodReceiver,
     named: &HashSet<String>,
     macros: Option<&mut Vec<Expr>>,
+    singletons: bool,
 ) -> Option<Vec<MethodDef>> {
-    let plan = plan(stmt, file, named, macros.is_some())?;
+    let plan = plan(stmt, file, named, macros.is_some(), singletons)?;
     let keys = match &plan.entries {
         Entries::Array(k) | Entries::Hash(k) => k.clone(),
     };
@@ -566,8 +650,9 @@ fn unroll_with(
             }
         }
     }
-    let mut out = Vec::new();
-    for define in &plan.defines {
+    let mut defines = Vec::new();
+    for (define, on_class) in &plan.defines {
+        let receiver = if *on_class { MethodReceiver::Class } else { receiver };
         let names = plan_names(define, &plan)?;
         let block = define.block()?.as_block_node()?;
         let params: Vec<Param> = required_params(block.parameters())?
@@ -582,14 +667,20 @@ fn unroll_with(
             Some(b) => ingest_expr(&b, file).ok()?,
             None => Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] }),
         };
-        for (key, name) in keys.iter().zip(names) {
+        defines.push((receiver, names, params, name_span, body));
+    }
+    // In the order Ruby runs them, each element's definitions in turn, so a
+    // name two definitions spell is the later one's.
+    let mut out = Vec::new();
+    for (i, key) in keys.iter().enumerate() {
+        for (receiver, names, params, name_span, body) in &defines {
             let mut body = body.clone();
             substitute(&mut body, &plan, key);
             fold_send_names(&mut body);
             out.push(MethodDef {
-                name_span,
-                name: Symbol::from(name.as_str()),
-                receiver,
+                name_span: *name_span,
+                name: Symbol::from(names[i].as_str()),
+                receiver: *receiver,
                 visibility: crate::dialect::MethodVisibility::Public,
                 params: params.clone(),
                 unsupported_formals: None,
@@ -605,14 +696,29 @@ fn unroll_with(
             });
         }
     }
+    // A definition a later one replaces never answers a call: only the last stays.
+    let mut seen = HashSet::default();
+    out.reverse();
+    out.retain(|m| seen.insert((m.name.clone(), m.receiver)));
+    out.reverse();
     Some(out)
 }
 
-/// `"on_#{"finish"}"` once the key is in place: the String it spells, as a macro reads a literal name.
+/// `"on_#{"finish"}"` once the key is in place: the String it spells, as a
+/// macro reads a literal name; `:"#{"small"}_ones"` (ingested as `"…".to_sym`)
+/// the Symbol.
 fn fold_literal_interpolation(expr: &mut Expr) {
     expr.node.for_each_child_mut(&mut fold_literal_interpolation);
     if let Some(text) = literal_interpolation(expr) {
         *expr.node = ExprNode::Lit { value: Literal::Str { value: text } };
+    }
+    if let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*expr.node
+        && method.as_str() == "to_sym"
+        && args.is_empty()
+        && let ExprNode::Lit { value: Literal::Str { value } } = &*recv.node
+    {
+        let value = Literal::Sym { value: Symbol::from(value.as_str()) };
+        *expr.node = ExprNode::Lit { value };
     }
 }
 

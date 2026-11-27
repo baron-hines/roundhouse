@@ -145,7 +145,7 @@ if [[ "$LANE" == spinel ]]; then
         exec ./build/blog ) >"$WORK/emit-server.log" 2>&1 &
 else
     cp "$REPO_ROOT/tests/db_differential/trace.ru" "$OUT/trace.ru"
-    ( cd "$OUT" && RAILS_ENV=development SECRET_KEY_BASE=x exec ruby -S puma -p "$PORT" trace.ru ) \
+    ( cd "$OUT" && RAILS_ENV=development BLOG_DB=storage/development.sqlite3 SECRET_KEY_BASE=x exec ruby -S puma -p "$PORT" trace.ru ) \
         >"$WORK/emit-server.log" 2>&1 &
 fi
 EMIT_PID=$!

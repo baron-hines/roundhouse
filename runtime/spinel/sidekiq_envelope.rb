@@ -147,4 +147,88 @@ module SidekiqEnvelope
     return message if message.length <= ERROR_MESSAGE_LIMIT
     message[0, ERROR_MESSAGE_LIMIT]
   end
+
+  # What a `sidekiq_retry_in` block's answer means, as `JobRetry#delay_for`
+  # reads it: -2 for `:kill`, -1 for `:discard`, a positive number of
+  # seconds, or 0 for Sidekiq's default delay.
+  def self.retry_in_choice(rv)
+    return -2 if rv == :kill
+    return -1 if rv == :discard
+    n = 0
+    n = rv.to_i if rv.is_a?(Integer) || rv.is_a?(Float) || rv.is_a?(String) || rv.nil?
+    n > 0 ? n : 0
+  end
+
+  # ---- A native job's arguments, read back for `JobRegistry.perform_native`
+
+  # Raise rather than coerce like ActiveJob::Arguments' readers (`"x".to_i`): a coerced value is one nobody pushed.
+  def self.native_args(args)
+    raise TypeError, "a native job's args must be a JSON array" unless args.is_a?(Array)
+    args.length
+  end
+
+  def self.native_int(v, where)
+    raise TypeError, where + ": expected an Integer, got " + json_kind(v) unless v.is_a?(Integer)
+    v.to_i
+  end
+
+  # Not Float alone: a pusher in another language may write `2.0` as `2`.
+  def self.native_float(v, where)
+    raise TypeError, where + ": expected a Float, got " + json_kind(v) unless v.is_a?(Float) || v.is_a?(Integer)
+    v.to_f
+  end
+
+  def self.native_str(v, where)
+    raise TypeError, where + ": expected a String, got " + json_kind(v) unless v.is_a?(String)
+    v.to_s
+  end
+
+  def self.native_bool(v, where)
+    raise TypeError, where + ": expected true or false, got " + json_kind(v) unless v == true || v == false
+    v == true
+  end
+
+  def self.native_null(v, where)
+    raise TypeError, where + ": expected nil, got " + json_kind(v) unless v.nil?
+    nil
+  end
+
+  def self.native_scalar(v, where)
+    raise TypeError, where + ": expected a String, number, true, false or nil, got " + json_kind(v) if v.is_a?(Array) || v.is_a?(Hash)
+    v
+  end
+
+  def self.native_scalar_array(v, where)
+    native_array(v, where)
+    v.each { |x| native_scalar(x, where) }
+    v
+  end
+
+  def self.native_scalar_hash(v, where)
+    native_hash(v, where)
+    v.each { |k, x| native_scalar(x, where) }
+    v
+  end
+
+  def self.native_array(v, where)
+    raise TypeError, where + ": expected an Array, got " + json_kind(v) unless v.is_a?(Array)
+    v.length
+  end
+
+  def self.native_hash(v, where)
+    raise TypeError, where + ": expected a Hash, got " + json_kind(v) unless v.is_a?(Hash)
+    v.length
+  end
+
+  def self.json_kind(v)
+    return "nil" if v.nil?
+    return "true" if v == true
+    return "false" if v == false
+    return "an Integer" if v.is_a?(Integer)
+    return "a Float" if v.is_a?(Float)
+    return "a String" if v.is_a?(String)
+    return "an Array" if v.is_a?(Array)
+    return "a Hash" if v.is_a?(Hash)
+    "an unknown value"
+  end
 end

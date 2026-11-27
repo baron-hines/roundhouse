@@ -1001,6 +1001,15 @@ fn rewrite(
         &*target.node,
         ExprNode::Lit { value: Literal::Sym { .. } | Literal::Str { .. } }
     ) {
+        // Not `send` on a receiver of unknown class: a native build resolves that name to any class defining its own
+        // `send` (the Spinel tree's `Faye::WebSocket#send`); `__send__` is Kernel's alone, as Ruby's `send` is here.
+        // Nor a String argument: `ws.send("hello")` on a socket is the socket's own `send`, which a Symbol never reaches.
+        let untyped = recv.as_ref().is_some_and(|r| matches!(r.ty, None | Some(Ty::Var { .. }) | Some(Ty::Untyped)));
+        if method.as_str() == "send" && untyped && matches!(&*target.node, ExprNode::Lit { value: Literal::Sym { .. } })
+            && let ExprNode::Send { method, .. } = &mut *e.node
+        {
+            *method = Symbol::from("__send__");
+        }
         return;
     }
     // The receiver lands in every arm, and the case evaluates the
@@ -1275,7 +1284,7 @@ pub(crate) fn method_return_via_registry(
             // walk started from, as analyze's dispatch substitutes.
             let ty = ty.subst_self(&Ty::Class { id: class.clone(), args: Vec::new().into() });
             let ret = match ty {
-                Ty::Fn { ret, .. } => std::sync::Arc::unwrap_or_clone(ret),
+                Ty::Fn(fn_ty) => std::sync::Arc::unwrap_or_clone(fn_ty.ret),
                 t => t,
             };
             return match ret {

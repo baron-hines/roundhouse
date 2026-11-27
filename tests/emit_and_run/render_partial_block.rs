@@ -45,26 +45,49 @@ fn a_partial_renders_its_block_as_its_yield() {
         .assert_passes();
 }
 
-/// A captured string is Rails' answer only for a partial that yields once
-/// at its top level, with the body in a record slot nothing else uses.
-/// The other shapes are refused, each with its reason, as is a block-form
-/// render the lowering doesn't model (`render partial: …, locals: … do`
-/// raises in Rails).
+/// `render partial: …, locals: … do` raises in Rails, and stays refused.
 #[test]
-fn a_block_render_rails_answers_otherwise_is_refused() {
-    for (partial, markup, reason) in [
-        ("<p><%= yield %>|<%= yield %></p>\n", "<%= render \"shared/blurb\" do %>x<% end %>\n", "yield exactly once"),
-        ("<% [1, 2].each do |i| %><%= yield %><% end %>\n", "<%= render \"shared/blurb\" do %>x<% end %>\n", "yield exactly once"),
-        ("<%# locals: (title:) -%>\n<h2><%= title %></h2><%= yield %>\n", "<%= render \"shared/blurb\", title: \"T\" do %>x<% end %>\n", "strict locals"),
-        ("<p><%= shared %></p><%= yield %>\n", "<%= render \"shared/blurb\" do %>x<% end %>\n", "record local"),
-        (BLURB, "<%= render \"shared/blurb\" do |x| %>x<% end %>\n", "block with parameters"),
-        (BLURB, "<%= render partial: \"shared/blurb\", locals: { a: 1 } do %>x<% end %>\n", "are modeled"),
+fn a_block_render_rails_raises_for_is_refused() {
+    let errors = emit_and_run::real_blog()
+        .write("app/views/shared/_blurb.html.erb", BLURB)
+        .edit(
+            "app/views/articles/index.html.erb",
+            "<% content_for :title, \"Articles\" %>\n",
+            "<% content_for :title, \"Articles\" %>\n<%= render partial: \"shared/blurb\", locals: { a: 1 } do %>x<% end %>\n",
+        )
+        .check_errors();
+    assert!(errors.iter().any(|e| e.contains("render with a block not supported") && e.contains("are modeled")), "{errors:?}");
+}
+
+/// The shapes the captured string could not carry, which Rails runs by
+/// calling the block at each yield (`ingest::yield_partials` inlines it
+/// there): two yields, a yield in a loop, a strict-locals partial, a block
+/// taking what the yield passes, and a render passing the partial's record
+/// local (a hyphenated directory's, a collection's `as:`).
+#[test]
+fn block_render_shapes_rails_runs() {
+    for (path, partial, markup, want) in [
+        ("app/views/shared/_blurb.html.erb", "<p class=\"y\"><%= yield %>|<%= yield %></p>\n", "<%= render \"shared/blurb\" do %>x<% end %>\n", "<p class=\"y\">x|x</p>"),
+        ("app/views/shared/_blurb.html.erb", "<p class=\"y\"><% [1, 2].each do |i| %><%= yield %><% end %></p>\n", "<%= render \"shared/blurb\" do %>x<% end %>\n", "<p class=\"y\">xx</p>"),
+        ("app/views/shared/_blurb.html.erb", "<%# locals: (title:) -%>\n<p class=\"y\"><%= title %>:<%= yield %></p>\n", "<%= render \"shared/blurb\", title: \"T\" do %>x<% end %>\n", "<p class=\"y\">T:x</p>"),
+        ("app/views/shared/_blurb.html.erb", "<p class=\"y\"><%= yield 5 %></p>\n", "<%= render \"shared/blurb\" do |n| %><%= n * 2 %><% end %>\n", "<p class=\"y\">10</p>"),
+        ("app/views/product-items/_blurb.html.erb", "<p class=\"y\"><%= product_item %>:<%= yield %></p>\n", "<%= render \"product-items/blurb\", product_item: \"v\" do %>x<% end %>\n", "<p class=\"y\">v:x</p>"),
+        (
+            "app/views/articles/_wrap.html.erb",
+            "<p class=\"y\"><%= card %>:<%= yield %></p>\n",
+            "<%= render \"articles/wrap\", card: \"v\" do %>x<% end %>\n",
+            "<p class=\"y\">v:x</p>",
+        ),
     ] {
-        let errors = emit_and_run::real_blog()
-            .write("app/views/shared/_blurb.html.erb", partial)
+        let test = format!(
+            "require \"test_helper\"\n\nclass BlockShapeControllerTest < ActionDispatch::IntegrationTest\n  test \"shape\" do\n    get articles_url\n    assert_response :success\n    assert_includes response.body, {want:?}\n  end\nend\n"
+        );
+        emit_and_run::real_blog()
+            .write(path, partial)
             .edit("app/views/articles/index.html.erb", "<% content_for :title, \"Articles\" %>\n", &format!("<% content_for :title, \"Articles\" %>\n{markup}"))
-            .check_errors();
-        assert!(errors.iter().any(|e| e.contains("render with a block not supported") && e.contains(reason)), "{markup}: {errors:?}");
+            .write("test/controllers/block_shape_controller_test.rb", &test)
+            .run_test("test/controllers/block_shape_controller_test.rb")
+            .assert_passes();
     }
 }
 
@@ -149,20 +172,21 @@ fn a_collection_render_of_a_yielding_partial_yields_nothing() {
         .assert_passes();
 }
 
-/// A partial collected `as: :card` that reads `card` and yields: its
-/// record local is `card`, so a block render to it is refused, as for
-/// any partial reading its record local (review, mod.rs:3826).
+/// A partial collected `as: :card` that reads `card` and yields: a block
+/// render passing `card` reads it, and the block runs at the yield.
 #[test]
-fn a_block_render_to_a_partial_reading_its_collection_local_is_refused() {
-    let errors = emit_and_run::real_blog()
+fn a_block_render_to_a_partial_reading_its_collection_local_runs() {
+    let test = "require \"test_helper\"\n\nclass CardControllerTest < ActionDispatch::IntegrationTest\n  test \"card\" do\n    get articles_url\n    assert_response :success\n    assert_match(%r{<b>[^<]+</b>x}, response.body)\n  end\nend\n";
+    emit_and_run::real_blog()
         .write("app/views/articles/_card.html.erb", "<b><%= card.title %></b><%= yield %>\n")
         .edit(
             "app/views/articles/index.html.erb",
             "<% content_for :title, \"Articles\" %>\n",
-            "<% content_for :title, \"Articles\" %>\n<%= render partial: \"articles/card\", collection: @articles, as: :card %>\n<%= render \"articles/card\" do %>x<% end %>\n",
+            "<% content_for :title, \"Articles\" %>\n<%= render partial: \"articles/card\", collection: @articles, as: :card %>\n<%= render \"articles/card\", card: @articles.first do %>x<% end %>\n",
         )
-        .check_errors();
-    assert!(errors.iter().any(|e| e.contains("render with a block not supported") && e.contains("record local")), "{errors:?}");
+        .write("test/controllers/card_controller_test.rb", test)
+        .run_test("test/controllers/card_controller_test.rb")
+        .assert_passes();
 }
 
 /// Two formats of one partial: the HTML one carries the yield, the text
@@ -250,26 +274,4 @@ fn a_partial_reading_its_record_through_local_assigns_keeps_it() {
     }
 }
 
-/// The record local a block render can't also pass is the one the
-/// lowering binds the yielded body to: `product_item` under a hyphenated
-/// `product-items/`, and a collection's `as:` local (review,
-/// diagnostics.rs:194).
-#[test]
-fn a_block_render_passing_the_partials_record_local_is_refused() {
-    for (path, markup) in [
-        (
-            "app/views/product-items/_blurb.html.erb",
-            "<%= render \"product-items/blurb\", product_item: \"v\" do %>x<% end %>\n",
-        ),
-        (
-            "app/views/articles/_wrap.html.erb",
-            "<%= render partial: \"articles/wrap\", collection: @articles, as: :card %>\n<%= render \"articles/wrap\", card: \"v\" do %>x<% end %>\n",
-        ),
-    ] {
-        let errors = emit_and_run::real_blog()
-            .write(path, BLURB)
-            .edit("app/views/articles/index.html.erb", "<% content_for :title, \"Articles\" %>\n", &format!("<% content_for :title, \"Articles\" %>\n{markup}"))
-            .check_errors();
-        assert!(errors.iter().any(|e| e.contains("render with a block not supported") && e.contains("also passes")), "{markup}: {errors:?}");
-    }
-}
+

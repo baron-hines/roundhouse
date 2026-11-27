@@ -128,6 +128,24 @@ pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
     let resolver = app.const_resolver.for_sources(&app.sources);
     let mut diagnostics = Vec::new();
     for factory in &app.library_classes {
+        if let Some(span) = factory.data_constructor_visibility()
+            && app.library_classes.iter().any(|owner| matches!(owner.name.0.as_str(), "Module" | "Class")
+                && owner.methods.iter().any(|method| matches!(method.name.as_str(), "private" | "public" | "protected" | "private_class_method"))) {
+            diagnostics.push(Diagnostic::unsupported(span, None, "Data.define", "Data visibility macro has an app-defined owner")); continue;
+        }
+        if let Some(span) = factory.data_constructor_visibility()
+            && (app.library_classes.iter().any(|class| !class.parent_span.is_synthetic()
+                && class.parent.as_ref().is_none_or(|parent| {
+                    let path = parent.0.as_str().split("::").map(Symbol::from).collect::<Vec<_>>();
+                    resolver.namespace(class.parent_span, &path).is_none()
+                        || resolver.declaration_name(class.parent_span, &path) == Some(factory.name.0.as_str())
+                })) || app.library_classes.iter().flat_map(|class| &class.constants).any(|(_, value)| {
+                    matches!(&*value.node, ExprNode::Const { path } if resolver.declaration_name(value.span, path) == Some(factory.name.0.as_str()))
+                })) {
+            diagnostics.push(Diagnostic::unsupported(span, None, "Data.define",
+                "constructor visibility with Data subclasses requires a direct superclass namespace, not an alias or expression; subclasses are not modeled"));
+            continue;
+        }
         if factory.data_define().is_some() {
             for (_, value) in &factory.constants {
                 if let ExprNode::Send { recv: Some(recv), method, .. } = &*value.node

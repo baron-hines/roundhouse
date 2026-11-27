@@ -9,6 +9,7 @@ module ActionController
   def self.header_value_ok?: (String? v) -> bool
   def self.header_control?: (String c) -> bool
   def self.sanitize_location: (String path) -> String
+  def self.first_requested_format: (Array[String] accepted, Array[String] order) -> String
   def self.strip_leading_controls: (String s) -> String
   def self.strip_trailing_controls: (String s) -> String
   def self.location_host: (String url) -> String
@@ -140,6 +141,20 @@ module ActionController
     def query_string=: (String) -> String
     def accepts_any_format: () -> bool
     def accepts_any_format=: (bool) -> bool
+    def accept_header: () -> String
+    def accept_header=: (String value) -> String
+    def explicit_format: () -> String
+    def explicit_format=: (String) -> String
+    def explicit_format_registered: () -> bool
+    def explicit_format_registered=: (bool) -> bool
+    def negotiate_format: (Array[String] order) -> String
+    def negotiate_template_format: (Array[String] order) -> String
+    def negotiate_in: (Array[String] order, bool template) -> String
+    def accepted_format_names: () -> Array[String]
+    def accepted_format_names=: (Array[String]) -> Array[String]
+    def unacceptable_requested_json?: () -> bool
+    def unacceptable_body: () -> String
+    def unacceptable_content_type: () -> String
     def vary_on_accept: () -> bool
     def vary_on_accept=: (bool) -> bool
     # Rails' `_set_vary_header` (render, send_data); see the .rb.
@@ -148,6 +163,10 @@ module ActionController
     def path_parameters=: (Hash[String, String]) -> Hash[String, String]
     @headers: ActionController::HeaderStore
     @content_type_explicit: bool
+    @accept_header: String
+    @accepted_format_names: Array[String]
+    @explicit_format: String
+    @explicit_format_registered: bool
     @head_response: bool
     @cache_control: ActionController::CacheControlStore
     def action_name: () -> String
@@ -241,7 +260,7 @@ module ActionController
     def request_host_for_redirect: () -> String
     def default_url_options: () -> Hash[Symbol, String]
     def request_protocol_for_url: () -> String
-    def url_from_path: (String path) -> String
+    def url_from_path: (String path, ?String? call_protocol, ?(Integer | String)? call_port, ?bool call_port_given) -> String
 
     # Strict targets use Symbols; Ruby/Spinel widens resolve_status.
     def resolve_status: (Symbol s) -> Integer

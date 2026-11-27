@@ -119,7 +119,7 @@ class ArticleCoverTest < ActiveSupport::TestCase
   # The key is derived from the clock; a stopped one (a test that froze
   # time while the fixtures reload) must not make two rows' keys equal.
   test "a stopped clock still gives each row its own key" do
-    ActiveSupport.freeze(1_700_000_000)
+    ActiveSupport.freeze_clock(1_700_000_000)
     SchemaSetup.reset!
     assert_equal 3, ActiveStorage::Blob.count
   ensure

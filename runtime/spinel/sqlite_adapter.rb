@@ -14,6 +14,8 @@
 # placeholder bind params — the FFI shim can't construct SQLITE_TRANSIENT
 # for bind_text, so the shared contract is "inline escaped values".
 module SqliteAdapter
+  DML_QUERY = /\A(?:[(\s]|--.*\n|\/\*(?:[^*]|\*[^\/])*\*\/)*(?:insert|update|delete|replace)\b/i
+
   # Quote one schema-validated SQL identifier (not a value); SQLite
   # doubles embedded quotes and accepts this SQL-standard spelling.
   def self.quote_column_name(name)
@@ -21,7 +23,37 @@ module SqliteAdapter
   end
 
   def self.configure(database_path)
+    create_parent_directory(database_path)
     Db.configure(database_path)
+  end
+
+  # Rails' SQLite3Adapter creates the database file's directory before
+  # opening it (`FileUtils.mkdir_p(File.dirname(database))`), so a
+  # database.yml path such as `storage/db/development.sqlite3` opens on
+  # a fresh checkout. `:memory:` and `file:` URIs name no directory.
+  # One segment at a time: the Spinel subset has `Dir.mkdir`, not
+  # `FileUtils`.
+  def self.create_parent_directory(database_path)
+    return nil if database_path == "" || database_path == ":memory:" || database_path.start_with?("file:")
+    dir = File.dirname(database_path)
+    return nil if Dir.exist?(dir)
+    built = dir.start_with?("/") ? "/" : ""
+    dir.split("/").each do |seg|
+      next if seg.length == 0
+      built = (built == "" || built == "/") ? built + seg : built + "/" + seg
+      mkdir_parent(built) unless Dir.exist?(built)
+    end
+    nil
+  end
+
+  # Another process may create the same directory between the check and the mkdir.
+  def self.mkdir_parent(path)
+    begin
+      Dir.mkdir(path)
+    rescue Errno::EEXIST
+      raise unless Dir.exist?(path)
+    end
+    nil
   end
 
   # Writes run with their values written in: a Relation's bind marks
@@ -118,7 +150,8 @@ module SqliteAdapter
   # leave it checked out on the connection until the lease ends — or,
   # outside `Db.with_connection`, until `Db.close`.
   def self.each_row(sql)
-    stmt = Db.prepare(sql)
+    # A write keeps its returned rows and invalidates held readers.
+    stmt = sql.match?(DML_QUERY) ? Db.exec_returning(ActiveRecord::Relation.inline_sql(sql)) : Db.prepare(sql)
     begin
       ncols = Db.column_count(stmt)
       # Column names can't change between rows — resolve them once, not

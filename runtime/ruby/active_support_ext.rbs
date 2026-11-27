@@ -37,13 +37,15 @@ module ActiveSupport
   def self.errors_to_hash: (Array[ActiveRecord::ErrorDetail] details) -> Hash[Symbol, Array[String]]
   def self.errors_messages: (Array[ActiveRecord::ErrorDetail] details) -> Hash[Symbol, Array[String]]
   def self.errors_attribute_names: (Array[ActiveRecord::ErrorDetail] details) -> Array[Symbol]
-  def self.errors_delete: (Array[String] errors, Array[ActiveRecord::ErrorDetail] details, String attribute) -> Array[String]?
+  def self.errors_delete: (Array[String] errors, Array[ActiveRecord::ErrorDetail] details, String attribute, Bool type_symbolic, String? type_kind) -> Array[String]?
   def self.errors_details: (Array[ActiveRecord::ErrorDetail] details) -> Hash[Symbol, Array[ActiveRecord::ErrorDetail]]
+  def self.errors_group_by_attribute: (Array[ActiveRecord::ErrorDetail] details) -> Hash[Symbol, Array[ActiveRecord::ErrorDetail]]
   def self.errors_import: (Array[String] errors, Array[ActiveRecord::ErrorDetail] details, ActiveRecord::ErrorDetail error, String? attribute, Hash[String, String] names, String before, String between, String after) -> Array[ActiveRecord::ErrorDetail]
   def self.error_detail: (String name, String? kind, String? message, Hash[String, String] options, Hash[String, String] site, Hash[String, String] names, Hash[String, String] overrides, String before, String between, String after) -> ActiveRecord::ErrorDetail
   def self.error_template: (Hash[String, String] table, String key, String? count) -> String?
   def self.interpolate: (String template, Hash[String, String] values) -> String
   def self.errors_merge: (Array[String] errors, Array[ActiveRecord::ErrorDetail] details, Array[ActiveRecord::ErrorDetail] others, Hash[String, String] names, String before, String between, String after) -> Array[ActiveRecord::ErrorDetail]
+  def self.errors_copy: (Array[String] errors, Array[ActiveRecord::ErrorDetail] details, Array[ActiveRecord::ErrorDetail] others, Hash[String, String] names, String before, String between, String after) -> Array[ActiveRecord::ErrorDetail]
 
   def self.deprecation_line: (String line) -> nil
 
@@ -71,10 +73,26 @@ module ActiveSupport
     end
   end
   class KeyGenerator
+    @sha1: bool
     @secret: String
     @iterations: Integer
     def initialize: (String secret, ?Hash[Symbol, untyped] options) -> void
     def generate_key: (String salt, ?Integer key_size) -> String
+  end
+  class MessageEncryptor
+    def self.key_len: (?String cipher) -> Integer
+  end
+  module Messages
+    class RotationConfiguration
+      self.@shared: RotationConfiguration
+      @signed: Array[String]
+      @encrypted: Array[String]
+      def self.shared: () -> RotationConfiguration
+      def initialize: () -> void
+      def signed: () -> Array[String]
+      def encrypted: () -> Array[String]
+      def rotate: (Symbol kind, String secret) -> nil
+    end
   end
   class CachingKeyGenerator
     @key_generator: KeyGenerator
@@ -160,6 +178,10 @@ module ActiveSupport
   def self.noon: (Time t) -> Time
   def self.beginning_of_week: (Time t, ?Integer start) -> Time
   def self.end_of_week: (Time t, ?Integer start) -> Time
+  def self.loose_decimal_text: (String text) -> String
+  def self.loose_digits: (String text, Integer at) -> String
+  def self.loose_digits_end: (String text, Integer at) -> Integer
+  def self.loose_to_d: (String | Integer | Float | BigDecimal | Roundhouse::ParamValue | nil value) -> BigDecimal
   def self.float_decimal_text: (Float f) -> String
   def self.next_week: (Time t) -> Time
   def self.prev_week: (Time t) -> Time

@@ -49,6 +49,7 @@ const DETAIL: &str = "mixing a module into one live object needs a per-object me
 
 pub fn apply_object_extend_stub(app: &mut App) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
+    mark_hook_bases(app);
     lift_fresh_builtin_extends(app);
     super::for_each_hook_body(app, &mut |e| stub_sites(e, &mut diags));
     for view in &mut app.views {
@@ -99,6 +100,36 @@ pub fn apply_object_extend_stub(app: &mut App) -> Vec<Diagnostic> {
     diags
 }
 
+/// `def self.extended(base); base.extend(Api); end` (version_gem's Basic): Ruby hands the hook the class or module
+/// that extends it, so its parameter's `extend` is that class's, as `Foo.extend Api` is.
+fn mark_hook_bases(app: &mut App) {
+    fn mark(e: &mut Expr, base: &Symbol) {
+        if let ExprNode::Send { recv: Some(recv), method, .. } = &mut *e.node
+            && method.as_str() == "extend"
+            && var_is(recv, base)
+        {
+            recv.decisions |= crate::expr::MIXIN_HOOK_BASE;
+        }
+        e.node.for_each_child_mut(&mut |c| mark(c, base));
+    }
+    for lc in &mut app.library_classes {
+        if !lc.is_module {
+            continue;
+        }
+        for m in &mut lc.methods {
+            // (not `included`: ingest carries an included hook's `base.extend(ClassMethods)` as the includer's class methods)
+            if m.receiver != MethodReceiver::Class
+                || m.name.as_str() != "extended"
+                || m.params.len() != 1
+            {
+                continue;
+            }
+            let base = m.params[0].name.clone();
+            mark(&mut m.body, &base);
+        }
+    }
+}
+
 /// `@line_ends = []` then `@line_ends.extend RangeSearch` (parslet's
 /// LineCache, on every parse): the receiver is a fresh Array, not the
 /// `.new` of a class Spinel can subclass. A fresh empty Array or Hash
@@ -138,6 +169,7 @@ fn lift_fresh_builtin_extends(app: &mut App) {
             parent_span: site,
             includes: vec![ClassId(Symbol::from(module.as_str()))],
             include_spans: vec![site],
+            include_statements: Vec::new(),
             methods: Vec::new(),
             nullable_columns: Vec::new(),
             origin: None,
@@ -480,6 +512,7 @@ fn hoist_anonymous_modules(
             parent_span: Span::synthetic(),
             includes: Vec::new(),
             include_spans: Vec::new(),
+            include_statements: Vec::new(),
             methods: defs,
             nullable_columns: Vec::new(),
             origin: None,
@@ -761,7 +794,7 @@ fn instance_extend(expr: &Expr) -> Option<(&Expr, ())> {
     if method.as_str() != "extend" {
         return None;
     }
-    if matches!(&*recv.node, ExprNode::Const { .. } | ExprNode::SelfRef) {
+    if matches!(&*recv.node, ExprNode::Const { .. } | ExprNode::SelfRef) || recv.decisions & crate::expr::MIXIN_HOOK_BASE != 0 {
         return None;
     }
     Some((recv, ()))

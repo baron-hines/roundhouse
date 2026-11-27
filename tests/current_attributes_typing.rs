@@ -126,13 +126,14 @@ fn a_read_through_the_forwarder_answers_the_model() {
 
 /// Ablation for reason 2: `reset` must not nil the slot, or
 /// `self.instance` answers `Current | Nil` and nothing downstream types.
+/// As in Rails, it keeps the instance and reassigns the attributes.
 #[test]
-fn reset_replaces_the_instance_rather_than_nilling_it() {
+fn reset_keeps_the_instance_rather_than_nilling_it() {
     let src = emitted("app/models/current.rb");
     assert!(
-        src.contains("Thread.current[:__current_attrs_Current] = Current.new")
-            && !src.contains("Thread.current[:__current_attrs_Current] = nil"),
-        "resetting a CurrentAttributes means a fresh instance:\n{src}"
+        !src.contains("Thread.current[:__current_attrs_Current] = nil")
+            && src.contains("def reset\n    __reset_attributes\n  end"),
+        "resetting a CurrentAttributes reassigns its attributes on the same instance:\n{src}"
     );
 }
 

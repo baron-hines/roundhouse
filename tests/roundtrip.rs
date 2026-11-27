@@ -39,6 +39,7 @@ fn tiny_blog_round_trips() {
                     array: false,
                     array_stored: false,
                     unset_until_assigned: false,
+                    collated: false,
                 },
                 Column {
                     name: Symbol::from("title"),
@@ -54,6 +55,7 @@ fn tiny_blog_round_trips() {
                     array: false,
                     array_stored: false,
                     unset_until_assigned: false,
+                    collated: false,
                 },
             ],
             indexes: vec![],
@@ -130,6 +132,7 @@ fn tiny_blog_round_trips() {
         }],
         layout: Default::default(),
         sibling_classes: Vec::new(),
+        csp_header: false,
     };
 
     let routes = RouteTable {
@@ -146,6 +149,7 @@ fn tiny_blog_round_trips() {
         direct_helpers: vec![],
         redirects: vec![],
         diagnostics: vec![],
+        url_protocols: vec![],
     };
 
     let app = App {
@@ -159,6 +163,7 @@ fn tiny_blog_round_trips() {
         i18n_runtime_sites: Default::default(),
         i18n_table_sites: Default::default(),
         inferred_method_params: Default::default(),
+        relation_params: Default::default(),
         models: vec![post_model],
         library_classes: vec![],
         native_library_keywords: false,
@@ -173,6 +178,7 @@ fn tiny_blog_round_trips() {
         gem_load_statements: Vec::new(),
         gem_loaded_files: Default::default(),
         initializer_response_headers: Vec::new(),
+        runs_after_initialize: false,
         collection_cache_store: None,
         app_requires: Vec::new(),
         sql_functions: Vec::new(),
@@ -180,6 +186,8 @@ fn tiny_blog_round_trips() {
         databases: Vec::new(),
         model_databases: Default::default(),
         database_refusals: Vec::new(),
+        current_attribute_refusals: Vec::new(),
+        database_routes: None,
         ingest_drops: Vec::new(),
         library_class_files: Vec::new(),
         rbs_includes: Default::default(),
@@ -219,10 +227,14 @@ fn tiny_blog_round_trips() {
         global_id_locate_models: std::collections::BTreeSet::new(),
         global_id_locate_signed_models: std::collections::BTreeSet::new(),
         unreachable_views: std::collections::BTreeSet::new(),
+        pagy: Default::default(),
+        yield_specialized: Vec::new(),
+        yield_originals: std::collections::BTreeSet::new(),
         helper_diagnostics: None,
         unknown_association_targets: Vec::new(),
         helper_modules: Default::default(),
         job_plans: Vec::new(),
+        native_plans: Vec::new(),
         queue_adapter: None,
         sidekiq_redis: Default::default(),
         sidekiq_worker: Default::default(),
@@ -260,6 +272,8 @@ fn tiny_blog_round_trips() {
         concern_class_side_spans: roundhouse::det::HashSet::default(),
         concern_model_items: roundhouse::det::HashMap::default(),
         concern_guarded_items: roundhouse::det::HashMap::default(),
+        concern_class_attr_defaults: roundhouse::det::HashMap::default(),
+        concern_prepended_items: roundhouse::det::HashMap::default(),
         concern_included_redefs: roundhouse::det::HashMap::default(),
         validates_with_guards: Vec::new(),
         render_edges: roundhouse::det::HashMap::default(),
@@ -267,6 +281,7 @@ fn tiny_blog_round_trips() {
         controller_resolutions: roundhouse::det::HashMap::default(),
         sources: vec![],
         wrap_parameters_by_default: false,
+        hidden_field_autocomplete: false,
         active_job_retry_jitter: 0.0,
         ports_active_model_validator: false,
         each_validator_calls: Vec::new(),

@@ -46,6 +46,15 @@ module ActionView
       SafeString.new(value.to_s)
     end
 
+    # `safe_join` answers a SafeBuffer in Rails, so an `h(...)` of what it
+    # joined (a helper's, or a value handed on) leaves the markup alone.
+    # The parts are joined as the shared body joins them.
+    # Not each part escaped unless html_safe, as Rails does: an app helper's markup reaches here unmarked (the emit
+    # drops its `.html_safe`), and would be escaped.
+    def self.safe_join(parts, separator = "")
+      SafeString.new(parts.join(separator))
+    end
+
     # Rails' `content_for?` is `present?`-based: a slot holding only
     # whitespace counts as UNSET. The block form always deposits the
     # template's newlines, so a guard-suppressed `content_for :subnav
@@ -100,6 +109,18 @@ module ActionText
     # answers `@html`; this makes the stdlib encoder ask.
     def to_json(*args)
       as_json.to_json(*args)
+    end
+  end
+end
+
+module ActionView
+  class Base
+    # Rails' `render(renderable)` from a view: the object renders itself on this view (a component's `render_in`).
+    # Not a partial or a template by name, which no view context here looks up.
+    def render(options = {}, args = {}, &block)
+      raise NotImplementedError, "roundhouse: render from a view context renders only an object with render_in" unless options.respond_to?(:render_in)
+
+      options.render_in(self, &block)
     end
   end
 end

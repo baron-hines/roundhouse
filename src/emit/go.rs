@@ -708,6 +708,16 @@ fn emit_v2_test_files(app: &App) -> Vec<EmittedFile> {
     }
     if !app.test_modules.is_empty() {
         for tm in &app.test_modules {
+            // The Go test emitter runs `setup` and the tests only: an `after` hook's teardown would be
+            // dropped, and an example whose cleanup fails would pass.
+            if let Some(teardown) = tm.helpers.iter().find(|h| h.name.as_str() == "teardown") {
+                crate::emit::diagnostics::push(crate::diagnostic::Diagnostic::unsupported(
+                    teardown.name_span,
+                    Some(crate::ident::Symbol::from("go")),
+                    "test teardown".to_string(),
+                    format!("`{}`'s teardown (an RSpec `after` hook, or `def teardown`) is not run by the Go test emitter", tm.name.0.as_str()),
+                ));
+            }
             let f = spec::emit_go_tests(tm, app);
             out.push(rewrite_test_file_to_v2(f, &model_names));
         }

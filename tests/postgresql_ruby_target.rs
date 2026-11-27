@@ -53,6 +53,58 @@ fn a_postgresql_primary_ships_the_pg_tree() {
     assert!(!article.contains("sqlite_sequence"), "{article}");
 }
 
+/// Fixtures insert explicit ids, so on PostgreSQL the loader moves each
+/// keyed table's id sequence past them, as Rails' `reset_pk_sequence!`
+/// does after it loads fixtures: a create in a test then takes a new id
+/// (#2164). SQLite's rowid needs nothing.
+/// The sequence is set to the largest id, marked called so the next
+/// value is past it, rather than to `MAX(id) + 1`, which overflows a
+/// bigint key at its largest value. With no positive id (an empty table,
+/// or fixtures keyed 0 or below) it is set to 1, uncalled: the sequence's
+/// minimum, below which `setval` raises.
+#[test]
+fn postgresql_fixtures_move_the_id_sequence_past_their_rows() {
+    let (emitted, errors) = postgresql_blog().emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let comments = read(&emitted, "test/fixtures/comments.rb");
+    assert!(
+        comments.contains("setval(pg_get_serial_sequence('\\\"comments\\\"', 'id'), GREATEST(COALESCE(MAX(\\\"id\\\"), 0), 1), COALESCE(MAX(\\\"id\\\"), 0) >= 1) FROM \\\"comments\\\""),
+        "{comments}"
+    );
+    let (emitted, errors) = emit_and_run::real_blog().emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let comments = read(&emitted, "test/fixtures/comments.rb");
+    assert!(!comments.contains("setval"), "{comments}");
+}
+
+/// Fixtures keyed below zero load on PostgreSQL, and a create after them
+/// takes the sequence's first value. PostgreSQL 18 refuses `setval`
+/// below a sequence's minimum ("setval: value 0 is out of bounds for
+/// sequence ... (1..9223372036854775807)"). Not keyed 0: the insert
+/// takes a 0 key as unset and lets the database assign one.
+#[test]
+fn postgresql_fixtures_keyed_below_zero_load() {
+    let Some(db) = pg_test_url::pg_test_db("postgresql_ruby_target_nonpositive_ids") else { return };
+    postgresql_blog()
+        .edit("test/fixtures/comments.yml", "one:\n  article: one\n", "one:\n  id: -1\n  article: one\n")
+        .edit("test/fixtures/comments.yml", "two:\n  article: two\n", "two:\n  id: -2\n  article: two\n")
+        .write("test/models/nonpositive_id_test.rb", NONPOSITIVE_ID_TEST)
+        .run_test_env("test/models/nonpositive_id_test.rb", &[("DATABASE_URL", db.url.as_str())])
+        .assert_passes();
+}
+
+const NONPOSITIVE_ID_TEST: &str = r#"require "test_helper"
+
+class NonpositiveIdTest < ActiveSupport::TestCase
+  test "fixtures keyed below zero, then a create" do
+    assert_equal(-1, comments(:one).id)
+    assert_equal(-2, comments(:two).id)
+    comment = Comment.create!(article: articles(:one), commenter: "Carol", body: "A new comment")
+    assert_equal 1, comment.id
+  end
+end
+"#;
+
 #[test]
 fn a_sqlite_primary_keeps_the_sqlite_tree() {
     let (emitted, errors) = emit_and_run::real_blog().emit(BuildTarget::Ruby);
@@ -122,4 +174,269 @@ fn sqlite_functions_on_a_postgresql_primary_are_refused() {
         .write("config/initializers/sqlite.rb", "conn.create_function(\"regexp\", 2) do |fn, pattern, expr|\n  fn.result = 1\nend\n")
         .emit(BuildTarget::Ruby);
     assert!(errors.iter().any(|e| e.contains("SQLite functions (regexp)") && e.contains("postgresql")), "{errors:#?}");
+}
+
+/// A hash condition's value against an integer column, cast as Rails
+/// casts it before it writes SQL: `find_by(id: "not-an-export")` and an
+/// id past the column's range find nothing, `"7tail"` is 7, and
+/// `where.not` and lists keep Rails' answers. Sent as given, the String
+/// reaches the database, where PostgreSQL rejects it (SQLSTATE 22P02 or
+/// 22003) and SQLite compares it loosely.
+const INTEGER_QUERIES: &str = include_str!("support/integer_query_values.rb");
+
+const INTEGER_QUERY_SCHEMA: &str = "ActiveRecord::Schema.define(version: 1) do\n  create_table \"exports\", force: :cascade do |t|\n    t.bigint \"user_id\"\n    t.integer \"number\"\n    t.string \"label\"\n  end\nend\n";
+
+/// What Rails 8.1.4 answers, on SQLite and on PostgreSQL alike, so two
+/// identical wrong answers still fail.
+const INTEGER_QUERY_ROWS: &[&str] = &[
+    "find_by not-an-export: nil",
+    "find_by huge: nil",
+    "find_by 1: 1",
+    "find_by 1abc: 1",
+    "exists? abc, 1abc: false true",
+    "\"abc\": [] not []",
+    "\"\": [] not []",
+    "\" \\t\": [] not []",
+    "\"+x\": [] not []",
+    "\"_7\": [] not []",
+    "\"7tail\": [1] not [3]",
+    "\"7.9\": [1] not [3]",
+    "\"1_0\": [] not [1, 3]",
+    "\"0junk\": [3] not [1]",
+    "\"99999999999999999999\": [] not [1, 2, 3]",
+    "\"-99999999999999999999\": [] not [1, 2, 3]",
+    "7.9: [1] not [3]",
+    "true: [] not [1, 3]",
+    "false: [3] not [1]",
+    ":\"7\": [] not []",
+    "1970-01-01 00:00:00 UTC: [3] not [1]",
+    "1970-01-01 00:00:07 UTC: [1] not [3]",
+    "nil: [2] not [1, 3]",
+    "[\"7\", \"x\"]: [1] not [3]",
+    "[\"x\", nil]: [2] not []",
+    "[\"x\", \"y\"]: [] not []",
+    "[\"99999999999999999999\"]: [] not [1, 2, 3]",
+    "[\"99999999999999999999\", nil]: [2] not [1, 3]",
+    "[\"99999999999999999999\", \"7\"]: [1] not [3]",
+    "[\"99999999999999999999\", \"99999999999999999999\"]: [] not []",
+    "[\"x\", 0..0]: [3] not []",
+    "[]: [] not [1, 2, 3]",
+    "[nil, \"7tail\", 0..0]: [1, 2, 3] not []",
+    "[:\"7\", \"7\"]: [1] not [3]",
+    "qualified: [1] []",
+    "string column: []",
+];
+
+/// Past `number`'s 4 bytes, which only PostgreSQL's `integer` has
+/// (Rails' SQLite integer is 8 bytes): under `where.not` such a value
+/// keeps every row, NULLs included. Run after INTEGER_QUERIES, on its rows.
+const POSTGRESQL_INTEGER_QUERIES: &str = r##"
+lines = []
+["2147483647", "2147483648", "-2147483648", "-2147483649", 2147483648, 1e30, Float::NAN].each do |value|
+  lines << "#{value.inspect}: #{ids(Export.where(number: value)).inspect} not #{ids(Export.where.not(number: value)).inspect}"
+end
+lines << "user_id 2147483648: #{ids(Export.where(user_id: "2147483648")).inspect} not #{ids(Export.where.not(user_id: "2147483648")).inspect}"
+puts lines
+"##;
+
+const POSTGRESQL_INTEGER_QUERY_ROWS: &[&str] = &[
+    "\"2147483647\": [] not [1, 3]",
+    "\"2147483648\": [] not [1, 2, 3]",
+    "\"-2147483648\": [] not [1, 3]",
+    "\"-2147483649\": [] not [1, 2, 3]",
+    "2147483648: [] not [1, 2, 3]",
+    "1.0e+30: [] not [1, 2, 3]",
+    "NaN: [] not []",
+    "user_id 2147483648: [] not [1, 2, 3]",
+];
+
+fn integer_query_app(database_yml: &str) -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n")
+        .write("app/models/export.rb", "class Export < ApplicationRecord\nend\n")
+        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n")
+        .write("config/routes.rb", "Rails.application.routes.draw do\nend\n")
+        .write("db/schema.rb", INTEGER_QUERY_SCHEMA)
+        .write("config/database.yml", database_yml)
+}
+
+fn lines(stdout: &str) -> Vec<&str> {
+    stdout.lines().collect()
+}
+
+/// The same queries on ActiveRecord 8.1.4, over SQLite or (with a URL
+/// and a schema of its own) PostgreSQL. `None` when this Ruby has no
+/// Rails 8.1.4 or no driver for it.
+fn rails_answers(queries: &str, postgresql: Option<(&str, &str)>) -> Option<String> {
+    let oracle = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/rails_oracle.rb");
+    let (driver, connect) = match postgresql {
+        Some((url, schema)) => (
+            "pg: \">= 1.1\"",
+            format!(
+                "ActiveRecord::Base.establish_connection(url: {url:?})\n\
+                 ActiveRecord::Base.connection.execute(\"CREATE SCHEMA {schema}\")\n\
+                 at_exit {{ ActiveRecord::Base.connection.execute(\"DROP SCHEMA {schema} CASCADE\") }}\n\
+                 ActiveRecord::Base.connection.schema_search_path = {schema:?}\n"
+            ),
+        ),
+        None => ("sqlite3: \">= 2.9\"", "ActiveRecord::Base.establish_connection(adapter: \"sqlite3\", database: \":memory:\")\n".to_string()),
+    };
+    let program = format!(
+        "require {oracle:?}\n\
+         unless RailsOracle.available?(\"activerecord\", {driver})\n  warn \"skipped the Rails control: #{{RailsOracle.label}} or its driver is not installed\"\n  exit 77\nend\n\
+         RailsOracle.activate(\"activerecord\", {driver})\nrequire \"active_record\"\n{connect}\
+         ActiveRecord::Schema.verbose = false\n{INTEGER_QUERY_SCHEMA}class Export < ActiveRecord::Base\nend\n{queries}"
+    );
+    let output = emit_and_run::ruby().args(["-e", &program]).output().expect("ruby");
+    if output.status.code() == Some(77) {
+        eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+        return None;
+    }
+    assert!(output.status.success(), "Rails control failed:\n{}", String::from_utf8_lossy(&output.stderr));
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[test]
+fn integer_query_values_cast_as_rails_on_sqlite() {
+    let run = integer_query_app("test:\n  adapter: sqlite3\n  database: \":memory:\"\n").run_ruby(INTEGER_QUERIES);
+    run.assert_passes();
+    assert_eq!(lines(&run.stdout), INTEGER_QUERY_ROWS, "emitted, SQLite");
+    if let Some(rails) = rails_answers(INTEGER_QUERIES, None) {
+        assert_eq!(lines(&rails), INTEGER_QUERY_ROWS, "Rails, SQLite");
+    }
+}
+
+#[test]
+fn integer_query_values_cast_as_rails_on_postgresql() {
+    let Some(db) = pg_test_url::pg_test_db("integer_query_values") else { return };
+    let on_server = |sql: String| {
+        let output = std::process::Command::new("ruby")
+            .args(["-rpg", "-e", "PG.connect(ARGV[0]).exec(ARGV[1])", &db.url, &sql])
+            .output()
+            .expect("ruby with the pg gem");
+        assert!(output.status.success(), "{sql}: {}", String::from_utf8_lossy(&output.stderr));
+    };
+    let options = format!("-c search_path={}", db.schema);
+    let script = format!("{INTEGER_QUERIES}{POSTGRESQL_INTEGER_QUERIES}");
+    on_server(format!("CREATE SCHEMA {}", db.schema));
+    let run = integer_query_app(POSTGRESQL_DATABASE_YML)
+        .run_ruby_env(&script, &[("DATABASE_URL", db.url.as_str()), ("PGOPTIONS", options.as_str())]);
+    on_server(format!("DROP SCHEMA {} CASCADE", db.schema));
+    run.assert_passes();
+    let expected: Vec<&str> = INTEGER_QUERY_ROWS.iter().chain(POSTGRESQL_INTEGER_QUERY_ROWS).copied().collect();
+    assert_eq!(lines(&run.stdout), expected, "emitted, PostgreSQL");
+    let rails_schema = format!("{}_rails", db.schema);
+    if let Some(rails) = rails_answers(&script, Some((&db.url, &rails_schema))) {
+        assert_eq!(lines(&rails), expected, "Rails, PostgreSQL");
+    }
+}
+
+/// The width each value is range-checked against is the one Rails'
+/// adapter gives the column: PostgreSQL's `integer` is 4 bytes and its
+/// `bigint` 8, and Rails' SQLite integer is 8 bytes.
+#[test]
+fn integer_query_limits_follow_the_database() {
+    for (database_yml, limits) in [
+        (POSTGRESQL_DATABASE_YML, "{ id: 8, user_id: 8, number: 4 }"),
+        ("test:\n  adapter: sqlite3\n  database: \":memory:\"\n", "{ id: 8, user_id: 8, number: 8 }"),
+    ] {
+        let (emitted, errors) = integer_query_app(database_yml).emit(BuildTarget::Ruby);
+        assert!(errors.is_empty(), "{errors:#?}");
+        let model = read(&emitted, "app/models/export.rb");
+        assert!(model.contains(&format!("def self.schema_integer_query_limits\n    {limits}\n  end")), "{model}");
+    }
+}
+
+/// A generated column whose expression is PostgreSQL's own SQL (maybe's
+/// `balances.end_balance`, a `numeric` sum with `::numeric` casts, and
+/// `accounts.classification`, a `CASE … = ANY (ARRAY[…])`), which the
+/// grammar SQLite and PostgreSQL read alike can't read: the tree that runs
+/// on PostgreSQL carries it as written, with the column's `numeric(p,s)`,
+/// and PostgreSQL computes the stored values. A target that runs SQLite
+/// refuses the schema rather than drop the column.
+const GENERATED: &str = concat!(
+    "    t.decimal \"price\", precision: 10, scale: 2\n",
+    "    t.virtual \"doubled\", type: :decimal, precision: 10, scale: 2, as: \"((price * (2)::numeric) + 0.005)\", stored: true\n",
+    "    t.virtual \"shelf\", type: :string, as: \"\\nCASE\\n    WHEN ((title)::text = ANY ((ARRAY['Alpha'::character varying, 'Beta'::character varying])::text[])) THEN 'listed'::text\\n    ELSE 'other'::text\\nEND\", stored: true\n",
+);
+
+const GENERATED_TEST: &str = r#"require "test_helper"
+
+class GeneratedColumnTest < ActiveSupport::TestCase
+  test "postgresql computes the stored generated columns" do
+    listed = Article.create!(title: "Alpha", body: "A body long enough", price: "1.25")
+    other = Article.create!(title: "Gamma", body: "A body long enough", price: "3.10")
+    listed.reload
+    other.reload
+    assert_equal 251, (listed.doubled * 100).round
+    # numeric(10,2) rounds 6.205 half away from zero.
+    assert_equal 621, (other.doubled * 100).round
+    assert_equal "listed", listed.shelf
+    assert_equal "other", other.shelf
+  end
+end
+"#;
+
+fn generated_blog() -> emit_and_run::Overlay {
+    let articles = "  create_table \"articles\", force: :cascade do |t|\n";
+    postgresql_blog().edit("db/schema.rb", articles, &format!("{articles}{GENERATED}"))
+}
+
+#[test]
+fn a_postgresql_generated_expression_is_carried_as_written() {
+    let (emitted, errors) = generated_blog().emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let schema = read(&emitted, "config/schema.rb");
+    assert!(schema.contains("numeric(10,2) GENERATED ALWAYS AS (((price * (2)::numeric) + 0.005)) STORED"), "{schema}");
+    assert!(schema.contains("'listed'::text"), "{schema}");
+    assert!(schema.contains("\\\"price\\\" numeric(10,2)"), "{schema}");
+    // JRuby runs SQLite and persists generated columns, so the schema itself is what it refuses.
+    let Err(refusal) = std::panic::catch_unwind(|| generated_blog().emit(BuildTarget::Jruby)) else { panic!("JRuby emits the schema") };
+    let message = refusal.downcast_ref::<String>().cloned().unwrap_or_default();
+    assert!(message.contains("articles.doubled") && message.contains("own database's SQL"), "{message}");
+}
+
+#[test]
+fn a_postgresql_generated_expression_is_computed_on_postgresql() {
+    let Some(db) = pg_test_url::pg_test_db("postgresql_ruby_target_generated") else { return };
+    generated_blog()
+        // Not the blog's fixtures: their explicit ids leave the key's sequence behind (docs/guide/spinel.md, PostgreSQL).
+        .write("test/fixtures/comments.yml", "")
+        .write("test/fixtures/articles.yml", "")
+        .write("test/models/generated_column_test.rb", GENERATED_TEST)
+        .run_test_env("test/models/generated_column_test.rb", &[("DATABASE_URL", db.url.as_str())])
+        .assert_passes();
+}
+
+/// A later migration on the table revalidates it under the grammar that
+/// kept the expression, and a precision the schema can't hold is refused
+/// rather than dropped.
+#[test]
+fn a_native_generated_column_survives_a_migration_and_an_unheld_precision_is_refused() {
+    use roundhouse::ingest::{ingest_migration_with_generated_expression_dialect, ingest_schema_with_generated_expression_dialect};
+    use roundhouse::schema::generated::GeneratedExpressionDialect::OtherDatabase;
+    let schema_rb = |columns: &str| format!("ActiveRecord::Schema[8.1].define(version: 1) do\n  create_table \"articles\", force: :cascade do |t|\n    t.string \"title\"\n{columns}  end\nend\n");
+    let mut schema = roundhouse::ingest::prism::scope(|| ingest_schema_with_generated_expression_dialect(schema_rb(GENERATED).as_bytes(), "db/schema.rb", OtherDatabase)).0.unwrap();
+    let migration = "class AddNote < ActiveRecord::Migration[8.1]\n  def change\n    add_column :articles, :note, :string\n  end\nend\n";
+    roundhouse::ingest::prism::scope(|| ingest_migration_with_generated_expression_dialect(migration.as_bytes(), "db/migrate/20260101000000_add_note.rb", &mut schema, OtherDatabase)).0.unwrap();
+    let articles = &schema.tables[&roundhouse::Symbol::from("articles")];
+    assert!(articles.columns.iter().any(|c| c.name.as_str() == "note"));
+    assert!(articles.columns.iter().find(|c| c.name.as_str() == "doubled").and_then(|c| c.generated.as_ref()).is_some_and(|g| g.native));
+    let add = "class AddTripled < ActiveRecord::Migration[8.1]\n  def change\n    add_column :articles, :tripled, :decimal, precision: 10, scale: 2, as: \"(price * (3)::numeric)\", stored: true\n  end\nend\n";
+    roundhouse::ingest::prism::scope(|| ingest_migration_with_generated_expression_dialect(add.as_bytes(), "db/migrate/20260102000000_add_tripled.rb", &mut schema, OtherDatabase)).0.unwrap();
+    let articles = &schema.tables[&roundhouse::Symbol::from("articles")];
+    assert!(articles.columns.iter().find(|c| c.name.as_str() == "tripled").and_then(|c| c.generated.as_ref()).is_some_and(|g| g.native));
+    // A change to an operand moves another column's expression out of the shared grammar: that column is kept native too.
+    let mut labelled = roundhouse::ingest::prism::scope(|| ingest_schema_with_generated_expression_dialect(schema_rb("    t.virtual \"label\", type: :string, as: \"coalesce(title, '')\", stored: true\n").as_bytes(), "db/schema.rb", OtherDatabase)).0.unwrap();
+    let bound = "class BoundTitle < ActiveRecord::Migration[8.1]\n  def change\n    change_column :articles, :title, :string, limit: 10\n  end\nend\n";
+    roundhouse::ingest::prism::scope(|| ingest_migration_with_generated_expression_dialect(bound.as_bytes(), "db/migrate/20260103000000_bound_title.rb", &mut labelled, OtherDatabase)).0.unwrap();
+    let label = labelled.tables[&roundhouse::Symbol::from("articles")].columns.iter().find(|c| c.name.as_str() == "label").and_then(|c| c.generated.clone());
+    assert!(label.is_some_and(|g| g.native));
+    // Native SQL still keeps Roundhouse's own name rules.
+    let reserved = roundhouse::ingest::prism::scope(|| ingest_schema_with_generated_expression_dialect(schema_rb("    t.virtual \"updated_at\", type: :decimal, as: \"(1)::numeric\", stored: true\n").as_bytes(), "db/schema.rb", OtherDatabase)).0;
+    assert!(reserved.is_err_and(|e| e.to_string().contains("updated_at")));
+    let wide = roundhouse::ingest::prism::scope(|| ingest_schema_with_generated_expression_dialect(schema_rb("    t.decimal \"price\", precision: 300, scale: 2\n").as_bytes(), "db/schema.rb", OtherDatabase)).0;
+    assert!(wide.is_err_and(|e| e.to_string().contains("precision 300")));
+    let negative = roundhouse::ingest::prism::scope(|| ingest_schema_with_generated_expression_dialect(schema_rb("    t.decimal \"price\", precision: 10, scale: -2\n").as_bytes(), "db/schema.rb", OtherDatabase)).0;
+    assert!(negative.is_err_and(|e| e.to_string().contains("scale -2")));
 }

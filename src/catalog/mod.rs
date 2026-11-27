@@ -959,6 +959,14 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         chain: ChainKind::NotApplicable,
         return_kind: Some(ReturnKind::Bool),
     },
+    // `#validate!` runs them and raises on failure (`RecordInvalid` on a record, `ValidationError` on a tableless one).
+    CatalogedMethod {
+        name: "validate!",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::Pure,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::Bool),
+    },
     CatalogedMethod {
         name: "persisted?",
         receiver: ReceiverContext::Instance,

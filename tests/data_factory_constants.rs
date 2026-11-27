@@ -34,15 +34,21 @@ fn file_data_composition_strictly_emits() {
 }
 
 #[test]
-fn inherited_data_constructor_visibility_is_refused_at_the_call() {
+fn complete_generated_data_constructors_can_be_made_private() {
     for names in [":new", ":[]", ":allocate", ":new, :[]", ":new, :allocate", ":[], :allocate",
         ":new, :new, :[]", ":new, :[], :allocate, :allocate", "'new', '[]', 'allocate'",
         ":new, :[], :allocate", ":new, :allocate, :[]", ":[], :new, :allocate",
         ":[], :allocate, :new", ":allocate, :new, :[]", ":allocate, :[], :new"] {
         let source = format!("Artifact = Data.define(:digest) do\n  private_class_method {names}\nend\n");
         for path in ["lib/artifact.rb", "app/models/artifact.rb"] {
-            assert_review_refusal(&source, path, "requires an already defined local method",
-                Some(source.find("private_class_method").unwrap()));
+            if names.starts_with("'") {
+                assert_review_refusal(&source, path, "Data visibility macro", Some(source.find("private_class_method").unwrap()));
+            } else if ["new", "[]", "allocate"].iter().all(|name| names.contains(name)) {
+                assert_review_admitted(&source, path);
+            } else {
+                assert_review_refusal(&source, path, "requires an already defined local method",
+                    Some(source.find("private_class_method").unwrap()));
+            }
         }
     }
 }
@@ -62,8 +68,8 @@ fn data_constructor_visibility_before_a_definition_is_refused_at_the_marker() {
 }
 
 #[test]
-fn data_constructor_visibility_in_a_singleton_block_is_refused_at_the_marker() {
-    for later in ["", "def self.new(digest:) = digest"] {
+fn partial_singleton_constructor_privacy_is_refused_at_the_marker() {
+    for later in ["def self.new(digest:) = digest"] {
         let source = format!("Artifact = Data.define(:digest) do\n  class << self; private :new; end\n  {later}\nend\n");
         for path in ["lib/artifact.rb", "app/models/artifact.rb"] {
             assert_review_refusal(&source, path, "requires an already defined local method",
@@ -73,29 +79,34 @@ fn data_constructor_visibility_in_a_singleton_block_is_refused_at_the_marker() {
 }
 
 #[test]
-fn private_data_constructors_refuse_subclasses_toggles_and_reopenings_at_the_call() {
+fn complete_private_constructors_keep_subclasses_and_toggles_refused() {
     let parent = "Artifact = Data.define(:digest) do\n  def self.build(digest) = new(digest:)\n  private_class_method :new, :[], :allocate\nend\n";
     for suffix in [
         "class Child < Artifact; def self.make(digest) = new(digest:); end\n",
         "class Child < Artifact; DEFAULT = new(digest: 'default'); end\n",
-        "class Child < Artifact; def self.make(digest) = new(digest:); end\nx = Child.make('a'); p x; p x.with(digest: 'b').class\n",
-        "class Artifact; def label = 'L:' + digest; end\n",
     ] {
         let source = format!("{parent}{suffix}");
-        assert_review_refusal(&source, "lib/artifact.rb", "requires an already defined local method",
+        assert_review_refusal(&source, "lib/artifact.rb", "constructor visibility with Data subclasses",
             Some(source.find("private_class_method").unwrap()));
     }
+    assert_review_admitted(&format!("{parent}class Artifact; def label = 'L:' + digest; end\n"), "lib/artifact.rb");
     for marker in ["public_class_method :new", "public_class_method :[]",
         "public_class_method :new, :[], :allocate"] {
         let source = parent.replace("end\n", &format!("  {marker}\nend\n"));
-        assert_review_refusal(&source, "lib/artifact.rb", "requires an already defined local method",
-            Some(source.find("private_class_method").unwrap()));
+        assert_review_refusal(&source, "lib/artifact.rb", "Data visibility macro",
+            Some(source.find(marker).unwrap()));
     }
     for work in ["def self.make(digest) = new(digest:)", "DEFAULT = new(digest: 'default')"] {
         let source = format!("module Shop; end\nShop::Artifact = Data.define(:digest) do\n  private_class_method :new, :[], :allocate\nend\nmodule Shop\n  class Child < Artifact\n    {work}\n  end\nend\n");
-        assert_review_refusal(&source, "lib/artifact.rb", "requires an already defined local method",
+        assert_review_refusal(&source, "lib/artifact.rb", "constructor visibility with Data subclasses",
             Some(source.find("private_class_method").unwrap()));
     }
+}
+
+fn assert_review_admitted(source: &str, path: &str) {
+    let mut app = review_record(source, path, None);
+    let diagnostics = errors(&mut app);
+    assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
 }
 
 #[test]
@@ -187,7 +198,6 @@ fn file_data_admission_does_not_accept_arbitrary_calls_or_replace_an_earlier_cla
         "puts 'side effect'\nArtifact = Data.define(:digest)",
         "class Artifact; def label = 'old'; end\nArtifact = Data.define(:digest)",
         "Artifact = Data.define(:digest)\nArtifact = Data.define(:other)",
-        "Artifact = Data.define(:digest)\nclass Artifact; VALUE = 'inside'; end",
         "Artifact = Data.define(:digest) do; def label = 'before'; end\nmodule Observer; VALUE = Artifact.new('x').label; end\nclass Artifact; def label = 'after'; end",
     ] {
         let mut app = review_record(source, "lib/artifact.rb", None);
@@ -982,7 +992,6 @@ fn custom_factory_blocks_are_not_silently_discarded() {
     assert!(roundhouse::ingest::ingest_library_class(source, "probe.rb").is_err());
     for block in [
         "def label; name; end; LIMIT = 4",
-        "def label; name; end; include Comparable",
         "def label; name; end; puts 'side effect'",
         "def other.label; 1; end",
         "|value| value; def label; name; end",
@@ -993,6 +1002,17 @@ fn custom_factory_blocks_are_not_silently_discarded() {
             "{source}"
         );
     }
+}
+
+/// An `include` of a constant in the block is the Data class's own, kept
+/// rather than dropped with the rest of the body.
+#[test]
+fn a_custom_factory_block_s_include_is_kept() {
+    let source = b"class Owner; State = Data.define(:name) do; include Comparable; def label; name; end; end; end";
+    let classes = roundhouse::ingest::ingest_library_classes(source, "probe.rb").expect("ingests");
+    let state = classes.iter().find(|c| c.name.0.as_str() == "Owner::State").expect("lifted");
+    assert_eq!(state.includes.iter().map(|i| i.0.as_str()).collect::<Vec<_>>(), ["Comparable"]);
+    assert!(state.methods.iter().any(|m| m.name.as_str() == "label"));
 }
 
 /// Keep error diagnostics for dynamic/invalid members, shadowed Data, and
@@ -1295,13 +1315,13 @@ fn unsupported_file_level_data_blocks_keep_source_located_refusals() {
 #[test]
 fn file_level_data_replacements_are_refused() {
     let record = "Artifact = Data.define(:digest) do; def label = digest; end";
-    for source in [
-        format!("class Artifact; def extra = 1; end\n{record}"),
-        format!("{record}\nArtifact = Data.define(:size)"),
+    for (source, expected) in [
+        (format!("class Artifact; def extra = 1; end\n{record}"), "same class"),
+        (format!("{record}\nArtifact = Data.define(:size)"), "reassignment of Data.define constant `Artifact`"),
     ] {
         let error = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "lib/artifact.rb")
             .expect_err("a replacement must not merge unrelated bodies");
-        assert!(format!("{error:?}").contains("same class"), "{error:?}");
+        assert!(format!("{error:?}").contains(expected), "{error:?}");
     }
 }
 
@@ -1401,4 +1421,17 @@ fn a_top_level_data_factory_is_rejected_before_unverified_target_emission() {
             "{diagnostic:?}"
         );
     }
+}
+
+/// A computed include replayed as a call keeps no `ActiveModel::Serialization`
+/// argument: the marker the include list drops would name a namespace no
+/// target ships when the call runs.
+#[test]
+fn a_replayed_include_drops_the_serialization_marker() {
+    let source = b"class Stat < Base\n  include ActiveModel::Serialization, Helpers.mixin\nend\n";
+    let classes = roundhouse::ingest::ingest_library_classes(source, "probe.rb").expect("ingests");
+    let stat = classes.iter().find(|c| c.name.0.as_str() == "Stat").expect("class");
+    let replayed: Vec<String> = stat.unknown_calls.iter().map(|e| format!("{:?}", e.node)).collect();
+    assert!(!replayed.is_empty(), "the computed include is replayed");
+    assert!(replayed.iter().all(|r| !r.contains("Serialization")), "{replayed:#?}");
 }

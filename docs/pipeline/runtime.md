@@ -95,8 +95,9 @@ in `src/project.rs`. Shape notes worth knowing:
   PostgreSQL: on Spinel through the pure-Ruby spinel-pg driver (no
   libpq), on CRuby through the pg gem. The few places the two drivers
   differ go through `PgDriver` (`pg_driver.rb`, and
-  `pg_driver_cruby.rb`, which CRuby gets as `pg_driver.rb`). No target
-  selects it yet. `tests/spinel_pg_db.rs` compiles it with Spinel, and
+  `pg_driver_cruby.rb`, which CRuby gets as `pg_driver.rb`). The Ruby
+  and Spinel targets select it for an app whose `config/database.yml`
+  names postgresql (`project::apply_postgresql_tree`). `tests/spinel_pg_db.rs` compiles it with Spinel, and
   `tests/db_contract.rs` runs it on CRuby, each against a live server
   (`ROUNDHOUSE_PG_TEST_URL`).
   - `Db.exec_returning` answers the returned rows.
@@ -106,6 +107,10 @@ in `src/project.rs`. Shape notes worth knowing:
     class through `runtime/spinel/pg_errors.rb`.
   - A transaction keeps its connection, and a lease that ends inside
     one rolls it back.
+  - `Db.configure(url, schema_search_path: "a,b")` sets `search_path` on
+    every connection the pool opens, as Rails' `schema_search_path` does;
+    the Spinel tree's test helper puts each test process in its own schema
+    this way.
   - The pool is sharded per thread, as `runtime/spinel/db.rb`'s is.
     `Db.prepare` runs through a named statement cached per connection
     (at most 128, closed on the server when evicted); finalizing a read
@@ -2408,7 +2413,18 @@ keeps `count:`, `format`, `inclusion` and `numericality` keep
 picks the details on that attribute and answers their messages, so the
 read is exact under any `errors.format`, and `:base` is an attribute
 like any other. The form builder's `field_with_errors` wrapper asks the
-same question with `any?`.
+same question with `any?`. A field known only at run time — a block
+parameter, a method's parameter, a local — reads the same when its type
+is a Symbol or a String: `errors[field]` and `errors.messages_for(field)`
+are `error_messages_for(...)` and `errors.full_messages_for(field)` is
+`error_full_messages_for(...)`, a Symbol field turned into the String
+the reader takes (a String is passed as it is). Such a field, and a
+String literal, are read so only on a model's errors: an app's own
+`errors` (a Hash keyed by String, say) answers `[]` itself. A field of
+any other type, an untyped local say, is not grounded, because nothing
+proves which String it would read: `messages_for` and
+`full_messages_for` report an error, and `errors[field]` stays a dynamic
+`[]` with its residue warning.
 
 `errors.to_hash` groups the same details by attribute:
 `ActiveSupport.errors_to_hash(error_details)`, in the order of each
@@ -2420,13 +2436,24 @@ no detail, so `to_hash` leaves it out; Rails' Errors has no `<<`.
 `[:field]`, `key?` or the emptiness questions, is
 `ActiveSupport.errors_messages(error_details)`: the same Hash with
 Rails' `[]` default, frozen. `errors.attribute_names` is
-`errors_attribute_names`, each attribute once, frozen. Both are gaps on
-a strict target as `to_hash` is, except under `render json:`, which
+`errors_attribute_names`, each attribute once, frozen.
+`errors.group_by_attribute` is
+`ActiveSupport.errors_group_by_attribute(error_details)`: the same
+grouping, but a plain Hash with no default and not frozen, as
+`Enumerable#group_by` answers it. Each of those helpers is a gap on a
+strict target as `to_hash` is, except under `render json:`, which
 writes `Base#errors_json` on every target. `errors.include?`, `key?`
 and `has_key?` ask `error_messages_for(...).any?`, so they reach every
 target; a field that is not a Symbol or String literal is an error,
 because the accumulator's own `include?` would ask its full messages
 and answer false.
+
+`errors.to_a` is Rails' alias for `full_messages`, which is what
+`errors` already holds here, so every target reads a `dup` of the
+accumulator: Rails builds a new Array on each call, so a kept answer
+does not grow with later errors. `errors.objects` is the `ActiveModel::Error`s
+Rails collects, which is `error_details`: the lowering reads it as that
+field, and what it yields reads as an iteration's does.
 
 Iterating `errors` (`each`, `map`, `collect`, `select`, `filter`,
 `reject`, `find`, `detect`, `all?`, `first`, and `any?`, `none?` and
@@ -2441,9 +2468,13 @@ error on that field with that Symbol type, and with a String type asks
 the field's messages, as Rails does. `errors.where(:field, :type)` is
 the `error_details` on that field, of that type when one is given, so
 what it answers reads like an iteration's. `errors.delete(:field)` is
-`ActiveSupport.errors_delete(errors, error_details, "field")`, which
-drops the field's entries from both, index for index, and answers their
-messages or nil; like `to_hash`, it is a gap on a strict target. Without a block, `any?`, `none?` and `count` keep
+`ActiveSupport.errors_delete(errors, error_details, "field", false,
+nil)`, which drops the field's entries from both, index for index, and
+answers their messages or nil; given a type, `errors.delete(:field,
+:type)`, it drops only the entries of that type — a Symbol, or the
+String a message was added with, which Rails' `Error#type` answers for
+such an error — and answers their messages, or nil when none matched.
+Like `to_hash`, it is a gap on a strict target. Without a block, `any?`, `none?` and `count` keep
 asking the full messages, which answer the same.
 
 `errors.details` is `ActiveSupport.errors_details(error_details)`, the
@@ -2468,10 +2499,27 @@ attribute is humanized, as `human_attribute_name` falls back to.
 once each, or an `import` with options beyond a Symbol `attribute:`,
 is an error. Both helpers are gaps on a strict target.
 
+`errors.copy!(other)` drops the record's own errors and takes copies of
+the other's, its full messages named as the copying model names them,
+by the same rules: `ActiveSupport.errors_copy` clears both arrays and
+imports each of the other's details as `merge!` does, so what the record
+holds is its own, and dropping one from either leaves the other whole.
+Copying a record's own errors is a no-op, as Rails' `deep_dup` of them
+is, and `copy!` is a gap on a strict target as `merge!` is. Only
+another record's `errors` is grounded: Rails' `copy!` takes an `Errors`,
+and given a record it keeps that record's `Errors` where its Array goes.
+A copy keeps the message the other model's lookup chose; Rails looks it
+up again for the copying model, so a model-scoped locale message for
+the copier is not used.
+
 A `belongs_to` checks its record where it is declared, among the
 `validates`, so its error lists in Rails' order, and its type is
 `:blank`: Rails validates the association's presence with `message:
-:required`, which picks the text and leaves the type.
+:required`, which picks the text and leaves the type. The check reads
+the association, as Rails does, so a record assigned in memory counts
+once the writer has kept it; a polymorphic one is checked through its
+reader alone, since the class to query is the row's `<assoc>_type` and
+the runtime's unsaved key is 0 rather than nil.
 
 Every one of these rewrites matches an `errors` send as its receiver,
 which `&.` hides behind a local (`(t = record.errors) && t.m`).
@@ -2491,8 +2539,9 @@ compile in Rust or Go. The class sits in `active_record/base.rb` so
 `Base`'s own bodies type against it.
 
 **What it costs.** A message pushed by anything other than those two
-lowerings has no detail beside it. `errors.delete` with a type is not
-modeled, nor are the option values `details` would answer; an
+lowerings has no detail beside it. `errors.delete` with options
+(`delete(:field, :type, count: 2)`) is not modeled, nor are the option
+values `details` would answer; an
 `errors <<` written by hand pushes a message no field claims. A dotted
 attribute (`comments.body`) is named by humanizing it, where Rails
 looks under the association's namespace first. `errors.add` reads its record twice
@@ -3148,7 +3197,16 @@ Three gaps remain, all on spinel's side:
   literal prefix (`t("statuses.#{v}")`) folds every translation under
   the prefix into a `case` on the normalized key, falling back to the
   missing answer or `default:`. Where such a key names a subtree, Rails
-  answers a Hash; here it raises `NotImplementedError`. A key with no
+  answers a Hash; here it raises `NotImplementedError`. A literal key
+  that names a node of Strings, written `t("term.js").to_json` (a
+  template handing its strings to a script), folds to the JSON Rails
+  writes for that Hash, per locale: keys in the files' order, `<`, `>`
+  and `&` escaped, and U+2028 / U+2029 escaped as
+  `config.active_support.escape_js_separators_in_json` says (off under
+  `config.load_defaults` 8.1 or later, on before it, the app's own
+  setting winning). With options, or
+  over a node holding an Array, a number or a nil, it stays an error;
+  `escape_html_entities_in_json` is taken as Rails' default (on). A key with no
   literal prefix, or one reaching more than 400 translations, is an
   error rather than a guess. A `Rails::Engine` gem's `config/locales`
   load before the app's, read where Bundler installed the gem
@@ -3194,11 +3252,19 @@ Three gaps remain, all on spinel's side:
   each message was added on, as `errors[:field]`'s are (see above).
   A form over a record that is not one of the app's models (a form
   object, say) is not wrapped, even when it has errors.
-- **`config.after_initialize` blocks do not run at boot.** campfire has
-  two: `Room::MessagesCount.ensure!` (its counter triggers, which
-  `schema.rb` cannot dump) and starting the WAL checkpointer outside
-  tests. The test suite gets the first through its `load_fixtures`
-  override, which is read; a served tree gets neither.
+- **`config.after_initialize` blocks run at boot only in the spellings
+  `ingest::after_initialize` reads**: a block with no parameters that
+  reads no local around it, at the top of an initializer, in
+  `config/application.rb`'s class body, or inside
+  `Rails.application.configure`. Each entry runs them once it has opened
+  the database and set up the job drain, before it serves or works off a
+  job. campfire's two (`Room::MessagesCount.ensure!` and starting the WAL
+  checkpointer outside tests) run this way. Hooks inside an initializer's
+  top-level `if defined?(Rails::Server)`, with no `else` and nothing else
+  in its body, run from the entries that serve (the Spinel server and
+  `config.ru`), as Rails runs them under `rails server` only. A block
+  under any other guard or in any other spelling is not run, and the
+  initializer ledger reports it.
 - **`Rails.application.env_config` holds what is set and is consulted
   for nothing**: a forgery failure always renders the 422 that
   `action_dispatch.show_exceptions = :rescuable` asks for.
@@ -4270,7 +4336,7 @@ table it prints, and the gaps in it:
 | global_ids, sgids.generate | 4/4, 5/5 | |
 | sgids.verify | 19/24 | |
 | app_verifiers.blob_id / envelope / data | 8/8, 3/3, 7/7 | fixed with this entry: the blob verifier signed with signed-id's envelope |
-| encrypted_cookies.verify / generate | 20/20, 8/8 | `cookies.encrypted`; see "`cookies.encrypted` is Rails' encrypted cookie jar" below |
+| encrypted_cookies.verify / generate | 20/20, 8/8 | `cookies.encrypted` and the session store; see "`cookies.encrypted` is Rails' encrypted cookie jar" and "The session cookie is Rails' CookieStore" below |
 | csrf | 0/208 | not implemented |
 | passwords | 0/45 | not held |
 
@@ -4289,12 +4355,7 @@ path the runtime follows (`SignedGlobalId` unverified read), so a
 mention renders; any other attachable signed by an older install does
 not.
 
-**Not implemented.** The session cookie is SIGNED where Rails'
-`CookieStore` ENCRYPTS it (AES-256-GCM under
-`"authenticated encrypted cookie"`), so a Rails `_campfire_session` is
-not read after a migration — the flash and the CSRF secret start over,
-while the user stays signed in (the `session_token` cookie is signed and
-verifies). CSRF tokens are the session's own, unmasked (see
+**Not implemented.** CSRF tokens are the session's own, unmasked (see
 `runtime/spinel/request_forgery_protection.rb`'s header), so a form
 rendered by Rails does not post to the emit. Passwords: the ruby family
 runs the bcrypt gem; spinel's package is not yet held to these vectors.
@@ -4749,14 +4810,56 @@ pre-5.2 cookie without metadata), CRuby and the spinel binary alike.
   it. Rails records the expiry inside the encrypted envelope, so a
   copied short-lived cookie stops reading server-side. Only
   `.permanent` sets one. The signed jar has the same gap.
-- **The session cookie** is still the signed one (see "Not
-  implemented" in the vectors entry above): `cookies.encrypted[<session
-  key>]` reads nil in an emitted app until the session store writes
-  through this jar.
 - **Link cost (spinel):** AES-GCM comes from spinel's `packages/openssl`,
   which `runtime/spinel/message_digest.rb` requires, so every spinel web
   app now links libssl/libcrypto and a build host needs the OpenSSL
   headers.
+
+### The session cookie is Rails' CookieStore - CLOSED (ours, 2026-10-15)
+
+**Was:** the ruby family SIGNED the session (HMAC-SHA1 under
+"signed cookie") over its own `k=v` encoding and kept each flash message
+in a signed cookie of its own (`flash_notice`, `flash_alert`). Values
+came back as Strings, a session Rails wrote read as empty and Rails
+could not read ours, and an app whose Action Cable connection authorizes
+from `cookies.encrypted[session_options[:key]]` refused every handshake
+(401; the browser reconnects forever) while the same app worked under
+Puma.
+
+**Now (measured against Rails 8.1.4, `load_defaults 8.1`):** the
+session is `cookies.encrypted[<session key>]`'s value (see
+"`cookies.encrypted` is Rails' encrypted cookie jar" above for the
+format): the session as JSON, with the flash inside it as
+`"flash" => {"discard" => [], "flashes" => {...}}`
+(`runtime/spinel/cookie_store.rb`).
+`tests/emit_and_run/encrypted_session_cookie.rs` and its spinel twin
+run a sign-in, the `/cable` handshake and the flash through the emitted
+app, read a cookie Rails minted, and have Rails read the one the app
+wrote (the Rails half skips where the railties and actionpack gems are
+not installed).
+
+**Left as they are, each stated where it lives:**
+
+- **Not read:** `session_store` options other than `key:`
+  (`expire_after`, `domain`, `secure`), as before.
+- **`session_id`:** Rails gives a session its 32-hex `session_id` when
+  the session is first written in a request; here it is added when the
+  cookie is written, so `session[:session_id]` is nil during that first
+  request.
+- **`reset_session`** deletes the cookie; Rails writes one holding only
+  a fresh `session_id`. The app sees an empty session either way.
+- **Writes:** the cookie is written when the session's JSON changed;
+  Rails rewrites it (with a new IV) on every request that loaded the
+  session. A flash the request never read is dropped with the rest of
+  the shown ones, where Rails keeps it for the next request
+  (`Flash#to_persisted`, as before this change); flash keys other than
+  `notice` and `alert` are not read.
+- **The cookie name** defaults to `_session` when the app declares no
+  `session_store`; Rails derives `_<app>_session` from the application
+  name, so such an app's Rails cookie is not found under the default.
+- **Old cookies:** the signed `k=v` session and the `flash_notice` /
+  `flash_alert` cookies this runtime wrote before read as nothing: users
+  of an emitted app sign in once more after the upgrade.
 
 ### Signed cookies interoperate with Rails — CLOSED (ours)
 

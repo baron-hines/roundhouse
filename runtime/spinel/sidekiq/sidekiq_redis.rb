@@ -66,6 +66,35 @@ module SidekiqRedis
     end
   end
 
+  # A bulk push's batch: one `SADD queues` and one `LPUSH` of every
+  # envelope, pipelined, as Sidekiq's `Client#push_bulk` sends a batch.
+  def self.push_many(url, queue, jsons)
+    delays = SidekiqPush.reconnect_delays
+    tries = 0
+    while true
+      used = []
+      begin
+        conn = acquire(url)
+        used.push(conn)
+        LOCK.synchronize { send_push_many(conn, queue, jsons) }
+        return nil
+      rescue Redis::BaseConnectionError => e
+        discard(used[0]) if used.length > 0
+        raise e if tries >= delays.length
+        wait_to_reconnect(delays[tries])
+        tries += 1
+      end
+    end
+  end
+
+  def self.send_push_many(conn, queue, jsons)
+    conn.pipelined do |p|
+      p.sadd("queues", queue)
+      p.lpush("queue:" + queue, jsons)
+    end
+    nil
+  end
+
   def self.schedule(url, at, json)
     delays = SidekiqPush.reconnect_delays
     tries = 0

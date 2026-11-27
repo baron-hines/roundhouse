@@ -255,6 +255,18 @@ impl Facts {
     }
 
     /// `Some(answer)` when decidable; `None` leaves the `defined?`.
+    /// Whether an unrooted `path`'s head names an in-tree constant under one of `owner`'s lexical namespaces
+    /// (`Wrapper::ActiveRecord` for `ActiveRecord::Base` read in `Wrapper`), which Ruby finds before the top level's.
+    fn head_shadowed(&self, owner: Option<&ClassId>, path: &[String]) -> bool {
+        if path.first().is_some_and(|s| s.is_empty()) {
+            return false;
+        }
+        let Some(head) = path.first() else { return false };
+        let Some(owner) = owner else { return false };
+        let parts: Vec<&str> = owner.0.as_str().split("::").collect();
+        (1..=parts.len()).any(|n| self.tree_and_prefixes.contains(&format!("{}::{head}", parts[..n].join("::"))))
+    }
+
     fn decide(&self, owner: Option<&ClassId>, path: &[String], load_time: bool) -> Option<bool> {
         let rooted = path.first().is_some_and(|s| s.is_empty());
         let segs: Vec<&str> = path.iter().filter(|s| !s.is_empty()).map(String::as_str).collect();
@@ -560,6 +572,23 @@ fn framework_method(operand: &Expr) -> Option<(Vec<String>, &'static str)> {
     methods.iter().find(|m| **m == method.as_str()).map(|m| (segments, *m))
 }
 
+/// Class methods Rails 8.1 no longer defines, which a gem asks `defined?` for to tell Rails versions apart: Rails 7.2
+/// moved the connection clearing of `ActiveRecord::Base` to its connection handler (message_bus's
+/// `elsif defined? ActiveRecord::Base.clear_active_connections!`).
+const FRAMEWORK_REMOVED_METHODS: &[(&str, &[&str])] = &[(
+    "ActiveRecord::Base",
+    &["clear_active_connections!", "clear_reloadable_connections!", "clear_all_connections!", "flush_idle_connections!"],
+)];
+
+fn removed_framework_method(operand: &Expr) -> Option<Vec<String>> {
+    let ExprNode::Send { recv: Some(r), method, block: None, .. } = &*operand.node else { return None };
+    let ExprNode::Const { path } = &*r.node else { return None };
+    let segments: Vec<String> = path.iter().map(|s| s.as_str().to_string()).collect();
+    let name = segments.iter().filter(|p| !p.is_empty()).cloned().collect::<Vec<_>>().join("::");
+    let (_, methods) = FRAMEWORK_REMOVED_METHODS.iter().find(|(c, _)| *c == name)?;
+    methods.contains(&method.as_str()).then_some(segments)
+}
+
 fn framework_answer(e: &Expr) -> Option<bool> {
     let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*e.node else { return None };
     if method.as_str() != "respond_to?" {
@@ -616,6 +645,15 @@ fn walk(e: &mut Expr, owner: Option<&ClassId>, facts: &Facts, lt: bool, cond: bo
             && facts.decide(owner, &path, lt) == Some(true)
         {
             *e = if cond { lit(e, Literal::Bool { value: true }, Ty::Bool) } else { lit(e, Literal::Str { value: "method".into() }, Ty::Str) };
+            return true;
+        }
+        // nil where the framework is loaded, as Rails answers; an absent one is left to Ruby as above, and so is a head an
+        // enclosing namespace binds to its own constant, which may define the method.
+        if let Some(path) = removed_framework_method(operand)
+            && !facts.head_shadowed(owner, &path)
+            && facts.decide(owner, &path, lt) == Some(true)
+        {
+            *e = lit(e, Literal::Nil, Ty::Nil);
             return true;
         }
         if let ExprNode::Const { path } = &*operand.node {

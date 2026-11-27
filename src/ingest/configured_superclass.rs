@@ -436,6 +436,8 @@ struct Eval<'a> {
     omitted: Vec<String>,
     /// The statements of a block `class_eval`d on the subject (Devise's Validatable's `validates_*`): the model's own body, after its includes.
     class_body: Vec<Expr>,
+    /// The program's methods by name (class index, method index), built on first use.
+    by_name: std::cell::OnceCell<HashMap<String, Vec<(usize, usize)>>>,
 }
 
 /// The mapper a routing method runs on: the program's classes that answer on it, and its instance variables.
@@ -470,7 +472,7 @@ const SCOPE_KEYS: &[&str] = &["path", "as", "module", "constraints", "defaults",
 impl<'a> Eval<'a> {
     fn new(app: &'a App) -> Self {
         let known = app.library_classes.iter().map(|c| c.name.0.as_str().to_string()).collect();
-        Eval { classes: &app.library_classes, concern_items: &app.concern_model_items, class_side_spans: &app.concern_class_side_spans, models: &app.models, macro_names: app.load_hook_extended_macros.iter().flat_map(|m| app.library_classes.iter().filter(move |c| c.name == *m)).flat_map(|c| c.methods.iter().map(|d| d.name.as_str().to_string())).collect(), known, heap: Vec::new(), class_ivars: HashMap::default(), unsure: HashMap::default(), written: HashMap::default(), tick: 0, depth: 0, subject: None, calls: Vec::new(), drawn: Vec::new(), cvars: HashMap::default(), router: RouterState::default(), facts: super::gem_hooks::Facts::of(app), consts: HashMap::default(), evaled: HashMap::default(), singleton_attrs: Vec::new(), passed_over: false, mixed_in: Vec::new(), hooked: HashSet::default(), side_calls: Vec::new(), helper_methods: Vec::new(), evaled_by: HashSet::default(), omitted: Vec::new(), class_body: Vec::new() }
+        Eval { classes: &app.library_classes, concern_items: &app.concern_model_items, class_side_spans: &app.concern_class_side_spans, models: &app.models, macro_names: app.load_hook_extended_macros.iter().flat_map(|m| app.library_classes.iter().filter(move |c| c.name == *m)).flat_map(|c| c.methods.iter().map(|d| d.name.as_str().to_string())).collect(), known, heap: Vec::new(), class_ivars: HashMap::default(), unsure: HashMap::default(), written: HashMap::default(), tick: 0, depth: 0, subject: None, calls: Vec::new(), drawn: Vec::new(), cvars: HashMap::default(), router: RouterState::default(), facts: super::gem_hooks::Facts::of(app), consts: HashMap::default(), evaled: HashMap::default(), singleton_attrs: Vec::new(), passed_over: false, mixed_in: Vec::new(), hooked: HashSet::default(), side_calls: Vec::new(), helper_methods: Vec::new(), evaled_by: HashSet::default(), omitted: Vec::new(), class_body: Vec::new(), by_name: std::cell::OnceCell::new() }
     }
 
     /// The constant `expr` names once the initializers that call on its root have run.
@@ -2021,6 +2023,13 @@ impl<'a> Eval<'a> {
                 };
                 match &*body.node {
                     ExprNode::Ivar { name } => Some(Slot::Ivar(holder, name.as_str().to_string())),
+                    // A mattr's instance copy (`def mapping = Routes.mapping`): the module's value it reads.
+                    // Not in the caller's frame: the reader's constant is looked up from where the reader is defined.
+                    ExprNode::Send { recv: Some(owner), args, block: None, .. } if args.is_empty() && matches!(&*owner.node, ExprNode::Const { .. }) => {
+                        let body = body.clone();
+                        let mut reader = Frame { this: holder, locals: HashMap::default(), block: None, scope: Some(scope) };
+                        self.held_by(&body, &mut reader)
+                    }
                     _ => None,
                 }
             }
@@ -2530,6 +2539,47 @@ impl<'a> Eval<'a> {
         if c.is_module && m.receiver == MethodReceiver::Instance { ("*".into(), false) } else { (c.name.0.as_str().to_string(), m.receiver == MethodReceiver::Class) }
     }
 
+    fn methods_named(&self, name: &str) -> impl Iterator<Item = (&'a LibraryClass, &'a MethodDef)> + '_ {
+        let classes: &'a [LibraryClass] = self.classes;
+        let index = self.by_name.get_or_init(|| {
+            let mut map: HashMap<String, Vec<(usize, usize)>> = HashMap::default();
+            for (ci, c) in classes.iter().enumerate() {
+                for (mi, m) in c.methods.iter().enumerate() {
+                    map.entry(m.name.as_str().to_string()).or_default().push((ci, mi));
+                }
+            }
+            map
+        });
+        index.get(name).into_iter().flatten().map(move |&(ci, mi)| (&classes[ci], &classes[ci].methods[mi]))
+    }
+
+    /// The core class of a value only a literal or a core conversion gives (`:plain`, `fallback.to_sym`).
+    fn core_value_class(&self, e: &Expr) -> Option<&'static str> {
+        match &*e.node {
+            ExprNode::Lit { value: Literal::Sym { .. } } => Some("Symbol"),
+            ExprNode::Lit { value: Literal::Str { .. } } => Some("String"),
+            ExprNode::Lit { value: Literal::Int { .. } } => Some("Integer"),
+            ExprNode::Lit { value: Literal::Float { .. } } => Some("Float"),
+            ExprNode::Send { recv: Some(_), method, args, block: None, .. } if args.is_empty() => {
+                let class = match method.as_str() {
+                    "to_sym" => "Symbol",
+                    "to_s" | "to_str" | "inspect" => "String",
+                    "to_i" => "Integer",
+                    "to_f" => "Float",
+                    _ => return None,
+                };
+                // Not when the program defines the conversion itself: its own may answer anything.
+                let defines = |name: &str| {
+                    self.methods_named(name).next().is_some()
+                        || self.evaled.values().flatten().any(|m| m.name.as_str() == name)
+                        || self.models.iter().any(|model| model.methods().any(|m| m.name.as_str() == name))
+                };
+                (!defines(method.as_str())).then_some(class)
+            }
+            _ => None,
+        }
+    }
+
     fn all_method_writes(&self) -> Option<HashSet<Tag>> {
         let mut out = HashSet::default();
         for c in self.classes {
@@ -2556,7 +2606,7 @@ impl<'a> Eval<'a> {
             }
             // `@scopes << :read`, `URL_HELPERS[key].concat(value)`: the object the ivar or constant holds changes, which a read of it sees; a program's own method is followed instead.
             ExprNode::Send { recv: Some(r), method, .. }
-                if !self.classes.iter().any(|c| c.methods.iter().any(|m| &m.name == method))
+                if self.methods_named(method.as_str()).next().is_none()
                     && (method.as_str().ends_with('!')
                         || matches!(method.as_str(), "<<" | "push" | "[]=" | "concat" | "update" | "delete" | "clear" | "replace" | "insert" | "unshift" | "store" | "append" | "prepend")) =>
             {
@@ -2720,14 +2770,21 @@ impl<'a> Eval<'a> {
                 }
                 let callees: Vec<(&LibraryClass, &MethodDef)> = match exact {
                     Some((def, _)) => self
-                        .classes
-                        .iter()
-                        .flat_map(|c| c.methods.iter().map(move |m| (c, m)))
+                        .methods_named(def.name.as_str())
                         .filter(|(_, m)| m.name == def.name && m.receiver == def.receiver && m.body.span == def.body.span)
                         .take(1)
                         .collect(),
                     // Every method of the program by that name: which one the call reaches is not known here.
-                    None => self.classes.iter().flat_map(|c| c.methods.iter().filter(|m| m.name.as_str() == name).map(move |m| (c, m))).collect(),
+                    None => {
+                        // Not the class names alone: a module the core class or `Object` includes answers on the value too.
+                        let core: Option<HashSet<String>> = recv.as_ref().and_then(|r| self.core_value_class(r)).map(|k| {
+                            [k, "Object", "Kernel", "BasicObject", "Comparable", "Numeric"].into_iter().flat_map(|c| self.ancestry(c)).collect()
+                        });
+                        self.methods_named(&name)
+                            // Not a program class's method on a core value: only what the core class's lookup reaches, reopened or included, answers it.
+                            .filter(|(c, m)| core.as_ref().is_none_or(|owners| m.receiver == MethodReceiver::Instance && owners.contains(c.name.0.as_str())))
+                            .collect()
+                    }
                 };
                 for (c, m) in callees {
                     let key = format!("{}#{}#{:?}#{:?}", c.name.0.as_str(), m.name.as_str(), m.receiver, m.body.span);
@@ -4154,5 +4211,74 @@ mod tests {
         let shadowed = statement("items.each { |config| config.update }\n");
         let writes = eval.may_write_with(&shadowed, "*", false, &mut HashSet::default(), &locals).expect("bounded");
         assert!(writes.iter().any(|(owner, _, name)| owner == "Other" && name == "other"), "{writes:?}");
+    }
+
+    /// `x.to_sym == :plain` compares Symbols: a program `==` is not reached, a module String includes still is, and a program's own `to_sym`, a model's too, keeps every `==`.
+    #[test]
+    fn a_core_value_reaches_only_what_its_core_class_answers() {
+        let writes_with = |extra: &str, model: Option<&str>, source: &str| {
+            let mut tree: std::collections::HashMap<std::path::PathBuf, Vec<u8>> = [
+                ("db/schema.rb", "ActiveRecord::Schema.define do\nend\n"),
+                ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\nend\n"),
+                ("lib/release_version.rb", "class ReleaseVersion\n  def ==(other)\n    @compared = true\n  end\nend\n"),
+                ("lib/token_ops.rb", "module TokenOps\n  def flip\n    @flipped = true\n  end\nend\n"),
+                ("lib/string_ext.rb", "class String\n  include TokenOps\nend\n"),
+                ("config/routes.rb", "Rails.application.routes.draw do\nend\n"),
+            ]
+            .into_iter()
+            .map(|(p, c)| (std::path::PathBuf::from(p), c.as_bytes().to_vec()))
+            .collect();
+            if !extra.is_empty() {
+                tree.insert(std::path::PathBuf::from("lib/converter.rb"), extra.as_bytes().to_vec());
+            }
+            if let Some(model) = model {
+                tree.insert(std::path::PathBuf::from("app/models/token.rb"), model.as_bytes().to_vec());
+            }
+            let app = crate::ingest::ingest_app_from_tree(tree).expect("ingest");
+            let eval = Eval::new(&app);
+            eval.may_write(&statement(source), "*", false, &mut HashSet::default()).expect("bounded")
+        };
+        let writes = |extra: &str, source: &str| writes_with(extra, None, source);
+        let named = |w: &HashSet<Tag>, n: &str| w.iter().any(|(_, _, name)| name == n);
+        let symbols = writes("", "fallback.to_sym == :plain\n");
+        assert!(!named(&symbols, "compared"), "{symbols:?}");
+        let other = writes("", "fallback.version == :plain\n");
+        assert!(named(&other, "compared"), "{other:?}");
+        let included = writes("", "fallback.to_s.flip\n");
+        assert!(named(&included, "flipped"), "{included:?}");
+        let own = writes("class Converter\n  def to_sym\n    ReleaseVersion.new\n  end\nend\n", "fallback.to_sym == :plain\n");
+        assert!(named(&own, "compared"), "{own:?}");
+        let modeled = writes_with("", Some("class Token < ApplicationRecord\n  def to_sym\n    ReleaseVersion.new\n  end\nend\n"), "fallback.to_sym == :plain\n");
+        assert!(named(&modeled, "compared"), "{modeled:?}");
+    }
+
+    /// The by-name index answers exactly what a scan of every class's methods does, in the same order, duplicates across classes and within one included.
+    #[test]
+    fn the_method_index_answers_what_the_full_scan_does() {
+        let tree: std::collections::HashMap<std::path::PathBuf, Vec<u8>> = [
+            ("db/schema.rb", "ActiveRecord::Schema.define do\nend\n"),
+            ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\nend\n"),
+            ("lib/alpha.rb", "class Alpha\n  def run\n    @a = 1\n  end\n  def only_alpha\n  end\n  def self.run\n    @sa = 1\n  end\nend\n"),
+            ("lib/beta.rb", "module Beta\n  def run\n    @b = 1\n  end\n  def only_beta\n  end\nend\n"),
+            ("lib/gamma.rb", "class Gamma\n  def run\n    @g = 1\n  end\n  def run\n    @g2 = 1\n  end\nend\n"),
+            ("config/routes.rb", "Rails.application.routes.draw do\nend\n"),
+        ]
+        .into_iter()
+        .map(|(p, c)| (std::path::PathBuf::from(p), c.as_bytes().to_vec()))
+        .collect();
+        let app = crate::ingest::ingest_app_from_tree(tree).expect("ingest");
+        let eval = Eval::new(&app);
+        let mut names: Vec<&str> = app.library_classes.iter().flat_map(|c| c.methods.iter().map(|m| m.name.as_str())).collect();
+        names.push("absent");
+        assert!(names.iter().filter(|n| **n == "run").count() >= 4, "{names:?}");
+        for name in names {
+            let scanned: Vec<(&str, usize)> = app
+                .library_classes
+                .iter()
+                .flat_map(|c| c.methods.iter().filter(|m| m.name.as_str() == name).map(move |m| (c.name.0.as_str(), m.body.span.start as usize)))
+                .collect();
+            let indexed: Vec<(&str, usize)> = eval.methods_named(name).map(|(c, m)| (c.name.0.as_str(), m.body.span.start as usize)).collect();
+            assert_eq!(indexed, scanned, "{name}");
+        }
     }
 }

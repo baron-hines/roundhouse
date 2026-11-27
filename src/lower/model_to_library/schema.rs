@@ -8,7 +8,7 @@ use crate::ident::{ClassId, Symbol, VarId};
 use crate::lower::column_slot::{self, ColumnSlot};
 use crate::schema::{Column, Table};
 use crate::span::Span;
-use crate::ty::Ty;
+use crate::ty::{FnTy, Ty};
 
 use super::row::row_class_id;
 use super::{
@@ -63,6 +63,28 @@ fn push_schema_symbol_list(
 /// as read. Only a model with a stored array column overrides `Base`'s
 /// identity, so only its tree names `ArrayColumn`.
 fn push_decode_plucked(methods: &mut Vec<MethodDef>, owner: &ClassId, table: &Table) {
+    push_array_column_switch(methods, owner, table, "decode_plucked", |col| array_load_method(col), |col| super::ty_of_column_stored(col));
+}
+
+/// `def self.encode_written(column, value)`: an Array a bulk write
+/// (`update_all`, `insert_all`, `upsert_all`) gives a stored array column,
+/// encoded as a record's save encodes it (`ArrayColumn.dump`): JSON text
+/// on SQLite, the array literal on PostgreSQL. Every other column's value
+/// is written as given, so an Array into a json column stays JSON.
+fn push_encode_written(methods: &mut Vec<MethodDef>, owner: &ClassId, table: &Table) {
+    push_array_column_switch(methods, owner, table, "encode_written", |_| "dump", |_| Ty::Untyped);
+}
+
+/// `def self.<name>(column, value)`: `ArrayColumn.<call>(value)` for each
+/// stored array column, `value` for every other one.
+fn push_array_column_switch(
+    methods: &mut Vec<MethodDef>,
+    owner: &ClassId,
+    table: &Table,
+    name: &str,
+    call: impl Fn(&Column) -> &'static str,
+    arg_ty: impl Fn(&Column) -> Ty,
+) {
     let stored: Vec<&Column> = table.columns.iter().filter(|c| c.array_stored).collect();
     if stored.is_empty() {
         return;
@@ -98,8 +120,8 @@ fn push_decode_plucked(methods: &mut Vec<MethodDef>, owner: &ClassId, table: &Ta
             Span::synthetic(),
             ExprNode::Send {
                 recv: Some(class_const(&ClassId(Symbol::from("ArrayColumn")))),
-                method: Symbol::from(array_load_method(col)),
-                args: vec![with_ty(var_ref(value.clone()), super::ty_of_column_stored(col))],
+                method: Symbol::from(call(col)),
+                args: vec![with_ty(var_ref(value.clone()), arg_ty(col))],
                 block: None,
                 parenthesized: true,
             },
@@ -114,7 +136,7 @@ fn push_decode_plucked(methods: &mut Vec<MethodDef>, owner: &ClassId, table: &Ta
         unsupported_formals: None,
         has_anonymous_block: false,
         name_span: Span::synthetic(),
-        name: Symbol::from("decode_plucked"),
+        name: Symbol::from(name),
         receiver: MethodReceiver::Class,
         params: vec![Param::positional(column.clone()), Param::positional(value.clone())],
         body,
@@ -156,7 +178,7 @@ fn rails_type_name(col: &crate::schema::ColumnType) -> &'static str {
 }
 
 /// `def self.schema_column_types; { id: :integer, title: :string, ... }; end`
-fn push_schema_column_types(methods: &mut Vec<MethodDef>, owner: &ClassId, table: &Table) {
+fn push_schema_column_types(methods: &mut Vec<MethodDef>, owner: &ClassId, table: &Table, source: crate::schema::generated::GeneratedExpressionDialect) {
     // Not String values: a per-model Hash of String literals is shared text Spinel's String analysis refuses `Arel.sql` over
     let ty = Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Sym) };
     let body = with_ty(
@@ -192,6 +214,126 @@ fn push_schema_column_types(methods: &mut Vec<MethodDef>, owner: &ClassId, table
     });
 }
 
+/// The columns whose query values an `attribute` or `normalizes`
+/// declaration in the model's body casts, by name. `None` when a
+/// declaration's name is not a literal: it could be any column.
+fn query_decorated_columns(model: &Model) -> Option<crate::det::HashSet<Symbol>> {
+    fn name(expr: &Expr, out: &mut Option<crate::det::HashSet<Symbol>>) {
+        let value = match &*expr.node {
+            ExprNode::Lit { value: Literal::Sym { value } } => value.clone(),
+            ExprNode::Lit { value: Literal::Str { value } } => Symbol::from(value.as_str()),
+            _ => {
+                *out = None;
+                return;
+            }
+        };
+        if let Some(out) = out {
+            out.insert(value);
+        }
+    }
+    fn visit(expr: &Expr, out: &mut Option<crate::det::HashSet<Symbol>>) {
+        if out.is_none() {
+            return;
+        }
+        if let ExprNode::Send { method, args, .. } = &*expr.node {
+            match method.as_str() {
+                "attribute" => match args.first() {
+                    Some(arg) => name(arg, out),
+                    None => *out = None,
+                },
+                "normalizes" => {
+                    for arg in args.iter().take_while(|arg| !matches!(&*arg.node, ExprNode::Hash { .. } | ExprNode::KeywordSplat { .. })) {
+                        name(arg, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        expr.node.for_each_child(&mut |child| visit(child, out));
+    }
+    let mut out = Some(crate::det::HashSet::default());
+    for item in &model.body {
+        if let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item {
+            visit(expr, &mut out);
+        }
+    }
+    out
+}
+
+/// `def self.schema_integer_query_limits; { id: 8, number: 4 }; end`: the
+/// byte width Rails' integer type range-checks a query value against
+/// (ActiveModel::Type::Integer's `limit`), for each plain integer column
+/// (Relation#integer_query_limit). On PostgreSQL that is the column's
+/// own, `integer` 4 and `bigint` 8; Rails' SQLite integer is 8 bytes
+/// (`SQLite3Integer#_limit`). An enum, `attribute` or `normalizes`
+/// column casts through its declaration instead, so it is left out, and
+/// a declaration that names its column at runtime leaves every one out.
+/// So is a `t.references` column: ingest keeps its logical name, not the
+/// `<name>_id` a query names, and drops an explicit `type:` (`:uuid`,
+/// `:string`), so its storage type is not known. A dumped schema writes
+/// the key as `t.bigint "<name>_id"`, which is listed.
+fn push_schema_integer_query_limits(methods: &mut Vec<MethodDef>, model: &Model, table: &Table) {
+    use crate::schema::ColumnType;
+    let postgres = crate::emit::shared::schema_sql::Dialect::current() == crate::emit::shared::schema_sql::Dialect::Postgres;
+    let decorated = query_decorated_columns(model);
+    let entries = table
+        .columns
+        .iter()
+        .filter(|c| !c.array && !model.enums.contains_key(&c.name))
+        .filter(|c| decorated.as_ref().is_some_and(|names| !names.contains(&c.name)))
+        .filter_map(|c| match c.col_type {
+            ColumnType::Integer if postgres => Some((c, 4)),
+            ColumnType::Integer | ColumnType::BigInt => Some((c, 8)),
+            _ => None,
+        })
+        .map(|(c, limit)| (lit_sym(c.name.clone()), lit_int(limit)))
+        .collect();
+    let ty = Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Int) };
+    methods.push(MethodDef {
+        visibility: crate::dialect::MethodVisibility::Public,
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        name_span: Span::synthetic(),
+        name: Symbol::from("schema_integer_query_limits"),
+        receiver: MethodReceiver::Class,
+        params: Vec::new(),
+        body: with_ty(Expr::new(Span::synthetic(), ExprNode::Hash { entries, kwargs: false }), ty.clone()),
+        signature: Some(fn_sig(vec![], ty)),
+        effects: EffectSet::default(),
+        enclosing_class: Some(model.name.0.clone()),
+        kind: AccessorKind::Method,
+        is_async: false,
+        mutates_self: false,
+        block_param: None,
+    });
+}
+
+/// `def self.schema_uuid_query_columns; [:id, :owner_id]; end`: on
+/// PostgreSQL, the uuid columns whose query values Relation casts as
+/// Rails' OID::Uuid does (Relation#uuid_query_column?), so a blank or
+/// malformed value is `= NULL` rather than a literal the server rejects.
+/// Left out where Rails does not cast through the uuid type: on SQLite,
+/// whose uuid column is text, and for a `uuid[]`, enum, `attribute` or
+/// `normalizes` column, as `schema_integer_query_limits` leaves them out.
+/// A model with no such column still lists none of its own: a model
+/// whose parent has a table (an abstract parent whose conventional table
+/// exists) would otherwise inherit the parent's list and cast its own
+/// keys as uuids.
+fn push_schema_uuid_query_columns(methods: &mut Vec<MethodDef>, model: &Model, table: &Table) {
+    use crate::emit::shared::schema_sql::Dialect;
+    if Dialect::current() != Dialect::Postgres {
+        return;
+    }
+    let decorated = query_decorated_columns(model);
+    let keep = |c: &Column| {
+        c.col_type == crate::schema::ColumnType::Uuid
+            && !c.array
+            && !model.enums.contains_key(&c.name)
+            && decorated.as_ref().is_some_and(|names| !names.contains(&c.name))
+    };
+    push_schema_symbol_list(methods, &model.name, "schema_uuid_query_columns", table, keep);
+}
+
 pub(super) fn push_schema_methods(
     methods: &mut Vec<MethodDef>,
     model: &Model,
@@ -199,6 +341,7 @@ pub(super) fn push_schema_methods(
     table: &Table,
     through_joins: &super::associations::ThroughJoins,
     runtime_relation: super::RuntimeRelation,
+    source: crate::schema::generated::GeneratedExpressionDialect,
 ) {
     let owner = &model.name;
 
@@ -238,6 +381,7 @@ pub(super) fn push_schema_methods(
     );
     if runtime_relation == super::RuntimeRelation::Present {
         push_enum_condition_methods(methods, model, table);
+        push_enum_where_methods(methods, model, table);
     }
     let mut demanded: Option<std::rc::Rc<crate::det::HashSet<Symbol>>> = None;
     for col in &table.columns {
@@ -283,13 +427,14 @@ pub(super) fn push_schema_methods(
             model,
             runtime_relation == super::RuntimeRelation::Present,
         ));
-        // An enum label can share its column's name. Rails' enum predicate
-        // overrides the generic attribute query in that case; otherwise
-        // push_user_methods would discard the value comparison as a duplicate.
-        let predicate = Symbol::from(format!("{}?", col.name.as_str()));
-        if !model.enums.contains_key(&col.name)
-            || !super::associations::model_defines_instance_method(model, &predicate)
-        {
+        // The model's own `<col>?` (a `def`, or an enum label sharing the
+        // column's name) overrides the generic attribute query, as in
+        // Rails, where attribute methods live in a module the class
+        // includes; otherwise push_user_methods would keep the generated
+        // predicate and discard the model's as a duplicate. A `def` that
+        // calls `super` wants the generated one, which has no other name
+        // to reach it by yet, so the generated predicate stays there.
+        if !own_column_predicate(model, col) {
             methods.push(synth_column_predicate(owner, col));
         }
         // `<col>_previously_changed?` and `saved_change_to_<col>?`
@@ -507,7 +652,7 @@ pub(super) fn push_schema_methods(
             continue;
         }
         let predicate = crate::emit::shared::schema_sql::Dialect::current()
-            .index_predicate(table, i)
+            .index_predicate(table, i, source)
             .map(str::to_string);
         targets.push((cols, predicate));
     }
@@ -619,12 +764,17 @@ pub(super) fn push_schema_methods(
     // Schema column-name lists. Time vs date stay separate so JSON can
     // apply ISO8601-with-offset vs calendar-only without sniffing values.
     push_schema_symbol_list(methods, owner, "schema_columns", table, |_| true);
-    push_schema_column_types(methods, owner, table);
+    push_schema_column_types(methods, owner, table, source);
+    if runtime_relation == super::RuntimeRelation::Present {
+        push_schema_integer_query_limits(methods, model, table);
+        push_schema_uuid_query_columns(methods, model, table);
+    }
     let json_coder = crate::lower::serialize::json_serialize_columns(model);
     if table.columns.iter().any(|c| json_coder.contains(&c.name)) {
         push_schema_symbol_list(methods, owner, "schema_json_coder_columns", table, |c| json_coder.contains(&c.name));
     }
     push_decode_plucked(methods, owner, table);
+    push_encode_written(methods, owner, table);
     push_schema_symbol_list(methods, owner, "schema_time_columns", table, |c| {
         matches!(c.col_type, crate::schema::ColumnType::DateTime | crate::schema::ColumnType::Time)
     });
@@ -644,7 +794,11 @@ pub(super) fn push_schema_methods(
     // narrows it once via `<Model>Row.from_raw(row)` and then constructs
     // the model via `<Model>.from_row(typed_row)`. The Hash-shaped
     // boundary stops at `from_raw`; everything downstream is typed.
-    methods.push(synth_instantiate(owner, model_declares_after_initialize(model)));
+    methods.push(synth_instantiate(
+        owner,
+        model_declares_after_initialize(model),
+        runtime_relation == super::RuntimeRelation::Present,
+    ));
 
     // def attributes_before_type_cast; { "id" => @id, "created_at" => @created_at_raw, ... }; end
     //
@@ -744,7 +898,7 @@ pub(super) fn push_schema_methods(
     // there (`rewrite_update_to_typed_variant`), and `update` stays
     // Rails-shaped for everyone else.
     for bang in [false, true] {
-        methods.push(synth_update_hash(owner, model, table, bang));
+        methods.push(synth_update_hash(owner, model, table, bang, runtime_relation));
     }
 
     // def fill_timestamps(creating); now = ActiveSupport.db_now; @updated_at = now; @created_at = now if creating; end
@@ -812,13 +966,10 @@ pub(super) fn push_schema_methods(
 pub fn shakeable_synthesized_names(table: &Table, model: &Model) -> Vec<Symbol> {
     let mut names: Vec<Symbol> = Vec::new();
     for col in &table.columns {
-        // Mirror push_schema_methods: an enum's user-defined predicate
-        // was not synthesized and must never be a shake candidate.
-        let predicate = Symbol::from(format!("{}?", col.name.as_str()));
-        if !model.enums.contains_key(&col.name)
-            || !super::associations::model_defines_instance_method(model, &predicate)
-        {
-            names.push(predicate);
+        // Mirror push_schema_methods: a model's own predicate was not
+        // synthesized and must never be a shake candidate.
+        if !own_column_predicate(model, col) {
+            names.push(Symbol::from(format!("{}?", col.name.as_str())));
         }
         // Mirrors the two `synth_column_dirty_pred` spellings (both
         // skipped for `id`, which Base answers from its own flag).
@@ -1018,6 +1169,29 @@ fn synth_fill_timestamps(owner: &ClassId, table: &Table) -> Option<MethodDef> {
 /// affix `Pred`/`_pred`. Before that was uniform this synthesizer fired for
 /// boolean columns only (and no fixture has one, so it was never exercised
 /// cross-target).
+/// The model's own `<col>?` (a `def`, or an enum label sharing the
+/// column's name) replaces the generated attribute predicate, which is
+/// then neither synthesized nor a tree-shake candidate.
+pub fn own_column_predicate(model: &Model, col: &Column) -> bool {
+    let predicate = Symbol::from(format!("{}?", col.name.as_str()));
+    super::associations::model_defines_instance_method(model, &predicate)
+        && (model.enums.contains_key(&col.name) || !instance_method_calls_super(model, &predicate))
+}
+
+/// Some instance `def` of `name` in the model body calls `super`.
+fn instance_method_calls_super(model: &Model, name: &Symbol) -> bool {
+    use crate::dialect::ModelBodyItem;
+    fn calls_super(e: &Expr) -> bool {
+        let mut found = matches!(&*e.node, ExprNode::Super { .. });
+        e.node.for_each_child(&mut |c| found = found || calls_super(c));
+        found
+    }
+    model.body.iter().any(|item| {
+        matches!(item, ModelBodyItem::Method { method, .. }
+            if method.name == *name && method.receiver == MethodReceiver::Instance && calls_super(&method.body))
+    })
+}
+
 fn synth_column_predicate(owner: &ClassId, col: &Column) -> MethodDef {
     let col_ty = ty_of_column(&col.col_type);
     // The ivar's real type — nullable columns hold nil, and the
@@ -1815,7 +1989,7 @@ fn synth_json_storage_writer(owner: &ClassId, col: &Column) -> MethodDef {
     }
 }
 
-fn synth_instantiate(owner: &ClassId, fire_after_initialize: bool) -> MethodDef {
+fn synth_instantiate(owner: &ClassId, fire_after_initialize: bool, note_unloaded: bool) -> MethodDef {
     let row = Symbol::from("row");
     let instance = Symbol::from("instance");
     let row_class = row_class_id(owner);
@@ -1871,9 +2045,11 @@ fn synth_instantiate(owner: &ClassId, fire_after_initialize: bool) -> MethodDef 
     // (`if new_record? || has_attribute?(:token)`) is exactly that test
     // — a `User.select(*attrs)` that omits `token` must not mint one.
     // Persisted first, noted second, hook last: the order Rails' hook
-    // observes. Only models with a hook note anything (see
+    // observes. On the ruby family every row is noted, since a left-out
+    // column's generated reader raises there (`lower::missing_attribute`);
+    // elsewhere only models with a hook note anything (see
     // `Base#_note_unloaded`).
-    if fire_after_initialize {
+    if fire_after_initialize || note_unloaded {
         stmts.push(Expr::new(
             Span::synthetic(),
             ExprNode::Send {
@@ -1884,6 +2060,8 @@ fn synth_instantiate(owner: &ClassId, fire_after_initialize: bool) -> MethodDef 
                 parenthesized: true,
             },
         ));
+    }
+    if fire_after_initialize {
         stmts.push(Expr::new(
             Span::synthetic(),
             ExprNode::Send {
@@ -2834,7 +3012,10 @@ fn synth_column_dirty_pred(owner: &ClassId, col: &Column, name: Symbol) -> Metho
 /// the hook-call tails in `synth_initialize` and the hydration
 /// factories, so hook-free models (the whole blog fixture) emit
 /// nothing new on any target.
-pub(super) fn model_declares_after_initialize(model: &Model) -> bool {
+/// The synthesized `initialize`'s second parameter, true when the caller runs the initialization callbacks itself.
+pub(crate) const DEFER_INITIALIZE_CALLBACKS: &str = "defer_initialize_callbacks";
+
+pub(crate) fn model_declares_after_initialize(model: &Model) -> bool {
     use crate::dialect::ModelBodyItem;
     model.body.iter().any(|item| match item {
         ModelBodyItem::Method { method, .. } => {
@@ -3020,7 +3201,7 @@ fn synth_initialize(
                 target: LValue::Ivar { name: col_storage_name(col) },
                 value: with_ty(raw_default, slot_ty.clone()),
             }), slot_ty));
-            stmts.push(given_value_assign(col, &attrs, enum_label_cast(model, col, lookup.clone()).unwrap_or_else(|| Expr::new(Span::synthetic(), ExprNode::Cast { value: lookup, target_ty: super::ty_of_column_slot(col) }))));
+            stmts.push(given_value_assign(col, &attrs, enum_writer_input(model, col, lookup.clone(), runtime_relation).unwrap_or_else(|| Expr::new(Span::synthetic(), ExprNode::Cast { value: lookup, target_ty: super::ty_of_column_slot(col) }))));
             continue;
         }
         // is_id_column reference retained as a feature flag for
@@ -3654,7 +3835,8 @@ fn synth_initialize(
     // with `HYDRATE_ATTRS` (see `hydrate_attrs_const`): that record is
     // an empty shell until its columns land, and the factory fires the
     // hook itself once they have.
-    if model_declares_after_initialize(model) {
+    let defers = model_declares_after_initialize(model);
+    if defers {
         let hook = Expr::new(
             Span::synthetic(),
             ExprNode::Send {
@@ -3666,10 +3848,22 @@ fn synth_initialize(
             },
         );
         let hydrating = bool_send(var_ref(Symbol::from("attrs")), "equal?", hydrate_attrs_const());
+        // Not run here for a creation block: Rails yields the record to it before its initialization callbacks, and the
+        // block cannot be passed to `new` on every target, so `lower::first_or_create` runs it and then the hook.
+        let deferred = var_ref(Symbol::from(DEFER_INITIALIZE_CALLBACKS));
+        let cond = Expr::new(
+            Span::synthetic(),
+            ExprNode::BoolOp {
+                op: crate::expr::BoolOpKind::Or,
+                surface: crate::expr::BoolOpSurface::Symbol,
+                left: hydrating,
+                right: with_ty(deferred, Ty::Bool),
+            },
+        );
         stmts.push(Expr::new(
             Span::synthetic(),
             ExprNode::If {
-                cond: with_ty(no_arg_send(hydrating, "!"), Ty::Bool),
+                cond: with_ty(no_arg_send(with_ty(cond, Ty::Bool), "!"), Ty::Bool),
                 then_branch: hook,
                 else_branch: Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
             },
@@ -3688,14 +3882,21 @@ fn synth_initialize(
         ExprNode::Hash { entries: Vec::new(), kwargs: false },
     );
     let attrs_ty = Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Untyped) };
-    let signature = Ty::Fn {
-        params: vec![crate::ty::Param {
-            name: attrs.clone(), ty: attrs_ty.into(), kind: crate::ty::ParamKind::Optional,
-        }].into(),
+    let mut sig_params = vec![crate::ty::Param {
+        name: attrs.clone(), ty: attrs_ty.into(), kind: crate::ty::ParamKind::Optional,
+    }];
+    let mut params = vec![Param::with_default(attrs.clone(), attrs_default)];
+    if defers {
+        let name = Symbol::from(DEFER_INITIALIZE_CALLBACKS);
+        sig_params.push(crate::ty::Param { name: name.clone(), ty: Ty::Bool.into(), kind: crate::ty::ParamKind::Optional });
+        params.push(Param::with_default(name, Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Bool { value: false } })));
+    }
+    let signature = Ty::Fn(Box::new(FnTy {
+        params: sig_params.into(),
         block: None,
         ret: std::sync::Arc::new(Ty::Nil),
         effects: EffectSet::default(),
-    };
+    }));
     MethodDef {
         visibility: crate::dialect::MethodVisibility::Private,
         unsupported_formals: None,
@@ -3703,7 +3904,7 @@ fn synth_initialize(
         name_span: crate::span::Span::synthetic(),
         name: Symbol::from("initialize"),
         receiver: MethodReceiver::Instance,
-        params: vec![Param::with_default(attrs.clone(), attrs_default)],
+        params,
         body: seq(stmts),
         signature: Some(signature),
         effects: EffectSet::default(),
@@ -3964,6 +4165,29 @@ fn enum_label_cast(model: &Model, col: &Column, raw: Expr) -> Option<Expr> {
     enum_setter_value(model, col, raw)
 }
 
+/// What the constructor and `update` hand an enum column's public
+/// writer, which casts what it is given (`enum_setter_value`). A String
+/// mapping's value goes in as assigned, so it is cast once, as Rails
+/// casts an assigned value once: cast here as well, a stored value that
+/// is also a label (`{ queued: "sent", sent: "done" }`) was read again
+/// as that label. An Integer mapping keeps the cast ahead of the writer,
+/// whose own cast passes a stored Integer through.
+///
+/// The Ruby-family writer takes the value untyped (`synth_attr_writer`'s
+/// `raw_inputs`) and keeps it for `<col>_before_type_cast`, so it is
+/// handed over as is; elsewhere the writer takes the column's type, so a
+/// `Cast` bridges the untyped attrs value.
+fn enum_writer_input(model: &Model, col: &Column, raw: Expr, runtime_relation: super::RuntimeRelation) -> Option<Expr> {
+    match enum_arrays(model, col) {
+        Some((_, _, Ty::Str)) if runtime_relation == super::RuntimeRelation::Present => Some(raw),
+        Some((_, _, Ty::Str)) => Some(Expr::new(
+            Span::synthetic(),
+            ExprNode::Cast { value: raw, target_ty: super::ty_of_column_slot(col) },
+        )),
+        _ => enum_label_cast(model, col, raw),
+    }
+}
+
 /// The setter's twin of [`enum_label_cast`]: `record.status = "archived"` reaches the column through `status=`.
 fn enum_setter_value(model: &Model, col: &Column, value: Expr) -> Option<Expr> {
     let text = Expr::new(
@@ -4040,6 +4264,124 @@ fn push_enum_condition_methods(methods: &mut Vec<MethodDef>, model: &Model, tabl
             block_param: None,
         });
     }
+}
+
+/// The runtime relation's cast of a `where` value on an enum column
+/// (#2078): `def self.schema_enum_columns; [:status]; end`, and
+/// `def self._enum_where_value(col, value)` answering
+/// `ActiveRecord.enum_where_int(value, STATUS_ENUM_LABELS,
+/// STATUS_ENUM_VALUES, "")` for `col == "status"` and nil for any
+/// other column, which `schema_enum_columns` keeps from calling it.
+/// `lower::enum_symbols` casts a literal label when the app is lowered;
+/// this is the half for a label known only at runtime (a method
+/// argument, a `params` value), which Rails casts through the enum type
+/// as well. Nothing for a model without an enum, so the base
+/// class's defaults (no enum column) answer.
+fn push_enum_where_methods(methods: &mut Vec<MethodDef>, model: &Model, table: &Table) {
+    let castable = |c: &Column| model.enums.contains_key(&c.name) && enum_arrays(model, c).is_some();
+    if !table.columns.iter().any(castable) {
+        return;
+    }
+    push_schema_symbol_list(methods, &model.name, "schema_enum_columns", table, castable);
+    let col_param = Symbol::from("col");
+    let value = Symbol::from("value");
+    // The value types `ActiveRecord.enum_where_int` / `enum_where_str`
+    // take, and the stored value either answers.
+    let value_ty = Ty::Union { variants: vec![Ty::Int, Ty::Float, Ty::Bool, Ty::Sym, Ty::Str, Ty::Nil].into() };
+    let stored_ty = Ty::Union { variants: vec![Ty::Int, Ty::Str, Ty::Nil].into() };
+    let mut body = nil_lit();
+    for col in table.columns.iter().rev().filter(|c| castable(c)) {
+        let Some((_, _, col_value_ty)) = enum_arrays(model, col) else { continue };
+        let (labels, values, _) = enum_array_refs(model, col, &col_value_ty);
+        let nil_label = enum_nil_label(model, col).unwrap_or_default();
+        let cast = with_ty(
+            Expr::new(
+                Span::synthetic(),
+                ExprNode::Send {
+                    recv: Some(Expr::new(Span::synthetic(), ExprNode::Const { path: vec![Symbol::from("ActiveRecord")] })),
+                    method: Symbol::from(if col_value_ty == Ty::Int { "enum_where_int" } else { "enum_where_str" }),
+                    args: vec![with_ty(var_ref(value.clone()), value_ty.clone()), labels, values, with_ty(lit_str(nil_label), Ty::Str)],
+                    block: None,
+                    parenthesized: true,
+                },
+            ),
+            Ty::Union { variants: vec![if col_value_ty == Ty::Int { Ty::Int } else { Ty::Str }, Ty::Nil].into() },
+        );
+        let is_col = with_ty(
+            Expr::new(
+                Span::synthetic(),
+                ExprNode::Send {
+                    recv: Some(with_ty(var_ref(col_param.clone()), Ty::Str)),
+                    method: Symbol::from("=="),
+                    args: vec![with_ty(lit_str(col.name.as_str().to_string()), Ty::Str)],
+                    block: None,
+                    parenthesized: false,
+                },
+            ),
+            Ty::Bool,
+        );
+        body = with_ty(Expr::new(Span::synthetic(), ExprNode::If { cond: is_col, then_branch: cast, else_branch: body }), stored_ty.clone());
+    }
+    // `stored = <the column's cast>; stored`: the method ends in a read
+    // of its typed result, not in the chain's trailing `nil`.
+    let stored = Symbol::from("stored");
+    let body = seq(vec![
+        with_ty(
+            Expr::new(
+                Span::synthetic(),
+                ExprNode::Assign { target: LValue::Var { id: VarId(0), name: stored.clone() }, value: body },
+            ),
+            stored_ty.clone(),
+        ),
+        with_ty(var_ref(stored), stored_ty.clone()),
+    ]);
+    methods.push(MethodDef {
+        visibility: crate::dialect::MethodVisibility::Public,
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        name_span: Span::synthetic(),
+        name: Symbol::from("_enum_where_value"),
+        receiver: MethodReceiver::Class,
+        params: vec![Param::positional(col_param.clone()), Param::positional(value.clone())],
+        body,
+        signature: Some(fn_sig(vec![(col_param, Ty::Str), (value, value_ty)], stored_ty)),
+        effects: EffectSet::default(),
+        enclosing_class: Some(model.name.0.clone()),
+        kind: AccessorKind::Method,
+        is_async: false,
+        mutates_self: false,
+        block_param: None,
+    });
+}
+
+/// The cast `_enum_where_value` applies to a String-valued enum
+/// column, around `value`: `ActiveRecord.enum_where_str(value,
+/// STATUS_ENUM_LABELS, STATUS_ENUM_VALUES, "<nil label>")`, a label's
+/// stored value (nil for the `nil` entry's) and anything else as given.
+/// A `where` folded to SQL on the Ruby-family targets
+/// (`arel::ruby_values`) casts a value known only at runtime with it,
+/// since no runtime relation sees that value. `None` for any other
+/// mapping.
+pub(crate) fn enum_where_str_cast(model: &Model, col: &Column, value: Expr) -> Option<Expr> {
+    let (_, _, value_ty) = enum_arrays(model, col)?;
+    if value_ty != Ty::Str {
+        return None;
+    }
+    let (labels, values, _) = enum_array_refs(model, col, &value_ty);
+    let nil_label = enum_nil_label(model, col).unwrap_or_default();
+    Some(with_ty(
+        Expr::new(
+            Span::synthetic(),
+            ExprNode::Send {
+                recv: Some(Expr::new(Span::synthetic(), ExprNode::Const { path: vec![Symbol::from("ActiveRecord")] })),
+                method: Symbol::from("enum_where_str"),
+                args: vec![value, labels, values, with_ty(lit_str(nil_label), Ty::Str)],
+                block: None,
+                parenthesized: true,
+            },
+        ),
+        Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() },
+    ))
 }
 
 /// What `normalizes` on an enum hands its lambda: the label, as Rails'
@@ -4649,10 +4991,21 @@ fn schema_default_literal(col: &Column) -> Option<Expr> {
     }
     let raw = col.stored_default()?;
     if col.array_stored {
-        // `default: []`, the only array default ingest keeps: a fresh
-        // empty Array of the column's element type.
+        // The array default ingest keeps (`[]`, `[0]`, `["a"]`, as JSON):
+        // a fresh Array of the column's element type, with its elements.
+        let elements = match serde_json::from_str::<serde_json::Value>(raw).ok()? {
+            serde_json::Value::Array(elements) => elements,
+            _ => return None,
+        };
+        let elements = elements
+            .iter()
+            .map(|e| match e {
+                serde_json::Value::String(s) => Some(lit_str(s.clone())),
+                _ => e.as_i64().map(lit_int),
+            })
+            .collect::<Option<Vec<_>>>()?;
         return Some(with_ty(
-            Expr::new(Span::synthetic(), ExprNode::Array { elements: vec![], style: ArrayStyle::Brackets }),
+            Expr::new(Span::synthetic(), ExprNode::Array { elements, style: ArrayStyle::Brackets }),
             super::ty_of_column_slot(col),
         ));
     }
@@ -5347,6 +5700,7 @@ fn synth_update_hash(
     model: &Model,
     table: &Table,
     bang: bool,
+    runtime_relation: super::RuntimeRelation,
 ) -> MethodDef {
     let attrs = Symbol::from("attrs");
 
@@ -5417,7 +5771,7 @@ fn synth_update_hash(
             lookup(&col.name),
             slot_ty.clone(),
         )
-        .or_else(|| enum_label_cast(model, col, lookup(&col.name)))
+        .or_else(|| enum_writer_input(model, col, lookup(&col.name), runtime_relation))
         .or_else(|| column.is_json().then(|| lookup(&col.name)))
         .unwrap_or_else(|| {
             Expr::new(

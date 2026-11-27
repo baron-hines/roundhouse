@@ -206,9 +206,17 @@ impl Inheritance {
                         ancestors.push(id.clone());
                         parent = models.get(id).and_then(|m| m.parent.as_ref());
                     }
+                    // A class with no table of its own — a form object that
+                    // only `include ActiveModel::Model` — has no column surface
+                    // to collide with: the virtual attributes the accessor
+                    // declares ARE its storage. A model whose table the schema
+                    // merely lacks stays ineligible: its columns are unknown,
+                    // not absent.
+                    let tableless = model.parent.is_none()
+                        && super::validations::includes_active_model_model(model);
                     let eligible = !ambiguous.contains(&model.name)
                         && !super::markers::is_abstract_class(model)
-                        && app.schema.tables.contains_key(&model.table.0);
+                        && (app.schema.tables.contains_key(&model.table.0) || tableless);
                     (model.name.clone(), eligible, ancestors)
                 })
                 .collect(),

@@ -7,26 +7,21 @@
 # set does.
 module ActionDispatch
   class Flash
-    def initialize(other = nil)
-      @notice = nil
-      @alert  = nil
-      @notice_was = nil
-      @alert_was  = nil
+    # The shared constructor calls these: every loaded key is carried and discarded at the sweep.
+    def begin_carry
       @others = {}
       @discard = []
-      return if other.nil?
-      other.each do |k, v|
-        if k == "notice"
-          @notice = v
-          @notice_was = v
-        elsif k == "alert"
-          @alert = v
-          @alert_was = v
-        else
-          @others[k] = v
-        end
-        @discard.push(k)
-      end
+      nil
+    end
+
+    def carry_other(key, value)
+      @others[key] = value
+      nil
+    end
+
+    def carried(key)
+      @discard.push(key)
+      nil
     end
 
     def now
@@ -207,33 +202,6 @@ module ActionDispatch
         result[k] = v
       end
       result
-    end
-
-    def self.signed_cookie(value, name)
-      return ActionDispatch::SignedCookie.sign(value, name) if value.is_a?(String)
-      ActionController::MessageVerifier.generate(
-        Rails.application.secret_key_base,
-        ActionController::MessageVerifier::SIGNED_COOKIE_SALT,
-        JSON.generate(value), "flash.json." + name, true
-      )
-    end
-
-    def self.cookie_flashes(raw, name)
-      result = {}
-      encoded = ActionController::MessageVerifier.verified(
-        Rails.application.secret_key_base,
-        ActionController::MessageVerifier::SIGNED_COOKIE_SALT,
-        raw, "flash.json." + name, true
-      )
-      if encoded.empty?
-        legacy = ActionDispatch::SignedCookie.verified(raw, name)
-        result[name[6, name.length - 6]] = legacy unless legacy.empty?
-      else
-        result[name[6, name.length - 6]] = JSON.parse(encoded)
-      end
-      result
-    rescue JSON::ParserError
-      {}
     end
   end
 

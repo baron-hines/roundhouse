@@ -6,6 +6,7 @@
 
 use crate::ingest::prism_api::PrismLocation;
 mod hoist;
+mod load_order;
 
 use std::collections::hash_map::Entry;
 use crate::det::{HashMap, HashSet};
@@ -57,6 +58,14 @@ class Enumerator < Object\nend\n";
 /// `core_rbs()` emits the RBS; `core_value_type` answers the type.
 const CORE_VALUE_CONSTS: &[(&str, &str, fn() -> Ty)] = &[
     ("Float", "INFINITY", || Ty::Float),
+    // `2 * Math::PI * radius` (maybe's progress circle).
+    ("Math", "PI", || Ty::Float),
+    ("Math", "E", || Ty::Float),
+    // `Date::ABBR_MONTHNAMES.compact` (maybe's budget picker): index 0 is nil, as Ruby's are.
+    ("Date", "MONTHNAMES", || Ty::Array { elem: std::sync::Arc::new(Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() }) }),
+    ("Date", "ABBR_MONTHNAMES", || Ty::Array { elem: std::sync::Arc::new(Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() }) }),
+    ("Date", "DAYNAMES", || Ty::Array { elem: std::sync::Arc::new(Ty::Str) }),
+    ("Date", "ABBR_DAYNAMES", || Ty::Array { elem: std::sync::Arc::new(Ty::Str) }),
     ("Float", "NAN", || Ty::Float),
     ("Float", "EPSILON", || Ty::Float),
     ("Float", "MAX", || Ty::Float),
@@ -112,6 +121,21 @@ const CORE_VALUE_CONSTS: &[(&str, &str, fn() -> Ty)] = &[
     // `packages/openssl` (same values) on spinel.
     ("OpenSSL::SSL", "VERIFY_NONE", || Ty::Int),
     ("OpenSSL::SSL", "VERIFY_PEER", || Ty::Int),
+    // `sock.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY, 1)` — a network client's connection options.
+    // The values both CRuby and spinel answer on every platform the trees build on (not SOL_TCP or
+    // TCP_KEEPIDLE, which one of them lacks on macOS).
+    ("Socket", "IPPROTO_TCP", || Ty::Int),
+    ("Socket", "IPPROTO_IPV6", || Ty::Int),
+    ("Socket", "SOL_SOCKET", || Ty::Int),
+    ("Socket", "SO_KEEPALIVE", || Ty::Int),
+    ("Socket", "SO_REUSEADDR", || Ty::Int),
+    ("Socket", "TCP_NODELAY", || Ty::Int),
+    ("Socket", "TCP_KEEPINTVL", || Ty::Int),
+    ("Socket", "TCP_KEEPCNT", || Ty::Int),
+    ("Socket", "AF_INET", || Ty::Int),
+    ("Socket", "AF_INET6", || Ty::Int),
+    ("Socket", "AF_UNSPEC", || Ty::Int),
+    ("Socket", "SOCK_STREAM", || Ty::Int),
     ("Zlib", "BEST_COMPRESSION", || Ty::Int),
     ("Zlib", "MAX_WBITS", || Ty::Int),
     ("Zlib", "FINISH", || Ty::Int),
@@ -124,7 +148,14 @@ const CORE_VALUE_CONSTS: &[(&str, &str, fn() -> Ty)] = &[
     ("URI", "DEFAULT_PARSER", uri_rfc3986_parser),
     ("URI", "RFC3986_PARSER", uri_rfc3986_parser),
     ("URI", "RFC2396_PARSER", uri_rfc2396_parser),
+    // `RbConfig::CONFIG["host_os"]` — a gem's platform branch. Ruby's own on the ruby family, spinel's
+    // `builtins/rbconfig.rb` (the machine it compiled for, String values throughout) on spinel.
+    ("RbConfig", "CONFIG", str_str_hash),
 ];
+
+fn str_str_hash() -> Ty {
+    Ty::Hash { key: std::sync::Arc::new(Ty::Str), value: std::sync::Arc::new(Ty::Str) }
+}
 
 fn uri_rfc2396_parser() -> Ty {
     Ty::Class { id: ClassId(Symbol::from("URI::RFC2396_Parser")), args: vec![].into() }
@@ -135,7 +166,7 @@ fn uri_rfc3986_parser() -> Ty {
 }
 
 /// Owners of value Consts that Ruby defines as modules, not classes.
-const CORE_VALUE_MODULES: &[&str] = &["URI", "Math", "Zlib"];
+const CORE_VALUE_MODULES: &[&str] = &["URI", "Math", "Zlib", "RbConfig"];
 
 /// Ruby's top-level value Consts: `STDERR.puts "…"` (discourse's
 /// warnings) reads the process's own stream, which `$stderr` is only
@@ -144,7 +175,7 @@ const CORE_TOP_CONSTS: &[&str] = &["STDIN", "STDOUT", "STDERR"];
 
 /// `if RUBY_VERSION >= "2.7.1"` (aasm, hashie): the running Ruby's own
 /// version, which a compile-time answer would freeze to the wrong one.
-const CORE_TOP_STR_CONSTS: &[&str] = &["RUBY_VERSION", "RUBY_PLATFORM"];
+const CORE_TOP_STR_CONSTS: &[&str] = &["RUBY_VERSION", "RUBY_PLATFORM", "RUBY_ENGINE"];
 
 fn io_ty() -> Ty {
     Ty::Class { id: ClassId(Symbol::from("IO")), args: vec![].into() }
@@ -157,6 +188,7 @@ const CORE_VALUE_CLASSES: &[(&str, &str)] = &[
     ("File", "IO"),
     ("Encoding", "Object"),
     ("OpenSSL::SSL", "Object"),
+    ("Socket", "IO"),
     ("Regexp", "Object"),
     ("Date", "Object"),
 ];
@@ -171,6 +203,9 @@ fn rbs_type_name(ty: &Ty) -> &'static str {
         Ty::Int => "Integer",
         Ty::Str => "String",
         Ty::Class { id, .. } if id.0.as_str() == "Encoding" => "Encoding",
+        Ty::Hash { key, value } if matches!((&**key, &**value), (Ty::Str, Ty::Str)) => "Hash[String, String]",
+        Ty::Array { elem } if matches!(&**elem, Ty::Str) => "Array[String]",
+        Ty::Array { elem } if matches!(&**elem, Ty::Union { variants } if variants.len() == 2 && variants.contains(&Ty::Str) && variants.contains(&Ty::Nil)) => "Array[String?]",
         _ => "untyped",
     }
 }
@@ -179,6 +214,22 @@ fn core_rbs() -> &'static str {
     static RBS: OnceLock<String> = OnceLock::new();
     RBS.get_or_init(|| {
         let mut out = String::from(CORE_RBS_BASE);
+        // (the namespace too: a `class OpenSSL::SSL` alone leaves `OpenSSL` undeclared, and a read of
+        // `OpenSSL::SSL::VERIFY_NONE` from inside a nested module found no `OpenSSL` to start the path from)
+        let mut declared: Vec<&str> = Vec::new();
+        for (class, _) in CORE_VALUE_CLASSES {
+            let mut at = 0;
+            while let Some(i) = class[at..].find("::") {
+                let outer = &class[..at + i];
+                if !declared.contains(&outer) && !CORE_VALUE_CLASSES.iter().any(|(c, _)| *c == outer) {
+                    declared.push(outer);
+                    out.push_str("module ");
+                    out.push_str(outer);
+                    out.push_str("\nend\n");
+                }
+                at += i + 2;
+            }
+        }
         for (class, parent) in CORE_VALUE_CLASSES {
             out.push_str("class ");
             out.push_str(class);
@@ -261,6 +312,19 @@ pub(crate) fn is_core_value_constant(name: &str) -> bool {
     core_value_type(name).is_some()
 }
 
+/// The type of a value constant `core_rbs()` declares (`Math::PI`), for a reference no source document answers.
+pub(crate) fn core_value_constant_type(name: &str) -> Option<Ty> {
+    core_value_type(name)
+}
+
+/// The constants a platform may lack, read where a load-time branch has tested for them
+/// (`ingest::platform_guards`); not core values, since a read anywhere else may raise NameError.
+const PLATFORM_CONSTANTS: &[&str] = &["Socket::SOL_TCP", "Socket::TCP_KEEPIDLE", "Socket::TCP_KEEPALIVE"];
+
+pub(crate) fn platform_constant_type(name: &str) -> Option<Ty> {
+    PLATFORM_CONSTANTS.contains(&name.trim_start_matches("::")).then_some(Ty::Int)
+}
+
 /// The value contract contributed by a constant declared in `core_rbs()`.
 fn core_value_type(name: &str) -> Option<Ty> {
     if name.trim_start_matches("Object::") == "ENV" {
@@ -272,6 +336,7 @@ fn core_value_type(name: &str) -> Option<Ty> {
     if CORE_TOP_STR_CONSTS.contains(&name.trim_start_matches("Object::")) {
         return Some(Ty::Str);
     }
+    let name = name.trim_start_matches("Object::");
     CORE_VALUE_CONSTS.iter().find_map(|(owner, field, ty)| {
         let need = owner.len() + 2 + field.len();
         (name.len() == need
@@ -322,6 +387,9 @@ struct FileAnswers {
     sole_namespaces: HashSet<Box<str>>,
     singleton_methods: HashMap<Box<str>, HashSet<Box<str>>>,
     singleton_owners: HashSet<Box<str>>,
+    /// References read while the file loads that an enclosing namespace's constant, defined only later, does not
+    /// shadow yet: the typer writes them from the top level, as the emitted tree may define that namespace first.
+    rooted: HashSet<u32>,
 }
 
 /// The identity map's hasher is not `Clone`, so its entries are copied.
@@ -343,6 +411,7 @@ impl Clone for FileAnswers {
             sole_namespaces: self.sole_namespaces.clone(),
             singleton_methods: self.singleton_methods.clone(),
             singleton_owners: self.singleton_owners.clone(),
+            rooted: self.rooted.clone(),
         }
     }
 }
@@ -696,7 +765,8 @@ impl ConstResolver {
             if !ancestors.contains(&own) { ancestors.insert(0, own.clone()); }
             Some((own, ancestors))
         }).collect();
-        let files = crate::timings::phase("rubydex: answers", || collect_answers(&graph, sources));
+        let order = load_order::LoadOrder::of(sources);
+        let files = crate::timings::phase("rubydex: answers", || collect_answers(&graph, sources, &order));
         drop(graph);
         let mut declared: Vec<&str> = files.iter().flatten().flat_map(|file| file.class_definitions.iter().map(|name| name.as_ref())).collect();
         declared.sort_unstable();
@@ -778,6 +848,12 @@ impl ConstResolver {
 
     /// App and runtime sources define this reference; RBI declarations do
     /// not enter this graph and cannot establish source ownership.
+    /// [`FileAnswers::rooted`].
+    pub(super) fn rooted(&self, span: Span, path: &[Symbol]) -> bool {
+        let Some(length) = path.last().and_then(|last| u32::try_from(last.as_str().len()).ok()) else { return false };
+        span.end.checked_sub(length).is_some_and(|start| self.file(span.file).is_some_and(|file| file.rooted.contains(&start)))
+    }
+
     pub(crate) fn has_definition(&self, span: Span, path: &[Symbol]) -> bool {
         self.reference(span, path).is_some_and(|resolved| resolved.is_some())
     }
@@ -804,7 +880,7 @@ impl ConstResolver {
 
     /// A declaration header is not a constant reference. Its body still runs
     /// on the resolved namespace, including qualified reopenings and aliases.
-    pub(in crate::analyze) fn namespace_body(&self, span: Span) -> Option<&ClassId> {
+    pub(crate) fn namespace_body(&self, span: Span) -> Option<&ClassId> {
         self.file(span.file)?.namespace_bodies.get(&span.end)
     }
 
@@ -1013,7 +1089,7 @@ fn index_sources(sources: &[SourceFile]) -> Graph {
 /// leaves memory before the inference fixpoint starts. The answers for
 /// each file are independent, so workers collect them in parallel.
 #[cfg(not(target_arch = "wasm32"))]
-fn collect_answers(graph: &Graph, sources: &[SourceFile]) -> Vec<Option<FileAnswers>> {
+fn collect_answers(graph: &Graph, sources: &[SourceFile], order: &load_order::LoadOrder) -> Vec<Option<FileAnswers>> {
     let workers = std::thread::available_parallelism()
         .map_or(1, std::num::NonZeroUsize::get)
         .min(MAX_WORKERS);
@@ -1021,7 +1097,7 @@ fn collect_answers(graph: &Graph, sources: &[SourceFile]) -> Vec<Option<FileAnsw
     std::thread::scope(|scope| {
         let chunks: Vec<_> = sources
             .chunks(chunk)
-            .map(|chunk| scope.spawn(move || answer_files(graph, chunk)))
+            .map(|chunk| scope.spawn(move || answer_files(graph, chunk, order)))
             .collect();
         chunks
             .into_iter()
@@ -1036,15 +1112,15 @@ fn collect_answers(graph: &Graph, sources: &[SourceFile]) -> Vec<Option<FileAnsw
 
 /// The browser build has no threads.
 #[cfg(target_arch = "wasm32")]
-fn collect_answers(graph: &Graph, sources: &[SourceFile]) -> Vec<Option<FileAnswers>> {
-    answer_files(graph, sources)
+fn collect_answers(graph: &Graph, sources: &[SourceFile], order: &load_order::LoadOrder) -> Vec<Option<FileAnswers>> {
+    answer_files(graph, sources, order)
 }
 
-fn answer_files(graph: &Graph, sources: &[SourceFile]) -> Vec<Option<FileAnswers>> {
+fn answer_files(graph: &Graph, sources: &[SourceFile], order: &load_order::LoadOrder) -> Vec<Option<FileAnswers>> {
     let mut class_cache = IdentityHashMap::default();
     sources
         .iter()
-        .map(|source| is_indexed(source).then(|| answer_file(graph, source, &mut class_cache)))
+        .map(|source| is_indexed(source).then(|| answer_file(graph, source, order, &mut class_cache)))
         .collect()
 }
 
@@ -1109,9 +1185,102 @@ fn multi_write_values(text: &str) -> HashMap<u32, u32> {
     values.0
 }
 
+/// What a bare reference evaluated while the file loads names: Ruby's lexical lookup sees only what is defined by
+/// then, so a namespace this same file defines further down (`module Probe; class Config; FORCE = Rails.env…; end;
+/// module Rails; end; end`) does not shadow the outer name yet, and the reference is the next enclosing scope's, along
+/// the namespaces around it (`crefs`, innermost first), else the top level's.
+fn defined_by_then<'g>(
+    graph: &'g Graph,
+    order: &load_order::LoadOrder,
+    path: &str,
+    at: u32,
+    lexical: &dyn Fn() -> &'g load_order::Lexical,
+    id: DeclarationId,
+    declaration: &'g Declaration,
+) -> (DeclarationId, &'g Declaration) {
+    let later = |declaration: &Declaration| {
+        !declaration.definitions().is_empty()
+            && declaration.definitions().iter().all(|definition| {
+                graph.definitions().get(definition).is_some_and(|definition| {
+                    graph.documents().get(definition.uri_id()).is_some_and(|document| order.later(document.uri(), definition.offset().start(), path, at))
+                })
+            })
+    };
+    // Not parsed for the lookup chain before this: most references name what is defined by then.
+    if !later(declaration) || lexical().deferred(at) {
+        return (id, declaration);
+    }
+    let crefs = lexical().crefs(at);
+    let name = hoisted_name(declaration.name());
+    let Some(last) = name.rsplit("::").next() else { return (id, declaration) };
+    // Not a scope the name's own prefix spells: inside `module Outer::Inner`, `Outer` is no scope of the lookup.
+    let Some(found) = crefs.iter().position(|cref| format!("{cref}::{last}") == name) else { return (id, declaration) };
+    // Then, as Ruby looks, the innermost namespace's ancestors (`Child < Base` reads `Base::Marker`), then the top
+    // level. A mixed-in module that holds the name stops the search with the graph's own answer: the graph's chain does
+    // not say whether its `include` had run by then.
+    let ancestors: Vec<(String, bool)> = crefs
+        .first()
+        .and_then(|inner| graph.declarations().get(&rubydex::model::ids::declaration_id_from_lookup_name(inner)))
+        .and_then(|inner| inner.as_namespace())
+        .map(|inner| {
+            inner
+                .ancestors()
+                .iter()
+                .filter_map(|ancestor| match ancestor {
+                    Ancestor::Complete(id) => graph.declarations().get(id),
+                    _ => None,
+                })
+                .map(|ancestor| {
+                    let class = matches!(ancestor, Declaration::Namespace(rubydex::model::declaration::Namespace::Class(_)));
+                    (hoisted_name(ancestor.name()).to_string(), class)
+                })
+                .filter(|(ancestor, _)| ancestor.as_str() != crefs[0] && ancestor.as_str() != "Object")
+                .collect()
+        })
+        .unwrap_or_default();
+    let outer: Vec<(String, bool)> = crefs[found + 1..]
+        .iter()
+        .map(|cref| (format!("{cref}::{last}"), true))
+        .chain(ancestors.into_iter().map(|(ancestor, class)| (format!("{ancestor}::{last}"), class)))
+        .chain(std::iter::once((last.to_string(), true)))
+        .collect();
+    // Not a gem's declaration the reference's own walk may not have loaded: only one some definition surely precedes.
+    let defined_by_now = |declaration: &Declaration| {
+        declaration.definitions().iter().any(|definition| {
+            graph.definitions().get(definition).is_some_and(|definition| {
+                graph.documents().get(definition.uri_id()).is_some_and(|document| {
+                    order.earlier(document.uri(), definition.offset().start(), path, at).unwrap_or(true)
+                })
+            })
+        })
+    };
+    // A candidate surely defined later is passed over, as Ruby's lookup does; one surely defined by now answers; one
+    // this cannot tell about (an autoload's, another walk's) stops the search with the graph's own answer.
+    for (candidate, certain) in outer {
+        // Not past a namespace the chain cannot name: it may hold the name.
+        if candidate.starts_with(load_order::UNKNOWN) {
+            return (id, declaration);
+        }
+        let candidate_id = rubydex::model::ids::declaration_id_from_lookup_name(&candidate);
+        let Some(outer) = graph.declarations().get(&candidate_id) else { continue };
+        if !certain {
+            return (id, declaration);
+        }
+        if later(outer) {
+            continue;
+        }
+        if defined_by_now(outer) {
+            return (candidate_id, outer);
+        }
+        return (id, declaration);
+    }
+    (id, declaration)
+}
+
 fn answer_file(
     graph: &Graph,
     source: &SourceFile,
+    order: &load_order::LoadOrder,
     class_cache: &mut IdentityHashMap<DeclarationId, (Arc<ClassId>, bool)>,
 ) -> FileAnswers {
     let mut answers = FileAnswers::default();
@@ -1130,6 +1299,9 @@ fn answer_file(
     };
     // Positions a whole-path reference filled, which an exact one replaces.
     let mut path_keys = HashSet::default();
+    // Not from the graph's method definitions: it keeps only those with a receiver, and an instance method's body runs
+    // when called, not as the file loads.
+    let lexical: std::cell::OnceCell<load_order::Lexical> = std::cell::OnceCell::new();
     for reference_id in document.constant_references() {
         let Some(reference) = graph.constant_references().get(reference_id) else {
             continue;
@@ -1170,9 +1342,22 @@ fn answer_file(
         {
             answers.namespace_definitions.insert(hoisted_name(target.name()).into());
         }
+        // Not a qualified one (`::Probe::Rails`, `Probe::Rails`): it names that scope's constant or raises.
+        let bare = offset.start() < 2 || source.text.get(offset.start() as usize - 2..offset.start() as usize) != Some("::");
         let target = graph
             .name_id_to_declaration_id(*reference.name_id())
             .and_then(|id| graph.declarations().get(id).map(|decl| (*id, decl)))
+            .map(|(id, declaration)| {
+                if !bare {
+                    return (id, declaration);
+                }
+                let (outer, outer_declaration) =
+                    defined_by_then(graph, order, &source.path, offset.start(), &|| lexical.get_or_init(|| load_order::Lexical::of(&source.text)), id, declaration);
+                if outer != id {
+                    answers.rooted.insert(key);
+                }
+                (outer, outer_declaration)
+            })
             // An app's own alias of a class or module in a file of
             // constants alone (`RemoteThing = Thing`, which the autoloader
             // maps by name): Ruby binds the name to the very class, so
@@ -1265,6 +1450,43 @@ fn answer_file(
                     slot.insert(target);
                 }
             }
+        }
+    }
+    // `extend Plugs::Basic` in a file-level block (`Version.class_eval do … end`): the index records a mixin only in
+    // a namespace's body, so it keeps the path's `Plugs` and drops `Basic`. A name after a resolved namespace is that
+    // namespace's own, as `Plugs::Basic` is anywhere; only a class or module there is taken.
+    let namespaces: Vec<(u32, Arc<ClassId>)> = answers.references.iter()
+        .filter_map(|(key, answer)| match answer {
+            Some(ResolvedConstant::Namespace { class, .. }) => Some((*key, Arc::clone(class))),
+            _ => None,
+        })
+        .collect();
+    let ident_len = |at: usize| source.text.get(at..).map_or(0, |rest| rest.bytes().take_while(|b| b.is_ascii_alphanumeric() || *b == b'_').count());
+    for (start, class) in namespaces {
+        let mut owner = class.0.to_string();
+        let mut end = start as usize + ident_len(start as usize);
+        while source.text.get(end..end + 2) == Some("::") {
+            let at = end + 2;
+            let len = ident_len(at);
+            let Some(name) = source.text.get(at..at + len).filter(|n| n.starts_with(|c: char| c.is_ascii_uppercase())) else { break };
+            let Ok(key) = u32::try_from(at) else { break };
+            if answers.references.contains_key(&key) {
+                break;
+            }
+            let full = format!("{owner}::{name}");
+            let Some(declaration) = graph.declarations().get(&DeclarationId::from(full.as_str())) else { break };
+            if declaration.as_namespace().is_none() || is_assigned_value(graph, declaration) {
+                break;
+            }
+            if declaration.kind() == "Class" {
+                answers.class_references.insert(key);
+            }
+            answers.references.insert(key, Some(ResolvedConstant::Namespace {
+                class: Arc::new(ClassId(Symbol::from(hoisted_name(declaration.name()).as_ref()))),
+                runtime: is_runtime_declaration(graph, declaration),
+            }));
+            owner = full;
+            end = at + len;
         }
     }
     for definition_id in document.definitions() {

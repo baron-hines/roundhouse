@@ -48,7 +48,7 @@
 //!
 //! ```text
 //! render json: opengraph
-//! render plain: opengraph.as_json_str, content_type: "application/json"
+//! render plain: opengraph.as_json_str, content_type: "application/json; charset=utf-8"
 //! ```
 //!
 //! — which the controller rewrite already lowers on every target, with
@@ -277,7 +277,7 @@ fn settle_representable_writers(
             let ty = registry
                 .get(&lc.name)
                 .and_then(|info| match info.instance_methods.get(&Symbol::from(reader.as_str())) {
-                    Some(Ty::Fn { ret, .. }) => Some((**ret).clone()),
+                    Some(Ty::Fn(fn_ty)) => Some((*fn_ty.ret).clone()),
                     _ => None,
                 })
                 .or_else(|| lc.methods.iter().find(|m| m.name.as_str() == reader).and_then(|m| m.body.ty.clone()));
@@ -464,7 +464,7 @@ fn settle_ams_writers(app: &mut App, registry: &HashMap<ClassId, ClassInfo>) -> 
             let ty = registry
                 .get(&lc.name)
                 .and_then(|info| match info.instance_methods.get(&Symbol::from(reader.as_str())) {
-                    Some(Ty::Fn { ret, .. }) => Some((**ret).clone()),
+                    Some(Ty::Fn(fn_ty)) => Some((*fn_ty.ret).clone()),
                     _ => None,
                 })
                 .or_else(|| body.and_then(|b| b.ty.clone()));
@@ -724,7 +724,11 @@ fn rewrite_render_json(e: &Expr, written: &HashSet<ClassId>, variants: &HashSet<
             with_ty(
                 Expr::new(
                     value.span,
-                    ExprNode::Lit { value: Literal::Str { value: "application/json".to_string() } },
+                    ExprNode::Lit {
+                        value: Literal::Str {
+                            value: crate::lower::controller_to_library::rewrites::JSON_RESPONSE_TYPE.to_string(),
+                        },
+                    },
                 ),
                 Ty::Str,
             ),
@@ -872,7 +876,7 @@ fn declared_as_json_writer(
                     }
                 }
                 let ty = match info.instance_methods.get(name) {
-                    Some(Ty::Fn { ret, .. }) => (**ret).clone(),
+                    Some(Ty::Fn(fn_ty)) => (*fn_ty.ret).clone(),
                     _ => info
                         .attributes
                         .fields

@@ -15,9 +15,11 @@
 //! type. The expression-level recursive descent lives in [`expr`]; small
 //! cross-cutting Prism AST helpers live in [`util`].
 
+mod after_initialize;
 mod alba;
 mod built_send;
 mod conditional_permit;
+mod controller_name_constants;
 pub(crate) mod unreachable_views;
 mod view_paths;
 mod uncalled_helper_copies;
@@ -27,11 +29,13 @@ pub(crate) mod gem_package_settings;
 mod graphql_ruby;
 mod guarded_include;
 mod lock_versions;
+mod ruby_conditions;
 pub(crate) mod validates_with;
 pub(crate) mod each_validator;
 pub(crate) mod mailer_callbacks;
 pub(crate) mod mailer_defaults;
 pub(crate) mod has_many_hold;
+pub(crate) mod has_one_write;
 pub(crate) mod mailer_helpers;
 pub(crate) mod class_attribute;
 mod class_configuration;
@@ -39,6 +43,7 @@ pub(crate) use concern_accessors::{library_classes_by_name, unconsumed_class_sid
 mod dry_initializer;
 mod dry_struct;
 mod dry_types;
+mod multi_json;
 mod oj;
 pub(crate) mod source_gems;
 mod auto_source_gems;
@@ -56,6 +61,8 @@ mod dry_monads;
 mod dry_validation;
 mod representable;
 mod active_model_serializer;
+mod active_model_serializer_08;
+mod class_arg_specialize;
 mod action_cable_config;
 mod recurring_commands;
 mod session_config;
@@ -73,6 +80,9 @@ mod boot_program;
 mod engine_config;
 mod engine_helpers;
 mod interpolated_renders;
+mod controller_csp;
+mod simple_format_sanitize;
+mod render_layout_choice;
 mod container_specialize;
 mod controller_class_methods;
 mod controller_delegates;
@@ -101,6 +111,8 @@ pub mod invisible_captcha;
 pub mod generated_helpers;
 pub mod jbuilder;
 pub mod library_class;
+mod top_level_mixins;
+mod platform_guards;
 mod file_program;
 pub(crate) use file_program::{normalize_source, resolve_gem_require};
 pub(crate) fn source_gems_mount() -> &'static str {
@@ -122,14 +134,18 @@ mod delegated_type;
 mod app_extension_calls;
 mod body_statements;
 mod error_site;
+mod concerning;
 mod external_include;
+mod included_hook_includes;
 mod hook_class_attribute;
+mod load_hooks;
 pub(crate) mod inherited_alias;
 mod class_macros;
 mod configured_superclass;
 mod gem_hooks;
 pub(crate) use gem_hooks::method_missing_readers;
 mod gem_routes;
+mod gem_shadowed_files;
 mod column_accessors;
 mod model_macros;
 mod referenced_carriers;
@@ -167,12 +183,17 @@ pub mod util;
 pub mod view;
 pub mod vite;
 pub mod current_page;
+mod computed_partials;
+mod yield_partials;
+mod form_partial_record;
 pub mod time_tag;
 mod visibility;
 
 pub use app::{ingest_app, ingest_app_from_tree, ingest_app_with_vfs};
 pub use concern_accessors::{defer as defer_accessor_surface, DeferredAccessorSurface};
 pub use puma_boot::preserve_config as preserve_puma_config;
+pub use pagy::locked_before_43 as pagy_locked_before_43;
+pub use pagy::locked_major as pagy_locked_major;
 
 /// The construct an ActiveRecord class outside app/models is reported
 /// under (`app::report_unmodelled_records`): the CLI keys its per-target
@@ -252,6 +273,7 @@ pub(crate) fn rails_application_class() -> crate::dialect::LibraryClass {
         parent_span: Default::default(),
         includes: Vec::new(),
         include_spans: Vec::new(),
+        include_statements: Vec::new(),
         methods: Vec::new(),
         nullable_columns: Vec::new(),
         origin: None,

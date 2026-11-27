@@ -8,6 +8,9 @@ module ActionDispatch
     @discard: Array[String]
 
     def initialize: (?Hash[String, untyped]? other) -> void
+    def begin_carry: () -> nil
+    def carry_other: (String key, untyped value) -> nil
+    def carried: (String key) -> nil
     def notice: () -> untyped
     def notice=: (untyped value) -> untyped
     def alert: () -> untyped
@@ -30,8 +33,6 @@ module ActionDispatch
     def to_session_value: () -> Hash[String, untyped]?
     def merge: (Hash[String, untyped] other) -> Flash
 
-    def self.signed_cookie: (untyped value, String name) -> String
-    def self.cookie_flashes: (String raw, String name) -> Hash[String, untyped]
   end
 
   class FlashNow

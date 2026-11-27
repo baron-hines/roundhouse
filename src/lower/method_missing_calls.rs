@@ -24,10 +24,15 @@ pub fn apply_method_missing_calls(app: &mut App, registry: &HashMap<ClassId, cra
         .filter(|c| !c.is_module)
         .map(|c| (c.name.0.as_str().to_string(), c.parent.as_ref().map(|p| p.0.as_str().trim_start_matches("::").to_string())))
         .collect();
-    let core_of = |id: &ClassId| -> &'static [&'static str] {
+    // The class outside the program each class descends from, by its written parents (`ActiveSupport::OrderedOptions`
+    // for `class Settings < ActiveSupport::OrderedOptions`).
+    // The program's classes from `id` up, then the class outside it the chain ends at.
+    let chain_of = |id: &ClassId| -> (Vec<String>, String) {
         let mut current = id.0.as_str().to_string();
+        let mut chain = Vec::new();
         for _ in 0..32 {
-            let Some(Some(parent)) = parents.get(&current) else { break };
+            let Some(Some(parent)) = parents.get(&current) else { return (chain, current) };
+            chain.push(current.clone());
             let scope: Vec<&str> = current.split("::").collect();
             let resolved = (0..scope.len())
                 .rev()
@@ -35,18 +40,57 @@ pub fn apply_method_missing_calls(app: &mut App, registry: &HashMap<ClassId, cra
                 .find(|candidate| *candidate != current && parents.contains_key(candidate));
             match resolved {
                 Some(next) => current = next,
-                None => {
-                    return match parent.as_str() {
-                        "Hash" => super::core_instance_methods::HASH,
-                        "Array" => super::core_instance_methods::ARRAY,
-                        "String" => super::core_instance_methods::STRING,
-                        _ => super::core_instance_methods::OBJECT,
-                    };
-                }
+                None => return (chain, parent.clone()),
             }
         }
-        super::core_instance_methods::OBJECT
+        (chain, "Object".to_string())
     };
+    let root_of = |id: &ClassId| chain_of(id).1;
+    let own_update: crate::det::HashSet<String> = app
+        .library_classes
+        .iter()
+        .filter(|c| c.methods.iter().any(|m| m.name.as_str() == "update" && m.receiver == crate::dialect::MethodReceiver::Instance))
+        .map(|c| c.name.0.as_str().to_string())
+        .collect();
+    // Not a subclass's own `update`, which Ruby finds before the alias.
+    let ordered_options = |id: &ClassId| {
+        let (chain, root) = chain_of(id);
+        root == "ActiveSupport::OrderedOptions" && !chain.iter().any(|c| own_update.contains(c))
+    };
+    // An ActiveRecord model also answers `ActiveRecord::Base`'s own instance API, which the registry leaves out where a
+    // later pass lowers it (`association(:x).loaded?` to `x_loaded?`).
+    let active_record = |id: &ClassId, method: &str| {
+        registry.get(id).is_some_and(|info| info.active_record_model) && super::core_instance_methods::ACTIVE_RECORD_BASE.contains(&method)
+    };
+    let core_of = |id: &ClassId| -> &'static [&'static str] {
+        // Not Object's alone for Rails' OrderedOptions, a Hash on the ruby family's tree (Spinel's holds one, and
+        // answers only what its own class defines).
+        match root_of(id).as_str() {
+            "ActiveSupport::OrderedOptions" if target != crate::build_target::BuildTarget::Spinel => super::core_instance_methods::HASH,
+            "Hash" => super::core_instance_methods::HASH,
+            "Array" => super::core_instance_methods::ARRAY,
+            "String" => super::core_instance_methods::STRING,
+            _ => super::core_instance_methods::OBJECT,
+        }
+    };
+    // Not `update` on Spinel's OrderedOptions, which defines only `merge!` (Rails' alias): an `update` beside it would type
+    // openssl's `Digest#update` by its Hash (`runtime/spinel/ordered_options_spinel.rb`).
+    if target == crate::build_target::BuildTarget::Spinel {
+        fn rename(e: &mut Expr, ordered_options: &dyn Fn(&ClassId) -> bool) {
+            e.node.for_each_child_mut(&mut |c| rename(c, ordered_options));
+            // Not a class object (`PrefBox.update`, `self.class.update`): `Ty::Class` alone does not tell it from an instance.
+            if let ExprNode::Send { recv: Some(r), method, .. } = &mut *e.node
+                && method.as_str() == "update"
+                && r.decisions & crate::expr::CLASS_OBJECT_VALUE == 0
+                && !matches!(&*r.node, ExprNode::Const { .. })
+                && !matches!(&*r.node, ExprNode::Send { method, args, .. } if method.as_str() == "class" && args.is_empty())
+                && matches!(r.ty.as_ref().map(Ty::peel_nilable), Some(Ty::Class { id, .. }) if ordered_options(id))
+            {
+                *method = Symbol::from("merge!");
+            }
+        }
+        crate::lower::for_each_emit_body(app, &mut |body| rename(body, &ordered_options));
+    }
     // The classes whose nearest `method_missing` is private, which an explicit receiver reaches only through `__send__`.
     let private_missing: crate::det::HashSet<String> = {
         let own: HashMap<String, bool> = app
@@ -77,6 +121,9 @@ pub fn apply_method_missing_calls(app: &mut App, registry: &HashMap<ClassId, cra
         .map(|c| (c.name.0.as_str().to_string(), c.includes.iter().map(|m| m.0.as_str().trim_start_matches("::").to_string()).collect()))
         .collect();
     let module_answers = |id: &ClassId, method: &str| {
+        if active_record(id, method) {
+            return true;
+        }
         let mut current = Some(id.0.as_str().to_string());
         for _ in 0..32 {
             let Some(name) = current else { break };
@@ -94,16 +141,71 @@ pub fn apply_method_missing_calls(app: &mut App, registry: &HashMap<ClassId, cra
         }
         false
     };
+    // The instance methods each class's subclasses define: a receiverless call in the class reaches one of them on a
+    // subclass's instance (view_component's `render_template_for` calls the `call` each component defines), which
+    // Ruby dispatches before `method_missing`.
+    // Not the parent as written: `class UI::Card < Base` names `UI::Base` when one is declared, as `core_of` resolves it.
+    let qualified_parent = |name: &str| -> Option<String> {
+        let parent = parents.get(name)?.clone()?;
+        let scope: Vec<&str> = name.split("::").collect();
+        (1..scope.len())
+            .rev()
+            .map(|depth| format!("{}::{parent}", scope[..depth].join("::")))
+            .find(|candidate| candidate != name && parents.contains_key(candidate))
+            .or(Some(parent))
+    };
+    let mut below: HashMap<String, crate::det::HashSet<String>> = HashMap::default();
+    for lc in app.library_classes.iter().filter(|c| !c.is_module) {
+        let names: Vec<String> = lc.methods.iter().filter(|m| m.receiver == crate::dialect::MethodReceiver::Instance).map(|m| m.name.as_str().to_string()).collect();
+        let mut current = qualified_parent(lc.name.0.as_str());
+        for _ in 0..32 {
+            let Some(name) = current else { break };
+            below.entry(name.clone()).or_default().extend(names.iter().cloned());
+            current = qualified_parent(&name);
+        }
+    }
+    // The classes that include `module`, directly, through a module they include, or through a parent: a receiverless
+    // call in the module's method runs on one of their instances.
+    let includers_of = |module: &ClassId| -> Vec<ClassId> {
+        let reaches = |class: &ClassId| {
+            let mut current = Some(class);
+            for _ in 0..32 {
+                let Some(id) = current else { break };
+                let Some(info) = registry.get(id) else { break };
+                let mut pending: Vec<&ClassId> = info.includes.iter().collect();
+                let mut seen: crate::det::HashSet<&ClassId> = crate::det::HashSet::default();
+                while let Some(m) = pending.pop() {
+                    if m == module {
+                        return true;
+                    }
+                    if seen.insert(m) {
+                        pending.extend(registry.get(m).into_iter().flat_map(|inc| inc.includes.iter()));
+                    }
+                }
+                current = info.parent.as_ref();
+            }
+            false
+        };
+        let mut out: Vec<ClassId> = registry.iter().filter(|(id, info)| !info.is_module && reaches(id)).map(|(id, _)| id.clone()).collect();
+        out.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+        out
+    };
     for lc in &mut app.library_classes {
         let owner = lc.name.clone();
-        let own_missing = answers_missing(&owner);
+        // A module's `self` is an includer: a receiverless call is a miss only if no includer answers it, and with no
+        // includer known it is left as written, where Ruby's own dispatch decides.
+        let includers = if lc.is_module && answers_missing(&owner) { includers_of(&owner) } else { Vec::new() };
+        let own_missing = answers_missing(&owner) && (!lc.is_module || !includers.is_empty());
+        let subclasses_define = below.get(owner.0.as_str()).cloned().unwrap_or_default();
         for m in lc.methods.iter_mut().filter(|m| m.receiver == crate::dialect::MethodReceiver::Instance) {
             // Not inside `method_missing` itself, where an unanswered name is the one it was asked.
             if m.name == missing || m.name.as_str() == "respond_to_missing?" {
                 continue;
             }
-            let locals: Vec<Symbol> = m.params.iter().map(|p| p.name.clone()).collect();
-            rewrite(&mut m.body, &owner, own_missing, &locals, true, registry, &answers_missing, &core_of, &module_answers, &private_missing);
+            let mut locals: Vec<Symbol> = m.params.iter().map(|p| p.name.clone()).collect();
+            // (a name a subclass defines is no miss: treated as the locals are, left as written)
+            locals.extend(subclasses_define.iter().map(|n| Symbol::from(n.as_str())));
+            rewrite(&mut m.body, &owner, own_missing, &locals, &includers, true, registry, &answers_missing, &core_of, &module_answers, &private_missing);
         }
     }
     // A block a class-body call hands over (`uid do request.params[options.uid_field] end`, replayed and instance_eval'd
@@ -119,7 +221,7 @@ pub fn apply_method_missing_calls(app: &mut App, registry: &HashMap<ClassId, cra
     }
     // Every other body reaches such a class through a receiver (`auth.provider` on OmniAuth's AuthHash in a model).
     let nobody = ClassId(Symbol::from(""));
-    crate::lower::for_each_emit_body(app, &mut |body| rewrite(body, &nobody, false, &[], true, registry, &answers_missing, &core_of, &module_answers, &private_missing));
+    crate::lower::for_each_emit_body(app, &mut |body| rewrite(body, &nobody, false, &[], &[], true, registry, &answers_missing, &core_of, &module_answers, &private_missing));
 }
 
 fn rewrite(
@@ -127,6 +229,7 @@ fn rewrite(
     owner: &ClassId,
     own_missing: bool,
     locals: &[Symbol],
+    includers: &[ClassId],
     typed: bool,
     registry: &HashMap<ClassId, crate::analyze::ClassInfo>,
     answers_missing: &dyn Fn(&ClassId) -> bool,
@@ -134,7 +237,7 @@ fn rewrite(
     module_answers: &dyn Fn(&ClassId, &str) -> bool,
     private_missing: &crate::det::HashSet<String>,
 ) {
-    e.node.for_each_child_mut(&mut |c| rewrite(c, owner, own_missing, locals, typed, registry, answers_missing, core_of, module_answers, private_missing));
+    e.node.for_each_child_mut(&mut |c| rewrite(c, owner, own_missing, locals, includers, typed, registry, answers_missing, core_of, module_answers, private_missing));
     // Typed too where `typed` (the analysis answers a call no method takes with `method_missing`'s type), but not on a
     // receiver spelled as a class object (`Errors.new`, `self.class.new`): `Ty::Class` alone does not tell it from an instance.
     let instance_read = |r: &Expr| {
@@ -165,6 +268,16 @@ fn rewrite(
         || module_answers(&class, method.as_str())
         || (recv.is_none() && super::core_instance_methods::KERNEL_PRIVATE.contains(&method.as_str()))
     {
+        return;
+    }
+    // In a module, a name an includer answers (its column reader, its own `def`) is no miss.
+    let answered_by = |id: &ClassId| {
+        core_of(id).contains(&method.as_str())
+            || module_answers(id, method.as_str())
+            || crate::analyze::diagnostics::method_registered_on(registry, Some(&Ty::Class { id: id.clone(), args: vec![].into() }), method)
+            || registry.get(id).is_some_and(|info| info.attributes.fields.contains_key(method))
+    };
+    if recv.is_none() && includers.iter().any(answered_by) {
         return;
     }
     let private = recv.is_some() && private_missing.contains(class.0.as_str());
@@ -200,7 +313,7 @@ fn body_reads(
         return;
     }
     let held = match info.instance_methods.get(reader) {
-        Some(Ty::Fn { ret, .. }) => (**ret).clone(),
+        Some(Ty::Fn(fn_ty)) => (*fn_ty.ret).clone(),
         Some(t) => t.clone(),
         None => return,
     };

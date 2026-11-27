@@ -7,7 +7,7 @@
 use crate::det::{HashMap, HashSet};
 
 use crate::App;
-use crate::dialect::{MethodDef, MethodReceiver};
+use crate::dialect::{LibraryClass, MethodDef, MethodReceiver};
 use crate::expr::{Expr, ExprNode, LValue};
 use crate::ident::{ClassId, Symbol};
 
@@ -59,6 +59,12 @@ pub(super) fn index_unmodeled_lookup_mutations(app: &App, index: &mut SourceCont
         .chain(app.models.iter().flat_map(|model| model.methods()))
         .chain(app.test_modules.iter().flat_map(|module| module.helpers.iter()))
         .filter(|method| !makes_no_call(method))
+        .map(|method| method.name.clone())
+        .collect();
+    let class_side_methods: HashSet<Symbol> = super::classes(app)
+        .flat_map(|class| class.methods.iter())
+        .chain(app.models.iter().flat_map(|model| model.methods()))
+        .filter(|method| method.receiver == MethodReceiver::Class)
         .map(|method| method.name.clone())
         .collect();
     let modules_with_custom_new: HashSet<ClassId> = index
@@ -119,14 +125,25 @@ pub(super) fn index_unmodeled_lookup_mutations(app: &App, index: &mut SourceCont
             modules_with_custom_initialize,
             &modules_with_mutating_hooks,
         );
+        let lookup_changers = lookup_changing_methods(
+            app,
+            &app_methods,
+            &modules_with_custom_new,
+            modules_with_custom_initialize,
+            &known_module_names,
+            &modules_with_mutating_hooks,
+            &hook_targets,
+            question,
+        );
         let context = ConstructorMutationContext {
             owner_aliases: &constructor_owner_aliases,
             modules_with_custom_new: &modules_with_custom_new,
             modules_with_custom_initialize,
             known_modules: &known_module_names,
-            app_methods: &app_methods,
+            app_methods: &lookup_changers,
             modules_with_mutating_hooks: &modules_with_mutating_hooks,
             hook_targets: Some(&hook_targets),
+            class_side_methods: Some(&class_side_methods),
             question,
         };
         let findings = collect_app_lookup_mutations(app, &context);
@@ -153,12 +170,15 @@ pub(super) fn index_unmodeled_lookup_mutations(app: &App, index: &mut SourceCont
 fn shadows_supplied_initialize(app: &App) -> HashSet<ClassId> {
     let resolver = app.const_resolver.for_sources(&app.sources);
     let initialize = Symbol::from("initialize");
-    let plain = |owner: &ClassId, method: &MethodDef| {
+    let declared = |owner: &ClassId, method: &MethodDef| {
         let span = method.name_span;
         !span.is_synthetic()
             // A `def`'s name token; an alias copy spans its statement.
             && (span.end - span.start) as usize == initialize.as_str().len()
             && resolver.namespaces_declared_in(span.file).any(|name| name == owner.0.as_str())
+    };
+    let plain = |owner: &ClassId, method: &MethodDef| {
+        declared(owner, method)
             && !contains_super(&method.body)
             && method.params.iter().all(|param| param.default.as_ref().is_none_or(|d| !contains_super(d)))
     };
@@ -173,20 +193,63 @@ fn shadows_supplied_initialize(app: &App) -> HashSet<ClassId> {
                 && (target == full || full.ends_with(&format!("::{target}")) || target.ends_with(&format!("::{full}")))
         })
     };
+    let mut parts_of: HashMap<&ClassId, Vec<&LibraryClass>> = HashMap::default();
+    for class in super::classes(app) {
+        parts_of.entry(&class.name).or_default().push(class);
+    }
     let mut out = HashSet::default();
-    for class in super::classes(app).filter(|class| !class.is_module) {
-        let defs: Vec<&MethodDef> = class
-            .methods
+    // Every reopening's together: one's plain `initialize` does not answer for another's `super`.
+    for (name, parts) in &parts_of {
+        if parts.iter().any(|class| class.is_module) {
+            continue;
+        }
+        let defs: Vec<&MethodDef> = parts
             .iter()
+            .flat_map(|class| class.methods.iter())
             .filter(|m| m.receiver == MethodReceiver::Instance && m.name == initialize)
             .collect();
         if !defs.is_empty()
-            && defs.iter().all(|m| plain(&class.name, m))
-            && !class.unknown_calls.iter().any(prepends)
-            && !prepended_elsewhere(&class.name)
+            && defs.iter().all(|m| plain(name, m))
+            && !parts.iter().any(|class| class.unknown_calls.iter().any(prepends))
+            && !prepended_elsewhere(name)
         {
-            out.insert(class.name.clone());
+            out.insert((*name).clone());
         }
+    }
+    // A `super`, or no `initialize` at all, lands on the parent's: when that one never passes the call on and no mixin of
+    // the owner's own sits between them with an `initialize`, the call stops there too (maybe's `DS::Button` and
+    // `DS::Link` under `DS::Buttonish`).
+    let brings_initialize = |module: &ClassId| match parts_of.get(module) {
+        None => !catalog_leaves(module.0.as_str(), Question::NewOrInitialize),
+        Some(known) => known.iter().any(|c| {
+            !c.is_module
+                || !c.includes.is_empty()
+                || c.unknown_calls.iter().any(prepends)
+                || c.methods.iter().any(|m| m.receiver == MethodReceiver::Instance && m.name == initialize)
+        }),
+    };
+    let stops_at_parent = |name: &ClassId, parts: &[&LibraryClass], out: &HashSet<ClassId>| {
+        parts.iter().all(|class| !class.is_module)
+            && parts
+                .iter()
+                .flat_map(|class| class.methods.iter())
+                .filter(|m| m.receiver == MethodReceiver::Instance && m.name == initialize)
+                .all(|m| declared(name, m))
+            && parts.iter().all(|class| class.parent.as_ref().is_none_or(|parent| out.contains(parent)))
+            && parts.iter().any(|class| class.parent.is_some())
+            && !parts.iter().any(|class| class.includes.iter().any(&brings_initialize) || class.unknown_calls.iter().any(prepends))
+            && !prepended_elsewhere(name)
+    };
+    loop {
+        let found: Vec<ClassId> = parts_of
+            .iter()
+            .filter(|(name, parts)| !out.contains(**name) && stops_at_parent(name, parts, &out))
+            .map(|(name, _)| (*name).clone())
+            .collect();
+        if found.is_empty() {
+            break;
+        }
+        out.extend(found);
     }
     for model in &app.models {
         let defs: Vec<&MethodDef> =
@@ -241,6 +304,8 @@ const MIXINS_WITHOUT_CONSTRUCTOR_HOOK: &[(&str, bool)] = &[
     ("ActionView::Helpers::SanitizeHelper", false),
     ("ActionView::Helpers::JavaScriptHelper", false),
     ("Rails.application.routes.url_helpers", true),
+    // The same module as ingest records its include (`library_class`: the program's generated route helpers).
+    ("RouteHelpers", true),
     ("ActiveModel::Model", true),
     ("ActiveModel::Validations", false),
     ("ActiveModel::Attributes", true),
@@ -348,6 +413,7 @@ fn resolve_mutating_hook_modules(
                     app_methods,
                     modules_with_mutating_hooks,
                     hook_targets: None,
+                    class_side_methods: None,
                     question,
                 };
                 let scan = scan_constructor_mutations(
@@ -612,6 +678,17 @@ pub(super) fn scan_constructor_mutations(
             _ => false,
         }
     }
+    // Not every app method handed a value of the receiver: a class-side one no body of which changes lookup only stores it (`child.virtual_path = child.identifier.gsub(…)`).
+    fn runs_own_harmless_method(
+        recv: Option<&Expr>,
+        method: &Symbol,
+        callback_receiver: &Symbol,
+        context: &ConstructorMutationContext<'_>,
+    ) -> bool {
+        recv.is_some_and(|recv| matches!(&*recv.node, ExprNode::Var { name, .. } if name == callback_receiver))
+            && context.class_side_methods.is_some_and(|names| names.contains(method))
+            && !context.app_methods.contains(method)
+    }
     fn contains_callback(expr: &Expr, callback_receiver: &Symbol) -> bool {
         if matches!(&*expr.node, ExprNode::Var { name, .. } if name == callback_receiver) {
             return true;
@@ -666,9 +743,10 @@ pub(super) fn scan_constructor_mutations(
                     && recv
                         .as_ref()
                         .is_some_and(|recv| receiver_uses_callback(recv, callback_receiver)))
-                    || args
-                        .iter()
-                        .any(|arg| contains_callback(arg, callback_receiver))
+                    || (!runs_own_harmless_method(recv.as_ref(), method, callback_receiver, context)
+                        && args
+                            .iter()
+                            .any(|arg| contains_callback(arg, callback_receiver)))
             });
             if mutates_lookup || mutates_callback_receiver {
                 match recv.as_ref().map(|recv| &*recv.node) {
@@ -733,6 +811,8 @@ pub(super) struct ConstructorMutationContext<'a> {
     pub(super) modules_with_mutating_hooks: &'a HashSet<ClassId>,
     /// The module sets above, probed by spelling: once they are final.
     pub(super) hook_targets: Option<&'a HookTargets>,
+    /// Every class-side method name the app defines, once `app_methods` is final.
+    pub(super) class_side_methods: Option<&'a HashSet<Symbol>>,
     pub(super) question: Question,
 }
 
@@ -1011,13 +1091,129 @@ fn eval_only_registers_filters(
     )
 }
 
+/// A method that may change lookup by what it is handed (`extend(Factory)`), or by running code (`class_eval`).
+fn lookup_primitive(name: &str) -> bool {
+    matches!(
+        name,
+        "include" | "extend" | "prepend" | "define_method" | "define_singleton_method" | "remove_method" | "undef_method"
+            | "alias_method" | "class_eval" | "module_eval" | "instance_eval" | "class_exec" | "module_exec" | "instance_exec"
+            | "send" | "public_send" | "__send__"
+    )
+}
+
+// Not every app method's name: one no definition of which changes lookup, sends by a built name, or calls such a method runs code that cannot reach it.
+#[allow(clippy::too_many_arguments)]
+fn lookup_changing_methods(
+    app: &App,
+    app_methods: &HashSet<Symbol>,
+    modules_with_custom_new: &HashSet<ClassId>,
+    modules_with_custom_initialize: &HashSet<ClassId>,
+    known_modules: &KnownModules,
+    modules_with_mutating_hooks: &HashSet<ClassId>,
+    hook_targets: &HookTargets,
+    question: Question,
+) -> HashSet<Symbol> {
+    fn visit(expr: &Expr, name: &Symbol, changes: &mut dyn FnMut(&Symbol, &[Expr]) -> bool, found: &mut bool) {
+        if *found {
+            return;
+        }
+        if expr.diagnostic().is_some() || expr.nested_def().is_some() {
+            *found = true;
+            return;
+        }
+        // Not the explicit sends alone: a bound method (`recv.method(:install)`) runs its name when called, and an
+        // attribute's compound or multiple assignment calls its writer.
+        let writer = |attr: &Symbol| Symbol::from(format!("{}=", attr.as_str()).as_str());
+        let implicit = match &*expr.node {
+            // Not the reference's own arguments: the bound method runs with the later call's, so a primitive whose
+            // effect its arguments decide (`method(:extend).call(Factory)`) counts whatever it is handed.
+            ExprNode::MethodRef { name: referenced, .. } => lookup_primitive(referenced.as_str()) || changes(referenced, &[]),
+            ExprNode::Send { method, args, .. } if matches!(method.as_str(), "method" | "public_method" | "instance_method") => {
+                args.first().map(literal_method_name).is_none_or(|name| {
+                    name.is_none_or(|name| lookup_primitive(name) || changes(&Symbol::from(name), &[]))
+                })
+            }
+            ExprNode::OpAssign { target: crate::expr::LValue::Attr { name: attr, .. }, value, .. } => {
+                changes(attr, &[]) || changes(&writer(attr), std::slice::from_ref(value))
+            }
+            ExprNode::MultiAssign { targets, .. } => targets
+                .iter()
+                .any(|target| matches!(target, crate::expr::LValue::Attr { name: attr, .. } if changes(&writer(attr), &[]))),
+            _ => false,
+        };
+        if implicit {
+            *found = true;
+            return;
+        }
+        match &*expr.node {
+            ExprNode::Send { method, args, .. } if changes(method, args) => {
+                *found = true;
+                return;
+            }
+            // Not the `super` call's own arguments alone: a zsuper passes the method's, so a primitive's override (`def self.include(*m) = super`) changes lookup whatever it is handed.
+            ExprNode::Super { .. }
+                if changes(name, &[])
+                    || lookup_primitive(name.as_str())
+                    || is_method_lookup_hook(name.as_str())
+                    || defines_constructor_lookup_callback(name.as_str()) =>
+            {
+                *found = true;
+                return;
+            }
+            _ => {}
+        }
+        expr.node.for_each_child(&mut |child| visit(child, name, changes, found));
+    }
+    let methods: Vec<&MethodDef> = super::classes(app)
+        .flat_map(|class| class.methods.iter())
+        .chain(app.models.iter().flat_map(|model| model.methods()))
+        .chain(app.test_modules.iter().flat_map(|module| module.helpers.iter()))
+        .filter(|method| app_methods.contains(&method.name))
+        .collect();
+    let mut changers: HashSet<Symbol> = HashSet::default();
+    loop {
+        let before = changers.len();
+        for method in &methods {
+            if changers.contains(&method.name) {
+                continue;
+            }
+            let mut changes = |called: &Symbol, args: &[Expr]| {
+                mutates_constructor_lookup_method(
+                    called.as_str(),
+                    args,
+                    modules_with_custom_new,
+                    modules_with_custom_initialize,
+                    known_modules,
+                    modules_with_mutating_hooks,
+                    Some(hook_targets),
+                    question,
+                ) || sends_app_method(called, args, &changers)
+                    || (matches!(called.as_str(), "send" | "public_send" | "__send__")
+                        && args.first().and_then(literal_method_name).is_none())
+            };
+            let mut found = false;
+            visit(&method.body, &method.name, &mut changes, &mut found);
+            for default in method.params.iter().filter_map(|param| param.default.as_ref()) {
+                visit(default, &method.name, &mut changes, &mut found);
+            }
+            if found {
+                changers.insert(method.name.clone());
+            }
+        }
+        if changers.len() == before {
+            return changers;
+        }
+    }
+}
+
 /// Whether `method(args)` runs a method the app defines: by name, or
 /// through `send` / `public_send` / `__send__` with a literal name. A
 /// dynamic send with any other name may run one, so it counts.
 fn sends_app_method(method: &Symbol, args: &[Expr], app_methods: &HashSet<Symbol>) -> bool {
     if matches!(method.as_str(), "send" | "public_send" | "__send__") {
-        return match args.first().map(literal_method_name) {
-            Some(Some(name)) => app_methods.contains(&Symbol::from(name)),
+        // Not the literal name alone: `public_send(:send, :install, …)` runs what the inner send names.
+        return match args.split_first().map(|(first, rest)| (literal_method_name(first), rest)) {
+            Some((Some(name), rest)) => sends_app_method(&Symbol::from(name), rest, app_methods),
             _ => true,
         };
     }

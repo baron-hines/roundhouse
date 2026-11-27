@@ -60,12 +60,16 @@ module ActiveRecord
     text == "" ? nil : enum_int(text, labels, values, texts, attr)
   end
 
+  # A label wins over a stored value of the same spelling, whichever the
+  # declaration lists first, as Rails' enum type casts: with
+  # `{ sent: "done", queued: "sent" }`, "sent" is the label `sent` and
+  # stores "done". A stored value is taken only while no entry matched.
   def self.enum_str(text, labels, values, attr)
     result = text + ""
     found = text == ""
     i = 0
     while i < labels.length
-      if labels[i] == text || values[i] == text
+      if labels[i] == text || (!found && values[i] == text)
         result = values[i]
         found = true
       end
@@ -594,6 +598,19 @@ module ActiveRecord
       []
     end
 
+    # The enum columns, which `where` casts through `_enum_where_value`.
+    def self.schema_enum_columns
+      []
+    end
+
+    # A `where` value on enum column `col` as its stored value. Only a
+    # column `schema_enum_columns` names reaches it, and a model with an
+    # enum overrides both, so this default never casts.
+    def self._enum_where_value(_col, _value)
+      stored = nil
+      stored
+    end
+
     def self.instantiate(_row)
       raise NotImplementedError, "#{name}.instantiate must be overridden"
     end
@@ -605,6 +622,12 @@ module ActiveRecord
     # models without one fall back to this no-op, which leaves the lazy
     # association readers doing the work (correct, just N+1).
     def self.preload_associations(_records, _specs)
+    end
+
+    # Not left to `preload_associations` alone: an `includes` whose association a condition names is a JOIN in Rails
+    # (`includes(:article).where(article: {…})`); models with such associations answer theirs.
+    def self._eager_load_joins(_specs, _conditions, _joined)
+      []
     end
 
     # Per-model adapter primitives — public AR API delegates here.
@@ -835,6 +858,12 @@ module ActiveRecord
     def mark_persisted!
       @persisted = true
       @destroyed = false
+    end
+
+    # Seat this record on `records`, loaded by a relation built off its
+    # has_many `name`, through that association's inverse. A model whose
+    # has_many has one answers it (generated); any other seats nothing.
+    def _set_inverse_from_queries(name, records)
     end
 
     # ---- Class-level CRUD -------------------------------------------
@@ -1197,6 +1226,20 @@ module ActiveRecord
       !changes.empty?
     end
 
+    # ActiveModel::Dirty's names over the same diffs: `changes` is the pending one (`changes_to_save`), keyed by column
+    # String as Rails' indifferent Hash reads it; `previous_changes` the last save's; `changed` the pending columns.
+    def changes
+      changes_to_save
+    end
+
+    def previous_changes
+      saved_changes
+    end
+
+    def changed
+      changes_to_save.keys
+    end
+
     def has_changes_to_save?
       changed?
     end
@@ -1216,6 +1259,12 @@ module ActiveRecord
 
     def restore_attribute!(name)
       nil
+    end
+
+    # Rails' `restore_attributes`: every pending change written back, the
+    # names it restored. None here, for the same reason.
+    def restore_attributes
+      changes_to_save.keys
     end
 
     # `id` never appears in the subclass `attributes` hash, so the
@@ -1367,11 +1416,12 @@ module ActiveRecord
     # transaction a plain `reload` already gives the guarantee Rails
     # extracts from the row lock: the enclosing `BEGIN` serializes
     # writers, so nothing can land between this read and a following
-    # write in the same transaction. A Postgres adapter would spell
-    # the `lock` argument as `FOR UPDATE` / `FOR SHARE` here; this
-    # runtime keeps the Rails signature — `lock` may be `true` or a
-    # String locking clause (`lock!("FOR UPDATE NOWAIT")`) — but
-    # doesn't need either under SQLite; both are accepted and ignored.
+    # write in the same transaction. This runtime keeps the Rails
+    # signature — `lock` may be `true` or a String locking clause
+    # (`lock!("FOR UPDATE NOWAIT")`) — but doesn't need either under
+    # SQLite; both are accepted and ignored. On PostgreSQL the ruby
+    # family's reopen (active_record/connection.rb) takes the row lock
+    # the clause names before this reload.
     def lock!(lock = nil)
       # Rails passes `reload(lock: lock)`; this runtime ignores the
       # clause under SQLite, so a bare reload keeps the same guarantee.
@@ -1467,6 +1517,12 @@ module ActiveRecord
       ok = @errors.empty?
       after_validation
       ok
+    end
+
+    # Not ActiveModel's `ValidationError`: on a record Rails raises the `RecordInvalid` that `save!` does.
+    def validate!
+      raise RecordInvalid, self unless valid?
+      true
     end
 
     # ---- Equality ---------------------------------------------------

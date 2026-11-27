@@ -67,6 +67,8 @@ pub(crate) enum Plan {
 /// one per locale it can run in (the `locale:` it names, else each
 /// available locale) and per environment whose fallbacks differ.
 pub(crate) fn plans(catalog: &Catalog, call: &Call, in_view: bool) -> Result<Vec<(Variant, Plan)>, String> {
+    #[cfg(test)]
+    phase_cache_tests::PLANS_COMPUTED.with(|n| n.set(n.get() + 1));
     let locales = match &call.locale {
         Some(Locale::Literal(l)) if !catalog.locales().contains(l) => {
             return Err(format!("`locale: :{l}`, which is not an available locale"));
@@ -155,6 +157,9 @@ pub(crate) enum Site<'a> {
     /// under its `controller_path` with `/` read as `.` (`admin.users`):
     /// AbstractController::Translation's `t`.
     Controller(&'a str),
+    /// A public instance method (an action) of an `ActionMailer::Base` mailer, under its `mailer_name` with `/` read
+    /// as `.`, and the action: the same `t`, its lazy key read for the action the body is.
+    Mailer(&'a str, &'a str),
 }
 
 impl Site<'_> {
@@ -165,6 +170,11 @@ impl Site<'_> {
 
 /// `controller_path` with `/` as `.`, as `AbstractController::Translation`
 /// scopes a lazy key: `Admin::UsersController` → `admin.users`.
+/// A mailer's `mailer_name` as its lazy `t` keys read it: `Admin::NoticeMailer` → `admin.notice_mailer`.
+pub(crate) fn mailer_scope(class_name: &str) -> String {
+    crate::naming::underscore(class_name).replace('/', ".")
+}
+
 pub(crate) fn controller_scope(class_name: &str) -> String {
     let name = class_name.strip_suffix("Controller").unwrap_or(class_name);
     crate::naming::underscore(name).replace('/', ".")
@@ -194,6 +204,7 @@ pub(crate) fn parse(
     Some(match (site, on_i18n) {
         (Site::View(view), false) => parse_args(args, view, true),
         (Site::Controller(scope), false) => parse_controller_args(args, scope),
+        (Site::Mailer(scope, action), false) => parse_mailer_args(args, scope, action),
         _ => parse_args(args, None, false),
     })
 }
@@ -201,6 +212,24 @@ pub(crate) fn parse(
 /// `AbstractController::Translation#translate`: a lazy `.key` becomes
 /// `"<scope>.#{action_name}.key"`, with `:"<scope>.key"` put in front of
 /// any `default:` (always a list then); an `_html` key is refused.
+/// A mailer action's `t(".key")`: `"<scope>.<action>.key"` with `:"<scope>.key"` in front of any `default:`, as
+/// AbstractController::Translation reads it for the action being processed.
+fn parse_mailer_args(args: &[Expr], scope: &str, action: &str) -> Result<Call, String> {
+    let Some(key) = args.first().and_then(literal_text) else {
+        // A key known only when it runs may be lazy (`.fallback`), and the run-time lookup has no mailer-level default.
+        return Err("a mailer action's key computed when it runs".into());
+    };
+    let Some(rest) = key.strip_prefix('.').map(str::to_string) else { return parse_args(args, None, false) };
+    if rest.ends_with("_html") || rest.ends_with(".html") {
+        return Err("an `_html` key in a mailer: Rails returns it html-safe, which no String here carries".into());
+    }
+    let key = Expr { ty: Some(Ty::Str), ..Expr::new(args[0].span, ExprNode::Lit { value: Literal::Str { value: format!("{scope}.{action}.{rest}") } }) };
+    let mut call = parse_args(&std::iter::once(key).chain(args[1..].iter().cloned()).collect::<Vec<_>>(), None, false)?;
+    call.lookup.defaults.insert(0, Fallback::Key(format!("{scope}.{rest}")));
+    call.lookup.default_list = true;
+    Ok(call)
+}
+
 fn parse_controller_args(args: &[Expr], scope: &str) -> Result<Call, String> {
     let lazy = args.first().and_then(literal_text).and_then(|k| k.strip_prefix('.').map(str::to_string));
     let call = match lazy {
@@ -309,11 +338,36 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-// Answers shared only within one immutable-catalog phase and its workers.
+// Answers shared within one immutable-catalog phase and its workers, and with a later phase of the same session over
+// the same catalog (`with_session_plans`).
 #[derive(Clone, Default)]
-pub(crate) struct SharedPlanCache(std::sync::Arc<std::sync::Mutex<
-    crate::det::HashMap<PlanKey, Result<Vec<(Variant, Plan)>, String>>
->>);
+pub(crate) struct SharedPlanCache(std::sync::Arc<std::sync::Mutex<PhasePlans>>);
+
+/// One catalog's answers. `catalog` is the address of the catalog they were
+/// planned over: the one the cache was made for (`SharedPlanCache::over`,
+/// every phase the compiler runs), else the one of the first plan kept
+/// (`with_plan_cache`). A call planned over any other catalog is neither
+/// answered from here nor kept, so a phase that reaches a second catalog
+/// cannot read the first one's plans.
+#[derive(Default)]
+struct PhasePlans {
+    catalog: Option<usize>,
+    answers: crate::det::HashMap<PlanKey, Result<Vec<(Variant, Plan)>, String>>,
+}
+
+fn address(catalog: &Catalog) -> usize {
+    catalog as *const Catalog as usize
+}
+
+impl SharedPlanCache {
+    /// An empty cache that answers for `catalog` alone.
+    fn over(catalog: &Catalog) -> Self {
+        SharedPlanCache(std::sync::Arc::new(std::sync::Mutex::new(PhasePlans {
+            catalog: Some(address(catalog)),
+            answers: Default::default(),
+        })))
+    }
+}
 
 pub(crate) fn plan_cache_snapshot() -> Option<SharedPlanCache> {
     PLANNED.with(|c| c.borrow().clone())
@@ -339,10 +393,55 @@ struct PlanKey {
     in_view: bool,
 }
 
-/// Keep plans for one phase over one immutable catalog. Nested analyses
-/// start a fresh cache: an outer session may analyze another app/catalog.
+/// Keep plans for one phase over one immutable catalog (the first one a
+/// plan is kept for), in a fresh cache shared with no other phase
+/// (`with_catalog_plans` shares a session's).
 pub fn with_plan_cache<T>(f: impl FnOnce() -> T) -> T {
     let _cache = install_plan_cache(Some(Default::default()));
+    f()
+}
+
+thread_local! {
+    /// The catalog the session's phases last planned over, and their plans (`with_session_plans`).
+    static SESSION: std::cell::RefCell<Option<(std::sync::Weak<Catalog>, SharedPlanCache)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Let the phases inside `f` that plan over one catalog share their plans: the fold then reads what typing planned
+/// instead of planning every call again. A plan is a function of the catalog and the `PlanKey` alone, so a phase over
+/// the same `Arc` gets the same answers; a phase over another catalog starts over. The plans go when the fold has read
+/// them (`apply_i18n_translate_lowering`), and at the latest when `f` returns.
+pub fn with_session_plans<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<(std::sync::Weak<Catalog>, SharedPlanCache)>);
+    impl Drop for Restore {
+        fn drop(&mut self) { SESSION.with(|s| *s.borrow_mut() = self.0.take()); }
+    }
+    let _restore = Restore(SESSION.with(|s| s.replace(Some((std::sync::Weak::new(), SharedPlanCache::default())))));
+    f()
+}
+
+/// The cache for one phase over `catalog`: the session's, if the session last planned over this same `Arc`, else a
+/// fresh one (which the session then keeps for this catalog). Outside a session, always fresh.
+fn phase_plans(catalog: &std::sync::Arc<Catalog>) -> SharedPlanCache {
+    // Bound before any plan is kept, to the catalog typing and the fold both plan over (`or_rails_default`): a call
+    // planned over anything else is not kept under this `Arc`'s name, in this phase or a later one.
+    let fresh = || SharedPlanCache::over(catalog.or_rails_default());
+    SESSION.with(|s| match s.borrow_mut().as_mut() {
+        None => fresh(),
+        Some((seen, plans)) => {
+            // A `Weak` keeps the allocation, so no other catalog can reuse this address while it is held.
+            if !seen.upgrade().is_some_and(|c| std::sync::Arc::ptr_eq(&c, catalog)) {
+                *seen = std::sync::Arc::downgrade(catalog);
+                *plans = fresh();
+            }
+            plans.clone()
+        }
+    })
+}
+
+/// `with_plan_cache` for a phase over `catalog`, with the session's plans for it.
+pub fn with_catalog_plans<T>(catalog: &std::sync::Arc<Catalog>, f: impl FnOnce() -> T) -> T {
+    let _cache = install_plan_cache(Some(phase_plans(catalog)));
     f()
 }
 
@@ -358,19 +457,49 @@ fn plan_key(call: &Call, in_view: bool) -> PlanKey {
     }
 }
 
-/// `plans` for the call written as `recv.method(args)`, kept for the length of `with_plan_cache`.
+/// `plans` for the call written as `recv.method(args)`, kept in the installed cache: for the phase, and inside a
+/// session for the later phases over the same catalog.
 fn plans_at(catalog: &Catalog, call: &Call, in_view: bool) -> Result<Vec<(Variant, Plan)>, String> {
+    planned(catalog, call, in_view, Clone::clone)
+}
+
+/// Whether `plans` answers the call, from the same cache but without
+/// copying the plans: typing asks this of every translate call on every
+/// fixpoint round, and an app with many locales keeps one plan per locale.
+fn plans_ok_at(catalog: &Catalog, call: &Call, in_view: bool) -> Result<(), String> {
+    planned(catalog, call, in_view, |out| out.as_ref().map(|_| ()).map_err(Clone::clone))
+}
+
+/// `read` of the call's `plans`, kept as `plans_at` says.
+fn planned<T>(
+    catalog: &Catalog,
+    call: &Call,
+    in_view: bool,
+    read: impl Fn(&Result<Vec<(Variant, Plan)>, String>) -> T,
+) -> T {
     let key = plan_key(call, in_view);
-    if let Some(hit) = PLANNED.with(|c| c.borrow().as_ref().and_then(|m| m.0.lock().unwrap().get(&key).cloned())) {
+    let here = address(catalog);
+    let hit = PLANNED.with(|c| {
+        c.borrow().as_ref().and_then(|m| {
+            let kept = m.0.lock().unwrap();
+            if kept.catalog == Some(here) { kept.answers.get(&key).map(&read) } else { None }
+        })
+    });
+    if let Some(hit) = hit {
         return hit;
     }
     let out = plans(catalog, call, in_view);
+    let answer = read(&out);
     PLANNED.with(|c| {
         if let Some(m) = c.borrow().as_ref() {
-            m.0.lock().unwrap().insert(key, out.clone());
+            let mut kept = m.0.lock().unwrap();
+            // The cache belongs to the first catalog a plan is kept for; another catalog's plan is not kept.
+            if *kept.catalog.get_or_insert(here) == here {
+                kept.answers.insert(key, out);
+            }
         }
     });
-    out
+    answer
 }
 
 /// Whether every key a translate call can look up resolves; `None` when
@@ -401,7 +530,7 @@ fn resolves_uncached(
             .iter()
             .try_for_each(|a| resolves(catalog, recv, method, a, block, site).expect("still a translate call")),
         (Ok(call), None) if counted_by_rule(&call, catalog) => Err(COUNT_BY_RULE.to_string()),
-        (Ok(call), None) => plans_at(catalog, &call, site.in_view()).map(|_| ()),
+        (Ok(call), None) => plans_ok_at(catalog, &call, site.in_view()),
         (Err(reason), None) => Err(reason),
     };
     Some(match answer {
@@ -489,6 +618,11 @@ pub(crate) fn value_answer(catalog: &Catalog, recv: Option<&Expr>, method: &str,
     if crate::i18n::is_html_safe_key(&full) {
         return None;
     }
+    // Every variant below reads its value from a catalog `catalog_for` reaches: this one or one of `others`. A key
+    // none of them holds as a value answers `None` at the first variant, so typing's call on every round stops here.
+    if !std::iter::once(catalog).chain(&catalog.others).any(|c| c.values.contains_key(&full)) {
+        return None;
+    }
     let mut locales = catalog.locales();
     for other in &catalog.others {
         if !locales.contains(&other.locale) {
@@ -526,6 +660,84 @@ pub(crate) fn value_answer(catalog: &Catalog, recv: Option<&Expr>, method: &str,
         Opaque::Float(_) => (full, "translate_float", Ty::Float),
         Opaque::Bool(_) => (full, "translate_boolean", Ty::Bool),
     })
+}
+
+/// `t("term.js")` before a `.to_json` (`inner`): a key naming a node of Strings, which I18n
+/// answers as a nested Hash of them, and that Hash's JSON as
+/// ActiveSupport's `to_json` writes it (`Catalog::subtree_json`). A
+/// template hands its strings to a script this way
+/// (`<%= raw(t("term.js").to_json) %>`). The text per locale the call
+/// can run in, the default first: the first locale of the fallback
+/// chain that has the node answers it whole, as the gem's Fallbacks
+/// backend does. Only a literal key with no options and no `_html`
+/// key; `None` (the call stays what `resolves` says it is) for anything
+/// else, or when environments whose fallbacks differ answer differently.
+pub(crate) fn subtree_json(catalog: &Catalog, inner: &Expr, site: Site<'_>) -> Option<Vec<(String, String)>> {
+    let ExprNode::Send { recv, method, args, block, .. } = &*inner.node else { return None };
+    let site = if inner.decisions & crate::expr::HELPER_COPY_TRANSLATE != 0 { Site::View(None) } else { site };
+    let call = parse(recv.as_ref(), method.as_str(), args, block.as_ref(), site)?.ok()?;
+    if call.dynamic.is_some() || call.lookup.counted || !call.lookup.values.is_empty() || call.locale.is_some()
+        || !call.lookup.defaults.is_empty()
+    {
+        return None;
+    }
+    let key = Translate::full_key(&call.lookup, &call.lookup.key).ok()?;
+    if crate::i18n::is_html_safe_key(&key) {
+        return None;
+    }
+    let locales = catalog.locales();
+    if locales.len() > 1 && catalog.available_unknown.is_some() {
+        return None;
+    }
+    if (locales.len() > 1 || catalog.fallbacks.app.is_some() || !catalog.fallbacks.envs.is_empty()) && catalog.fallbacks.unknown.is_some() {
+        return None;
+    }
+    let lands = |c: &Catalog| c.entries.contains_key(&key) || c.opaque.contains(&key) || c.is_subtree(&key);
+    let mut per_locale: Vec<(String, String)> = Vec::new();
+    for variant in catalog.variants(&locales) {
+        let chain = match &variant.fallbacks {
+            Some(defaults) => crate::i18n::fallback_chain(&variant.locale, defaults),
+            None => vec![variant.locale.clone()],
+        };
+        let owner = chain.iter().filter_map(|l| catalog.catalog_for(l)).find(|c| lands(c))?;
+        let json = owner.subtree_json(&key, catalog.escape_js_separators)?;
+        match per_locale.iter().find(|(l, _)| *l == variant.locale) {
+            Some((_, seen)) if *seen != json => return None,
+            Some(_) => {}
+            None => per_locale.push((variant.locale.clone(), json)),
+        }
+    }
+    Some(per_locale)
+}
+
+/// The receiver of `expr` when it is a bare `<receiver>.to_json`.
+fn to_json_receiver(expr: &Expr) -> Option<&Expr> {
+    match &*expr.node {
+        ExprNode::Send { recv: Some(inner), method, args, block: None, .. } if method.as_str() == "to_json" && args.is_empty() => Some(inner),
+        _ => None,
+    }
+}
+
+/// The `subtree_json` texts as one expression: the text, or a `case` on
+/// `I18n.locale` whose else branch is the default locale's.
+fn subtree_json_expr(span: Span, mut per_locale: Vec<(String, String)>) -> Option<Expr> {
+    if per_locale.windows(2).all(|w| w[0].1 == w[1].1) {
+        return Some(lit(span, per_locale.pop()?.1));
+    }
+    let (_, default) = per_locale.remove(0);
+    let mut arms: Vec<Arm> = per_locale
+        .into_iter()
+        .map(|(l, json)| Arm { pattern: Pattern::Lit { value: Literal::Str { value: l } }, guard: None, body: lit(span, json) })
+        .collect();
+    arms.push(Arm { pattern: Pattern::Wildcard, guard: None, body: lit(span, default) });
+    let scrutinee = Expr::new(span, ExprNode::Send {
+        recv: Some(Expr { ty: Some(Ty::Sym), ..const_send(span, "I18n", "locale", vec![]) }),
+        method: Symbol::from("to_s"),
+        args: vec![],
+        block: None,
+        parenthesized: false,
+    });
+    Some(typed(Expr::new(span, ExprNode::Case { scrutinee: typed(scrutinee), arms })))
 }
 
 const COUNT_BY_RULE: &str = "a count whose form a locale's own plural rule picks";
@@ -635,8 +847,20 @@ thread_local! {
 /// templates. A controller's instance methods (its actions and the
 /// private methods they call) take the controller's `t`.
 pub fn apply_i18n_translate_lowering(app: &mut App) {
-    // This catalog is a new phase, independent of analysis and outer sessions.
-    let _cache = install_plan_cache(Some(Default::default()));
+    // The fold is the last reader of a session's plans: the session lets them go when this returns.
+    struct LastReader;
+    impl Drop for LastReader {
+        fn drop(&mut self) {
+            SESSION.with(|s| {
+                if let Some(kept) = s.borrow_mut().as_mut() {
+                    *kept = (std::sync::Weak::new(), SharedPlanCache::default());
+                }
+            });
+        }
+    }
+    let _last = LastReader;
+    // A new phase: inside a session it reads the plans typing made over this same catalog, else it starts fresh.
+    let _cache = install_plan_cache(Some(phase_plans(&app.i18n)));
     TABLE.with(|t| *t.borrow_mut() = Default::default());
     RUNTIME_SITES.with(|r| *r.borrow_mut() = Default::default());
     // A handle on the shared catalog, not a copy: the walk below borrows `app` mutably.
@@ -648,12 +872,37 @@ pub fn apply_i18n_translate_lowering(app: &mut App) {
         .filter(|c| translates(app, c))
         .map(|c| (c.name.clone(), controller_scope(c.name.0.as_str())))
         .collect();
+    let mailers: crate::det::HashMap<crate::ident::ClassId, String> = app
+        .library_classes
+        .iter()
+        .filter(|lc| mailer_translates(app, lc))
+        .map(|lc| (lc.name.clone(), mailer_scope(lc.name.0.as_str())))
+        .collect();
     super::for_each_owned_hook_body(app, &mut |owner, body| {
+        // A mailer's own roots too (`default subject: I18n.t(…)`): its methods' bare `t` is left by this site for the pass below.
         if owner.is_some_and(|o| controllers.contains_key(o)) {
             return;
         }
         rewrite(body, &catalog, Site::Other)
     });
+    for lc in app.library_classes.iter_mut() {
+        let Some(scope) = mailers.get(&lc.name) else { continue };
+        for m in lc.methods.iter_mut() {
+            // An action with callbacks has its body under `__mailer_action_<name>` (`ingest::mailer_callbacks`).
+            let action = (m.receiver == crate::dialect::MethodReceiver::Instance).then(|| match m.name.as_str().strip_prefix(crate::ingest::mailer_callbacks::ACTION_PREFIX) {
+                Some(action) => Some(action.to_string()),
+                None => (m.visibility == crate::dialect::MethodVisibility::Public).then(|| m.name.as_str().to_string()),
+            }).flatten();
+            let site = match &action {
+                Some(action) => Site::Mailer(scope, action),
+                None => Site::Other,
+            };
+            for default in m.params.iter_mut().filter_map(|p| p.default.as_mut()) {
+                rewrite_default(default, &catalog, site);
+            }
+            rewrite(&mut m.body, &catalog, site);
+        }
+    }
     // An `app/helpers` module's instance methods run in the view: their bare `t` is ActionView's, with no template for a lazy key.
     let helpers: crate::det::HashSet<crate::ident::ClassId> = app.helper_method_index.values().cloned().collect();
     for lc in app.library_classes.iter_mut().filter(|lc| helpers.contains(&lc.name)) {
@@ -730,6 +979,46 @@ fn translates(app: &App, controller: &crate::dialect::Controller) -> bool {
     false
 }
 
+/// Whether `lc` is a mailer with AbstractController::Translation's `t`: it descends from `ActionMailer::Base` through
+/// the app's classes, and neither it nor an app ancestor defines its own `t` / `translate`.
+pub(crate) fn mailer_translates(app: &App, lc: &crate::dialect::LibraryClass) -> bool {
+    let by_name: crate::det::HashMap<&str, &crate::dialect::LibraryClass> =
+        app.library_classes.iter().filter(|c| !c.is_module).map(|c| (c.name.0.as_str(), c)).collect();
+    let modules: crate::det::HashMap<&str, &crate::dialect::LibraryClass> =
+        app.library_classes.iter().filter(|c| c.is_module).map(|c| (c.name.0.as_str(), c)).collect();
+    let defines_t = |c: &crate::dialect::LibraryClass| {
+        c.methods.iter().any(|m| m.receiver == crate::dialect::MethodReceiver::Instance && matches!(m.name.as_str(), "t" | "translate"))
+    };
+    // An included app module sits ahead of AbstractController::Translation, so its `t` is the one that runs.
+    fn module_defines_t(
+        id: &str,
+        modules: &crate::det::HashMap<&str, &crate::dialect::LibraryClass>,
+        defines_t: &dyn Fn(&crate::dialect::LibraryClass) -> bool,
+        seen: &mut Vec<String>,
+    ) -> bool {
+        let id = id.trim_start_matches("::");
+        if seen.iter().any(|s| s == id) {
+            return false;
+        }
+        seen.push(id.to_string());
+        let Some(m) = modules.get(id) else { return false };
+        defines_t(m) || m.includes.iter().any(|i| module_defines_t(i.0.as_str(), modules, defines_t, seen))
+    }
+    let mut current = Some(lc);
+    for _ in 0..32 {
+        let Some(c) = current else { return false };
+        if defines_t(c) || c.includes.iter().any(|i| module_defines_t(i.0.as_str(), &modules, &defines_t, &mut Vec::new())) {
+            return false;
+        }
+        let Some(parent) = c.parent.as_ref().map(|p| p.0.as_str().trim_start_matches("::")) else { return false };
+        if parent == "ActionMailer::Base" {
+            return true;
+        }
+        current = by_name.get(parent).copied();
+    }
+    false
+}
+
 // A parameter default has no statement ahead of it to hoist a `Seq` into, so a dynamic key's `__k = …; case __k …` keeps its own `begin`.
 fn rewrite_default(expr: &mut Expr, catalog: &Catalog, site: Site<'_>) {
     rewrite(expr, catalog, site);
@@ -740,6 +1029,10 @@ fn rewrite_default(expr: &mut Expr, catalog: &Catalog, site: Site<'_>) {
 }
 
 fn rewrite(expr: &mut Expr, catalog: &Catalog, site: Site<'_>) {
+    if let Some(folded) = to_json_receiver(expr).and_then(|inner| subtree_json(catalog, inner, site)).and_then(|texts| subtree_json_expr(expr.span, texts)) {
+        *expr = folded;
+        return;
+    }
     expr.node.for_each_child_mut(&mut |c| rewrite(c, catalog, site));
     // Folded as the view's `t` it is, without the `raw` a controller body has no helper for: nothing renders this copy.
     if expr.decisions & crate::expr::HELPER_COPY_TRANSLATE != 0 {
@@ -960,6 +1253,7 @@ fn runtime_call(span: Span, args: &[Expr], catalog: &Catalog, site: Site<'_>) ->
                 })) },
             ],
         })),
+        Site::Mailer(scope, action) => lit(span, format!("{scope}.{action}")),
         _ => lit(span, String::new()),
     };
     let in_view = site.in_view();
@@ -1258,7 +1552,7 @@ fn with_locale(e: &Expr) -> Option<Expr> {
     let body = Expr { ty: body_ty.clone(), ..Expr::new(span, ExprNode::Seq { exprs: vec![save, body] }) };
     Some(Expr {
         ty: body_ty,
-        ..Expr::new(span, ExprNode::BeginRescue { body, rescues: Vec::new(), else_branch: None, ensure: Some(leave), implicit: false })
+        ..Expr::new(span, ExprNode::BeginRescue { body, rescues: Vec::new(), else_branch: None, ensure: Some(Box::new(leave)), implicit: false })
     })
 }
 
@@ -1651,11 +1945,207 @@ mod tree_answer_tests {
         }
         assert!(positive > 0 && negative > 0);
     }
+
+    /// `value_answer` as it read before the early return for a key no
+    /// reachable catalog holds as a value: every variant's chain walked.
+    fn eager_value(catalog: &Catalog, full: &str) -> Option<Vec<crate::i18n::Opaque>> {
+        let mut locales = catalog.locales();
+        for other in &catalog.others {
+            if !locales.contains(&other.locale) {
+                locales.push(other.locale.clone());
+            }
+        }
+        let lands = |c: &Catalog| c.entries.contains_key(full) || c.opaque.contains(full) || c.is_subtree(full);
+        let mut found = Vec::new();
+        for v in catalog.variants(&locales) {
+            let chain = match &v.fallbacks {
+                Some(defaults) => crate::i18n::fallback_chain(&v.locale, defaults),
+                None => vec![v.locale.clone()],
+            };
+            found.push(chain.iter().filter_map(|l| catalog.catalog_for(l)).find(|c| lands(c))?.values.get(full)?.clone());
+        }
+        let first = found.first()?;
+        found.iter().all(|v| std::mem::discriminant(v) == std::mem::discriminant(first)).then_some(found)
+    }
+
+    #[test]
+    fn value_answers_match_every_variant_walked() {
+        // `days` is a value everywhere, `only_fr` only in fr and fr-CA, `regional` only in fr-CA, `en_only` only in en,
+        // `split` a value in en and text in fr.
+        let source = "en:\n  days:\n    - :mon\n    - tue\n  en_only:\n    - a\n  split:\n    - x\n  title: Text\n  menu:\n    title: Menu\nfr:\n  days:\n    - :lun\n  only_fr:\n    - b\n  split: texte\n  title: Texte\nfr-CA:\n  days:\n    - lun\n  only_fr:\n    - c\n  regional:\n    - q\n";
+        let mut files = vec![("locales.yml".into(), source.into())];
+        let (mut catalog, problems) = Catalog::load("en", &mut files);
+        assert!(problems.is_empty());
+        catalog.load_locales(vec!["en".into(), "fr".into(), "fr-CA".into()], FallbackPolicy::default(), &[], &mut files);
+        let recv = Expr::new(Span::synthetic(), ExprNode::Const { path: vec![Symbol::from("I18n")] });
+        let keys = ["days", "only_fr", "regional", "en_only", "split", "title", "menu", "menu.title", "missing", ""];
+        let settings = [None, Some(Vec::new()), Some(vec!["en".into()]), Some(vec!["fr".into()]), Some(vec!["fr-CA".into(), "en".into()])];
+        let (mut positive, mut negative) = (0, 0);
+        for default in &settings {
+            for environment in &settings {
+                catalog.fallbacks = FallbackPolicy {
+                    app: default.clone(),
+                    envs: vec![("production".into(), environment.clone()), ("test".into(), default.clone())],
+                    ..Default::default()
+                };
+                for shape in ["loaded", "no others", "an other not available"] {
+                    let mut c = catalog.clone();
+                    match shape {
+                        // A catalog whose `others` were never loaded: only its own values are reachable.
+                        "no others" => c.others.clear(),
+                        // fr-CA stays in `others` (reached by fallbacks and as its own variant) without being available.
+                        "an other not available" => {
+                            c.available.retain(|l| l != "fr-CA");
+                            c.available.extend(["en".into(), "fr".into()]);
+                            c.others.push(c.others[0].clone());
+                        }
+                        _ => {}
+                    }
+                    for key in keys {
+                        let args = [lit(Span::synthetic(), key.into())];
+                        let answer = value_answer(&c, Some(&recv), "t", &args, None, Site::Other);
+                        let expected = eager_value(&c, key);
+                        if expected.is_some() { positive += 1 } else { negative += 1 }
+                        assert_eq!(answer.is_some(), expected.is_some(),
+                            "{key:?}, {default:?}, {environment:?}, {shape}");
+                    }
+                }
+            }
+        }
+        assert!(positive > 0 && negative > 0);
+    }
 }
 
 #[cfg(test)]
 mod phase_cache_tests {
     use super::*;
+
+    thread_local! {
+        /// Calls of `plans` on this thread: what a cache did not answer.
+        pub(super) static PLANS_COMPUTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn computed() -> usize {
+        PLANS_COMPUTED.with(|n| n.get())
+    }
+
+    #[test]
+    fn a_cache_answers_only_for_the_catalog_it_was_filled_over() {
+        let catalog = |text: &str| {
+            let mut c = Catalog::default();
+            c.locale = "en".into();
+            c.entries.building().insert("label".into(), text.into());
+            c
+        };
+        let (first, second) = (catalog("first"), catalog("second"));
+        let call = Call { lookup: Translate { key: "label".into(), ..Default::default() },
+            count: None, values: vec![], order: vec![], dynamic: None, locale: None };
+        let (of_first, of_second) = (plans(&first, &call, false).unwrap(), plans(&second, &call, false).unwrap());
+        assert_ne!(of_first, of_second);
+        with_plan_cache(|| {
+            assert_eq!(plans_at(&first, &call, false).unwrap(), of_first);
+            // Another catalog asked in the same phase, with no nested cache, gets its own answer.
+            assert_eq!(plans_at(&second, &call, false).unwrap(), of_second);
+            assert_eq!(plans_ok_at(&second, &call, false), Ok(()));
+            // It left nothing behind: the first catalog still reads its own kept plans, and the second is planned
+            // again each time it asks.
+            let before = computed();
+            assert_eq!(plans_at(&first, &call, false).unwrap(), of_first);
+            assert_eq!(computed(), before);
+            assert_eq!(plans_at(&second, &call, false).unwrap(), of_second);
+            assert_eq!(computed(), before + 1);
+        });
+    }
+
+    #[test]
+    fn analyze_and_lower_plans_a_translate_call_once() {
+        // One helper, one `t`: every phase walks a single item, so no worker thread plans out of this one's sight.
+        let files = [
+            ("config/locales/en.yml", "en:\n  probe:\n    label: Probe\n"),
+            ("app/helpers/probe_helper.rb", "module ProbeHelper\n  def probe_label\n    t(\"probe.label\")\n  end\nend\n"),
+        ];
+        let app = || crate::ingest::ingest_app_from_tree(
+            files.iter().map(|(p, s)| (std::path::PathBuf::from(p), s.as_bytes().to_vec())).collect(),
+        ).unwrap();
+        let planned_by = |run: &dyn Fn()| {
+            let before = computed();
+            run();
+            computed() - before
+        };
+        let typing = planned_by(&|| {
+            let mut app = app();
+            crate::analyze::Analyzer::new(&app).analyze(&mut app);
+        });
+        let session = planned_by(&|| {
+            crate::session::analyze_and_lower(&mut app());
+        });
+        assert!(typing > 0, "typing plans the helper's `t`");
+        assert_eq!(session, typing, "the fold planned what typing had planned");
+        // The fold is the plans' last reader: the session holds them until it has run, and not after.
+        let mut app = app();
+        with_session_plans(|| {
+            crate::analyze::Analyzer::new(&app).analyze(&mut app);
+            assert_eq!(std::sync::Arc::weak_count(&app.i18n), 1, "typing's plans wait for the fold");
+            let before = computed();
+            // A second typing run over a clone of the app, as after `source_gem_shake`: the same catalog `Arc`.
+            let mut trimmed = app.clone();
+            crate::analyze::Analyzer::new(&trimmed).analyze(&mut trimmed);
+            apply_i18n_translate_lowering(&mut app);
+            assert_eq!(computed(), before, "the second run and the fold read them");
+            assert_eq!(std::sync::Arc::weak_count(&app.i18n), 0, "and the session let them go");
+        });
+    }
+
+    #[test]
+    fn a_session_that_unwinds_is_closed() {
+        let catalog = {
+            let mut c = Catalog::default();
+            c.locale = "en".into();
+            c.entries.building().insert("label".into(), "first".into());
+            std::sync::Arc::new(c)
+        };
+        let call = Call { lookup: Translate { key: "label".into(), ..Default::default() },
+            count: None, values: vec![], order: vec![], dynamic: None, locale: None };
+        let planned_in_a_phase = || {
+            let before = computed();
+            with_catalog_plans(&catalog, || plans_at(&catalog, &call, false).unwrap());
+            computed() - before
+        };
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_session_plans(|| -> () {
+                assert_eq!(planned_in_a_phase(), 1);
+                std::panic::resume_unwind(Box::new("inside the session"))
+            })
+        }));
+        // The unwind is the one started above, not a failed assertion inside the session.
+        assert_eq!(unwound.unwrap_err().downcast_ref::<&str>(), Some(&"inside the session"));
+        // No session is left open behind the unwind: every phase starts fresh, as outside one.
+        assert_eq!(planned_in_a_phase(), 1);
+        assert_eq!(planned_in_a_phase(), 1);
+    }
+
+    #[test]
+    fn a_catalog_changed_in_place_is_planned_again() {
+        let mut catalog = {
+            let mut c = Catalog::default();
+            c.locale = "en".into();
+            c.entries.building().insert("label".into(), "first".into());
+            std::sync::Arc::new(c)
+        };
+        let call = Call { lookup: Translate { key: "label".into(), ..Default::default() },
+            count: None, values: vec![], order: vec![], dynamic: None, locale: None };
+        with_session_plans(|| {
+            let before = with_catalog_plans(&catalog, || plans_at(&catalog, &call, false).unwrap());
+            assert_eq!(before, plans(&catalog, &call, false).unwrap());
+            // The session holds the catalog weakly: it keeps no catalog alive, and the owner below is the only one.
+            assert_eq!((std::sync::Arc::strong_count(&catalog), std::sync::Arc::weak_count(&catalog)), (1, 1));
+            // The only strong owner changes the catalog: the session's `Weak` must not keep its old plans.
+            std::sync::Arc::make_mut(&mut catalog).entries.building().insert("label".into(), "changed".into());
+            let after = with_catalog_plans(&catalog, || plans_at(&catalog, &call, false).unwrap());
+            assert_ne!(after, before);
+            assert_eq!(after, plans(&catalog, &call, false).unwrap());
+        });
+    }
 
     #[test]
     fn nested_phases_do_not_reuse_another_catalogs_answer() {
@@ -1673,6 +2163,102 @@ mod phase_cache_tests {
             assert_eq!(plans_at(&first, &call, false).unwrap(), expected);
             with_plan_cache(|| assert_eq!(plans_at(&second, &call, false).unwrap(), plans(&second, &call, false).unwrap()));
             assert_eq!(plans_at(&first, &call, false).unwrap(), expected);
+        });
+    }
+
+    #[test]
+    fn the_resolves_answer_shares_the_folds_cached_plans() {
+        let catalog = |text: &str| {
+            let mut c = Catalog::default();
+            c.locale = "en".into();
+            c.entries.building().insert("label".into(), text.into());
+            c
+        };
+        let first = catalog("first");
+        let call = |locale: Option<&str>| Call { lookup: Translate { key: "label".into(), ..Default::default() },
+            count: None, values: vec![], order: vec![], dynamic: None, locale: locale.map(|l| Locale::Literal(l.into())) };
+        let (en, fr) = (call(None), call(Some("fr")));
+        let (plans_en, plans_fr) = (plans(&first, &en, false).unwrap(), plans(&first, &fr, false));
+        let refusal = plans_fr.clone().map(|_| ());
+        assert!(refusal.is_err());
+        with_plan_cache(|| {
+            // The answer `plans` gives, the refusal's text included, on the miss and on the hit.
+            assert_eq!(plans_ok_at(&first, &en, false), Ok(()));
+            assert_eq!(plans_ok_at(&first, &fr, false), refusal);
+            assert_eq!(plans_ok_at(&first, &fr, false), refusal);
+            // Kept for the phase: later reads of the same calls, whole plans or not, plan nothing again.
+            let before = computed();
+            assert_eq!(plans_ok_at(&first, &fr, false), refusal);
+            assert_eq!(plans_at(&first, &en, false).unwrap(), plans_en);
+            assert_eq!(plans_at(&first, &fr, false), plans_fr);
+            assert_eq!(computed(), before);
+        });
+    }
+
+    #[test]
+    fn a_sessions_phases_share_plans_only_over_the_same_catalog() {
+        let catalog = |text: &str| {
+            let mut c = Catalog::default();
+            c.locale = "en".into();
+            c.entries.building().insert("label".into(), text.into());
+            std::sync::Arc::new(c)
+        };
+        let first = catalog("first");
+        // Equal to `first`, but another catalog: identity, not content, decides.
+        let twin = std::sync::Arc::new((*first).clone());
+        let call = Call { lookup: Translate { key: "label".into(), ..Default::default() },
+            count: None, values: vec![], order: vec![], dynamic: None, locale: None };
+        let expected = plans(&first, &call, false).unwrap();
+        // How many times a phase over `over` had to plan the call: 0 when it read a kept answer.
+        let planned_in_a_phase_over = |over: &std::sync::Arc<Catalog>| {
+            let before = computed();
+            assert_eq!(with_catalog_plans(over, || plans_at(over, &call, false).unwrap()), expected);
+            computed() - before
+        };
+        with_session_plans(|| {
+            assert_eq!(planned_in_a_phase_over(&first), 1);
+            // A later phase over the same `Arc` reads what the first one planned.
+            assert_eq!(planned_in_a_phase_over(&first), 0);
+            // Another catalog, even an equal one, starts over.
+            assert_eq!(planned_in_a_phase_over(&twin), 1);
+            // That phase replaced the session's catalog: `first`'s plans are gone.
+            assert_eq!(planned_in_a_phase_over(&first), 1);
+            // A nested session starts empty, and the outer one keeps its plans after it: not the nested one's, which
+            // ended over another catalog.
+            with_session_plans(|| {
+                assert_eq!(planned_in_a_phase_over(&first), 1);
+                assert_eq!(planned_in_a_phase_over(&twin), 1);
+            });
+            assert_eq!(planned_in_a_phase_over(&first), 0);
+        });
+        // Outside a session, and after one, every phase starts fresh.
+        assert_eq!(planned_in_a_phase_over(&first), 1);
+        assert_eq!(planned_in_a_phase_over(&first), 1);
+    }
+
+    #[test]
+    fn a_sessions_cache_is_its_catalogs_before_the_first_plan() {
+        let catalog = |text: &str| {
+            let mut c = Catalog::default();
+            c.locale = "en".into();
+            c.entries.building().insert("label".into(), text.into());
+            std::sync::Arc::new(c)
+        };
+        let (first, second) = (catalog("first"), catalog("second"));
+        let call = Call { lookup: Translate { key: "label".into(), ..Default::default() },
+            count: None, values: vec![], order: vec![], dynamic: None, locale: None };
+        let (of_first, of_second) = (plans(&first, &call, false).unwrap(), plans(&second, &call, false).unwrap());
+        assert_ne!(of_first, of_second);
+        with_session_plans(|| {
+            // The first call of a phase over `first` plans over another catalog: it is answered, and not kept.
+            assert_eq!(with_catalog_plans(&first, || plans_at(&second, &call, false).unwrap()), of_second);
+            // A later phase over `first` plans `first` itself, and the other catalog again when it is asked.
+            let before = computed();
+            with_catalog_plans(&first, || {
+                assert_eq!(plans_at(&first, &call, false).unwrap(), of_first);
+                assert_eq!(plans_at(&second, &call, false).unwrap(), of_second);
+            });
+            assert_eq!(computed(), before + 2);
         });
     }
 }

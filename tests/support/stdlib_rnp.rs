@@ -99,3 +99,57 @@ pub fn overlay() -> super::emit_and_run::Overlay {
         .write("config/routes.rb", "Rails.application.routes.draw do\nend\n")
         .write("app/services/stdlib_probe.rb", SOURCE)
 }
+
+/// OpenStruct on its own app: on Spinel, `require "ostruct"` makes a bare reader on any boxed value a
+/// possible member read (`ostruct_member_read`), which miscompiles the lazy-chain probes above
+/// (`StdlibProbe.lazily`'s array of arrays); recorded as a Spinel defect, not hidden here.
+pub const OSTRUCT_SOURCE: &str = r#"require "ostruct"
+class OpenStructProbe
+  def self.config
+    OpenStruct.new({ "locales" => ["da", "en"], "country_code" => "dk" })
+  end
+
+  def self.config_members
+    settings = config
+    [settings.locales, settings.country_code, settings.missing, settings.locales.first]
+  end
+
+  def self.keyword_member
+    OpenStruct.new(query_text: "flat").query_text
+  end
+
+  def self.member_named_new
+    OpenStruct.new(new: "x").new
+  end
+
+  def self.config_hash
+    config.to_h
+  end
+
+  def self.config_responds?
+    config.respond_to?(:country_code) && !config.respond_to?(:missing)
+  end
+
+  def self.config?
+    config.is_a?(OpenStruct)
+  end
+end
+"#;
+
+pub const OSTRUCT_ASSERTIONS: &str = r#"
+raise "ostruct #{OpenStructProbe.config_members}" unless OpenStructProbe.config_members == [["da", "en"], "dk", nil, "da"]
+raise "ostruct keyword" unless OpenStructProbe.keyword_member == "flat"
+raise "ostruct member named new" unless OpenStructProbe.member_named_new == "x"
+raise "ostruct to_h #{OpenStructProbe.config_hash}" unless OpenStructProbe.config_hash == { locales: ["da", "en"], country_code: "dk" }
+raise "ostruct?" unless OpenStructProbe.config?
+raise "ostruct respond_to?" unless OpenStructProbe.config_responds?
+puts "ostruct OK"
+"#;
+
+pub fn ostruct_overlay() -> super::emit_and_run::Overlay {
+    super::emit_and_run::empty_app()
+        .write("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table :items do |t|\n    t.string :name\n  end\nend\n")
+        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n")
+        .write("config/routes.rb", "Rails.application.routes.draw do\nend\n")
+        .write("app/services/open_struct_probe.rb", OSTRUCT_SOURCE)
+}

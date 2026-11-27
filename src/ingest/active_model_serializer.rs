@@ -92,6 +92,9 @@ impl ScopeReads {
 }
 
 pub(super) fn lower_active_model_serializers(app: &mut crate::App, sources: &[SourceFile]) -> IngestResult<()> {
+    if super::active_model_serializer_08::applies(app) {
+        return Ok(());
+    }
     // A serializer another app class inherits from is a base, not one
     // to render through: lowered, it would lose the gem's parent its
     // subclasses still need (their `attributes`, `as_json`). It stays as
@@ -284,7 +287,7 @@ pub(super) fn lower_active_model_serializers(app: &mut crate::App, sources: &[So
 }
 
 /// Every class in the file with its fully qualified path.
-fn collect_classes<'pr>(
+pub(super) fn collect_classes<'pr>(
     node: &ruby_prism::Node<'pr>,
     scope: &mut Vec<String>,
     out: &mut Vec<(Vec<String>, ruby_prism::ClassNode<'pr>)>,
@@ -594,13 +597,16 @@ fn rewrite_renders_in(expr: &mut Expr, scope_of: &dyn Fn(&str) -> Option<Option<
     if !entries.iter().all(|(k, _)| name(k).is_some_and(|n| RENDER_KEPT.contains(&n.as_str()))) {
         return;
     }
+    // The lowered class's name (no leading `::`), and the path as written.
     let const_name = |v: &Expr| match &*v.node {
-        ExprNode::Const { path } => Some(path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::")),
+        ExprNode::Const { path } => {
+            Some((path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::"), path.clone()))
+        }
         _ => None,
     };
     let serializer = entries.iter().find_map(|(k, v)| (name(k).as_deref() == Some("serializer")).then(|| const_name(v)).flatten());
     let each = entries.iter().find_map(|(k, v)| (name(k).as_deref() == Some("each_serializer")).then(|| const_name(v)).flatten());
-    let (class, collection) = match (serializer, each) {
+    let ((class, written), collection) = match (serializer, each) {
         (Some(s), None) => (s, false),
         (None, Some(s)) => (s, true),
         _ => return,
@@ -612,10 +618,10 @@ fn rewrite_renders_in(expr: &mut Expr, scope_of: &dyn Fn(&str) -> Option<Option<
         Expr::new(span, ExprNode::Send { recv, method: Symbol::from(m), args, block, parenthesized: true })
     };
     // A synthetic position: a constant with a source one is resolved in
-    // the source index there, where this generated one isn't written.
-    let class_expr = || {
-        Expr::new(Span::synthetic(), ExprNode::Const { path: class.split("::").map(Symbol::from).collect() })
-    };
+    // the source index there, where this generated one isn't written. The
+    // path as written, a leading `::` kept: inside `module Api`,
+    // `::ArticleSerializer` is the top-level class.
+    let class_expr = || Expr::new(Span::synthetic(), ExprNode::Const { path: written.clone() });
     // The gem reads the scope inside `render`, after every option's value
     // has run in source order, and once for a collection. When an option
     // other than `json:` runs code, or the render maps a collection, each
@@ -638,7 +644,7 @@ fn rewrite_renders_in(expr: &mut Expr, scope_of: &dyn Fn(&str) -> Option<Option<
                 if chosen(&entries[i].0) || !runs(&entries[i].1) {
                     continue;
                 }
-                let temp = fresh(&format!("__ams_{}", name(&entries[i].0).unwrap_or_default()), taken);
+                let temp = fresh(&format!("ams_{}", name(&entries[i].0).unwrap_or_default()), taken);
                 if i == json {
                     bindings.push(bound(&temp, value));
                     value = var(&temp);
@@ -647,7 +653,7 @@ fn rewrite_renders_in(expr: &mut Expr, scope_of: &dyn Fn(&str) -> Option<Option<
                     entries[i].1 = var(&temp);
                 }
             }
-            let temp = fresh("__ams_scope", taken);
+            let temp = fresh("ams_scope", taken);
             bindings.push(bound(&temp, scope));
             Some(var(&temp))
         }
@@ -662,7 +668,7 @@ fn rewrite_renders_in(expr: &mut Expr, scope_of: &dyn Fn(&str) -> Option<Option<
         send(Some(send(Some(class_expr()), "new", args, None)), "serializable_hash", vec![], None)
     };
     let rendered = if collection {
-        let item = Symbol::from(fresh("__ams_item", taken).as_str());
+        let item = Symbol::from(fresh("ams_item", taken).as_str());
         let read = Expr::new(span, ExprNode::Var { id: crate::ident::VarId(0), name: item.clone() });
         let block = Expr::new(
             span,
@@ -749,7 +755,7 @@ fn rewrite_resources(expr: &mut Expr, lowered: &HashSet<String>) {
 /// The bodies the resource rewrite walks: controller actions and class
 /// methods, model methods, and library class methods. A resource
 /// anywhere else stays a use of the gem's class.
-fn for_each_rewritten_body(app: &mut crate::App, f: &mut dyn FnMut(&mut Expr)) {
+pub(super) fn for_each_rewritten_body(app: &mut crate::App, f: &mut dyn FnMut(&mut Expr)) {
     for controller in &mut app.controllers {
         for item in &mut controller.body {
             match item {
@@ -1030,7 +1036,7 @@ fn resource_as_json_call<'pr>(
 
 /// Whether a constant path is written from the top level (`::A::B`): its
 /// leftmost segment has no parent.
-fn is_rooted(node: &ruby_prism::Node<'_>) -> bool {
+pub(super) fn is_rooted(node: &ruby_prism::Node<'_>) -> bool {
     let Some(mut path) = node.as_constant_path_node() else { return false };
     loop {
         match path.parent() {
@@ -1050,7 +1056,7 @@ fn is_identifier(s: &str) -> bool {
     chars.next().is_some_and(|c| c.is_ascii_lowercase() || c == '_') && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-fn refuse(source: &SourceFile, offset: usize, reason: &str) -> IngestError {
+pub(super) fn refuse(source: &SourceFile, offset: usize, reason: &str) -> IngestError {
     let (line, column) = source.line_col(offset as u32);
     IngestError::Unsupported {
         file: source.path.clone(),

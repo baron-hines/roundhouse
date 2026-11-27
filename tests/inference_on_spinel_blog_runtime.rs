@@ -571,7 +571,161 @@ fn untyped_subexpressions_baseline() {
     // (active_record/connection.rb's `increment_counter`/`decrement_counter` and `find_or_*_by`, relation.rb's
     // `find_or_*_by`), whose parameters are vars on this RBS-less probe; their RBS types them for the
     // RBS-paired gate, which stays at its ceiling.
-    const CEILING: usize = 1242;
+    // MEASURED 1276 on 2026-11-12 (main 2df7ba939: 1238): the `where` casts
+    // of an enum column, `ActiveRecord.enum_where_int` (+20) and
+    // `enum_where_str` (+17) in active_record/relation.rb, read the where
+    // value, the mapping's label and value lists and the nil label, which
+    // no runtime call site types (a model's generated `_enum_where_value`
+    // calls them); +1 on the module's own residual. relation.rbs types them
+    // for the RBS-paired gate, which stays at main's count.
+    // MEASURED 1280 on 2026-11-12 (merging main e5e647a77, 1242, into this
+    // branch's 1276): the two notes above add up, +4 and +38.
+    // MEASURED 1284 on 2026-11-13 (doorkeeper, on main's 1280): `Base.columns` and `Column`'s `null` argument in
+    // active_record/connection.rb (+4), vars on this RBS-less probe; connection.rbs types them for the RBS-paired gate.
+    // MEASURED 1341 on 2026-11-14 (relation queries, on main's 1268): the
+    // parameters and block values of the Relation methods this branch adds,
+    // vars on this RBS-less probe. `scoping` (+49: `take_query_scalars` 26,
+    // `current_scope_for` 10, `copy_query_state_to` 5, `scoping` 4,
+    // `initialize` 3, `drop_inherited_scope!` 1), `merge_orders!` and
+    // `merge!` (+16), `delete` (+5), `async_count` and `Promise` (+6),
+    // `_missing_attribute` and `_as_json_only` in active_record/connection.rb
+    // (+3), less `unscope_part!` and `order_sql!` (-5, -1). relation.rbs and
+    // connection.rbs type them for the RBS-paired gate, which stays at 0.
+    // MEASURED 1342 on partial-select writes (1341): `_note_loaded` in
+    // active_record/connection.rb drops its column `name`, a var on this
+    // RBS-less probe (+1); connection.rbs types it for the RBS-paired gate.
+    // MEASURED 1343 on partial-select reads (1342): `read_attribute`
+    // checks its `name` against the row's unloaded columns before it
+    // reads `self[name]` (+1 in active_record/connection.rb).
+    // MEASURED 1345 on scoped reordering (1343): `copy_query_state_to`
+    // hands `take_query_scalars` the relation's `@reordering` too, a var
+    // on this RBS-less probe at both ends (+2 in active_record/relation.rb).
+    // MEASURED 1347 on async_count(:id) of a select (1345): `async_count`
+    // reads its `column` twice more to count the key of a relation with a
+    // `select`, a var on this RBS-less probe (+2 in active_record/relation.rb).
+    // MEASURED 1351 on unscoped's block value (1347): `scoping` and
+    // `Model.unscoped { }` bind the block's value before their ensure, so
+    // the Spinel binary keeps it, a var on this RBS-less probe (+2 in
+    // active_record/relation.rb, +2 in active_record/connection.rb).
+    // MEASURED 1352 on partial-select writes (1351): `_note_loaded` in
+    // active_record/connection.rb names the column it assigned in the row's
+    // pending writes, so it reads the column name twice more — the early
+    // return for one that was not left out, and `name.to_s` (+2); less
+    // `read_attribute`, whose unloaded check and `[]` read now pass the
+    // Symbol it normalizes to instead of the name as given, which types
+    // both (-1). The names are vars on this RBS-less probe;
+    // connection.rbs types them for the RBS-paired gate, which stays at 0.
+    // MEASURED 1354 on PostgreSQL array columns (1352): a bulk write passes
+    // each value through `Model._written_sql(column, value)`, which hands
+    // an Array to `encode_written(column, value)`; both take a column value
+    // of any type, as `escape_value` does, so their `value` reads are vars
+    // on this RBS-less probe (+2 in active_record/connection.rb).
+    // connection.rbs types them for the RBS-paired gate, which stays at 0.
+    // MEASURED 1355 on aasm (1354): `attribute_names` in active_record/connection.rb
+    // leaves out the row's unloaded columns, reading each column `name` in its
+    // block, a var on this RBS-less probe (+1); connection.rbs types it for the
+    // RBS-paired gate, which stays at 0.
+    // MEASURED 1420 on has_many merges (1355): the parameters and block
+    // values of the runtime methods this branch adds, vars on this
+    // RBS-less probe. In active_record/relation.rb, `qualify_order_term`
+    // (+25) and `merge_through_scope` (+10). In
+    // active_record/connection.rb, `_merge_target` (+24) and
+    // `_take_unchanged_attributes` (+6). relation.rbs and connection.rbs
+    // type them for the RBS-paired gate, which stays at 0.
+    // MEASURED 1424 on multi-column through ordering (1420):
+    // `merge_through_scope` splits each order clause on commas before
+    // qualifying it. `o.split(",")` and `clause.strip` are untyped on
+    // this RBS-less probe, and so are their `o` / `clause` receivers
+    // (+4 in active_record/relation.rb). relation.rbs types them for the
+    // RBS-paired gate, which stays at 0.
+    // MEASURED 1425 on a nil through-scope body (1424):
+    // `merge_through_scope`'s `return self if other.nil?` reads `other`
+    // once more, a var on this RBS-less probe (+1 in
+    // active_record/relation.rb); relation.rbs types it for the
+    // RBS-paired gate, which stays at 0.
+    // MEASURED 1427 on expression orderings of a through scope (1425):
+    // `merge_through_scope` asks each ordering clause whether it holds a
+    // parenthesis or a quote before it splits it, two reads of a var on
+    // this RBS-less probe (+2 in active_record/relation.rb); relation.rbs
+    // types it for the RBS-paired gate, which stays at 0.
+    // MEASURED 1428 on restore_attributes (1427): its block reads each
+    // restored `name`, a var on this RBS-less probe (+1 in
+    // active_record/connection.rb); connection.rbs types it for the
+    // RBS-paired gate, which stays at 0.
+    // MEASURED 1432 on association relation inverses (main e942cef18:
+    // 1427): `_inversed_from` stores its owner and association name (+4)
+    // and `load_records` hands the stored owner its rows (+1), vars on
+    // this RBS-less probe (active_record/relation.rb); relation.rbs types
+    // them for the RBS-paired gate, which stays at 0.
+    // MEASURED 1433 on merging #2176 and #2177 (1427): restore_attributes's
+    // +1 and the association relation inverses' +5, which add up.
+    // MEASURED 1448 on uuid-keyed token_for (1433): active_record/token_for.rb's
+    // payload writers take the key already written as JSON, a `key` var where
+    // `id.to_s` read a String (+12), and `str_key` / `data_str_id` (+3), vars
+    // on this RBS-less probe; token_for.rbs types them for the RBS-paired gate.
+    // MEASURED 1434 on routed connection handles (main 105a34827: 1433):
+    // the Db slot calls a connection handle makes in
+    // active_record/connection.rb read the Db contract, which this
+    // RBS-less probe does not model, as `self.transaction`'s `Db.exec`
+    // calls do: `Base.connection`'s `Db.connection_slot` and the `slot` it
+    // answers (+4), `transaction`'s guard (+2), and `enter_slot` /
+    // `leave_slot` in `execute`, `select_rows` and `exec_update` with
+    // `raw_connection`'s guard (+8). `Base.connection` now answers a
+    // `Connection.new` on one arm, so its callers' chains in
+    // migration_runner.rb, schema_reader.rb and tasks.rb type (-13).
+    // db.rbs and connection.rbs type them for the RBS-paired gate.
+    // MEASURED 1436 on a held `with_connection` (1434): the handle's
+    // `_hold_slot` and `_release_slot` call `Db.enter_slot` and
+    // `Db.leave_slot`, the Db contract this probe does not model, as the
+    // handle's statements do (+2 in active_record/connection.rb);
+    // `with_connection` itself adds none. db.rbs and connection.rbs type
+    // them for the RBS-paired gate.
+    // MEASURED 1451 on merging main 2d02f862f (1448) with the routed
+    // connection handles' +3, which add up.
+    // MEASURED 1439 on PostgreSQL row locking (main 1a54a7397: 1433):
+    // the ruby family's `lock!` / `_lock_row` (active_record/connection.rb)
+    // add 6. Four read the `lock` argument, typed only by connection.rbs,
+    // which this RBS-less probe does not load; the other two are the `Db`
+    // receivers of `Db.adapter_name` and `Db.exec`, as in `Relation#lock`.
+    // MEASURED 1446 on the #2201 review (1439 above): `_lock_row` keeps
+    // the lock's row through `Db.exec_returning` / `Db.step?` /
+    // `Db.finalize` (+7). The `stmt` local, its begin/ensure and the three
+    // `Db` results read as untyped on this RBS-less probe, as `Db.exec` did.
+    // MEASURED 1464 on merging main 7d9513597 (1451) with the row locking's
+    // +13 (1446 less main 1a54a7397's 1433), which add up.
+    // MEASURED 1465 on a fixpoint entry answering what it did not know (1464):
+    // `version_recorded?`'s `version` parameter in
+    // active_record/migration_runner.rb moves between two spellings of untyped (`Var`
+    // and `Untyped`) as its callers' rows settle, a move the fixpoint no
+    // longer counts toward a pin, so it stays unresolved on this RBS-less
+    // probe (+1); migration_runner.rbs types it for the RBS-paired gate.
+    // MEASURED 1452 on PostgreSQL uuid casts (1451): a record's id under a
+    // uuid column is read on its own arm, `uuid_value_predicate(qcol,
+    // val._primary_key_value)`, as the bound arm already reads it. That is
+    // one more `_primary_key_value` send this RBS-less probe leaves
+    // unresolved (+1 in active_record/relation.rb). base.rbs types it
+    // `Integer` for the RBS-paired gate.
+    // MEASURED 1465 on merging main 81b6491fc (1464) with the uuid casts'
+    // +1 (1452 less 1451), which add up.
+    // MEASURED 1467 on an unsaved record under a uuid column (1465): the
+    // record arm reads `new_record?` and the key's `to_s` before casting
+    // (+2 in active_record/relation.rb), so an unsaved record is
+    // `IS NULL` as in Rails.
+    // MEASURED 1470 on an unsaved record in a uuid IN list (1467): the
+    // list's untyped elements reach `uuid_record_key` (+3 in
+    // active_record/relation.rb), so the record is the list's nil arm.
+    // MEASURED 1471 on merging main 2d9d16d0c (1465) with the uuid casts'
+    // +6 (1470 less 1464), which add up.
+    // MEASURED 1474 on the connection handler (1471):
+    // `ConnectionHandler#clear_active_connections!` asks
+    // `Db.connection_slot(true) == -2` and `Db.query_cache_enabled?`
+    // (+3 in active_record/connection.rb), which read as untyped on this
+    // RBS-less probe, as the other `Db` results do.
+    // MEASURED 1482 on carrying `references` through `or!`, `and!` and
+    // `merge!` (1473): each hands its untyped `other` to
+    // `merge_reference_names!`, whose body reads that `other`, as the rest
+    // of those methods already do (+9 in active_record/relation.rb).
+    const CEILING: usize = 1482;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ledger: \

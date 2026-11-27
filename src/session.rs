@@ -45,11 +45,21 @@ pub fn analyze_and_lower(app: &mut App) -> Vec<Diagnostic> {
 }
 
 fn analyze_and_lower_with_target(app: &mut App, target: crate::build_target::BuildTarget) -> Vec<Diagnostic> {
+    // The translate fold reads the plans typing made over the same catalog.
+    crate::lower::i18n_translate::with_session_plans(|| analyze_and_lower_in_session(app, target))
+}
+
+fn analyze_and_lower_in_session(app: &mut App, target: crate::build_target::BuildTarget) -> Vec<Diagnostic> {
     if target == crate::build_target::BuildTarget::Spinel {
         crate::ingest::source_gem_autoload::answer_nil(app);
     }
     let mut analyzer = crate::analyze::Analyzer::new(app);
     analyzer.analyze(app);
+    // Before the shake: a render that becomes `render_in` is what reaches the object's rendering code (a gem's).
+    if crate::lower::renderable::apply(app) {
+        analyzer = crate::analyze::Analyzer::new(app);
+        analyzer.analyze(app);
+    }
     // Typed again without the gem code the program does not reach: its calls are no evidence for what the reached code is
     // passed, as Warden's `update(label, &block)`, which nothing calls, would type `add`'s strategy `untyped`.
     if crate::source_gem_shake::shakes_source_gems(app, target)
@@ -62,7 +72,7 @@ fn analyze_and_lower_with_target(app: &mut App, target: crate::build_target::Bui
     #[cfg(feature = "memory-census")]
     crate::memory_census::census("after analyze", app);
     app.helper_diagnostics = Some(crate::analyze::diagnose_helper_modules(app));
-    // Only the registry outlives the analysis.
+    // Only the registry outlives the analysis (and the session's translate plans, until the fold has read them).
     #[cfg(feature = "memory-census")]
     let registry = if crate::memory_census::enabled() { analyzer.census_drop() } else { analyzer.into_class_registry() };
     #[cfg(not(feature = "memory-census"))]
@@ -116,6 +126,8 @@ pub fn analyze_and_lower_for(app: &mut App, target: crate::build_target::BuildTa
         let mut found = crate::ingest::validates_with::expand(app);
         crate::ingest::mailer_defaults::expand(app);
         crate::ingest::has_many_hold::expand(app);
+        crate::ingest::has_one_write::expand(app);
+        found.extend(crate::ingest::has_one_write::refuse(app, true));
         found.extend(crate::ingest::each_validator::expand(app, target.as_str()));
         found.extend(crate::ingest::mailer_helpers::apply(app, target.as_str()));
         found.extend(crate::ingest::mailer_callbacks::expand(app, target.as_str()));
@@ -123,6 +135,7 @@ pub fn analyze_and_lower_for(app: &mut App, target: crate::build_target::BuildTa
     } else {
         let mut found = crate::ingest::each_validator::refuse(app, target.as_str());
         found.extend(crate::ingest::mailer_callbacks::refuse(app, target.as_str()));
+        found.extend(crate::ingest::has_one_write::refuse(app, false));
         found
     };
     if !target.parses_numericality_input() {
@@ -168,6 +181,11 @@ pub fn drop_answered_by_target(app: &App, target: crate::build_target::BuildTarg
 /// file's program).
 pub fn drop_runtime_answered(target: crate::build_target::BuildTarget, diags: &mut Vec<Diagnostic>) {
     use crate::build_target::BuildTarget;
+    // Spinel's SQLite Db opens the pools of an app that routes by role and shard (`ingest::database_ownership`); no
+    // other target's does, and they keep the refusal.
+    if target == BuildTarget::Spinel {
+        diags.retain(|diagnostic| !matches!(&diagnostic.kind, crate::diagnostic::DiagnosticKind::Unsupported { construct, .. } if construct.as_str() == "database_routes"));
+    }
     if !matches!(target, BuildTarget::Ruby | BuildTarget::Jruby) {
         return;
     }

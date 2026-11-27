@@ -97,7 +97,7 @@ fn expand_included_blocks(app: &mut App) {
         if !module.is_module || module.origin.is_some() {
             continue;
         }
-        let Some((ci, decls, writes, calls_a_method)) = module.unknown_calls.iter().enumerate().find_map(|(ci, call)| {
+        let Some((ci, decls, writes, calls_a_method, private)) = module.unknown_calls.iter().enumerate().find_map(|(ci, call)| {
             let ExprNode::Send { recv: None, method, args, block: Some(block), .. } = &*call.node else { return None };
             if method.as_str() != "included" || !args.is_empty() {
                 return None;
@@ -117,13 +117,42 @@ fn expand_included_blocks(app: &mut App) {
                 return None;
             }
             let mut writes = Vec::new();
+            // `private_class_method :name, :name=` of what the block declared (discourse's JsonApiKit resources).
+            let accessors: Vec<String> = decls
+                .iter()
+                .flat_map(|d| d.names.iter())
+                .flat_map(|n| [n.as_str().to_string(), format!("{}=", n.as_str()), format!("{}?", n.as_str())])
+                .collect();
+            let mut private: Vec<Symbol> = Vec::new();
+            let mut rest: Vec<&Expr> = Vec::new();
             for stmt in &stmts[declared..] {
+                match &*stmt.node {
+                    ExprNode::Send { recv: None, method, args, block: None, .. } if method.as_str() == "private_class_method" && !args.is_empty() => {
+                        for arg in args {
+                            let ExprNode::Lit { value: Literal::Sym { value } } = &*arg.node else { return None };
+                            if !accessors.iter().any(|a| a == value.as_str()) {
+                                return None;
+                            }
+                            private.push(value.clone());
+                        }
+                    }
+                    _ if !private.is_empty() => return None,
+                    _ => rest.push(stmt),
+                }
+            }
+            // Not beside an instance accessor, which reads the class's through `self.class.name`.
+            if !private.is_empty()
+                && decls.iter().any(|d| !matches!(d.kind, Kind::ClassAttribute { instance_reader: false, instance_writer: false, .. }))
+            {
+                return None;
+            }
+            for stmt in rest.iter().copied() {
                 if class_attribute(stmt).is_some() || !block_writes(stmt, module, &app.library_classes, &decls, &mut writes) {
                     return None;
                 }
             }
-            let calls_a_method = stmts[declared..].iter().any(|stmt| matches!(&*stmt.node, ExprNode::Send { recv: None, .. }));
-            seeds_run_like_the_block(&decls, &writes).then_some((ci, decls, writes, calls_a_method))
+            let calls_a_method = rest.iter().any(|stmt| matches!(&*stmt.node, ExprNode::Send { recv: None, .. }));
+            seeds_run_like_the_block(&decls, &writes).then_some((ci, decls, writes, calls_a_method, private))
         }) else {
             continue;
         };
@@ -177,6 +206,24 @@ fn expand_included_blocks(app: &mut App) {
             for decl in &decls {
                 added.extend(methods(&lc.name, Some("superclass"), &lc.methods, &added, decl, decl.span));
                 lc.class_ivar_initializers.extend(seeds_with_writes(decl, &writes));
+            }
+            for m in added.iter_mut().filter(|m| m.receiver == MethodReceiver::Class && private.contains(&m.name)) {
+                // A private reader is not callable on `superclass`: the parent's value is read as Ruby's singleton lookup
+                // would reach it.
+                if !m.name.as_str().ends_with(['=', '?'])
+                    && let Some(mut reader) = defs(&format!(
+                        "  def self.{n}\n    @{w} ? @{n} : superclass.send(:{n})\n  end\n",
+                        n = m.name.as_str(),
+                        w = written(m.name.as_str())
+                    ))
+                    .into_iter()
+                    .next()
+                {
+                    reader.name_span = m.name_span;
+                    reader.enclosing_class = m.enclosing_class.clone();
+                    *m = reader;
+                }
+                m.visibility = crate::dialect::MethodVisibility::Private;
             }
             lc.methods.splice(0..0, added);
         }

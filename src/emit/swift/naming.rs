@@ -76,7 +76,9 @@ fn is_swift_keyword(s: &str) -> bool {
 /// stays consistent. Same fix as Kotlin's `type_name`.
 pub fn type_name(qualified: &str) -> String {
     let last = qualified.rsplit("::").next().unwrap_or(qualified);
-    if last == "Base" && qualified.contains("::") {
+    // A namespaced class named like a core error (`I18n::ArgumentError`) would redeclare it in the flat module.
+    let shadows_core = matches!(last, "ArgumentError" | "TypeError" | "NameError" | "NoMethodError" | "RuntimeError" | "StandardError" | "KeyError" | "IndexError" | "RangeError");
+    if (last == "Base" || shadows_core) && qualified.contains("::") {
         qualified.split("::").collect::<String>()
     } else {
         last.to_string()

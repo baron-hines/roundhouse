@@ -21,7 +21,9 @@ use crate::lower::controller::body::FormatBreadth;
 const SPINEL_TEST_HELPER: &str =
     include_str!("../../runtime/spinel/test/test_helper.rb");
 
+pub(crate) mod class_paths;
 pub(crate) mod expr;
+mod inverse_seating;
 mod library;
 mod par_render;
 pub(crate) use library::install_lookup_indexes;
@@ -45,6 +47,10 @@ pub use expr::emit_expr;
 
 /// The `models/<stem>` anchor of the file a library class is emitted
 /// into: its outermost enclosing app class's (`library::file_owner`).
+pub(crate) fn library_file_owner(name: &str, app: &App) -> String {
+    library::file_owner(name, app, &app.library_classes)
+}
+
 pub(crate) fn library_file_anchor(name: &str, app: &App) -> String {
     format!("models/{}", crate::naming::underscore(&library::file_owner(name, app, &app.library_classes)))
 }
@@ -200,7 +206,8 @@ pub fn emit_rails_application(app: &App) -> Option<EmittedFile> {
 fn relax_from_stmt_handle(lc: &mut LibraryClass) {
     for m in &mut lc.methods {
         if m.name.as_str() == "from_stmt" && m.receiver == MethodReceiver::Class {
-            if let Some(crate::ty::Ty::Fn { params, .. }) = m.signature.as_mut() {
+            if let Some(crate::ty::Ty::Fn(fn_ty)) = m.signature.as_mut() {
+                let crate::ty::FnTy { params, .. } = &mut **fn_ty;
                 if let Some(p) = params.first_mut() {
                     p.ty = crate::ty::Ty::Untyped.into();
                 }
@@ -410,12 +417,20 @@ pub(crate) fn apply_model_lowering(mut lcs: &mut [LibraryClass], app: &App) {
     // that same cache and would have nothing to prepend itself to if it
     // ran first.
     library::apply_belongs_to_memoization(&mut lcs, app);
+    // An association's loaded records hold their owner through its
+    // inverse. AFTER the memoization above, whose cache the seat fills,
+    // and the preload pass, whose setters it extends.
+    inverse_seating::apply(&mut lcs, app);
+    // A partial `select`'s left-out column raises from its generated
+    // reader. After every pass that rewrites a reader body by its shape.
+    crate::lower::missing_attribute::apply(&mut lcs, app);
     // A has_many cache is made on first read rather than at construction,
     // and the constructor's `attrs = {}` default is one shared frozen Hash
     // (`lower::lazy_model_state`) — nine Arrays and a Hash per hydrated
     // User on campfire's room page, for records that only answer a name.
     // LAST, after every pass that reads or writes `@<assoc>_cache` by name.
     crate::lower::lazy_model_state::apply(&mut lcs, app);
+    crate::lower::rooted_constants::root_shadowed(lcs, app);
 }
 
 fn emit_model_classes(
@@ -433,20 +448,19 @@ fn emit_model_classes(
         .filter(|lc| lc.origin.is_some())
         .map(|lc| {
             let name = lc.name.0.as_str().to_string();
-            let stem = crate::naming::underscore(&name);
-            (name, format!("app/models/{stem}"))
+            let anchor = class_paths::class_anchor(&name);
+            (name, anchor)
         })
         .collect();
     for spec in params_specs.iter() {
         let name = spec.class_id.0.as_str().to_string();
-        let stem = crate::naming::underscore(&name);
-        synthesized.push((name, format!("app/models/{stem}")));
+        let anchor = class_paths::class_anchor(&name);
+        synthesized.push((name, anchor));
     }
 
     lcs.iter()
         .flat_map(|lc| {
-            let stem = crate::naming::underscore(lc.name.0.as_str());
-            let out_path = PathBuf::from(format!("app/models/{stem}.rb"));
+            let out_path = class_paths::class_rb(lc.name.0.as_str());
             library::emit_library_class_pair_with_synthesized(
                 lc,
                 app,
@@ -722,8 +736,8 @@ fn emit_lowered_controllers_from_lcs(
         .filter(|lc| lc.origin.is_some())
         .map(|lc| {
             let name = lc.name.0.as_str().to_string();
-            let stem = crate::naming::underscore(&name);
-            (name, format!("app/models/{stem}"))
+            let anchor = class_paths::class_anchor(&name);
+            (name, anchor)
         })
         .collect();
 
@@ -731,7 +745,7 @@ fn emit_lowered_controllers_from_lcs(
         .flat_map(|lc| {
             let file_stem = crate::naming::underscore(lc.name.0.as_str());
             let out_path = if lc.origin.is_some() {
-                PathBuf::from(format!("app/models/{file_stem}.rb"))
+                class_paths::class_rb(lc.name.0.as_str())
             } else {
                 PathBuf::from(format!("app/controllers/{file_stem}.rb"))
             };
@@ -1143,7 +1157,7 @@ pub(crate) fn emit_spinel_with_param_binds(app: &App, param_binds: bool) -> Vec<
     // + `Object.const_get` scan, which violates the spinel subset).
     // Same `fixture_lcs` is reused below for the per-fixture file emit
     // and for `fixture_extras` synthesized siblings.
-    let mut fixture_lcs = crate::lower::lower_fixtures_to_library_classes(app);
+    let mut fixture_lcs = crate::lower::lower_fixtures_to_library_classes_keeping_keys(app);
     // Same vestige as the view pipeline above, for the same reason:
     // fixture classes are synthesized here, after the shared post-
     // analyze hooks have already run over the App, so an ERB tag's
