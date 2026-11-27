@@ -168,15 +168,16 @@ fn transpile_inner(json_in: &str) -> String {
     roundhouse::analyze::attribution::attribute_analysis_gaps(&mut diags, &app, &mut gaps);
     diags.extend(parse_diags);
     diags.extend(lower_diags);
+    // Two positions per diagnostic and per hover type: each file's line
+    // index is built once (`line_col` alone counts from the top of the file).
+    let mut positions = roundhouse::span::SourcePositions::new(&app.sources);
     let diagnostics: Vec<DiagnosticOut> = diags
         .into_iter()
         .filter_map(|d| {
             if d.span.is_synthetic() {
                 return None;
             }
-            let sf = app.sources.get((d.span.file.0 as usize).checked_sub(1)?)?;
-            let (start_line, start_col) = sf.line_col(d.span.start);
-            let (end_line, end_col) = sf.line_col(d.span.end);
+            let (sf, (start_line, start_col), (end_line, end_col)) = positions.of(d.span)?;
             let severity = match d.severity {
                 Severity::Error => "error",
                 Severity::Warning => "warning",
@@ -205,9 +206,7 @@ fn transpile_inner(json_in: &str) -> String {
             if span.is_synthetic() || matches!(ty, roundhouse::ty::Ty::Var { .. }) {
                 return None;
             }
-            let sf = app.sources.get((span.file.0 as usize).checked_sub(1)?)?;
-            let (start_line, start_col) = sf.line_col(span.start);
-            let (end_line, end_col) = sf.line_col(span.end);
+            let (sf, (start_line, start_col), (end_line, end_col)) = positions.of(span)?;
             Some(TypeOut {
                 path: sf.path.clone(),
                 start_line,
@@ -384,15 +383,16 @@ fn analyze_app_inner(json_in: &str) -> String {
     roundhouse::analyze::attribution::attribute_unknown_gems(&mut diags, &app);
     diags.extend(parse_diags);
 
+    // Two positions per diagnostic: each file's line index is built once
+    // (`line_col` alone counts from the top of the file).
+    let mut positions = roundhouse::span::SourcePositions::new(&app.sources);
     let diagnostics: Vec<DiagnosticOut> = diags
         .into_iter()
         .filter_map(|d| {
             if d.span.is_synthetic() {
                 return None;
             }
-            let sf = app.sources.get((d.span.file.0 as usize).checked_sub(1)?)?;
-            let (start_line, start_col) = sf.line_col(d.span.start);
-            let (end_line, end_col) = sf.line_col(d.span.end);
+            let (sf, (start_line, start_col), (end_line, end_col)) = positions.of(d.span)?;
             let severity = match d.severity {
                 Severity::Error => "error",
                 Severity::Warning => "warning",
