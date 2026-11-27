@@ -1371,17 +1371,18 @@ end
     #[test]
     fn change_by_compares_the_values_around_the_block() {
         let tms = ingest(&example("expect { Article.create! }.to change(Article, :count).by(1)"));
-        let ExprNode::Seq { exprs } = &*tms[0].tests[0].body.node else { panic!() };
-        let kinds: Vec<String> = exprs
-            .iter()
-            .map(|e| match &*e.node {
-                ExprNode::Assign { target: LValue::Var { name, .. }, .. } => format!("{} =", name.as_str()),
-                ExprNode::Send { method, .. } => method.as_str().to_string(),
-                other => format!("{other:?}"),
-            })
-            .collect();
-        // `by` needs no copy of the value: it is a difference.
-        assert_eq!(kinds, ["__rspec_before =", "create!", "__rspec_after =", "assert"]);
+        fn kinds(e: &Expr, out: &mut Vec<String>) {
+            match &*e.node {
+                ExprNode::Seq { exprs } => exprs.iter().for_each(|e| kinds(e, out)),
+                ExprNode::Assign { target: LValue::Var { name, .. }, .. } => out.push(format!("{} =", name.as_str())),
+                ExprNode::Send { method, .. } => out.push(method.as_str().to_string()),
+                other => out.push(format!("{other:?}")),
+            }
+        }
+        let mut order = Vec::new();
+        kinds(&tms[0].tests[0].body, &mut order);
+        // `by`'s argument is read first, as RSpec builds the matcher before the block; no copy of the value: it is a difference.
+        assert_eq!(order, ["__rspec_by =", "__rspec_before =", "create!", "__rspec_after =", "assert"]);
     }
 
     #[test]
